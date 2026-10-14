@@ -91,7 +91,8 @@ source = "UM1670 Rev 6 section 7.10 (64-Mbit SDRAM, 1Mbit x 16-bit x 4-bank): th
 # reaches less than it fitted, and either number alone would be wrong for somebody.
 
 [memory.sdram.device]
-part = "IS42S16400J, 64-Mbit SDRAM, all 16 data lines wired"
+part = "IS42S16400J"         # the fitted device, as the MB1075 schematic prints it: a 64-Mbit
+                             # SDRAM with all 16 of its data lines wired.
 bank = 2                    # SDCKE1 and SDNE1 are the wired pair, so this is the controller's
                             # bank 2. Bank 1 would answer at a different window and does not exist.
 column_bits = 8

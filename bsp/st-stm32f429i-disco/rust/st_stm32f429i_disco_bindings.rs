@@ -105,6 +105,7 @@ pub const MEMORY_SDRAM_KIND: &str = "ram";
 pub const MEMORY_SDRAM_BASE: u32 = 0xD0000000;
 pub const MEMORY_SDRAM_SIZE: u32 = 0x800000;
 pub const MEMORY_SDRAM_CONTROLLER: &str = "fmc";
+pub const MEMORY_SDRAM_PART: &str = "IS42S16400J";
 pub const MEMORY_SDRAM_OPTIONAL: u32 = 1;
 
 /// -- the SDRAM fitted to 'sdram': the shape its controller has to be told. The geometry and

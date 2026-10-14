@@ -319,7 +319,7 @@ fn a_named_serial_picks_its_device_whole_and_without_regard_to_case() {
     let refusal = choose_device(&two, VENDOR, Some("BBBB")).expect_err("a part of a serial names nothing");
     assert!(refusal.contains("serial BBBB."), "names the serial asked for: {refusal}");
     assert!(refusal.contains("AAAA1111") && refusal.contains("BBBB2222"), "lists what is attached: {refusal}");
-    assert!(refusal.contains("--device <serial>"), "and says how to name one: {refusal}");
+    assert!(refusal.contains("--dfu <serial>"), "and says how to name one: {refusal}");
 }
 
 /// With no serial named, only a sole device is taken; several are refused with every one listed, and
@@ -331,7 +331,7 @@ fn with_no_serial_named_only_a_sole_device_is_taken() {
     let two = [attached(VENDOR, Some("AAAA1111")), attached(VENDOR, None)];
     let refusal = choose_device(&two, VENDOR, None).expect_err("two attached, none named");
     assert!(refusal.contains("AAAA1111") && refusal.contains("(none reported)"), "{refusal}");
-    assert!(refusal.contains("--device <serial>"), "and says how to name one: {refusal}");
+    assert!(refusal.contains("--dfu <serial>"), "and says how to name one: {refusal}");
     assert!(choose_device(&[], VENDOR, None).is_err(), "none attached");
 }
 

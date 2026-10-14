@@ -1,12 +1,24 @@
-//! The RP2350 family: the clock plan its boards state, UART0 as the console, and TIMER0 as the
-//! millisecond clock.
+//! The RP2350 family: the clock plan its boards state, UART0 as the console, TIMER0 as the
+//! millisecond clock, and the QSPI PSRAM a board may fit.
 //!
 //! Every RP2350 board states the same kind of plan: a crystal that feeds clk_ref and clk_peri
 //! directly, PLL_SYS for clk_sys, and PLL_USB for clk_usb and clk_adc. The startup applies it from
 //! any state the part was left in, so it parks clk_sys on the crystal before it resets the PLL
 //! that clk_sys may be running on.
+//!
+//! A board that fits a QSPI PSRAM on the QSPI memory interface's second chip select states it, and
+//! [`psram_bring_up`] brings the part up, proves the window by reading back what it wrote, and
+//! wipes it, for an image's startup to call once clk_sys is final. The image's heap then takes the
+//! window it returns. [`attach_psram`] is that call as a startup makes it after [`init`], keeping
+//! what became of the part in a [`PsramRecord`].
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::cell::UnsafeCell;
+use core::mem::MaybeUninit;
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+
+use lamella_psram_qspi::proof::{self, Memory, Mismatch};
+use lamella_psram_qspi::rp2350::{self as qmi, Regs};
+use lamella_psram_qspi::{Grade, Part, Window};
 
 use crate::registers::Registers;
 
@@ -63,6 +75,10 @@ pub const SWITCH_POLLS: u32 = 100_000;
 /// at least 2.6 ms at 150 MHz, and at least 33 ms at the crystal's 12 MHz.
 pub const TX_POLLS: u32 = 100_000;
 
+/// The ring oscillator's RANDOMBIT register, whose bit 0 is the oscillator's output: the ROSC block
+/// at 0x400e8000 and the register at its offset 0x20 (RP2350 datasheet, section 2.2 and table 614).
+pub const ROSC_RANDOMBIT: u32 = 0x400e_8020;
+
 /// A board's console: UART0 and the pin its transmit line is routed to, with the divisor for the
 /// console's baud under the board's plan.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -102,6 +118,96 @@ pub struct Plan {
     pub pll_usb_prim: u32,
 }
 
+impl Plan {
+    /// clk_sys under this plan once PLL_SYS has locked: the crystal's rate times the feedback
+    /// divisor over the two post dividers. The startup sets the reference divider to 1.
+    #[must_use]
+    pub const fn pll_sys_hz(&self) -> u32 {
+        let postdiv1 = (self.pll_sys_prim & pll::PRIM_POSTDIV1) >> pll::PRIM_POSTDIV1_LSB;
+        let postdiv2 = (self.pll_sys_prim & pll::PRIM_POSTDIV2) >> pll::PRIM_POSTDIV2_LSB;
+        let vco_hz = self.xosc_hz as u64 * self.pll_sys_fbdiv as u64;
+        (vco_hz / (postdiv1 as u64 * postdiv2 as u64)) as u32
+    }
+}
+
+/// A QSPI PSRAM a board fits on the QSPI memory interface's second chip select, which answers as
+/// RAM in the interface's second window once [`psram_bring_up`] has run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Psram {
+    /// The GPIO line the board wires the part's chip select to.
+    pub select_line: u8,
+    /// The part's datasheet facts.
+    pub part: &'static Part,
+    /// The temperature grade the part is ordered in.
+    pub grade: Grade,
+    /// The window's base in the cached view.
+    pub base: usize,
+    /// The window's size in bytes.
+    pub bytes: usize,
+}
+
+/// The PSRAM parts this driver knows, by the ordering code a board's facts name: each code with
+/// the part's datasheet facts and the temperature grade the code orders. The APS6404L-3SQR
+/// datasheet's ordering table lists APS6404L-3SQR-ZR as the part for -40 C to +85 C.
+const PSRAM_PARTS: [(&str, &Part, Grade); 1] =
+    [("APS6404L-3SQR-ZR", &Part::APS6404L_3SQR, Grade::Standard)];
+
+impl Psram {
+    /// The PSRAM a board's facts state: the line its chip select is wired to, the part's ordering
+    /// code, and the window's base and size.
+    ///
+    /// # Panics
+    ///
+    /// For an ordering code this driver does not know, or a line no GPIO has, at compile time
+    /// when evaluated in a constant.
+    #[must_use]
+    pub const fn from_facts(select_line: u32, ordering_code: &str, base: u32, bytes: u32) -> Self {
+        assert!(select_line <= u8::MAX as u32, "no GPIO line has that number");
+        let mut index = 0;
+        while index < PSRAM_PARTS.len() {
+            let (code, part, grade) = PSRAM_PARTS[index];
+            if same_bytes(code.as_bytes(), ordering_code.as_bytes()) {
+                return Psram {
+                    select_line: select_line as u8,
+                    part,
+                    grade,
+                    base: base as usize,
+                    bytes: bytes as usize,
+                };
+            }
+            index += 1;
+        }
+        panic!("the board's PSRAM part is not one this driver knows")
+    }
+}
+
+/// Whether two byte strings are equal, in a constant.
+const fn same_bytes(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut index = 0;
+    while index < a.len() {
+        if a[index] != b[index] {
+            return false;
+        }
+        index += 1;
+    }
+    true
+}
+
+/// Whether the QSPI memory interface can route its second chip select to `line`.
+const fn routable(line: u8) -> bool {
+    let mut index = 0;
+    while index < qmi::SELECT_LINES.len() {
+        if qmi::SELECT_LINES[index] == line {
+            return true;
+        }
+        index += 1;
+    }
+    false
+}
+
 /// A board on this family.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Board {
@@ -109,6 +215,8 @@ pub struct Board {
     pub console: Console,
     /// The board's default clock plan.
     pub plan: Plan,
+    /// The QSPI PSRAM the board fits, if it fits one.
+    pub psram: Option<Psram>,
 }
 
 impl Board {
@@ -116,12 +224,14 @@ impl Board {
     /// cannot apply as stated.
     ///
     /// The console's divisor must have been computed for clk_peri on the crystal, which is where
-    /// the startup puts it. And the crystal must divide into whole microseconds within the tick
-    /// generator's 9-bit count.
+    /// the startup puts it. The crystal must divide into whole microseconds within the tick
+    /// generator's 9-bit count. And a PSRAM must answer in the QSPI memory interface's second
+    /// window, on a line the interface can route its second chip select to, with a window of whole
+    /// words no larger than the part or the interface's window.
     ///
     /// # Panics
     ///
-    /// When either does not hold.
+    /// When any of these does not hold.
     #[must_use]
     pub const fn checked(self) -> Self {
         assert!(
@@ -137,6 +247,23 @@ impl Board {
             cycles != 0 && cycles <= ticks::TIMER0_CYCLES_CYCLES,
             "a microsecond must fit the tick generator's count"
         );
+        if let Some(psram) = self.psram {
+            assert!(
+                psram.base == qmi::WINDOW1_BASE,
+                "the PSRAM must answer in the QSPI memory interface's second window"
+            );
+            assert!(
+                routable(psram.select_line),
+                "the QSPI memory interface cannot route its second chip select to the PSRAM's line"
+            );
+            assert!(
+                psram.bytes != 0
+                    && psram.bytes.is_multiple_of(4)
+                    && psram.bytes <= psram.part.bytes
+                    && psram.bytes <= qmi::WINDOW1_BYTES_MAX,
+                "the PSRAM's window must be whole words, no larger than the part or the interface's window"
+            );
+        }
         self
     }
 
@@ -220,6 +347,217 @@ pub fn now_ms<R: Registers>(regs: &mut R, state: &State) -> u64 {
         return 0;
     }
     (read_microseconds(regs) / 1000).wrapping_add(1)
+}
+
+/// Why a board's PSRAM is not in use.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PsramFault {
+    /// The bring-up refused, and programmed nothing of the window: the part's limits cannot be met
+    /// at this clk_sys, the interface does not serve the line or the size, a step never finished,
+    /// or no good die answered.
+    BringUp(lamella_psram_qspi::Error),
+    /// A word the stride proof wrote did not read back: the window is not RAM as the board states.
+    Proof(Mismatch),
+}
+
+/// Brings up the board's PSRAM at clk_sys `sys_hz`, proves the window with the stride walk, and
+/// wipes it, so every word reads zero through either view and nothing of it is cached. Answers the
+/// window, whose cached view is the program's RAM, or why there is none.
+///
+/// The proof writes its pattern salted with `salt`, so a pattern left by an earlier boot cannot
+/// pass for this one; any value that differs between boots serves.
+///
+/// # Safety
+///
+/// One core runs; every interrupt is masked; clk_sys is final at `sys_hz`; nothing uses the
+/// interface's second window; and the image's map places the section
+/// `.data.lamella_psram_qspi_nucleus` in RAM, because the direct-mode sequence that wakes the part
+/// takes the flash window off the bus while it runs.
+#[allow(unsafe_code)]
+pub unsafe fn psram_bring_up(psram: &Psram, sys_hz: u32, salt: u32) -> Result<Window, PsramFault> {
+    // SAFETY: the caller guarantees this function's contract, and `Mmio` is the hardware it names.
+    unsafe { psram_bring_up_with(&mut qmi::Mmio, &mut qmi::Mmio, psram, sys_hz, salt) }
+}
+
+/// [`psram_bring_up`] against any registers and memory, so a test runs it against models of both.
+///
+/// # Safety
+///
+/// As [`psram_bring_up`] when either is the hardware.
+#[allow(unsafe_code)]
+pub unsafe fn psram_bring_up_with<R: Regs, M: Memory>(
+    regs: &mut R,
+    memory: &mut M,
+    psram: &Psram,
+    sys_hz: u32,
+    salt: u32,
+) -> Result<Window, PsramFault> {
+    let config = qmi::Config {
+        select_line: psram.select_line,
+        part: psram.part,
+        sys_hz,
+        grade: psram.grade,
+        bytes: psram.bytes,
+    };
+    // SAFETY: the caller guarantees this function's contract, which is the bring-up's.
+    let window = unsafe { qmi::bring_up_with(regs, &config) }.map_err(PsramFault::BringUp)?;
+    // SAFETY: the bring-up just programmed the window, and nothing else uses it.
+    unsafe { proof::stride_walk(memory, &window, salt) }.map_err(PsramFault::Proof)?;
+    // SAFETY: the same window, still used by nothing else.
+    unsafe { wipe(memory, &window) };
+    Ok(window)
+}
+
+/// Writes zero to every word of the window through its uncached view, then cleans and drops every
+/// cache line, so the window reads zero through either view.
+///
+/// # Safety
+///
+/// The window is the caller's to write, and nothing else uses it or the cache meanwhile.
+#[allow(unsafe_code)]
+pub unsafe fn wipe<M: Memory>(memory: &mut M, window: &Window) {
+    let mut offset = 0;
+    while offset < window.bytes {
+        // SAFETY: the offset lies inside the window, which the caller lets this write.
+        unsafe { memory.write(window.uncached_base + offset, 0) };
+        offset += 4;
+    }
+    // SAFETY: nothing else uses the cache, by the caller's word.
+    unsafe { memory.flush() };
+}
+
+/// What became of a board's PSRAM at the startup: nothing yet, the window it serves, or why it
+/// serves none. An outcome is recorded once. All zero means nothing is recorded, which is what the
+/// RAM a startup clears holds.
+pub struct PsramRecord {
+    phase: AtomicU8,
+    outcome: UnsafeCell<MaybeUninit<Result<Window, PsramFault>>>,
+}
+
+/// [`PsramRecord`]'s phases: nothing recorded, an outcome being made, and an outcome recorded.
+const EMPTY: u8 = 0;
+const MAKING: u8 = 1;
+const RECORDED: u8 = 2;
+
+// SAFETY: the outcome is written only by the one call that moved the phase from EMPTY to MAKING,
+// and read only once the phase is RECORDED, which that call stores after its write, with Release
+// against the readers' Acquire. Nothing writes it again.
+#[allow(unsafe_code)]
+unsafe impl Sync for PsramRecord {}
+
+impl PsramRecord {
+    /// Nothing recorded.
+    #[must_use]
+    pub const fn new() -> Self {
+        PsramRecord {
+            phase: AtomicU8::new(EMPTY),
+            outcome: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+
+    /// Runs `bring_up` and records what it answers, unless an outcome is already recorded or being
+    /// made, in which case `bring_up` does not run. Answers whether it ran.
+    #[allow(unsafe_code)]
+    pub fn record_with(&self, bring_up: impl FnOnce() -> Result<Window, PsramFault>) -> bool {
+        if self
+            .phase
+            .compare_exchange(EMPTY, MAKING, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        let outcome = bring_up();
+        // SAFETY: moving the phase from EMPTY made this call the outcome's one writer, and no
+        // reader reads it before the phase is RECORDED.
+        unsafe { (*self.outcome.get()).write(outcome) };
+        self.phase.store(RECORDED, Ordering::Release);
+        true
+    }
+
+    /// The recorded outcome, or `None` while nothing is recorded.
+    #[allow(unsafe_code)]
+    #[must_use]
+    pub fn outcome(&self) -> Option<Result<Window, PsramFault>> {
+        if self.phase.load(Ordering::Acquire) != RECORDED {
+            return None;
+        }
+        // SAFETY: the phase is RECORDED only once the outcome is written, and it is never written
+        // again.
+        Some(unsafe { (*self.outcome.get()).assume_init_read() })
+    }
+
+    /// The window's base in the cached view and its size in bytes, when the PSRAM came up.
+    #[must_use]
+    pub fn window(&self) -> Option<(usize, usize)> {
+        match self.outcome() {
+            Some(Ok(window)) => Some((window.base, window.bytes)),
+            _ => None,
+        }
+    }
+}
+
+impl Default for PsramRecord {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl core::fmt::Debug for PsramRecord {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PsramRecord")
+            .field("outcome", &self.outcome())
+            .finish()
+    }
+}
+
+/// A salt for the PSRAM's proof that differs between boots: 32 reads of the ring oscillator's
+/// output, one bit each, as the datasheet's section 8.3.8 describes for a value that needs no
+/// cryptographic strength. The bits are random while the system clocks run from the crystal, as
+/// they do once [`init`] has applied the plan.
+pub fn rosc_salt<R: Registers>(regs: &mut R) -> u32 {
+    let mut salt = 0;
+    for _ in 0..32 {
+        salt = (salt << 1) | (regs.read(ROSC_RANDOMBIT) & 1);
+    }
+    salt
+}
+
+/// Brings up the board's PSRAM once [`init`] has applied the plan, as [`psram_bring_up`] does, and
+/// records the window or why there is none. Nothing runs on a board without a PSRAM; when clk_sys
+/// does not run from PLL_SYS, the one clk_sys rate the plan states; or when `record` already holds
+/// an outcome or is making one. The record then stays as it was.
+///
+/// # Safety
+///
+/// As [`psram_bring_up`], with clk_sys final at the rate `applied` reports.
+#[allow(unsafe_code)]
+pub unsafe fn attach_psram(board: &Board, applied: Applied, record: &PsramRecord, salt: u32) {
+    // SAFETY: the caller guarantees this function's contract, and `Mmio` is the hardware it names.
+    unsafe { attach_psram_with(&mut qmi::Mmio, &mut qmi::Mmio, board, applied, record, salt) }
+}
+
+/// [`attach_psram`] against any registers and memory, so a test runs it against models of both.
+///
+/// # Safety
+///
+/// As [`attach_psram`] when either is the hardware.
+#[allow(unsafe_code)]
+pub unsafe fn attach_psram_with<R: Regs, M: Memory>(
+    regs: &mut R,
+    memory: &mut M,
+    board: &Board,
+    applied: Applied,
+    record: &PsramRecord,
+    salt: u32,
+) {
+    let Some(psram) = board.psram else { return };
+    if !applied.pll_sys {
+        return;
+    }
+    let sys_hz = board.plan.pll_sys_hz();
+    // SAFETY: the caller guarantees the bring-up's contract, and clk_sys runs at the plan's rate.
+    let _ =
+        record.record_with(|| unsafe { psram_bring_up_with(regs, memory, &psram, sys_hz, salt) });
 }
 
 /// Starts the crystal and waits, boundedly, for it to report stable.

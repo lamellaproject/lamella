@@ -9,7 +9,7 @@ use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use lamella_binder::{
     BoundCatch, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, BoundSwitchLabel, SpecialType,
-    TypeSymbol, always_exits,
+    TypeSymbol, always_exits, is_const_true,
 };
 use lamella_cil::{EhClause, EhKind, Instruction, InstructionRange, Opcode, Operand};
 use lamella_syntax::ast::{AssignmentOperator, BinaryOperator, PostfixOperator, UnaryOperator};
@@ -154,6 +154,27 @@ impl Labels<'_> {
         self.branch(opcode, label, out);
     }
 
+    /// Whether control can reach the end of the instructions emitted from `start` on: there are
+    /// none, the last one can fall through, or a branch among them targets a label placed at their
+    /// end.
+    ///
+    /// **A BRANCH COUNTS WHETHER OR NOT ANYTHING CAN TAKE IT.** The CLI forbids a branch into a
+    /// handler, and one out of a protected region by anything but `leave`, whatever its condition
+    /// (ECMA-335 1st ed, Partition I 11.4.2.8) -- so the question is about the instructions, and the
+    /// flow analysis, which is about what can run, is the wrong witness for it.
+    fn reaches_end(&self, start: u32, out: &[Instruction]) -> bool {
+        let end = out.len() as u32;
+        match out.last() {
+            Some(last) if end > start => {
+                falls_through(last.opcode)
+                    || self.pending.iter().any(|&(index, label)| {
+                        index as u32 >= start && self.positions[label] == Some(end)
+                    })
+            }
+            _ => true,
+        }
+    }
+
     fn backpatch(&self, out: &mut [Instruction]) {
         for &(index, label) in &self.pending {
             if let Some(position) = self.positions[label] {
@@ -161,6 +182,25 @@ impl Labels<'_> {
             }
         }
     }
+}
+
+/// Whether control can continue to the next instruction after one with `opcode`: every opcode
+/// can but the unconditional transfers (ECMA-335 4th ed, Partition I 12.4.2.8.1). A conditional
+/// branch can, through its not-taken case.
+fn falls_through(opcode: Opcode) -> bool {
+    !matches!(
+        opcode,
+        Opcode::Br
+            | Opcode::BrS
+            | Opcode::Leave
+            | Opcode::LeaveS
+            | Opcode::Ret
+            | Opcode::Jmp
+            | Opcode::Throw
+            | Opcode::Rethrow
+            | Opcode::Endfinally
+            | Opcode::Endfilter
+    )
 }
 
 /// The maximum evaluation-stack depth a straight-line/structured body reaches --
@@ -303,7 +343,8 @@ pub fn emit_body(
     let body = spilled.as_ref().unwrap_or(body);
     let mut frame = Frame::build(parameters, byref_params, body, arg_base);
     frame.set_constructor_of(match (method_name, declaring_type) {
-        (".ctor" | ".cctor", Some(owner)) => Some(owner.clone()),
+        (".ctor", Some(owner)) => Some((owner.clone(), false)),
+        (".cctor", Some(owner)) => Some((owner.clone(), true)),
         _ => None,
     });
     let lowered = lower(&mut frame, tokens, body, return_type, prologue, source)?;
@@ -479,11 +520,9 @@ fn contains_return(stmt: &BoundStmt) -> bool {
 /// Whether control can fall through the end of `stmt` -- C#'s reachable-end-point
 /// analysis (ECMA-334 8.1). A block's closing-brace step point is emitted only when its
 /// end is reachable this way: a block that ends by transferring control (a `break`,
-/// `continue`, `return`, `throw`, `goto`, an exhaustive `if`, or a `try`/`switch` whose
-/// every path diverts) has an unreachable `}`, which csc -- and so lcsc -- leaves
-/// unbraced. A loop is taken to complete, since its usual shape has a reachable exit (a
-/// never-completing `while (true)` without a `break` is a rare case this does not model,
-/// and at worst brackets a `}` csc omits -- it never drops one csc keeps).
+/// `continue`, `return`, `throw`, `goto`, an exhaustive `if`, a loop that never ends, or a
+/// `try`/`switch` whose every path diverts) has an unreachable `}`, which csc -- and so
+/// lcsc -- leaves unbraced.
 fn completes_normally(stmt: &BoundStmt) -> bool {
     use BoundStmtKind as Kind;
     match &stmt.kind {
@@ -517,7 +556,10 @@ fn completes_normally(stmt: &BoundStmt) -> bool {
                 && (completes_normally(body)
                     || catches.iter().any(|catch| completes_normally(&catch.body)))
         }
-        Kind::Switch { .. } => !always_exits(stmt),
+        Kind::Switch { .. }
+        | Kind::While { .. }
+        | Kind::DoWhile { .. }
+        | Kind::For { .. } => !always_exits(stmt),
         _ => true,
     }
 }
@@ -635,9 +677,8 @@ fn emit_statement(
         BoundStmtKind::While { condition, body } => {
             let start = labels.label();
             labels.place(start, out);
-            emit_expression(condition, frame, tokens, out)?;
             let end = labels.label();
-            labels.branch(Opcode::Brfalse, end, out);
+            emit_loop_test(condition, Opcode::Brfalse, end, frame, tokens, labels, out)?;
             labels.loops.push(LoopContext {
                 continue_label: start,
                 break_label: end,
@@ -663,8 +704,9 @@ fn emit_statement(
             emit_statement(body, frame, tokens, labels, out)?;
             labels.loops.pop();
             labels.place(test, out);
-            emit_expression(condition, frame, tokens, out)?;
-            labels.branch(Opcode::Brtrue, start, out);
+            if !emit_loop_test(condition, Opcode::Brtrue, start, frame, tokens, labels, out)? {
+                labels.branch(Opcode::Br, start, out);
+            }
             labels.place(end, out);
         }
         BoundStmtKind::For {
@@ -803,10 +845,6 @@ fn emit_statement(
             let constant_temp =
                 || temp.ok_or(EmitError::Unsupported("a constant case label in a pattern switch"));
 
-            let long = matches!(
-                expression.ty,
-                TypeSymbol::Special(SpecialType::Int64 | SpecialType::UInt64)
-            );
             let section_labels: Vec<usize> = sections.iter().map(|_| labels.label()).collect();
             let end = labels.label();
             let mut default_label = None;
@@ -817,12 +855,11 @@ fn emit_statement(
                         BoundSwitchLabel::Case(value) => {
                             let temp = constant_temp()?;
                             out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(temp)));
-                            let constant = if long {
-                                Instruction::new(Opcode::LdcI8, Operand::Int64(*value))
-                            } else {
-                                Instruction::new(Opcode::LdcI4, Operand::Int32(*value as i32))
-                            };
-                            out.push(constant);
+                            out.push(crate::expr::integer_constant(
+                                *value,
+                                &expression.ty,
+                                tokens,
+                            ));
                             out.push(Instruction::simple(Opcode::Ceq));
                             labels.branch(Opcode::Brtrue, section_labels[index], out);
                         }
@@ -1066,13 +1103,7 @@ fn emit_try(
     let end = labels.label();
 
     let try_start = out.len() as u32;
-    labels.region_depth += 1;
-    let emitted = emit_statement(body, frame, tokens, labels, out);
-    labels.region_depth -= 1;
-    emitted?;
-    if !always_exits(body) {
-        labels.branch(Opcode::Leave, end, out);
-    }
+    emit_protected(body, end, frame, tokens, labels, out)?;
     let try_range = InstructionRange {
         start: try_start,
         end: out.len() as u32,
@@ -1135,13 +1166,7 @@ fn emit_try(
         } else {
             out.push(Instruction::simple(Opcode::Pop));
         }
-        labels.region_depth += 1;
-        let emitted = emit_statement(&catch.body, frame, tokens, labels, out);
-        labels.region_depth -= 1;
-        emitted?;
-        if !always_exits(&catch.body) {
-            labels.branch(Opcode::Leave, end, out);
-        }
+        emit_protected(&catch.body, end, frame, tokens, labels, out)?;
         let kind = match filter_start {
             Some(filter_start) => EhKind::Filter { filter_start },
             None => {
@@ -1189,6 +1214,42 @@ fn emit_try(
     }
 
     labels.place(end, out);
+    Ok(())
+}
+
+/// Emits a `try` block or a `catch` handler one protected region deeper, then closes it with a
+/// `leave` to `end` when control can reach its end.
+///
+/// **ONE FUNCTION FOR BOTH, BECAUSE A REGION IS LEFT THE SAME WAY FROM EITHER.** Control may leave a
+/// try block or a catch handler only by `throw`, `rethrow` or `leave`, never by a branch or by falling
+/// off its end (ECMA-335 1st ed, Partition I 11.4.2.8, rules 1 and 4) -- and whatever ends the region
+/// sits right before a handler, or after the last one.
+///
+/// **THE EMITTED CODE DECIDES WHETHER THE `leave` IS NEEDED, NOT THE FLOW ANALYSIS.** The flow
+/// analysis says what can RUN, and the CLI checks what is WRITTEN, including code that never runs:
+/// the test of `do { return x; } while (c);` is dead, and still falls through to whatever follows
+/// it. Ending a region, that is the handler. [`Labels::reaches_end`] reads the instructions instead.
+///
+/// A handler is a region too (a `br` out of a `catch` is `BranchOutOfHandler` rather than
+/// `BranchOutOfTry`), so it raises the depth as well. The one other place a region opens is the
+/// `finally` handler in [`emit_try`], which raises the depth itself and always ends with
+/// `endfinally`.
+fn emit_protected(
+    body: &BoundStmt,
+    end: usize,
+    frame: &mut Frame,
+    tokens: &Tokens,
+    labels: &mut Labels<'_>,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    let start = out.len() as u32;
+    labels.region_depth += 1;
+    let emitted = emit_statement(body, frame, tokens, labels, out);
+    labels.region_depth -= 1;
+    emitted?;
+    if labels.reaches_end(start, out) {
+        labels.branch(Opcode::Leave, end, out);
+    }
     Ok(())
 }
 
@@ -1244,8 +1305,7 @@ fn emit_for(
     labels.place(start, out);
     let end = labels.label();
     if let Some(condition) = condition {
-        emit_expression(condition, frame, tokens, out)?;
-        labels.branch(Opcode::Brfalse, end, out);
+        emit_loop_test(condition, Opcode::Brfalse, end, frame, tokens, labels, out)?;
     }
     let step = labels.label();
     labels.loops.push(LoopContext {
@@ -1263,6 +1323,39 @@ fn emit_for(
     labels.branch(Opcode::Br, start, out);
     labels.place(end, out);
     Ok(())
+}
+
+/// Emits a loop's test -- `condition`, then `branch` to `target` -- and says whether it wrote one.
+///
+/// **A CONDITION THAT IS THE CONSTANT `true` IS NOT TESTED.** Nothing can leave the loop through it,
+/// and an exit edge that is never taken is still an edge the CLI checks: ending a value-returning
+/// method, it reaches a `ret` with nothing to return, and ending a protected region, it makes the
+/// region need a `leave` that nothing can use. csc writes no test either, and [`is_const_true`] is
+/// the predicate the flow analysis uses to call such a loop endless, so the two agree on which loops
+/// have a way out.
+///
+/// A debug build writes a `nop` where the test would have stood, so a step point on the condition
+/// keeps an instruction of its own: csc's debug build keeps one too, on an evaluation it stores and
+/// never reads.
+#[allow(clippy::too_many_arguments)]
+fn emit_loop_test(
+    condition: &BoundExpr,
+    branch: Opcode,
+    target: usize,
+    frame: &mut Frame,
+    tokens: &Tokens,
+    labels: &mut Labels<'_>,
+    out: &mut Vec<Instruction>,
+) -> Result<bool, EmitError> {
+    if is_const_true(condition) {
+        if labels.source.is_some() {
+            out.push(Instruction::simple(Opcode::Nop));
+        }
+        return Ok(false);
+    }
+    emit_expression(condition, frame, tokens, out)?;
+    labels.branch(branch, target, out);
+    Ok(true)
 }
 
 fn loop_target(

@@ -22,7 +22,7 @@ lamella-generics = { path = "../lamella-generics", optional = true }
 # gates out the same bindings the interpreter does. The DEFAULT is the full desktop profile (the
 # differential's run-with-corlib runner = full ECMA-335 1st-ed compliance, incl. typed references);
 # a constrained target builds --no-default-features + an explicit subset.
-default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental", "typed-references", "varargs", "real-memory", "debug-names", "generics", "wifi"]
+default = ["NETMFv4_4", "exceptions", "float", "gc", "finalizers", "math-transcendental", "typed-references", "varargs", "real-memory", "debug-names", "generics", "wifi", "board-buses"]
 # Bake-time monomorphization: a closed generic instantiation becomes its own type identity, so a
 # program naming `Pair<int,string>` runs instead of being refused. OFF turns the whole pass into the
 # refusal that preceded it -- `ProfileViolation::UnloweredGeneric` still names every call site, so a
@@ -34,6 +34,10 @@ generics = ["dep:lamella-generics", "lamella-cil-runtime/generics"]
 # The Lamella.Net.WiFi class library's seam: binds its WiFiNative methods to the runtime's radio
 # intrinsics, which this turns on. On by default, so every host that binds or bakes a program binds them.
 wifi = ["lamella-cil-runtime/wifi"]
+# The board's bus table: binds `Lamella.Hardware.BoardBuses` to the runtime's two intrinsics, which this
+# turns on. On by default, so every host that bakes a program binds them, and the image then names the
+# two intrinsics whatever board it is sent to.
+board-buses = ["lamella-cil-runtime/board-buses"]
 bcl = ["lamella-cil-runtime/bcl"]
 NETMFv4_4 = ["bcl", "reflection", "text", "collections", "lamella-cil-runtime/NETMFv4_4"]
 # The collection types beyond the array. See lamella-cil-runtime.

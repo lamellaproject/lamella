@@ -858,6 +858,35 @@ pub fn definition_symbol(definition: &[Box<str>], arguments: usize) -> TypeSymbo
     TypeSymbol::Named(parts.into())
 }
 
+/// Whether `a` and `b` name the same type DEFINITION.
+///
+/// **AN EXACT COMPARISON ANSWERS "DIFFERENT" FOR EVERY MEMBER OF EVERY GENERIC TYPE.** Inside its
+/// own body a generic type is an instantiation over its own parameters -- its fields are declared
+/// on `G<T>` -- while the constructor being bound or emitted belongs to the plain `G`. And a
+/// primitive's own type in the corlib is spelled two ways, `System.Int32` and `int`. Both are
+/// folded before comparing, which is what "a constructor of the type that declares the field"
+/// (ECMA-334 17.4.2) has to mean for either to work.
+#[must_use]
+pub fn same_type_definition(a: &TypeSymbol, b: &TypeSymbol) -> bool {
+    fn key(ty: &TypeSymbol) -> TypeSymbol {
+        let definition = match ty {
+            TypeSymbol::Instantiation {
+                definition,
+                arguments,
+            } => definition_symbol(definition, arguments.len()),
+            _ => ty.clone(),
+        };
+        match &definition {
+            TypeSymbol::Named(parts) if parts.len() == 2 => {
+                crate::reference::special_for_named(&parts[0], &parts[1])
+                    .map_or(definition.clone(), TypeSymbol::Special)
+            }
+            _ => definition,
+        }
+    }
+    key(a) == key(b)
+}
+
 /// `ty` with every type parameter named in `bindings` replaced by its argument, recursing through
 /// every position a parameter can hide in.
 ///

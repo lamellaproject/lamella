@@ -46,4 +46,5 @@ public enum Rp2350Instances {
     public static let PWM_BASE: UInt32 = 0x400A8000
     public static let PWM_RESET_BIT: UInt32 = 16
     public static let PWM_RESET_MASK: UInt32 = 0x10000
+    public static let QMI_BASE: UInt32 = 0x400D0000
 }

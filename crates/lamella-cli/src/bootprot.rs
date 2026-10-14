@@ -83,7 +83,7 @@ fn target<'a>(parsed: &'a Options, step: &str) -> Result<Target<'a>, String> {
         programmer,
         parsed.value("--probe"),
         parsed.value("--volume"),
-        parsed.value("--device"),
+        parsed.value("--dfu"),
     )
     .map_err(refusal)?;
     let probe = crate::flash::choose_board(programmer, selector.as_deref()).map_err(refusal)?;

@@ -256,6 +256,7 @@ INSTANCES = {
     "ticks": {"block": "ticks", "base": 0x40108000},
     "trng": {"block": "trng", "base": 0x400F0000, "reset_bit": 0x19},
     "pwm": {"block": "pwm", "base": 0x400A8000, "reset_bit": 0x10},
+    "qmi": {"block": "qmi", "base": 0x400D0000},
 }
 
 PLANS = {
@@ -281,6 +282,7 @@ DEVICES = {
 # that instance is brought up; touching it first is a bus fault, not a wrong value.
 MEMORY = {
     "flash": {"kind": "flash", "size": 0x1000000, "optional": False},
+    "psram": {"kind": "ram", "base": 0x11000000, "size": 0x800000, "controller": "qmi", "part": "APS6404L-3SQR-ZR", "optional": True},
 }
 
 # The sockets a removable module plugs into. The socket is board truth -- it is on the

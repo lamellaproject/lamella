@@ -17,7 +17,7 @@ fn main() {
     std::fs::write(
         &generated,
         format!(
-            "/// The board's flash in bytes, from `[memory] flash` in its `board.toml`.\n\
+            "/// The board's flash in bytes, from the flash region its `board.toml` states.\n\
              const BOARD_FLASH_BYTES: usize = {whole_flash_bytes:#x};\n"
         ),
     )
@@ -212,13 +212,16 @@ fn board() -> &'static str {
     }
 }
 
-/// The flash `board` solders, in bytes: `[memory] flash` in its `board.toml`. The RP2350 has no
+/// The flash `board` solders, in bytes: the flash region its `board.toml` states, read by bsp-gen's
+/// own parser, which takes the region in either shape a board file writes it. The RP2350 has no
 /// flash inside it -- it executes in place from a QSPI part on the board -- so the figure is the
 /// board's: 4 MB on the Pico 2 and Pico 2 W, 16 MB on the Pimoroni Pico Plus 2 and Plus 2 W.
 ///
 /// A board file this cannot read, or one that states no flash, fails the build: a default here
 /// would be one board's figure applied to another, which is the fault this reads the facts to avoid.
 fn board_flash_bytes(board: &str) -> usize {
+    use lamella_bsp_gen::strata::{self, Strata};
+
     let facts = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../../bsp")
         .join(board)
@@ -226,26 +229,12 @@ fn board_flash_bytes(board: &str) -> usize {
     println!("cargo:rerun-if-changed={}", facts.display());
     let text = std::fs::read_to_string(&facts)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", facts.display()));
-    let mut in_memory = false;
-    for line in text.lines() {
-        let line = line.split('#').next().unwrap_or_default().trim();
-        if line.starts_with('[') {
-            in_memory = line == "[memory]";
-            continue;
-        }
-        let Some(value) = in_memory
-            .then(|| line.strip_prefix("flash")?.trim_start().strip_prefix('='))
-            .flatten()
-        else {
-            continue;
-        };
-        let value = value.trim().replace('_', "");
-        let bytes = value
-            .strip_prefix("0x")
-            .map_or_else(|| value.parse().ok(), |hex| usize::from_str_radix(hex, 16).ok())
-            .unwrap_or_else(|| panic!("{}: `flash = {value}` is not a byte count", facts.display()));
-        assert!(bytes > 0, "{} states no flash, and this board executes from it", facts.display());
-        return bytes;
-    }
-    panic!("{} states no `flash` in its [memory] table", facts.display());
+    let Strata::Board(table) =
+        strata::parse(&text).unwrap_or_else(|e| panic!("{}: {e}", facts.display()))
+    else {
+        panic!("{} is not a board's facts", facts.display());
+    };
+    let bytes = table.xip_flash();
+    assert!(bytes > 0, "{} states no flash, and this board executes from it", facts.display());
+    usize::try_from(bytes).unwrap_or_else(|_| panic!("{}: {bytes} bytes of flash", facts.display()))
 }

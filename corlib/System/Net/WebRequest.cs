@@ -21,14 +21,37 @@ namespace System.Net
             throw new NotSupportedException("The request scheme '" + scheme + "' is not registered.");
         }
 
-        public abstract string Method { get; set; }
-        public abstract Uri RequestUri { get; }
-        public abstract WebHeaderCollection Headers { get; set; }
-        public abstract string ContentType { get; set; }
-        public abstract long ContentLength { get; set; }
+        private const string MethodNotImplemented = "This method is not implemented by this class.";
+        private const string PropertyNotImplemented = "This property is not implemented by this class.";
 
-        public abstract Stream GetRequestStream();
-        public abstract WebResponse GetResponse();
+        public virtual string Method
+        {
+            get { throw new NotImplementedException(PropertyNotImplemented); }
+            set { throw new NotImplementedException(PropertyNotImplemented); }
+        }
+
+        public virtual Uri RequestUri { get { throw new NotImplementedException(PropertyNotImplemented); } }
+
+        public virtual WebHeaderCollection Headers
+        {
+            get { throw new NotImplementedException(PropertyNotImplemented); }
+            set { throw new NotImplementedException(PropertyNotImplemented); }
+        }
+
+        public virtual string ContentType
+        {
+            get { throw new NotImplementedException(PropertyNotImplemented); }
+            set { throw new NotImplementedException(PropertyNotImplemented); }
+        }
+
+        public virtual long ContentLength
+        {
+            get { throw new NotImplementedException(PropertyNotImplemented); }
+            set { throw new NotImplementedException(PropertyNotImplemented); }
+        }
+
+        public virtual Stream GetRequestStream() { throw new NotImplementedException(MethodNotImplemented); }
+        public virtual WebResponse GetResponse() { throw new NotImplementedException(MethodNotImplemented); }
     }
 }
 #endif

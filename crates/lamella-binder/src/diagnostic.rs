@@ -295,6 +295,19 @@ impl NonGenericName {
     }
 }
 
+/// What a write does with a target that turns out to be a value rather than a variable. The rule
+/// that decides it is one; csc names the refusal by what the write was doing, so the codes come in
+/// a row for each of these (measured on csc 10.0.301).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WriteUse {
+    /// `=`, a compound assignment, `++` or `--`, or the source of a ref reassignment (`r = ref e`).
+    Assign,
+    /// A `ref` or `out` argument, or a `ref` local's initializer.
+    Reference,
+    /// `return ref e`.
+    Return,
+}
+
 /// What a binder diagnostic IS, one variant per rule the binder enforces.
 ///
 /// Each variant carries the parts its message needs rather than a formatted string, so the code
@@ -703,15 +716,35 @@ pub enum DiagnosticKind {
         /// The method group's name.
         name: Box<str>,
     },
-    /// `CS1656`: an assignment to a local the language owns rather than the body -- a `foreach`
-    /// iteration variable (rebound from the collection each pass, 15.8.4) or a `using` resource
-    /// (disposed on the way out, 15.13). The message names which kind it was.
-    CannotAssignToReadonlyLocal {
+    /// A write to a local the language owns rather than the body -- a `foreach` iteration variable
+    /// (rebound from the collection each pass, 15.8.4) or a `using` resource (disposed on the way
+    /// out, 15.13) -- or to a member of one. The message names which kind of local it is. Four
+    /// codes, measured:
+    ///
+    /// | the write | the local | a member of it |
+    /// |---|---|---|
+    /// | assigned or stepped | `CS1656` | `CS1654` |
+    /// | by reference, returned by reference included | `CS1657` | `CS1655` |
+    ReadonlyLocalWrite {
         /// The local's name.
         name: Box<str>,
         /// What holds it, as the message quotes it (`foreach iteration variable`).
         kind: &'static str,
+        /// Whether the write reaches a MEMBER of the local rather than the local itself.
+        member: bool,
+        /// What the write does with it.
+        write: WriteUse,
     },
+    /// `CS1612`: a member of a value that a property, an indexer or a method returned is written --
+    /// `c.P.X = 5` with `P` of a struct type. The value is a copy, so the write would land in it.
+    ReturnValueNotVariable {
+        /// The member that returned it, as csc renders it: `Holder.P`, `Holder.Get()`,
+        /// `Holder.this[int]`.
+        member: Box<str>,
+    },
+    /// `CS0445`: a member of an unboxed value is written -- `((S)o).X = 5`. The unboxing yields a
+    /// copy of the boxed value, not the box's contents.
+    UnboxingResultNotVariable,
     /// `CS0117`: the type does not contain a definition for the named member.
     MemberNotFound {
         /// The type the member was looked for on.
@@ -1089,6 +1122,16 @@ pub enum DiagnosticKind {
     NotAnAttributeClass {
         /// The type named in the attribute, as the message quotes it.
         type_name: Box<str>,
+    },
+    /// `CS1614`: an attribute name that names an attribute class both as written and with
+    /// `Attribute` appended (21.3), so which one is meant cannot be decided.
+    AmbiguousAttribute {
+        /// The name as written.
+        name: Box<str>,
+        /// The class the name names as written.
+        written: Box<str>,
+        /// The class the name names with `Attribute` appended.
+        suffixed: Box<str>,
     },
     /// `CS0579`: the same attribute is applied twice to one target (24.2).
     DuplicateAttribute {
@@ -1644,10 +1687,26 @@ pub enum DiagnosticKind {
     ConstFieldRequiresValue,
     /// `CS0525`: an interface declares an instance (non-const) field.
     InterfaceCannotContainInstanceField,
-    /// `CS0191`: a `readonly` field is assigned outside a constructor.
-    ReadonlyAssignment {
-        /// The field name.
+    /// A write to a `readonly` field, or to a member of a struct-typed one, where the field is a
+    /// value and not a variable: anywhere but a constructor of its declaring type -- the static
+    /// constructor for a static field -- reached through `this` (ECMA-334 17.4.2). Twelve codes, one
+    /// rule; csc picks the code by what the write does, whether the field is static, and whether the
+    /// write reaches the field itself or a member of it. Measured, every cell:
+    ///
+    /// | the write | the field | static | a member of it | static |
+    /// |---|---|---|---|---|
+    /// | assigned, stepped, or a ref reassignment's source | `CS0191` | `CS0198` | `CS1648` | `CS1650` |
+    /// | a `ref`/`out` operand or a `ref` local's initializer | `CS0192` | `CS0199` | `CS1649` | `CS1651` |
+    /// | returned by reference | `CS8160` | `CS8161` | `CS8162` | `CS8163` |
+    ReadonlyFieldWrite {
+        /// The field, qualified by its declaring type (`C.s`); only the member codes quote it.
         field: Box<str>,
+        /// Whether the field is static.
+        is_static: bool,
+        /// Whether the write reaches a MEMBER of the field rather than the field itself.
+        member: bool,
+        /// What the write does with it.
+        write: WriteUse,
     },
     /// `CS8852`: an init-only property or indexer assigned outside the places C# 9 permits.
     InitOnlyAssignment {
@@ -2073,11 +2132,6 @@ pub enum DiagnosticKind {
     /// position -- the shape a rule with several implementations needs to avoid gaining its next
     /// case in none of them.
     RefOperandNotAssignable,
-    /// `CS0192`: a `readonly` field used as a `ref`/`out` operand outside a constructor.
-    ///
-    /// A SEPARATE CODE FROM the CS0191 an ASSIGNMENT to one draws, and csc's text says so: this
-    /// one names "a ref or out value" and carries its own "(except in a constructor)" clause.
-    RefOperandReadonlyField,
     /// `CS0206`: a property or indexer that does not return by reference, used as a `ref`/`out`
     /// operand. A ref-returning one is legal and does not reach here -- it binds through
     /// `deref_ref_return` to a `Dereference`, which names storage.
@@ -2091,11 +2145,6 @@ pub enum DiagnosticKind {
         /// The ref variable's referent type, which csc quotes.
         ty: Box<str>,
     },
-    /// `CS8160`: `return ref f;` where `f` is a `readonly` field.
-    ///
-    /// A THIRD code for the same operand: a readonly field is `CS0192` as a `ref` argument,
-    /// `CS0191` as a ref-reassignment source, and this when returned. Measured at 7.3.
-    ReadonlyFieldReturnedByReference,
     /// `CS1059`: `++`/`--` applied to something that is not a variable, property or indexer.
     ///
     /// A SEPARATE CODE FROM the `CS0131` an ASSIGNMENT to the same operand draws -- measured on one
@@ -2415,7 +2464,16 @@ impl DiagnosticKind {
             DiagnosticKind::ConditionalNeedsTargetTyping { .. } => 8957,
             DiagnosticKind::NotAssignable => 131,
             DiagnosticKind::CannotAssignToMethodGroup { .. } => 1656,
-            DiagnosticKind::CannotAssignToReadonlyLocal { .. } => 1656,
+            DiagnosticKind::ReadonlyLocalWrite { member, write, .. } => {
+                match (*member, matches!(write, WriteUse::Assign)) {
+                    (false, true) => 1656,
+                    (false, false) => 1657,
+                    (true, true) => 1654,
+                    (true, false) => 1655,
+                }
+            }
+            DiagnosticKind::ReturnValueNotVariable { .. } => 1612,
+            DiagnosticKind::UnboxingResultNotVariable => 445,
             DiagnosticKind::MemberNotFound { .. } => 117,
             DiagnosticKind::MemberSignatureNotSupported { .. } => 2,
             DiagnosticKind::SwitchExpressionExceptionMissing => 3,
@@ -2470,6 +2528,7 @@ impl DiagnosticKind {
             DiagnosticKind::ConstructorInitializerCycle { .. } => 768,
             DiagnosticKind::UsingRequiresDisposable { .. } => 1674,
             DiagnosticKind::NotAnAttributeClass { .. } => 616,
+            DiagnosticKind::AmbiguousAttribute { .. } => 1614,
             DiagnosticKind::DuplicateAttribute { .. } => 579,
             DiagnosticKind::NonConstantAttributeArgument => 182,
             DiagnosticKind::ThrowExpressionNotAllowed => 8115,
@@ -2563,7 +2622,25 @@ impl DiagnosticKind {
             DiagnosticKind::InconsistentAccessibility { position, .. } => position.code(),
             DiagnosticKind::ConstFieldRequiresValue => 145,
             DiagnosticKind::InterfaceCannotContainInstanceField => 525,
-            DiagnosticKind::ReadonlyAssignment { .. } => 191,
+            DiagnosticKind::ReadonlyFieldWrite {
+                is_static,
+                member,
+                write,
+                ..
+            } => match (write, *member, *is_static) {
+                (WriteUse::Assign, false, false) => 191,
+                (WriteUse::Assign, false, true) => 198,
+                (WriteUse::Assign, true, false) => 1648,
+                (WriteUse::Assign, true, true) => 1650,
+                (WriteUse::Reference, false, false) => 192,
+                (WriteUse::Reference, false, true) => 199,
+                (WriteUse::Reference, true, false) => 1649,
+                (WriteUse::Reference, true, true) => 1651,
+                (WriteUse::Return, false, false) => 8160,
+                (WriteUse::Return, false, true) => 8161,
+                (WriteUse::Return, true, false) => 8162,
+                (WriteUse::Return, true, true) => 8163,
+            },
             DiagnosticKind::InitOnlyAssignment { .. } => 8852,
             DiagnosticKind::PropertyCannotBeAssigned { .. } => 200,
             DiagnosticKind::MemberNotFoundOnExpression { .. } => 1061,
@@ -2619,11 +2696,9 @@ impl DiagnosticKind {
             DiagnosticKind::CannotReturnParameterByReference { .. } => 8166,
             DiagnosticKind::ExpressionCannotBeReturnedByReference => 8156,
             DiagnosticKind::RefOperandNotAssignable => 1510,
-            DiagnosticKind::RefOperandReadonlyField => 192,
             DiagnosticKind::RefOperandNonRefProperty => 206,
             DiagnosticKind::RefAssignTargetNotRef => 8373,
             DiagnosticKind::RefAssignTypeMismatch { .. } => 8173,
-            DiagnosticKind::ReadonlyFieldReturnedByReference => 8160,
             DiagnosticKind::StepOperandNotAssignable => 1059,
             DiagnosticKind::ByRefLocalMustHaveInitializer { .. } => 8174,
             DiagnosticKind::CannotInitializeByRefWithValue => 8172,
@@ -2970,8 +3045,32 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "Cannot assign to '{name}' because it is a 'method group'"
             ),
-            DiagnosticKind::CannotAssignToReadonlyLocal { name, kind } => {
-                write!(f, "Cannot assign to '{name}' because it is a '{kind}'")
+            DiagnosticKind::ReadonlyLocalWrite {
+                name,
+                kind,
+                member,
+                write,
+            } => match (*member, matches!(write, WriteUse::Assign)) {
+                (false, true) => write!(f, "Cannot assign to '{name}' because it is a '{kind}'"),
+                (false, false) => write!(
+                    f,
+                    "Cannot use '{name}' as a ref or out value because it is a '{kind}'"
+                ),
+                (true, true) => write!(
+                    f,
+                    "Cannot modify members of '{name}' because it is a '{kind}'"
+                ),
+                (true, false) => write!(
+                    f,
+                    "Cannot use fields of '{name}' as a ref or out value because it is a '{kind}'"
+                ),
+            },
+            DiagnosticKind::ReturnValueNotVariable { member } => write!(
+                f,
+                "Cannot modify the return value of '{member}' because it is not a variable"
+            ),
+            DiagnosticKind::UnboxingResultNotVariable => {
+                write!(f, "Cannot modify the result of an unboxing conversion")
             }
             DiagnosticKind::MemberNotFound { type_name, member } => write!(
                 f,
@@ -3209,6 +3308,14 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::NotAnAttributeClass { type_name } => {
                 write!(f, "'{type_name}' is not an attribute class")
             }
+            DiagnosticKind::AmbiguousAttribute {
+                name,
+                written,
+                suffixed,
+            } => write!(
+                f,
+                "'{name}' is ambiguous between '{written}' and '{suffixed}'. Either use '@{name}' or explicitly include the 'Attribute' suffix."
+            ),
             DiagnosticKind::DuplicateAttribute { name } => {
                 write!(f, "Duplicate '{name}' attribute")
             }
@@ -3586,10 +3693,60 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::InterfaceCannotContainInstanceField => {
                 write!(f, "Interfaces cannot contain instance fields")
             }
-            DiagnosticKind::ReadonlyAssignment { field } => write!(
-                f,
-                "A readonly field '{field}' cannot be assigned to (except in a constructor)"
-            ),
+            DiagnosticKind::ReadonlyFieldWrite {
+                field,
+                is_static,
+                member,
+                write,
+            } => match (write, *member, *is_static) {
+                (WriteUse::Assign, false, false) => write!(
+                    f,
+                    "A readonly field cannot be assigned to (except in a constructor or init-only setter of the type in which the field is defined or a variable initializer)"
+                ),
+                (WriteUse::Assign, false, true) => write!(
+                    f,
+                    "A static readonly field cannot be assigned to (except in a static constructor or a variable initializer)"
+                ),
+                (WriteUse::Assign, true, false) => write!(
+                    f,
+                    "Members of readonly field '{field}' cannot be modified (except in a constructor or a variable initializer)"
+                ),
+                (WriteUse::Assign, true, true) => write!(
+                    f,
+                    "Fields of static readonly field '{field}' cannot be assigned to (except in a static constructor or a variable initializer)"
+                ),
+                (WriteUse::Reference, false, false) => write!(
+                    f,
+                    "A readonly field cannot be used as a ref or out value (except in a constructor)"
+                ),
+                (WriteUse::Reference, false, true) => write!(
+                    f,
+                    "A static readonly field cannot be used as a ref or out value (except in a static constructor)"
+                ),
+                (WriteUse::Reference, true, false) => write!(
+                    f,
+                    "Members of readonly field '{field}' cannot be used as a ref or out value (except in a constructor)"
+                ),
+                (WriteUse::Reference, true, true) => write!(
+                    f,
+                    "Fields of static readonly field '{field}' cannot be used as a ref or out value (except in a static constructor)"
+                ),
+                (WriteUse::Return, false, false) => {
+                    write!(f, "A readonly field cannot be returned by writable reference")
+                }
+                (WriteUse::Return, false, true) => write!(
+                    f,
+                    "A static readonly field cannot be returned by writable reference"
+                ),
+                (WriteUse::Return, true, false) => write!(
+                    f,
+                    "Members of readonly field '{field}' cannot be returned by writable reference"
+                ),
+                (WriteUse::Return, true, true) => write!(
+                    f,
+                    "Fields of static readonly field '{field}' cannot be returned by writable reference"
+                ),
+            },
             DiagnosticKind::InitOnlyAssignment { property } => write!(
                 f,
  "Init-only property or indexer '{property}' can only be assigned in an object initializer, or on 'this' or 'base' in an instance constructor or an 'init' accessor."
@@ -3826,10 +3983,6 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::RefOperandNotAssignable => {
                 write!(f, "A ref or out value must be an assignable variable")
             }
-            DiagnosticKind::RefOperandReadonlyField => write!(
-                f,
-                "A readonly field cannot be used as a ref or out value (except in a constructor)"
-            ),
             DiagnosticKind::RefOperandNonRefProperty => write!(
                 f,
                 "A non ref-returning property or indexer may not be used as an out or ref value"
@@ -3841,10 +3994,6 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::RefAssignTypeMismatch { ty } => write!(
                 f,
                 "The expression must be of type '{ty}' because it is being assigned by reference"
-            ),
-            DiagnosticKind::ReadonlyFieldReturnedByReference => write!(
-                f,
-                "A readonly field cannot be returned by writable reference"
             ),
             DiagnosticKind::StepOperandNotAssignable => write!(
                 f,

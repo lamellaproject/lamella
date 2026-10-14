@@ -12,7 +12,9 @@ namespace System.Runtime.CompilerServices
 
         public void GetResult()
         {
-            if (_task != null) _task.ThrowIfFaulted();
+            if (_task == null) return;
+            if (!_task.IsCompleted) _task.ParkUntilSettled();
+            _task.ThrowIfFaulted();
         }
 
         public void OnCompleted(System.Action continuation)

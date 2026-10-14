@@ -1,0 +1,12 @@
+[package]
+name = "lamella-board-buses"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The bus table of the board a build names: its layout, the check made before any of it is served, and the two lookups System.Device's factories make through Lamella.Hardware.BoardBuses. no_std and allocation-free, so the interpreter, the AOT link and the runtime-support archive share one reading of it."
+publish = false
+
+[lints]
+workspace = true

@@ -13,9 +13,6 @@ namespace System.Device.Gpio
         /// <summary>The number of pins provided by the driver.</summary>
         protected internal abstract int PinCount { get; }
 
-        /// <summary>Converts a board pin number to the driver's logical numbering scheme.</summary>
-        protected internal abstract int ConvertPinNumberToLogicalNumberingScheme(int pinNumber);
-
         /// <summary>Opens a pin so it is ready to use, without changing its mode or value.</summary>
         protected internal abstract void OpenPin(int pinNumber);
 

@@ -4689,6 +4689,13 @@ impl ObjectModel {
         self.seq_slot(value).and_then(|i| self.seqs.get(i))
     }
 
+    /// The elements of a `list`, to change in place, or `None` if `value` is not a list. A tuple is
+    /// refused: its elements never change.
+    pub(crate) fn list_items_mut(&mut self, value: Value) -> Option<&mut Vec<Value>> {
+        let index = self.container_slot(value, self.list_type_id)?;
+        self.seqs.get_mut(index)
+    }
+
     /// The key/value pairs if `value` is a `dict` (or a dict subtype).
     pub(crate) fn dict_value(&self, value: Value) -> Option<&Vec<(Value, Value)>> {
         self.dict_slot(value).and_then(|i| self.dicts.get(i))
@@ -6005,7 +6012,7 @@ impl ObjectModel {
         }
         if let Some(elements) = self.seq_value(container).cloned() {
             for candidate in elements {
-                if crate::interp::elem_eq(element, candidate, functions, self, depth)? {
+                if crate::interp::elem_eq(candidate, element, functions, self, depth)? {
                     return Ok(true);
                 }
             }
@@ -16340,7 +16347,7 @@ impl ObjectModel {
                 let elements = self.seqs[slot].clone();
                 let mut count = 0i32;
                 for element in elements {
-                    if crate::interp::elem_eq(*value, element, functions, self, depth)? {
+                    if crate::interp::elem_eq(element, *value, functions, self, depth)? {
                         count = count.checked_add(1).ok_or(Trap::Overflow)?;
                     }
                 }
@@ -16348,25 +16355,10 @@ impl ObjectModel {
             }
             LIST_INDEX => {
                 let elements = self.seqs[slot].clone();
-                let len = elements.len() as i64;
-                let clamp = |i: i64| (if i < 0 { i + len } else { i }).clamp(0, len) as usize;
-                let (value, lo, hi) = match args {
-                    [v] => (*v, 0usize, len as usize),
-                    [v, s] => (*v, clamp(s.as_int().ok_or(Trap::TypeError)?), len as usize),
-                    [v, s, e] => (
-                        *v,
-                        clamp(s.as_int().ok_or(Trap::TypeError)?),
-                        clamp(e.as_int().ok_or(Trap::TypeError)?),
-                    ),
-                    _ => return Err(Trap::TypeError),
-                };
-                let hi = hi.max(lo);
-                for (offset, element) in elements[lo..hi].iter().enumerate() {
-                    if crate::interp::elem_eq(value, *element, functions, self, depth)? {
-                        return Value::fixnum((lo + offset) as i32).ok_or(Trap::Overflow);
-                    }
+                match self.index_of_dyn(&elements, args, functions, depth)? {
+                    Some(position) => Value::fixnum(position as i32).ok_or(Trap::Overflow),
+                    None => Err(self.with_message(Trap::ValueError, "list.index(x): x not in list")),
                 }
-                Err(self.with_message(Trap::ValueError, "list.index(x): x not in list"))
             }
             LIST_REMOVE => {
                 let [value] = args else {
@@ -16375,7 +16367,7 @@ impl ObjectModel {
                 let elements = self.seqs[slot].clone();
                 let mut found = None;
                 for (position, element) in elements.iter().enumerate() {
-                    if crate::interp::elem_eq(*value, *element, functions, self, depth)? {
+                    if crate::interp::elem_eq(*element, *value, functions, self, depth)? {
                         found = Some(position);
                         break;
                     }
@@ -16387,6 +16379,12 @@ impl ObjectModel {
                     }
                     None => Err(self.with_message(Trap::ValueError, "list.remove(x): x not in list")),
                 }
+            }
+            LIST_SORT => {
+                if !args.is_empty() {
+                    return Err(Trap::TypeError);
+                }
+                crate::builtins::list_sort_python(list, Value::NONE, false, functions, self, depth)
             }
             LIST_EXTEND => {
                 let [iterable] = args else {
@@ -16864,6 +16862,73 @@ impl ObjectModel {
     /// Whether `a` and `b` share no element.
     fn set_disjoint(&self, a: &[Value], b: &[Value]) -> bool {
         !a.iter().any(|&x| b.iter().any(|&y| self.key_eq(x, y)))
+    }
+
+    /// The first position in `elements[start:stop]` whose element equals `args[0]`, tested with the
+    /// element on the left as CPython tests it -- the search `list.index` and `tuple.index` share.
+    /// `start` and `stop` clamp as slice bounds do.
+    fn index_of_dyn(
+        &mut self,
+        elements: &[Value],
+        args: &[Value],
+        functions: &Functions,
+        depth: usize,
+    ) -> Result<Option<usize>, Trap> {
+        let len = elements.len() as i64;
+        let clamp = |i: i64| (if i < 0 { i + len } else { i }).clamp(0, len) as usize;
+        let (value, lo, hi) = match args {
+            [v] => (*v, 0usize, len as usize),
+            [v, s] => (*v, clamp(s.as_int().ok_or(Trap::TypeError)?), len as usize),
+            [v, s, e] => (
+                *v,
+                clamp(s.as_int().ok_or(Trap::TypeError)?),
+                clamp(e.as_int().ok_or(Trap::TypeError)?),
+            ),
+            _ => return Err(Trap::TypeError),
+        };
+        let hi = hi.max(lo);
+        for (offset, element) in elements[lo..hi].iter().enumerate() {
+            if crate::interp::elem_eq(*element, value, functions, self, depth)? {
+                return Ok(Some(lo + offset));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `tuple.count(x)` and `tuple.index(x[, start[, stop]])` on a plain tuple, interpreter-aware: each
+    /// element is tested with the element on the left, so its own `__eq__` runs and a container in it
+    /// compares its own elements. Any other method goes to [`ObjectModel::call_bound_method`].
+    pub(crate) fn call_tuple_method_dyn(
+        &mut self,
+        callee: Value,
+        tuple: Value,
+        method_id: u32,
+        args: &[Value],
+        functions: &Functions,
+        depth: usize,
+    ) -> Result<Value, Trap> {
+        let Some(elements) = self.seq_value(tuple).cloned() else {
+            return self.call_bound_method(callee, args);
+        };
+        match method_id {
+            TUPLE_COUNT => {
+                let [value] = args else {
+                    return Err(Trap::TypeError);
+                };
+                let mut count = 0i32;
+                for element in elements {
+                    if crate::interp::elem_eq(element, *value, functions, self, depth)? {
+                        count = count.checked_add(1).ok_or(Trap::Overflow)?;
+                    }
+                }
+                Value::fixnum(count).ok_or(Trap::Overflow)
+            }
+            TUPLE_INDEX => match self.index_of_dyn(&elements, args, functions, depth)? {
+                Some(position) => Value::fixnum(position as i32).ok_or(Trap::Overflow),
+                None => Err(self.with_message(Trap::ValueError, "tuple.index(x): x not in tuple")),
+            },
+            _ => self.call_bound_method(callee, args),
+        }
     }
 
     /// Dispatches a `tuple` method: `index(x)` (the first position, `ValueError` if absent) and
@@ -18097,9 +18162,9 @@ impl ObjectModel {
     }
 
     /// The in-place sort behind [`ObjectModel::list_sort_in_place`]: no key sorts the elements
-    /// directly (reverse flips), a key sorts (element, key) pairs by key (directional stable, so
-    /// ties keep original order under reverse).
-    fn sort_elements(
+    /// directly, a key sorts (element, key) pairs by key; either way a reverse sort is stable, so
+    /// ties keep their original order.
+    pub(crate) fn sort_elements(
         &self,
         elements: &mut [Value],
         keys: Option<Vec<Value>>,
@@ -18107,11 +18172,14 @@ impl ObjectModel {
     ) -> Result<(), Trap> {
         match keys {
             None => {
-                self.sort_values(elements)?;
                 if reverse {
                     elements.reverse();
                 }
-                Ok(())
+                let outcome = self.sort_values(elements);
+                if reverse {
+                    elements.reverse();
+                }
+                outcome
             }
             Some(keys) => {
                 if keys.len() != elements.len() {
@@ -18376,6 +18444,9 @@ mod tests {
         let l3 = model.new_list(alloc::vec![n(100), n(200)]).unwrap();
         model.list_sort_in_place(l3, Some(alloc::vec![n(1), n(1)]), true).unwrap();
         assert_eq!(model.repr(l3), "[100, 200]");
+        let l4 = model.new_list(alloc::vec![n(0), Value::TRUE, n(1), Value::FALSE]).unwrap();
+        model.list_sort_in_place(l4, None, true).unwrap();
+        assert_eq!(model.repr(l4), "[True, 1, 0, False]");
     }
 
     #[test]

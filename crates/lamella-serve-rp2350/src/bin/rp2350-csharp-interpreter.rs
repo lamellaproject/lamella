@@ -186,6 +186,142 @@ mod serve {
     #[global_allocator]
     static ALLOCATOR: lamella_heap::LockedHeap = lamella_heap::LockedHeap::empty();
 
+    /// The heap's bytes beyond SRAM: the PSRAM a Pico Plus 2 board adds at boot, else 0.
+    static HEAP_BEYOND_SRAM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+    /// A Pico Plus 2 board's PSRAM, brought up at the final clk_sys, proven and wiped, then handed to
+    /// the heap as its second region, after SRAM: a request is carved from SRAM while it fits, and a
+    /// block SRAM has no room left for comes from the PSRAM. The boot report names both ranges, or
+    /// why the PSRAM is not in use, and the heap then stays SRAM alone.
+    ///
+    /// It runs before the clock starts folding SysTick, because the wipe holds the core for longer
+    /// than one SysTick wrap with nothing reading the clock, which would lose wraps from its time base.
+    #[cfg(any(feature = "pico-plus-2", feature = "pico-plus-2-w"))]
+    fn attach_psram(clk_sys_hz: Option<u32>) {
+        #[cfg(feature = "pico-plus-2")]
+        use lamella_board_support::boards::pimoroni_pico_plus_2::BOARD;
+        #[cfg(feature = "pico-plus-2-w")]
+        use lamella_board_support::boards::pimoroni_pico_plus_2_w::BOARD;
+
+        let (start, bytes) = heap();
+        let sram = alloc::format!(
+            "SRAM {:#010x}..{:#010x} ({} KB)",
+            start as usize,
+            start as usize + bytes,
+            bytes / 1024
+        );
+        let Some(psram) = BOARD.psram else {
+            say_psram(&alloc::format!("[lamella] RAM: {sram}"));
+            return;
+        };
+        let Some(clk_sys_hz) = clk_sys_hz else {
+            say_psram(&alloc::format!("[lamella] RAM: {sram}; PSRAM not used: clk_sys runs at no known rate"));
+            return;
+        };
+        let salt = read_register(SYST_CVR);
+        let started = cycles();
+        let up = critical_section::with(|_| unsafe {
+            lamella_board_support::rp2350::psram_bring_up(&psram, clk_sys_hz, salt)
+        });
+        let up_ms = elapsed_ms(started, clk_sys_hz);
+        let window = match up {
+            Ok(window) => window,
+            Err(fault) => {
+                say_psram(&alloc::format!("[lamella] RAM: {sram}; PSRAM not used: {fault:?}"));
+                return;
+            }
+        };
+        #[cfg(feature = "psram-full-walk")]
+        {
+            let started = cycles();
+            let walked = unsafe {
+                lamella_psram_qspi::proof::full_walk(&mut lamella_psram_qspi::rp2350::Mmio, &window, !salt)
+            };
+            let walk_ms = elapsed_ms(started, clk_sys_hz);
+            match walked {
+                Ok(()) => say_psram(&alloc::format!(
+                    "[lamella] PSRAM full walk: every word of {} KB under both patterns, through both views, in {walk_ms} ms: PASS",
+                    window.bytes / 1024
+                )),
+                Err(mismatch) => {
+                    say_psram(&alloc::format!(
+                        "[lamella] RAM: {sram}; PSRAM not used: the full walk failed after {walk_ms} ms: {mismatch:?}"
+                    ));
+                    return;
+                }
+            }
+        }
+        if !unsafe { ALLOCATOR.add_region(window.base as *mut u8, window.bytes) } {
+            say_psram(&alloc::format!("[lamella] RAM: {sram}; PSRAM not used: the heap takes no more regions"));
+            return;
+        }
+        HEAP_BEYOND_SRAM.store(window.bytes, core::sync::atomic::Ordering::Relaxed);
+        say_psram(&alloc::format!(
+            "[lamella] RAM: {sram}; PSRAM {:#010x}..{:#010x} ({} KB, {}, vendor {:#04x}, good die {:#04x}), proven and wiped in {up_ms} ms",
+            window.base,
+            window.base + window.bytes,
+            window.bytes / 1024,
+            psram.part.name,
+            window.id.vendor,
+            window.id.kgd
+        ));
+    }
+
+    /// One line of the PSRAM's boot report: said on the UART and, in a `psram-full-walk` flight
+    /// build, also kept in RAM, where a probe reads it on a board whose UART is not wired.
+    #[cfg(any(feature = "pico-plus-2", feature = "pico-plus-2-w"))]
+    fn say_psram(line: &str) {
+        narrate(line);
+        #[cfg(feature = "psram-full-walk")]
+        flight_report::push(line);
+    }
+
+    /// The flight build's copy of the PSRAM's boot report, for a probe to read.
+    #[cfg(feature = "psram-full-walk")]
+    mod flight_report {
+        use core::sync::atomic::{AtomicUsize, Ordering};
+
+        /// The report's lines, each ended by CR LF, in ASCII, zero past its end: read it through
+        /// the board's probe at this symbol's address.
+        #[unsafe(no_mangle)]
+        static mut LAMELLA_PSRAM_REPORT: [u8; 1024] = [0; 1024];
+        static LEN: AtomicUsize = AtomicUsize::new(0);
+
+        /// Appends one line, cut off at the buffer's end.
+        pub fn push(line: &str) {
+            let buf = unsafe { &mut *core::ptr::addr_of_mut!(LAMELLA_PSRAM_REPORT) };
+            let mut at = LEN.load(Ordering::Relaxed);
+            for &byte in line.as_bytes().iter().chain(b"\r\n") {
+                if at >= buf.len() {
+                    break;
+                }
+                buf[at] = byte;
+                at += 1;
+            }
+            LEN.store(at, Ordering::Relaxed);
+        }
+    }
+
+    /// The core's cycle counter (DWT CYCCNT), started on first use. 32 bits at clk_sys: it times
+    /// anything under 28 s at 150 MHz.
+    #[cfg(any(feature = "pico-plus-2", feature = "pico-plus-2-w"))]
+    fn cycles() -> u32 {
+        const DEMCR: usize = 0xe000_edfc;
+        const DEMCR_TRCENA: u32 = 1 << 24;
+        const DWT_CTRL: usize = 0xe000_1000;
+        const DWT_CTRL_CYCCNTENA: u32 = 1;
+        const DWT_CYCCNT: usize = 0xe000_1004;
+        write_register(DEMCR, read_register(DEMCR) | DEMCR_TRCENA);
+        write_register(DWT_CTRL, read_register(DWT_CTRL) | DWT_CTRL_CYCCNTENA);
+        read_register(DWT_CYCCNT)
+    }
+
+    /// Milliseconds since the cycle count `started`, at clk_sys `clk_sys_hz`.
+    #[cfg(any(feature = "pico-plus-2", feature = "pico-plus-2-w"))]
+    fn elapsed_ms(started: u32, clk_sys_hz: u32) -> u64 {
+        u64::from(cycles().wrapping_sub(started)) * 1000 / u64::from(clk_sys_hz)
+    }
+
     /// A firmware-level abort (an OOM, a HardFault) must not brick a deployed board: stamp the
     /// recovery flag and reset, so the next boot waits for the host rather than re-running the app that
     /// aborted. (A safe interpreted app's own trap does NOT reach here -- run_deployed returns
@@ -197,7 +333,7 @@ mod serve {
             format_args!(
                 "[lamella] FIRMWARE ABORT: {info}\r\n[lamella] heap: {} of {} bytes carved, {} live\r\n",
                 ALLOCATOR.carved_lockfree(),
-                heap().1,
+                heap().1 + HEAP_BEYOND_SRAM.load(core::sync::atomic::Ordering::Relaxed),
                 ALLOCATOR.live_lockfree()
             ),
         );
@@ -777,7 +913,10 @@ mod serve {
                 chip::PLL_SYS_BASE as usize,
                 chip::PLL_USB_BASE as usize,
             );
-            match rp2350_clocks::clk_sys_hz_from(&tree, board::XOSC_HZ_PLL_150_48) {
+            let clk_sys_hz = rp2350_clocks::clk_sys_hz_from(&tree, board::XOSC_HZ_PLL_150_48);
+            #[cfg(any(feature = "pico-plus-2", feature = "pico-plus-2-w"))]
+            attach_psram(clk_sys_hz);
+            match clk_sys_hz {
                 Some(clk_sys_hz) => {
                     TICKS_PER_MS.store(clk_sys_hz / 1000, core::sync::atomic::Ordering::Relaxed);
                     clock::install(clk_sys_hz);

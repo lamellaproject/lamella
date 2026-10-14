@@ -7,7 +7,13 @@ namespace System.Diagnostics
         private int _indentLevel;
         private int _indentSize;
 
-        protected bool NeedIndent;
+        private bool _needIndent;
+
+        protected bool NeedIndent
+        {
+            get { return _needIndent; }
+            set { _needIndent = value; }
+        }
 
         protected TraceListener()
         {

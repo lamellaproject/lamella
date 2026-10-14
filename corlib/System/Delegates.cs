@@ -3,6 +3,8 @@ namespace System
 {
     public abstract class Delegate : ICloneable
     {
+        internal Delegate() { }
+
         private object _target;
 
         private IntPtr _methodPtr;
@@ -31,6 +33,8 @@ namespace System
 
     public abstract class MulticastDelegate : Delegate
     {
+        internal MulticastDelegate() { }
+
         private Delegate[] _invocationList;
 
         /// <summary>Whether <paramref name="obj"/> is a delegate of exactly this type with the same

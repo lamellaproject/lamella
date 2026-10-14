@@ -16,6 +16,14 @@ lamella-load = { path = "../lamella-load" }
 lamella-metadata = { path = "../lamella-metadata" }
 lamella-cil-runtime = { path = "../lamella-cil-runtime" }
 lamella-clock-host = { path = "../lamella-clock-host" }
+# The reference-assembly search the `lamella` command and the MCP servers make, so a line typed here
+# binds and runs against the class library they find. `repl-host` alone: the prompt needs no carrier.
+lamella-wire-host = { path = "../lamella-wire-host", default-features = false, features = ["repl-host"] }
+
+[dev-dependencies]
+# The reference-assembly search as a TEST build makes it: it also looks at this source tree's test
+# corlib, first, so these tests bind that corlib wherever they run. Nothing built for use looks there.
+lamella-wire-host = { path = "../lamella-wire-host", default-features = false, features = ["fixture-corlib"] }
 
 [lints]
 workspace = true

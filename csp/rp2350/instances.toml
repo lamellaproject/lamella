@@ -124,3 +124,13 @@ name = "pwm"
 block = "pwm"
 base = 0x400a8000
 reset_bit = 16
+
+# The QSPI memory interface, which serves the external memory windows: 0x10000000 for chip select 0's
+# flash, and 0x11000000 for chip select 1, where a board fits PSRAM (datasheet 2.2.2 and 4.4.1). Its
+# registers are XIP_QMI_BASE in the APB address map (2.2), and the RESET register has no bit for it
+# (Table 535). A board's PSRAM region names it as the controller that brings the window up.
+[[instances]]
+name = "qmi"
+block = "qmi"
+base = 0x400d0000
+reset_bit = -1

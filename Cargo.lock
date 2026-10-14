@@ -294,6 +294,7 @@ dependencies = [
  "lamella-asm-arm32",
  "lamella-asm-riscv32",
  "lamella-asm-wasm",
+ "lamella-board-buses",
  "lamella-cil",
  "lamella-cmsis-dap",
  "lamella-cmsis-dap-sam",
@@ -344,8 +345,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-board-buses"
+version = "0.0.0"
+
+[[package]]
 name = "lamella-board-support"
 version = "0.0.0"
+dependencies = [
+ "lamella-psram-qspi",
+]
 
 [[package]]
 name = "lamella-bsp-gen"
@@ -372,6 +380,7 @@ dependencies = [
 name = "lamella-cil-runtime"
 version = "0.0.0"
 dependencies = [
+ "lamella-board-buses",
  "lamella-cil",
  "lamella-decimal",
  "lamella-net-core",
@@ -745,14 +754,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "lamella-mcp-csharp"
-version = "0.0.0"
-dependencies = [
- "lamella-wire-host",
- "serde_json",
-]
-
-[[package]]
 name = "lamella-mdns"
 version = "0.0.0"
 dependencies = [
@@ -810,6 +811,10 @@ name = "lamella-probe-core"
 version = "0.0.0"
 
 [[package]]
+name = "lamella-psram-qspi"
+version = "0.1.0"
+
+[[package]]
 name = "lamella-py-bytecode"
 version = "0.0.0"
 dependencies = [
@@ -864,6 +869,7 @@ dependencies = [
  "lamella-clock-host",
  "lamella-load",
  "lamella-metadata",
+ "lamella-wire-host",
 ]
 
 [[package]]
@@ -871,6 +877,7 @@ name = "lamella-runner"
 version = "0.0.0"
 dependencies = [
  "lamella-assemble",
+ "lamella-bsp-gen",
  "lamella-cil-runtime",
  "lamella-debug-agent",
  "lamella-fs-fat",
@@ -944,12 +951,15 @@ name = "lamella-serve-rp2350"
 version = "0.0.0"
 dependencies = [
  "critical-section",
+ "lamella-board-support",
+ "lamella-bsp-gen",
  "lamella-cil-runtime",
  "lamella-heap",
  "lamella-mmio",
  "lamella-net-core",
  "lamella-net-smoltcp",
  "lamella-pin-events",
+ "lamella-psram-qspi",
  "lamella-py-runtime",
  "lamella-runner",
  "lamella-tls-mbedtls",
@@ -1003,6 +1013,10 @@ dependencies = [
 
 [[package]]
 name = "lamella-tls-roots"
+version = "0.0.0"
+
+[[package]]
+name = "lamella-tls-roots-gen"
 version = "0.0.0"
 
 [[package]]
@@ -1120,6 +1134,7 @@ name = "lamella-wire-host"
 version = "0.0.0"
 dependencies = [
  "lamella-assemble",
+ "lamella-catalog",
  "lamella-cil-runtime",
  "lamella-clock-host",
  "lamella-debug-backend",
@@ -1127,6 +1142,8 @@ dependencies = [
  "lamella-load",
  "lamella-metadata",
  "lamella-runner",
+ "lamella-syntax",
+ "lamella-token",
  "lamella-usbbulk",
  "lamella-wire",
  "serde",

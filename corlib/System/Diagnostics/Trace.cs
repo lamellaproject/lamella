@@ -98,11 +98,6 @@ namespace System.Diagnostics
             WriteLine(value == null ? "" : value.ToString());
         }
 
-        public static void Print(string message)
-        {
-            WriteLine(message);
-        }
-
         public static void WriteIf(bool condition, string message)
         {
             if (condition) Write(message);

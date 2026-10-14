@@ -138,5 +138,5 @@ DEVICES = {
 # Memory regions the board fits. A region with a "controller" does not exist until
 # that instance is brought up; touching it first is a bus fault, not a wrong value.
 MEMORY = {
-    "sdram": {"kind": "ram", "base": 0xD0000000, "size": 0x800000, "controller": "fmc", "optional": True, "device": {"bank": 2, "sdcr1": 0x1800, "sdcr2": 0x154, "sdcmr_clock_enable": 0x9, "sdcmr_precharge_all": 0xA, "sdcmr_auto_refresh": 0xEB, "sdcmr_load_mode": 0x4400C, "settle_us": 100, "sdclk_hz_hsi_16mhz": 8000000, "refresh_count_hsi_16mhz": 105, "sdrtr_hsi_16mhz": 0xD2, "sdtr1_hsi_16mhz": 0x106000, "sdtr2_hsi_16mhz": 0x1020361}},
+    "sdram": {"kind": "ram", "base": 0xD0000000, "size": 0x800000, "controller": "fmc", "part": "IS42S16400J", "optional": True, "device": {"bank": 2, "sdcr1": 0x1800, "sdcr2": 0x154, "sdcmr_clock_enable": 0x9, "sdcmr_precharge_all": 0xA, "sdcmr_auto_refresh": 0xEB, "sdcmr_load_mode": 0x4400C, "settle_us": 100, "sdclk_hz_hsi_16mhz": 8000000, "refresh_count_hsi_16mhz": 105, "sdrtr_hsi_16mhz": 0xD2, "sdtr1_hsi_16mhz": 0x106000, "sdtr2_hsi_16mhz": 0x1020361}},
 }

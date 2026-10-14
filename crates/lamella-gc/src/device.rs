@@ -243,7 +243,7 @@ pub type DeviceOomRootsHook = fn(visit: &mut dyn FnMut(&mut Ref));
 ///
 /// It must not allocate, for the reason the whole path exists: it runs at the moment the only
 /// allocator in the image has just failed.
-#[cfg(feature = "gc-collect")]
+#[cfg(all(feature = "gc-collect", not(feature = "second-segment")))]
 pub type DeviceCollectHook = fn(&mut DeviceHeap) -> bool;
 
 /// Installs the collection an exhausted device heap runs. See [`DeviceCollectHook`].
@@ -378,10 +378,22 @@ pub unsafe extern "C" fn lamella_gc_alloc_impl(
             },
             "lamella_gc_alloc payload_size disagrees with the TypeDesc",
         );
+        #[cfg(feature = "second-segment")]
+        {
+            let second = unsafe { (*SECOND_SEGMENT.0.get()).as_mut() };
+            unsafe {
+                DeviceHeap::alloc_spanning(heap, second, payload_size, type_desc, collect_spanning)
+            }
+        }
+        #[cfg(not(feature = "second-segment"))]
         if let Some(reference) = unsafe { heap.alloc(payload_size, type_desc) } {
             return heap.payload_ptr(reference);
         }
-        #[cfg(all(feature = "gc-collect", feature = "host-heap"))]
+        #[cfg(all(
+            feature = "gc-collect",
+            feature = "host-heap",
+            not(feature = "second-segment")
+        ))]
         {
             let hook = unsafe { *DEVICE_GC.oom_roots.get() };
             let Some(hook) = hook else {
@@ -391,7 +403,11 @@ pub unsafe extern "C" fn lamella_gc_alloc_impl(
             unsafe { heap.alloc(payload_size, type_desc) }
                 .map_or(core::ptr::null_mut(), |r| heap.payload_ptr(r))
         }
-        #[cfg(all(feature = "gc-collect", not(feature = "host-heap")))]
+        #[cfg(all(
+            feature = "gc-collect",
+            not(feature = "host-heap"),
+            not(feature = "second-segment")
+        ))]
         {
             let hook = unsafe { *DEVICE_GC.collect.get() };
             let Some(hook) = hook else {
@@ -403,11 +419,78 @@ pub unsafe extern "C" fn lamella_gc_alloc_impl(
             unsafe { heap.alloc(payload_size, type_desc) }
                 .map_or(core::ptr::null_mut(), |r| heap.payload_ptr(r))
         }
-        #[cfg(not(feature = "gc-collect"))]
+        #[cfg(all(not(feature = "gc-collect"), not(feature = "second-segment")))]
         {
             core::ptr::null_mut()
         }
     })
+}
+
+
+/// The heap's SECOND SEGMENT, when the image has one, installed by
+/// [`lamella_gc_init_device_second_segment`]: allocation spills into it once the first segment is
+/// full, and a collection covers both. A cell of its own beside [`DEVICE_GC`], accessed under the same
+/// critical section.
+#[cfg(feature = "second-segment")]
+struct SecondSegmentCell(UnsafeCell<Option<DeviceHeap>>);
+
+#[cfg(feature = "second-segment")]
+unsafe impl Sync for SecondSegmentCell {}
+
+#[cfg(feature = "second-segment")]
+static SECOND_SEGMENT: SecondSegmentCell = SecondSegmentCell(UnsafeCell::new(None));
+
+/// A collection the EMBEDDER runs when the heap is exhausted, answering whether it ran -- in a build
+/// whose heap can have a SECOND SEGMENT, which the hook is handed beside the first (`None` when the
+/// image installed none). It is expected to call [`DeviceHeap::collect_no_alloc_spanning`], so one
+/// collection covers both; everything else is as for the one-segment hook: answering `false` means
+/// nothing was collected, and it must not allocate.
+#[cfg(all(feature = "gc-collect", feature = "second-segment"))]
+pub type DeviceCollectHook = fn(&mut DeviceHeap, Option<&mut DeviceHeap>) -> bool;
+
+/// Installs the heap's SECOND SEGMENT over the raw region `[base, base + len)`, zeroed as the first
+/// is: allocation spills into it once the first segment is full, and every collection covers both.
+///
+/// The region must not overlap the first segment's. A collection over two overlapping regions
+/// refuses, so the heap would run out of memory rather than reclaim anything.
+///
+/// # Safety
+/// As [`lamella_gc_init_device_heap`]: `base`/`len` must name `len` bytes owned exclusively by the GC
+/// for the program's lifetime and not aliased elsewhere, with `len >= ALIGN`.
+#[cfg(feature = "second-segment")]
+pub unsafe fn lamella_gc_init_device_second_segment(base: *mut u8, len: usize) {
+    let heap = unsafe { DeviceHeap::from_raw(base, len) };
+    critical_section(|| unsafe {
+        *SECOND_SEGMENT.0.get() = Some(heap);
+    });
+}
+
+/// The collection a heap with a SECOND SEGMENT runs when neither segment holds an allocation,
+/// answering whether it collected. Called from [`lamella_gc_alloc_impl`], inside its critical
+/// section.
+#[cfg(feature = "second-segment")]
+fn collect_spanning(heap: &mut DeviceHeap, second: Option<&mut DeviceHeap>) -> bool {
+    #[cfg(all(feature = "gc-collect", not(feature = "host-heap")))]
+    {
+        let hook = unsafe { *DEVICE_GC.collect.get() };
+        hook.is_some_and(|hook| hook(heap, second))
+    }
+    #[cfg(all(feature = "gc-collect", feature = "host-heap"))]
+    {
+        if second.is_some() {
+            return false;
+        }
+        let Some(hook) = (unsafe { *DEVICE_GC.oom_roots.get() }) else {
+            return false;
+        };
+        heap.collect(|visit| hook(visit));
+        true
+    }
+    #[cfg(not(feature = "gc-collect"))]
+    {
+        let _ = (heap, second);
+        false
+    }
 }
 
 /// The device safepoint-collect entry: walks the live AOT call stack from the captured

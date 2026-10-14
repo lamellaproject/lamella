@@ -46,24 +46,17 @@ namespace System.Net.NetworkInformation
             get { return (NetworkInterfaceType)IfaceType(_index); }
         }
 
-        public bool IsDhcpEnabled
+#if LAMELLA_SURFACE_NETFX_2_0
+        public IPInterfaceProperties GetIPProperties()
         {
-            get { return (IfaceFlags(_index) & 1) != 0; }
+            return new InterfaceIPProperties(IPv4(_index), Ipv4Mask(_index), Ipv4Gateway(_index),
+                (IfaceFlags(_index) & 1) != 0);
         }
+#endif
 
-        public string IPv4Address
+        internal int PackedIPv4
         {
-            get { return FormatIPv4(IPv4(_index)); }
-        }
-
-        public string IPv4SubnetMask
-        {
-            get { return FormatIPv4(Ipv4Mask(_index)); }
-        }
-
-        public string IPv4GatewayAddress
-        {
-            get { return FormatIPv4(Ipv4Gateway(_index)); }
+            get { return IPv4(_index); }
         }
 
         public string Name
@@ -78,15 +71,6 @@ namespace System.Net.NetworkInformation
                 else prefix = "net";
                 return prefix + _index.ToString();
             }
-        }
-
-        private static string FormatIPv4(int packed)
-        {
-            int a = (packed >> 24) & 0xFF;
-            int b = (packed >> 16) & 0xFF;
-            int c = (packed >> 8) & 0xFF;
-            int d = packed & 0xFF;
-            return a.ToString() + "." + b.ToString() + "." + c.ToString() + "." + d.ToString();
         }
     }
 }

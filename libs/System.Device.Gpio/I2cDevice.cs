@@ -44,16 +44,17 @@ namespace System.Device.I2c
         public abstract void WriteRead(System.ReadOnlySpan<byte> writeBuffer, System.Span<byte> readBuffer);
 
         /// <summary>Creates a communications channel to the device described by
-        /// <paramref name="settings"/>, over the driver the board bound for
-        /// <see cref="I2cConnectionSettings.BusId"/>. The driver is shared by every device on
-        /// the bus, so disposing this device does not dispose it -- the same sharing a device
-        /// created through <see cref="I2cBus.CreateDevice"/> already has.</summary>
-        /// <exception cref="System.InvalidOperationException">No driver is bound for the
-        /// settings' bus.</exception>
+        /// <paramref name="settings"/>, over the driver of the bus
+        /// <see cref="I2cConnectionSettings.BusId"/> names on the board the program was built for.
+        /// The driver is shared by every device on the bus, so disposing this device does not
+        /// dispose it -- the same sharing a device created through <see cref="I2cBus.CreateDevice"/>
+        /// already has.</summary>
+        /// <exception cref="System.IO.IOException">The board has no such bus, or the program was
+        /// built for no board.</exception>
         public static I2cDevice Create(I2cConnectionSettings settings)
         {
             if ((object)settings == null) throw new System.ArgumentNullException("settings");
-            return new DriverI2cDevice(settings.Clone(), Buses.ResolveI2c(settings.BusId), false);
+            return new DriverI2cDevice(settings.Clone(), I2cBus.Open(settings.BusId), false);
         }
 
         /// <summary>Disposes this instance.</summary>

@@ -116,12 +116,14 @@ pub const MEMORY_QSPI_KIND: &str = "flash";
 pub const MEMORY_QSPI_BASE: u32 = 0x90000000;
 pub const MEMORY_QSPI_SIZE: u32 = 0x1000000;
 pub const MEMORY_QSPI_CONTROLLER: &str = "quadspi";
+pub const MEMORY_QSPI_PART: &str = "N25Q128A13EF840E";
 pub const MEMORY_QSPI_OPTIONAL: u32 = 1;
 pub const MEMORY_SDRAM_KIND: &str = "ram";
 pub const MEMORY_SDRAM_BASE: u32 = 0xC0000000;
 pub const MEMORY_SDRAM_SIZE: u32 = 0x800000;
 pub const MEMORY_SDRAM_DEVICE_SIZE: u32 = 0x1000000;
 pub const MEMORY_SDRAM_CONTROLLER: &str = "fmc";
+pub const MEMORY_SDRAM_PART: &str = "MT48LC4M32B2B5-6A";
 pub const MEMORY_SDRAM_OPTIONAL: u32 = 1;
 
 /// -- the flash fitted to 'qspi': what the controller must be told about the DEVICE, as

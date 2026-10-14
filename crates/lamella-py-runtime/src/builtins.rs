@@ -1986,28 +1986,18 @@ fn sorted_kw(
             _ => return Err(Trap::TypeError),
         }
     }
-    let elements = collect_iterable(model, &[*iterable], functions, depth)?;
-    if key.is_none() {
-        let mut sorted = elements;
-        if sorted.iter().any(|&e| model.is_instance(e)) {
-            sort_values_dyn(&mut sorted, functions, model, depth)?;
-        } else {
-            model.sort_values(&mut sorted)?;
-        }
-        if reverse {
-            sorted.reverse();
-        }
-        model.new_list(sorted)
+    let mut elements = collect_iterable(model, &[*iterable], functions, depth)?;
+    let keys = if key.is_none() {
+        None
     } else {
-        let mut pairs = Vec::with_capacity(elements.len());
-        for element in elements {
-            let k = call_value(key, &[element], functions, model, depth)?;
-            pairs.push((k, element));
+        let mut computed = Vec::with_capacity(elements.len());
+        for &element in &elements {
+            computed.push(call_value(key, &[element], functions, model, depth)?);
         }
-        model.sort_pairs_by_key(&mut pairs, reverse)?;
-        let sorted: Vec<Value> = pairs.into_iter().map(|(_, element)| element).collect();
-        model.new_list(sorted)
-    }
+        Some(computed)
+    };
+    sort_python(&mut elements, keys, reverse, functions, model, depth)?;
+    model.new_list(elements)
 }
 
 /// `dict(**kwargs)` / `dict(mapping_or_pairs, **kwargs)`: a dict whose keyword arguments become
@@ -2258,72 +2248,148 @@ fn ascii_escape(s: &str) -> String {
     out
 }
 
-/// Sorts the collected elements into a new list: int elements numerically, str lexicographically;
-/// a mixed or otherwise unorderable set is a `TypeError`.
-/// `a < b`, honoring a user class's `__lt__` (via the reflected comparison protocol), else the
-/// built-in ordering (`compare_ordered` over int/str/tuple).
-fn less_than_dyn(
+/// `a < b` as the program's own `<` evaluates it, then its truth: a tuple or list compares element by
+/// element, an instance's own dunders run (reflected when its class lacks the method), and values
+/// that do not order raise CPython's `TypeError`.
+fn python_less(
     a: Value,
     b: Value,
     functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<bool, Trap> {
-    if let Some(value) = crate::interp::try_compare_dunder(CmpOp::Lt, a, b, functions, model, depth)? {
-        return Ok(value == Value::TRUE);
-    }
-    Ok(model.compare_ordered(a, b)? == Ordering::Less)
+    let outcome = crate::interp::compare_values(CmpOp::Lt, a, b, functions, model, depth)?;
+    crate::interp::py_truthy_dyn(outcome, functions, model, depth)
 }
 
-/// Orders `a` vs `b` for min/max, honoring `__lt__`: Less if `a<b`, Greater if `b<a`, else Equal.
-fn compare_dyn(
-    a: Value,
-    b: Value,
+/// The stable order of `keys` under `<`, as indices into it. A bottom-up merge sort that asks only
+/// `<`, takes from the right run only when its head is strictly less (so equal keys keep their
+/// order), and stops at the first comparison that raises. A `reverse` order is stable too: the
+/// indices are reversed before the sort and again after it.
+fn stable_order(
+    keys: &[Value],
+    reverse: bool,
     functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
-) -> Result<Ordering, Trap> {
-    if less_than_dyn(a, b, functions, model, depth)? {
-        Ok(Ordering::Less)
-    } else if less_than_dyn(b, a, functions, model, depth)? {
-        Ok(Ordering::Greater)
-    } else {
-        Ok(Ordering::Equal)
+) -> Result<Vec<usize>, Trap> {
+    let count = keys.len();
+    let mut order: Vec<usize> = (0..count).collect();
+    if reverse {
+        order.reverse();
     }
+    let mut merged = order.clone();
+    let mut width = 1;
+    while width < count {
+        let mut start = 0;
+        while start < count {
+            let middle = (start + width).min(count);
+            let end = (start + 2 * width).min(count);
+            let (mut left, mut right) = (start, middle);
+            for slot in &mut merged[start..end] {
+                let take_right = right < end
+                    && (left == middle
+                        || python_less(keys[order[right]], keys[order[left]], functions, model, depth)?);
+                if take_right {
+                    *slot = order[right];
+                    right += 1;
+                } else {
+                    *slot = order[left];
+                    left += 1;
+                }
+            }
+            start = end;
+        }
+        core::mem::swap(&mut order, &mut merged);
+        width *= 2;
+    }
+    if reverse {
+        order.reverse();
+    }
+    Ok(order)
 }
 
-/// A stable insertion sort using `__lt__`-aware comparison -- the path when instances are present
-/// (the model's fast `compare_ordered` sort has no interpreter context to call `__lt__`). O(n^2),
-/// fine at teaching scale.
-fn sort_values_dyn(
-    elements: &mut [Value],
+/// Sorts `elements` in place under Python's `<` on `keys` (one per element; the elements themselves
+/// when `None`), stably, and stably descending when `reverse`. The model's own ordering decides when
+/// it can. When it cannot -- an instance, or a tuple or list holding one, or values that do not
+/// order -- the sort runs again from the original order through [`stable_order`], which calls the
+/// values' own comparisons and raises CPython's error for values that do not order. On an error the
+/// elements keep their original order.
+pub(crate) fn sort_python(
+    elements: &mut Vec<Value>,
+    keys: Option<Vec<Value>>,
+    reverse: bool,
     functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<(), Trap> {
-    for i in 1..elements.len() {
-        let mut j = i;
-        while j > 0 && less_than_dyn(elements[j], elements[j - 1], functions, model, depth)? {
-            elements.swap(j, j - 1);
-            j -= 1;
+    let original = elements.clone();
+    match model.sort_elements(elements, keys.clone(), reverse) {
+        Err(Trap::TypeError) => {}
+        outcome => return outcome,
+    }
+    let keys = keys.unwrap_or_else(|| original.clone());
+    match stable_order(&keys, reverse, functions, model, depth) {
+        Ok(order) => {
+            *elements = order.iter().map(|&i| original[i]).collect();
+            Ok(())
+        }
+        Err(trap) => {
+            *elements = original;
+            Err(trap)
         }
     }
-    Ok(())
 }
 
-/// Sorts `elements` into a new list: `__lt__`-aware when any element is an instance, else the fast
-/// built-in ordering.
+/// `list.sort(key=key, reverse=reverse)`, in place. As in CPython the elements are out of the list
+/// while the keys are computed and the sort runs: a key or a comparison that reads the list sees it
+/// empty, and one that changes it gets `ValueError` once the sort is done, with the sorted elements
+/// in place of whatever it wrote. A key that raises leaves the list as it was.
+pub(crate) fn list_sort_python(
+    list: Value,
+    key: Value,
+    reverse: bool,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let mut elements = core::mem::take(model.list_items_mut(list).ok_or(Trap::TypeError)?);
+    let mut outcome = Ok(());
+    let mut keys = None;
+    if !key.is_none() {
+        let mut computed = Vec::with_capacity(elements.len());
+        for &element in &elements {
+            match call_value(key, &[element], functions, model, depth) {
+                Ok(value) => computed.push(value),
+                Err(trap) => {
+                    outcome = Err(trap);
+                    break;
+                }
+            }
+        }
+        keys = Some(computed);
+    }
+    if outcome.is_ok() {
+        outcome = sort_python(&mut elements, keys, reverse, functions, model, depth);
+    }
+    let items = model.list_items_mut(list).ok_or(Trap::TypeError)?;
+    let modified = !items.is_empty();
+    *items = elements;
+    outcome?;
+    if modified {
+        return Err(model.raise_named_exception("ValueError", "list modified during sort"));
+    }
+    Ok(Value::NONE)
+}
+
+/// Sorts `elements` into a new list, by [`sort_python`].
 fn sorted_list(
     mut elements: Vec<Value>,
     functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
-    if elements.iter().any(|&e| model.is_instance(e)) {
-        sort_values_dyn(&mut elements, functions, model, depth)?;
-    } else {
-        model.sort_values(&mut elements)?;
-    }
+    sort_python(&mut elements, None, false, functions, model, depth)?;
     model.new_list(elements)
 }
 
@@ -2742,9 +2808,11 @@ fn min_max_impl(
         }
     };
     let mut best_key = mapped(best, model)?;
+    let op = if keep == Ordering::Less { CmpOp::Lt } else { CmpOp::Gt };
     for element in iter {
         let element_key = mapped(element, model)?;
-        if compare_dyn(element_key, best_key, functions, model, depth)? == keep {
+        let outcome = crate::interp::compare_values(op, element_key, best_key, functions, model, depth)?;
+        if crate::interp::py_truthy_dyn(outcome, functions, model, depth)? {
             best = element;
             best_key = element_key;
         }

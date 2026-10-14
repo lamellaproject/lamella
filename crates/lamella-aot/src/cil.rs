@@ -236,6 +236,91 @@ pub enum ControlFlowGap {
     /// A synthesized trap leader needs the tag of a builtin exception the [`CallResolver`] does
     /// not supply, so the failure edge has nothing to dispatch on.
     NoBuiltinExceptionTag,
+    /// An edge passes a different number of values than the block it reaches takes.
+    ///
+    /// The shape ordinary CIL reaches is a BRANCH INTO A HANDLER'S FIRST BLOCK. A catch handler or
+    /// finally clause is entered only by the exception mechanism -- ECMA-335 (6th edition, I.12.4,
+    /// rule 1) never permits a control transfer to enter one any other way -- so its first block
+    /// takes the method's locals from the synthesized edge that routes an exception or a `leave` to
+    /// it, and a branch into it passes none of them.
+    EdgeArity {
+        /// The block the edge reaches.
+        target: EdgeTarget,
+        /// The values the edge passes.
+        passed: usize,
+        /// The values the target block takes.
+        takes: usize,
+    },
+}
+
+/// The kind of block an [`ControlFlowGap::EdgeArity`] edge reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EdgeTarget {
+    /// The first block of a `catch` handler.
+    CatchHandler,
+    /// The first block of a `finally` handler.
+    FinallyHandler,
+    /// Any other block.
+    Block,
+}
+
+impl core::fmt::Display for ControlFlowGap {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ControlFlowGap::EntryLoopArgs => f.write_str(
+                "a loop branches back to the method's first block, and that block has more than one \
+                 predecessor or an argument whose address is taken or that is reassigned",
+            ),
+            ControlFlowGap::NoPredecessor => {
+                f.write_str("a block that no edge reaches has no predecessor to inherit its locals from")
+            }
+            ControlFlowGap::BackEdgeNotHeader => f.write_str(
+                "a block's first predecessor comes later in the method and is not a loop header, \
+                 so the values it would inherit are not defined yet",
+            ),
+            ControlFlowGap::EndfinallyOutsideFinally => {
+                f.write_str("an `endfinally` ends a block that is not inside a `finally` handler")
+            }
+            ControlFlowGap::TargetNotBlockStart => f.write_str(
+                "a branch, `leave` or `switch` targets an instruction in the middle of a block",
+            ),
+            ControlFlowGap::RanOffEnd => {
+                f.write_str("control runs off the end of the method with no `ret` or `throw`")
+            }
+            ControlFlowGap::UnknownBranchOpcode => f.write_str("a branch opcode is not classified"),
+            ControlFlowGap::NoBuiltinExceptionTag => f.write_str(
+                "a trapping instruction needs a built-in exception's tag that this build does not \
+                 supply",
+            ),
+            ControlFlowGap::EdgeArity { target, passed, takes } => {
+                let unit = if *passed == 1 { "value" } else { "values" };
+                match target {
+                    EdgeTarget::CatchHandler | EdgeTarget::FinallyHandler => write!(
+                        f,
+                        "a branch enters the first block of a `{}` handler, passing {passed} {unit} \
+                         where that block takes {takes}: a handler takes the method's locals from the \
+                         exception mechanism, the only way in -- ECMA-335 (I.12.4) never permits a \
+                         branch to enter a catch handler or finally clause",
+                        if *target == EdgeTarget::CatchHandler { "catch" } else { "finally" },
+                    ),
+                    EdgeTarget::Block => {
+                        write!(f, "an edge passes {passed} {unit} to a block that takes {takes}")
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl core::fmt::Display for CilError {
+    /// What the lowering met, for the build's refusal: the control-flow shapes in words, and every
+    /// other error by its name and contents.
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CilError::UnsupportedControlFlow(gap) => write!(f, "{gap}"),
+            other => write!(f, "{other:?}"),
+        }
+    }
 }
 
 /// What a `call`'s target is, recovered from its metadata token by a [`CallResolver`].
@@ -1745,6 +1830,21 @@ fn lower_with_source(
             let inst = &code[i];
             let is_last = i + 1 == end;
             let before = insts.len();
+            if is_last
+                && (control_flow::branch_kind(inst.opcode).is_some()
+                    || inst.opcode == Opcode::Switch)
+                && let Some(pending) = last_local_addr.take()
+            {
+                materialize_pending(
+                    pending,
+                    &mut stack,
+                    &mut locals,
+                    local_types,
+                    &args,
+                    &mut value_types,
+                    &mut insts,
+                )?;
+            }
             if is_last && inst.opcode == Opcode::Ret {
                 terminator = Some(Terminator::Return(stack.pop()));
             } else if is_last && matches!(inst.opcode, Opcode::Throw | Opcode::Rethrow) {
@@ -2034,6 +2134,17 @@ fn lower_with_source(
                 if next >= blocks.len() {
                     return Err(CilError::UnsupportedControlFlow(ControlFlowGap::RanOffEnd));
                 }
+                if let Some(pending) = last_local_addr.take() {
+                    materialize_pending(
+                        pending,
+                        &mut stack,
+                        &mut locals,
+                        local_types,
+                        &args,
+                        &mut value_types,
+                        &mut insts,
+                    )?;
+                }
                 let mut args = merge_args(
                     takes_edge_params(next),
                     local_count,
@@ -2120,12 +2231,23 @@ fn lower_with_source(
 
     for block in &mir_blocks {
         let edge = |target: BlockId, args: &[ValueId]| -> Result<(), CilError> {
-            match mir_blocks.get(target.index()) {
-                Some(t) if t.params.len() == args.len() => Ok(()),
-                _ => Err(CilError::UnsupportedControlFlow(
-                    ControlFlowGap::BackEdgeNotHeader,
-                )),
+            let takes = mir_blocks.get(target.index()).map_or(0, |t| t.params.len());
+            if mir_blocks.get(target.index()).is_some() && takes == args.len() {
+                return Ok(());
             }
+            let t = target.index();
+            let kind = if t < original_block_count && handler_clause[t].is_some() {
+                EdgeTarget::CatchHandler
+            } else if t < original_block_count && finally_handler[t].is_some() {
+                EdgeTarget::FinallyHandler
+            } else {
+                EdgeTarget::Block
+            };
+            Err(CilError::UnsupportedControlFlow(ControlFlowGap::EdgeArity {
+                target: kind,
+                passed: args.len(),
+                takes,
+            }))
         };
         match &block.terminator {
             Some(Terminator::Jump { target, args }) => edge(*target, args)?,
@@ -2851,16 +2973,18 @@ struct PendingAddr {
     depth: usize,
 }
 
-/// How many operands an opcode takes off the evaluation stack, for the ONE question
-/// [`materialize_pending_if_read`] asks: does this instruction reach down to a pending address?
+/// How many operands an opcode takes off the evaluation stack, for the question
+/// [`take_recorded_operand`] asks before the opcode runs: does this instruction reach down to a
+/// pending address?
 ///
 /// `None` means UNMODELED, and unmodeled keeps the deferral -- so an opcode missing from this table
-/// behaves exactly as it did before the table existed. That direction is deliberate: an omission
-/// costs a refusal, which is loud, where a wrong entry would materialize an address into a stack
-/// position that nothing consumes and reorder the operands under it.
+/// behaves exactly as it did before the table existed. That direction is deliberate: a wrong entry
+/// would materialize an address into a stack position that nothing consumes and reorder the operands
+/// under it.
 ///
 /// The consumers of a pending address are NOT here and must not be: `ldfld`, `stfld`, `ldflda`,
-/// `initobj` and the calls take the record directly, which is the deferral working.
+/// `initobj`, `newobj` and the calls ask [`take_recorded_operand`] themselves, with the operand count
+/// only they know.
 fn pending_operand_reads(opcode: Opcode) -> Option<usize> {
     Some(match opcode {
         Opcode::Dup | Opcode::Pop => 1,
@@ -2928,17 +3052,81 @@ fn materialize_pending(
     Ok(addr)
 }
 
-/// Whether a recorded address is the RECEIVER of a call that takes `operands` values, its receiver
-/// included: whether it sits at the bottom of the call's operand window.
+/// Where a recorded address sits against the operands of the instruction being lowered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RecordedSlot {
+    /// Below every operand: the address belongs to a later instruction, and this one never reaches it.
+    /// `p.X = src.F` is `ldloca p; ldloc src; ldfld F; stfld X`, and `&p` is the `stfld`'s, not the
+    /// `ldfld`'s.
+    Below,
+    /// The deepest operand: an instance call's receiver, the object of `ldfld`, `stfld` or `ldflda`,
+    /// the target of `initobj`.
+    Deepest,
+    /// An operand above the deepest one: an `out` or `ref` argument after the receiver
+    /// (`obj.M(out s)` is `ldloc obj; ldloca s; callvirt`), or the value `stfld` stores.
+    Above,
+}
+
+/// Where a recorded address sits against an instruction that takes `operands` values off a stack
+/// `stack_len` values tall.
 ///
 /// Pushed, the address would occupy slot `pending.depth` of a stack one value taller than
-/// `stack_len`, and the call takes the top `operands` slots of that stack. A recorded address
-/// anywhere else is an ordinary operand. Above the bottom it is an explicit argument: `obj.M(out s)`
-/// is `ldloc obj; ldloca s; callvirt`, with `&s` above `obj`. Below it, it belongs to a later
-/// instruction: `p.X = obj.Get()` is `ldloca p; ldloc obj; callvirt; stfld`, and `&p` is the
-/// `stfld`'s. Either way it is materialized at its depth ([`materialize_pending`]).
-fn pending_is_receiver(pending: &PendingAddr, stack_len: usize, operands: usize) -> bool {
-    (stack_len + 1).checked_sub(operands) == Some(pending.depth)
+/// `stack_len`, and the instruction takes the top `operands` slots of that stack. An instruction that
+/// takes more values than that stack holds reads every slot, the address included, so the address
+/// counts as an operand above the deepest one and the shortfall is reported where the values are
+/// taken off.
+fn recorded_slot(pending: &PendingAddr, stack_len: usize, operands: usize) -> RecordedSlot {
+    match (stack_len + 1).checked_sub(operands) {
+        Some(deepest) if pending.depth < deepest => RecordedSlot::Below,
+        Some(deepest) if pending.depth == deepest => RecordedSlot::Deepest,
+        _ => RecordedSlot::Above,
+    }
+}
+
+/// THE ONE RULE FOR A RECORDED ADDRESS, asked by every instruction that takes values off the stack.
+///
+/// The instruction takes `operands` values. It is handed the record only when the address is its
+/// DEEPEST operand and it can use an address there directly (`takes_address`): an instance call's
+/// receiver, the object of a field access, the target of `initobj`. When it reads the address's slot
+/// any other way, the address is materialized at its depth ([`materialize_pending`]) and taken off
+/// with the other values. When the address lies below every operand, it is left recorded for the
+/// later instruction it belongs to. A record that an instruction neither takes nor materializes is
+/// therefore always one it never reaches.
+#[allow(clippy::too_many_arguments)]
+fn take_recorded_operand(
+    last_local_addr: &mut Option<PendingAddr>,
+    operands: usize,
+    takes_address: bool,
+    stack: &mut Vec<ValueId>,
+    locals: &mut [Option<ValueId>],
+    local_types: &[MirType],
+    args: &[ValueId],
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> Result<Option<PendingAddr>, CilError> {
+    let Some(pending) = *last_local_addr else {
+        return Ok(None);
+    };
+    match recorded_slot(&pending, stack.len(), operands) {
+        RecordedSlot::Below => Ok(None),
+        RecordedSlot::Deepest if takes_address => {
+            *last_local_addr = None;
+            Ok(Some(pending))
+        }
+        RecordedSlot::Deepest | RecordedSlot::Above => {
+            *last_local_addr = None;
+            materialize_pending(
+                pending,
+                stack,
+                locals,
+                local_types,
+                args,
+                value_types,
+                insts,
+            )?;
+            Ok(None)
+        }
+    }
 }
 
 /// Records a `ldloca`/`ldarga` address, materializing whatever was already pending.
@@ -3121,12 +3309,18 @@ fn apply_value_op(
     promoted_arg: &[Option<usize>],
     narrowing: Narrowing<'_>,
 ) -> Result<(), CilError> {
-    if let Some(pending) = *last_local_addr
-        && let Some(pops) = pending_operand_reads(inst.opcode)
-        && stack.len() < pending.depth + pops
-    {
-        *last_local_addr = None;
-        materialize_pending(pending, stack, locals, local_types, args, value_types, insts)?;
+    if let Some(pops) = pending_operand_reads(inst.opcode) {
+        take_recorded_operand(
+            last_local_addr,
+            pops,
+            false,
+            stack,
+            locals,
+            local_types,
+            args,
+            value_types,
+            insts,
+        )?;
     }
     match inst.opcode {
         Opcode::Nop => {}
@@ -3666,6 +3860,17 @@ fn apply_value_op(
                 insts,
             );
             if let Some((arg_count, result_type)) = resolver.delegate_invoke_args(&inst.operand) {
+                take_recorded_operand(
+                    last_local_addr,
+                    arg_count + 1,
+                    false,
+                    stack,
+                    locals,
+                    local_types,
+                    args,
+                    value_types,
+                    insts,
+                )?;
                 let mut args = Vec::with_capacity(arg_count);
                 for _ in 0..arg_count {
                     args.push(stack.pop().ok_or(CilError::StackUnderflow)?);
@@ -3695,25 +3900,22 @@ fn apply_value_op(
                     charset,
                 } = call;
                 let arg_count = param_is_string.len();
-                let by_ref = last_local_addr
-                    .take()
-                    .map(|p: PendingAddr| -> Result<ValueId, CilError> {
-                        let base =
-                            addr_base(p.source, locals, local_types, args, value_types, insts)?;
-                        let ptr = new_value(value_types, MirType::ManagedPtr);
-                        insts.push((ptr, Inst::FieldAddr { base, offset: p.offset }));
-                        Ok(ptr)
-                    })
-                    .transpose()?;
-                let explicit = arg_count.saturating_sub(by_ref.is_some() as usize);
+                take_recorded_operand(
+                    last_local_addr,
+                    arg_count,
+                    false,
+                    stack,
+                    locals,
+                    local_types,
+                    args,
+                    value_types,
+                    insts,
+                )?;
                 let mut args = Vec::with_capacity(arg_count);
-                for _ in 0..explicit {
+                for _ in 0..arg_count {
                     args.push(stack.pop().ok_or(CilError::StackUnderflow)?);
                 }
                 args.reverse();
-                if let Some(ptr) = by_ref {
-                    args.insert(0, ptr);
-                }
                 let mut marshaled_a_string = false;
                 for (slot, &is_string) in args.iter_mut().zip(param_is_string.iter()) {
                     if is_string {
@@ -3913,27 +4115,28 @@ fn apply_value_op(
                     .ok_or(CilError::UnresolvedCall)?,
             };
             if matches!(info.target, CallTarget::Intrinsic(Intrinsic::IntToString)) {
-                let receiver = match last_local_addr.take() {
-                    Some(pending) if pending_is_receiver(&pending, stack.len(), info.args) => {
-                        Some(pending)
-                    }
-                    Some(operand) => {
-                        materialize_pending(
-                            operand,
-                            stack,
-                            locals,
-                            local_types,
-                            args,
-                            value_types,
-                            insts,
-                        )?;
-                        None
-                    }
-                    None => None,
-                };
+                let receiver = take_recorded_operand(
+                    last_local_addr,
+                    info.args,
+                    info.has_this,
+                    stack,
+                    locals,
+                    local_types,
+                    args,
+                    value_types,
+                    insts,
+                )?;
                 let value = match receiver {
-                    Some(PendingAddr { source, .. }) => {
-                        addr_base(source, locals, local_types, args, value_types, insts)?
+                    Some(PendingAddr { source, offset, .. }) => {
+                        let base =
+                            addr_base(source, locals, local_types, args, value_types, insts)?;
+                        if matches!(value_types[base.index()], MirType::ValueType { .. }) {
+                            let field = new_value(value_types, MirType::I32);
+                            insts.push((field, Inst::FieldLoad { base, offset }));
+                            field
+                        } else {
+                            base
+                        }
                     }
                     None => {
                         let ptr = stack.pop().ok_or(CilError::StackUnderflow)?;
@@ -3954,23 +4157,17 @@ fn apply_value_op(
                 stack.push(result);
                 return Ok(());
             }
-            let mut pending = last_local_addr.take();
-            let receiver_pending = pending.is_some_and(|address| {
-                info.has_this && pending_is_receiver(&address, stack.len(), info.args)
-            });
-            if !receiver_pending {
-                if let Some(operand) = pending.take() {
-                    materialize_pending(
-                        operand,
-                        stack,
-                        locals,
-                        local_types,
-                        args,
-                        value_types,
-                        insts,
-                    )?;
-                }
-            }
+            let pending = take_recorded_operand(
+                last_local_addr,
+                info.args,
+                info.has_this,
+                stack,
+                locals,
+                local_types,
+                args,
+                value_types,
+                insts,
+            )?;
             let off_stack = pending.is_some() || constrained.is_some();
             let explicit = info.args.saturating_sub(off_stack as usize);
             let mut call_args = Vec::with_capacity(info.args);
@@ -4226,7 +4423,18 @@ fn apply_value_op(
             let field = resolver
                 .field_offset(&inst.operand)
                 .ok_or_else(|| unlaid(resolver, &inst.operand))?;
-            match last_local_addr.take() {
+            let object = take_recorded_operand(
+                last_local_addr,
+                1,
+                true,
+                stack,
+                locals,
+                local_types,
+                args,
+                value_types,
+                insts,
+            )?;
+            match object {
                 Some(pending) => {
                     *last_local_addr = Some(PendingAddr {
                         offset: pending.offset + field,
@@ -4241,66 +4449,113 @@ fn apply_value_op(
                 }
             }
         }
-        Opcode::Initobj => match last_local_addr.take() {
-            Some(PendingAddr { source: AddrOf::Local(n), .. }) => {
-                let (handle, size, refs) = match resolver.type_operand_mir(&inst.operand) {
-                    Some(MirType::ValueType { handle, size, refs }) => (handle, size, refs),
-                    _ => {
-                        let (size, refs) = resolver
-                            .value_type_cell(&inst.operand)
-                            .ok_or(CilError::BadOperand)?;
-                        let handle = match &inst.operand {
-                            Operand::Token(token) => lamella_ir::TypeHandle(token.0),
-                            _ => lamella_ir::TypeHandle(0),
-                        };
-                        (handle, size, refs)
-                    }
-                };
-                let zeroed = new_value(value_types, MirType::ValueType { handle, size, refs });
-                insts.push((zeroed, Inst::InitStruct));
-                *locals.get_mut(n).ok_or(CilError::BadOperand)? = Some(zeroed);
+        Opcode::Initobj => {
+            let target = match take_recorded_operand(
+                last_local_addr,
+                1,
+                true,
+                stack,
+                locals,
+                local_types,
+                args,
+                value_types,
+                insts,
+            )? {
+                Some(
+                    field @ PendingAddr {
+                        source: AddrOf::Local(_),
+                        offset,
+                        ..
+                    },
+                ) if offset != 0 => {
+                    materialize_pending(
+                        field,
+                        stack,
+                        locals,
+                        local_types,
+                        args,
+                        value_types,
+                        insts,
+                    )?;
+                    None
+                }
+                target => target,
+            };
+            match target {
+                Some(PendingAddr {
+                    source: AddrOf::Local(n),
+                    ..
+                }) => {
+                    let (handle, size, refs) = match resolver.type_operand_mir(&inst.operand) {
+                        Some(MirType::ValueType { handle, size, refs }) => (handle, size, refs),
+                        _ => {
+                            let (size, refs) = resolver
+                                .value_type_cell(&inst.operand)
+                                .ok_or(CilError::BadOperand)?;
+                            let handle = match &inst.operand {
+                                Operand::Token(token) => lamella_ir::TypeHandle(token.0),
+                                _ => lamella_ir::TypeHandle(0),
+                            };
+                            (handle, size, refs)
+                        }
+                    };
+                    let zeroed = new_value(value_types, MirType::ValueType { handle, size, refs });
+                    insts.push((zeroed, Inst::InitStruct));
+                    *locals.get_mut(n).ok_or(CilError::BadOperand)? = Some(zeroed);
+                }
+                None => {
+                    let addr = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    let size = resolver
+                        .value_type_cell(&inst.operand)
+                        .map(|(size, _)| size)
+                        .or_else(|| {
+                            resolver
+                                .type_operand_mir(&inst.operand)
+                                .map(MirType::stack_slot_bytes)
+                        })
+                        .ok_or(CilError::BadOperand)?;
+                    let zero = new_value(value_types, MirType::I32);
+                    insts.push((
+                        zero,
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 0,
+                        },
+                    ));
+                    let sz = new_value(value_types, MirType::I32);
+                    insts.push((
+                        sz,
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: i64::from(size),
+                        },
+                    ));
+                    let result = new_value(value_types, MirType::I32);
+                    insts.push((
+                        result,
+                        Inst::FillBlock {
+                            dst: addr,
+                            value: zero,
+                            size: sz,
+                        },
+                    ));
+                }
+                Some(_) => return Err(CilError::BadOperand),
             }
-            None => {
-                let addr = stack.pop().ok_or(CilError::StackUnderflow)?;
-                let size = resolver
-                    .value_type_cell(&inst.operand)
-                    .map(|(size, _)| size)
-                    .or_else(|| {
-                        resolver
-                            .type_operand_mir(&inst.operand)
-                            .map(MirType::stack_slot_bytes)
-                    })
-                    .ok_or(CilError::BadOperand)?;
-                let zero = new_value(value_types, MirType::I32);
-                insts.push((
-                    zero,
-                    Inst::ConstInt {
-                        ty: MirType::I32,
-                        value: 0,
-                    },
-                ));
-                let sz = new_value(value_types, MirType::I32);
-                insts.push((
-                    sz,
-                    Inst::ConstInt {
-                        ty: MirType::I32,
-                        value: i64::from(size),
-                    },
-                ));
-                let result = new_value(value_types, MirType::I32);
-                insts.push((
-                    result,
-                    Inst::FillBlock {
-                        dst: addr,
-                        value: zero,
-                        size: sz,
-                    },
-                ));
-            }
-            Some(_) => return Err(CilError::BadOperand),
-        },
+        }
         Opcode::Ldfld => {
-            let (base, base_offset) = match last_local_addr.take() {
+            let object = take_recorded_operand(
+                last_local_addr,
+                1,
+                true,
+                stack,
+                locals,
+                local_types,
+                args,
+                value_types,
+                insts,
+            )?;
+            let (base, base_offset) = match object {
                 Some(PendingAddr { source, offset, .. }) => (
                     addr_base(source, locals, local_types, args, value_types, insts)?,
                     offset,
@@ -4328,8 +4583,19 @@ fn apply_value_op(
             stack.push(result);
         }
         Opcode::Stfld => {
+            let object = take_recorded_operand(
+                last_local_addr,
+                2,
+                true,
+                stack,
+                locals,
+                local_types,
+                args,
+                value_types,
+                insts,
+            )?;
             let value = stack.pop().ok_or(CilError::StackUnderflow)?;
-            let (base, base_offset) = match last_local_addr.take() {
+            let (base, base_offset) = match object {
                 Some(PendingAddr { source, offset, .. }) => (
                     addr_base(source, locals, local_types, args, value_types, insts)?,
                     offset,
@@ -5041,6 +5307,17 @@ fn apply_value_op(
                 }
             };
             let explicit = info.args.saturating_sub(1);
+            take_recorded_operand(
+                last_local_addr,
+                explicit,
+                false,
+                stack,
+                locals,
+                local_types,
+                args,
+                value_types,
+                insts,
+            )?;
             let mut call_args = Vec::with_capacity(info.args);
             for _ in 0..explicit {
                 call_args.push(stack.pop().ok_or(CilError::StackUnderflow)?);
@@ -9901,8 +10178,8 @@ mod tests {
     ///
     /// `p.X = obj.Get()` is `ldloca p; ldarg.0; callvirt Get; stfld X`, and `p.S = n.ToString()` is
     /// `ldloca p; ldloca n; call Int32::ToString; stfld S`, where `n` is an int local whose own
-    /// address is pushed as a real pointer. In both, the call's receiver is on the stack, and `&p` is
-    /// the `stfld`'s base.
+    /// address is pushed as a real pointer. In both, the call's receiver is on the stack, and `&p`
+    /// stays recorded below the call until the `stfld`, which stores into `p`'s own slot.
     #[test]
     fn a_struct_local_s_address_below_a_call_is_the_next_store_s_base() {
         use lamella_token::Token;
@@ -9977,9 +10254,13 @@ mod tests {
                     _ => None,
                 })
                 .unwrap_or_else(|| panic!("{case}: the store is emitted"));
-            let Some(Inst::FieldAddr { base: slot, offset: 0 }) = defined_by(store_base) else {
-                panic!("{case}: the store's base is `&p`, got {:?}", defined_by(store_base));
-            };
+            assert!(
+                matches!(defined_by(store_base), Some(Inst::InitStruct))
+                    && func.value_types[store_base.index()] == label,
+                "{case}: the store's base is local 0's slot, got {:?}",
+                defined_by(store_base)
+            );
+            let slot = &store_base;
             let result = if int_to_string {
                 let Some(Inst::IntToString { value }) = defined_by(stored) else {
                     panic!("{case}: the stored value is the string");
@@ -10004,6 +10285,603 @@ mod tests {
             assert_eq!(stored, result, "{case}: the call's result is what is stored");
             assert_ne!(*slot, func.blocks[func.entry.index()].params[0], "{case}: `&p` is not `obj`");
         }
+    }
+
+    /// A resolver for the recorded-address tests: each field's offset is its token's row, so every
+    /// access names its field by where it lands; method row 9 is `Box::.ctor(int, out S)`, method
+    /// row 10 an `int`-returning import taking `(int, ref S)`, and the delegate row 11 an `Invoke`
+    /// taking one `out S`.
+    struct Recorded;
+    impl CallResolver for Recorded {
+        fn resolve(&self, operand: &Operand) -> Option<CallInfo> {
+            match operand {
+                Operand::Token(token) if token.row() == 9 => Some(CallInfo {
+                    args: 3,
+                    has_result: false,
+                    result_type: None,
+                    has_this: true,
+                    target: CallTarget::Internal(9),
+                }),
+                _ => None,
+            }
+        }
+        fn field_offset(&self, operand: &Operand) -> Option<u32> {
+            match operand {
+                Operand::Token(token) => Some(token.row()),
+                _ => None,
+            }
+        }
+        fn value_type_cell(&self, _: &Operand) -> Option<(u32, lamella_ir::RefWords)> {
+            Some((8, lamella_ir::RefWords::NONE))
+        }
+        fn newobj_reference_layout(&self, _: &Operand) -> Option<ReferenceLayout> {
+            Some(ReferenceLayout {
+                handle: lamella_ir::TypeHandle(4),
+                size: 8,
+                reference_offsets: Vec::new(),
+            })
+        }
+        fn pinvoke_call(&self, operand: &Operand) -> Option<PInvokeCall> {
+            match operand {
+                Operand::Token(token) if token.row() == 10 => Some(PInvokeCall {
+                    import: "native_read".into(),
+                    param_is_string: alloc::vec![false, false],
+                    result_type: Some(MirType::I32),
+                    result_is_bool: false,
+                    charset: 0,
+                }),
+                _ => None,
+            }
+        }
+        fn delegate_invoke_args(&self, operand: &Operand) -> Option<(usize, Option<MirType>)> {
+            match operand {
+                Operand::Token(token) if token.row() == 11 => Some((1, None)),
+                _ => None,
+            }
+        }
+    }
+
+    /// The struct local every recorded-address test addresses: 24 bytes, no references.
+    fn recorded_struct() -> MirType {
+        MirType::ValueType {
+            handle: lamella_ir::TypeHandle(3),
+            size: 24,
+            refs: lamella_ir::RefWords::NONE,
+        }
+    }
+
+    /// Lowers `code` against [`Recorded`], with argument 0 an object, argument 1 a managed pointer,
+    /// local 0 the struct and local 1 an int; returns the function and every instruction in it.
+    fn lower_recorded(case: &str, code: Vec<Instruction>) -> (Function, Vec<(ValueId, Inst)>) {
+        let body = MethodBodyImage {
+            max_stack: 6,
+            init_locals: true,
+            local_var_sig: None,
+            code: code.into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(
+            &body,
+            &Recorded,
+            &[MirType::ObjectRef, MirType::ManagedPtr],
+            &[recorded_struct(), MirType::I32],
+            Returns::FromBody,
+            Narrowing::default(),
+        )
+        .unwrap_or_else(|e| panic!("{case}: {e:?}"));
+        assert!(
+            lamella_ir::verify(&func).is_ok(),
+            "{case}: {:?}",
+            lamella_ir::verify(&func)
+        );
+        let insts = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter().cloned())
+            .collect();
+        (func, insts)
+    }
+
+    fn field(row: u32) -> Operand {
+        Operand::Token(lamella_token::Token::new(0x04, row))
+    }
+
+    /// The value `id` is defined as, if an instruction defines it.
+    fn defined(insts: &[(ValueId, Inst)], id: ValueId) -> Option<&Inst> {
+        insts.iter().find(|(v, _)| *v == id).map(|(_, i)| i)
+    }
+
+    /// Whether `id` is local 0's own slot: the struct value zeroed on first use.
+    fn is_local_slot(func: &Function, insts: &[(ValueId, Inst)], id: ValueId) -> bool {
+        matches!(defined(insts, id), Some(Inst::InitStruct))
+            && func.value_types[id.index()] == recorded_struct()
+    }
+
+    /// A struct local's address recorded BELOW a field access belongs to the instruction after it,
+    /// and the access reads the object on the stack.
+    ///
+    /// `p.X = src.F` is `ldloca p; ldloc src; ldfld F; stfld X`; `p.X = src.Inner.A` puts `ldflda
+    /// Inner; ldfld A` where the `ldfld` is; `p.X = (src.G = 50)` stores into `src` first, through a
+    /// `stfld` whose two operands are both above `&p`; and an `initobj` through a pointer leaves `&p`
+    /// for the store after it. In each, `src` (argument 0) or the pointer (argument 1) is what the
+    /// inner access uses, and the store at offset 4 lands in `p`.
+    #[test]
+    fn a_struct_local_s_address_below_a_field_access_is_the_next_store_s_base() {
+        let p = || Instruction::new(Opcode::LdlocaS, Operand::Variable(0));
+        let store_x = || Instruction::new(Opcode::Stfld, field(4));
+        let ret = || Instruction::simple(Opcode::Ret);
+        let cases: [(&str, Vec<Instruction>); 4] = [
+            (
+                "p.X = src.F",
+                alloc::vec![
+                    p(),
+                    Instruction::simple(Opcode::Ldarg0),
+                    Instruction::new(Opcode::Ldfld, field(8)),
+                    store_x(),
+                    ret(),
+                ],
+            ),
+            (
+                "p.X = src.Inner.A",
+                alloc::vec![
+                    p(),
+                    Instruction::simple(Opcode::Ldarg0),
+                    Instruction::new(Opcode::Ldflda, field(12)),
+                    Instruction::new(Opcode::Ldfld, field(0)),
+                    store_x(),
+                    ret(),
+                ],
+            ),
+            (
+                "p.X = (src.G = 50)",
+                alloc::vec![
+                    p(),
+                    Instruction::simple(Opcode::Ldarg0),
+                    Instruction::new(Opcode::LdcI4S, Operand::Int8(50)),
+                    Instruction::simple(Opcode::Dup),
+                    Instruction::simple(Opcode::Stloc1),
+                    Instruction::new(Opcode::Stfld, field(16)),
+                    Instruction::simple(Opcode::Ldloc1),
+                    store_x(),
+                    ret(),
+                ],
+            ),
+            (
+                "initobj through a pointer, then p.X = 7",
+                alloc::vec![
+                    p(),
+                    Instruction::simple(Opcode::Ldarg1),
+                    Instruction::new(
+                        Opcode::Initobj,
+                        Operand::Token(lamella_token::Token::new(0x02, 5))
+                    ),
+                    Instruction::new(Opcode::LdcI4S, Operand::Int8(7)),
+                    store_x(),
+                    ret(),
+                ],
+            ),
+        ];
+        for (case, code) in cases {
+            let (func, insts) = lower_recorded(case, code);
+            let entry = &func.blocks[func.entry.index()];
+            let (src, pointer) = (entry.params[0], entry.params[1]);
+            let (base, value) = insts
+                .iter()
+                .find_map(|(_, i)| match i {
+                    Inst::FieldStore {
+                        base,
+                        offset: 4,
+                        value,
+                    } => Some((*base, *value)),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{case}: the store to `p.X` is emitted"));
+            assert!(
+                is_local_slot(&func, &insts, base),
+                "{case}: `p.X` is stored into `p`, got {:?}",
+                defined(&insts, base)
+            );
+            match case {
+                "p.X = src.F" => assert_eq!(
+                    defined(&insts, value),
+                    Some(&Inst::FieldLoad {
+                        base: src,
+                        offset: 8
+                    }),
+                    "{case}: `F` is read from `src`"
+                ),
+                "p.X = src.Inner.A" => {
+                    let Some(Inst::FieldLoad {
+                        base: inner,
+                        offset: 0,
+                    }) = defined(&insts, value)
+                    else {
+                        panic!(
+                            "{case}: `A` is read through `&src.Inner`, got {:?}",
+                            defined(&insts, value)
+                        );
+                    };
+                    assert_eq!(
+                        defined(&insts, *inner),
+                        Some(&Inst::FieldAddr {
+                            base: src,
+                            offset: 12
+                        }),
+                        "{case}: `&src.Inner` is `src` at `Inner`'s offset"
+                    );
+                }
+                "p.X = (src.G = 50)" => {
+                    let stored_g = insts.iter().find_map(|(_, i)| match i {
+                        Inst::FieldStore {
+                            base,
+                            offset: 16,
+                            value,
+                        } => Some((*base, *value)),
+                        _ => None,
+                    });
+                    assert_eq!(
+                        stored_g,
+                        Some((src, value)),
+                        "{case}: `G` is stored into `src`, with the value `p.X` gets"
+                    );
+                }
+                _ => {
+                    assert!(
+                        insts.iter().any(
+                            |(_, i)| matches!(i, Inst::FillBlock { dst, .. } if *dst == pointer)
+                        ),
+                        "{case}: `initobj` zeroes through the pointer"
+                    );
+                    assert!(
+                        matches!(
+                            defined(&insts, value),
+                            Some(Inst::ConstInt { value: 7, .. })
+                        ),
+                        "{case}: `p.X` gets 7"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A recorded address ABOVE the deepest operand is an ordinary operand, in its own place.
+    ///
+    /// `obj.R = ref p`'s `stfld` stores `&p` as the VALUE into the object below it; `h.Item = new
+    /// Box(5, out p)` hands the constructor `(this, 5, &p)` and stores the object into `h`; an import
+    /// taking `(int, ref S)` gets `(5, &p)`; and a delegate taking `out S` is invoked on the delegate
+    /// with `&p`. Each used to take the record as the wrong operand: the `stfld` as its object, the
+    /// constructor and the delegate not at all, the import as its first argument.
+    #[test]
+    fn a_struct_local_s_address_above_the_deepest_operand_stays_in_its_place() {
+        let p = || Instruction::new(Opcode::LdlocaS, Operand::Variable(0));
+        let five = || Instruction::simple(Opcode::LdcI45);
+        let ret = || Instruction::simple(Opcode::Ret);
+        let method = |row| Operand::Token(lamella_token::Token::new(0x06, row));
+        let cases: [(&str, Vec<Instruction>); 4] = [
+            (
+                "obj.R = ref p",
+                alloc::vec![
+                    Instruction::simple(Opcode::Ldarg0),
+                    p(),
+                    Instruction::new(Opcode::Stfld, field(20)),
+                    ret()
+                ],
+            ),
+            (
+                "h.Item = new Box(5, out p)",
+                alloc::vec![
+                    Instruction::simple(Opcode::Ldarg0),
+                    five(),
+                    p(),
+                    Instruction::new(Opcode::Newobj, method(9)),
+                    Instruction::new(Opcode::Stfld, field(4)),
+                    ret(),
+                ],
+            ),
+            (
+                "native_read(5, ref p)",
+                alloc::vec![
+                    five(),
+                    p(),
+                    Instruction::new(Opcode::Call, method(10)),
+                    Instruction::simple(Opcode::Pop),
+                    ret()
+                ],
+            ),
+            (
+                "d(out p)",
+                alloc::vec![
+                    Instruction::simple(Opcode::Ldarg0),
+                    p(),
+                    Instruction::new(Opcode::Callvirt, method(11)),
+                    ret()
+                ],
+            ),
+        ];
+        for (case, code) in cases {
+            let (func, insts) = lower_recorded(case, code);
+            let obj = func.blocks[func.entry.index()].params[0];
+            let address = insts
+                .iter()
+                .find_map(|(id, i)| match i {
+                    Inst::FieldAddr { base, offset: 0 } if is_local_slot(&func, &insts, *base) => {
+                        Some(*id)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{case}: `&p` is materialized as a pointer to `p`"));
+            let constant_five =
+                |id: ValueId| matches!(defined(&insts, id), Some(Inst::ConstInt { value: 5, .. }));
+            match case {
+                "obj.R = ref p" => {
+                    let store = insts.iter().find_map(|(_, i)| match i {
+                        Inst::FieldStore {
+                            base,
+                            offset: 20,
+                            value,
+                        } => Some((*base, *value)),
+                        _ => None,
+                    });
+                    assert_eq!(
+                        store,
+                        Some((obj, address)),
+                        "{case}: `&p` is stored into `obj`"
+                    );
+                }
+                "h.Item = new Box(5, out p)" => {
+                    let (ctor_args, new_obj) = insts
+                        .iter()
+                        .find_map(|(_, i)| match i {
+                            Inst::Call { callee: 9, args } => Some((args.clone(), args[0])),
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("{case}: the constructor is called"));
+                    assert!(
+                        matches!(defined(&insts, new_obj), Some(Inst::Alloc { .. })),
+                        "{case}: `this` is the new object"
+                    );
+                    assert_eq!(ctor_args.len(), 3, "{case}");
+                    assert!(
+                        constant_five(ctor_args[1]) && ctor_args[2] == address,
+                        "{case}: the constructor gets (this, 5, &p), got {ctor_args:?}"
+                    );
+                    let store = insts.iter().find_map(|(_, i)| match i {
+                        Inst::FieldStore {
+                            base,
+                            offset: 4,
+                            value,
+                        } => Some((*base, *value)),
+                        _ => None,
+                    });
+                    assert_eq!(
+                        store,
+                        Some((obj, new_obj)),
+                        "{case}: the object is stored into `h`"
+                    );
+                }
+                "native_read(5, ref p)" => {
+                    let import_args = insts
+                        .iter()
+                        .find_map(|(_, i)| match i {
+                            Inst::PInvoke { import, args } if &**import == "native_read" => {
+                                Some(args.clone())
+                            }
+                            _ => None,
+                        })
+                        .unwrap_or_else(|| panic!("{case}: the import is called"));
+                    assert_eq!(import_args.len(), 2, "{case}");
+                    assert!(
+                        constant_five(import_args[0]) && import_args[1] == address,
+                        "{case}: the import gets (5, &p), got {import_args:?}"
+                    );
+                }
+                _ => {
+                    let invoke = insts.iter().find_map(|(_, i)| match i {
+                        Inst::InvokeDelegate { delegate, args, .. } => {
+                            Some((*delegate, args.clone()))
+                        }
+                        _ => None,
+                    });
+                    assert_eq!(
+                        invoke,
+                        Some((obj, alloc::vec![address])),
+                        "{case}: the delegate is invoked with `&p`"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A recorded address still pending when its block ends crosses the edge on the stack.
+    ///
+    /// `p.X = c ? 61 : 62` is `ldloca p; ldarg c; brfalse ELSE; ldc 61; br JOIN; ELSE: ldc 62;
+    /// JOIN: stfld X`. The record is pending at the `brfalse`, and the join's `stfld` needs it under
+    /// the value; dropped there, the join found one value where two belonged and the method did not
+    /// lower.
+    #[test]
+    fn a_struct_local_s_address_pending_at_a_branch_reaches_the_join_on_the_stack() {
+        let code = alloc::vec![
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::new(Opcode::BrfalseS, Operand::Target(5)),
+            Instruction::new(Opcode::LdcI4S, Operand::Int8(61)),
+            Instruction::new(Opcode::BrS, Operand::Target(6)),
+            Instruction::new(Opcode::LdcI4S, Operand::Int8(62)),
+            Instruction::new(Opcode::Stfld, field(4)),
+            Instruction::simple(Opcode::Ret),
+        ];
+        let (func, insts) = lower_recorded("p.X = c ? 61 : 62", code);
+        let address = insts
+            .iter()
+            .find_map(|(id, i)| match i {
+                Inst::FieldAddr { base, offset: 0 } if is_local_slot(&func, &insts, *base) => {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .expect("`&p` is materialized before the branch");
+        let (join, base) = func
+            .blocks
+            .iter()
+            .enumerate()
+            .find_map(|(b, block)| {
+                block.insts.iter().find_map(|(_, i)| match i {
+                    Inst::FieldStore {
+                        base, offset: 4, ..
+                    } => Some((b, *base)),
+                    _ => None,
+                })
+            })
+            .expect("the join stores `p.X`");
+        assert!(
+            func.blocks[join].params.contains(&base),
+            "the store's base is the join's stack parameter"
+        );
+        let position = func.blocks[join]
+            .params
+            .iter()
+            .position(|&param| param == base)
+            .unwrap();
+        let mut edges = 0;
+        for block in &func.blocks {
+            let jumps: Vec<&[ValueId]> = match &block.terminator {
+                Some(Terminator::Jump { target, args }) if target.index() == join => {
+                    alloc::vec![&args[..]]
+                }
+                _ => Vec::new(),
+            };
+            for args in jumps {
+                assert_eq!(
+                    args.get(position),
+                    Some(&address),
+                    "an edge into the join carries `&p`"
+                );
+                edges += 1;
+            }
+        }
+        assert_eq!(edges, 2, "both arms reach the join");
+    }
+
+    /// A recorded address's FIELD OFFSET is part of the address its consumer takes.
+    ///
+    /// `s.B.ToString()` is `ldloca s; ldflda B; call Int32::ToString`, so the `int` printed is the one
+    /// at `B`'s offset; and `p.f = default` as csc writes it, `ldloca p; ldflda f; initobj T`, zeroes
+    /// that field alone, through its address, leaving `p` the same slot with its other fields intact.
+    #[test]
+    fn a_recorded_address_s_field_offset_is_part_of_the_address() {
+        struct ToStringResolver;
+        impl CallResolver for ToStringResolver {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 1,
+                    has_result: true,
+                    result_type: Some(MirType::ObjectRef),
+                    has_this: true,
+                    target: CallTarget::Intrinsic(Intrinsic::IntToString),
+                })
+            }
+            fn field_offset(&self, operand: &Operand) -> Option<u32> {
+                Recorded.field_offset(operand)
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: true,
+            local_var_sig: None,
+            code: alloc::vec![
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::new(Opcode::Ldflda, field(4)),
+                Instruction::new(
+                    Opcode::Call,
+                    Operand::Token(lamella_token::Token::new(0x0A, 3))
+                ),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(
+            &body,
+            &ToStringResolver,
+            &[],
+            &[recorded_struct()],
+            Returns::FromBody,
+            Narrowing::default(),
+        )
+        .expect("s.B.ToString() lowers");
+        let insts: Vec<(ValueId, Inst)> = func
+            .blocks
+            .iter()
+            .flat_map(|b| b.insts.iter().cloned())
+            .collect();
+        let printed = insts
+            .iter()
+            .find_map(|(_, i)| match i {
+                Inst::IntToString { value } => Some(*value),
+                _ => None,
+            })
+            .expect("the int is converted");
+        let Some(Inst::FieldLoad { base, offset: 4 }) = defined(&insts, printed) else {
+            panic!(
+                "s.B.ToString(): `B` is read at its offset, got {:?}",
+                defined(&insts, printed)
+            );
+        };
+        assert!(
+            is_local_slot(&func, &insts, *base),
+            "s.B.ToString(): `B` is read from `s`"
+        );
+
+        let (func, insts) = lower_recorded(
+            "p.f = default (csc)",
+            alloc::vec![
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::new(Opcode::LdcI4S, Operand::Int8(31)),
+                Instruction::new(Opcode::Stfld, field(0)),
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::new(Opcode::Ldflda, field(8)),
+                Instruction::new(
+                    Opcode::Initobj,
+                    Operand::Token(lamella_token::Token::new(0x02, 5))
+                ),
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::new(Opcode::Ldfld, field(0)),
+                Instruction::simple(Opcode::Ret),
+            ],
+        );
+        let slots: Vec<ValueId> = insts
+            .iter()
+            .filter(|(id, _)| is_local_slot(&func, &insts, *id))
+            .map(|(id, _)| *id)
+            .collect();
+        assert_eq!(
+            slots.len(),
+            1,
+            "p.f = default: `p` keeps its one slot rather than a fresh zeroed one"
+        );
+        let zeroed = insts
+            .iter()
+            .find_map(|(_, i)| match i {
+                Inst::FillBlock { dst, .. } => Some(*dst),
+                _ => None,
+            })
+            .expect("p.f = default: the field is zeroed through its address");
+        assert_eq!(
+            defined(&insts, zeroed),
+            Some(&Inst::FieldAddr {
+                base: slots[0],
+                offset: 8
+            }),
+            "p.f = default: the address zeroed is `p` at `f`'s offset"
+        );
+        let read = insts.iter().find_map(|(id, i)| match i {
+            Inst::FieldLoad { base, offset: 0 } if *base == slots[0] => Some(*id),
+            _ => None,
+        });
+        assert!(
+            read.is_some(),
+            "p.f = default: `p.X` is read back from the same slot"
+        );
     }
 
     #[test]
@@ -11988,6 +12866,65 @@ mod tests {
         .0;
         assert!(lamella_ir::verify(&func).is_ok());
         assert_eq!(bare_traps(&func), 4, "exactly the dead statement lowers to bare traps");
+    }
+
+    /// A branch from a `try` body into its own `finally` handler is refused as what it is.
+    ///
+    /// ECMA-335 never permits a branch to enter a handler, so the handler's first block takes the
+    /// method's locals from the synthesized edge an exception or a `leave` arrives by, and a plain
+    /// branch passes none. The refusal names the handler kind and both counts, and says so in words.
+    #[test]
+    fn a_branch_into_a_finally_handler_is_refused_as_what_it_is() {
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: true,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::BrtrueS, Operand::Target(5)),
+                Instruction::new(Opcode::LeaveS, Operand::Target(6)),
+                Instruction::simple(Opcode::Endfinally),
+                Instruction::simple(Opcode::Ldloc0),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: vec![EhClause {
+                try_range: lamella_cil::InstructionRange { start: 0, end: 5 },
+                handler_range: lamella_cil::InstructionRange { start: 5, end: 6 },
+                kind: EhKind::Finally,
+            }]
+            .into_boxed_slice(),
+        };
+        let error = lower_method_typed(
+            &body,
+            &NoCalls,
+            &[MirType::I32],
+            &[MirType::I32],
+            Returns::FromBody,
+            Narrowing::default(),
+        )
+        .expect_err("a branch into a handler is refused");
+        let CilError::UnsupportedControlFlow(ControlFlowGap::EdgeArity { target, passed, takes }) = error
+        else {
+            panic!("expected the edge-arity refusal, got {error:?}");
+        };
+        assert_eq!(target, EdgeTarget::FinallyHandler, "the edge enters a finally handler");
+        assert_eq!(passed, 0, "a branch passes no locals");
+        assert!(takes >= 1, "the handler's first block takes the method's locals, got {takes}");
+        let message = alloc::format!("{error}");
+        for words in ["`finally` handler", "passing 0 values", "ECMA-335"] {
+            assert!(message.contains(words), "the refusal says {words:?}: {message}");
+        }
+        assert!(!message.contains("BackEdgeNotHeader"), "{message}");
+        assert_eq!(
+            alloc::format!(
+                "{}",
+                ControlFlowGap::EdgeArity { target: EdgeTarget::Block, passed: 1, takes: 3 }
+            ),
+            "an edge passes 1 value to a block that takes 3"
+        );
     }
 
     #[test]

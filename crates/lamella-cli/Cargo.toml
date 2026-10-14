@@ -35,9 +35,10 @@ lamella-flash-routes = { path = "../lamella-flash-routes" }
 lamella-js-frontend = { path = "../lamella-js-frontend" }
 lamella-probe-core = { path = "../lamella-probe-core" }
 # The host compile-and-run seam (LcscCompiler + the REPL engine's LoopbackLink), the device
-# enumeration behind `devices`, and the target grammar every verb taking `--target` shares. The
-# SAME seams the MCP server and lamella-dap use.
-lamella-wire-host = { path = "../lamella-wire-host", features = ["repl-host", "serial", "usb", "tcp"] }
+# enumeration behind `devices`, and the target grammar every verb taking `--device` shares, with
+# `boards`: what a build for a board compiles against and its image carries. The SAME seams the MCP
+# server and lamella-dap use.
+lamella-wire-host = { path = "../lamella-wire-host", features = ["repl-host", "serial", "usb", "tcp", "boards"] }
 # The wire protocol types: Capabilities / Negotiated / product_model, for what `devices --identify`
 # reports back off a board.
 lamella-wire = { path = "../lamella-wire" }
@@ -109,7 +110,7 @@ lamella-load = { path = "../lamella-load", optional = true }
 lamella-cil-runtime = { path = "../lamella-cil-runtime", optional = true, default-features = false }
 # The metadata token a violation carries, read back into the member it names.
 lamella-token = { path = "../lamella-token", optional = true }
-# The debug-channel seam `run --target` drives. It is that channel and not the deploy one because
+# The debug-channel seam `run --device` drives. It is that channel and not the deploy one because
 # CONSOLE OUTPUT ARRIVES THERE: the wire's terminal frames carry a program's whole output and none
 # of them exists until it has finished, so streaming a running program means draining EVT_OUTPUT,
 # which rides the debug session.
@@ -121,6 +122,11 @@ lamella-debug-backend = { path = "../lamella-debug-backend", optional = true }
 # dependency through lamella-wire-host, with the same features; under `bake` it carries
 # `baked-image`, which those tests need.
 lamella-runner = { path = "../lamella-runner" }
+# The reference-assembly search as a TEST build makes it: it also looks at this source tree's test
+# corlib, first, so these tests bind that corlib wherever they run. Nothing built for use looks there.
+# And the board a test sends a program to: a board's deploy serve in the test's process, which exists
+# only in a build with `bake`.
+lamella-wire-host = { path = "../lamella-wire-host", default-features = false, features = ["fixture-corlib", "loopback-board"] }
 
 [features]
 # Every code generator this tool carries, on by default.

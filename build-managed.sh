@@ -44,15 +44,13 @@ done
 
 # Every assembly under libs/, in an order where each is built after what it references. The second
 # field lists other entries here that it references; all of them reference the corlib implicitly.
-# The `nanoFramework.` prefix marks a compatibility surface: the types keep nanoFramework's
-# namespaces so unmodified nanoFramework source compiles, and the ASSEMBLY name is what says this is
-# not the authoritative .NET design.
-# Fields are `name|references|foldedIn`, and an empty field is meaningful: `System.Device.Gpio||…`
+# Fields are `name|references|foldedIn|held`, and an empty field is meaningful: `System.Device.Gpio||…`
 # references nothing beyond the corlib. `foldedIn` names source directories that build INTO this
 # assembly instead of getting one of their own -- upstream ships `PwmChannel` inside
 # `System.Device.Gpio.dll`, so the namespace is unchanged and only the assembly is. A folded
 # directory must not also be listed here on its own, or the same type lands in two assemblies and a
 # reference resolves it from whichever is found first.
+# `held` holds a row back and names the reason: a held row is reported on every run instead of built.
 assemblies=(
     # Its own assembly rather than folded, unlike System.Device.Pwm below. See build-managed.ps1's
     # entry for the upstream measurement the distinction rests on. References only corlib.
@@ -70,12 +68,6 @@ assemblies=(
     "Lamella.Net.Time.Nts|Lamella.Net.Time"
     "Lamella.Net.WiFi|System.Net.NetworkInformation"
     "Lamella.IO.Storage|System.Device.Gpio"
-    "nanoFramework.System.Device.Adc|Lamella.Hardware"
-    "nanoFramework.System.IO.FileSystem|"
-    # The NETMF compatibility tier, so an existing Microsoft.SPOT.Hardware program compiles
-    # unchanged. A fourth field holds a row back and names the reason; a held row is reported on
-    # every run rather than skipped quietly.
-    "Microsoft.SPOT.Hardware|System.Device.Gpio||nested-type identity"
 )
 
 # An assembly present on disk but missing from the list above would be silently skipped, and a
@@ -135,6 +127,27 @@ read_lines() {
     while IFS= read -r line; do REPLY_LINES+=("$line"); done
 }
 
+# Every compile reads its sources from a response file, never from the command line itself:
+# build-managed.ps1 says why, and writes the file the same way, one path to a line, quoted, with a
+# backslash before a quote or at the end doubled. One file serves every compile here, and it is
+# removed however the script ends. Under Git Bash or Cygwin, lcsc is a native Windows program:
+# bash rewrites a POSIX path in an ARGUMENT for it, but a path written into a file reaches it as
+# written, so the paths that go into the file, and the file's own, are converted with cygpath.
+source_list="$(mktemp)"
+trap 'rm -f "$source_list"' EXIT
+if command -v cygpath >/dev/null 2>&1; then
+    native_paths() { cygpath -m -f -; }
+    source_list_arg="@$(cygpath -m -- "$source_list")"
+else
+    native_paths() { cat; }
+    source_list_arg="@$source_list"
+fi
+# Writes its arguments into the response file the next compile reads.
+write_sources() {
+    printf '%s\n' "$@" | native_paths |
+        sed -e 's/\(\\*\)"/\1\1\\"/g' -e 's/\(\\*\)$/\1\1/' -e 's/^/"/' -e 's/$/"/' > "$source_list"
+}
+
 # The language version follows the capability surface -- the same rule, condition and rung as
 # build-managed.ps1, which compiles these same sources and states the reasoning in full.
 # `corlib/System/Collections/Generic/*.cs` is guarded by LAMELLA_SURFACE_NETFX_2_0, so that symbol is
@@ -171,7 +184,8 @@ echo "corlib (${#corlib_src[@]} sources) -> $corlib_dll"
 # --unsafe: the corlib carries unsafe source (String's char* constructors and its pinnable
 # reference). None of the libs/ assemblies do, so the flag stays on the one compilation that needs
 # it rather than becoming a blanket -- the point of an opt-in is that it is scoped.
-"$lcsc" "${corlib_src[@]}" "$langversion" "--define=$define" --unsafe "--out=$corlib_dll" --no-debug
+write_sources "${corlib_src[@]}"
+"$lcsc" "$source_list_arg" "$langversion" "--define=$define" --unsafe "--out=$corlib_dll" --no-debug
 
 # --- libs --------------------------------------------------------------------------------------
 for entry in "${assemblies[@]}"; do
@@ -200,7 +214,93 @@ for entry in "${assemblies[@]}"; do
         for d in "${dep_list[@]}"; do refs+=("--reference=$out/$d.dll"); done
     fi
     echo "$name (${#src[@]} sources) -> $out/$name.dll"
-    "$lcsc" "${src[@]}" "$langversion" "--define=$define" "${refs[@]}" "--out=$out/$name.dll" --no-debug
+    write_sources "${src[@]}"
+    "$lcsc" "$source_list_arg" "$langversion" "--define=$define" "${refs[@]}" "--out=$out/$name.dll" --no-debug
+done
+
+# --- System.Device.Gpio, once per family -------------------------------------------------------------
+# Each family with a libs/System.Device.Gpio/Families/<family>.cs gets a System.Device.Gpio of its own,
+# at families/<family>/System.Device.Gpio.dll, holding the drivers that file constructs from a board's
+# bus table and the csp/<family>/csharp sources Families/<family>.sources lists: build-managed.ps1 says
+# why, and why build-boards.ps1 leaves those sources out of a board's assembly. The listed sources are
+# compiled from copies whose overrides of GpioDriver's `protected internal` members say so; the edit
+# is the .ps1's, made with sed, and the list is read and refused as the .ps1 reads and refuses it.
+gpio_folded=""
+for entry in "${assemblies[@]}"; do
+    IFS='|' read -r name deps folded held <<< "$entry"
+    if [ "$name" = "System.Device.Gpio" ]; then gpio_folded="$folded"; fi
+done
+read_lines < <(sources_of "$root/libs/System.Device.Gpio" 1)
+gpio_src=("${REPLY_LINES[@]}")
+if [ -n "$gpio_folded" ]; then
+    IFS=',' read -ra folded_list <<< "$gpio_folded"
+    for f in "${folded_list[@]}"; do
+        read_lines < <(sources_of "$root/libs/$f" 1)
+        gpio_src+=("${REPLY_LINES[@]}")
+    done
+fi
+read_lines < <(sources_of "$root/libs/System.Device.Gpio/Families" 1)
+family_files=()
+if [ ${#REPLY_LINES[@]} -gt 0 ]; then family_files=("${REPLY_LINES[@]}"); fi
+for family_file in "${family_files[@]}"; do
+    family="$(basename "$family_file" .cs)"
+    csp="$root/csp/$family/csharp"
+    if [ ! -d "$csp" ]; then
+        echo "libs/System.Device.Gpio/Families/$family.cs names a family with no csp/$family/csharp" >&2
+        exit 1
+    fi
+    list="$root/libs/System.Device.Gpio/Families/$family.sources"
+    if [ ! -f "$list" ]; then
+        echo "libs/System.Device.Gpio/Families/$family.sources does not exist: it lists the csp/$family/csharp sources the $family build of System.Device.Gpio carries" >&2
+        exit 1
+    fi
+    listed=()
+    while IFS= read -r line || [ -n "$line" ]; do
+        entry="$(printf '%s' "$line" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        case "$entry" in ''|'#'*) continue ;; esac
+        case "$entry" in
+            *.cs) if [ -f "$csp/$entry" ]; then listed+=("$entry"); continue; fi ;;
+        esac
+        echo "libs/System.Device.Gpio/Families/$family.sources lists '$entry', which is not a C# source in csp/$family/csharp" >&2
+        exit 1
+    done < "$list"
+    if [ ${#listed[@]} -eq 0 ]; then
+        echo "libs/System.Device.Gpio/Families/$family.sources lists no sources" >&2
+        exit 1
+    fi
+    unique="$(printf '%s\n' "${listed[@]}" | LC_ALL=C sort -u | wc -l | tr -d ' ')"
+    work="$(mktemp -d)"
+    copies=()
+    read_lines < <(sources_of "$csp" "")
+    for file in "${REPLY_LINES[@]}"; do
+        relative="${file#"$csp"/}"
+        found=""
+        for entry in "${listed[@]}"; do
+            if [ "$entry" = "$relative" ]; then found=1; break; fi
+        done
+        if [ -z "$found" ]; then continue; fi
+        mkdir -p "$work/$(dirname "$relative")"
+        sed -E -e '/Dispose\(/!s/^([[:blank:]]*)protected override/\1protected internal override/' \
+            "$file" > "$work/$relative"
+        copies+=("$work/$relative")
+    done
+    if [ ${#copies[@]} -ne "$unique" ]; then
+        echo "libs/System.Device.Gpio/Families/$family.sources lists $unique sources and csp/$family/csharp yielded ${#copies[@]} of them" >&2
+        exit 1
+    fi
+    mkdir -p "$out/families/$family"
+    dll="$out/families/$family/System.Device.Gpio.dll"
+    echo "System.Device.Gpio for $family ($(( ${#gpio_src[@]} + 1 + ${#copies[@]} )) sources) -> $dll"
+    write_sources "${gpio_src[@]}" "$family_file" "${copies[@]}"
+    "$lcsc" "$source_list_arg" "$langversion" "--define=$define;LAMELLA_FAMILY_DRIVERS" \
+        "--reference=$corlib_dll" "--reference=$out/Lamella.Hardware.dll" "--out=$dll" --no-debug
+    rm -rf "$work"
+done
+
+# The compatibility libraries are external and not built here, so one of their assemblies in the
+# output directory is stale, and anything that references it by name would still find it.
+for gone in Microsoft.SPOT.Hardware nanoFramework.System.Device.Adc nanoFramework.System.IO.FileSystem; do
+    rm -f -- "$out/$gone.dll"
 done
 
 echo

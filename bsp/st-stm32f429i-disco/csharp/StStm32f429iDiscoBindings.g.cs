@@ -119,6 +119,7 @@ namespace Lamella.Generated
         public const uint MEMORY_SDRAM_BASE = 0xD0000000;
         public const uint MEMORY_SDRAM_SIZE = 0x800000;
         public const string MEMORY_SDRAM_CONTROLLER = "fmc";
+        public const string MEMORY_SDRAM_PART = "IS42S16400J";
         public const uint MEMORY_SDRAM_OPTIONAL = 1;
 
         /// -- the SDRAM fitted to 'sdram': the shape its controller has to be told. The geometry and

@@ -3,6 +3,8 @@ namespace System.Text
 {
     public class UTF8Encoding : Encoding
     {
+        internal static UTF8Encoding _default = new UTF8Encoding();
+
         public UTF8Encoding() { }
 
         private static bool IsHighSurrogate(int c) { return c >= 0xD800 && c <= 0xDBFF; }
@@ -16,40 +18,32 @@ namespace System.Text
             return 4;
         }
 
-        private static int ScalarAt(string s, int i)
+        private static int ScalarAt(string s, char[] a, int i, int end)
         {
-            int c = s[i];
-            if (IsHighSurrogate(c) && i + 1 < s.Length && IsLowSurrogate(s[i + 1]))
+            int c = a != null ? a[i] : s[i];
+            if (IsHighSurrogate(c) && i + 1 < end)
             {
-                return 0x10000 + ((c - 0xD800) << 10) + (s[i + 1] - 0xDC00);
+                int next = a != null ? a[i + 1] : s[i + 1];
+                if (IsLowSurrogate(next)) return 0x10000 + ((c - 0xD800) << 10) + (next - 0xDC00);
             }
             if (IsHighSurrogate(c) || IsLowSurrogate(c)) return 0xFFFD;
             return c;
         }
 
-        public override int GetByteCount(string s)
+        private static int Encode(string s, char[] a, int index, int count, byte[] bytes, int byteIndex)
         {
-            int count = 0;
-            int i = 0;
-            while (i < s.Length)
+            int pos = byteIndex;
+            int end = index + count;
+            int i = index;
+            while (i < end)
             {
-                int scalar = ScalarAt(s, i);
-                count = count + BytesForScalar(scalar);
-                i = i + (scalar >= 0x10000 ? 2 : 1);
-            }
-            return count;
-        }
-
-        public override byte[] GetBytes(string s)
-        {
-            byte[] bytes = new byte[GetByteCount(s)];
-            int pos = 0;
-            int i = 0;
-            while (i < s.Length)
-            {
-                int cp = ScalarAt(s, i);
+                int cp = ScalarAt(s, a, i, end);
                 i = i + (cp >= 0x10000 ? 2 : 1);
-                if (cp < 0x80)
+                if (bytes == null)
+                {
+                    pos = pos + BytesForScalar(cp);
+                }
+                else if (cp < 0x80)
                 {
                     bytes[pos] = (byte)cp;
                     pos = pos + 1;
@@ -76,27 +70,43 @@ namespace System.Text
                     pos = pos + 4;
                 }
             }
+            return pos - byteIndex;
+        }
+
+        public override int GetByteCount(string s)
+        {
+            return Encode(s, null, 0, s.Length, null, 0);
+        }
+
+        public override int GetByteCount(char[] chars, int index, int count)
+        {
+            RequireArray(chars, "chars");
+            RequireNonNegative(index, "index", count, "count");
+            RequireRangeWithin(chars, index, count, "buffer");
+            return Encode(null, chars, index, count, null, 0);
+        }
+
+        public override byte[] GetBytes(string s)
+        {
+            byte[] bytes = new byte[Encode(s, null, 0, s.Length, null, 0)];
+            Encode(s, null, 0, s.Length, bytes, 0);
             return bytes;
         }
 
-        /// <summary>Decodes a range of UTF-8 bytes into a string. A byte sequence that is not well-formed
-        /// UTF-8 decodes to U+FFFD, one for each maximal ill-formed subpart.</summary>
-        /// <param name="bytes">The array holding the bytes to decode.</param>
-        /// <param name="index">The position of the first byte to decode.</param>
-        /// <param name="count">How many bytes to decode.</param>
-        /// <returns>The decoded text.</returns>
-        /// <exception cref="ArgumentNullException"><paramref name="bytes"/> is null.</exception>
-        /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> or
-        /// <paramref name="count"/> is negative, or the range does not lie within
-        /// <paramref name="bytes"/>.</exception>
-        public override string GetString(byte[] bytes, int index, int count)
+        public override int GetBytes(char[] chars, int charIndex, int charCount, byte[] bytes, int byteIndex)
         {
-            if (bytes == null) throw new ArgumentNullException("bytes", "Array cannot be null.");
-            if (index < 0) throw new ArgumentOutOfRangeException("index", "Non-negative number required.");
-            if (count < 0) throw new ArgumentOutOfRangeException("count", "Non-negative number required.");
-            RequireRangeWithin(bytes, index, count);
+            RequireArray(chars, "chars");
+            RequireArray(bytes, "bytes");
+            RequireNonNegative(charIndex, "charIndex", charCount, "charCount");
+            RequireRangeWithin(chars, charIndex, charCount, "string");
+            RequireDestinationIndex(byteIndex, bytes.Length, "byteIndex");
+            RequireByteRoom(Encode(null, chars, charIndex, charCount, null, 0), bytes, byteIndex, "65001");
+            return Encode(null, chars, charIndex, charCount, bytes, byteIndex);
+        }
 
-            StringBuilder result = new StringBuilder(count);
+        private static int Decode(byte[] bytes, int index, int count, char[] chars, int charIndex)
+        {
+            int at = charIndex;
             int end = index + count;
             int i = index;
             while (i < end)
@@ -104,7 +114,8 @@ namespace System.Text
                 int lead = bytes[i];
                 if (lead < 0x80)
                 {
-                    result.Append((char)lead);
+                    if (chars != null) chars[at] = (char)lead;
+                    at = at + 1;
                     i = i + 1;
                     continue;
                 }
@@ -134,7 +145,8 @@ namespace System.Text
                 }
                 else
                 {
-                    result.Append(ReplacementCharacter);
+                    if (chars != null) chars[at] = ReplacementCharacter;
+                    at = at + 1;
                     i = i + 1;
                     continue;
                 }
@@ -152,21 +164,65 @@ namespace System.Text
                 i = i + taken;
                 if (taken < length)
                 {
-                    result.Append(ReplacementCharacter);
+                    if (chars != null) chars[at] = ReplacementCharacter;
+                    at = at + 1;
                 }
                 else if (scalar >= 0x10000)
                 {
                     int offset = scalar - 0x10000;
-                    result.Append((char)(0xD800 + (offset >> 10)));
-                    result.Append((char)(0xDC00 + (offset & 0x3FF)));
+                    if (chars != null)
+                    {
+                        chars[at] = (char)(0xD800 + (offset >> 10));
+                        chars[at + 1] = (char)(0xDC00 + (offset & 0x3FF));
+                    }
+                    at = at + 2;
                 }
                 else
                 {
-                    result.Append((char)scalar);
+                    if (chars != null) chars[at] = (char)scalar;
+                    at = at + 1;
                 }
             }
-            return result.ToString();
+            return at - charIndex;
         }
 
+        public override int GetCharCount(byte[] bytes, int index, int count)
+        {
+            RequireArray(bytes, "bytes");
+            RequireNonNegative(index, "index", count, "count");
+            RequireRangeWithin(bytes, index, count);
+            return Decode(bytes, index, count, null, 0);
+        }
+
+        public override int GetChars(byte[] bytes, int byteIndex, int byteCount, char[] chars, int charIndex)
+        {
+            RequireArray(bytes, "bytes");
+            RequireArray(chars, "chars");
+            RequireNonNegative(byteIndex, "byteIndex", byteCount, "byteCount");
+            RequireRangeWithin(bytes, byteIndex, byteCount);
+            RequireDestinationIndex(charIndex, chars.Length, "charIndex");
+            RequireCharRoom(Decode(bytes, byteIndex, byteCount, null, 0), chars, charIndex, "65001");
+            return Decode(bytes, byteIndex, byteCount, chars, charIndex);
+        }
+
+        /// <summary>Decodes a range of UTF-8 bytes into a string. A byte sequence that is not well-formed
+        /// UTF-8 decodes to U+FFFD, one for each maximal ill-formed subpart.</summary>
+        /// <param name="bytes">The array holding the bytes to decode.</param>
+        /// <param name="index">The position of the first byte to decode.</param>
+        /// <param name="count">How many bytes to decode.</param>
+        /// <returns>The decoded text.</returns>
+        /// <exception cref="ArgumentNullException"><paramref name="bytes"/> is null.</exception>
+        /// <exception cref="ArgumentOutOfRangeException"><paramref name="index"/> or
+        /// <paramref name="count"/> is negative, or the range does not lie within
+        /// <paramref name="bytes"/>.</exception>
+        public override string GetString(byte[] bytes, int index, int count)
+        {
+            RequireArray(bytes, "bytes");
+            RequireNonNegative(index, "index", count, "count");
+            RequireRangeWithin(bytes, index, count);
+            char[] chars = new char[Decode(bytes, index, count, null, 0)];
+            Decode(bytes, index, count, chars, 0);
+            return new string(chars);
+        }
     }
 }

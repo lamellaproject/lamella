@@ -194,6 +194,26 @@ enum StdlibFn {
     /// `_thread.wake_all(waiters)` -- makes every queued thread runnable and empties the queue.
     #[cfg(feature = "threading")]
     ThreadWakeAll,
+    /// `_heapq.heappush(heap, item)` -- adds `item` to the min-heap `heap`.
+    HeapqPush,
+    /// `_heapq.heappop(heap)` -- removes and returns the smallest element.
+    HeapqPop,
+    /// `_heapq.heapreplace(heap, item)` -- pops the smallest element and pushes `item`, as one step.
+    HeapqReplace,
+    /// `_heapq.heappushpop(heap, item)` -- pushes `item`, then pops and returns the smallest.
+    HeapqPushPop,
+    /// `_heapq.heapify(list)` -- rearranges `list` into a min-heap, in place.
+    HeapqHeapify,
+    /// `_heapq.heappush_max(heap, item)` -- adds `item` to the max-heap `heap`.
+    HeapqPushMax,
+    /// `_heapq.heappop_max(heap)` -- removes and returns the largest element.
+    HeapqPopMax,
+    /// `_heapq.heapreplace_max(heap, item)` -- pops the largest element and pushes `item`.
+    HeapqReplaceMax,
+    /// `_heapq.heappushpop_max(heap, item)` -- pushes `item`, then pops and returns the largest.
+    HeapqPushPopMax,
+    /// `_heapq.heapify_max(list)` -- rearranges `list` into a max-heap, in place.
+    HeapqHeapifyMax,
     /// NOT A FUNCTION. One past the last real variant, so the coverage guard below can count them
     /// without naming which one is last.
     ///
@@ -309,6 +329,9 @@ impl StdlibFn {
             78 => ThreadWaitFlag,
             #[cfg(feature = "threading")]
             79 => ThreadWakeAll,
+            n if (HeapqPush as u32..HeapqPush as u32 + HEAPQ_FUNCTIONS.len() as u32).contains(&n) => {
+                HEAPQ_FUNCTIONS[(n - HeapqPush as u32) as usize]
+            }
             _ => return None,
         })
     }
@@ -406,9 +429,53 @@ impl StdlibFn {
             ReactorUnpark => "unpark",
             ReactorBlockPoint => "block_point",
             ReactorNowMs => "now_ms",
+            HeapqPush => "heappush",
+            HeapqPop => "heappop",
+            HeapqReplace => "heapreplace",
+            HeapqPushPop => "heappushpop",
+            HeapqHeapify => "heapify",
+            HeapqPushMax => "heappush_max",
+            HeapqPopMax => "heappop_max",
+            HeapqReplaceMax => "heapreplace_max",
+            HeapqPushPopMax => "heappushpop_max",
+            HeapqHeapifyMax => "heapify_max",
         }
     }
+
+    /// The heap operation a `_heapq` function performs and whether on a max-heap, or `None` for a
+    /// function of another module.
+    fn heap_op(self) -> Option<(crate::heapq::HeapOp, bool)> {
+        use crate::heapq::HeapOp;
+        use StdlibFn::*;
+        Some(match self {
+            HeapqPush => (HeapOp::Push, false),
+            HeapqPop => (HeapOp::Pop, false),
+            HeapqReplace => (HeapOp::Replace, false),
+            HeapqPushPop => (HeapOp::PushPop, false),
+            HeapqHeapify => (HeapOp::Heapify, false),
+            HeapqPushMax => (HeapOp::Push, true),
+            HeapqPopMax => (HeapOp::Pop, true),
+            HeapqReplaceMax => (HeapOp::Replace, true),
+            HeapqPushPopMax => (HeapOp::PushPop, true),
+            HeapqHeapifyMax => (HeapOp::Heapify, true),
+            _ => return None,
+        })
+    }
 }
+
+/// `_heapq`'s functions, in their declaration order: `from_id` indexes this by id.
+const HEAPQ_FUNCTIONS: [StdlibFn; 10] = [
+    StdlibFn::HeapqPush,
+    StdlibFn::HeapqPop,
+    StdlibFn::HeapqReplace,
+    StdlibFn::HeapqPushPop,
+    StdlibFn::HeapqHeapify,
+    StdlibFn::HeapqPushMax,
+    StdlibFn::HeapqPopMax,
+    StdlibFn::HeapqReplaceMax,
+    StdlibFn::HeapqPushPopMax,
+    StdlibFn::HeapqHeapifyMax,
+];
 
 /// Dispatches a KEYWORD call of stdlib function `id`. The only stdlib keyword surface is
 /// `deque(iterable, maxlen=N)`; any other stdlib function with no keywords falls back to the
@@ -444,6 +511,9 @@ pub fn call_stdlib_kw(
     }
     if kwargs.is_empty() {
         return call_stdlib(id, posargs, functions, model, depth);
+    }
+    if let Some(f) = StdlibFn::from_id(id).filter(|f| f.heap_op().is_some()) {
+        return Err(crate::heapq::keyword_refusal(f.python_name(), model));
     }
     Err(Trap::TypeError)
 }
@@ -571,6 +641,7 @@ pub fn build_module(name: &str, model: &mut ObjectModel) -> Option<Result<Value,
         "_fs" => Some(build_fs_module(model)),
         "_struct" => Some(build_struct_seam_module(model)),
         "weakref" => Some(build_weakref_module(model)),
+        "_heapq" => Some(build_heapq_module(model)),
         "_reactor" => Some(build_reactor_module(model)),
         "_socket" => Some(build_socket_module(model)),
         "_sys" => Some(build_sys_seam_module(model)),
@@ -731,6 +802,18 @@ fn build_thread_module(model: &mut ObjectModel) -> Result<Value, Trap> {
         ThreadWaitFlag,
         ThreadWakeAll,
     ] {
+        let key = model.new_str(f.python_name())?;
+        entries.push((key, Value::builtin_ref(f.id())));
+    }
+    let namespace = model.new_dict(entries)?;
+    model.new_module(namespace)
+}
+
+/// Builds `_heapq`: the ten heap operations, which `heapq` imports and re-exports beside its own
+/// `nsmallest` and `nlargest`.
+fn build_heapq_module(model: &mut ObjectModel) -> Result<Value, Trap> {
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    for f in HEAPQ_FUNCTIONS {
         let key = model.new_str(f.python_name())?;
         entries.push((key, Value::builtin_ref(f.id())));
     }
@@ -1218,6 +1301,11 @@ pub fn call_stdlib(
                 NetResult::WouldBlock => Ok(Value::FALSE),
                 NetResult::Error => Err(net_error(model, "connect")),
             }
+        }
+        f @ (HeapqPush | HeapqPop | HeapqReplace | HeapqPushPop | HeapqHeapify | HeapqPushMax
+        | HeapqPopMax | HeapqReplaceMax | HeapqPushPopMax | HeapqHeapifyMax) => {
+            let (op, is_max) = f.heap_op().ok_or(Trap::Malformed)?;
+            crate::heapq::call(op, is_max, f.python_name(), args, functions, model, depth)
         }
         SocketTcpConnect => {
             let [addr, port] = args else { return Err(Trap::TypeError) };

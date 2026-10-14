@@ -27,5 +27,6 @@ pub const BOARD: rp2350::Board = rp2350::Board {
         pll_usb_fbdiv: bindings::PLL_USB_FBDIV_PLL_150_48,
         pll_usb_prim: bindings::PLL_USB_PRIM_PLL_150_48,
     },
+    psram: None,
 }
 .checked();

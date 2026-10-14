@@ -7,9 +7,9 @@ namespace System
         public const float MinValue = -3.40282347E+38f;
         public const float MaxValue = 3.40282347E+38f;
         public const float Epsilon = 1.401298E-45f;
-        public static readonly float NaN = BitConverter.Int32BitsToSingle(0x7FC00000);
-        public static readonly float PositiveInfinity = BitConverter.Int32BitsToSingle(0x7F800000);
-        public static readonly float NegativeInfinity = BitConverter.Int32BitsToSingle(unchecked((int)0xFF800000));
+        public const float NaN = (float)0.0 / (float)0.0;
+        public const float PositiveInfinity = (float)1.0 / (float)0.0;
+        public const float NegativeInfinity = (float)(-1.0) / (float)0.0;
 
         public static bool IsNaN(float f)
         {

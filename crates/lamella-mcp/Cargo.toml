@@ -5,15 +5,18 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Native Lamella MCP server: exposes the toolchain to AI assistants over stdio (JSON-RPC 2.0). Default build = compile / run / size / enumerate / identify. Build `--features bake` for the on-device path (bake / deploy / run-on-device / Lamella Link source-level debug), which needs lamella-load's non-additive `code-in-place`. A thin front-end over the SAME lamella-wire-host / lamella-dap seams the CLIs use."
+description = "Native Lamella MCP server: exposes the toolchain to AI agents over stdio (JSON-RPC 2.0). Default build = check / run on this machine / boards / fit / enumerate / identify / flash. Build `--features bake` for the on-device path (size / bake / deploy / run-on-device / Lamella Link source-level debug), which needs lamella-load's non-additive `code-in-place`. A thin front-end over the SAME lamella-wire-host / lamella-dap seams the CLIs use."
 publish = false
 
 [dependencies]
 # DEFAULT surface (compile / run / enumerate / identify / deploy-status): the Lamella Link REPL engine (host
-# compile + run: LcscCompiler + engine::Repl), the serial/usb carriers (UsbTransport::list / list_serial +
-# WireTransport for identify/status), and the wire debug backend TYPES. NO `baked` here -- see the `bake`
-# feature, which is the only thing that pulls lamella-load's `code-in-place`.
-lamella-wire-host = { path = "../lamella-wire-host", features = ["repl-host", "serial", "usb", "debug-backend"] }
+# compile + run: LcscCompiler + engine::Repl), the carriers a device tool opens through `open_target` --
+# serial, the board's own USB and a board on a network (tcp) -- with UsbTransport::list / list_serial, and
+# the wire debug backend TYPES. NO `baked` here -- see the `bake` feature, which is the only thing that
+# pulls lamella-load's `code-in-place`.
+# `boards`: the reference set a program compiles against, cut to the libraries a call names, and for a
+# device tool, the board that answered with its chip family's builds.
+lamella-wire-host = { path = "../lamella-wire-host", features = ["repl-host", "serial", "usb", "tcp", "debug-backend", "boards"] }
 # The wire protocol types: Capabilities / Negotiated / ProfileIdentity / product_model for the HELLO identify path.
 lamella-wire = { path = "../lamella-wire" }
 # The board/part fact tables and a board's resolution to its part row, and the RULE computed over
@@ -43,6 +46,13 @@ lamella-debug-backend = { path = "../lamella-debug-backend", optional = true }
 lamella-assemble = { path = "../lamella-assemble", optional = true }
 lamella-metadata = { path = "../lamella-metadata", optional = true }
 lamella-token = { path = "../lamella-token", optional = true }
+
+[dev-dependencies]
+# The reference-assembly search as a TEST build makes it: it also looks at this source tree's test
+# corlib, first, so these tests bind that corlib wherever they run. Nothing built for use looks there.
+# And the board a test sends a program to: a board's deploy serve in the test's process, which exists
+# only in a build with `bake`.
+lamella-wire-host = { path = "../lamella-wire-host", default-features = false, features = ["fixture-corlib", "loopback-board"] }
 
 [features]
 # The on-device BAKE / DEPLOY / RUN-ON-DEVICE / DEBUG path: compile -> bake (`Module::write_baked`, needs

@@ -4,6 +4,7 @@
 
 extern crate alloc;
 
+use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -256,6 +257,21 @@ pub const STATICS_START_SYMBOL: &str = "__lamella_statics_start";
 
 /// The symbol just past the linker-laid statics RAM span (see [`STATICS_START_SYMBOL`]).
 pub const STATICS_END_SYMBOL: &str = "__lamella_statics_end";
+
+/// The symbol at the FLASH address of the image's initialized RAM data -- every object's
+/// [`Object::data`], laid end to end as the DATA RUN -- which the image's startup copies to
+/// [`DATA_START_SYMBOL`] before any code reads it. `lamella-linker` defines the three data-run symbols
+/// only for a link in which some object carries data, so a link without any comes out exactly as it
+/// did before the run existed.
+pub const DATA_LOAD_SYMBOL: &str = "__lamella_data_load";
+
+/// The symbol at the RAM address the data run starts at, word-aligned: the copy's destination (see
+/// [`DATA_LOAD_SYMBOL`]).
+pub const DATA_START_SYMBOL: &str = "__lamella_data_start";
+
+/// The symbol just past the data run in RAM, word-aligned, so the copy moves whole words (see
+/// [`DATA_LOAD_SYMBOL`]).
+pub const DATA_END_SYMBOL: &str = "__lamella_data_end";
 
 /// The symbol bracketing the gathered stack-map pointer table's first word (its `u32` record count).
 /// `lamella-linker` defines it (Global) on any image whose objects carry stack-map records; the
@@ -1050,15 +1066,46 @@ pub enum ElfError {
     /// The executable declares no loadable bytes: either no `PT_LOAD` segment at all, or only
     /// segments whose file size is zero. See [`flat_image`] for why this is an error.
     NoLoadableContent,
-    /// An object carries INITIALIZED writable data (an allocatable, writable `SHT_PROGBITS`
-    /// section -- `.data`), and the image model has no pass that copies it from flash into RAM.
+    /// An allocatable section, named here, that [`read_object`] has no place for: neither the flash
+    /// text, nor the RAM extents an image's startup prepares ([`Object::data`] and the `.bss`
+    /// extent), nor the unwind metadata and notes a no-unwind image discards.
     ///
-    /// **A refusal rather than a gap**, because the alternative is what this replaced: the section
-    /// was skipped and its symbols silently resolved into the text blob, so a write went nowhere and
-    /// a read answered instruction bytes. Zero-initialized writable data (`.bss`) IS placed -- see
-    /// [`Object::bss_len`] -- because the boot stub already clears the band it goes in; initialized
-    /// data would need a flash-to-RAM copy that does not exist.
-    InitializedDataUnsupported(String),
+    /// **A refusal rather than a guess**, because a guess is what this replaced: a section the reader
+    /// did not recognize was left out while its symbols resolved into the text, so a write through
+    /// one went nowhere and a read answered instruction bytes.
+    UnplaceableSection {
+        /// The section's name.
+        name: String,
+        /// Why no extent fits it.
+        reason: Unplaceable,
+    },
+    /// A member of an archive that is an ELF object but that [`read_object`] refused, named with the
+    /// refusal. [`read_archive`] skips a member that is not an ELF object at all, as an archive may
+    /// hold other files beside its objects, and refuses a member it would otherwise drop with its
+    /// symbols.
+    RefusedArchiveMember {
+        /// The member's file name.
+        member: String,
+        /// Why [`read_object`] refused it.
+        error: Box<ElfError>,
+    },
+}
+
+/// Why [`read_object`] has no place for an allocatable section ([`ElfError::UnplaceableSection`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Unplaceable {
+    /// A thread-local section (`SHF_TLS`, or named `.tdata` or `.tbss`): each thread's copy needs
+    /// a block of its own, and no image here sets one up.
+    ThreadLocal,
+    /// A table of constructors or destructors (`SHT_INIT_ARRAY`, `SHT_FINI_ARRAY` or
+    /// `SHT_PREINIT_ARRAY`): its entries are functions a startup must call, and no startup here
+    /// calls them.
+    Constructors,
+    /// A zero-filled section (`SHT_NOBITS`) that is neither writable nor named for RAM, so it asks
+    /// for neither the flash text, which holds file bytes, nor RAM.
+    ZeroFilledReadOnly,
+    /// An allocatable section of a type this reader does not know, given as `sh_type`.
+    UnknownType(u32),
 }
 
 /// A linked executable flattened into the bytes a flasher writes, and the address they go at.
@@ -1201,6 +1248,10 @@ pub struct ParsedSymbol {
     /// kind was treated as the first, which resolved a global's address into the middle of a
     /// function.
     pub bss: bool,
+    /// Whether this symbol lives in the object's initialized RAM extent ([`Object::data`]), with
+    /// [`Self::value`] its offset from the start of that extent: a third address space beside the
+    /// text and the `.bss` extent, which the linker places in RAM with a copy of its bytes in flash.
+    pub data: bool,
 }
 
 /// A relocation parsed from an object's `.rela.text` (explicit addend) or `.rel.text` (implicit).
@@ -1254,6 +1305,52 @@ pub struct Object {
     /// an object built in memory rather than read from a file, which a linker then trims as one
     /// whose section boundaries are unknown.
     pub input_sections: Vec<InputSection>,
+    /// The bytes of the object's INITIALIZED RAM extent: every allocatable section that is writable
+    /// or named for RAM (`.data`, `.data.*` and the others [`is_ram_section_name`] lists), merged
+    /// into one run the way [`Self::text`] merges the read-only ones. Empty for an object with none,
+    /// which is almost all of them.
+    ///
+    /// The linker runs the extent from RAM and stores these bytes in flash, and the image's startup
+    /// copies them across before any code reads them. **A section is placed by its NAME as well as
+    /// its flags**, as a GNU linker script's `*(.data .data.*)` places it: a function that has to
+    /// run from RAM is put in `.data.<name>` and keeps the flags of code, allocatable and
+    /// executable, with no write flag at all. A symbol inside the extent is marked by
+    /// [`ParsedSymbol::data`].
+    pub data: Vec<u8>,
+    /// The alignment the object's data extent needs -- the largest `sh_addralign` among the sections
+    /// merged into it, or 1 when there are none.
+    pub data_align: u32,
+    /// The relocations that apply to [`Self::data`], each `offset` from the start of the extent.
+    pub data_relocations: Vec<ParsedRelocation>,
+    /// The input sections merged into [`Self::data`], in file order, each with its place in the
+    /// extent, as [`Self::input_sections`] records the text's.
+    pub data_sections: Vec<InputSection>,
+}
+
+/// Whether an allocatable section with this name belongs in RAM whatever its flags say: the names a
+/// GNU linker's default script gathers into its RAM output sections -- `.data` and `.bss`, the
+/// small-data `.sdata` and `.sbss`, each also with a `.`-separated suffix, and the `.gnu.linkonce.d.`
+/// and `.gnu.linkonce.b.` families.
+///
+/// The name is what a toolchain is asked for when code or data has to live in RAM. A function that
+/// must run while the flash it would otherwise run from is busy is declared in `.data.<name>`, and
+/// its compiler keeps the flags of code on the section, so the flags alone would put it in flash.
+#[must_use]
+pub fn is_ram_section_name(name: &str) -> bool {
+    [".data", ".bss", ".sdata", ".sbss"].iter().any(|family| {
+        name.strip_prefix(family)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    }) || name.starts_with(".gnu.linkonce.d.")
+        || name.starts_with(".gnu.linkonce.b.")
+}
+
+/// Whether a section with this name is thread-local by name: `.tdata` or `.tbss`, each also with a
+/// `.`-separated suffix, as a GNU linker's default script gathers them.
+fn is_thread_local_section_name(name: &str) -> bool {
+    [".tdata", ".tbss"].iter().any(|family| {
+        name.strip_prefix(family)
+            .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+    })
 }
 
 /// One allocated, read-only input section of an [`Object`], where it lies in [`Object::text`].
@@ -1316,6 +1413,12 @@ const SH_ADDRALIGN: usize = 32;
 const SHF_WRITE: u32 = 0x1;
 const SHF_ALLOC: u32 = 0x2;
 const SHF_EXECINSTR: u32 = 0x4;
+const SHF_TLS: u32 = 0x400;
+const SHT_NOTE: u32 = 7;
+const SHT_INIT_ARRAY: u32 = 14;
+const SHT_FINI_ARRAY: u32 = 15;
+const SHT_PREINIT_ARRAY: u32 = 16;
+const SHT_ARM_EXIDX: u32 = 0x7000_0001;
 
 /// Parses an ELF32 little-endian relocatable object (as written by [`write_relocatable_object`],
 /// and, later, a C toolchain): the `.text` bytes, the symbol table (names resolved), and the
@@ -1344,6 +1447,42 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
     let is_unwind_metadata =
         |name: &str| name.starts_with(".eh_frame") || name.starts_with(".ARM.ex");
 
+    let placement = |i: usize| -> Result<Placement, ElfError> {
+        let flags = sh(i, SH_FLAGS)?;
+        if flags & SHF_ALLOC == 0 {
+            return Ok(Placement::NotAllocated);
+        }
+        let name = sec_name(i)?;
+        let empty = sh(i, SH_SIZE)? == 0;
+        let refuse = |reason| match empty {
+            true => Ok(Placement::Discarded),
+            false => Err(ElfError::UnplaceableSection {
+                name: String::from(name),
+                reason,
+            }),
+        };
+        if flags & SHF_TLS != 0 || is_thread_local_section_name(name) {
+            return refuse(Unplaceable::ThreadLocal);
+        }
+        let ram = flags & SHF_WRITE != 0 || is_ram_section_name(name);
+        match sh(i, SH_TYPE)? {
+            SHT_PROGBITS if is_unwind_metadata(name) => Ok(Placement::Discarded),
+            SHT_PROGBITS if ram => Ok(Placement::Data),
+            SHT_PROGBITS => Ok(Placement::Text),
+            SHT_NOBITS if ram => Ok(Placement::Bss),
+            SHT_NOBITS => refuse(Unplaceable::ZeroFilledReadOnly),
+            SHT_NOTE | SHT_ARM_EXIDX => Ok(Placement::Discarded),
+            SHT_INIT_ARRAY | SHT_FINI_ARRAY | SHT_PREINIT_ARRAY => {
+                refuse(Unplaceable::Constructors)
+            }
+            other => refuse(Unplaceable::UnknownType(other)),
+        }
+    };
+    let mut placements: Vec<Placement> = Vec::with_capacity(e_shnum);
+    for i in 0..e_shnum {
+        placements.push(placement(i)?);
+    }
+
     let mut symtab_i = None;
     let mut section_base: Vec<Option<u32>> = Vec::new();
     section_base.resize(e_shnum, None);
@@ -1357,11 +1496,7 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
             symtab_i = Some(i);
         }
         let flags = sh(i, SH_FLAGS)?;
-        let merge = sh(i, SH_TYPE)? == 1
-            && flags & SHF_ALLOC != 0
-            && flags & SHF_WRITE == 0
-            && !is_unwind_metadata(sec_name(i)?);
-        if !merge {
+        if placements[i] != Placement::Text {
             continue;
         }
         let align = sh(i, SH_ADDRALIGN)?.max(1);
@@ -1391,18 +1526,44 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
     let mut bss_align = 1u32;
     #[allow(clippy::needless_range_loop)]
     for i in 0..e_shnum {
-        let flags = sh(i, SH_FLAGS)?;
-        if flags & SHF_ALLOC == 0 || flags & SHF_WRITE == 0 || sh(i, SH_SIZE)? == 0 {
+        if placements[i] != Placement::Bss || sh(i, SH_SIZE)? == 0 {
             continue;
-        }
-        if sh(i, SH_TYPE)? == SHT_PROGBITS {
-            return Err(ElfError::InitializedDataUnsupported(String::from(sec_name(i)?)));
         }
         let align = sh(i, SH_ADDRALIGN)?.max(1);
         bss_align = bss_align.max(align);
         bss_len = bss_len.next_multiple_of(align);
         bss_base[i] = Some(bss_len);
         bss_len += sh(i, SH_SIZE)?;
+    }
+
+    let mut data_base: Vec<Option<u32>> = alloc::vec![None; e_shnum];
+    let mut data_sections: Vec<InputSection> = Vec::new();
+    let mut data_section_of: Vec<Option<usize>> = alloc::vec![None; e_shnum];
+    let mut data: Vec<u8> = Vec::new();
+    let mut data_align = 1u32;
+    #[allow(clippy::needless_range_loop)]
+    for i in 0..e_shnum {
+        let size = sh(i, SH_SIZE)? as usize;
+        if placements[i] != Placement::Data || size == 0 {
+            continue;
+        }
+        let align = sh(i, SH_ADDRALIGN)?.max(1);
+        data_align = data_align.max(align);
+        while !(data.len() as u32).is_multiple_of(align) {
+            data.push(0);
+        }
+        data_base[i] = Some(data.len() as u32);
+        data_section_of[i] = Some(data_sections.len());
+        data_sections.push(InputSection {
+            name: String::from(sec_name(i)?),
+            offset: data.len() as u32,
+            size: size as u32,
+            executable: sh(i, SH_FLAGS)? & SHF_EXECINSTR != 0,
+            align,
+            symbols: Vec::new(),
+        });
+        let off = sh(i, SH_OFFSET)? as usize;
+        data.extend_from_slice(bytes.get(off..off + size).ok_or(ElfError::Truncated)?);
     }
 
     let mut sections: Vec<ParsedSection> = Vec::new();
@@ -1446,6 +1607,9 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
         if let Some(&Some(section)) = input_section_of.get(st_shndx as usize) {
             input_sections[section].symbols.push(s as u32);
         }
+        if let Some(&Some(section)) = data_section_of.get(st_shndx as usize) {
+            data_sections[section].symbols.push(s as u32);
+        }
         let binding = match st_info >> 4 {
             1 => Binding::Global,
             2 => Binding::Weak,
@@ -1458,7 +1622,8 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
         };
         let carried = carried_of.get(st_shndx as usize).copied().flatten();
         let in_bss = bss_base.get(st_shndx as usize).copied().flatten();
-        let rebase = match (carried, in_bss) {
+        let in_data = data_base.get(st_shndx as usize).copied().flatten();
+        let rebase = match (carried, in_bss.or(in_data)) {
             (Some(_), _) => 0,
             (None, Some(base)) => base,
             (None, None) => section_base
@@ -1476,10 +1641,12 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
             defined: st_shndx != SHN_UNDEF,
             section: carried,
             bss: in_bss.is_some(),
+            data: in_data.is_some(),
         });
     }
 
     let mut relocations = Vec::new();
+    let mut data_relocations = Vec::new();
     for ri in 0..e_shnum {
         let implicit = match sh(ri, SH_TYPE)? {
             4 => false,
@@ -1487,12 +1654,15 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
             _ => continue,
         };
         let applies_to = sh(ri, SH_INFO)? as usize;
-        let target = match section_base.get(applies_to).copied().flatten() {
-            Some(base) => RelocTarget::Text(base),
-            None => match carried_of.get(applies_to).copied().flatten() {
-                Some(idx) => RelocTarget::Carried(idx),
-                None => continue,
-            },
+        let target = match (
+            section_base.get(applies_to).copied().flatten(),
+            data_base.get(applies_to).copied().flatten(),
+            carried_of.get(applies_to).copied().flatten(),
+        ) {
+            (Some(base), _, _) => RelocTarget::Text(base),
+            (None, Some(base), _) => RelocTarget::Data(base),
+            (None, None, Some(idx)) => RelocTarget::Carried(idx),
+            (None, None, None) => continue,
         };
         let off = sh(ri, SH_OFFSET)? as usize;
         let size = sh(ri, SH_SIZE)? as usize;
@@ -1503,7 +1673,7 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
             let parsed = ParsedRelocation {
                 offset: rd_u32(bytes, base)?
                     + match target {
-                        RelocTarget::Text(b) => b,
+                        RelocTarget::Text(b) | RelocTarget::Data(b) => b,
                         RelocTarget::Carried(_) => 0,
                     },
                 symbol: r_info >> 8,
@@ -1517,6 +1687,7 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
             };
             match target {
                 RelocTarget::Text(_) => relocations.push(parsed),
+                RelocTarget::Data(_) => data_relocations.push(parsed),
                 RelocTarget::Carried(idx) => sections[idx as usize].relocations.push(parsed),
             }
         }
@@ -1532,14 +1703,34 @@ pub fn read_object(bytes: &[u8]) -> Result<Object, ElfError> {
         bss_len,
         bss_align,
         input_sections,
+        data,
+        data_align,
+        data_relocations,
+        data_sections,
     })
 }
 
-/// What a relocation section applies to: the merged code blob (at the given rebase offset) or a
-/// carried section (by its [`Object::sections`] index).
+/// Where [`read_object`] puts one section: decided once per section, so its passes cannot disagree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Placement {
+    /// Not allocatable: the carried-section pass keeps it or drops it.
+    NotAllocated,
+    /// Merged into the flash text, [`Object::text`].
+    Text,
+    /// Merged into the initialized RAM extent, [`Object::data`].
+    Data,
+    /// Merged into the `.bss` extent ([`Object::bss_len`]).
+    Bss,
+    /// Allocatable and read by nothing the program runs: unwind metadata and notes.
+    Discarded,
+}
+
+/// What a relocation section applies to: the merged code blob or the data extent (each at the given
+/// rebase offset), or a carried section (by its [`Object::sections`] index).
 #[derive(Clone, Copy)]
 enum RelocTarget {
     Text(u32),
+    Data(u32),
     Carried(u32),
 }
 
@@ -1566,8 +1757,9 @@ const AR_HEADER_SIZE: usize = 60;
 /// Parses a System V / GNU `ar` archive: the `!<arch>` magic, then 60-byte member headers each
 /// followed by an even-padded payload. The `/` symbol index is skipped (this crate scans each
 /// member's own symbol table); the `//` long-name table resolves members named `/<offset>`. Every
-/// other member is parsed as an ELF object. (Thin archives, which reference external files, are not
-/// supported.)
+/// other member that is an ELF file is parsed as an object, and one [`read_object`] refuses refuses
+/// the archive ([`ElfError::RefusedArchiveMember`]); a member that is not an ELF file is skipped.
+/// (Thin archives, which reference external files, are not supported.)
 pub fn read_archive(bytes: &[u8]) -> Result<Archive, ElfError> {
     if bytes.len() < AR_MAGIC.len() || &bytes[..AR_MAGIC.len()] != AR_MAGIC {
         return Err(ElfError::NotArchive);
@@ -1589,8 +1781,12 @@ pub fn read_archive(bytes: &[u8]) -> Result<Archive, ElfError> {
         if raw_name == b"/" || raw_name == b"/SYM64/" {
         } else if raw_name == b"//" {
             long_names = data.to_vec();
-        } else if let Ok(object) = read_object(data) {
+        } else if data.starts_with(b"\x7fELF") {
             let name = resolve_ar_name(raw_name, &long_names)?;
+            let object = read_object(data).map_err(|error| ElfError::RefusedArchiveMember {
+                member: name.clone(),
+                error: Box::new(error),
+            })?;
             members.push(ArchiveMember { name, object });
         }
         pos = data_start + size + (size & 1);
@@ -2449,5 +2645,369 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Rewrites the type and flags of the section named `name` in the object `bytes`: the writer
+    /// emits every section it is given as `SHT_PROGBITS`, and these tests need the other kinds.
+    fn set_section_kind(bytes: &mut [u8], name: &str, sh_type: u32, sh_flags: u32) {
+        let word =
+            |bytes: &[u8], at: usize| u32::from_le_bytes(bytes[at..at + 4].try_into().unwrap());
+        let shoff = word(bytes, 32) as usize;
+        let shnum = u16::from_le_bytes([bytes[48], bytes[49]]) as usize;
+        let shstrndx = u16::from_le_bytes([bytes[50], bytes[51]]) as usize;
+        let names = word(bytes, shoff + shstrndx * 40 + SH_OFFSET) as usize;
+        for i in 0..shnum {
+            let header = shoff + i * 40;
+            let at = names + word(bytes, header + SH_NAME) as usize;
+            if bytes[at..].starts_with(name.as_bytes()) && bytes[at + name.len()] == 0 {
+                bytes[header + SH_TYPE..header + SH_TYPE + 4]
+                    .copy_from_slice(&sh_type.to_le_bytes());
+                bytes[header + SH_FLAGS..header + SH_FLAGS + 4]
+                    .copy_from_slice(&sh_flags.to_le_bytes());
+                return;
+            }
+        }
+        panic!("the object has no section {name}");
+    }
+
+    /// An ARM object with `movs r0, #1; bx lr` in `.text` as `in_flash`, and one more section, `name`,
+    /// of the kind given, holding `data` with the symbol `inside` at its start.
+    fn object_with_section(name: &str, sh_type: u32, sh_flags: u32, data: &[u8]) -> Vec<u8> {
+        let text = [0x01, 0x20, 0x70, 0x47];
+        let mut bytes = write_relocatable_object_with_sections(
+            Machine::Arm,
+            &text,
+            &[
+                Symbol {
+                    name: "in_flash",
+                    value: 1,
+                    size: 4,
+                    binding: Binding::Global,
+                    kind: SymbolType::Func,
+                    section: SymbolSection::Text,
+                },
+                Symbol {
+                    name: "inside",
+                    value: 0,
+                    size: data.len() as u32,
+                    binding: Binding::Global,
+                    kind: SymbolType::NoType,
+                    section: SymbolSection::InSection(0),
+                },
+            ],
+            &[],
+            &[Section {
+                name,
+                flags: sh_flags,
+                addralign: 4,
+                data,
+                relocations: &[],
+            }],
+        );
+        set_section_kind(&mut bytes, name, sh_type, sh_flags);
+        bytes
+    }
+
+    #[test]
+    fn a_function_placed_in_a_data_section_runs_from_ram_and_never_from_flash() {
+        let in_flash = [0x01, 0x20, 0x70, 0x47];
+        let in_ram = [0x02, 0x20, 0x70, 0x47];
+        let bytes = write_relocatable_object_with_sections(
+            Machine::Arm,
+            &in_flash,
+            &[
+                Symbol {
+                    name: "in_flash",
+                    value: 1,
+                    size: 4,
+                    binding: Binding::Global,
+                    kind: SymbolType::Func,
+                    section: SymbolSection::Text,
+                },
+                Symbol {
+                    name: "in_ram",
+                    value: 1,
+                    size: 4,
+                    binding: Binding::Local,
+                    kind: SymbolType::Func,
+                    section: SymbolSection::InSection(0),
+                },
+            ],
+            &[],
+            &[Section {
+                name: ".data.in_ram",
+                flags: SHF_ALLOC | SHF_EXECINSTR,
+                addralign: 2,
+                data: &in_ram,
+                relocations: &[],
+            }],
+        );
+        let object = read_object(&bytes).unwrap();
+        assert_eq!(
+            object.text, in_flash,
+            "the text holds the flash function alone"
+        );
+        assert!(
+            object
+                .input_sections
+                .iter()
+                .all(|s| s.name != ".data.in_ram")
+        );
+        assert_eq!(object.data, in_ram);
+        assert_eq!(object.data_sections.len(), 1);
+        assert_eq!(object.data_sections[0].name, ".data.in_ram");
+        assert!(object.data_sections[0].executable);
+        let ram = object.symbols.iter().find(|s| s.name == "in_ram").unwrap();
+        assert!(ram.data && !ram.bss);
+        assert_eq!(
+            ram.value, 1,
+            "its offset into the data extent, with the Thumb bit"
+        );
+        let flash = object
+            .symbols
+            .iter()
+            .find(|s| s.name == "in_flash")
+            .unwrap();
+        assert!(!flash.data);
+    }
+
+    #[test]
+    fn writable_initialized_data_is_carried_with_its_bytes_and_its_relocations() {
+        let text = [0x01, 0x20, 0x70, 0x47];
+        let byte = [0x07];
+        let table = [0x2a, 0, 0, 0, 0, 0, 0, 0];
+        let bytes = write_relocatable_object_with_sections(
+            Machine::Arm,
+            &text,
+            &[
+                Symbol {
+                    name: "f",
+                    value: 1,
+                    size: 4,
+                    binding: Binding::Global,
+                    kind: SymbolType::Func,
+                    section: SymbolSection::Text,
+                },
+                Symbol {
+                    name: "flag",
+                    value: 0,
+                    size: 1,
+                    binding: Binding::Global,
+                    kind: SymbolType::NoType,
+                    section: SymbolSection::InSection(0),
+                },
+                Symbol {
+                    name: "table",
+                    value: 0,
+                    size: 8,
+                    binding: Binding::Global,
+                    kind: SymbolType::NoType,
+                    section: SymbolSection::InSection(1),
+                },
+            ],
+            &[],
+            &[
+                Section {
+                    name: ".data.flag",
+                    flags: SHF_ALLOC | SHF_WRITE,
+                    addralign: 1,
+                    data: &byte,
+                    relocations: &[],
+                },
+                Section {
+                    name: ".data.table",
+                    flags: SHF_ALLOC | SHF_WRITE,
+                    addralign: 4,
+                    data: &table,
+                    relocations: &[Relocation {
+                        offset: 4,
+                        symbol: 0,
+                        kind: arm::R_ARM_ABS32,
+                        addend: 0,
+                    }],
+                },
+            ],
+        );
+        let object = read_object(&bytes).unwrap();
+        assert_eq!(object.text, text);
+        assert_eq!(object.data, [0x07, 0, 0, 0, 0x2a, 0, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(object.data_align, 4);
+        let sym = |name: &str| object.symbols.iter().find(|s| s.name == name).unwrap();
+        assert!(sym("flag").data && sym("table").data && !sym("f").data);
+        assert_eq!(
+            sym("table").value,
+            4,
+            "rebased past the first section, at its own alignment"
+        );
+        assert!(object.relocations.is_empty(), "the text has no relocation");
+        assert_eq!(object.data_relocations.len(), 1);
+        assert_eq!(
+            object.data_relocations[0].offset, 8,
+            "the table's second word, in the extent"
+        );
+        assert_eq!(
+            object.symbols[object.data_relocations[0].symbol as usize].name,
+            "f"
+        );
+    }
+
+    #[test]
+    fn each_allocatable_section_goes_where_its_name_or_its_flags_say() {
+        const TEXT: u8 = 0;
+        const DATA: u8 = 1;
+        const BSS: u8 = 2;
+        const NOWHERE: u8 = 3;
+        for (name, sh_type, sh_flags, place) in [
+            (".rodata.k", SHT_PROGBITS, SHF_ALLOC, TEXT),
+            (".text.g", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, TEXT),
+            (".database", SHT_PROGBITS, SHF_ALLOC, TEXT),
+            (".data", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE, DATA),
+            (".data.k", SHT_PROGBITS, SHF_ALLOC, DATA),
+            (".sdata.k", SHT_PROGBITS, SHF_ALLOC, DATA),
+            (".gnu.linkonce.d.k", SHT_PROGBITS, SHF_ALLOC, DATA),
+            (".bss.k", SHT_PROGBITS, SHF_ALLOC, DATA),
+            (".rodata.w", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE, DATA),
+            (".bss", SHT_NOBITS, SHF_ALLOC | SHF_WRITE, BSS),
+            (".sbss.k", SHT_NOBITS, SHF_ALLOC, BSS),
+            (".eh_frame", SHT_PROGBITS, SHF_ALLOC, NOWHERE),
+            (".eh_frame", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE, NOWHERE),
+            (".ARM.exidx.text.g", SHT_ARM_EXIDX, SHF_ALLOC, NOWHERE),
+            (".note.k", SHT_NOTE, SHF_ALLOC, NOWHERE),
+        ] {
+            let object = read_object(&object_with_section(name, sh_type, sh_flags, &[1, 2, 3, 4]))
+                .unwrap_or_else(|e| panic!("{name}: {e:?}"));
+            let inside = object.symbols.iter().find(|s| s.name == "inside").unwrap();
+            let got = match (object.text.len() > 4, object.data.len(), object.bss_len) {
+                (true, 0, 0) => TEXT,
+                (false, 4, 0) => DATA,
+                (false, 0, 4) => BSS,
+                (false, 0, 0) => NOWHERE,
+                other => panic!("{name}: in more than one place, {other:?}"),
+            };
+            assert_eq!(got, place, "{name} {sh_type:#x} {sh_flags:#x}");
+            assert_eq!(inside.data, place == DATA, "{name}");
+            assert_eq!(inside.bss, place == BSS, "{name}");
+        }
+    }
+
+    #[test]
+    fn a_section_no_extent_fits_is_refused_by_name() {
+        for (name, sh_type, sh_flags, reason) in [
+            (
+                ".tdata.k",
+                SHT_PROGBITS,
+                SHF_ALLOC | SHF_WRITE | SHF_TLS,
+                Unplaceable::ThreadLocal,
+            ),
+            (
+                ".tbss",
+                SHT_NOBITS,
+                SHF_ALLOC | SHF_WRITE,
+                Unplaceable::ThreadLocal,
+            ),
+            (
+                ".init_array",
+                SHT_INIT_ARRAY,
+                SHF_ALLOC | SHF_WRITE,
+                Unplaceable::Constructors,
+            ),
+            (
+                ".fini_array",
+                SHT_FINI_ARRAY,
+                SHF_ALLOC | SHF_WRITE,
+                Unplaceable::Constructors,
+            ),
+            (
+                ".preinit_array",
+                SHT_PREINIT_ARRAY,
+                SHF_ALLOC | SHF_WRITE,
+                Unplaceable::Constructors,
+            ),
+            (
+                ".zeroes",
+                SHT_NOBITS,
+                SHF_ALLOC,
+                Unplaceable::ZeroFilledReadOnly,
+            ),
+            (
+                ".odd",
+                0x6000_0001,
+                SHF_ALLOC,
+                Unplaceable::UnknownType(0x6000_0001),
+            ),
+        ] {
+            assert_eq!(
+                read_object(&object_with_section(name, sh_type, sh_flags, &[1, 2, 3, 4]))
+                    .unwrap_err(),
+                ElfError::UnplaceableSection {
+                    name: String::from(name),
+                    reason,
+                },
+                "{name}"
+            );
+        }
+        let empty =
+            object_with_section(".tdata", SHT_PROGBITS, SHF_ALLOC | SHF_WRITE | SHF_TLS, &[]);
+        assert!(read_object(&empty).is_ok());
+    }
+
+    #[test]
+    fn read_archive_refuses_an_elf_member_the_reader_refuses_and_skips_a_file_that_is_not_elf() {
+        let good = object_with_section(".rodata.k", SHT_PROGBITS, SHF_ALLOC, &[1, 2, 3, 4]);
+        let bad = object_with_section(
+            ".tdata",
+            SHT_PROGBITS,
+            SHF_ALLOC | SHF_WRITE | SHF_TLS,
+            &[0; 4],
+        );
+        let notes: &[u8] = b"not an object\n";
+        let archive =
+            read_archive(&make_archive(&[("good.o", &good), ("notes.txt", notes)])).unwrap();
+        assert_eq!(archive.members.len(), 1);
+        assert_eq!(archive.members[0].name, "good.o");
+        assert_eq!(
+            read_archive(&make_archive(&[
+                ("good.o", &good),
+                ("notes.txt", notes),
+                ("bad.o", &bad)
+            ]))
+            .unwrap_err(),
+            ElfError::RefusedArchiveMember {
+                member: String::from("bad.o"),
+                error: Box::new(ElfError::UnplaceableSection {
+                    name: String::from(".tdata"),
+                    reason: Unplaceable::ThreadLocal,
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn a_ram_section_name_is_its_family_or_the_family_and_a_suffix() {
+        for name in [
+            ".data",
+            ".data.x",
+            ".data.rel.ro",
+            ".bss",
+            ".bss.x",
+            ".sdata",
+            ".sbss.x",
+        ] {
+            assert!(is_ram_section_name(name), "{name}");
+        }
+        for name in [".gnu.linkonce.d.x", ".gnu.linkonce.b.x"] {
+            assert!(is_ram_section_name(name), "{name}");
+        }
+        for name in [
+            ".text",
+            ".rodata",
+            ".database",
+            ".datax",
+            ".bsss",
+            "data",
+            ".gnu.linkonce.t.x",
+        ] {
+            assert!(!is_ram_section_name(name), "{name}");
+        }
     }
 }

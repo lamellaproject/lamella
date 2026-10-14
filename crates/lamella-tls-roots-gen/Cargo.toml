@@ -1,0 +1,12 @@
+[package]
+name = "lamella-tls-roots-gen"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Generates the root-certificate store that lamella-tls-roots carries -- every root's DER concatenated, and an index of the roots sorted by subject Name -- from curl's copy of the Mozilla CA store (cacert.pem). A host tool; it uses the standard library and nothing else."
+publish = false
+
+[lints]
+workspace = true

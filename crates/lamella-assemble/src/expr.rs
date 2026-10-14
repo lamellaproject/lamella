@@ -239,7 +239,12 @@ pub fn emit_expression(
                 {
                     emit_string_equality(*operator == BinaryOperator::NotEqual, tokens, out)
                 } else {
-                    emit_binary(*operator, &left.ty, *checked, tokens, out)
+                    let operand_ty = if tokens.is_enum(&right.ty) && !tokens.is_enum(&left.ty) {
+                        &right.ty
+                    } else {
+                        &left.ty
+                    };
+                    emit_binary(*operator, operand_ty, *checked, tokens, out)
                 }
             }
         },
@@ -375,10 +380,12 @@ pub fn emit_expression(
             delegate_type,
             target,
             receiver,
+            virtual_slot,
         } => emit_delegate_creation(
             delegate_type,
             target,
             receiver.as_deref(),
+            *virtual_slot,
             frame,
             tokens,
             out,
@@ -1417,14 +1424,16 @@ pub(crate) fn emit_argument(
 }
 
 /// Lowers `new D(method)`: push the target object (`ldnull` for a static target, else the
-/// receiver), the function pointer, then `newobj D::.ctor`. A virtual instance target reached
-/// through an object loads the pointer from the object's runtime type (`dup; ldvirtftn`,
-/// III.4.18), so an override is honored; a static, `base`-qualified, value-type, or non-virtual
-/// target binds the exact method named by the token (`ldftn`).
+/// receiver), the function pointer, then `newobj D::.ctor`. A target in a virtual slot
+/// (`virtual_slot`, the binder's answer from the bound method) reached through an object loads
+/// the pointer from the object's runtime type (`dup; ldvirtftn`, III.4.18), so an override is
+/// honored; a static, `base`-qualified, value-type, or non-virtual target binds the exact method
+/// named by the token (`ldftn`).
 fn emit_delegate_creation(
     delegate_type: &TypeSymbol,
     target: &lamella_binder::MethodReference,
     receiver: Option<&BoundExpr>,
+    virtual_slot: bool,
     frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
@@ -1436,9 +1445,7 @@ fn emit_delegate_creation(
         ))?;
     let through_object = matches!(receiver, Some(r)
         if !matches!(r.kind, BoundExprKind::Base) && !is_value_type(&r.ty, tokens));
-    let virtual_target = !target.is_static
-        && through_object
-        && tokens.is_virtual_method(&target.declaring_type, &target.name, &target.parameters);
+    let virtual_target = !target.is_static && through_object && virtual_slot;
     match receiver {
         Some(receiver) => {
             emit_expression(receiver, frame, tokens, out)?;
@@ -2586,13 +2593,26 @@ pub(crate) fn emit_field_receiver(
 /// mutates a readonly field that should have been copied. So the answer is "copy" only when the
 /// field is known to belong to another type; a constructor whose owner does not match stays where
 /// it was.
-fn addressable_in_place(field: &FieldReference, frame: &Frame) -> bool {
+///
+/// The evidence is the binder's rule for the same question, clause for clause: the constructor
+/// is of the type that declares the field, compared by DEFINITION (a generic type's fields are
+/// declared on `G<T>` and its constructor belongs to `G`, so an exact comparison copied every
+/// readonly struct field a generic constructor wrote, and the writes were lost); it is the static
+/// constructor for a static field and an instance one for an instance field; and an instance field
+/// is reached through `this`. The binder refuses a WRITE that fails any clause, so what reaches
+/// here failing one is a method called on the field -- `other.counter.Bump()` in a constructor --
+/// and csc calls that on a copy.
+fn addressable_in_place(field: &FieldReference, receiver: &BoundExpr, frame: &Frame) -> bool {
     if !field.is_readonly {
         return true;
     }
     match frame.constructor_of() {
         None => false,
-        Some(owner) => owner == &field.declaring_type,
+        Some((owner, in_static_constructor)) => {
+            in_static_constructor == field.is_static
+                && (field.is_static || matches!(receiver.kind, BoundExprKind::This))
+                && lamella_binder::symbols::same_type_definition(owner, &field.declaring_type)
+        }
     }
 }
 
@@ -2615,7 +2635,7 @@ pub(crate) fn emit_value_type_receiver(
             receiver: container,
             field: Some(field),
             ..
-        } if field.constant.is_none() && addressable_in_place(field, frame) => {
+        } if field.constant.is_none() && addressable_in_place(field, container, frame) => {
             let token =
                 tokens
                     .field(&field.declaring_type, &field.name)
@@ -2918,23 +2938,7 @@ fn emit_literal(
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
     match literal {
-        Literal::Integer { value, .. } => {
-            let wide = matches!(
-                ty,
-                TypeSymbol::Special(SpecialType::Int64 | SpecialType::UInt64)
-            ) || matches!(
-                tokens.enum_underlying(ty),
-                Some(SpecialType::Int64 | SpecialType::UInt64)
-            );
-            if wide {
-                out.push(Instruction::new(
-                    Opcode::LdcI8,
-                    Operand::Int64(*value as i64),
-                ));
-            } else {
-                out.push(load_i4(*value as i32));
-            }
-        }
+        Literal::Integer { value, .. } => out.push(integer_constant(*value as i64, ty, tokens)),
         Literal::Boolean(value) => out.push(load_i4(i32::from(*value))),
         Literal::Character(value) => out.push(load_i4(i32::from(*value))),
         Literal::Null => out.push(Instruction::simple(Opcode::Ldnull)),
@@ -3480,6 +3484,21 @@ fn push_logical_negation(out: &mut Vec<Instruction>) {
 
 fn load_i4(value: i32) -> Instruction {
     Instruction::new(Opcode::LdcI4, Operand::Int32(value))
+}
+
+/// The instruction that loads the integer constant `value` as a value of type `ty`: `ldc.i8` for a
+/// `long` or `ulong`, and for an enum whose underlying type is one of them, since an enum's value IS
+/// its underlying integer (ECMA-335 II.14.3); `ldc.i4`, with the low 32 bits, for every narrower type.
+///
+/// **A LITERAL AND A `switch`'s CASE LABEL LOAD THROUGH THIS ONE RULE**, so a case label of a
+/// `long`-backed enum keeps its upper 32 bits exactly as the same constant does anywhere else.
+pub(crate) fn integer_constant(value: i64, ty: &TypeSymbol, tokens: &Tokens) -> Instruction {
+    match conversion_operand_type(ty, tokens) {
+        TypeSymbol::Special(SpecialType::Int64 | SpecialType::UInt64) => {
+            Instruction::new(Opcode::LdcI8, Operand::Int64(value))
+        }
+        _ => load_i4(value as i32),
+    }
 }
 
 #[cfg(test)]

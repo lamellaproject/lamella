@@ -9,9 +9,14 @@
 # Compiling it into a reference assembly is what lets a program name its board once and then use the
 # standard device APIs without naming a Lamella type again:
 #
-#     new Pico2();                                  // arms the board's driver table
+#     new TargetBoard();                            // the board it was built for: binds its buses
 #     GpioController gpio = new GpioController();   // standard dotnet/iot, no Lamella type named
 #     GpioPin led = gpio.OpenPin(25, PinMode.Output);
+#
+# `Lamella.Hardware.TargetBoard` is one source, `bsp/TargetBoard.cs`, compiled into every board's
+# assembly beside the board's generated `TargetBoardFacts`, which names the board and arms it. So the
+# class is the same on every board, and the board a program constructs is the one whose assembly it
+# was built against.
 #
 # `build-managed.ps1` is the other half and runs FIRST: it builds corlib + libs/ into -OutDir, and
 # this reads them back as references. Run that, then this.
@@ -25,6 +30,13 @@
 # generated bindings and the board class come from `bsp/<board>/csharp/`, and the register layouts,
 # binding descriptors and drivers they name come from `csp/<family>/csharp/`. Neither half compiles
 # alone.
+#
+# A family with a System.Device.Gpio of its own (`build-managed.ps1` builds one for each
+# `libs/System.Device.Gpio/Families/<family>.cs`, at `families/<family>/`) carries some of those csp
+# sources in that build, which an image for the board links in place of the shared one. Its boards'
+# assemblies leave those sources out and are compiled against that build, so each csp type is in
+# exactly one assembly: the image does not link with a type defined in two, and `build-managed.ps1`
+# says why.
 
 [CmdletBinding()]
 param(
@@ -42,11 +54,16 @@ $root = $PSScriptRoot
 # unused reference costs nothing.
 $BoardReferences = @(
     'corlib',                          # every assembly
-    'System.Device.Gpio',              # GpioDriver/I2cDriver/SpiDriver seams + the dotnet/iot facades
+    'System.Device.Gpio',              # GpioDriver/I2cDriver/SpiDriver seams + the dotnet/iot facades;
+                                       # the family's own build, for a family that has one
     'Lamella.Hardware',                # Mmio, and the bus table a board class binds into
-    'nanoFramework.System.Device.Adc', # AdcDriver/AdcController, for the boards that expose one
     'System.Device.Analog'             # AnalogController, which the boards with a converter hand out
 )
+
+# The source every board assembly compiles beside its own: the hand-written half of
+# `Lamella.Hardware.TargetBoard`. Its other half is the board's generated `TargetBoardFacts.g.cs`.
+$TargetBoardSource = Join-Path $root 'bsp/TargetBoard.cs'
+if (-not (Test-Path $TargetBoardSource)) { throw "$TargetBoardSource is missing: every board assembly compiles it" }
 
 # --- Locate the compiler (same contract as build-managed.ps1) -----------------------------------
 if (-not $Lcsc) {
@@ -217,6 +234,8 @@ if ($Board) {
 if (-not $boards.Count) { throw 'no bsp/*/csharp directories found' }
 
 $built = @()
+# Each family's list of the csp sources its own System.Device.Gpio carries, asked once per family.
+$FamilySources = @{}
 foreach ($boardDir in $boards) {
     $name = Resolve-BoardName (Join-Path $boardDir.FullName 'csharp') $boardDir.Name
     $vendor = Resolve-BoardVendor (Join-Path $boardDir.FullName 'csharp') $boardDir.Name
@@ -232,12 +251,37 @@ foreach ($boardDir in $boards) {
 
     $standards = @(Resolve-ConnectorStandards $boardDir.FullName)
     $extSrc = @(Resolve-ExtensionSources $root $standards)
-    $src = @(Get-Sources $familyCs -Recurse) + @(Get-Sources (Join-Path $boardDir.FullName 'csharp') -Recurse) + $extSrc
+    $cspSrc = @(Get-Sources $familyCs -Recurse)
+    $gpioDll = Join-Path $out 'System.Device.Gpio.dll'
+    $cspNote = "csp/$family"
+    # The family's own System.Device.Gpio carries some csp sources: they are left out here, and the
+    # assembly is compiled against that build. build-managed.ps1, which compiles them, says which they
+    # are, so one reader of the list serves both scripts.
+    if (Test-Path (Join-Path $root "libs/System.Device.Gpio/Families/$family.cs")) {
+        if (-not $FamilySources.ContainsKey($family)) {
+            $listed = @(& pwsh -NoProfile -File (Join-Path $root 'build-managed.ps1') -PrintFamilySources $family)
+            if ($LASTEXITCODE -ne 0 -or -not $listed.Count) {
+                throw "build-managed.ps1 -PrintFamilySources $family named no sources, so which csp/$family/csharp sources its System.Device.Gpio carries is unknown"
+            }
+            $FamilySources[$family] = $listed
+        }
+        $prefix = $familyCs.TrimEnd('\', '/').Length + 1
+        $cspSrc = @($cspSrc | Where-Object { $FamilySources[$family] -notcontains $_.Substring($prefix).Replace('\', '/') })
+        $gpioDll = Join-Path $out "families/$family/System.Device.Gpio.dll"
+        if (-not (Test-Path $gpioDll)) {
+            throw "'families/$family/System.Device.Gpio.dll' is not in '$out'. Run build-managed.ps1 -OutDir '$OutDir' first."
+        }
+        $cspNote = "csp/$family less its System.Device.Gpio's $($FamilySources[$family].Count)"
+    }
+    $src = $cspSrc + @(Get-Sources (Join-Path $boardDir.FullName 'csharp') -Recurse) + $extSrc + @($TargetBoardSource)
     $dll = Join-Path $out "Lamella.Boards.$qualified.dll"
-    $refs = @($BoardReferences | ForEach-Object { "/reference:$(Join-Path $out "$_.dll")" })
+    $refs = @($BoardReferences | ForEach-Object {
+            $reference = if ($_ -eq 'System.Device.Gpio') { $gpioDll } else { Join-Path $out "$_.dll" }
+            "/reference:$reference"
+        })
 
     $extNote = if ($extSrc.Count) { " + $($extSrc.Count) ext" } else { '' }
-    Write-Host "Lamella.Boards.$qualified ($($src.Count) sources: csp/$family + bsp/$($boardDir.Name)$extNote) -> $dll"
+    Write-Host "Lamella.Boards.$qualified ($($src.Count) sources: $cspNote + bsp/$($boardDir.Name)$extNote) -> $dll"
     & $Lcsc @src @defineArg @refs /target:library "/out:$dll" /debug-
     # The argument vector goes in the message. A compiler that rejects its COMMAND LINE prints no
     # `error CS` diagnostic at all, so an exit code on its own reads as a crash in sources the line

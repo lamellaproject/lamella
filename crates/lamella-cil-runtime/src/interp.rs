@@ -10471,7 +10471,7 @@ mod tests {
     fn an_image_baked_before_the_trigger_tables_is_refused_until_booted() {
         let (mut module, main) = static_readonly_program();
         let image = module.write_baked(Some(main)).expect("bake");
-        let older = crate::module::image_without_trailing_tables(&image, 3);
+        let older = crate::module::image_without_trailing_tables(&image, 4);
         let image: &'static [u8] = Box::leak(older.into_boxed_slice());
         let (baked, entry) = Module::from_baked(image).expect("an older image still reads");
         let entry = entry.expect("the image records its entry point");

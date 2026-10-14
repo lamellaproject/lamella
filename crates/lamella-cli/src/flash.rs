@@ -113,7 +113,7 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             "--board",
             "--probe",
             "--volume",
-            "--device",
+            "--dfu",
             "--via",
             crate::bootprot::RESTORE_USER_ROW,
         ],
@@ -240,7 +240,7 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             eprintln!(
                 "lamella flash: {} is loaded BY firmware rather than written to a chip -- it needs \
                  a board that\nis already running Lamella, not a probe.\n\n\
-                 \x20   lamella deploy {} --target <t>\n\n\
+                 \x20   lamella deploy {} --device <d>\n\n\
                  `lamella devices` prints the target for each attached board.",
                 path.display(),
                 path.display()
@@ -275,7 +275,7 @@ pub fn flash_command(args: &[String]) -> ExitCode {
         chosen,
         parsed.value("--probe"),
         parsed.value("--volume"),
-        parsed.value("--device"),
+        parsed.value("--dfu"),
     ) {
         Ok(selector) => selector,
         Err(error) => {
@@ -475,7 +475,7 @@ pub fn deploy_to_chip(
         }
         None
     };
-    let source = match (&project, std::fs::read_to_string(path)) {
+    let source = match (&project, crate::text::read_text(path)) {
         (Some(_), _) => String::new(),
         (None, Ok(source)) => source,
         (None, Err(error)) => {
@@ -649,7 +649,7 @@ pub fn debug_elf_for_board(
         let project = crate::project::Project::read_file(path, "build")?;
         let libraries = project_libraries(&project, Tier::ClassLibrary, "build")?;
         let debuggable =
-            crate::program::compile_project_for_debugging(&project, &libraries, "build")?;
+            crate::program::compile_project_for_debugging(&project, &libraries, Some(board_id), "build")?;
         debug_elf_from(&debuggable, board_id, aot_target, "build", path)
     } else {
         let debuggable = crate::program::compile_csharp_for_debugging(
@@ -657,6 +657,7 @@ pub fn debug_elf_for_board(
             source,
             unsafe_code,
             libraries,
+            Some(board_id),
             "build",
         )?;
         debug_elf_from(&debuggable, board_id, aot_target, "build", path)
@@ -682,6 +683,7 @@ fn debug_elf_from(
             &debuggable.libraries,
             archive,
             aot_target,
+            lamella_wire_host::boards::bus_table(Some(board_id)),
         )
     })
 }
@@ -952,7 +954,7 @@ fn read_libraries(named: &[&str], verb: &str) -> Result<Vec<Library>, String> {
 ///
 /// **IGNORING IT IS THE ONE THING THIS MUST NOT DO.** The flat tier resolves no call outside the
 /// program, so a library named at it can have no effect -- and an input accepted and then
-/// discarded is this crate's oldest defect shape: a `--target` quietly ignored looks exactly like a
+/// discarded is this crate's oldest defect shape: a `--device` quietly ignored looks exactly like a
 /// board that did not respond. The reader is told, and nothing is built.
 fn reference_without_the_tier(verb: &str, named: &[&str]) -> String {
     let listed = named
@@ -994,6 +996,7 @@ fn build_image(
             source,
             unsafe_code,
             libraries,
+            Some(board_id),
             verb,
         )?;
         (compiled.assembly, compiled.corlib, compiled.libraries)
@@ -1003,6 +1006,7 @@ fn build_image(
             source,
             unsafe_code,
             libraries,
+            Some(board_id),
             verb,
         )?;
         (assembly, corlib, Vec::new())
@@ -1043,11 +1047,11 @@ fn build_project_image(
     let libraries = project_libraries(project, tier, verb)?;
     let (assembly, corlib, link) = if compiles_as_debug_build(tier) {
         let compiled =
-            crate::program::compile_project_for_debugging(project, &libraries, verb)?;
+            crate::program::compile_project_for_debugging(project, &libraries, Some(board_id), verb)?;
         (compiled.assembly, compiled.corlib, compiled.libraries)
     } else {
         let (assembly, corlib) =
-            crate::program::compile_project_assembly(project, &libraries, verb)?;
+            crate::program::compile_project_assembly(project, &libraries, Some(board_id), verb)?;
         (assembly, corlib, Vec::new())
     };
     image_from_assembly(&assembly, &corlib, board_id, aot_target, tier, &link, verb, path)
@@ -1087,7 +1091,7 @@ fn image_from_assembly(
     require_static_main(assembly, verb, path)?;
     if tier == Tier::ClassLibrary {
         return class_library_build(board_id, aot_target, verb, |archive| {
-            linked_build(assembly, corlib, libraries, archive, aot_target)
+            linked_build(assembly, corlib, libraries, archive, aot_target, lamella_wire_host::boards::bus_table(Some(board_id)))
         });
     }
     lamella_aot::build::build(assembly, aot_target)
@@ -1163,6 +1167,10 @@ fn library_bytes(libraries: &[Vec<u8>]) -> Vec<&[u8]> {
 /// **TWO ARMS RATHER THAN A `cfg!` INSIDE ONE**, because the entry point does not EXIST without the
 /// feature: a single body would not compile in a build that left the tier out, which is the
 /// configuration the refusal above is written for.
+///
+/// `board_buses` is the bus table of the board the image is for ([`lamella_wire_host::boards::bus_table`]), laid
+/// into the image for `System.Device`'s factories to find each bus in. `None` lays none, and every
+/// bus then reads as absent.
 #[cfg(feature = "class-library")]
 fn linked_build(
     assembly: &[u8],
@@ -1170,13 +1178,15 @@ fn linked_build(
     libraries: &[Vec<u8>],
     archive: &[u8],
     aot_target: &str,
+    board_buses: Option<&[u32]>,
 ) -> Result<Vec<u8>, String> {
-    lamella_aot::build::build_linked_cortex_m_with_libraries(
+    lamella_aot::build::build_linked_cortex_m_with_board(
         assembly,
         corlib,
         &library_bytes(libraries),
         archive,
         aot_target,
+        board_buses,
     )
     .map_err(|error| format!("{error}"))
 }
@@ -1222,6 +1232,7 @@ fn linked_build(
     _libraries: &[Vec<u8>],
     _archive: &[u8],
     _aot_target: &str,
+    _board_buses: Option<&[u32]>,
 ) -> Result<Vec<u8>, String> {
     Err("the class-library tier is not compiled into this build".to_owned())
 }
@@ -1237,17 +1248,19 @@ fn linked_debug_build(
     libraries: &[Vec<u8>],
     archive: &[u8],
     aot_target: &str,
+    board_buses: Option<&[u32]>,
 ) -> Result<Vec<u8>, String> {
     let pdb = lamella_metadata::PortablePdb::read(pdb).map_err(|error| {
         format!("the debug information the compiler wrote does not read back: {error:?}")
     })?;
-    lamella_aot::build::build_linked_cortex_m_debug(
+    lamella_aot::build::build_linked_cortex_m_debug_with_board(
         assembly,
         &pdb,
         corlib,
         &library_bytes(libraries),
         archive,
         aot_target,
+        board_buses,
     )
     .map_err(|error| format!("{error}"))
 }
@@ -1261,6 +1274,7 @@ fn linked_debug_build(
     _libraries: &[Vec<u8>],
     _archive: &[u8],
     _aot_target: &str,
+    _board_buses: Option<&[u32]>,
 ) -> Result<Vec<u8>, String> {
     Err("the class-library tier is not compiled into this build".to_owned())
 }
@@ -1386,7 +1400,7 @@ fn class_library_refusal(verb: &str, aot_target: &str) -> String {
 /// Why the tier flag cannot be honored on a route that builds no image.
 ///
 /// **AN OPTION ACCEPTED AND THEN DROPPED IS THIS CRATE'S OLDEST DEFECT SHAPE.** Its own parser says
-/// so: a `--target` quietly ignored looks exactly like a board that did not respond. `flag` chooses
+/// so: a `--device` quietly ignored looks exactly like a board that did not respond. `flag` chooses
 /// what a program is LINKED against, and two of the routes that take it link nothing -- so
 /// somebody passing it there believes they chose a tier and did not.
 ///
@@ -1450,7 +1464,7 @@ const USAGE: &str = "\
 usage: lamella flash <image> [--board <id>] [--via probe|volume]
                           [--probe <serial>]      which probe, on a probe route
                           [--volume <name>]       which drive, on a volume route
-                          [--device <serial>]     which bootloader, on a USB DFU route
+                          [--dfu <serial>]        which bootloader, on a USB DFU route
                           [--replace-bootloader]  over the board's bootloader, not behind it
        lamella flash --board <id> --clear-bootprot [--dry-run] [--probe <serial>]
        lamella flash --board <id> --restore-user-row <file> [--dry-run] [--probe <serial>]
@@ -1466,7 +1480,7 @@ them but a .uf2 is wrapped into one here, because the address and the family id 
 facts about the board and are already known. An image larger than the board's flash is refused
 before anything is opened.
 
---probe names WHICH probe when more than one is attached; --volume names which drive; --device
+--probe names WHICH probe when more than one is attached; --volume names which drive; --dfu
 names which system bootloader, over USB DFU. They are different questions and each belongs to one
 route, so naming the wrong one is refused rather than ignored. Without one, a probe route takes
 LAMELLA_PROBE_SERIAL and then the sole attached probe, the other routes take the sole candidate,
@@ -2015,6 +2029,38 @@ class Program
         }
     }
 
+    /// **A CLASS-LIBRARY IMAGE FOR A BOARD CARRIES THAT BOARD's BUS TABLE**, laid by the link word
+    /// for word as the catalog holds it, and so does the ELF a debugger is given for it. Skipped
+    /// where no runtime support archive has been built for the board.
+    #[test]
+    fn a_class_library_image_for_a_board_lays_the_boards_bus_table() {
+        let board = "rpi-pico2-w";
+        if !csharp_compiler_is_available() || !linked_tier_compiled_in() {
+            return;
+        }
+        let target = target_to_build_for(board).expect("the board has an ahead-of-time target");
+        if crate::tiers::runtime_archive(board, target).is_err() {
+            return;
+        }
+        let table = lamella_wire_host::boards::bus_table(Some(board)).expect("the board has a bus table");
+        let words: Vec<u8> = table.iter().flat_map(|word| word.to_le_bytes()).collect();
+        let fixture = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../lamella-wire-host/tests/fixtures/ReadsTheBusTable.cs"
+        );
+        let Ok(program) = std::fs::read_to_string(fixture) else {
+            return;
+        };
+        let path = Path::new("Buses.cs");
+
+        let (image, _) = image_for_board(path, &program, board, false, Tier::ClassLibrary, &[])
+            .unwrap_or_else(|error| panic!("the program links: {error}"));
+        assert!(image.windows(words.len()).any(|at| at == words.as_slice()), "the image carries the table");
+        let elf = debug_elf_for_board(path, &program, board, false, &[])
+            .unwrap_or_else(|error| panic!("the debug ELF links: {error}"));
+        assert!(elf.windows(words.len()).any(|at| at == words.as_slice()), "and so does the ELF");
+    }
+
     /// The reach of the flag is stated where somebody meets its edge, not only in the help.
     #[test]
     fn a_target_the_linked_tier_has_no_plan_for_is_refused_with_the_ones_it_does() {
@@ -2349,6 +2395,7 @@ class Program
             program,
             false,
             &broken,
+            None,
             "deploy",
         ) else {
             panic!("three bytes are not an assembly");
@@ -2358,6 +2405,7 @@ class Program
             program,
             false,
             &broken,
+            None,
             "build",
         ) else {
             panic!("three bytes are not an assembly, compiled plainly either");

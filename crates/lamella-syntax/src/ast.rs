@@ -1142,6 +1142,10 @@ pub struct CompilationUnit {
 pub struct QualifiedName {
     /// The dot-separated parts, in order.
     pub parts: Vec<Box<str>>,
+    /// Whether the RIGHT-MOST part was written as a verbatim identifier, `@Example`. Only an
+    /// attribute name reads it: there it names the class exactly as written, never the class with
+    /// `Attribute` appended (21.3).
+    pub last_verbatim: bool,
     /// The byte range the name covers.
     pub span: Span,
 }

@@ -2,9 +2,15 @@
 #if LAMELLA_SURFACE_THREADS
 namespace System.Threading
 {
+#if LAMELLA_SURFACE_NETFX_2_0
+    public static class Monitor
+#else
     public sealed class Monitor
+#endif
     {
+#if !LAMELLA_SURFACE_NETFX_2_0
         private Monitor() { }
+#endif
 
         private static void RequireObject(object obj)
         {

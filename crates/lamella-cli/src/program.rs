@@ -55,10 +55,10 @@ generated `board` module on the import path -- a fact table, with nothing behind
 which is not what `run` means to a reader.
 
     (neither)         run it on this machine
-    --target <t>      run it ON the board at <t>, with its output here";
+    --device <d>      run it ON the board at <d>, with its output here";
 
 const RUN_USAGE: &str = "\
-usage: lamella run <file.cs|file.csproj|file.py|file.js> [--target <t>]
+usage: lamella run <file.cs|file.csproj|file.py|file.js> [--device <d>]
 
 Compiles and runs the program, and STAYS until it ends -- its output appears here as it is
 printed. A program written to loop forever runs until you stop this tool.
@@ -68,10 +68,10 @@ find out whether a program compiles and does what you meant.
 
 A .csproj compiles every .cs beside it as one program, as `lamella build` compiles it. This
 machine runs a program against the class library alone, so here a project that references
-libraries of its own is refused; with --target the board is sent them, and
+libraries of its own is refused; with --device the board is sent them, and
 `lamella build --board <id> --format <f>` links them.
 
---target <t> runs a C# program -- a .cs or a .csproj -- ON a board that already has firmware, with
+--device <d> runs a C# program -- a .cs or a .csproj -- ON a board that already has firmware, with
 the output still appearing here. `lamella devices` prints the word to pass. The program is
 deployed as `lamella deploy` deploys it, so the board stores it and runs it again at every reset,
 and it then runs under the board's scheduler: threads, locks and blocking calls such as a socket's
@@ -87,7 +87,7 @@ and putting it on a board while returning you to your shell is `deploy`.";
 /// `lamella run <file> [--board <id>]`: compile and run on this machine.
 pub fn run_command(args: &[String]) -> ExitCode {
     let spec =
-        Spec { verb: "run", usage: Some(RUN_USAGE), values: &["--board", "--target"], flags: &[] };
+        Spec { verb: "run", usage: Some(RUN_USAGE), values: &["--board", "--device"], flags: &[] };
     let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
         Err(halt) => return halt.code(),
@@ -103,7 +103,7 @@ pub fn run_command(args: &[String]) -> ExitCode {
         eprintln!("lamella run: {BOTH_MODES}");
         return ExitCode::FAILURE;
     }
-    if let Some(target) = parsed.value("--target") {
+    if let Some(target) = parsed.value("--device") {
         return run_on_target(&path, target);
     }
     if crate::flash::is_project(&path) {
@@ -227,7 +227,7 @@ fn run_on_target(_path: &Path, _target: &str) -> ExitCode {
         "lamella run: this build cannot run a program on a board.\n\n\
          Doing so bakes it into an image first, which needs the `bake` feature:\n\
          \x20   cargo build -p lamella-cli --features bake\n\n\
-         Without a --target this build runs the program on THIS machine, which needs nothing."
+         Without a --device this build runs the program on THIS machine, which needs nothing."
     );
     ExitCode::FAILURE
 }
@@ -291,7 +291,7 @@ fn project_outcome(path: &Path) -> Result<Result<Outcome, ReplError>, String> {
         "This verb runs a program on this machine",
         &format!("lamella build {} --board <id> --format <f>", path.display()),
     )?;
-    let (assembly, corlib) = compile_project_assembly(&project, &[], "run")?;
+    let (assembly, corlib) = compile_project_assembly(&project, &[], None, "run")?;
     let mut link = LoopbackLink::new(corlib, install_host_clock);
     Ok(link
         .run(1, &assembly)
@@ -611,12 +611,19 @@ pub fn build_command(args: &[String]) -> ExitCode {
     let libraries: Vec<crate::flash::Library> = Vec::new();
 
     if let Some(name) = parsed.value("--format") {
+        let board = match crate::project::board_for_build("build", &path, parsed.value("--board")) {
+            Ok(board) => board,
+            Err(error) => {
+                eprintln!("{error}");
+                return ExitCode::FAILURE;
+            }
+        };
         return build_flashable(
             &path,
             &source,
             language,
             name,
-            parsed.value("--board"),
+            board.as_deref(),
             parsed.value("--out"),
             parsed.flag("--unsafe"),
             tier,
@@ -656,7 +663,7 @@ pub fn build_command(args: &[String]) -> ExitCode {
     }
 
     let built = match language {
-        Language::CSharp => build_csharp(&path, &source, parsed.flag("--unsafe")),
+        Language::CSharp => build_csharp(&path, &source, parsed.flag("--unsafe"), parsed.value("--board")),
         Language::Python => build_python(&path, &source, parsed.value("--board")),
         Language::JavaScript => Err(format!(
             "{}: lamella build produces a device artifact, and the JavaScript tier runs on this \
@@ -768,7 +775,8 @@ fn build_flashable(
     };
     let Some(board_id) = board_id else {
         eprintln!(
-            "lamella build: --format wants --board too.\n\n\
+            "lamella build: --format wants --board too, or a project that names its board with \
+             <LamellaTargetBoard>.\n\n\
              A record format describes an image for a specific chip -- its addresses are that \
              chip's -- so\nthere is no board-independent answer to write."
         );
@@ -965,25 +973,29 @@ struct Built {
 /// A `--features bake` build turns the assembly into the flash image a device runs; without it the
 /// assembly is as far as this verb goes. See the crate documentation for why that feature is not
 /// on by default.
-fn build_csharp(path: &Path, source: &str, unsafe_code: bool) -> Result<Built, String> {
+///
+/// An image for `board` carries the board's bus table and binds against its family's builds; the
+/// assembly alone carries neither, so the board does not change it.
+fn build_csharp(path: &Path, source: &str, unsafe_code: bool, board: Option<&str>) -> Result<Built, String> {
+    #[cfg(not(feature = "bake"))]
+    let _ = board;
     #[cfg(feature = "bake")]
     {
         let (assembly, references) =
-            compile_csharp_assembly_with_references(path, source, unsafe_code, &[], "build")?;
-        let image = crate::bake::bake(assembly, &references)?;
+            compile_csharp_assembly_with_references(path, source, unsafe_code, &[], board, "build")?;
+        let image = crate::bake::bake(assembly, &references, lamella_wire_host::boards::bus_table(board))?;
         return Ok(Built {
             bytes: image,
             extension: "lmli",
             what: BAKED_FLASH_IMAGE,
             note: None,
-            excludes: "the serve firmware already resident on the board, which this image is \
-                       loaded INTO rather than replacing",
+            excludes: lamella_wire_host::bake::SIZE_LEAVES_OUT,
             loaded_into_firmware: true,
         });
     }
     #[cfg(not(feature = "bake"))]
     let (assembly, _) =
-        compile_csharp_assembly_with_corlib(path, source, unsafe_code, &[], "build")?;
+        compile_csharp_assembly_with_corlib(path, source, unsafe_code, &[], None, "build")?;
     #[cfg(not(feature = "bake"))]
     Ok(Built {
         bytes: assembly,
@@ -1023,9 +1035,10 @@ pub fn compile_csharp_assembly_with_corlib(
     source: &str,
     unsafe_code: bool,
     libraries: &[crate::flash::Library],
+    board: Option<&str>,
     verb: &str,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    compile_csharp_file(path, source, unsafe_code, libraries, verb, false)
+    compile_csharp_file(path, source, unsafe_code, libraries, board, verb, false)
         .map(|compiled| (compiled.assembly, compiled.corlib))
 }
 
@@ -1042,9 +1055,10 @@ pub fn compile_csharp_assembly_with_references(
     source: &str,
     unsafe_code: bool,
     libraries: &[crate::flash::Library],
+    board: Option<&str>,
     verb: &str,
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
-    compile_csharp_file(path, source, unsafe_code, libraries, verb, false)
+    compile_csharp_file(path, source, unsafe_code, libraries, board, verb, false)
         .map(|compiled| (compiled.assembly, compiled.references))
 }
 
@@ -1070,9 +1084,10 @@ pub fn compile_csharp_for_debugging(
     source: &str,
     unsafe_code: bool,
     libraries: &[crate::flash::Library],
+    board: Option<&str>,
     verb: &str,
 ) -> Result<Debuggable, String> {
-    let compiled = compile_csharp_file(path, source, unsafe_code, libraries, verb, true)?;
+    let compiled = compile_csharp_file(path, source, unsafe_code, libraries, board, verb, true)?;
     compiled.debuggable(|| format!("lamella {verb}: {}", path.display()))
 }
 
@@ -1091,18 +1106,7 @@ pub struct Debuggable {
     pub libraries: Vec<Vec<u8>>,
 }
 
-/// The name ECMA-335 gives the kernel library, which the compiler scopes its well-known types to.
-/// A reference by this name is a reference to the corlib, whatever the corlib calls itself.
-const KERNEL_LIBRARY: &str = "mscorlib";
-
-/// Whether an assembly reference by `name` means the corlib: the kernel library's name, or the
-/// corlib's own.
-///
-/// **ONE ANSWER FOR BOTH TIERS THAT CARRY LIBRARIES**: the bake's set and the class-library link's
-/// are cut from the same reference set by it.
-pub(crate) fn names_the_corlib(name: &str, corlib: &lamella_metadata::Assembly) -> bool {
-    name == KERNEL_LIBRARY || corlib.assembly_name() == Some(name)
-}
+pub(crate) use lamella_wire_host::refusal::names_the_corlib;
 
 /// The libraries a class-library image may link beside `corlib`: every assembly of `references`, the
 /// set the program was bound against, that parses and is not named as the corlib -- in the order the
@@ -1196,15 +1200,21 @@ fn without_dot_segments(path: &Path) -> std::path::PathBuf {
 ///
 /// **ONE PATH, SO A PROGRAM IS BOUND THE SAME WAY WHETHER IT IS DEPLOYED OR DEBUGGED**: against
 /// the same references in the same order, under the same assembly name and the same options.
+///
+/// A build for `board` binds against its family's builds where the shared ones would be
+/// ([`lamella_wire_host::boards::ReferenceSet`]), so the image carries and links the drivers the board's buses
+/// take.
 fn compile_csharp_file(
     path: &Path,
     source: &str,
     unsafe_code: bool,
     libraries: &[crate::flash::Library],
+    board: Option<&str>,
     verb: &str,
     debug: bool,
 ) -> Result<Compiled, String> {
-    let compiler = LcscCompiler::discover()?;
+    let set = lamella_wire_host::boards::ReferenceSet::discover(board)?;
+    let compiler = set.compiler();
     let mut references: Vec<lamella_metadata::Assembly> = compiler
         .references()
         .iter()
@@ -1254,10 +1264,12 @@ fn compile_csharp_file(
     let Some(corlib) = compiler.references().first().cloned() else {
         return Err("the compiler found no reference assemblies".to_owned());
     };
+    let references = bound_against(compiler, libraries);
+    set.refuse_unmet(&image, &references).map_err(|why| format!("lamella {verb}: {why}"))?;
     Ok(Compiled {
         assembly: image,
         corlib,
-        references: bound_against(&compiler, libraries),
+        references,
         pdb: compiled.pdb,
     })
 }
@@ -1293,9 +1305,10 @@ fn assembly_name(path: &Path) -> String {
 pub fn compile_project_assembly(
     project: &crate::project::Project,
     libraries: &[crate::flash::Library],
+    board: Option<&str>,
     verb: &str,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    compile_project(project, libraries, verb, false)
+    compile_project(project, libraries, board, verb, false)
         .map(|compiled| (compiled.assembly, compiled.corlib))
 }
 
@@ -1308,9 +1321,10 @@ pub fn compile_project_assembly(
 pub fn compile_project_assembly_with_references(
     project: &crate::project::Project,
     libraries: &[crate::flash::Library],
+    board: Option<&str>,
     verb: &str,
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
-    compile_project(project, libraries, verb, false)
+    compile_project(project, libraries, board, verb, false)
         .map(|compiled| (compiled.assembly, compiled.references))
 }
 
@@ -1323,21 +1337,25 @@ pub fn compile_project_assembly_with_references(
 pub fn compile_project_for_debugging(
     project: &crate::project::Project,
     libraries: &[crate::flash::Library],
+    board: Option<&str>,
     verb: &str,
 ) -> Result<Debuggable, String> {
-    let compiled = compile_project(project, libraries, verb, true)?;
+    let compiled = compile_project(project, libraries, board, verb, true)?;
     compiled.debuggable(|| format!("lamella {verb}: {}", project.assembly_name))
 }
 
 /// The one project compilation behind [`compile_project_assembly`] and
-/// [`compile_project_for_debugging`]; `debug` also asks the compiler for the PDB.
+/// [`compile_project_for_debugging`]; `debug` also asks the compiler for the PDB. A build for
+/// `board` binds as [`compile_csharp_file`] describes.
 fn compile_project(
     project: &crate::project::Project,
     libraries: &[crate::flash::Library],
+    board: Option<&str>,
     verb: &str,
     debug: bool,
 ) -> Result<Compiled, String> {
-    let compiler = LcscCompiler::discover()?;
+    let set = lamella_wire_host::boards::ReferenceSet::discover(board)?;
+    let compiler = set.compiler();
     let mut references: Vec<lamella_metadata::Assembly> = compiler
         .references()
         .iter()
@@ -1357,7 +1375,7 @@ fn compile_project(
     let mut texts = Vec::with_capacity(project.sources.len());
     let mut documents = Vec::with_capacity(project.sources.len());
     for source in &project.sources {
-        let text = std::fs::read_to_string(source).map_err(|error| {
+        let text = crate::text::read_text(source).map_err(|error| {
             format!(
                 "lamella {verb}: read {}: {error}\n\n\
                  The project names it, so the build stops rather than compiling a program \
@@ -1402,10 +1420,12 @@ fn compile_project(
     let Some(corlib) = compiler.references().first().cloned() else {
         return Err("the compiler found no reference assemblies".to_owned());
     };
+    let references = bound_against(compiler, libraries);
+    set.refuse_unmet(&image, &references).map_err(|why| format!("lamella {verb}: {why}"))?;
     Ok(Compiled {
         assembly: image,
         corlib,
-        references: bound_against(&compiler, libraries),
+        references,
         pdb: compiled.pdb,
     })
 }
@@ -1613,8 +1633,13 @@ fn read(path: &Path) -> Result<(Language, String), String> {
         return Ok((Language::CSharp, String::new()));
     }
     let language = Language::of(path)?;
-    let source = std::fs::read_to_string(path)
-        .map_err(|error| format!("read {}: {error}", path.display()))?;
+    let source = match language {
+        Language::CSharp => crate::text::read_text(path),
+        Language::Python | Language::JavaScript => {
+            std::fs::read_to_string(path).map_err(|error| error.to_string())
+        }
+    }
+    .map_err(|error| format!("read {}: {error}", path.display()))?;
     Ok((language, source))
 }
 
@@ -1698,6 +1723,51 @@ mod tests {
     const PRINTS: &str = "class Program\n{\n    static void Main()\n    {\n        \
                           System.Console.WriteLine(\"from the project\");\n    }\n}\n";
 
+    /// **A PROJECT THAT NAMES ITS BOARD BUILDS FOR IT WITH NO `--board`**, and writes the image
+    /// `--board` would have: `<LamellaTargetBoard>` is the project's spelling of the option.
+    #[test]
+    fn a_project_naming_its_board_builds_its_image_with_no_board_option() {
+        if LcscCompiler::discover().is_err() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("lamella-cli-{}-named-board", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        std::fs::write(dir.join("Program.cs"), "class Program { static void Main() { } }\n")
+            .expect("write the program");
+        let write_project = |board: &str| {
+            std::fs::write(
+                dir.join("App.csproj"),
+                format!(
+                    "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    \
+                     <TargetFramework>lamella1.0</TargetFramework>\n    {board}\n  \
+                     </PropertyGroup>\n</Project>\n"
+                ),
+            )
+            .expect("write the project");
+        };
+        let build = |extra: &[&str], out: &str| {
+            let mut args = vec![dir.join("App.csproj").display().to_string()];
+            args.extend(["--format", "bin", "--nostdlib", "--out"].map(str::to_owned));
+            args.push(dir.join(out).display().to_string());
+            args.extend(extra.iter().map(|arg| (*arg).to_owned()));
+            build_command(&args)
+        };
+
+        write_project("<LamellaTargetBoard>rpi-pico2-w</LamellaTargetBoard>");
+        let named = build(&[], "named.bin");
+        write_project("");
+        let flagged = build(&["--board", "rpi-pico2-w"], "flagged.bin");
+        assert_eq!(format!("{named:?}"), format!("{:?}", ExitCode::SUCCESS), "the property alone");
+        assert_eq!(format!("{flagged:?}"), format!("{:?}", ExitCode::SUCCESS), "the option alone");
+        assert_eq!(
+            std::fs::read(dir.join("named.bin")).expect("the image the property built"),
+            std::fs::read(dir.join("flagged.bin")).expect("the image the option built"),
+            "one board, one image, however it was named"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// **A PROJECT RUNS AS `build` COMPILES IT.** `run` compiled the project file's own text, which
     /// holds no source, and reported a project with a perfectly good `Main` as having no entry point.
     #[test]
@@ -1718,6 +1788,58 @@ mod tests {
             Err(refusal) => panic!("refused: {refusal}"),
         }
         let _ = std::fs::remove_dir_all(project.parent().expect("its directory"));
+    }
+
+    /// **A PROJECT WINDOWS TOOLS WROTE RUNS AS ONE WRITTEN PLAINLY.** `Out-File` writes the project
+    /// file and its source alike, so both carry the byte-order mark here, and the source is read by
+    /// the rule the project file is: a reader that took one and refused the other would move the
+    /// refusal one file along.
+    #[test]
+    fn a_project_and_its_source_saved_with_a_byte_order_mark_run() {
+        if LcscCompiler::discover().is_err() {
+            return;
+        }
+        let project_text = "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    \
+                            <TargetFramework>lamella1.0</TargetFramework>\n  \
+                            </PropertyGroup>\n</Project>\n";
+        let projects = crate::text::as_windows_tools_save(project_text);
+        let sources = crate::text::as_windows_tools_save(PRINTS);
+        for (index, ((what, project_bytes), (_, source_bytes))) in
+            projects.into_iter().zip(sources).enumerate()
+        {
+            let project = project_at(&format!("marked-{index}"), "Exe", "", "");
+            std::fs::write(&project, project_bytes).expect("write the project");
+            let directory = project.parent().expect("its directory").to_path_buf();
+            std::fs::write(directory.join("Program.cs"), source_bytes).expect("write the program");
+            match project_outcome(&project) {
+                Ok(Ok(Outcome::Ran { output, exit, .. })) => {
+                    assert_eq!(output, "from the project\n", "{what}: the program's own output");
+                    assert_eq!(exit, 0, "{what}");
+                }
+                Ok(Err(error)) => panic!("{what}: the run failed: {error:?}"),
+                Ok(Ok(_)) => panic!("{what}: the project ran as something other than a program"),
+                Err(refusal) => panic!("{what}: refused: {refusal}"),
+            }
+            let _ = std::fs::remove_dir_all(directory);
+        }
+    }
+
+    /// **A SOURCE IS READ AS lcsc READS IT:** a byte-order mark names UTF-8 or UTF-16, and it is not
+    /// part of the program. A UTF-16 source was refused here before any compiler saw it, while
+    /// `lcsc` compiled the same file.
+    #[test]
+    fn a_source_saved_with_a_byte_order_mark_reads_as_its_text() {
+        let dir = std::env::temp_dir().join(format!("lamella-cli-{}-marked-source", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        for (what, bytes) in crate::text::as_windows_tools_save(PRINTS) {
+            let path = dir.join("Program.cs");
+            std::fs::write(&path, bytes).expect("write the program");
+            let (language, text) = read(&path).unwrap_or_else(|error| panic!("{what}: {error}"));
+            assert_eq!(language, Language::CSharp, "{what}");
+            assert_eq!(text, PRINTS, "{what}: the text, without the mark");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A class library has nothing to run, and a project that names libraries of its own would run
@@ -2340,7 +2462,7 @@ mod tests {
             !RUN_USAGE.contains("would FIT"),
             "`run --board` does not answer fit -- `build --board` does:\n{RUN_USAGE}"
         );
-        for (flag, language) in [("--target <t>", "C#")] {
+        for (flag, language) in [("--device <d>", "C#")] {
             let paragraph = RUN_USAGE
                 .split("\n\n")
                 .find(|block| block.starts_with(flag))

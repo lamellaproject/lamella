@@ -13,8 +13,6 @@ public sealed class Samd21GpioDriver : GpioDriver
 
     protected override int PinCount { get { return Pins; } }
 
-    protected override int ConvertPinNumberToLogicalNumberingScheme(int pinNumber) { return pinNumber; }
-
     protected override void OpenPin(int pinNumber)
     {
         CheckPin(pinNumber);

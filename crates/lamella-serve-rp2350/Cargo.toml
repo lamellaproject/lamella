@@ -18,6 +18,12 @@ lamella-runner = { path = "../lamella-runner", optional = true, default-features
 # The reclaiming O(1) segregated global allocator: deployed apps run unbounded, and the M33
 # has the atomic CAS its spin lock needs. Pulled by the `rp2350` part feature.
 lamella-heap = { path = "../lamella-heap", optional = true }
+# The board's half of an image, for the PSRAM bring-up the two Pico Plus 2 boards take: the one
+# call that brings the part up, proves it and wipes it, which the AOT startup makes too. Pulled by
+# the `pico-plus-2` and `pico-plus-2-w` board features, each naming its board.
+lamella-board-support = { path = "../lamella-board-support", optional = true }
+# The PSRAM's own crate, for the full walk the `psram-full-walk` flight aid runs.
+lamella-psram-qspi = { path = "../lamella-psram-qspi", features = ["rp2350-qmi"], optional = true }
 # The native-USB (driverless WinUSB) carrier: the RP2350 USB device controller as a hand-rolled
 # `usb_device::bus::UsbBus` (rp2350_usb.rs) under the shared usb_transport carrier. usb-device and
 # a critical-section implementation only -- no vendor USB-core crate; the RP2350 bus driver is in
@@ -105,13 +111,21 @@ cyw43 = [
 ]
 # The Pimoroni Pico Plus 2 W: the same firmware and the same CYW43439 radio on the same four lines
 # (its RM2 module), with its own board file and its own identity (PICO_PLUS_2_W). Combine with
-# `serve,rp2350,usb` -- `serve,rp2350,usb,pico-plus-2-w`.
-pico-plus-2-w = ["cyw43"]
+# `serve,rp2350,usb` -- `serve,rp2350,usb,pico-plus-2-w`. Its 8 MB PSRAM joins the heap at boot.
+pico-plus-2-w = [
+    "cyw43",
+    "dep:lamella-board-support",
+    "lamella-board-support/board-pimoroni-pico-plus-2-w",
+]
 # The Pimoroni Pico Plus 2: the Pico 2's firmware on an RP2350B with no radio, with its own board
 # file and its own identity (PICO_PLUS_2). Combine with `serve,rp2350,usb` --
 # `serve,rp2350,usb,pico-plus-2`. It cannot take `cyw43`: the board has no radio, and the build
-# refuses the combination.
-pico-plus-2 = []
+# refuses the combination. Its 8 MB PSRAM joins the heap at boot.
+pico-plus-2 = ["dep:lamella-board-support", "lamella-board-support/board-pimoroni-pico-plus-2"]
+# A flight aid, off by default: before the heap takes a Pico Plus 2 board's PSRAM, walk every word
+# of it under two patterns, through both views, and say the result and how long it took. It costs
+# seconds at every boot, so it is off in a release image.
+psram-full-walk = ["dep:lamella-psram-qspi"]
 # TLS on the interpreter over the wireless network: mbedTLS behind the runtime's TLS seam, keyed by
 # the RP2350's TRNG. Combine with a cyw43 build -- e.g. `serve,rp2350,usb,cyw43,tls`.
 tls = ["cyw43", "dep:lamella-tls-mbedtls"]
@@ -201,6 +215,9 @@ python-threading = ["lamella-py-runtime?/threading"]
 # The radio's images for a `cyw43` build: downloaded at a pinned commit and checked against pinned
 # hashes before the firmware carries them.
 lamella-wifi-images = { path = "../lamella-wifi-images", optional = true }
+# The board's facts, read by the one parser that generates its bindings, so the flash the build
+# sizes its deploy window by is the flash those facts state, in whichever shape they state it.
+lamella-bsp-gen = { path = "../lamella-bsp-gen" }
 
 # Declared explicitly so profile-only builds skip it: without the `serve` dependencies the modules
 # are cfg'd out and the bin cannot provide the vector-table symbols.

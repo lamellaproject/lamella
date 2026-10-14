@@ -1,14 +1,15 @@
 // Lamella managed corlib (from scratch). -- System.Diagnostics.Debug
 namespace System.Diagnostics
 {
+#if LAMELLA_SURFACE_NETFX_4_0
+    public static class Debug
+#else
     public sealed class Debug
+#endif
     {
+#if !LAMELLA_SURFACE_NETFX_4_0
         private Debug() { }
-
-        public static TraceListenerCollection Listeners
-        {
-            get { return Trace.Listeners; }
-        }
+#endif
 
         public static int IndentLevel
         {
@@ -52,10 +53,12 @@ namespace System.Diagnostics
             Trace.WriteLine(value);
         }
 
+#if LAMELLA_SURFACE_NETFX_2_0
         public static void Print(string message)
         {
-            Trace.Print(message);
+            Trace.WriteLine(message);
         }
+#endif
 
         public static void WriteIf(bool condition, string message)
         {

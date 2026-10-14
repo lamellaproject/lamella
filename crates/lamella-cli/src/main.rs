@@ -16,6 +16,7 @@ mod project;
 // Test-only: the one place that says what a rendered message may and may not contain.
 #[cfg(test)]
 mod rendered;
+mod text;
 mod tiers;
 mod verdicts;
 
@@ -61,10 +62,10 @@ const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 const USAGE: &str = "\
 usage:
   lamella devices [--identify] [--all-devices]       what is attached, and how to name it
-  lamella run <file> [--target <t>]                  run it here, or ON a board with output here
+  lamella run <file> [--device <d>]                  run it here, or ON a board with output here
   lamella build <file> [--board <id>] [--format f]   make an artifact; nothing is written
-  lamella deploy <file> --target <t> | --board <id>  compile it and put it on a board
-  lamella deploy --erase --target <t>                stop and erase the program a board stores
+  lamella deploy <file> --device <d> | --board <id>  compile it and put it on a board
+  lamella deploy --erase --device <d>                stop and erase the program a board stores
   lamella flash <image> --board <id> [--probe <s>]   write bytes that are ALREADY an image
   lamella boards                                     every board this build knows
   lamella fit --board <id> --image-bytes <n>         does an image of <n> bytes fit?
@@ -79,7 +80,7 @@ THREE VERBS PUT A PROGRAM SOMEWHERE, AND THEY DIFFER IN WHAT THEY TAKE AND WHERE
   flash <image>         AN IMAGE -> a board's chip.   Writes bytes somebody already built.
 
 `run` and `deploy` differ only in whether the tool stays. Both put the program on the board, where
-it stays and runs at every reset. `run --target` then runs it under the board's scheduler --
+it stays and runs at every reset. `run --device` then runs it under the board's scheduler --
 threads, locks and blocking calls included -- and prints what it prints, as it prints it, until it
 ends, which for a program written to loop forever means until you stop the tool. `deploy` starts
 it and leaves, which is what a production push wants.
@@ -88,12 +89,12 @@ it and leaves, which is what a production push wants.
 bare-metal image for `--board`, which is exactly what `flash` then takes. So `build` produces what
 `flash` consumes, and `deploy` is the two of them in one step.
 
-`deploy` takes ONE of two destinations, and the option chooses the route. `--target <t>` is a live
+`deploy` takes ONE of two destinations, and the option chooses the route. `--device <d>` is a live
 connection (what `devices` prints): the board's firmware stays put, only the program crosses, and a
 cycle takes seconds. `--board <id>` is a board model (what `boards` lists): it writes the chip
 over a probe and needs nothing on the board first, which is where a new board begins.
 
-NOTHING HERE NEEDS HARDWARE EXCEPT `devices`, `deploy`, `flash` AND `run --target`. `run` without a
+NOTHING HERE NEEDS HARDWARE EXCEPT `devices`, `deploy`, `flash` AND `run --device`. `run` without a
 target executes on this machine. `build` and `fit` answer from the board file and the part row; an
 attached board contributes nothing to the arithmetic.
 
@@ -139,7 +140,7 @@ mod tests {
             !summary.contains("--board"),
             "`run` has no --board; the summary must not offer one: {summary}"
         );
-        assert!(summary.contains("--target"), "and it keeps the one it has: {summary}");
+        assert!(summary.contains("--device"), "and it keeps the one it has: {summary}");
     }
 
     /// **ONE VERB IS DISPATCHED AND DELIBERATELY NOT DOCUMENTED**, so the test above cannot simply

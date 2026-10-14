@@ -1,9 +1,15 @@
 // Lamella managed corlib (from scratch). -- System.Buffer
 namespace System
 {
+#if LAMELLA_SURFACE_NETFX_2_0
+    public static class Buffer
+#else
     public sealed class Buffer
+#endif
     {
+#if !LAMELLA_SURFACE_NETFX_2_0
         private Buffer() { }
+#endif
 
         [Lamella.Runtime.RuntimeProvided] private static int ByteLengthInternal(Array array) { return -1; }
 

@@ -59,6 +59,11 @@ pub enum LinkError {
         /// descriptor dump maps one to the other.
         handles: Vec<u32>,
     },
+    /// An object carries initialized RAM data ([`lamella_elf::Object::data`]), from the section
+    /// named, and this link builds an image whose startup copies none: placed and never copied, it
+    /// would run as whatever RAM held at reset. Only [`link_gc_with_archives_ram_and_data`] links
+    /// such an object, for an image whose startup copies the data run.
+    InitializedDataNotCopied(String),
 }
 
 /// Which producer would have defined a symbol the link could not resolve.
@@ -176,6 +181,11 @@ impl core::fmt::Display for LinkError {
                 "the image carries {count} generic instantiations against a cap of {cap} \
                  (handles: {handles:?})"
             ),
+            LinkError::InitializedDataNotCopied(section) => write!(
+                f,
+                "an object carries initialized RAM data, in `{section}`, and this image's startup \
+                 does not copy it into RAM"
+            ),
         }
     }
 }
@@ -270,7 +280,15 @@ pub fn link_at_base_gc(
     entry: &str,
     text_base: u32,
 ) -> Result<LinkedImage, LinkError> {
-    link_gc_inner(objects, entry, &[], false, Some(text_base), None)
+    link_gc_inner(
+        objects,
+        entry,
+        &[],
+        false,
+        Some(text_base),
+        None,
+        DataInit::Refused,
+    )
 }
 
 /// Re-exported from [`lamella_elf`] so the backend that NAMES descriptor symbols and the linker that
@@ -298,6 +316,11 @@ pub use lamella_elf::{STACKMAP_BLOB_SYMBOL, STACKMAP_GCMAP_SECTION, TEXT_BASE_SY
 pub use lamella_elf::{
     EH_TAG_SYMBOL, STATICS_BASE_PREFIX, STATICS_END_SYMBOL, STATICS_START_SYMBOL,
 };
+
+/// Re-exported data-run names (see [`lamella_elf::DATA_LOAD_SYMBOL`]): this linker lays every
+/// object's initialized RAM data out as one run, in RAM with its bytes in flash, and defines the
+/// three names a startup copies it by.
+pub use lamella_elf::{DATA_END_SYMBOL, DATA_LOAD_SYMBOL, DATA_START_SYMBOL};
 
 /// Every generic instantiation the given objects CARRY, by handle, ascending.
 ///
@@ -507,6 +530,7 @@ fn retarget_unused_entries(
                     defined: false,
                     section: None,
                     bss: false,
+                    data: false,
                 });
                 rewritten.symbols.len() as u32 - 1
             });
@@ -538,6 +562,7 @@ fn unused_slot_trap(machine: Machine) -> Object {
                 defined: false,
                 section: None,
                 bss: false,
+                data: false,
             },
             lamella_elf::ParsedSymbol {
                 name: String::from(UNUSED_SLOT_TRAP),
@@ -548,6 +573,7 @@ fn unused_slot_trap(machine: Machine) -> Object {
                 defined: true,
                 section: None,
                 bss: false,
+                data: false,
             },
         ],
         relocations: Vec::new(),
@@ -555,6 +581,10 @@ fn unused_slot_trap(machine: Machine) -> Object {
         bss_len: 0,
         bss_align: 1,
         input_sections: Vec::new(),
+        data: Vec::new(),
+        data_align: 1,
+        data_relocations: Vec::new(),
+        data_sections: Vec::new(),
     }
 }
 
@@ -583,12 +613,15 @@ fn unused_slot_trap(machine: Machine) -> Object {
 /// own base.
 fn resolves_against_its_own_layout(obj: &Object) -> bool {
     let sections = sections_of_symbols(obj);
-    obj.relocations.iter().any(|r| {
-        obj.symbols
-            .get(r.symbol as usize)
-            .is_some_and(needs_section)
-            && sections.get(r.symbol as usize).copied().flatten().is_none()
-    })
+    obj.relocations
+        .iter()
+        .chain(&obj.data_relocations)
+        .any(|r| {
+            obj.symbols
+                .get(r.symbol as usize)
+                .is_some_and(needs_section)
+                && sections.get(r.symbol as usize).copied().flatten().is_none()
+        })
 }
 
 /// Each symbol's input section in `obj`, by symbol index: `None` for a symbol in no merged
@@ -619,7 +652,7 @@ fn symbol_offset(obj: &Object, s: &lamella_elf::ParsedSymbol) -> u32 {
 /// with no name (a section symbol, its offset into the section carried in the addend) or with no
 /// size (a label). A symbol-by-symbol trim cannot move either alone -- see [`retained_sections`].
 fn needs_section(s: &lamella_elf::ParsedSymbol) -> bool {
-    s.defined && !s.bss && s.section.is_none() && (s.name.is_empty() || s.size == 0)
+    s.defined && !s.bss && !s.data && s.section.is_none() && (s.name.is_empty() || s.size == 0)
 }
 
 /// The input sections of `obj` the trim keeps WHOLE, given the names `keep` holds.
@@ -640,6 +673,15 @@ fn retained_sections(
     keep: &BTreeSet<String>,
 ) -> BTreeSet<usize> {
     let mut retained: BTreeSet<usize> = BTreeSet::new();
+    for r in &obj.data_relocations {
+        if obj
+            .symbols
+            .get(r.symbol as usize)
+            .is_some_and(needs_section)
+        {
+            retained.extend(sections.get(r.symbol as usize).copied().flatten());
+        }
+    }
     let addresses_sections = obj.relocations.iter().any(|r| {
         obj.symbols
             .get(r.symbol as usize)
@@ -647,7 +689,7 @@ fn retained_sections(
     });
     let mut spans: Vec<(u32, u32)> = Vec::new();
     for (i, s) in obj.symbols.iter().enumerate() {
-        if !s.defined || s.bss || s.section.is_some() || s.name.is_empty() {
+        if !s.defined || s.bss || s.data || s.section.is_some() || s.name.is_empty() {
             continue;
         }
         match s.size {
@@ -765,6 +807,15 @@ fn reachable_from(
             }
         }
     }
+    for obj in objects {
+        for r in &obj.data_relocations {
+            if let Some(target) = obj.symbols.get(r.symbol as usize)
+                && !target.name.is_empty()
+            {
+                stack.push(target.name.clone());
+            }
+        }
+    }
     let mut slots = Slots::new(objects);
     let mut set_aside: BTreeMap<TableEntry, Vec<(String, String)>> = BTreeMap::new();
     let mut rooted: BTreeSet<(usize, usize)> = BTreeSet::new();
@@ -790,7 +841,7 @@ fn reachable_from(
         for &(oi, si) in sites {
             let obj = &objects[oi];
             let sym = &obj.symbols[si];
-            if sym.bss || sym.section.is_some() {
+            if sym.bss || sym.data || sym.section.is_some() {
                 continue;
             }
             let start = symbol_offset(obj, sym);
@@ -939,7 +990,7 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
             if !s.defined || s.section.is_some() {
                 return false;
             }
-            if s.bss || in_retained(i) {
+            if s.bss || s.data || in_retained(i) {
                 return true;
             }
             if s.size == 0 || s.name.is_empty() {
@@ -969,7 +1020,7 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
         .collect();
     for &i in &kept {
         let s = &obj.symbols[i];
-        if !s.bss && !in_retained(i) {
+        if !s.bss && !s.data && !in_retained(i) {
             let start = symbol_offset(obj, s);
             spans.push((start, start + s.size, align_of(sections[i])));
         }
@@ -1019,11 +1070,12 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
         defined: false,
         section: None,
         bss: false,
+        data: false,
     });
     let mut mapped: Vec<Option<u32>> = alloc::vec![None; obj.symbols.len()];
     for &i in &kept {
         let s = &obj.symbols[i];
-        let value = if s.bss {
+        let value = if s.bss || s.data {
             Some(s.value)
         } else {
             let old = symbol_offset(obj, s);
@@ -1059,30 +1111,23 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
         let Some(offset) = remap_text_offset(&ranges, r.offset) else {
             continue;
         };
-        let Some(target) = obj.symbols.get(r.symbol as usize) else {
+        let Some(symbol) = kept_or_extern(obj, r.symbol, &mapped, &mut externs, &mut symbols)
+        else {
             continue;
-        };
-        let symbol = match mapped[r.symbol as usize] {
-            Some(index) => index,
-            None => *externs.entry(target.name.clone()).or_insert_with(|| {
-                symbols.push(lamella_elf::ParsedSymbol {
-                    name: target.name.clone(),
-                    value: 0,
-                    size: target.size,
-                    binding: Binding::Global,
-                    kind: target.kind,
-                    defined: false,
-                    section: None,
-                    bss: false,
-                });
-                symbols.len() as u32 - 1
-            }),
         };
         relocations.push(ParsedRelocation {
             offset,
             symbol,
             ..*r
         });
+    }
+    let mut data_relocations: Vec<ParsedRelocation> = Vec::new();
+    for r in &obj.data_relocations {
+        let Some(symbol) = kept_or_extern(obj, r.symbol, &mapped, &mut externs, &mut symbols)
+        else {
+            continue;
+        };
+        data_relocations.push(ParsedRelocation { symbol, ..*r });
     }
 
     let mut debug_index_of: BTreeMap<u32, u32> = BTreeMap::new();
@@ -1095,7 +1140,7 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
             };
             let remapped = match target.section {
                 Some(_) => Some((target.value, target.section)),
-                None if target.defined && !target.bss => {
+                None if target.defined && !target.bss && !target.data => {
                     let old = symbol_offset(obj, target);
                     remap_text_offset(&ranges, old).map(|v| (v | (target.value - old), None))
                 }
@@ -1123,6 +1168,7 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
                     defined: target.defined,
                     section,
                     bss: target.bss,
+                    data: target.data,
                 });
                 symbols.len() as u32 - 1
             });
@@ -1198,7 +1244,52 @@ fn trim_object(obj: &Object, reachable: &BTreeSet<String>) -> Object {
         bss_len: obj.bss_len,
         bss_align: obj.bss_align,
         input_sections,
+        data: obj.data.clone(),
+        data_align: obj.data_align,
+        data_relocations,
+        data_sections: obj
+            .data_sections
+            .iter()
+            .map(|section| lamella_elf::InputSection {
+                symbols: section
+                    .symbols
+                    .iter()
+                    .filter_map(|&si| mapped[si as usize])
+                    .collect(),
+                ..section.clone()
+            })
+            .collect(),
     }
+}
+
+/// The index, in a rebuilt symbol table, of `obj`'s symbol `index`: its kept copy when [`trim_object`]
+/// kept it, and otherwise an undefined reference to its name, added to `symbols` once per name.
+/// `None` for an index past the end of `obj`'s table.
+fn kept_or_extern(
+    obj: &Object,
+    index: u32,
+    mapped: &[Option<u32>],
+    externs: &mut BTreeMap<String, u32>,
+    symbols: &mut Vec<lamella_elf::ParsedSymbol>,
+) -> Option<u32> {
+    let target = obj.symbols.get(index as usize)?;
+    if let Some(kept) = mapped[index as usize] {
+        return Some(kept);
+    }
+    Some(*externs.entry(target.name.clone()).or_insert_with(|| {
+        symbols.push(lamella_elf::ParsedSymbol {
+            name: target.name.clone(),
+            value: 0,
+            size: target.size,
+            binding: Binding::Global,
+            kind: target.kind,
+            defined: false,
+            section: None,
+            bss: false,
+            data: false,
+        });
+        symbols.len() as u32 - 1
+    }))
 }
 
 /// Maps a pre-trim `.text` offset to its post-trim one, or `None` if the byte was dropped. `ranges`
@@ -1217,7 +1308,26 @@ fn link_with_base(
     text_base: Option<u32>,
     residents: &[(&str, u32)],
 ) -> Result<LinkedImage, LinkError> {
-    link_with_base_ram(objects, entry, text_base, residents, None)
+    link_with_base_ram(
+        objects,
+        entry,
+        text_base,
+        residents,
+        None,
+        DataInit::Refused,
+    )
+}
+
+/// What a linked image's startup does with its objects' initialized RAM data
+/// ([`lamella_elf::Object::data`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DataInit {
+    /// It copies none, so a link of an object that carries any is refused
+    /// ([`LinkError::InitializedDataNotCopied`]).
+    Refused,
+    /// It copies the data run from [`DATA_LOAD_SYMBOL`] to [`DATA_START_SYMBOL`] before any code
+    /// reads it.
+    Copied,
 }
 
 fn link_with_base_ram(
@@ -1226,6 +1336,7 @@ fn link_with_base_ram(
     text_base: Option<u32>,
     residents: &[(&str, u32)],
     ram: Option<(u32, u32)>,
+    data_init: DataInit,
 ) -> Result<LinkedImage, LinkError> {
     check_instantiation_cap(objects, INSTANTIATION_CAP)?;
     let synthetic: Vec<Object> = stackmap_table_object(objects)
@@ -1235,9 +1346,9 @@ fn link_with_base_ram(
     if !synthetic.is_empty() {
         let mut with_synthetic: Vec<Object> = objects.to_vec();
         with_synthetic.extend(synthetic);
-        return link_with_base_inner(&with_synthetic, entry, text_base, residents, ram);
+        return link_with_base_inner(&with_synthetic, entry, text_base, residents, ram, data_init);
     }
-    link_with_base_inner(objects, entry, text_base, residents, ram)
+    link_with_base_inner(objects, entry, text_base, residents, ram, data_init)
 }
 
 /// One function's contribution to the return-address stack map, as the backend's `.lamella_gcmap`
@@ -1348,6 +1459,10 @@ fn gcmap_blob_object(objects: &[Object]) -> Option<Object> {
         bss_len: 0,
         bss_align: 1,
         input_sections: Vec::new(),
+        data: Vec::new(),
+        data_align: 1,
+        data_relocations: Vec::new(),
+        data_sections: Vec::new(),
         symbols: alloc::vec![
             lamella_elf::ParsedSymbol {
                 name: String::new(),
@@ -1358,6 +1473,7 @@ fn gcmap_blob_object(objects: &[Object]) -> Option<Object> {
                 defined: false,
                 section: None,
                 bss: false,
+                data: false,
             },
             lamella_elf::ParsedSymbol {
                 name: String::from(STACKMAP_BLOB_SYMBOL),
@@ -1368,6 +1484,7 @@ fn gcmap_blob_object(objects: &[Object]) -> Option<Object> {
                 defined: true,
                 section: None,
                 bss: false,
+                data: false,
             },
         ],
         relocations: Vec::new(),
@@ -1450,6 +1567,7 @@ fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
         defined: false,
         section: None,
         bss: false,
+        data: false,
     });
     symbols.push(lamella_elf::ParsedSymbol {
         name: String::from(STACKMAP_START_SYMBOL),
@@ -1460,6 +1578,7 @@ fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
         defined: true,
         section: None,
         bss: false,
+        data: false,
     });
     symbols.push(lamella_elf::ParsedSymbol {
         name: String::from(STACKMAP_END_SYMBOL),
@@ -1470,6 +1589,7 @@ fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
         defined: true,
         section: None,
         bss: false,
+        data: false,
     });
     let mut relocations: Vec<ParsedRelocation> = Vec::with_capacity(names.len());
     for (i, name) in names.into_iter().enumerate() {
@@ -1489,6 +1609,7 @@ fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
             defined: false,
             section: None,
             bss: false,
+            data: false,
         });
     }
     Some(Object {
@@ -1501,6 +1622,10 @@ fn stackmap_table_object(objects: &[Object]) -> Option<Object> {
         bss_len: 0,
         bss_align: 1,
         input_sections: Vec::new(),
+        data: Vec::new(),
+        data_align: 1,
+        data_relocations: Vec::new(),
+        data_sections: Vec::new(),
     })
 }
 
@@ -1510,8 +1635,19 @@ fn link_with_base_inner(
     text_base: Option<u32>,
     residents: &[(&str, u32)],
     ram: Option<(u32, u32)>,
+    data_init: DataInit,
 ) -> Result<LinkedImage, LinkError> {
     let machine = link_machine(objects)?;
+
+    if data_init == DataInit::Refused
+        && let Some(obj) = objects.iter().find(|o| !o.data.is_empty())
+    {
+        return Err(LinkError::InitializedDataNotCopied(
+            obj.data_sections
+                .first()
+                .map_or_else(String::new, |s| s.name.clone()),
+        ));
+    }
 
     let mut text: Vec<u8> = Vec::new();
     let mut bases: Vec<u32> = Vec::with_capacity(objects.len());
@@ -1535,9 +1671,25 @@ fn link_with_base_inner(
         bss_total += obj.bss_len;
     }
 
+    let mut data_run: Vec<u32> = Vec::with_capacity(objects.len());
+    let mut data_total = 0u32;
+    let mut data_align = 4u32;
+    for obj in objects {
+        if obj.data.is_empty() {
+            data_run.push(0);
+            continue;
+        }
+        data_align = data_align.max(obj.data_align);
+        data_total = data_total.next_multiple_of(obj.data_align.max(1));
+        data_run.push(data_total);
+        data_total += obj.data.len() as u32;
+    }
+    let data_total = data_total.next_multiple_of(4);
+
     let mut defined: Vec<Defined> = Vec::new();
     let mut strong: BTreeSet<String> = BTreeSet::new();
     let mut bss_globals: Vec<(String, usize, u32)> = Vec::new();
+    let mut data_globals: Vec<(String, usize, u32, bool)> = Vec::new();
     for (oi, obj) in objects.iter().enumerate() {
         for sym in &obj.symbols {
             if !sym.defined || sym.name.is_empty() || sym.binding == Binding::Local {
@@ -1545,6 +1697,11 @@ fn link_with_base_inner(
             }
             if sym.bss {
                 bss_globals.push((sym.name.clone(), oi, sym.value));
+                continue;
+            }
+            if sym.data {
+                let (value, thumb) = symbol_target(machine, sym);
+                data_globals.push((sym.name.clone(), oi, value, thumb));
                 continue;
             }
             let (value, thumb) = symbol_target(machine, sym);
@@ -1686,6 +1843,32 @@ fn link_with_base_inner(
         }
     }
 
+    let mut data_bases: Vec<u32> = alloc::vec![0; objects.len()];
+    let mut data_span: Option<(u32, u32)> = None;
+    if data_total > 0 {
+        let base = text_base.ok_or(LinkError::AbsoluteNeedsBase)?;
+        let start = cursor.next_multiple_of(data_align);
+        let end = start + data_total;
+        for (oi, off) in data_run.iter().enumerate() {
+            data_bases[oi] = start.wrapping_add(*off).wrapping_sub(base);
+        }
+        for (name, oi, value, thumb) in &data_globals {
+            let addr = data_bases[*oi].wrapping_add(*value);
+            match defined.iter().position(|(n, _, _)| n == name) {
+                Some(_) => return Err(LinkError::DuplicateSymbol(name.clone())),
+                None => defined.push((name.clone(), addr, *thumb)),
+            }
+        }
+        let needed = end - ram_base;
+        if needed > ram_cap {
+            return Err(LinkError::StaticsOverflow {
+                needed,
+                cap: ram_cap,
+            });
+        }
+        data_span = Some((start, end));
+    }
+
     let mut veneers: BTreeMap<u32, u32> = BTreeMap::new();
     if machine == Machine::Arm {
         for (oi, obj) in objects.iter().enumerate() {
@@ -1693,8 +1876,15 @@ fn link_with_base_inner(
                 if r.kind != arm::R_ARM_THM_CALL && r.kind != arm::R_ARM_THM_JUMP24 {
                     continue;
                 }
-                let name = &obj.symbols[r.symbol as usize].name;
-                let Some((target, _)) = resolve_sym(&defined, name) else {
+                let sym = &obj.symbols[r.symbol as usize];
+                let Some((target, _)) = relocation_target(
+                    machine,
+                    sym,
+                    bases[oi],
+                    bss_bases[oi],
+                    data_bases[oi],
+                    &defined,
+                ) else {
                     continue;
                 };
                 let site = bases[oi] + r.offset;
@@ -1709,6 +1899,25 @@ fn link_with_base_inner(
         }
     }
 
+    let mut data_load = 0u32;
+    if let Some((start, end)) = data_span {
+        let base = text_base.ok_or(LinkError::AbsoluteNeedsBase)?;
+        align_to(&mut text, 4);
+        data_load = text.len() as u32;
+        text.resize(text.len() + data_total as usize, 0);
+        for (oi, obj) in objects.iter().enumerate() {
+            let at = (data_load + data_run[oi]) as usize;
+            text[at..at + obj.data.len()].copy_from_slice(&obj.data);
+        }
+        defined.push((String::from(DATA_LOAD_SYMBOL), data_load, false));
+        defined.push((
+            String::from(DATA_START_SYMBOL),
+            start.wrapping_sub(base),
+            false,
+        ));
+        defined.push((String::from(DATA_END_SYMBOL), end.wrapping_sub(base), false));
+    }
+
     for (oi, obj) in objects.iter().enumerate() {
         for r in &obj.relocations {
             let site = bases[oi] + r.offset;
@@ -1716,9 +1925,11 @@ fn link_with_base_inner(
                 &mut text,
                 machine,
                 site,
+                site,
                 text_base,
                 bases[oi],
                 bss_bases[oi],
+                data_bases[oi],
                 &defined,
                 &obj.symbols,
                 r,
@@ -1727,9 +1938,40 @@ fn link_with_base_inner(
         }
     }
 
+    if let Some((start, _)) = data_span {
+        let base = text_base.ok_or(LinkError::AbsoluteNeedsBase)?;
+        for (oi, obj) in objects.iter().enumerate() {
+            for r in &obj.data_relocations {
+                let at = data_run[oi] + r.offset;
+                apply_relocation(
+                    &mut text,
+                    machine,
+                    data_load + at,
+                    start.wrapping_add(at).wrapping_sub(base),
+                    text_base,
+                    bases[oi],
+                    bss_bases[oi],
+                    data_bases[oi],
+                    &defined,
+                    &obj.symbols,
+                    r,
+                    &veneers,
+                )?;
+            }
+        }
+    }
+
     fill_gcmap_blob(&mut text, objects, &defined);
 
-    let debug_sections = link_carried_sections(objects, &bases, &bss_bases, machine, text_base, &defined)?;
+    let debug_sections = link_carried_sections(
+        objects,
+        &bases,
+        &bss_bases,
+        &data_bases,
+        machine,
+        text_base,
+        &defined,
+    )?;
 
     let entry_offset =
         resolve(&defined, entry).ok_or_else(|| LinkError::MissingEntry(String::from(entry)))?;
@@ -1757,6 +1999,7 @@ fn link_carried_sections(
     objects: &[Object],
     bases: &[u32],
     bss_bases: &[u32],
+    data_bases: &[u32],
     machine: Machine,
     text_base: Option<u32>,
     defined: &[Defined],
@@ -1809,6 +2052,10 @@ fn link_carried_sections(
                     None if sym.defined && sym.bss => {
                         (bss_bases[oi].wrapping_add(sym.value), true)
                     }
+                    None if sym.defined && sym.data => (
+                        data_bases[oi].wrapping_add(symbol_target(machine, sym).0),
+                        true,
+                    ),
                     None if sym.defined && (sym.name.is_empty() || sym.binding == Binding::Local) => {
                         (bases[oi] + symbol_target(machine, sym).0, true)
                     }
@@ -1922,7 +2169,14 @@ pub fn link_with_archives_ram(
     ram: (u32, u32),
 ) -> Result<LinkedImage, LinkError> {
     let included = include_on_demand(objects, archives, &[]);
-    link_with_base_ram(&included, entry, text_base, &[], Some(ram))
+    link_with_base_ram(
+        &included,
+        entry,
+        text_base,
+        &[],
+        Some(ram),
+        DataInit::Refused,
+    )
 }
 
 /// The explicit objects plus the archive members pulled on demand (see [`link_with_archives`]),
@@ -1995,17 +2249,50 @@ fn link_machine(objects: &[Object]) -> Result<Machine, LinkError> {
     Ok(machine)
 }
 
-/// Resolves relocation `r` (at image offset `site`) and patches `text` in place, dispatching on the
-/// target `machine` then the relocation type. `defined` maps a name to its image offset; `obj_syms`
-/// is the relocation's own object's symbol table (to name `r.symbol`).
+/// The image offset a relocation's symbol `sym` resolves to, and whether an absolute reference to it
+/// carries the Thumb bit -- or `None` for a name nothing defines. `obj_base`, `bss_base` and
+/// `data_base` are where the relocation's own object's text, `.bss` extent and data extent were
+/// placed.
+///
+/// **ONE COPY FOR THE VENEER PASS AND THE RELOCATIONS**, so the target a veneer is planned for is the
+/// target the call resolves to.
+fn relocation_target(
+    machine: Machine,
+    sym: &lamella_elf::ParsedSymbol,
+    obj_base: u32,
+    bss_base: u32,
+    data_base: u32,
+    defined: &[Defined],
+) -> Option<(u32, bool)> {
+    if sym.defined && sym.bss {
+        return Some((bss_base.wrapping_add(sym.value), false));
+    }
+    if sym.defined && sym.data {
+        let (value, thumb) = symbol_target(machine, sym);
+        return Some((data_base.wrapping_add(value), thumb));
+    }
+    if sym.defined && (sym.name.is_empty() || sym.binding == Binding::Local) {
+        let (value, thumb) = symbol_target(machine, sym);
+        return Some((obj_base + value, thumb));
+    }
+    resolve_sym(defined, &sym.name)
+}
+
+/// Resolves relocation `r` and patches `text` in place, dispatching on the target `machine` then the
+/// relocation type. `site` is where the patched bytes lie in `text`, and `place` is where they run,
+/// as an image offset: the two are one for the text, and differ for the data run, whose bytes lie in
+/// flash and run from RAM. `defined` maps a name to its image offset; `obj_syms` is the relocation's
+/// own object's symbol table (to name `r.symbol`).
 #[allow(clippy::too_many_arguments)]
 fn apply_relocation(
     text: &mut [u8],
     machine: Machine,
     site: u32,
+    place: u32,
     text_base: Option<u32>,
     obj_base: u32,
     bss_base: u32,
+    data_base: u32,
     defined: &[Defined],
     obj_syms: &[lamella_elf::ParsedSymbol],
     r: &ParsedRelocation,
@@ -2015,16 +2302,11 @@ fn apply_relocation(
         return Ok(());
     }
     let sym = &obj_syms[r.symbol as usize];
-    let (target, target_is_thumb) = if sym.defined && sym.bss {
-        (bss_base.wrapping_add(sym.value), false)
-    } else if sym.defined && (sym.name.is_empty() || sym.binding == Binding::Local) {
-        let (value, thumb) = symbol_target(machine, sym);
-        (obj_base + value, thumb)
-    } else {
-        resolve_sym(defined, &sym.name).ok_or_else(|| LinkError::UndefinedSymbol(sym.name.clone()))?
-    };
+    let (target, target_is_thumb) =
+        relocation_target(machine, sym, obj_base, bss_base, data_base, defined)
+            .ok_or_else(|| LinkError::UndefinedSymbol(sym.name.clone()))?;
     let target = target as i64;
-    let site_i = site as i64;
+    let site_i = place as i64;
     let addend = relocation_addend(text, machine, site, r);
     match machine {
         Machine::RiscV => match r.kind {
@@ -2135,7 +2417,7 @@ fn relocation_addend(text: &[u8], machine: Machine, site: u32, r: &ParsedRelocat
 /// vtable's methods with it -- and the survivors are linked exactly as [`link`] links them. This is
 /// [`link_at_base_gc`] without a base; the two are one path.
 pub fn link_gc(objects: &[Object], entry: &str) -> Result<LinkedImage, LinkError> {
-    link_gc_inner(objects, entry, &[], false, None, None)
+    link_gc_inner(objects, entry, &[], false, None, None, DataInit::Refused)
 }
 
 /// Like [`link_gc`], but ALSO folds identical functions (ICF) after dead-stripping: byte-identical
@@ -2150,7 +2432,15 @@ pub fn link_icf(
     entry: &str,
     text_base: Option<u32>,
 ) -> Result<LinkedImage, LinkError> {
-    link_gc_inner(objects, entry, &[], true, text_base, None)
+    link_gc_inner(
+        objects,
+        entry,
+        &[],
+        true,
+        text_base,
+        None,
+        DataInit::Refused,
+    )
 }
 
 /// As [`link_gc`], but pulling archive members on demand first, exactly as [`link_with_archives`]
@@ -2169,7 +2459,15 @@ pub fn link_gc_with_archives(
     entry: &str,
     text_base: Option<u32>,
 ) -> Result<LinkedImage, LinkError> {
-    link_gc_inner(&include_on_demand(objects, archives, &[]), entry, &[], false, text_base, None)
+    link_gc_inner(
+        &include_on_demand(objects, archives, &[]),
+        entry,
+        &[],
+        false,
+        text_base,
+        None,
+        DataInit::Refused,
+    )
 }
 
 /// As [`link_gc_with_archives`], but placing the statics window the RAM-resident tier needs -- the
@@ -2207,6 +2505,37 @@ pub fn link_gc_with_archives_ram(
         false,
         text_base,
         Some(ram),
+        DataInit::Refused,
+    )
+}
+
+/// As [`link_gc_with_archives_ram`], for an image whose startup COPIES INITIALIZED RAM DATA: every
+/// object's [`lamella_elf::Object::data`] is laid out as one run in the RAM window, above the
+/// statics and the `.bss` run, with its bytes in flash after the text, and the link defines
+/// [`DATA_LOAD_SYMBOL`], [`DATA_START_SYMBOL`] and [`DATA_END_SYMBOL`] for the startup to copy it by.
+///
+/// **THE CALLER PROMISES THE COPY**, before any code reads the data. Every other link refuses an
+/// object that carries data ([`LinkError::InitializedDataNotCopied`]), because data placed and never
+/// copied runs as whatever RAM held at reset.
+///
+/// A link in which no object carries data defines none of the three names, and comes out exactly as
+/// [`link_gc_with_archives_ram`]'s.
+pub fn link_gc_with_archives_ram_and_data(
+    objects: &[Object],
+    archives: &[Archive],
+    entry: &str,
+    optional_roots: &[&str],
+    text_base: Option<u32>,
+    ram: (u32, u32),
+) -> Result<LinkedImage, LinkError> {
+    link_gc_inner(
+        &include_on_demand(objects, archives, optional_roots),
+        entry,
+        optional_roots,
+        false,
+        text_base,
+        Some(ram),
+        DataInit::Copied,
     )
 }
 
@@ -2220,7 +2549,15 @@ pub fn link_icf_with_archives(
     entry: &str,
     text_base: Option<u32>,
 ) -> Result<LinkedImage, LinkError> {
-    link_gc_inner(&include_on_demand(objects, archives, &[]), entry, &[], true, text_base, None)
+    link_gc_inner(
+        &include_on_demand(objects, archives, &[]),
+        entry,
+        &[],
+        true,
+        text_base,
+        None,
+        DataInit::Refused,
+    )
 }
 
 /// Dead-strips from `entry` and then links through the ORDINARY layout, optionally folding
@@ -2244,6 +2581,7 @@ fn link_gc_inner(
     fold: bool,
     text_base: Option<u32>,
     ram: Option<(u32, u32)>,
+    data_init: DataInit,
 ) -> Result<LinkedImage, LinkError> {
     let machine = link_machine(objects)?;
     let mut keep = reachable_from(objects, entry, optional_roots, TableEntries::Called);
@@ -2256,7 +2594,7 @@ fn link_gc_inner(
     }
     let mut trimmed: Vec<Object> = trim_all(objects, &keep);
     define_fold_aliases(&mut trimmed, &folds);
-    link_with_base_ram(&trimmed, entry, text_base, &[], ram)
+    link_with_base_ram(&trimmed, entry, text_base, &[], ram, data_init)
 }
 
 /// The ICF decision as `(folded-away name, representative name)` pairs, over the functions that
@@ -2297,6 +2635,7 @@ fn plan_folds(
         let whole = retained_sections(obj, &sections, keep);
         for (si, s) in obj.symbols.iter().enumerate() {
             if !s.defined
+                || s.data
                 || sections[si].is_some_and(|section| whole.contains(&section))
                 || s.size == 0
                 || s.name.is_empty()
@@ -5775,6 +6114,7 @@ mod tests {
             defined: true,
             section: None,
             bss: false,
+            data: false,
         });
         marked.input_sections[first].symbols.push(index);
         let helper = read_object(&write_relocatable_object_with_sections(
@@ -5959,5 +6299,353 @@ mod tests {
         assert_ne!(a, b, "`a` and `b` keep their own bodies");
         assert_eq!(image_word(&image, image_word(&image, a) - 0x1000), 1);
         assert_eq!(image_word(&image, image_word(&image, b) - 0x1000), 2);
+    }
+
+    /// Where `lamella-aot` links an RP2350 image: its text at `0x1000_0100`, its RAM window from
+    /// `0x2001_0000`.
+    const FLASH_TEXT: u32 = 0x1000_0100;
+    const RAM_WINDOW: (u32, u32) = (0x2001_0000, 0x6_0000);
+    /// `sh_flags` of a function placed in RAM by its section's name: allocatable and executable.
+    const RAM_CODE: u32 = 0x6;
+    /// `sh_flags` of writable data: allocatable and writable.
+    const RAM_DATA: u32 = 0x3;
+
+    fn symbol_in(img: &LinkedImage, name: &str) -> u32 {
+        img.symbols
+            .iter()
+            .find(|(n, _)| n == name)
+            .unwrap_or_else(|| panic!("the link defines no {name}"))
+            .1
+    }
+
+    fn word_in(bytes: &[u8], at: u32) -> u32 {
+        let at = at as usize;
+        u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+    }
+
+    /// `f0` in flash calling `in_ram`, a function placed in `.data.in_ram` and local to its object:
+    /// the shape of the PSRAM bring-up, whose flash code calls its RAM nucleus with a plain `bl`.
+    fn flash_calls_ram() -> Object {
+        read_object(&write_relocatable_object_with_sections(
+            Machine::Arm,
+            &[0x00, 0xF0, 0x00, 0xD0, 0x70, 0x47],
+            &[
+                func("f0", 1, 6),
+                Symbol {
+                    name: "in_ram",
+                    value: 1,
+                    size: 4,
+                    binding: Binding::Local,
+                    kind: SymbolType::Func,
+                    section: SymbolSection::InSection(0),
+                },
+            ],
+            &[Relocation {
+                offset: 0,
+                symbol: 1,
+                kind: arm::R_ARM_THM_CALL,
+                addend: -4,
+            }],
+            &[Section {
+                name: ".data.in_ram",
+                flags: RAM_CODE,
+                addralign: 2,
+                data: &[0x02, 0x20, 0x70, 0x47],
+                relocations: &[],
+            }],
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn a_function_in_the_data_run_is_called_from_flash_through_a_veneer_into_ram() {
+        let img = link_gc_with_archives_ram_and_data(
+            &[flash_calls_ram()],
+            &[],
+            "f0",
+            &[],
+            Some(FLASH_TEXT),
+            RAM_WINDOW,
+        )
+        .unwrap();
+        assert_eq!(
+            symbol_in(&img, DATA_START_SYMBOL),
+            RAM_WINDOW.0 - FLASH_TEXT
+        );
+        assert_eq!(
+            symbol_in(&img, DATA_END_SYMBOL),
+            RAM_WINDOW.0 + 4 - FLASH_TEXT
+        );
+        assert_eq!(&img.text[0..4], &[0x00, 0xF0, 0x02, 0xF8]);
+        assert_eq!(
+            &img.text[8..20],
+            &[
+                0x01, 0xB4, 0x02, 0x48, 0x84, 0x46, 0x01, 0xBC, 0x60, 0x47, 0x00, 0xBF
+            ]
+        );
+        assert_eq!(word_in(&img.text, 20), RAM_WINDOW.0 | 1);
+        assert_eq!(symbol_in(&img, DATA_LOAD_SYMBOL), 24);
+        assert_eq!(&img.text[24..], &[0x02, 0x20, 0x70, 0x47]);
+    }
+
+    #[test]
+    fn the_data_run_s_relocations_resolve_where_the_run_executes() {
+        let object = read_object(&write_relocatable_object_with_sections(
+            Machine::Arm,
+            &[0x00, 0xF0, 0x00, 0xD0, 0x70, 0x47],
+            &[
+                func("f0", 1, 6),
+                Symbol {
+                    name: "a",
+                    value: 1,
+                    size: 6,
+                    binding: Binding::Local,
+                    kind: SymbolType::Func,
+                    section: SymbolSection::InSection(0),
+                },
+                Symbol {
+                    name: "b",
+                    value: 1,
+                    size: 4,
+                    binding: Binding::Local,
+                    kind: SymbolType::Func,
+                    section: SymbolSection::InSection(1),
+                },
+                Symbol {
+                    name: "ptr",
+                    value: 0,
+                    size: 4,
+                    binding: Binding::Global,
+                    kind: SymbolType::NoType,
+                    section: SymbolSection::InSection(2),
+                },
+            ],
+            &[Relocation {
+                offset: 0,
+                symbol: 1,
+                kind: arm::R_ARM_THM_CALL,
+                addend: -4,
+            }],
+            &[
+                Section {
+                    name: ".data.a",
+                    flags: RAM_CODE,
+                    addralign: 2,
+                    data: &[0x00, 0xF0, 0x00, 0xD0, 0x70, 0x47],
+                    relocations: &[Relocation {
+                        offset: 0,
+                        symbol: 2,
+                        kind: arm::R_ARM_THM_CALL,
+                        addend: -4,
+                    }],
+                },
+                Section {
+                    name: ".data.b",
+                    flags: RAM_CODE,
+                    addralign: 2,
+                    data: &[0x03, 0x20, 0x70, 0x47],
+                    relocations: &[],
+                },
+                Section {
+                    name: ".data.ptr",
+                    flags: RAM_DATA,
+                    addralign: 4,
+                    data: &[0; 4],
+                    relocations: &[Relocation {
+                        offset: 0,
+                        symbol: 0,
+                        kind: arm::R_ARM_ABS32,
+                        addend: 0,
+                    }],
+                },
+            ],
+        ))
+        .unwrap();
+        let img = link_gc_with_archives_ram_and_data(
+            &[object],
+            &[],
+            "f0",
+            &[],
+            Some(FLASH_TEXT),
+            RAM_WINDOW,
+        )
+        .unwrap();
+        let load = symbol_in(&img, DATA_LOAD_SYMBOL);
+        let start = i64::from(symbol_in(&img, DATA_START_SYMBOL) + FLASH_TEXT);
+        assert_eq!(start + 4 + extract_thm_call(&img.text, load), start + 6);
+        assert_eq!(word_in(&img.text, load + 12), FLASH_TEXT | 1);
+    }
+
+    #[test]
+    fn a_link_whose_startup_copies_no_data_refuses_an_object_that_carries_some() {
+        let refusal = LinkError::InitializedDataNotCopied(String::from(".data.in_ram"));
+        let object = flash_calls_ram();
+        assert_eq!(
+            link_gc_with_archives_ram(
+                core::slice::from_ref(&object),
+                &[],
+                "f0",
+                &[],
+                Some(FLASH_TEXT),
+                RAM_WINDOW
+            )
+            .unwrap_err(),
+            refusal
+        );
+        assert_eq!(
+            link_at_base(core::slice::from_ref(&object), "f0", FLASH_TEXT).unwrap_err(),
+            refusal
+        );
+        assert_eq!(link_gc(&[object], "f0").unwrap_err(), refusal);
+    }
+
+    #[test]
+    fn a_link_without_data_comes_out_the_same_on_both_paths_and_names_no_data_run() {
+        let object = obj_arm(
+            &[0x00, 0xF0, 0x00, 0xD0, 0x70, 0x47, 0x70, 0x47],
+            &[func("f0", 1, 6), func("g", 7, 2)],
+            &[Relocation {
+                offset: 0,
+                symbol: 1,
+                kind: arm::R_ARM_THM_CALL,
+                addend: -4,
+            }],
+        );
+        let plain = link_gc_with_archives_ram(
+            core::slice::from_ref(&object),
+            &[],
+            "f0",
+            &[],
+            Some(FLASH_TEXT),
+            RAM_WINDOW,
+        )
+        .unwrap();
+        let copying = link_gc_with_archives_ram_and_data(
+            &[object],
+            &[],
+            "f0",
+            &[],
+            Some(FLASH_TEXT),
+            RAM_WINDOW,
+        )
+        .unwrap();
+        assert_eq!(plain.text, copying.text);
+        assert_eq!(plain.entry_offset, copying.entry_offset);
+        assert_eq!(plain.symbols, copying.symbols);
+        for name in [DATA_LOAD_SYMBOL, DATA_START_SYMBOL, DATA_END_SYMBOL] {
+            assert!(copying.symbols.iter().all(|(n, _)| n != name), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_data_run_lies_above_the_statics_and_the_bss_run_outside_their_brackets() {
+        let link = |data: &[Section]| {
+            let mut object = read_object(&write_relocatable_object_with_sections(
+                Machine::Arm,
+                &[0x70, 0x47, 0x00, 0xBF, 0, 0, 0, 0],
+                &[func("f0", 1, 8), undef(STATICS_END_SYMBOL)],
+                &[Relocation {
+                    offset: 4,
+                    symbol: 1,
+                    kind: arm::R_ARM_ABS32,
+                    addend: 0,
+                }],
+                data,
+            ))
+            .unwrap();
+            object.bss_len = 6;
+            object.bss_align = 2;
+            link_gc_with_archives_ram_and_data(
+                &[object],
+                &[],
+                "f0",
+                &[],
+                Some(FLASH_TEXT),
+                RAM_WINDOW,
+            )
+            .unwrap()
+        };
+        let without = link(&[]);
+        let with = link(&[Section {
+            name: ".data.k",
+            flags: RAM_DATA,
+            addralign: 8,
+            data: &[7; 8],
+            relocations: &[],
+        }]);
+        let statics_end = symbol_in(&without, STATICS_END_SYMBOL);
+        assert_eq!(symbol_in(&with, STATICS_END_SYMBOL), statics_end);
+        assert_eq!(statics_end + FLASH_TEXT, RAM_WINDOW.0 + 4 + 6);
+        let start = symbol_in(&with, DATA_START_SYMBOL) + FLASH_TEXT;
+        assert_eq!(start, (statics_end + FLASH_TEXT).next_multiple_of(8));
+        assert_eq!(symbol_in(&with, DATA_END_SYMBOL) + FLASH_TEXT, start + 8);
+        assert_eq!(
+            &with.text[symbol_in(&with, DATA_LOAD_SYMBOL) as usize..],
+            &[7; 8]
+        );
+    }
+
+    #[test]
+    fn a_data_run_past_the_window_is_refused() {
+        assert_eq!(
+            link_gc_with_archives_ram_and_data(
+                &[flash_calls_ram()],
+                &[],
+                "f0",
+                &[],
+                Some(FLASH_TEXT),
+                (RAM_WINDOW.0, 2),
+            )
+            .unwrap_err(),
+            LinkError::StaticsOverflow { needed: 4, cap: 2 }
+        );
+    }
+
+    #[test]
+    fn the_dead_strip_keeps_a_function_only_the_data_run_names() {
+        let object = read_object(&write_relocatable_object_with_sections(
+            Machine::Arm,
+            &[0x70, 0x47, 0x70, 0x47],
+            &[
+                func("f0", 1, 2),
+                func("g", 3, 2),
+                Symbol {
+                    name: "hook",
+                    value: 0,
+                    size: 4,
+                    binding: Binding::Global,
+                    kind: SymbolType::NoType,
+                    section: SymbolSection::InSection(0),
+                },
+            ],
+            &[],
+            &[Section {
+                name: ".data.hook",
+                flags: RAM_DATA,
+                addralign: 4,
+                data: &[0; 4],
+                relocations: &[Relocation {
+                    offset: 0,
+                    symbol: 1,
+                    kind: arm::R_ARM_ABS32,
+                    addend: 0,
+                }],
+            }],
+        ))
+        .unwrap();
+        let img = link_gc_with_archives_ram_and_data(
+            &[object],
+            &[],
+            "f0",
+            &[],
+            Some(FLASH_TEXT),
+            RAM_WINDOW,
+        )
+        .unwrap();
+        let load = symbol_in(&img, DATA_LOAD_SYMBOL);
+        assert_eq!(
+            word_in(&img.text, load),
+            (FLASH_TEXT + symbol_in(&img, "g")) | 1
+        );
     }
 }

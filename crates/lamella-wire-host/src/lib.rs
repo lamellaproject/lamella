@@ -8,7 +8,17 @@ pub use lamella_runner::{
 pub mod engine;
 pub mod firmware;
 pub mod identity;
+#[cfg(any(feature = "repl-host", feature = "baked"))]
+pub mod refusal;
 pub mod terminal;
+#[cfg(feature = "boards")]
+pub mod boards;
+#[cfg(feature = "baked")]
+pub mod bake;
+#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+pub mod on_device;
+#[cfg(all(feature = "baked", any(test, feature = "loopback-board")))]
+pub mod loopback;
 
 #[cfg(feature = "debug-backend")]
 pub mod debug_backend;

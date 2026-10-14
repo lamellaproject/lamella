@@ -2,9 +2,15 @@
 #if LAMELLA_SURFACE_GC
 namespace System
 {
+#if LAMELLA_SURFACE_NETFX_2_0
+    public static class GC
+#else
     public sealed class GC
+#endif
     {
+#if !LAMELLA_SURFACE_NETFX_2_0
         private GC() { }
+#endif
 
         [Lamella.Runtime.RuntimeProvided]
         [Lamella.Runtime.IntendedDefault]

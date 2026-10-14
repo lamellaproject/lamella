@@ -919,7 +919,7 @@ pub(crate) const FREE_BLOCK: u32 = 0x8000_0001;
 
 /// The length of the free block a header word opens, or `None` when the word is an object's header.
 #[cfg(feature = "gc-collect")]
-fn free_block_length(header_word: u32) -> Option<u32> {
+pub(crate) fn free_block_length(header_word: u32) -> Option<u32> {
     (header_word & FREE_BLOCK == FREE_BLOCK).then_some(header_word & !FREE_BLOCK)
 }
 
@@ -935,7 +935,7 @@ fn write_free_block(bytes: &mut [u8], start: usize, end: usize) {
 /// `footprint`: from its payload up to the next object's payload. A pin is the address a `fixed`
 /// statement holds, which is the object itself or -- over an array or a field -- an address inside it.
 #[cfg(feature = "gc-collect")]
-fn pinned_within(pinned: &[u32], payload: u32, footprint: u32) -> bool {
+pub(crate) fn pinned_within(pinned: &[u32], payload: u32, footprint: u32) -> bool {
     pinned.iter().any(|&pin| pin >= payload && pin < payload + footprint)
 }
 
@@ -957,7 +957,7 @@ pub(crate) const FREE_BLOCK_LINKED: u32 = 2 * ALIGN;
 #[derive(Default)]
 pub(crate) struct FreeChain {
     /// The region offset of the first linked block, or 0.
-    head: u32,
+    pub(crate) head: u32,
     /// The region offset of the last linked block, whose link the next one is written into.
     last: u32,
 }
@@ -965,7 +965,7 @@ pub(crate) struct FreeChain {
 #[cfg(feature = "gc-collect")]
 impl FreeChain {
     /// Turns `[start, end)` (region offsets) into a FREE BLOCK and appends it when it can hold a link.
-    fn add(&mut self, bytes: &mut [u8], start: usize, end: usize) {
+    pub(crate) fn add(&mut self, bytes: &mut [u8], start: usize, end: usize) {
         write_free_block(bytes, start, end);
         if end - start >= FREE_BLOCK_LINKED as usize {
             let offset = start as u32;
@@ -1352,7 +1352,7 @@ impl<'a> MarkBits<'a> {
     }
 
     /// How many bitmap words this one holds -- the capacity the collection checks itself against.
-    fn capacity_words(&self) -> usize {
+    pub(crate) fn capacity_words(&self) -> usize {
         self.words.len()
     }
 
@@ -1363,7 +1363,7 @@ impl<'a> MarkBits<'a> {
 
     /// Whether `addr` is marked. An address past the bitmap answers `false` rather than panicking;
     /// the capacity check runs once, before the collection starts, so this cannot be reached.
-    fn test(&self, base: u32, addr: u32) -> bool {
+    pub(crate) fn test(&self, base: u32, addr: u32) -> bool {
         let bit = Self::bit(base, addr);
         self.words
             .get(bit / 32)
@@ -1372,7 +1372,7 @@ impl<'a> MarkBits<'a> {
 
     /// Marks `addr`, answering whether THIS call is what marked it -- the dedupe that stops a cycle
     /// from tracing forever.
-    fn set(&mut self, base: u32, addr: u32) -> bool {
+    pub(crate) fn set(&mut self, base: u32, addr: u32) -> bool {
         let bit = Self::bit(base, addr);
         let Some(word) = self.words.get_mut(bit / 32) else {
             return false;
@@ -1405,7 +1405,7 @@ pub enum RootKind {
 /// storage at all and is merely slower. So the shape of a program's object graph changes how long a
 /// collection takes and never whether it is correct.
 #[cfg(feature = "gc-collect")]
-const MARK_STACK: usize = 64;
+pub(crate) const MARK_STACK: usize = 64;
 
 /// [`mark_compact`]'s ALLOCATION-FREE twin: the same sliding mark-compact, with every piece of
 /// bookkeeping in storage the caller supplies.
@@ -3155,6 +3155,7 @@ mod tests {
         /// [`no_alloc`] with each root's kind stated, for the interior roots the allocating engine
         /// has no counterpart for.
         fn no_alloc_kinds(heap: &Heap, roots: &[(Ref, RootKind)], pinned: &[u32]) -> (u32, Vec<u8>, Vec<Ref>) {
+            let roots_with_kinds = roots;
             let mut bytes = heap.bytes.clone();
             let mut roots = roots.to_vec();
             let resolver = TableResolver {
@@ -3163,7 +3164,7 @@ mod tests {
             };
             let mut storage = [0u32; 1024];
             let mut marks = MarkBits::new(&mut storage);
-            let top = mark_compact_no_alloc(
+            let compacted = mark_compact_no_alloc(
                 &mut bytes,
                 Heap::BASE,
                 heap.top,
@@ -3176,9 +3177,80 @@ mod tests {
                 pinned,
                 &mut marks,
             )
-            .expect("the bitmap is sized for this region")
-            .top;
-            (top, bytes, roots.into_iter().map(|(root, _)| root).collect())
+            .expect("the bitmap is sized for this region");
+            let roots: Vec<Ref> = roots.into_iter().map(|(root, _)| root).collect();
+            for indexed in [false, true] {
+                let segmented = segmented(heap, &resolver, roots_with_kinds, pinned, indexed);
+                assert_eq!(
+                    segmented.0, compacted,
+                    "a one-segment collection through the segmented engine answers differently (indexed: {indexed})"
+                );
+                assert_eq!(
+                    segmented.2, roots,
+                    "the segmented engine relocated a root differently (indexed: {indexed})"
+                );
+                assert_eq!(
+                    segmented.1, bytes,
+                    "the segmented engine produced a different region (indexed: {indexed})"
+                );
+            }
+            (compacted.top, bytes, roots)
+        }
+
+        /// The same collection as [`no_alloc_kinds`], through the SEGMENTED engine with ONE segment,
+        /// with its forwarding index or without.
+        ///
+        /// Every test that reaches `no_alloc_kinds` compares the two, so the second engine is held to
+        /// the first on every one-segment shape this module knows, and a fix that lands in only one
+        /// of them turns that test red.
+        fn segmented(
+            heap: &Heap,
+            resolver: &TableResolver<'_>,
+            roots: &[(Ref, RootKind)],
+            pinned: &[u32],
+            indexed: bool,
+        ) -> (Compacted, Vec<u8>, Vec<Ref>) {
+            use crate::segments::{Segment, forwarding_index_words_for, mark_compact_segments};
+            let mut bytes = heap.bytes.clone();
+            let mut roots = roots.to_vec();
+            let mut storage = [0u32; 1024];
+            let mut marks = [MarkBits::new(&mut storage)];
+            let mut answers = [Compacted { top: 0, free: 0 }];
+            let mut index = vec![
+                0u32;
+                if indexed {
+                    forwarding_index_words_for(bytes.len())
+                } else {
+                    0
+                }
+            ];
+            let mut segments = [Segment {
+                bytes: &mut bytes,
+                base: Heap::BASE,
+                top: heap.top,
+                index: &mut index,
+            }];
+            let ran = mark_compact_segments(
+                &mut segments,
+                &mut marks,
+                resolver,
+                |visit: &mut dyn FnMut(&mut Ref, RootKind)| {
+                    for (root, kind) in &mut roots {
+                        visit(root, *kind);
+                    }
+                },
+                pinned,
+                &mut answers,
+            );
+            assert!(
+                ran,
+                "the segmented engine refused a region its bitmap covers"
+            );
+            (
+                answers[0],
+                bytes,
+                roots.into_iter().map(|(root, _)| root).collect(),
+            )
         }
 
         /// Asserts the two engines agree on the new top, on EVERY byte of the region, and on where

@@ -223,11 +223,6 @@ pub struct Tokens {
     /// a plain `castclass` lowering yet (interface dispatch is an interpreter feature), so
     /// emission distinguishes them.
     interfaces: BTreeSet<String>,
-    /// The methods declared with a virtual vtable slot (`virtual`/`override`/`abstract`), by
-    /// method key. A method group over such a method converts to a delegate through the
-    /// object's runtime type (`ldvirtftn`, III.4.18), so an override is honored; a non-virtual
-    /// method binds the exact method (`ldftn`).
-    virtual_methods: BTreeSet<String>,
     /// The type-parameter NAMES each declared generic type owns, in declaration order, by type key
     /// -- `["TKey", "TValue"]` for `` Pair`2 ``. Empty (absent) for every non-generic type, which is
     /// every C# 1.0 type.
@@ -409,37 +404,6 @@ impl Tokens {
     #[must_use]
     pub fn is_interface(&self, ty: &TypeSymbol) -> bool {
         self.interfaces.contains(&type_key(&self.canonical(ty)))
-    }
-
-    /// Records that the method with this identity occupies a virtual vtable slot, so a
-    /// delegate over it dispatches through the receiver's runtime type (III.4.18).
-    pub fn insert_virtual_method(
-        &mut self,
-        declaring: &TypeSymbol,
-        name: &str,
-        parameters: &[TypeSymbol],
-    ) {
-        self.virtual_methods.insert(method_key(
-            &self.canonical(declaring),
-            name,
-            &self.canonical_params(parameters),
-        ));
-    }
-
-    /// Whether the method with this identity is virtual (so a delegate over it emits
-    /// `ldvirtftn` rather than `ldftn`).
-    #[must_use]
-    pub(crate) fn is_virtual_method(
-        &self,
-        declaring: &TypeSymbol,
-        name: &str,
-        parameters: &[TypeSymbol],
-    ) -> bool {
-        self.virtual_methods.contains(&method_key(
-            &self.canonical(declaring),
-            name,
-            &self.canonical_params(parameters),
-        ))
     }
 
     /// Records `token` as the method named by this identity.

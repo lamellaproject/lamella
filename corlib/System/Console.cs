@@ -1,9 +1,15 @@
 // Lamella managed corlib (from scratch). -- System.Console
 namespace System
 {
+#if LAMELLA_SURFACE_NETFX_2_0
+    public static class Console
+#else
     public sealed class Console
+#endif
     {
+#if !LAMELLA_SURFACE_NETFX_2_0
         private Console() { }
+#endif
 
         [Lamella.Runtime.RuntimeProvided] public static void WriteLine() { }
         [Lamella.Runtime.RuntimeProvided] public static void WriteLine(int value) { }

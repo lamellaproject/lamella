@@ -17,7 +17,6 @@ namespace System.Net.Security
         private const int PeerCertBufferSize = 2048;
         private int _stack;
         private const int VerifySystemRoots = 0;
-        private const int VerifyAcceptAny = 2;
         private const int VerifyReport = 3;
         private const int StateEstablished = 1;
         private const int StateError = 3;
@@ -31,7 +30,6 @@ namespace System.Net.Security
         private Stream _inner;
         private bool _leaveInnerStreamOpen;
         private RemoteCertificateValidationCallback _validationCallback;
-        private bool _acceptAnyCertificate;
         private int _tls;
         private bool _authenticated;
         private byte[] _xfer;
@@ -60,12 +58,6 @@ namespace System.Net.Security
 
         public bool IsAuthenticated { get { return _authenticated; } }
         public bool IsEncrypted { get { return _authenticated; } }
-
-        public bool AcceptAnyCertificate
-        {
-            get { return _acceptAnyCertificate; }
-            set { _acceptAnyCertificate = value; }
-        }
 
         public void AuthenticateAsClient(string targetHost)
         {
@@ -134,8 +126,7 @@ namespace System.Net.Security
         {
             _xfer = new byte[TlsBufferSize];
             int verifyMode = VerifySystemRoots;
-            if (_acceptAnyCertificate) verifyMode = VerifyAcceptAny;
-            else if ((object)_validationCallback != null) verifyMode = VerifyReport;
+            if ((object)_validationCallback != null) verifyMode = VerifyReport;
             int config;
             if ((object)chain == null)
             {
@@ -171,10 +162,6 @@ namespace System.Net.Security
             {
                 errors |= SslPolicyErrors.RemoteCertificateNameMismatch;
             }
-            if (_acceptAnyCertificate)
-            {
-                errors |= SslPolicyErrors.RemoteCertificateChainErrors;
-            }
             if (revocationRequested)
             {
                 errors |= SslPolicyErrors.RemoteCertificateChainErrors;
@@ -193,7 +180,7 @@ namespace System.Net.Security
                     throw new AuthenticationException("The remote certificate was rejected by the validation callback.");
                 }
             }
-            else if (errors != SslPolicyErrors.None && !_acceptAnyCertificate)
+            else if (errors != SslPolicyErrors.None)
             {
                 Close();
                 if (revocationRequested)

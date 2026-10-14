@@ -53,6 +53,11 @@ pub enum BuildError {
     /// than anything a caller passed in.
     #[cfg(feature = "linked")]
     ObjectRead(alloc::string::String),
+    /// The bus table given for the board the build names is not one the image could serve: it
+    /// fails the same check the bake and the interpreter make (`lamella_board_buses::check`), so
+    /// it is refused here, by name, rather than linked for a driver to misread.
+    #[cfg(feature = "linked")]
+    BoardBusTable(lamella_board_buses::Fault),
     /// A function could not be lowered to the WASM target.
     #[cfg(feature = "wasm")]
     LowerWasm(wasm::LowerError),
@@ -92,6 +97,8 @@ pub enum BuildError {
     LowerCil {
         /// The MethodDef row of the method whose body failed to lower.
         rid: u32,
+        /// The same method by name, as `Namespace.Type::Method`.
+        method: alloc::string::String,
         /// The CIL-lowering error.
         error: cil::CilError,
     },
@@ -313,6 +320,10 @@ impl core::fmt::Display for BuildError {
                  -- the emitter and the reader disagree about the format, so this is not something a \
                  caller passed in",
             ),
+            #[cfg(feature = "linked")]
+            BuildError::BoardBusTable(fault) => {
+                write!(f, "the board's bus table cannot be linked into the image: {fault}")
+            }
             #[cfg(feature = "wasm")]
             BuildError::LowerWasm(error) => {
                 write!(f, "the WASM backend could not lower a function: {error}")
@@ -337,8 +348,8 @@ impl core::fmt::Display for BuildError {
                 NameList(missing),
                 NameList(supplied),
             ),
-            BuildError::LowerCil { rid, error } => {
-                write!(f, "the CIL body of method {rid} did not lower: {error:?}")
+            BuildError::LowerCil { rid, method, error } => {
+                write!(f, "the CIL body of `{method}` (method {rid}) did not lower: {error}")
             }
             BuildError::SilentSeamCallEdge { caller, seam, total } => write!(
                 f,
@@ -1071,12 +1082,39 @@ pub fn build_linked_cortex_m_with_libraries(
     archive: &[u8],
     target: &str,
 ) -> Result<Vec<u8>, BuildError> {
+    build_linked_cortex_m_with_board(cil, corlib, libraries, archive, target, None)
+}
+
+/// [`build_linked_cortex_m_with_libraries`] for a build that names a board, with that board's bus
+/// table: `board_buses` is laid into the image at [`BOARD_BUSES_SYMBOL`], the table
+/// `Lamella.Hardware.BoardBuses` reads for `System.Device`'s factories. `None` lays nothing, and
+/// the runtime-support archive's one-word default then reads as no table, so every bus is absent.
+///
+/// The table is checked as the bake checks the one it writes into an image, and a table that fails
+/// is [`BuildError::BoardBusTable`].
+#[cfg(feature = "linked")]
+pub fn build_linked_cortex_m_with_board(
+    cil: &[u8],
+    corlib: &[u8],
+    libraries: &[&[u8]],
+    archive: &[u8],
+    target: &str,
+    board_buses: Option<&[u32]>,
+) -> Result<Vec<u8>, BuildError> {
     let part = linked_part(target)?;
     let libraries = referenced_libraries(cil, libraries)?;
     let (program_object, deferred) =
         build_linked_program_object(cil, corlib, &libraries, None, part.wide())?;
-    link_linked_image(part, &program_object, deferred, corlib, &libraries, archive)
-        .map(|(image, _)| image)
+    link_linked_image(
+        part,
+        &program_object,
+        deferred,
+        corlib,
+        &libraries,
+        archive,
+        board_buses,
+    )
+    .map(|(image, _)| image)
 }
 
 /// The libraries of `libraries` that the program `cil` references, directly or through one another
@@ -1176,6 +1214,48 @@ fn linked_part(target: &str) -> Result<LinkedPart, BuildError> {
         .ok_or(BuildError::UnsupportedTarget)
 }
 
+/// The symbol a board's bus table is laid at, which the runtime-support archive's two lookups read.
+/// The archive defines it too, as a WEAK one-word default with no table header, so an image built
+/// with no table links and every bus reads as absent.
+#[cfg(feature = "linked")]
+pub const BOARD_BUSES_SYMBOL: &str = "lamella_board_buses";
+
+/// The bus table `words`, checked, as a relocatable object defining [`BOARD_BUSES_SYMBOL`]: a
+/// STRONG global data symbol over the words, little-endian, in a read-only allocated section of its
+/// own (`.rodata.lamella_board_buses`), aligned to a word. Strong, so it wins over the archive's weak
+/// default at the link; read-only and allocated, so it is laid with the code, in flash.
+///
+/// The check is the one the bake and the interpreter make (`lamella_board_buses::check`), so the
+/// archive's lookups, which read the symbol with no length beside it, only ever walk a table whose
+/// header and rows describe it.
+#[cfg(feature = "linked")]
+fn board_buses_object(words: &[u32]) -> Result<lamella_elf::Object, BuildError> {
+    const SHF_ALLOC: u32 = 0x2;
+    lamella_board_buses::check(words).map_err(BuildError::BoardBusTable)?;
+    let data: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    let object = lamella_elf::write_relocatable_object_with_sections(
+        lamella_elf::Machine::Arm,
+        &[],
+        &[lamella_elf::Symbol {
+            name: BOARD_BUSES_SYMBOL,
+            value: 0,
+            size: data.len() as u32,
+            binding: lamella_elf::Binding::Global,
+            kind: lamella_elf::SymbolType::NoType,
+            section: lamella_elf::SymbolSection::InSection(0),
+        }],
+        &[],
+        &[lamella_elf::Section {
+            name: ".rodata.lamella_board_buses",
+            flags: SHF_ALLOC,
+            addralign: 4,
+            data: &data,
+            relocations: &[],
+        }],
+    );
+    lamella_elf::read_object(&object).map_err(|e| BuildError::ObjectRead(alloc::format!("{e:?}")))
+}
+
 /// Links a lowered PROGRAM object into `part`'s boot image: corlib's object and each user library's
 /// beside it, the runtime-support `archive` on demand, dead-stripped, linked at the part's text base
 /// and wrapped by [`nordic_linked_image`] or [`rp2350_linked_image`]. Returns the image and the link
@@ -1187,6 +1267,8 @@ fn linked_part(target: &str) -> Result<LinkedPart, BuildError> {
 /// **ONE PIPELINE, FOR THE IMAGE THAT SHIPS AND THE ONE THAT IS DEBUGGED.** The callers differ only
 /// in how the program object was built, so everything after that is here once -- and a caller that
 /// wants the link's debug sections takes them from the same link as the bytes.
+///
+/// `board_buses` is the bus table of the board the build names, laid by [`board_buses_object`].
 #[cfg(feature = "linked")]
 fn link_linked_image(
     part: LinkedPart,
@@ -1195,8 +1277,12 @@ fn link_linked_image(
     corlib: &[u8],
     libraries: &[&[u8]],
     archive: &[u8],
+    board_buses: Option<&[u32]>,
 ) -> Result<(Vec<u8>, lamella_linker::LinkedImage), BuildError> {
-    let trimmed = reachable_objects(program_object, deferred, corlib, libraries, part.wide())?;
+    let mut trimmed = reachable_objects(program_object, deferred, corlib, libraries, part.wide())?;
+    if let Some(words) = board_buses {
+        trimmed.push(board_buses_object(words)?);
+    }
     let support = lamella_elf::read_archive(archive)
         .map_err(|e| BuildError::ObjectRead(alloc::format!("{e:?}")))?;
     let linked = link_part_image(part, &trimmed, &[support], LINKED_ENTRY_SYMBOL)
@@ -1216,9 +1302,83 @@ fn link_linked_image(
             &linked.text,
             statics_end.unwrap_or(RP2350_STATICS_BASE),
             board_init,
+            linked_data_run(&linked, part.text_base()),
         ),
     };
     Ok((image, linked))
+}
+
+/// Where a link laid its initialized RAM data: the run's bytes in flash, and the RAM it runs at.
+#[cfg(feature = "linked")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DataRun {
+    /// The flash address of the run's first byte.
+    load: u32,
+    /// The RAM address the run starts at, word-aligned.
+    start: u32,
+    /// The RAM address just past the run, word-aligned.
+    end: u32,
+}
+
+/// The data run THIS link laid out, as absolute addresses, or `None` for a link that laid none --
+/// every link whose objects carry no initialized RAM data. `text_base` is the part's, because every
+/// symbol in a link is recorded relative to it.
+#[cfg(feature = "linked")]
+fn linked_data_run(linked: &lamella_linker::LinkedImage, text_base: u32) -> Option<DataRun> {
+    let at = |name: &str| {
+        linked
+            .symbols
+            .iter()
+            .find(|(symbol, _)| symbol == name)
+            .map(|&(_, offset)| offset.wrapping_add(text_base))
+    };
+    Some(DataRun {
+        load: at(lamella_elf::DATA_LOAD_SYMBOL)?,
+        start: at(lamella_elf::DATA_START_SYMBOL)?,
+        end: at(lamella_elf::DATA_END_SYMBOL)?,
+    })
+}
+
+/// The routine an RP2350 startup calls to copy a link's data run into RAM: `[run.load, ..)` to
+/// `[run.start, run.end)` a word at a time, then a `dsb` and an `isb`, so the run's code is fetched
+/// from the copy, then `bx lr`. It clobbers R0 to R3 and keeps its three addresses in a literal pool
+/// of its own, so it runs wherever it is laid on a word.
+///
+/// **A ROUTINE OF ITS OWN, BECAUSE THE STARTUP HAS NO ROOM FOR THE LOOP.** The startup is assembled
+/// into the fixed space between the IMAGE_DEF block and the text, which a board build's startup
+/// nearly fills: the loop with its three addresses does not fit there, and a call to it does.
+#[cfg(feature = "linked")]
+fn rp2350_data_copy_routine(run: DataRun) -> Vec<u8> {
+    use lamella_asm_arm32::{Cond, Encoder, Reg};
+    let mut enc = Encoder::new();
+    let load_word = enc.new_label();
+    let start_word = enc.new_label();
+    let end_word = enc.new_label();
+    enc.ldr_literal(Reg::R1, load_word).unwrap();
+    enc.ldr_literal(Reg::R2, start_word).unwrap();
+    enc.ldr_literal(Reg::R3, end_word).unwrap();
+    let copy = enc.new_label();
+    enc.bind_label(copy);
+    enc.ldr_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.adds_imm8(Reg::R1, 4).unwrap();
+    enc.str_imm(Reg::R0, Reg::R2, 0).unwrap();
+    enc.adds_imm8(Reg::R2, 4).unwrap();
+    enc.cmp_reg(Reg::R2, Reg::R3).unwrap();
+    enc.b_cond(Cond::CarryClear, copy);
+    
+    enc.emit_thumb32(0xF3BF, 0x8F4F);
+    enc.emit_thumb32(0xF3BF, 0x8F6F);
+    enc.bx(Reg::LR);
+    enc.align_to_word();
+    for (label, word) in [
+        (load_word, run.load),
+        (start_word, run.start),
+        (end_word, run.end),
+    ] {
+        enc.bind_label(label);
+        enc.emit_word(word);
+    }
+    enc.finish().expect("the RP2350 data copy assembles").bytes
 }
 
 /// The address a startup calls to run the board's startup hook ([`BOARD_INIT_SYMBOL`]), with the
@@ -1432,12 +1592,35 @@ pub fn build_linked_cortex_m_debug(
     archive: &[u8],
     target: &str,
 ) -> Result<Vec<u8>, BuildError> {
+    build_linked_cortex_m_debug_with_board(cil, pdb, corlib, libraries, archive, target, None)
+}
+
+/// [`build_linked_cortex_m_debug`] for a build that names a board, with that board's bus table, laid
+/// as [`build_linked_cortex_m_with_board`] lays it -- so the ELF a debugger reads is cut from the
+/// same link as the image the board is written with.
+#[cfg(feature = "linked")]
+pub fn build_linked_cortex_m_debug_with_board(
+    cil: &[u8],
+    pdb: &lamella_metadata::PortablePdb,
+    corlib: &[u8],
+    libraries: &[&[u8]],
+    archive: &[u8],
+    target: &str,
+    board_buses: Option<&[u32]>,
+) -> Result<Vec<u8>, BuildError> {
     let part = linked_part(target)?;
     let libraries = referenced_libraries(cil, libraries)?;
     let (program_object, deferred) =
         build_linked_program_object(cil, corlib, &libraries, Some(pdb), part.wide())?;
-    let (image, linked) =
-        link_linked_image(part, &program_object, deferred, corlib, &libraries, archive)?;
+    let (image, linked) = link_linked_image(
+        part,
+        &program_object,
+        deferred,
+        corlib,
+        &libraries,
+        archive,
+        board_buses,
+    )?;
     let program = lamella_elf::read_object(&program_object)
         .map_err(|e| BuildError::ObjectRead(alloc::format!("{e:?}")))?;
     let sections: Vec<(&str, &[u8])> = linked
@@ -1492,6 +1675,10 @@ pub fn link_product_image(
 }
 
 /// [`link_product_image`] for a part already resolved.
+///
+/// **INITIALIZED RAM DATA LINKS ONLY FOR THE RP2350**, whose startup copies it down
+/// ([`rp2350_linked_image`]). A Nordic part's startup copies none, so its link refuses an object that
+/// carries any (`LinkError::InitializedDataNotCopied`) rather than run it as whatever RAM held.
 #[cfg(feature = "linked")]
 fn link_part_image(
     part: LinkedPart,
@@ -1499,7 +1686,11 @@ fn link_part_image(
     archives: &[lamella_elf::Archive],
     entry: &str,
 ) -> Result<lamella_linker::LinkedImage, lamella_linker::LinkError> {
-    lamella_linker::link_gc_with_archives_ram(
+    let link = match part {
+        LinkedPart::Rp2350 => lamella_linker::link_gc_with_archives_ram_and_data,
+        LinkedPart::Nordic { .. } => lamella_linker::link_gc_with_archives_ram,
+    };
+    link(
         trimmed,
         archives,
         entry,
@@ -1652,7 +1843,7 @@ pub fn build_debug(cil: &[u8], target: &str) -> Result<(Vec<u8>, MethodDebug), B
     let (funcs, maps, fails, duplicates, plan) = lower_assembly_debug(&assembly, entry, &[])?;
     refuse_duplicate_bodies(&duplicates)?;
     if let Some((rid, error)) = fails.into_iter().next() {
-        return Err(BuildError::LowerCil { rid, error });
+        return Err(lower_cil_error(&assembly, rid, error));
     }
     let (code, method_lines) =
         arm32::lower_module_debug(&funcs, None, &maps).map_err(BuildError::LowerArm)?;
@@ -1902,16 +2093,27 @@ pub fn rp2350_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
 /// * **A board build's startup hook runs before the entry** ([`emit_board_init_call`]), after the
 ///   clear and after the boot magic is stamped, so a hook that never returns reads as "booted, not
 ///   returned" and never as the verdict the previous image left.
+/// * **Initialized RAM data is copied down after the clear and before the hook**, when the link laid
+///   a data run (`data`): the startup calls [`rp2350_data_copy_routine`], laid on a word after the
+///   text, and the heap starts above the run. A hook can run code the run holds, which is why the
+///   PSRAM bring-up can: its nucleus runs from RAM. A link with no data run gets the startup it
+///   always got, byte for byte.
 #[cfg(feature = "linked")]
 fn rp2350_linked_image(
     entry_offset: u32,
     text: &[u8],
     statics_end: u32,
     board_init: Option<u32>,
+    data: Option<DataRun>,
 ) -> Vec<u8> {
     use lamella_asm_arm32::{Encoder, Reg};
     const STUB_OFF: u32 = 16 * 4 + 5 * 4;
-    let heap_base = statics_end.next_multiple_of(8).max(RP2350_STATICS_BASE);
+    let ram_end = data.map_or(statics_end, |run| run.end.max(statics_end));
+    let heap_base = ram_end.next_multiple_of(8).max(RP2350_STATICS_BASE);
+    let copy_routine = data.map(|run| {
+        let at = RP2350_CODE_BASE + (text.len() as u32).next_multiple_of(4);
+        (at, rp2350_data_copy_routine(run))
+    });
     let heap_limit = RP2350_STACK_FLOOR;
     assert!(heap_base <= heap_limit, "the RP2350 statics must end below the stack's floor");
     assert!(heap_limit <= RP2350_RESULT_ADDR, "the RP2350 heap must end below the verdict mailbox");
@@ -1936,6 +2138,12 @@ fn rp2350_linked_image(
     enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
     emit_fault_record_clear(&mut enc, record_word);
     emit_zero_band(&mut enc, zero_start_word, zero_end_word);
+    let copy_word = copy_routine.as_ref().map(|_| {
+        let word = enc.new_label();
+        enc.ldr_literal(Reg::R0, word).unwrap();
+        enc.blx(Reg::R0);
+        word
+    });
     enc.ldr_literal(Reg::R0, heap_base_word).unwrap();
     enc.ldr_literal(Reg::R1, heap_ptr_word).unwrap();
     enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
@@ -1983,6 +2191,10 @@ fn rp2350_linked_image(
         enc.bind_label(label);
         enc.emit_word(hook);
     }
+    if let (Some(label), Some((at, _))) = (copy_word, &copy_routine) {
+        enc.bind_label(label);
+        enc.emit_word(at | 1);
+    }
     let stub = enc.finish().expect("the RP2350 startup assembles").bytes;
     assert!(
         STUB_OFF as usize + stub.len() <= (RP2350_CODE_BASE - RP2350_CODE_REGION) as usize,
@@ -2004,6 +2216,10 @@ fn rp2350_linked_image(
     image[..head.len()].copy_from_slice(&head);
     image[STUB_OFF as usize..STUB_OFF as usize + stub.len()].copy_from_slice(&stub);
     image.extend_from_slice(text);
+    if let Some((at, routine)) = copy_routine {
+        image.resize((at - RP2350_CODE_REGION) as usize, 0);
+        image.extend_from_slice(&routine);
+    }
     image
 }
 
@@ -2685,7 +2901,7 @@ fn build_program_object(
                     .collect();
                 return Err(BuildError::UnresolvedAssemblyReference { missing, supplied });
             }
-            return Err(BuildError::LowerCil { rid, error });
+            return Err(lower_cil_error(&assembly, rid, error));
         }
         Vec::new()
     };
@@ -4502,7 +4718,7 @@ fn lower_one_reachable(
                 },
             ) {
                 Ok((func, _map)) => Ok(Some(func)),
-                Err(error) => Err(BuildError::LowerCil { rid, error }),
+                Err(error) => Err(lower_cil_error(assembly, rid, error)),
             };
         }
     }
@@ -5398,9 +5614,17 @@ fn pinvoke_imports(funcs: &[Function]) -> Vec<(alloc::string::String, u32)> {
     imports
 }
 
+/// The refusal for a method whose CIL body did not lower, naming it by row and by name.
+fn lower_cil_error(assembly: &Assembly, rid: u32, error: cil::CilError) -> BuildError {
+    let method = method_display_names(assembly, rid as usize + 1)
+        .pop()
+        .flatten()
+        .unwrap_or_else(|| alloc::format!("method {rid}"));
+    BuildError::LowerCil { rid, method, error }
+}
+
 /// `rid -> "Namespace.Type::Method"` for every METHOD_DEF row (None for a rid no method occupies
 /// -- the rid-indexed layout keeps gaps as placeholder functions).
-#[cfg(any(feature = "arm32", feature = "riscv32"))]
 fn method_display_names(
     assembly: &Assembly,
     count: usize,
@@ -6756,6 +6980,104 @@ fn clock_seam_body(name: Option<&str>, params: &[SigType]) -> Option<Function> {
     })
 }
 
+/// `System.Environment.TickCount`'s `[RuntimeProvided]` getter, as the low 32 bits of the counter
+/// the managed clock reads.
+///
+/// .NET's `TickCount` counts milliseconds from an arbitrary origin and wraps: it rises from zero to
+/// `int.MaxValue` in about 24.9 days, continues from `int.MinValue`, and is back at zero 24.9 days
+/// later. The 64-bit `lamella_clock_now_ms` reading truncated to 32 bits is exactly that wrap, and it
+/// is the reading `Lamella.Runtime.Clock`'s monotonic seam takes ([`clock_seam_body`]), so
+/// `TickCount`, `Stopwatch`, `DateTime` and every timeout measured through the clock share one
+/// timebase. The interpreter answers the same truncation of the same counter, and the archive's `0`
+/// for "no clock" truncates to the `0` the interpreter answers without one.
+///
+/// `Environment.ProcessorCount`'s getter, the type's other `[RuntimeProvided]` member with no intended
+/// default, answers `1`, as the interpreter's intrinsic does: the one core a program runs on.
+fn environment_seam_body(name: Option<&str>, params: &[SigType]) -> Option<Function> {
+    if name? == "get_ProcessorCount" && params.is_empty() {
+        let count = ValueId(0);
+        return Some(Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    count,
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: 1,
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(count))),
+            }],
+        });
+    }
+    if name? != "get_TickCount" || !params.is_empty() {
+        return None;
+    }
+    let (now, ticks) = (ValueId(0), ValueId(1));
+    Some(Function {
+        params: Vec::new(),
+        ret: Some(MirType::I32),
+        value_types: vec![MirType::I64, MirType::I32],
+        entry: BlockId(0),
+        blocks: vec![BasicBlock {
+            params: Vec::new(),
+            insts: vec![
+                (
+                    now,
+                    Inst::PInvoke {
+                        import: "lamella_clock_now_ms".into(),
+                        args: Vec::new(),
+                    },
+                ),
+                (ticks, Inst::Truncate { value: now }),
+            ],
+            terminator: Some(Terminator::Return(Some(ticks))),
+        }],
+    })
+}
+
+/// `Lamella.Hardware.BoardBuses`' two seams, the lookups `System.Device`'s factories make in the bus
+/// table of the board the build names. Each is one call into the runtime-support archive, which reads
+/// the table at `lamella_board_buses` through `lamella-board-buses`, the reading the bake and the
+/// interpreter share:
+///
+/// - `Length(kind, bus)` answers -1 when the image carries no table, 0 for a bus the table lacks or a
+///   negative argument, and the bus's descriptor word count otherwise;
+/// - `Word(kind, bus, index)` answers that descriptor's word `index`, and 0 outside it.
+///
+/// A build that names a board lays its table (`build_linked_cortex_m_with_board`). Without one, the
+/// archive's own weak one-word default reads as no table, so every bus is absent.
+fn board_buses_seam_body(name: Option<&str>, params: &[SigType]) -> Option<Function> {
+    let (import, arity): (&str, u32) = match (name?, params) {
+        ("Length", [SigType::I4, SigType::I4]) => ("lamella_board_buses_length", 2),
+        ("Word", [SigType::I4, SigType::I4, SigType::I4]) => ("lamella_board_buses_word", 3),
+        _ => return None,
+    };
+    let args: Vec<ValueId> = (0..arity).map(ValueId).collect();
+    let result = ValueId(arity);
+    Some(Function {
+        params: vec![MirType::I32; arity as usize],
+        ret: Some(MirType::I32),
+        value_types: vec![MirType::I32; arity as usize + 1],
+        entry: BlockId(0),
+        blocks: vec![BasicBlock {
+            params: args.clone(),
+            insts: vec![(
+                result,
+                Inst::PInvoke {
+                    import: import.into(),
+                    args,
+                },
+            )],
+            terminator: Some(Terminator::Return(Some(result))),
+        }],
+    })
+}
+
 fn reference_equals_body() -> Function {
     Function {
         params: vec![MirType::ObjectRef, MirType::ObjectRef],
@@ -7707,6 +8029,15 @@ fn synthesized_seam_body<'a>(
             return SeamEmission::Synthesized(func);
         }
     }
+    if (type_name.namespace, type_name.name) == ("System", "Environment") {
+        let params = signature
+            .as_ref()
+            .map(|s| s.parameters.as_slice())
+            .unwrap_or(&[]);
+        if let Some(func) = environment_seam_body(method.name(), params) {
+            return SeamEmission::Synthesized(func);
+        }
+    }
     if (type_name.namespace, type_name.name) == ("System", "Math") {
         let params = signature
             .as_ref()
@@ -7791,6 +8122,15 @@ fn synthesized_seam_body<'a>(
         };
         if let Some(body) = mmio_body {
             return SeamEmission::Synthesized(body);
+        }
+    }
+    if (type_name.namespace, type_name.name) == ("Lamella.Hardware", "BoardBuses") {
+        let params = signature
+            .as_ref()
+            .map(|s| s.parameters.as_slice())
+            .unwrap_or(&[]);
+        if let Some(func) = board_buses_seam_body(method.name(), params) {
+            return SeamEmission::Synthesized(func);
         }
     }
     if (type_name.namespace, type_name.name) == ("System", "Buffer") {
@@ -7929,7 +8269,7 @@ fn lower_assembly<'a>(
         lower_assembly_debug(assembly, entry, references)?;
     refuse_duplicate_bodies(&duplicates)?;
     if let Some((rid, error)) = fails.into_iter().next() {
-        return Err(BuildError::LowerCil { rid, error });
+        return Err(lower_cil_error(assembly, rid, error));
     }
     Ok((funcs, plan))
 }
@@ -12101,6 +12441,105 @@ mod tests {
         crate::arm32::lower_object(&[f], &["deferred"], &[]).expect("it lowers on the object path");
     }
 
+    /// `Lamella.Hardware.BoardBuses`' two seams are one call each into the runtime-support archive,
+    /// passing the managed arguments through in order, and on each ISA the call leaves the object as
+    /// an undefined extern for the link to resolve against the archive. Matched on the signature: a
+    /// near miss is not this seam.
+    #[test]
+    fn board_buses_seams_call_the_archive_s_two_lookups() {
+        for (name, params, import) in [
+            ("Length", &[SigType::I4, SigType::I4][..], "lamella_board_buses_length"),
+            ("Word", &[SigType::I4, SigType::I4, SigType::I4][..], "lamella_board_buses_word"),
+        ] {
+            let body = board_buses_seam_body(Some(name), params).expect("the lookup is synthesized");
+            assert_eq!(body.ret, Some(MirType::I32), "{name} answers one word");
+            assert_eq!(body.params, vec![MirType::I32; params.len()], "{name} takes its int arguments");
+            match (&body.blocks[0].params[..], &body.blocks[0].insts[..]) {
+                (incoming, [(result, Inst::PInvoke { import: called, args })]) => {
+                    assert_eq!(&called[..], import);
+                    assert_eq!(args, incoming, "{name} passes its arguments through, in order");
+                    assert_eq!(
+                        body.blocks[0].terminator,
+                        Some(Terminator::Return(Some(*result))),
+                        "and the archive's answer is {name}'s"
+                    );
+                }
+                other => panic!("expected one call into the archive, got {other:?}"),
+            }
+            assert!(lamella_ir::verify(&body).is_ok(), "{:?}", lamella_ir::verify(&body));
+            let calls_the_archive = |object: &[u8]| {
+                lamella_elf::read_object(object)
+                    .expect("the object parses back")
+                    .symbols
+                    .iter()
+                    .any(|s| s.name == import && !s.defined)
+            };
+            #[cfg(feature = "arm32")]
+            assert!(calls_the_archive(
+                &crate::arm32::lower_object(&[body.clone()], &["lookup"], &[]).expect("ARM lowers it")
+            ));
+            #[cfg(feature = "riscv32")]
+            assert!(calls_the_archive(
+                &crate::riscv32::lower_object(&[body.clone()], &["lookup"], &[], &[])
+                    .expect("RISC-V lowers it")
+            ));
+            let _ = calls_the_archive;
+        }
+        for (name, params) in [
+            ("Length", &[SigType::I4][..]),
+            ("Length", &[SigType::I4, SigType::I8][..]),
+            ("Word", &[SigType::I4, SigType::I4][..]),
+            ("Count", &[SigType::I4, SigType::I4][..]),
+        ] {
+            assert!(board_buses_seam_body(Some(name), params).is_none(), "{name}{params:?} is not this seam");
+        }
+    }
+
+    /// The table a board names is laid as the STRONG global `lamella_board_buses`, its words
+    /// little-endian and word-aligned in read-only data merged with the code, where the archive's
+    /// lookups find each bus; and a table that fails the bake's check is refused by name rather than
+    /// laid.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn a_board_s_bus_table_is_laid_strong_and_word_aligned_or_refused() {
+        let table: &[u32] = &[
+            0x5355_424C, 1, 10, 3, 1, 0, 2, 0x2380_0000, 0, 2, 0, 8, 0x4009_0000, 0x250, 0x4002_8024,
+            0x4003_8014, 0x4002_802C, 0x4003_8018, 3, 150_000_000, 3, 0, 12, 0x4008_0000, 0x4_0240, 0x4002_8084, 0x4003_8044, 0x4002_8094, 0x4003_804C,
+            0x4002_809C, 0x4003_8050, 1, 12_000_000, 1, 17,
+        ];
+        let object = board_buses_object(table).expect("a checked table is laid");
+        let symbol = object
+            .symbols
+            .iter()
+            .find(|s| s.name == BOARD_BUSES_SYMBOL)
+            .expect("the table's symbol");
+        assert!(symbol.defined, "laid here, not left to the archive");
+        assert_eq!(
+            symbol.binding,
+            lamella_elf::Binding::Global,
+            "strong, so it wins over the archive's weak default"
+        );
+        assert_eq!(symbol.size as usize, table.len() * 4, "sized to the whole table");
+        assert_eq!(symbol.value % 4, 0, "word-aligned");
+        assert!(object.text_align >= 4, "and the merged data keeps that alignment");
+        let laid: Vec<u32> = object.text[symbol.value as usize..][..table.len() * 4]
+            .chunks_exact(4)
+            .map(|w| u32::from_le_bytes([w[0], w[1], w[2], w[3]]))
+            .collect();
+        assert_eq!(laid, table, "the words, little-endian, as given");
+        let read = |index: usize| laid.get(index).copied();
+        assert_eq!(lamella_board_buses::length(read, 2, 0), 8, "I2C0's eight words");
+        assert_eq!(lamella_board_buses::word(read, 3, 0, 11), 17, "SPI0's select is GP17");
+        assert_eq!(lamella_board_buses::length(read, 2, 1), 0, "the board has no I2C1");
+        match board_buses_object(&[0x5355_424C, 2, 10, 0]) {
+            Err(error @ BuildError::BoardBusTable(_)) => {
+                let said = alloc::format!("{error}");
+                assert!(said.contains("bus table"), "the refusal names the table: {said}");
+            }
+            other => panic!("a table of another layout version must be refused, got {other:?}"),
+        }
+    }
+
     #[cfg(any(feature = "arm32", feature = "riscv32", feature = "wasm"))]
     #[test]
     fn mmio_seam_bodies_are_inline_memory_ops() {
@@ -12372,7 +12811,7 @@ mod tests {
         let word = |image: &[u8], at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
         let literals = |image: &[u8]| -> Vec<u32> { (0x54..0x100).step_by(4).map(|at| word(image, at)).collect() };
 
-        let image = rp2350_linked_image(4, &text, RP2350_STATICS_BASE, None);
+        let image = rp2350_linked_image(4, &text, RP2350_STATICS_BASE, None, None);
         assert_eq!(
             word(&image, 0),
             0x2007_F000,
@@ -12402,7 +12841,7 @@ mod tests {
         assert!(pool.contains(&0x1000_0105), "the entry is the text base plus its offset, in Thumb");
         assert!(pool.contains(&0x2000_0000), "a fault is recorded where a Nordic image records one");
 
-        let raised = literals(&rp2350_linked_image(4, &text, 0x2001_2345, None));
+        let raised = literals(&rp2350_linked_image(4, &text, 0x2001_2345, None, None));
         assert!(raised.contains(&0x2001_2348), "the heap starts above the statics' end");
         assert!(raised.contains(&0x2006_F000), "and still ends at the stack's floor");
     }
@@ -12471,7 +12910,7 @@ mod tests {
         let targets = |calls: &[(usize, u32)]| calls.iter().map(|&(_, target)| target).collect::<Vec<_>>();
         let text = [0xAAu8; 8];
         const RP2350_STUB: usize = 16 * 4 + 5 * 4;
-        let rp2350 = |hook| rp2350_linked_image(4, &text, 0x2000_2468, hook);
+        let rp2350 = |hook| rp2350_linked_image(4, &text, 0x2000_2468, hook, None);
         let nordic = |hook| nordic_linked_image(0x2000_4000, 4, &text, 0x2000_1000, hook);
         for (part, plain, hooked, start, entry, hook) in [
             ("rp2350", rp2350(None), rp2350(Some(0x1000_0201)), RP2350_STUB, 0x1000_0105, 0x1000_0201),
@@ -12852,6 +13291,70 @@ mod tests {
         assert!(clock_seam_body(Some("MonotonicMilliseconds"), &[SigType::I8]).is_none());
     }
 
+    /// `Environment.TickCount` reads the clock's counter and keeps its low 32 bits, as .NET's wraps.
+    ///
+    /// The same entry point the managed clock's monotonic seam calls, so the getter and every
+    /// duration measured through `Lamella.Runtime.Clock` read one counter; then a truncation, which
+    /// is the wrap .NET specifies and the interpreter's answer (`now_millis() as i32`). The type's
+    /// other built seam is `ProcessorCount`, which answers 1 as the interpreter does;
+    /// `GetEnvironmentVariable` keeps its intended default.
+    #[test]
+    fn tick_count_is_the_clock_counter_s_low_32_bits() {
+        let body = environment_seam_body(Some("get_TickCount"), &[]).expect("the getter is synthesized");
+        assert_eq!(body.ret, Some(MirType::I32), "TickCount is an `int`");
+        assert!(body.params.is_empty(), "and the getter is static, taking nothing");
+        match &body.blocks[0].insts[..] {
+            [(now, Inst::PInvoke { import, args }), (ticks, Inst::Truncate { value })] => {
+                assert_eq!(&import[..], "lamella_clock_now_ms");
+                assert!(args.is_empty());
+                assert_eq!(body.value_types[now.index()], MirType::I64, "the counter is 64-bit");
+                assert_eq!(value, now, "the truncation takes the counter");
+                assert_eq!(
+                    body.blocks[0].terminator,
+                    Some(Terminator::Return(Some(*ticks))),
+                    "and its low 32 bits are the answer"
+                );
+            }
+            other => panic!("expected the clock call and a truncation, got {other:?}"),
+        }
+        assert!(lamella_ir::verify(&body).is_ok(), "{:?}", lamella_ir::verify(&body));
+        let calls_the_clock = |object: &[u8]| {
+            lamella_elf::read_object(object)
+                .expect("the object parses back")
+                .symbols
+                .iter()
+                .any(|s| s.name == "lamella_clock_now_ms" && !s.defined)
+        };
+        #[cfg(feature = "arm32")]
+        assert!(calls_the_clock(
+            &crate::arm32::lower_object(&[body.clone()], &["tick_count"], &[]).expect("ARM lowers it")
+        ));
+        #[cfg(feature = "riscv32")]
+        assert!(calls_the_clock(
+            &crate::riscv32::lower_object(&[body.clone()], &["tick_count"], &[], &[]).expect("RISC-V lowers it")
+        ));
+        let _ = calls_the_clock;
+        for (name, params) in [
+            ("get_TickCount", &[SigType::I4][..]),
+            ("get_ProcessorCount", &[SigType::I4][..]),
+            ("GetEnvironmentVariable", &[SigType::String][..]),
+        ] {
+            assert!(environment_seam_body(Some(name), params).is_none(), "{name}{params:?} is not this seam");
+        }
+        let count = environment_seam_body(Some("get_ProcessorCount"), &[]).expect("ProcessorCount is built");
+        assert_eq!(count.ret, Some(MirType::I32), "ProcessorCount is an `int`");
+        assert!(count.params.is_empty(), "and its getter is static, taking nothing");
+        match &count.blocks[0].insts[..] {
+            [(one, Inst::ConstInt { ty: MirType::I32, value: 1 })] => assert_eq!(
+                count.blocks[0].terminator,
+                Some(Terminator::Return(Some(*one))),
+                "one core, as the interpreter answers"
+            ),
+            other => panic!("expected the constant 1, got {other:?}"),
+        }
+        assert!(lamella_ir::verify(&count).is_ok(), "{:?}", lamella_ir::verify(&count));
+    }
+
     /// A BUILD REFUSAL NAMES THE THING, NOT THE VARIANT.
     ///
     /// The case that prompted this: a user compiling a program was handed `LowerArm(CallUnsupported)`
@@ -13116,6 +13619,39 @@ mod tests {
 
     fn fixture(relative: &str) -> Option<Vec<u8>> {
         std::fs::read(alloc::format!("{}/{relative}", env!("CARGO_MANIFEST_DIR"))).ok()
+    }
+
+    /// A body that does not lower is refused BY NAME -- `Namespace.Type::Method`, beside its row --
+    /// and what the lowering met is said in words rather than as a variant.
+    #[test]
+    fn a_lowering_refusal_names_the_method_and_what_it_met() {
+        let Some(bytes) = fixture("../lamella-load/tests/fixtures/corlib.dll") else {
+            return;
+        };
+        let assembly = Assembly::read(&bytes).expect("the corlib fixture parses");
+        let rid = assembly
+            .find_type("System", "Object")
+            .and_then(|object| object.methods().find(|m| m.name() == Some("ToString")))
+            .expect("the corlib declares System.Object::ToString")
+            .rid();
+        let error = lower_cil_error(
+            &assembly,
+            rid,
+            cil::CilError::UnsupportedControlFlow(cil::ControlFlowGap::EdgeArity {
+                target: cil::EdgeTarget::FinallyHandler,
+                passed: 0,
+                takes: 2,
+            }),
+        );
+        let BuildError::LowerCil { method, .. } = &error else {
+            panic!("expected the lowering refusal, got {error:?}");
+        };
+        assert_eq!(method, "System.Object::ToString");
+        let message = alloc::format!("{error}");
+        assert!(message.contains("`System.Object::ToString`"), "{message}");
+        assert!(message.contains(&alloc::format!("(method {rid})")), "{message}");
+        assert!(message.contains("first block of a `finally` handler"), "{message}");
+        assert!(!message.contains("UnsupportedControlFlow"), "{message}");
     }
 
     /// A method whose every reachable path throws is lowered with the result type its signature
@@ -13600,6 +14136,208 @@ mod tests {
         assert_a_program_names_only_what_corlib_exports(
             &build_object_riscv_with_reference(&program, &corlib).expect("the program builds"),
             &build_library_object_riscv(&corlib).expect("corlib builds"),
+        );
+    }
+
+    /// THE RP2350 STARTUP COPIES A LINK'S DATA RUN AFTER THE CLEAR AND BEFORE THE BOARD'S HOOK, which
+    /// is what lets the hook run code the run holds -- the PSRAM bring-up's nucleus, which runs from
+    /// RAM. The copy is a call to a routine laid on the first word after the text, and the heap starts
+    /// above the run.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn the_rp2350_startup_copies_the_data_run_after_the_clear_and_before_the_hook() {
+        let half = |image: &[u8], at: usize| u16::from_le_bytes([image[at], image[at + 1]]);
+        let word =
+            |image: &[u8], at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+        let calls_and_clear = |image: &[u8]| {
+            let (mut calls, mut clear, mut last) = (Vec::new(), None, 0u32);
+            let mut at = 16 * 4 + 5 * 4;
+            while half(image, at) != 0xE7FE {
+                let op = half(image, at);
+                if op & 0xFF00 == 0x4800 {
+                    last = word(image, ((at + 4) & !3) + usize::from(op & 0xFF) * 4);
+                }
+                if op == 0x4291 {
+                    clear.get_or_insert(at);
+                }
+                if op == 0x4780 {
+                    calls.push((at, last));
+                }
+                at += 2;
+            }
+            (calls, clear.expect("the startup clears RAM"))
+        };
+        let text = [0xAAu8; 10];
+        let run = DataRun {
+            load: RP2350_CODE_BASE + 4,
+            start: 0x2001_2340,
+            end: 0x2001_2354,
+        };
+        let image = rp2350_linked_image(4, &text, 0x2001_2340, Some(0x1000_0201), Some(run));
+        let routine = RP2350_CODE_BASE + 12;
+        let (calls, clear) = calls_and_clear(&image);
+        let targets: Vec<u32> = calls.iter().map(|&(_, target)| target).collect();
+        assert_eq!(
+            targets,
+            [routine | 1, 0x1000_0201, 0x1000_0105],
+            "the copy, then the hook, then the entry"
+        );
+        assert!(clear < calls[0].0, "the copy follows the clear");
+        let laid = (routine - RP2350_CODE_REGION) as usize;
+        assert_eq!(&image[laid..], rp2350_data_copy_routine(run).as_slice());
+        assert!(
+            image[0x100 + 10..laid].iter().all(|&b| b == 0),
+            "padded to the word"
+        );
+        let pool: Vec<u32> = (0x54..0x100)
+            .step_by(4)
+            .map(|at| word(&image, at))
+            .collect();
+        assert!(
+            pool.contains(&0x2001_2358),
+            "the heap starts above the run, on 8 bytes"
+        );
+        let plain = rp2350_linked_image(4, &text, 0x2001_2340, Some(0x1000_0201), None);
+        let (calls, _) = calls_and_clear(&plain);
+        assert_eq!(calls.len(), 2);
+        assert_eq!(plain.len(), 0x100 + text.len());
+    }
+
+    /// THE COPY ROUTINE, RUN: the RP2350 is no machine QEMU models, so its Thumb instructions are
+    /// stepped here against memory -- a run in flash, and RAM holding garbage -- and the RAM must hold
+    /// the run's bytes after it, with nothing past the run's end written, and the `dsb` and `isb`
+    /// executed before it returns.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn the_rp2350_data_copy_routine_copies_the_run_a_word_at_a_time() {
+        let at: u32 = 0x1000_0108;
+        let run = DataRun {
+            load: 0x1000_0200,
+            start: 0x2001_0010,
+            end: 0x2001_0020,
+        };
+        let code = rp2350_data_copy_routine(run);
+        let flash: Vec<u8> = (0u8..16)
+            .map(|b| b.wrapping_mul(37).wrapping_add(5))
+            .collect();
+        let mut ram = alloc::vec![0xEEu8; 0x40];
+        let read = |addr: u32, ram: &[u8]| -> u32 {
+            let bytes: &[u8] = if (at..at + code.len() as u32).contains(&addr) {
+                &code[(addr - at) as usize..]
+            } else if (run.load..run.load + 16).contains(&addr) {
+                &flash[(addr - run.load) as usize..]
+            } else {
+                &ram[(addr - 0x2001_0000) as usize..]
+            };
+            u32::from_le_bytes(bytes[..4].try_into().unwrap())
+        };
+        let (mut r, mut pc, mut carry, mut barriers) = ([0u32; 4], at, false, Vec::new());
+        for _ in 0..200 {
+            let op = u16::from_le_bytes([code[(pc - at) as usize], code[(pc - at) as usize + 1]]);
+            let (t, n) = (usize::from(op & 7), usize::from((op >> 3) & 7));
+            let imm5 = u32::from((op >> 6) & 31) * 4;
+            match op {
+                _ if op & 0xF800 == 0x4800 => {
+                    r[usize::from((op >> 8) & 7)] =
+                        read(((pc + 4) & !3) + u32::from(op & 0xFF) * 4, &ram)
+                }
+                _ if op & 0xF800 == 0x6800 => r[t] = read(r[n] + imm5, &ram),
+                _ if op & 0xF800 == 0x6000 => {
+                    let o = (r[n] + imm5 - 0x2001_0000) as usize;
+                    ram[o..o + 4].copy_from_slice(&r[t].to_le_bytes());
+                }
+                _ if op & 0xF800 == 0x3000 => r[usize::from((op >> 8) & 7)] += u32::from(op & 0xFF),
+                _ if op & 0xFFC0 == 0x4280 => carry = r[t] >= r[n],
+                _ if op & 0xFF00 == 0xD300 => {
+                    if !carry {
+                        pc = (pc as i64 + 4 + i64::from(op as u8 as i8) * 2) as u32;
+                        continue;
+                    }
+                }
+                0xF3BF => {
+                    let second = u16::from_le_bytes([
+                        code[(pc - at) as usize + 2],
+                        code[(pc - at) as usize + 3],
+                    ]);
+                    barriers.push(second);
+                    pc += 4;
+                    continue;
+                }
+                0x4770 => break,
+                other => panic!("an instruction the routine should not hold: {other:#06x}"),
+            }
+            pc += 2;
+        }
+        assert_eq!(
+            barriers,
+            [0x8F4F, 0x8F6F],
+            "a dsb, then an isb, before the return"
+        );
+        assert_eq!(&ram[0x10..0x20], flash.as_slice(), "the run, copied");
+        assert!(
+            ram[..0x10].iter().chain(&ram[0x20..]).all(|&b| b == 0xEE),
+            "and nothing else"
+        );
+    }
+
+    /// INITIALIZED RAM DATA LINKS FOR THE RP2350 ONLY: its startup copies the data run down, and a
+    /// Nordic part's copies nothing, so a Nordic link of the same object is refused, naming the
+    /// section, rather than build an image that runs the data as whatever RAM held at reset.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn only_the_rp2350_link_takes_an_object_that_carries_initialized_data() {
+        let object =
+            lamella_elf::read_object(&lamella_elf::write_relocatable_object_with_sections(
+                lamella_elf::Machine::Arm,
+                &[0x70, 0x47],
+                &[
+                    lamella_elf::Symbol {
+                        name: "f0",
+                        value: 1,
+                        size: 2,
+                        binding: lamella_elf::Binding::Global,
+                        kind: lamella_elf::SymbolType::Func,
+                        section: lamella_elf::SymbolSection::Text,
+                    },
+                    lamella_elf::Symbol {
+                        name: "setting",
+                        value: 0,
+                        size: 4,
+                        binding: lamella_elf::Binding::Global,
+                        kind: lamella_elf::SymbolType::NoType,
+                        section: lamella_elf::SymbolSection::InSection(0),
+                    },
+                ],
+                &[],
+                &[lamella_elf::Section {
+                    name: ".data.setting",
+                    flags: 0x3,
+                    addralign: 4,
+                    data: &[42, 0, 0, 0],
+                    relocations: &[],
+                }],
+            ))
+            .unwrap();
+        let rp2350 = link_part_image(
+            LinkedPart::Rp2350,
+            core::slice::from_ref(&object),
+            &[],
+            "f0",
+        )
+        .expect("the RP2350 link lays the run");
+        let run = linked_data_run(&rp2350, LinkedPart::Rp2350.text_base()).expect("and names it");
+        assert_eq!(run.end - run.start, 4);
+        assert_eq!(
+            link_part_image(
+                LinkedPart::Nordic {
+                    initial_sp: 0x2000_4000
+                },
+                &[object],
+                &[],
+                "f0"
+            )
+            .unwrap_err(),
+            lamella_linker::LinkError::InitializedDataNotCopied(String::from(".data.setting"))
         );
     }
 }

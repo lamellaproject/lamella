@@ -48,9 +48,33 @@ notes = [
     "X1 IS A 12 MHz CRYSTAL, AND THE FIGURE IS MEASURED BECAUSE NO DOCUMENT FOR THIS BOARD STATES IT. Schematic sheet 2 draws X1 with its designator, its pads and its load capacitors, and no frequency. RP2350 datasheet section 5.2.8.1: BOOTSEL mode needs a crystal across XIN and XOUT or a clock driven into XIN; the bootrom assumes a 12 MHz XOSC and derives a fixed 48 MHz for USB from it, which 'must be a precise frequency'; and a board with any other crystal that wants USB boot programs BOOTSEL_PLL_CFG and BOOTSEL_XOSC_CFG in OTP and sets BOOT_FLAGS0.ENABLE_BOOTSEL_NON_DEFAULT_PLL_XOSC_CFG. Measured on one unit of this board: it enumerates as the RP2350's USB boot device, and its OTP, read over SWD, has that bit clear in BOOT_FLAGS0 and in both of its redundant copies (rows 0x048 to 0x04a, section 13.10) and neither configuration row programmed. So its bootrom brought USB up on the 12 MHz it assumes.",
 ]
 
-[memory]                    # the RP2350 has NO internal flash (chip flash = 0, gate-pinned) --
-flash = 0x1000000           # the 16 MB QSPI chip it XIPs from is BOARD truth.
+# --- memory: what the board fits beside the chip. The RP2350B's own SRAM is chip truth, stated in
+#     csp/rp2350/parts.toml. ---
+
+[[memory]]                  # the RP2350 has NO internal flash (chip flash = 0, gate-pinned) --
+name = "flash"              # the 16 MB QSPI chip it XIPs from is BOARD truth.
+kind = "flash"
+size = 0x1000000
 source = "Schematic sheet 2: U2 is a 16MB W25Q128JVPIQ on the QSPI lines. The pinout diagram states 16MB Flash in its summary. 16 MB = 0x1000000."
+
+# THE PSRAM SHARES THE FLASH'S CLOCK AND FOUR DATA LINES AND HAS A SELECT OF ITS OWN, GP47 (the
+# `psram-cs` row below), so it answers in the QSPI memory interface's second window: 0x11000000,
+# chip select 1's, beside the flash's 0x10000000. That address is the window's CACHED view; the XIP
+# cache sits in front of both windows, and the same bytes read uncached at 0x15000000. Nothing
+# answers there at reset: the interface's window 1 must first be told the part's commands and
+# timing and GP47 routed to it, and writes reach the part only once XIP_CTRL.WRITABLE_M1 is set.
+[[memory]]
+name = "psram"
+kind = "ram"
+base = 0x11000000
+size = 0x800000             # 8 MB: the whole part.
+controller = "qmi"
+optional = true             # the board boots and runs from its flash and the chip's SRAM without it.
+source = "Schematic sheet 2: the part 'PSRAM 8MB APS6404L-3SQR-ZR' shares QSPI_SCLK and QSPI_SD0 to QSPI_SD3 with the flash, and its CS pin is the net PSRAM_CS, which sheet 1 lands on GPIO47/ADC7 (ball 58). The APS6404L-3SQR datasheet (APM_PSRAM_E3_QSPI v2.7), Features: 'Organization: 64Mb, 8M x 8bits', so 8 MB = 0x800000. RP2350 datasheet 4.4.1: the lower half of the XIP address space holds two 16 MB windows, one for each QMI chip select, read cached at 0x10... and uncached at 0x14...; and the XIP_CTRL register's WRITABLE_M1 bit names window 1 as 0x11000000 through 0x11ffffff, which must be made writable 'if a RAM device is attached on QSPI chip select 1'."
+
+[memory.psram.device]
+part = "APS6404L-3SQR-ZR"
+source = "Schematic sheet 2 prints the part as 'PSRAM 8MB APS6404L-3SQR-ZR'. The APS6404L-3SQR datasheet (APM_PSRAM_E3_QSPI v2.7), section 5, Table 1 'Ordering Information', lists APS6404L-3SQR-ZR as the USON-8 part for Tc = -40 C to +85 C, the standard temperature range, at 84 MHz."
 
 # --- the wires, and the peripherals the header names. The pinout diagram labels GP0 and GP1 UART 0
 #     TX and RX; GP16, GP17, GP18 and GP19 SPI 0 RX, CSn, SCK and TX; and GP4 and GP5 I2C 0 SDA and

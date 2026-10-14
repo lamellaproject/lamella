@@ -1,9 +1,15 @@
 // Lamella managed corlib (from scratch). -- System.BitConverter
 namespace System
 {
+#if LAMELLA_SURFACE_NETFX_2_0
+    public static class BitConverter
+#else
     public sealed class BitConverter
+#endif
     {
+#if !LAMELLA_SURFACE_NETFX_2_0
         private BitConverter() { }
+#endif
 
         public static readonly bool IsLittleEndian = true;
 

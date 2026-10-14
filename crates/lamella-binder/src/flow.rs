@@ -207,8 +207,11 @@ fn exits(stmt: &BoundStmt, jumps: &Jumps) -> bool {
     }
 }
 
-/// Whether an expression is the constant `true`.
-fn is_const_true(expr: &BoundExpr) -> bool {
+/// Whether an expression is the constant `true` -- the condition of a loop that only a `break`
+/// can end. The code generator asks the same question, so a loop this analysis calls endless is
+/// written with no exit test.
+#[must_use]
+pub fn is_const_true(expr: &BoundExpr) -> bool {
     matches!(&expr.kind, BoundExprKind::Literal(Literal::Boolean(true)))
 }
 

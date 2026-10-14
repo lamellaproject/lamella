@@ -5,8 +5,9 @@ namespace Lamella.Hardware
     public delegate AdcDriver AdcDriverFactory();
 
     /// <summary>The board's ADC driver binding. A board binds it once at startup, and everything
-    /// that reads a converter -- <see cref="Adc"/>, and the compatibility surfaces built over it --
-    /// resolves through here.</summary>
+    /// that reads a converter -- <see cref="Adc"/>, every controller from
+    /// <see cref="CreateAnalogController"/>, and any library built over this binding -- resolves
+    /// through here.</summary>
     public sealed class AdcControllers
     {
         private AdcControllers() { }
@@ -44,7 +45,7 @@ namespace Lamella.Hardware
 
         /// <summary>The bound ADC driver, creating it on first use.</summary>
         /// <remarks>
-        /// <para>THE SAME INSTANCE <see cref="Adc"/> and the compatibility surface use. One
+        /// <para>THE SAME INSTANCE <see cref="Adc"/> and the analog controllers use. One
         /// converter has one driver, and this caches it after the first call, so a reading taken
         /// through <see cref="Adc"/> and one taken through a driver from here act on the same
         /// registers.</para>
@@ -63,7 +64,9 @@ namespace Lamella.Hardware
             if ((object)_factory == null)
             {
                 throw new System.InvalidOperationException(
-                    "no ADC driver is bound; the board must call Lamella.Hardware.AdcControllers.Bind at startup");
+                    "no ADC driver is bound: construct the board the program was built for before"
+                    + " opening a converter, new Lamella.Hardware.TargetBoard(), which binds its converter"
+                    + " where it has one");
             }
             AdcDriver created = _factory();
             if ((object)created == null)

@@ -1230,6 +1230,9 @@ pub struct Module {
     /// metadata token -- the runtime knows which FACT it wants and has no token to ask with. One
     /// today: [`RUNTIME_SLOT_EXCEPTION_MESSAGE`]. See [`Module::bind_exception_message_slot`].
     runtime_field_slots: BTreeMap<u64, u32>,
+    /// The board's bus table as a host set it ([`Module::set_board_buses`]), until a freeze moves
+    /// it into the arena, where an image carries it. See [`Module::board_bus_length`].
+    board_buses: Option<Box<[u32]>>,
     type_methods_by_name: BTreeMap<(u64, String), u64>,
     type_properties_by_name: BTreeMap<(u64, String), u64>,
     /// Reflection introspection metadata per type (the `System.Type` `Namespace`/`FullName`/`Is*`
@@ -1381,6 +1384,34 @@ impl DenseIdColumn {
             }
         }
         None
+    }
+}
+
+/// A run of `entries` little-endian `u32` words at `offset` in the arena, kept as the host wrote
+/// them -- the frozen home of the board's bus table.
+#[derive(Clone, Copy, Default)]
+struct WordRun {
+    offset: usize,
+    entries: usize,
+}
+
+impl WordRun {
+    /// Word `index` of the run, `None` past its end.
+    fn word(&self, arena: &TableArena, index: usize) -> Option<u32> {
+        if index < self.entries {
+            arena.read_u32(self.offset.checked_add(index.checked_mul(4)?)?)
+        } else {
+            None
+        }
+    }
+
+    /// Whether the whole run lies inside an arena of `arena_len` bytes.
+    #[cfg(all(feature = "code-in-place", feature = "board-buses"))]
+    fn fits(&self, arena_len: usize) -> bool {
+        self.entries
+            .checked_mul(4)
+            .and_then(|bytes| self.offset.checked_add(bytes))
+            .is_some_and(|end| end <= arena_len)
     }
 }
 
@@ -1660,6 +1691,10 @@ struct FrozenTables {
     /// its offset run. Sparse, because only a type with a computed layout has an entry. Trailing:
     /// an image baked before it existed has none, and a field address in it cannot be walked.
     field_offset_runs: SortedWideTable,
+    /// The frozen `board_buses`: the words of the board's bus table, as the host wrote them.
+    /// Trailing: an image baked before it existed has none, and every bus then reads as absent,
+    /// as in an image baked with no board named.
+    board_buses: WordRun,
     /// The frozen `enum_wide` (enum handles with a 64-bit underlying type).
     enum_wide: SortedTokenSet,
     /// The frozen `enum_flags` (enum handles carrying `[Flags]`).
@@ -2072,6 +2107,12 @@ pub enum BakeError {
     /// bit, so the image would otherwise be misread as if the field were absent. Refusing is the
     /// point: the zero-check is what catches a forgotten feature bit.
     BadHeader,
+    /// The board's bus table is one this runtime cannot serve, whether a host set it with
+    /// [`Module::set_board_buses`] or an image booted with it.
+    ///
+    /// Refused rather than served, because the words of a table read wrongly would reach a
+    /// driver as its peripheral's addresses and pins.
+    BusTable(lamella_board_buses::Fault),
 }
 
 impl core::fmt::Display for BakeError {
@@ -2099,9 +2140,11 @@ impl core::fmt::Display for BakeError {
                 "baked image header is malformed: too few declared words, or a reserved word is \
                  not zero",
             ),
+            BakeError::BusTable(fault) => write!(f, "the board's bus table is refused: {fault}"),
         }
     }
 }
+
 
 /// Appends one image-directory word.
 #[cfg(feature = "code-in-place")]
@@ -2494,6 +2537,7 @@ impl FrozenTables {
         pair(out, self.cctor_types.offset, self.cctor_types.entries);
         pair(out, self.static_slot_types.offset, self.static_slot_types.entries);
         pair(out, self.field_offset_runs.offset, self.field_offset_runs.entries);
+        pair(out, self.board_buses.offset, self.board_buses.entries);
     }
 
     /// Reads a [`FrozenTables::write_directory`] image back; returns the views and the word
@@ -2607,6 +2651,7 @@ impl FrozenTables {
         trailing!(cctor_types, SortedTokenTable);
         trailing!(static_slot_types, DenseIdColumn);
         trailing!(field_offset_runs, SortedWideTable);
+        trailing!(board_buses, WordRun);
         Some((frozen, cursor))
     }
 }
@@ -2886,6 +2931,18 @@ impl Module {
         self.freeze_strings();
         self.freeze_names();
         self.freeze_reflect_records();
+        self.freeze_board_buses();
+    }
+
+    /// Moves the bus table a host set into the arena, where a baked image carries it.
+    fn freeze_board_buses(&mut self) {
+        if let Some(table) = self.board_buses.take() {
+            let offset = self.arena.bytes.len();
+            for &word in table.iter() {
+                self.arena.push_u32(word);
+            }
+            self.frozen.board_buses = WordRun { offset, entries: table.len() };
+        }
     }
 
     /// Drains every name-keyed reflection builder through one sorted UTF-8 pool. Name ids are
@@ -4427,6 +4484,16 @@ impl Module {
         let arena = TableArena {
             bytes: alloc::borrow::Cow::Borrowed(arena_bytes),
         };
+        #[cfg(feature = "board-buses")]
+        let buses = frozen.board_buses;
+        #[cfg(feature = "board-buses")]
+        if buses.entries != 0 {
+            if !buses.fits(arena_bytes.len()) {
+                return Err(BakeError::NotAnImage);
+            }
+            lamella_board_buses::check_words(buses.entries, |index| buses.word(&arena, index))
+                .map_err(BakeError::BusTable)?;
+        }
 
         let hints_valid =
             fingerprint == crate::intrinsic_registry::registry_fingerprint();
@@ -5068,6 +5135,10 @@ impl Module {
             ("custom_attributes", custom_attrs),
             ("type_names+full_names", type_names),
             ("data (asm/static/rva/enum)", data),
+            (
+                "board bus table (as set, before a freeze)",
+                self.board_buses.as_ref().map_or(0, |table| table.len() * 4),
+            ),
             ("arena (frozen flat tables, owned)", self.arena.resident_len()),
             #[cfg(feature = "code-in-place")]
             (
@@ -5114,6 +5185,8 @@ impl Module {
             ("static slot owner column entries (frozen)", self.frozen.static_slot_types.entries),
             ("field_offsets", self.field_offsets.len()),
             ("field offset runs (frozen)", self.frozen.field_offset_runs.entries),
+            ("board bus table words", self.board_buses.as_ref().map_or(0, |table| table.len())),
+            ("board bus table words (frozen)", self.frozen.board_buses.entries),
             ("enum_widths", self.enum_widths.len()),
             ("md_array_ctors", self.md_array_ctors.len()),
             ("delegate_ctor_types", self.delegate_ctor_types.len()),
@@ -7044,6 +7117,50 @@ impl Module {
             })
     }
 
+    /// Gives this module the bus table of the board a build names, so a later
+    /// [`Module::write_baked`] carries it in the image and `Lamella.Hardware.BoardBuses` serves it
+    /// to `System.Device`'s factories.
+    ///
+    /// `table` is the little-endian words a host writes from the board's `board.toml`: "LBUS",
+    /// the layout version, the board's product model and the row count, then each row as its bus
+    /// kind, its bus number, its word count and those words, in kind-then-bus order. A second
+    /// call replaces the first.
+    ///
+    /// # Errors
+    /// [`BakeError::BusTable`], naming the fault, for a table this runtime could not serve: no
+    /// "LBUS" header, another layout version, a row past the end or of no words, rows out of
+    /// order, or words after the last row.
+    pub fn set_board_buses(&mut self, table: &[u32]) -> Result<(), BakeError> {
+        lamella_board_buses::check(table).map_err(BakeError::BusTable)?;
+        self.board_buses = Some(table.into());
+        Ok(())
+    }
+
+    /// Word `index` of this module's bus table, the one a host set or else the image's; `None`
+    /// past its end, and for every word when the module carries no table.
+    fn bus_table_word(&self, index: usize) -> Option<u32> {
+        match &self.board_buses {
+            Some(table) => table.get(index).copied(),
+            None => self.frozen.board_buses.word(&self.arena, index),
+        }
+    }
+
+    /// How many descriptor words bus `bus` of `kind` has in the board's bus table: -1 when this
+    /// module carries no table, as an image baked with no board named carries none, and 0 when the
+    /// table has no such bus. What `Lamella.Hardware.BoardBuses.Length` answers.
+    #[must_use]
+    pub fn board_bus_length(&self, kind: i32, bus: i32) -> i32 {
+        lamella_board_buses::length(|index| self.bus_table_word(index), kind, bus)
+    }
+
+    /// Word `index` of the descriptor of bus `bus` of `kind` in the board's bus table, and 0 for
+    /// an index outside it or a bus the table does not have, as where no table exists. What
+    /// `Lamella.Hardware.BoardBuses.Word` answers.
+    #[must_use]
+    pub fn board_bus_word(&self, kind: i32, bus: i32, index: i32) -> u32 {
+        lamella_board_buses::word(|at| self.bus_table_word(at), kind, bus, index)
+    }
+
     /// Records that the type whose handle is `type_handle` has a field named `name` whose
     /// asm-folded `Field` token is `field_handle` -- what `Type.GetField(name)` returns.
     pub fn bind_type_field_name(&mut self, type_handle: u64, name: &str, field_handle: u64) {
@@ -8149,5 +8266,166 @@ mod tests {
                 other.map(|_| "loaded")
             ),
         }
+    }
+
+    /// A board's bus table with two rows: I2C bus 0 of three words and SPI bus 1 of two.
+    fn two_bus_table() -> Vec<u32> {
+        alloc::vec![
+            lamella_board_buses::MAGIC, 1, 2, 2,
+            2, 0, 3, 0x4009_0000, 0x250, 150_000_000,
+            3, 1, 2, 0x4008_0000, 17,
+        ]
+    }
+
+    /// What `BoardBuses.Length` and `Word` answer over `module`, for the table above.
+    fn assert_serves_two_bus_table(module: &Module, carrier: &str) {
+        assert_eq!(module.board_bus_length(2, 0), 3, "{carrier}: I2C bus 0");
+        assert_eq!(module.board_bus_length(3, 1), 2, "{carrier}: SPI bus 1");
+        let i2c: Vec<u32> = (0..3).map(|index| module.board_bus_word(2, 0, index)).collect();
+        assert_eq!(i2c, [0x4009_0000, 0x250, 150_000_000], "{carrier}: I2C bus 0's words");
+        let spi: Vec<u32> = (0..2).map(|index| module.board_bus_word(3, 1, index)).collect();
+        assert_eq!(spi, [0x4008_0000, 17], "{carrier}: SPI bus 1's words");
+        for (kind, bus) in [(1, 0), (2, 1), (3, 0), (4, 0), (-1, 0), (2, -1)] {
+            assert_eq!(module.board_bus_length(kind, bus), 0, "{carrier}: kind {kind}, bus {bus}");
+            assert_eq!(module.board_bus_word(kind, bus, 0), 0, "{carrier}: kind {kind}, bus {bus}");
+        }
+        assert_eq!(module.board_bus_word(2, 0, 3), 0, "{carrier}: past I2C bus 0's last word");
+        assert_eq!(module.board_bus_word(2, 0, -1), 0, "{carrier}: a negative index");
+    }
+
+    /// A table the runtime would misread is refused by name, as the bus table crate names it, and a
+    /// refused table leaves the module serving the one it had.
+    #[test]
+    fn a_bus_table_is_checked_before_it_is_served() {
+        use lamella_board_buses::Fault;
+        let good = two_bus_table();
+        let mut module = Module::new();
+        assert_eq!(module.set_board_buses(&good), Ok(()));
+        let with = |edit: &dyn Fn(&mut Vec<u32>)| {
+            let mut table = good.clone();
+            edit(&mut table);
+            table
+        };
+        let cases: [(&str, Vec<u32>, Fault); 3] = [
+            ("another magic", with(&|table| table[0] = 0x4C42_5553), Fault::NotABusTable),
+            ("version 2", with(&|table| table[1] = 2), Fault::UnsupportedVersion(2)),
+            ("a repeated row", with(&|table| table[10..12].copy_from_slice(&[2, 0])),
+                Fault::OutOfOrder { kind: 2, bus: 0 }),
+        ];
+        for (what, table, fault) in cases {
+            assert_eq!(
+                module.set_board_buses(&table),
+                Err(BakeError::BusTable(fault)),
+                "{what}: {table:x?}"
+            );
+            assert_serves_two_bus_table(&module, what);
+        }
+    }
+
+    /// A module carrying no table answers -1 for every bus -- the board with no buses an image
+    /// baked with no board named is -- and its words are 0.
+    #[test]
+    fn a_module_without_a_bus_table_answers_minus_one_for_every_bus() {
+        let module = Module::new();
+        for (kind, bus) in [(1, 0), (2, 0), (3, 0), (6, 9), (-1, -1)] {
+            assert_eq!(module.board_bus_length(kind, bus), -1, "kind {kind}, bus {bus}");
+            assert_eq!(module.board_bus_word(kind, bus, 0), 0, "kind {kind}, bus {bus}");
+        }
+    }
+
+    /// A board that has no buses has a table of no rows, and every bus of it answers 0 -- so an
+    /// image built for such a board stays distinguishable from one built for no board, which
+    /// answers -1.
+    #[test]
+    fn a_table_of_no_rows_answers_zero_for_every_bus() {
+        let mut module = Module::new();
+        module
+            .set_board_buses(&[lamella_board_buses::MAGIC, 1, 2, 0])
+            .expect("a header with no rows is a table");
+        for (kind, bus) in [(1, 0), (2, 0), (3, 0), (6, 9), (-1, -1)] {
+            assert_eq!(module.board_bus_length(kind, bus), 0, "kind {kind}, bus {bus}");
+            assert_eq!(module.board_bus_word(kind, bus, 0), 0, "kind {kind}, bus {bus}");
+        }
+    }
+
+    /// The table a host sets is served as set, and again from the image it is baked into, where the
+    /// module borrows it from the image's arena as a board borrows it from flash.
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn the_bus_table_survives_the_bake_and_is_served_from_the_image() {
+        let mut module = Module::new();
+        module.set_board_buses(&two_bus_table()).expect("a well-formed table");
+        assert_serves_two_bus_table(&module, "as set");
+        let image = module.write_baked(None).expect("bake");
+        assert_serves_two_bus_table(&module, "after its own bake");
+        let leaked: &'static [u8] = Box::leak(image.into_boxed_slice());
+        let (baked, _) = Module::from_baked(leaked).expect("the image boots");
+        assert!(baked.is_baked());
+        assert_serves_two_bus_table(&baked, "baked");
+        assert_eq!(
+            baked.table_census().iter().find(|(name, _)| *name == "board bus table words (frozen)"),
+            Some(&("board bus table words (frozen)", two_bus_table().len())),
+            "the census counts the image's table"
+        );
+
+        let mut none = Module::new();
+        let image = none.write_baked(None).expect("bake");
+        let leaked: &'static [u8] = Box::leak(image.into_boxed_slice());
+        let (baked, _) = Module::from_baked(leaked).expect("the image boots");
+        assert_eq!(baked.board_bus_length(2, 0), -1, "an image baked without a table has none");
+    }
+
+    /// An image baked before the table existed holds no pair for it, and still boots: a board with
+    /// no buses, as an image baked today with no board named.
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn an_image_baked_before_the_bus_table_boots_as_a_board_with_no_buses() {
+        let mut module = Module::new();
+        module.set_board_buses(&two_bus_table()).expect("a well-formed table");
+        let image = module.write_baked(None).expect("bake");
+        let older = image_without_trailing_tables(&image, 1);
+        let leaked: &'static [u8] = Box::leak(older.into_boxed_slice());
+        let (baked, _) = Module::from_baked(leaked).expect("an older image still boots");
+        assert_eq!(baked.board_bus_length(2, 0), -1);
+        assert_eq!(baked.board_bus_word(2, 0, 0), 0);
+    }
+
+    /// A table this runtime cannot read refuses the image at boot, by name, even with its checksum
+    /// intact -- a later layout version, here -- and a table the directory places outside the
+    /// arena refuses it as no image at all.
+    #[cfg(all(feature = "code-in-place", feature = "board-buses"))]
+    #[test]
+    fn an_image_whose_bus_table_this_runtime_cannot_read_is_refused_at_boot() {
+        let mut module = Module::new();
+        module.set_board_buses(&two_bus_table()).expect("a well-formed table");
+        let image = module.write_baked(None).expect("bake");
+        let word_at = |image: &[u8], index: usize| image_word(&image[8..], index).expect("header word");
+        let directory_start =
+            baked_directory_start(word_at(&image, HEADER_WORD_COUNT_INDEX)).expect("a whole header");
+        let directory_len = word_at(&image, HEADER_DIRECTORY_LEN_INDEX) as usize;
+        let arena_start = directory_start + directory_len;
+        let pair_at = arena_start - 16;
+        let table_offset = u64::from_le_bytes(image[pair_at..pair_at + 8].try_into().expect("8 bytes"));
+        let resealed = |edit: &dyn Fn(&mut Vec<u8>)| {
+            let mut image = image.clone();
+            edit(&mut image);
+            let checksum = image_checksum(&image[directory_start..arena_start], &image[arena_start..]);
+            let at = 8 + HEADER_CHECKSUM_INDEX * 8;
+            image[at..at + 8].copy_from_slice(&checksum.to_le_bytes());
+            let leaked: &'static [u8] = Box::leak(image.into_boxed_slice());
+            Module::from_baked(leaked).map(|_| ())
+        };
+
+        let version_at = arena_start + table_offset as usize + 4;
+        assert_eq!(
+            resealed(&|image| image[version_at..version_at + 4].copy_from_slice(&2u32.to_le_bytes())),
+            Err(BakeError::BusTable(lamella_board_buses::Fault::UnsupportedVersion(2)))
+        );
+        assert_eq!(
+            resealed(&|image| image[pair_at..pair_at + 8].copy_from_slice(&u64::MAX.to_le_bytes())),
+            Err(BakeError::NotAnImage),
+            "a table placed past the arena's end"
+        );
+        assert_eq!(resealed(&|_| {}), Ok(()), "the image itself boots");
     }
 }

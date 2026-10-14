@@ -4,9 +4,15 @@ using System.Net.Sockets;
 
 namespace System.Net
 {
+#if LAMELLA_SURFACE_NETFX_2_0
+    public static class Dns
+#else
     public sealed class Dns
+#endif
     {
+#if !LAMELLA_SURFACE_NETFX_2_0
         private Dns() { }
+#endif
 
         [Lamella.Runtime.RuntimeProvided] private static int ResolveHost(string host, byte[] buffer, int[] lengths) { return 0; }
 

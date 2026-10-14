@@ -2,11 +2,15 @@
 namespace System.Runtime.CompilerServices
 {
     /// <summary>Reserved for the compiler: services the runtime provides to generated code.</summary>
+#if LAMELLA_SURFACE_NETFX_2_0
+    public static class RuntimeHelpers
+#else
     public sealed class RuntimeHelpers
+#endif
     {
-        private RuntimeHelpers()
-        {
-        }
+#if !LAMELLA_SURFACE_NETFX_2_0
+        private RuntimeHelpers() { }
+#endif
 
         /// <summary>Ensures the remaining stack is large enough for the average .NET function.</summary>
         /// <remarks>

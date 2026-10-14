@@ -21,13 +21,6 @@ namespace System
         {
             return ArgIteratorNative.RemainingCount(_handle, _index);
         }
-
-        public object GetNextArg()
-        {
-            object next = ArgIteratorNative.GetArg(_handle, _index);
-            _index = _index + 1;
-            return next;
-        }
     }
 
     internal sealed class ArgIteratorNative

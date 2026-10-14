@@ -28,6 +28,10 @@ lamella-elf = { path = "../lamella-elf" }
 # allocate, reach the class library or print on a board. Optional, because the flat path and the
 # object emitters need none of it, and one-way -- the linker does not depend on this crate.
 lamella-linker = { path = "../lamella-linker", optional = true }
+# The bus table of the board a build names (`linked` feature): the check its words pass before the
+# link lays them, the same one the bake and the interpreter make, so the three agree on what a table
+# is. no_std, allocation-free, no dependencies of its own.
+lamella-board-buses = { path = "../lamella-board-buses", optional = true }
 
 [dev-dependencies]
 lamella-dwarf = { path = "../lamella-dwarf" }
@@ -53,7 +57,7 @@ arm32 = ["dep:lamella-asm-arm32"]
 # The LINKED image path: compile, link against corlib + the runtime-support archive, and wrap the
 # result in a part's boot image. Off by default because it pulls the linker in, and a consumer that
 # only lowers (the browser export, a differential runner) wants neither.
-linked = ["dep:lamella-linker", "arm32"]
+linked = ["dep:lamella-linker", "dep:lamella-board-buses", "arm32"]
 riscv32 = ["dep:lamella-asm-riscv32"]
 wasm = ["dep:lamella-asm-wasm"]
 # String storage encoding (runtime's seam): UTF-16 is the DEFAULT and has no feature of its own.

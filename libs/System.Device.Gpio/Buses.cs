@@ -25,10 +25,12 @@ namespace Lamella.Hardware
     public delegate System.Device.Pwm.PwmChannel PwmChannelFactory(int channel, int frequency, double dutyCyclePercentage);
 #endif
 
-    /// <summary>The board's map from bus id to the driver that serves it. A board binds its buses
-    /// once at startup; <see cref="System.Device.Spi.SpiDevice.Create(System.Device.Spi.SpiConnectionSettings)"/>
-    /// and its siblings then resolve through here, so application code uses the standard factories
-    /// and never names a driver.</summary>
+    /// <summary>The board's map from bus id to the driver that serves it.
+    /// <see cref="System.Device.Spi.SpiDevice.Create(System.Device.Spi.SpiConnectionSettings)"/> and
+    /// its siblings resolve through here, so application code uses the standard factories and never
+    /// names a driver. A bus comes from a factory a board's class binds, or else from the bus table
+    /// of the board the program was built for, whose drivers the board's family build of this
+    /// assembly carries.</summary>
     public sealed class Buses
     {
         /// <summary>The number of logical buses of each kind, and of PWM chips, so valid ids are 0
@@ -143,8 +145,8 @@ namespace Lamella.Hardware
         }
 #endif
 
-        /// <summary>The SPI driver bound to bus <paramref name="busId"/>, creating it on first
-        /// use.</summary>
+        /// <summary>The SPI driver of bus <paramref name="busId"/>, bound or from the board's bus
+        /// table, creating it on first use.</summary>
         /// <remarks>
         /// <para>THE SAME INSTANCE the standard factories use. One physical bus has one driver, and
         /// this caches it after the first call, so a device from
@@ -164,17 +166,14 @@ namespace Lamella.Hardware
         public static SpiDriver ResolveSpi(int busId)
         {
             CheckBusId(busId);
-            if ((object)_spiDrivers[busId] != null) return _spiDrivers[busId];
-            SpiDriverFactory factory = _spiFactories[busId];
-            if ((object)factory == null) throw NotBound("SPI", "bus", "buses", busId, _spiFactories);
-            SpiDriver created = factory();
-            if ((object)created == null) throw FactoryReturnedNull("SPI", "bus", busId);
-            _spiDrivers[busId] = created;
-            return created;
+            SpiDriver driver = FindSpi(busId);
+            if ((object)driver == null) throw new System.InvalidOperationException(MissingSpi(busId));
+            return driver;
         }
 
-        /// <summary>The I2C driver bound to bus <paramref name="busId"/>, creating it on first use
-        /// and configuring it, once, at the rate its board bound.</summary>
+        /// <summary>The I2C driver of bus <paramref name="busId"/>, bound or from the board's bus
+        /// table, creating it on first use and configuring it, once, at the rate its board bound, or
+        /// <see cref="DefaultI2cBusHz"/> for a bus from the table.</summary>
         /// <remarks>The same instance the standard factories use; see
         /// <see cref="ResolveSpi"/> for why that guarantee is what makes this worth exposing.</remarks>
         /// <exception cref="System.ArgumentOutOfRangeException">The bus id is out of range.</exception>
@@ -182,37 +181,110 @@ namespace Lamella.Hardware
         public static I2cDriver ResolveI2c(int busId)
         {
             CheckBusId(busId);
-            if ((object)_i2cDrivers[busId] != null) return _i2cDrivers[busId];
-            I2cDriverFactory factory = _i2cFactories[busId];
-            if ((object)factory == null) throw NotBound("I2C", "bus", "buses", busId, _i2cFactories);
-            I2cDriver created = factory();
-            if ((object)created == null) throw FactoryReturnedNull("I2C", "bus", busId);
-            created.Configure(_i2cRates[busId]);
-            _i2cDrivers[busId] = created;
-            return created;
+            I2cDriver driver = FindI2c(busId);
+            if ((object)driver == null) throw new System.InvalidOperationException(MissingI2c(busId));
+            return driver;
         }
 
-        /// <summary>The bound GPIO driver, creating it on first use.</summary>
+        /// <summary>The GPIO driver, bound or from the board's bus table, creating it on first
+        /// use.</summary>
         /// <remarks>The same instance <see cref="System.Device.Gpio.GpioController"/> uses; see
         /// <see cref="ResolveSpi"/> for why that guarantee is what makes this worth exposing.</remarks>
         /// <exception cref="System.InvalidOperationException">No GPIO driver is bound.</exception>
         public static GpioDriver ResolveGpio()
         {
-            if ((object)_gpioDriver != null) return _gpioDriver;
-            if ((object)_gpioFactory == null)
+            GpioDriver driver = FindGpio();
+            if ((object)driver == null) throw new System.InvalidOperationException(MissingGpio());
+            return driver;
+        }
+
+        /// <summary>SPI bus <paramref name="busId"/>'s driver, or null where there is none.</summary>
+        internal static SpiDriver FindSpi(int busId)
+        {
+            if (busId < 0 || busId >= BusCount) return null;
+            if ((object)_spiDrivers[busId] != null) return _spiDrivers[busId];
+            SpiDriverFactory factory = _spiFactories[busId];
+            SpiDriver created;
+            if ((object)factory != null)
             {
-                throw new System.InvalidOperationException(
-                    "no GPIO driver is bound" + (AnythingBound()
-                        ? "; this board binds no GPIO controller"
-                        : NothingBound));
+                created = factory();
+                if ((object)created == null) throw FactoryReturnedNull("SPI", "bus", busId);
             }
-            GpioDriver created = _gpioFactory();
-            if ((object)created == null)
+            else
             {
-                throw new System.InvalidOperationException("the bound GPIO driver factory returned null");
+                created = BoardDrivers.CreateSpi(busId);
+                if ((object)created == null) return null;
+            }
+            _spiDrivers[busId] = created;
+            return created;
+        }
+
+        /// <summary>I2C bus <paramref name="busId"/>'s driver, configured, or null where there is
+        /// none.</summary>
+        internal static I2cDriver FindI2c(int busId)
+        {
+            if (busId < 0 || busId >= BusCount) return null;
+            if ((object)_i2cDrivers[busId] != null) return _i2cDrivers[busId];
+            I2cDriverFactory factory = _i2cFactories[busId];
+            I2cDriver created;
+            int busHz;
+            if ((object)factory != null)
+            {
+                created = factory();
+                if ((object)created == null) throw FactoryReturnedNull("I2C", "bus", busId);
+                busHz = _i2cRates[busId];
+            }
+            else
+            {
+                created = BoardDrivers.CreateI2c(busId);
+                if ((object)created == null) return null;
+                busHz = DefaultI2cBusHz;
+            }
+            created.Configure(busHz);
+            _i2cDrivers[busId] = created;
+            return created;
+        }
+
+        /// <summary>The GPIO controller's driver, or null where there is none.</summary>
+        internal static GpioDriver FindGpio()
+        {
+            if ((object)_gpioDriver != null) return _gpioDriver;
+            GpioDriver created;
+            if ((object)_gpioFactory != null)
+            {
+                created = _gpioFactory();
+                if ((object)created == null)
+                {
+                    throw new System.InvalidOperationException("the bound GPIO driver factory returned null");
+                }
+            }
+            else
+            {
+                created = BoardDrivers.CreateGpio();
+                if ((object)created == null) return null;
             }
             _gpioDriver = created;
             return created;
+        }
+
+        /// <summary>Why SPI bus <paramref name="busId"/> has no driver.</summary>
+        internal static string MissingSpi(int busId)
+        {
+            return NotBoundMessage("SPI", "bus", "buses", busId, _spiFactories, BoardBuses.Spi);
+        }
+
+        /// <summary>Why I2C bus <paramref name="busId"/> has no driver.</summary>
+        internal static string MissingI2c(int busId)
+        {
+            return NotBoundMessage("I2C", "bus", "buses", busId, _i2cFactories, BoardBuses.I2c);
+        }
+
+        /// <summary>Why there is no GPIO driver.</summary>
+        internal static string MissingGpio()
+        {
+            return "no GPIO driver is bound" + (AnythingBound()
+                ? "; this board binds no GPIO controller"
+                : "; " + BoardDrivers.Describe(BoardBuses.Gpio, 0));
         }
 
 #if LAMELLA_SURFACE_FLOAT
@@ -248,6 +320,11 @@ namespace Lamella.Hardware
 
         private static System.Exception NotBound(string kind, string unit, string units, int id, object[] table)
         {
+            return new System.InvalidOperationException(NotBoundMessage(kind, unit, units, id, table, 0));
+        }
+
+        private static string NotBoundMessage(string kind, string unit, string units, int id, object[] table, int tableKind)
+        {
             string message = "no " + kind + " driver is bound for " + unit + " " + id.ToString();
             string listed = null;
             int count = 0;
@@ -273,17 +350,20 @@ namespace Lamella.Hardware
             {
                 message += "; this board binds no " + kind + " " + unit;
             }
+            else if (tableKind != 0)
+            {
+                message += "; " + BoardDrivers.Describe(tableKind, id);
+            }
             else
             {
                 message += NothingBound;
             }
-            return new System.InvalidOperationException(message);
+            return message;
         }
 
         private const string NothingBound =
-            ", and no bus is bound at all: add your board's class to the program"
-            + " (Lamella.Boards.RaspberryPi.Pico2 for a Raspberry Pi Pico 2). Where the firmware"
-            + " does not initialize it before Main, construct it before opening a bus";
+            ", and no bus is bound at all: construct the board the program was built for before"
+            + " opening a bus, new Lamella.Hardware.TargetBoard(), which binds its buses";
 
         /// <summary>Whether anything at all is bound, which separates a board that has no bus of
         /// one kind from a program that no board has armed.</summary>

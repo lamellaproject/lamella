@@ -117,12 +117,14 @@ public enum StStm32f746gDiscoBindings {
     public static let MEMORY_QSPI_BASE: UInt32 = 0x90000000
     public static let MEMORY_QSPI_SIZE: UInt32 = 0x1000000
     public static let MEMORY_QSPI_CONTROLLER: StaticString = "quadspi"
+    public static let MEMORY_QSPI_PART: StaticString = "N25Q128A13EF840E"
     public static let MEMORY_QSPI_OPTIONAL: UInt32 = 1
     public static let MEMORY_SDRAM_KIND: StaticString = "ram"
     public static let MEMORY_SDRAM_BASE: UInt32 = 0xC0000000
     public static let MEMORY_SDRAM_SIZE: UInt32 = 0x800000
     public static let MEMORY_SDRAM_DEVICE_SIZE: UInt32 = 0x1000000
     public static let MEMORY_SDRAM_CONTROLLER: StaticString = "fmc"
+    public static let MEMORY_SDRAM_PART: StaticString = "MT48LC4M32B2B5-6A"
     public static let MEMORY_SDRAM_OPTIONAL: UInt32 = 1
 
     // -- the flash fitted to 'qspi': what the controller must be told about the DEVICE, as

@@ -182,7 +182,8 @@ fn addr_bytes(ip: &IpAddress) -> Vec<u8> {
 }
 
 /// The dotted IPv4 subnet mask for a CIDR prefix length (24 -> 255.255.255.0; 0 -> 0.0.0.0). Backs
-/// the `NetworkInterface.IPv4SubnetMask` poll surface, since `smoltcp` stores the prefix, not a mask.
+/// the `UnicastIPAddressInformation.IPv4Mask` that `NetworkInterface.GetIPProperties()` reports, since
+/// `smoltcp` stores the prefix, not a mask.
 fn prefix_to_mask(prefix: u8) -> [u8; 4] {
     if prefix == 0 {
         return [0, 0, 0, 0];

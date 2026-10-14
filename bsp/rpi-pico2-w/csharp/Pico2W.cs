@@ -1,6 +1,5 @@
 // Lamella.Boards.RaspberryPi.Pico2W -- the Raspberry Pi Pico 2 W (RP2350A + an Infineon CYW43439).
 using System;
-using System.Device.Adc;
 using System.Device.Analog;
 using System.Device.Gpio;
 using System.Device.I2c;
@@ -27,8 +26,8 @@ namespace Lamella.Boards.RaspberryPi
 
         /// <summary>Binds this board's buses to the driver table, so a program writes plain
         /// dotnet/iot -- <c>SpiDevice.Create(settings)</c>, <c>new GpioController()</c> -- and never
-        /// names a Lamella type. Touching <see cref="Pico2W"/> at all is what arms it, which is why a
-        /// program constructs the board first.</summary>
+        /// names a Lamella type. Touching <see cref="Pico2W"/> at all is what arms it, and constructing
+        /// <see cref="TargetBoard"/> touches it.</summary>
         /// <remarks>A TYPE INITIALIZER rather than the instance constructor, for the reason
         /// <see cref="Lamella.Hardware.Buses.BindGpio"/> documents: the table refuses a second bind
         /// of the same kind rather than replacing it, and this class is instantiable and routinely
@@ -107,19 +106,12 @@ namespace Lamella.Boards.RaspberryPi
                 new uint[4]);
         }
 
-        /// <summary>An ADC controller over the RP2350 SAR converter (the on-chip temperature
-        /// sensor is on <see cref="TemperatureSensorChannel"/>). Channel 3 is the radio's clock line
-        /// and refuses to open.</summary>
-        public AdcController CreateAdcController()
-        {
-            return new AdcController();
-        }
-
         /// <summary>The on-chip converter as dotnet/iot's analog controller. Each pin is a converter
         /// channel: <see cref="AdcChannelGp26"/> to <see cref="AdcChannelGp28"/> and
         /// <see cref="TemperatureSensorChannel"/> name them.</summary>
         /// <remarks>Creating it touches no hardware; the first pin opened brings the converter up.
-        /// It reads through the same driver as <see cref="CreateAdcController"/>.</remarks>
+        /// It reads through the converter driver the board binds.
+        /// Channel 3 is the radio's clock line and refuses to open.</remarks>
         /// <param name="chip">Must be 0: the board has one converter.</param>
         /// <exception cref="ArgumentOutOfRangeException"><paramref name="chip"/> is not 0.</exception>
         public AnalogController CreateAnalogController(int chip)

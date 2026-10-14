@@ -104,6 +104,8 @@ use lamella_cil_runtime::intrinsics::{
     mmio_read32, mmio_write32, mmio_read8, mmio_write8, mmio_read16, mmio_write16,
     value_type_equals, value_type_get_hash_code,
 };
+#[cfg(feature = "board-buses")]
+use lamella_cil_runtime::intrinsics::{board_buses_length, board_buses_word};
 #[cfg(feature = "wifi")]
 use lamella_cil_runtime::intrinsics::{
     wifi_disconnect, wifi_join_start, wifi_join_stored, wifi_radio, wifi_record_clear,
@@ -4901,6 +4903,16 @@ fn bcl_intrinsic(
             "Write8" => return Some(intrinsic!(mmio_write8)),
             "Read16" => return Some(intrinsic!(mmio_read16)),
             "Write16" => return Some(intrinsic!(mmio_write16)),
+            _ => {}
+        }
+    }
+    #[cfg(feature = "board-buses")]
+    if namespace == "Lamella.Hardware" && type_name == "BoardBuses" {
+        match (method, parameters_of(signature)) {
+            ("Length", [SigType::I4, SigType::I4]) => return Some(intrinsic!(board_buses_length)),
+            ("Word", [SigType::I4, SigType::I4, SigType::I4]) => {
+                return Some(intrinsic!(board_buses_word));
+            }
             _ => {}
         }
     }

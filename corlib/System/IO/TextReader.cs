@@ -3,9 +3,9 @@ namespace System.IO
 {
     public abstract class TextReader : IDisposable
     {
-        public abstract int Peek();
+        public virtual int Peek() { return -1; }
 
-        public abstract int Read();
+        public virtual int Read() { return -1; }
 
         public virtual int Read(char[] buffer, int index, int count)
         {

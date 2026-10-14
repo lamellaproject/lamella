@@ -6,7 +6,7 @@ namespace System.Net.Sockets
     {
         public SocketException() : base("A socket operation failed.") { }
 
-        public SocketException(string message) : base(message) { }
+        internal SocketException(string message) : base(message) { }
     }
 }
 #endif

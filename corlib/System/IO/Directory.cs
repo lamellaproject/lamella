@@ -2,9 +2,15 @@
 #if LAMELLA_SURFACE_FILE_IO
 namespace System.IO
 {
+#if LAMELLA_SURFACE_NETFX_2_0
+    public static class Directory
+#else
     public sealed class Directory
+#endif
     {
+#if !LAMELLA_SURFACE_NETFX_2_0
         private Directory() { }
+#endif
 
         public static bool Exists(string path)
         {

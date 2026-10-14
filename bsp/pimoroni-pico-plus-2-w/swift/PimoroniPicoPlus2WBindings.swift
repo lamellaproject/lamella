@@ -270,10 +270,16 @@ public enum PimoroniPicoPlus2WBindings {
     // -- memory regions the board fits: SIZE is what a program may reach, which a device's own
     // size may exceed; a region with a CONTROLLER does not exist until that instance is brought
     // up, and touching it first is a bus fault rather than a wrong value --
-    public static let MEMORY_REGION_COUNT: UInt32 = 1
+    public static let MEMORY_REGION_COUNT: UInt32 = 2
     public static let MEMORY_FLASH_KIND: StaticString = "flash"
     public static let MEMORY_FLASH_SIZE: UInt32 = 0x1000000
     public static let MEMORY_FLASH_OPTIONAL: UInt32 = 0
+    public static let MEMORY_PSRAM_KIND: StaticString = "ram"
+    public static let MEMORY_PSRAM_BASE: UInt32 = 0x11000000
+    public static let MEMORY_PSRAM_SIZE: UInt32 = 0x800000
+    public static let MEMORY_PSRAM_CONTROLLER: StaticString = "qmi"
+    public static let MEMORY_PSRAM_PART: StaticString = "APS6404L-3SQR-ZR"
+    public static let MEMORY_PSRAM_OPTIONAL: UInt32 = 1
 
     // -- connectors: the sockets a removable module plugs into. The socket is board truth --
     // it is on the schematic and identical on every unit -- and what is plugged into it is not,

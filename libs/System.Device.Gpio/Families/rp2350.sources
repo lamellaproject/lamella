@@ -1,0 +1,20 @@
+# The csp/rp2350/csharp sources that the rp2350 build of System.Device.Gpio carries, one path per
+# line, relative to that directory: the drivers rp2350.cs constructs from a board's bus table, and the
+# bindings and register layouts those drivers take. build-managed compiles them into that build, and
+# build-boards leaves them out of each RP2350 board's assembly, which references that build instead,
+# so each of these types is in exactly one assembly. The rest of csp/rp2350/csharp is the boards'.
+drivers/Rp2350GpioDriver.cs
+drivers/Rp2350I2cDriver.cs
+drivers/Rp2350SpiDriver.cs
+Rp2350ClocksLayout.g.cs
+Rp2350I2cBinding.cs
+Rp2350I2cLayout.g.cs
+Rp2350Instances.g.cs
+Rp2350IoBank0Layout.g.cs
+Rp2350PadsBank0Layout.g.cs
+Rp2350ResetsLayout.g.cs
+Rp2350SioLayout.g.cs
+Rp2350SpiBinding.cs
+Rp2350SpiLayout.g.cs
+Rp2350TimerLayout.g.cs
+Rp2350XoscLayout.g.cs

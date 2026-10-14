@@ -1,0 +1,6 @@
+# The toolchain this crate is built and tested on, with the target its
+# battery builds for: the Cortex-M33 of the RP2350 (the Pimoroni Pico Plus 2
+# and Pico Plus 2 W).
+[toolchain]
+channel = "1.96.0"
+targets = ["thumbv8m.main-none-eabihf"]

@@ -269,10 +269,16 @@ pub const ADC2_HEADER_28_BANK1_MASK: u32 = 0x400;
 /// -- memory regions the board fits: SIZE is what a program may reach, which a device's own
 /// size may exceed; a region with a CONTROLLER does not exist until that instance is brought
 /// up, and touching it first is a bus fault rather than a wrong value --
-pub const MEMORY_REGION_COUNT: u32 = 1;
+pub const MEMORY_REGION_COUNT: u32 = 2;
 pub const MEMORY_FLASH_KIND: &str = "flash";
 pub const MEMORY_FLASH_SIZE: u32 = 0x1000000;
 pub const MEMORY_FLASH_OPTIONAL: u32 = 0;
+pub const MEMORY_PSRAM_KIND: &str = "ram";
+pub const MEMORY_PSRAM_BASE: u32 = 0x11000000;
+pub const MEMORY_PSRAM_SIZE: u32 = 0x800000;
+pub const MEMORY_PSRAM_CONTROLLER: &str = "qmi";
+pub const MEMORY_PSRAM_PART: &str = "APS6404L-3SQR-ZR";
+pub const MEMORY_PSRAM_OPTIONAL: u32 = 1;
 
 /// -- connectors: the sockets a removable module plugs into. The socket is board truth --
 /// it is on the schematic and identical on every unit -- and what is plugged into it is not,

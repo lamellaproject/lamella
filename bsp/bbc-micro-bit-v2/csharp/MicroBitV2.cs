@@ -8,6 +8,9 @@ namespace Lamella.Boards.Bbc
 {
     public sealed class MicroBitV2
     {
+        /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
+        public static readonly int BoardModel = BbcMicroBitV2Bindings.BOARD_MODEL;
+
         public const int I2cBusHz = 100000;
 
         public static readonly uint I2cFreqWord100k = Nrf52833TwiLayout.FREQUENCY_K100;
@@ -53,8 +56,8 @@ namespace Lamella.Boards.Bbc
 
         /// <summary>Binds this board's GPIO block to the driver table, so a program writes plain
         /// dotnet/iot -- <c>new GpioController()</c> -- and never names a Lamella type. Touching
-        /// <see cref="MicroBitV2"/> at all is what arms it, which is why a program constructs the
-        /// board first.</summary>
+        /// <see cref="MicroBitV2"/> at all is what arms it, and constructing
+        /// <see cref="TargetBoard"/> touches it.</summary>
         /// <remarks>A TYPE INITIALIZER rather than the instance constructor, for the reason
         /// <see cref="Lamella.Hardware.Buses.BindGpio"/> documents: the table refuses a second bind
         /// of the same kind rather than replacing it, and this class is instantiable and routinely

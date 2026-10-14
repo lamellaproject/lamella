@@ -7,9 +7,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use lamella_binder::{Binder, TypeSymbol};
 use lamella_pe::marshal::{MarshalSpec, NATIVE_TYPE_MAX};
-use lamella_syntax::ast::{
-    Attribute, AttributeArgument, AttributeSection, Expr, ExprKind, Literal,
-};
+use lamella_syntax::ast::{Attribute, AttributeArgument, AttributeSection, Expr, Literal};
 
 /// The `TypeAttributes` layout field (II.23.1.15), `LayoutMask` in the spec.
 pub(crate) const LAYOUT_MASK: u32 = 0x0000_0018;
@@ -47,24 +45,25 @@ pub(crate) struct StructLayout {
 /// rather than half-applied, because a `Pack` installed without the layout kind that motivated it
 /// is a type laid out one way and packed for another.
 pub(crate) fn struct_layout(
-    binder: &Binder,
+    binder: &mut Binder,
+    enclosing: &TypeSymbol,
     attributes: &[AttributeSection],
 ) -> Option<StructLayout> {
     let attribute = find_attribute(attributes, "StructLayout")?;
-    let kind = positional(attribute, 0).and_then(|expr| constant(binder, expr))?;
+    let kind = positional(attribute, 0).and_then(|expr| constant(binder, enclosing, expr))?;
     let layout = match kind {
         0 => SEQUENTIAL_LAYOUT,
         2 => EXPLICIT_LAYOUT,
         3 => 0,
         _ => return None,
     };
-    let charset = match named(binder, attribute, "CharSet") {
+    let charset = match named(binder, enclosing, attribute, "CharSet") {
         Some(3) => UNICODE_CLASS,
         Some(4) => AUTO_CLASS,
         _ => 0,
     };
-    let pack = named(binder, attribute, "Pack").unwrap_or(0);
-    let size = named(binder, attribute, "Size").unwrap_or(0);
+    let pack = named(binder, enclosing, attribute, "Pack").unwrap_or(0);
+    let size = named(binder, enclosing, attribute, "Size").unwrap_or(0);
     let pack = u16::try_from(pack).unwrap_or(0);
     let size = u32::try_from(size).unwrap_or(0);
     Some(StructLayout {
@@ -75,9 +74,13 @@ pub(crate) fn struct_layout(
 
 /// Reads the byte offset a `[FieldOffset(n)]` among `attributes` puts a field at, or `None` if
 /// there is none.
-pub(crate) fn field_offset(binder: &Binder, attributes: &[AttributeSection]) -> Option<u32> {
+pub(crate) fn field_offset(
+    binder: &mut Binder,
+    enclosing: &TypeSymbol,
+    attributes: &[AttributeSection],
+) -> Option<u32> {
     let attribute = find_attribute(attributes, "FieldOffset")?;
-    let offset = positional(attribute, 0).and_then(|expr| constant(binder, expr))?;
+    let offset = positional(attribute, 0).and_then(|expr| constant(binder, enclosing, expr))?;
     u32::try_from(offset).ok()
 }
 
@@ -88,22 +91,26 @@ pub(crate) fn field_offset(binder: &Binder, attributes: &[AttributeSection]) -> 
 /// they are about which named arguments the SOURCE supplied rather than about II.23.4. Measured
 /// against csc across six `LPArray` spellings; `MarshalSpec`'s own tests carry the bytes.
 pub(crate) fn marshal_spec(
-    binder: &Binder,
+    binder: &mut Binder,
+    enclosing: &TypeSymbol,
     attributes: &[AttributeSection],
 ) -> Option<MarshalSpec> {
     let attribute = find_attribute(attributes, "MarshalAs")?;
-    let native = positional(attribute, 0).and_then(|expr| constant(binder, expr))?;
+    let native = positional(attribute, 0).and_then(|expr| constant(binder, enclosing, expr))?;
     let native = u8::try_from(native).ok()?;
-    let array_sub_type = named(binder, attribute, "ArraySubType").and_then(|v| u8::try_from(v).ok());
-    let size_const = named(binder, attribute, "SizeConst").and_then(|v| u32::try_from(v).ok());
+    let array_sub_type =
+        named(binder, enclosing, attribute, "ArraySubType").and_then(|v| u8::try_from(v).ok());
+    let size_const =
+        named(binder, enclosing, attribute, "SizeConst").and_then(|v| u32::try_from(v).ok());
     let size_param_index =
-        named(binder, attribute, "SizeParamIndex").and_then(|v| u32::try_from(v).ok());
+        named(binder, enclosing, attribute, "SizeParamIndex").and_then(|v| u32::try_from(v).ok());
     Some(match native {
         0x17 => MarshalSpec::FixedSysString {
             size: size_const.unwrap_or(0),
         },
         0x1D => MarshalSpec::SafeArray {
-            variant: named(binder, attribute, "SafeArraySubType").and_then(|v| u32::try_from(v).ok()),
+            variant: named(binder, enclosing, attribute, "SafeArraySubType")
+                .and_then(|v| u32::try_from(v).ok()),
         },
         0x1E => MarshalSpec::FixedArray {
             size: size_const.unwrap_or(0),
@@ -116,8 +123,9 @@ pub(crate) fn marshal_spec(
             size: size_const.map(|size| (size, u32::from(size_param_index.is_some()))),
         },
         0x2C => MarshalSpec::CustomMarshaler {
-            marshal_type: named_string(attribute, "MarshalType")?,
-            cookie: named_string(attribute, "MarshalCookie").unwrap_or_else(|| "".into()),
+            marshal_type: named_string(binder, enclosing, attribute, "MarshalType")?,
+            cookie: named_string(binder, enclosing, attribute, "MarshalCookie")
+                .unwrap_or_else(|| "".into()),
         },
         _ => MarshalSpec::Simple(native),
     })
@@ -193,13 +201,17 @@ fn find_attribute<'a>(sections: &'a [AttributeSection], simple_name: &str) -> Op
 
 /// The marshalling descriptor of one already-found `[MarshalAs]`, for a caller that located the
 /// attribute itself (a `[return:]` section, a parameter's own list).
-pub(crate) fn marshal_spec_of(binder: &Binder, attribute: &Attribute) -> Option<MarshalSpec> {
+pub(crate) fn marshal_spec_of(
+    binder: &mut Binder,
+    enclosing: &TypeSymbol,
+    attribute: &Attribute,
+) -> Option<MarshalSpec> {
     let section = AttributeSection {
         target: None,
         span: attribute.span,
         attributes: alloc::vec![attribute.clone()],
     };
-    marshal_spec(binder, &[section])
+    marshal_spec(binder, enclosing, &[section])
 }
 
 fn matches_name(attribute: &Attribute, simple_name: &str) -> bool {
@@ -226,77 +238,42 @@ fn positional(attribute: &Attribute, index: usize) -> Option<&Expr> {
         .nth(index)
 }
 
+/// The expression `attribute`'s named argument `name` is given.
+fn named_value<'a>(attribute: &'a Attribute, name: &str) -> Option<&'a Expr> {
+    attribute.arguments.iter().find_map(|argument| match argument {
+        AttributeArgument::Named { name: n, value } if &**n == name => Some(value),
+        _ => None,
+    })
+}
+
 /// The integer value of `attribute`'s named argument `name`, or `None` when it is absent or is
-/// not a constant this reads.
-fn named(binder: &Binder, attribute: &Attribute, name: &str) -> Option<i64> {
-    attribute
-        .arguments
-        .iter()
-        .find_map(|argument| match argument {
-            AttributeArgument::Named { name: n, value } if &**n == name => Some(value),
-            _ => None,
-        })
-        .and_then(|expr| constant(binder, expr))
+/// no integral constant.
+fn named(
+    binder: &mut Binder,
+    enclosing: &TypeSymbol,
+    attribute: &Attribute,
+    name: &str,
+) -> Option<i64> {
+    constant(binder, enclosing, named_value(attribute, name)?)
 }
 
-/// The string value of `attribute`'s named argument `name`.
-fn named_string(attribute: &Attribute, name: &str) -> Option<Box<str>> {
-    attribute
-        .arguments
-        .iter()
-        .find_map(|argument| match argument {
-            AttributeArgument::Named { name: n, value } if &**n == name => Some(value),
-            _ => None,
-        })
-        .and_then(|expr| match &expr.kind {
-            ExprKind::Literal(Literal::String(units)) => {
-                Some(String::from_utf16_lossy(units).into_boxed_str())
-            }
-            _ => None,
-        })
-}
-
-/// The integer value of a layout-attribute argument: an integer literal, or an `E.Member` enum
-/// constant.
-///
-/// **THE ENUM IS RESOLVED THROUGH THE BINDER AND NOT BY ITS BARE NAME**, because every enum these
-/// attributes take -- `LayoutKind`, `CharSet`, `UnmanagedType`, `VarEnum` -- lives in a REFERENCE
-/// assembly under `System.Runtime.InteropServices`, and a bare-name model lookup finds those only
-/// when the model happens to index them unqualified. `Binder::resolve_type` is using-aware, so
-/// `LayoutKind.Sequential` under `using System.Runtime.InteropServices` and the fully written
-/// `System.Runtime.InteropServices.LayoutKind.Sequential` both answer.
-fn constant(binder: &Binder, expr: &Expr) -> Option<i64> {
-    if let ExprKind::Literal(literal) = &expr.kind {
-        return lamella_binder::literal_int_value(literal);
-    }
-    if let ExprKind::Cast { operand, .. } = &expr.kind {
-        return constant(binder, operand);
-    }
-    let ExprKind::MemberAccess { receiver, name } = &expr.kind else {
-        return None;
-    };
-    let enum_ty = binder.resolve_type(&TypeSymbol::Named(dotted_name(receiver)?.into()));
-    let info = binder.model().get_by_symbol(&enum_ty)?;
-    if info.kind != lamella_binder::TypeKind::Enum {
-        return None;
-    }
-    info.find_field(name)?
-        .constant
-        .as_ref()
-        .and_then(lamella_binder::literal_int_value)
-}
-
-/// The dotted parts of a name expression -- `LayoutKind` as one part, and
-/// `System.Runtime.InteropServices.LayoutKind` as four -- or `None` if the expression is anything
-/// else.
-fn dotted_name(expr: &Expr) -> Option<Vec<Box<str>>> {
-    match &expr.kind {
-        ExprKind::Name { name, .. } => Some(alloc::vec![name.clone()]),
-        ExprKind::MemberAccess { receiver, name } => {
-            let mut parts = dotted_name(receiver)?;
-            parts.push(name.clone());
-            Some(parts)
-        }
+/// The string value of `attribute`'s named argument `name`, or `None` when it is absent or is no
+/// string constant.
+fn named_string(
+    binder: &mut Binder,
+    enclosing: &TypeSymbol,
+    attribute: &Attribute,
+    name: &str,
+) -> Option<Box<str>> {
+    match binder.attribute_argument_constant(Some(enclosing), named_value(attribute, name)?)? {
+        Literal::String(units) => Some(String::from_utf16_lossy(&units).into_boxed_str()),
         _ => None,
     }
+}
+
+/// The integral value of a layout-attribute argument, bound in `enclosing`'s scope and folded: an
+/// enum member's is its underlying integer.
+fn constant(binder: &mut Binder, enclosing: &TypeSymbol, expr: &Expr) -> Option<i64> {
+    let literal = binder.attribute_argument_constant(Some(enclosing), expr)?;
+    lamella_binder::literal_int_value(&literal)
 }

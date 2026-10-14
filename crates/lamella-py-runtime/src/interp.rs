@@ -886,6 +886,29 @@ fn dispatch_compare(
     }
 }
 
+/// `lhs OP rhs` for any operator but `is`/`is not`, exactly as the program's own comparison
+/// evaluates it: [`dispatch_compare`], with a bare TypeError from an ORDERING comparison
+/// (`< <= > >=`) on unsupported types turned into CPython's `'OP' not supported between instances
+/// of ...`. `==`/`!=` never error (identity fallback), and a dunder that itself raised propagates
+/// unchanged. Native code that compares a program's values (`_heapq`) calls this, so its `<` and
+/// the program's are one evaluation.
+pub(crate) fn compare_values(
+    cmpop: CmpOp,
+    lhs: Value,
+    rhs: Value,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    match dispatch_compare(cmpop, lhs, rhs, functions, model, depth) {
+        Ok(value) => Ok(value),
+        Err(Trap::TypeError) if matches!(cmpop, CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge) => {
+            Err(model.compare_type_error(cmpop, lhs, rhs))
+        }
+        Err(other) => Err(other),
+    }
+}
+
 /// The dunder method name for a unary operator (`__neg__`/`__pos__`/`__invert__`).
 fn unary_dunder_name(op: UnaryOp) -> &'static str {
     match op {
@@ -991,11 +1014,14 @@ pub(crate) fn py_truthy_dyn(
     Ok(model.py_truthy(value)?.unwrap_or_else(|| value.is_truthy()))
 }
 
-/// Interp-aware element equality for set membership and dedup: when either operand is a user
-/// instance, its `__eq__` (with the reflected fallback) decides; otherwise the model's value
-/// equality (`key_eq`). This is to sets what the interp-aware repr is to `print` -- the model's
-/// `key_eq` is identity for a user object (it cannot call a dunder), so the equality a set uses to
-/// dedup and test membership is threaded through the interpreter here.
+/// Interp-aware element equality, CPython's `x is y or x == y`: for set membership and dedup, the
+/// sequence comparisons' search for the first unequal pair, and `in`, `count`, `index` and `remove`.
+/// An object equals itself without being asked. When either operand is a user instance, its `__eq__`
+/// (with the reflected fallback) decides; two containers compare through the full `==`, which reaches
+/// the instances they hold; otherwise the model's value equality (`key_eq`) decides. This is to sets
+/// what the interp-aware repr is to `print` -- the model's `key_eq` is identity for a user object (it
+/// cannot call a dunder), so the equality a set uses to dedup and test membership is threaded through
+/// the interpreter here.
 pub(crate) fn elem_eq(
     a: Value,
     b: Value,
@@ -1003,10 +1029,24 @@ pub(crate) fn elem_eq(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<bool, Trap> {
+    if a == b {
+        return Ok(true);
+    }
     if model.is_instance(a) || model.is_instance(b) {
         if let Some(result) = try_compare_dunder(CmpOp::Eq, a, b, functions, model, depth)? {
             return Ok(result == Value::TRUE);
         }
+    }
+    let container = |value: Value, model: &ObjectModel| {
+        model.seq_value(value).is_some()
+            || model.is_dict(value)
+            || model.is_set(value)
+            || model.is_frozenset(value)
+            || model.is_deque(value)
+    };
+    if container(a, model) && container(b, model) {
+        let outcome = compare_values(CmpOp::Eq, a, b, functions, model, depth)?;
+        return py_truthy_dyn(outcome, functions, model, depth);
     }
     Ok(model.key_eq(a, b))
 }
@@ -1395,7 +1435,7 @@ fn try_deque_compare_dyn(
         CmpOp::Ne => split.is_some() || a_elems.len() != b_elems.len(),
         CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => match split {
             Some(i) => {
-                let decided = dispatch_compare(op, a_elems[i], b_elems[i], functions, model, depth)?;
+                let decided = compare_values(op, a_elems[i], b_elems[i], functions, model, depth)?;
                 return Ok(Some(decided));
             }
             None => match op {
@@ -1452,7 +1492,7 @@ fn try_seq_compare_dyn(
         CmpOp::Ne => split.is_some() || a_elems.len() != b_elems.len(),
         CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => match split {
             Some(i) => {
-                let decided = dispatch_compare(op, a_elems[i], b_elems[i], functions, model, depth)?;
+                let decided = compare_values(op, a_elems[i], b_elems[i], functions, model, depth)?;
                 return Ok(Some(decided));
             }
             None => match op {
@@ -2637,6 +2677,8 @@ pub(crate) fn call_value(
             model.call_deque_method_dyn(receiver, method_id, args, functions, depth)
         } else if model.is_list(receiver) {
             model.call_list_method_dyn(callee, receiver, method_id, args, functions, depth)
+        } else if model.is_tuple(receiver) && !model.is_ntinstance(receiver) {
+            model.call_tuple_method_dyn(callee, receiver, method_id, args, functions, depth)
         } else {
             model.call_bound_method(callee, args)
         }
@@ -2980,7 +3022,7 @@ fn call_value_kw(
             return model.object_new(*class, rest, kwargs);
         }
         if kwargs.is_empty() {
-            model.call_bound_method(callee, posargs)
+            call_value(callee, posargs, functions, model, depth)
         } else {
             Err(Trap::TypeError)
         }
@@ -3016,17 +3058,7 @@ fn list_sort_kw(
             _ => return Err(Trap::TypeError),
         }
     }
-    let keys = if key.is_none() {
-        None
-    } else {
-        let elements = model.seq_elements(receiver).ok_or(Trap::TypeError)?;
-        let mut computed = Vec::with_capacity(elements.len());
-        for element in elements {
-            computed.push(call_value(key, &[element], functions, model, depth)?);
-        }
-        Some(computed)
-    };
-    model.list_sort_in_place(receiver, keys, reverse)
+    crate::builtins::list_sort_python(receiver, key, reverse, functions, model, depth)
 }
 
 /// Binds positional + keyword arguments (+ positional defaults) to a function's parameters,
@@ -4584,15 +4616,7 @@ fn drive_frames(
                     let same = lhs == rhs;
                     Value::from_bool(if matches!(cmpop, CmpOp::IsNot) { !same } else { same })
                 } else {
-                    match dispatch_compare(cmpop, lhs, rhs, functions, model, depth) {
-                        Ok(value) => value,
-                        Err(Trap::TypeError)
-                            if matches!(cmpop, CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge) =>
-                        {
-                            return Err(model.compare_type_error(cmpop, lhs, rhs));
-                        }
-                        Err(other) => return Err(other),
-                    }
+                    compare_values(cmpop, lhs, rhs, functions, model, depth)?
                 };
                 frame.push(result);
             }

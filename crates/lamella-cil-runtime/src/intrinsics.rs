@@ -8033,6 +8033,45 @@ pub fn mmio_read16(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Opti
     Ok(Some(Value::Int32(i32::from(vm.mmio_read16(mmio_u32(args, 0))))))
 }
 
+/// `Lamella.Hardware.BoardBuses.Length(int kind, int bus) -> int`: how many descriptor words bus
+/// `bus` of `kind` has in the bus table of the board the image was built for -- -1 when the image
+/// carries no table, 0 when the board has no such bus. `System.Device`'s factories find bus N
+/// through it. See [`Module::board_bus_length`].
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] when an argument is not an `int`.
+#[cfg(feature = "board-buses")]
+pub fn board_buses_length(
+    _vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (Some(&Value::Int32(kind)), Some(&Value::Int32(bus))) = (args.first(), args.get(1)) else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    Ok(Some(Value::Int32(module.board_bus_length(kind, bus))))
+}
+
+/// `Lamella.Hardware.BoardBuses.Word(int kind, int bus, int index) -> uint`: word `index` of the
+/// descriptor of bus `bus` of `kind` -- the binding its family's driver is constructed from -- and
+/// 0 outside it. See [`Module::board_bus_word`].
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] when an argument is not an `int`.
+#[cfg(feature = "board-buses")]
+pub fn board_buses_word(
+    _vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let (Some(&Value::Int32(kind)), Some(&Value::Int32(bus)), Some(&Value::Int32(index))) =
+        (args.first(), args.get(1), args.get(2))
+    else {
+        return Err(Trap::TypeMismatch(Opcode::Call));
+    };
+    Ok(Some(Value::Int32(module.board_bus_word(kind, bus, index) as i32)))
+}
+
 /// `Marshal.SizeOf(Type)`: the unmanaged size in bytes of a primitive type (`int` -> 4, `long` -> 8,
 /// ...). 0 for a type whose unmanaged size is not modeled here.
 ///

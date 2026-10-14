@@ -9,7 +9,7 @@ use crate::declaration::{
 use crate::diagnostic::{Diagnostic, DiagnosticKind, DiagnosticPhase, SignaturePosition};
 use lamella_syntax::lexer::OutputKind;
 use lamella_syntax::version::{Feature, LanguageVersion};
-use crate::reference::load_assembly;
+use crate::reference::load_references;
 use crate::special::SpecialType;
 use crate::symbols::{Accessibility, Model, TypeInfo};
 use crate::types::TypeSymbol;
@@ -149,10 +149,22 @@ pub fn bind_compilation_unit_with_options(
     references: &[Assembly],
     options: BindOptions<'_>,
 ) -> Vec<Diagnostic> {
-    let mut model = Model::new();
-    for reference in references {
-        load_assembly(&mut model, reference, options.compiling_assembly);
-    }
+    let model = load_references(references, options.compiling_assembly);
+    bind_compilation_unit_with_reference_model(unit, model, options)
+}
+
+/// [`bind_compilation_unit_with_options`] over references a caller has already loaded with
+/// [`load_references`], for a caller that needs that model again: a compiler emits from a copy of
+/// the one it bound against, so it reads its references once.
+///
+/// `model` holds the references alone, loaded under `options.compiling_assembly`, since a
+/// reference's `[assembly: InternalsVisibleTo]` decides which of its members exist.
+#[must_use]
+pub fn bind_compilation_unit_with_reference_model(
+    unit: &CompilationUnit,
+    mut model: Model,
+    options: BindOptions<'_>,
+) -> Vec<Diagnostic> {
     collect_into(&mut model, unit);
     let mut binder = Binder::with_model(model);
     qualify_declared_signatures(&mut binder, &unit.usings, &unit.members, "");
@@ -832,10 +844,20 @@ pub fn bind_compilation_units_with_options(
     references: &[Assembly],
     options: BindOptions<'_>,
 ) -> Vec<Vec<Diagnostic>> {
-    let mut model = Model::new();
-    for reference in references {
-        load_assembly(&mut model, reference, options.compiling_assembly);
-    }
+    let model = load_references(references, options.compiling_assembly);
+    bind_compilation_units_with_reference_model(units, model, options)
+}
+
+/// [`bind_compilation_units_with_options`] over references a caller has already loaded with
+/// [`load_references`] -- the multi-unit twin of [`bind_compilation_unit_with_reference_model`],
+/// and `model` holds the same thing: the references alone, loaded under
+/// `options.compiling_assembly`.
+#[must_use]
+pub fn bind_compilation_units_with_reference_model(
+    units: &[CompilationUnit],
+    mut model: Model,
+    options: BindOptions<'_>,
+) -> Vec<Vec<Diagnostic>> {
     for unit in units {
         collect_into(&mut model, unit);
     }
@@ -2148,18 +2170,35 @@ fn validate_attributes(binder: &mut Binder, attributes: &[AttributeSection]) {
                 );
             }
             let name = dotted(&attribute.name);
-            let written = TypeSymbol::Named(attribute.name.parts.iter().cloned().collect());
-            let resolved = binder.resolve_named_type_quietly(&written, attribute.span);
-            if !resolved.is_error()
-                && binder.is_provably_not_derived_from_system(&resolved, "Attribute")
-            {
-                binder.report(Diagnostic::new(
-                    DiagnosticKind::NotAnAttributeClass {
-                        type_name: name.clone().into(),
-                    },
-                    attribute.span,
-                ));
-            }
+            let resolved = match binder.resolve_attribute_class(&attribute.name) {
+                crate::bound::AttributeClass::Resolved(class) => class,
+                crate::bound::AttributeClass::Ambiguous { written, suffixed } => {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::AmbiguousAttribute {
+                            name: name.clone().into(),
+                            written: written.to_string().into(),
+                            suffixed: suffixed.to_string().into(),
+                        },
+                        attribute.span,
+                    ));
+                    TypeSymbol::Error
+                }
+                crate::bound::AttributeClass::NotFound { not_an_attribute } => {
+                    if let Some((_, suffixed)) = not_an_attribute {
+                        let mut type_name = name.clone();
+                        if suffixed {
+                            type_name.push_str("Attribute");
+                        }
+                        binder.report(Diagnostic::new(
+                            DiagnosticKind::NotAnAttributeClass {
+                                type_name: type_name.into(),
+                            },
+                            attribute.span,
+                        ));
+                    }
+                    TypeSymbol::Error
+                }
+            };
             if !seen.insert(name.clone()) {
                 binder.report(Diagnostic::new(
                     DiagnosticKind::DuplicateAttribute {
@@ -3311,12 +3350,14 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
     validate_conversion_operators(binder, declaration);
     validate_unsafe_permitted(binder, declaration);
     validate_constructor_initializer_cycles(binder, declaration);
+    let outer = binder.replace_current_type(Some(enclosing.clone()));
     validate_attributes(binder, &declaration.attributes);
     for member in &declaration.members {
         if let Some(attributes) = member_attributes(member) {
             validate_attributes(binder, attributes);
         }
     }
+    binder.replace_current_type(outer);
     validate_indexer_name_attribute(binder, declaration);
     validate_operator_pairs(binder, declaration);
     validate_conditional_methods(binder, declaration);
@@ -6979,8 +7020,9 @@ mod tests {
     #[test]
     fn sets_required_members_exempts_a_creation_and_an_abstract_type_reports_only_cs0144() {
         let v11 = LanguageVersion::CSharp11;
-        let attribute = "namespace System.Diagnostics.CodeAnalysis { \
-                         public class SetsRequiredMembersAttribute { } } ";
+        let attribute = "namespace System { public class Attribute { } } \
+                         namespace System.Diagnostics.CodeAnalysis { \
+                         public class SetsRequiredMembersAttribute : Attribute { } } ";
 
         assert_eq!(
             sorted_codes_parsed_at(

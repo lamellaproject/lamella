@@ -27,6 +27,20 @@ const REQUIRED_MEMBER_ATTRIBUTE_NAME: &str = "RequiredMemberAttribute";
 use lamella_syntax::token::RealSuffix;
 use lamella_token::Token;
 
+/// The model of `references` alone, as an assembly named `compiling_assembly` sees them: each one
+/// added by [`load_assembly`], in order, so where two declare the same type the later one's stands.
+///
+/// A compiler binds against a copy of this and emits from another, so the two resolve against the
+/// same members and every reference is read once per compilation.
+#[must_use]
+pub fn load_references(references: &[Assembly], compiling_assembly: &str) -> Model {
+    let mut model = Model::new();
+    for reference in references {
+        load_assembly(&mut model, reference, compiling_assembly);
+    }
+    model
+}
+
 /// Adds every type defined in `assembly` to `model`, as they are VISIBLE to an assembly named
 /// `compiling_assembly`.
 ///
@@ -64,6 +78,7 @@ pub fn load_assembly(model: &mut Model, assembly: &Assembly, compiling_assembly:
         "System.Runtime.CompilerServices",
         "IsByRefLikeAttribute",
     );
+    let constants = assembly.constants();
     for type_def in assembly.type_defs() {
         let own_parameters: &[&str] = type_parameters
             .get(&type_def.token().row())
@@ -78,6 +93,7 @@ pub fn load_assembly(model: &mut Model, assembly: &Assembly, compiling_assembly:
             &required_members,
             &sets_required,
             &by_ref_like,
+            &constants,
             internals_visible,
         ) {
             let mut info = info;
@@ -155,6 +171,7 @@ fn type_info(
     required_members: &BTreeSet<lamella_token::Token>,
     sets_required: &BTreeSet<lamella_token::Token>,
     by_ref_like: &BTreeSet<lamella_token::Token>,
+    constants: &BTreeMap<lamella_token::Token, ConstantValue>,
     internals_visible: bool,
 ) -> Option<TypeInfo> {
     let TypeName { namespace, name } = type_def.name()?;
@@ -217,7 +234,10 @@ fn type_info(
             continue;
         }
         if let (Some(field_name), Some(signature)) = (field.name(), field.signature()) {
-            let constant = field.constant().and_then(constant_to_literal);
+            let constant = constants
+                .get(&field.token())
+                .cloned()
+                .and_then(constant_to_literal);
             info.fields.push(FieldSymbol {
                 tuple_names: Vec::new(),
                 name: field_name.into(),
@@ -282,7 +302,11 @@ fn type_info(
                     sigtype_to_symbol(assembly, parameter, method_own_parameters, own_parameters)
                 })
                 .collect(),
-            parameter_info: imported_parameter_info(&method, signature.parameters.len()),
+            parameter_info: imported_parameter_info(
+                &method,
+                signature.parameters.len(),
+                constants,
+            ),
             is_static: !signature.has_this,
             is_params: method
                 .params()
@@ -399,6 +423,7 @@ fn type_info(
 fn imported_parameter_info(
     method: &lamella_metadata::Method,
     count: usize,
+    constants: &BTreeMap<lamella_token::Token, ConstantValue>,
 ) -> Vec<crate::symbols::ParameterInfo> {
     use crate::symbols::{ParameterInfo, ParameterMode};
     const PARAM_OUT: u32 = 0x0002;
@@ -420,7 +445,7 @@ fn imported_parameter_info(
             slot.mode = ParameterMode::Out;
             any = true;
         }
-        if let Some(value) = param.constant()
+        if let Some(value) = constants.get(&param.token()).cloned()
             && let Some(literal) = constant_to_literal(value)
         {
             slot.default = Some(literal);
@@ -511,9 +536,15 @@ fn member_accessibility(flags: u32) -> Accessibility {
 }
 
 /// Maps a metadata constant to the literal the binder folds a `const` field or enum member
-/// to at its use site (instead of an `ldsfld` on a storageless slot): the integral, char, and
-/// bool values, and now the float (`Single.MaxValue`, `Double.NaN`) and string ones. A null
-/// constant has no fold -- it is already the null literal at the use site.
+/// to at its use site (instead of an `ldsfld` on a storageless slot), and that an omitted
+/// argument passes for a parameter's default: the integral, char, bool, float and string values,
+/// and the NULL constant (II.22.9: `ELEMENT_TYPE_CLASS` with a 4-byte zero value).
+///
+/// **THE NULL CONSTANT IS A VALUE LIKE ANY OTHER.** csc writes it for every `null` default and for
+/// every zero-initialized one -- `string s = null`, `int? x = null`, `S s = default(S)`, `S s = new
+/// S()`, `T t = default(T)` -- and for a `const` whose value is `null`. [`Literal::Null`] is what
+/// the binder holds for all of those when they are declared in source, so a call or a use site
+/// treats the imported one the same way.
 fn constant_to_literal(value: ConstantValue) -> Option<Literal> {
     Some(match value {
         ConstantValue::Bool(b) => Literal::Boolean(b),
@@ -535,7 +566,7 @@ fn constant_to_literal(value: ConstantValue) -> Option<Literal> {
             suffix: RealSuffix::Double,
         },
         ConstantValue::String(units) => Literal::String(units.into_boxed_slice()),
-        ConstantValue::Null => return None,
+        ConstantValue::Null => Literal::Null,
     })
 }
 

@@ -2026,16 +2026,19 @@ impl Parser {
     fn parse_qualified_name(&mut self) -> QualifiedName {
         let start = self.current().span.start;
         let mut parts = Vec::new();
+        let mut last_verbatim = self.current().verbatim;
         let (first, mut end) = self.expect_identifier();
         parts.push(first);
         while self.current_punctuator() == Some(Punctuator::Dot) {
             self.bump();
+            last_verbatim = self.current().verbatim;
             let (part, part_end) = self.expect_identifier();
             end = part_end;
             parts.push(part);
         }
         QualifiedName {
             parts,
+            last_verbatim,
             span: Span::new(start, end),
         }
     }

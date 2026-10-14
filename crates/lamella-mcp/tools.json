@@ -4,7 +4,7 @@
     {
       "name": "lamella_check",
       "title": "Check (compile only)",
-      "description": "Compile-CHECK a Lamella program WITHOUT running it -- returns diagnostics only. Fast iteration on errors before you run or deploy. C# or Python.",
+      "description": "Compile-CHECK a C# program WITHOUT running it -- returns the compiler's diagnostics only, or that it compiles. Fast iteration on errors before you run or deploy. A C# program binds against the corlib, which is implicit, and against the libraries it names in `references`: every other library, System.Device.Gpio among them, is a separate reference, as in a .NET project. A program using a library it does not name is refused, naming the library to add.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -12,13 +12,20 @@
             "type": "string",
             "description": "The program source."
           },
+          "references": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The libraries the program uses besides the corlib, each named as its assembly is named, such as \"System.Device.Gpio\". The corlib is implicit; every other library is a separate reference, as a .NET project names one. The tool's description lists the libraries this server can reference."
+          },
           "language": {
             "type": "string",
             "enum": [
-              "csharp",
-              "python"
+              "csharp"
             ],
-            "default": "csharp"
+            "default": "csharp",
+            "description": "C#, the one language this server compiles. `lamella run <file.py>` runs a Python program on this machine."
           }
         },
         "required": [
@@ -33,7 +40,7 @@
     {
       "name": "lamella_run",
       "title": "Run (host interpreter)",
-      "description": "Compile and RUN a Lamella program on the HOST interpreter (no device needed) and return stdout, exit code, and diagnostics. Use this to test logic quickly. C#: a full program with a Main; Python: define main() and its return value is printed. A program that has not finished in 20 seconds (or the time the server was started with, --run-timeout) is stopped, and the answer says so.",
+      "description": "Compile and RUN a C# program on this machine's interpreter (no device needed) and return its output, its exit code, and the compiler's diagnostics. Use this to test logic quickly. A program that has not finished in 20 seconds (or the time the server was started with, --run-timeout) is stopped, and the answer says so. It runs a program against the corlib alone, so a program using a library, such as System.Device.Gpio, is refused here, naming it: lamella_check takes `references`, and lamella_run_on_device runs such a program on a board.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -44,10 +51,10 @@
           "language": {
             "type": "string",
             "enum": [
-              "csharp",
-              "python"
+              "csharp"
             ],
-            "default": "csharp"
+            "default": "csharp",
+            "description": "C#, the one language this server compiles. `lamella run <file.py>` runs a Python program on this machine."
           }
         },
         "required": [
@@ -62,7 +69,7 @@
     {
       "name": "lamella_size",
       "title": "Size report",
-      "description": "Report the flash / RAM / .wasm footprint of a compiled program against the target's budget -- the size meter. Use it to see whether a program fits a board before deploying, and where the bytes go.",
+      "description": "Bake a C# program to the flash image a board's firmware runs, without writing it, and report its size in bytes and what it carries. With `board`, the image is the one the device tools build for that board, and the answer says whether it fits the board's flash, as `lamella build <file> --board <id>` answers: lamella_fit's verdict, led by what the number leaves out (the firmware already on the board), so its headroom is an upper bound. It measures no RAM and no section sizes. A C# program binds against the corlib, which is implicit, and against the libraries it names in `references`: every other library, System.Device.Gpio among them, is a separate reference, as in a .NET project. A program using a library it does not name is refused, naming the library to add. The answer names each assembly the image carries, which build of it, and how much code it puts in the image. Without `board`, a program whose image would carry a library a chip family builds its own of, such as System.Device.Gpio, is refused: built for no board it would carry the build every family shares, which drives nothing, and on a board `new GpioController()` would throw PlatformNotSupportedException.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -70,9 +77,16 @@
             "type": "string",
             "description": "The C# program source."
           },
-          "target": {
+          "references": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The libraries the program uses besides the corlib, each named as its assembly is named, such as \"System.Device.Gpio\". The corlib is implicit; every other library is a separate reference, as a .NET project names one. The tool's description lists the libraries this server can reference."
+          },
+          "board": {
             "type": "string",
-            "description": "Optional board/profile name (e.g. 'rpi-pico2'); default is the generic profile."
+            "description": "A board id, as lamella_boards lists them, such as \"rpi-pico2-w\". The image is built for that board as the device tools build it for the board that answers: it carries the board's bus table and binds its chip family's build of a library built per family. Without it the image is built for no board."
           }
         },
         "required": [
@@ -150,13 +164,24 @@
     {
       "name": "lamella_bake",
       "title": "Bake to flash image",
-      "description": "Compile + BAKE a C# program into a deployable '.lmli' flash image (corlib-baked, the on-device deploy format) and report its size. This is the artifact lamella_deploy sends to a board. To keep the image, name a NEW file with out_name: it is written in the directory the server was started with --allow-write=<dir>, never over a file already there, and a server started without that flag writes no file at all.",
+      "description": "Compile + BAKE a C# program into a deployable '.lmli' flash image (the on-device deploy format, carrying the corlib and the libraries the program uses) and report its size: the artifact lamella_deploy sends to a board, and what `lamella build <file> --board <id>` writes. With `board`, it is built for that board, as the device tools build it for the board that answers. To keep the image, name a NEW file with out_name: it is written in the directory the server was started with --allow-write=<dir>, never over a file already there, and a server started without that flag writes no file at all. A C# program binds against the corlib, which is implicit, and against the libraries it names in `references`: every other library, System.Device.Gpio among them, is a separate reference, as in a .NET project. A program using a library it does not name is refused, naming the library to add. The answer names each assembly the image carries, which build of it, and how much code it puts in the image. Without `board`, a program whose image would carry a library a chip family builds its own of, such as System.Device.Gpio, is refused: built for no board it would carry the build every family shares, which drives nothing, and on a board `new GpioController()` would throw PlatformNotSupportedException.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "code": {
             "type": "string",
             "description": "The C# program source."
+          },
+          "references": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The libraries the program uses besides the corlib, each named as its assembly is named, such as \"System.Device.Gpio\". The corlib is implicit; every other library is a separate reference, as a .NET project names one. The tool's description lists the libraries this server can reference."
+          },
+          "board": {
+            "type": "string",
+            "description": "A board id, as lamella_boards lists them, such as \"rpi-pico2-w\". The image is built for that board as the device tools build it for the board that answers: it carries the board's bus table and binds its chip family's build of a library built per family. Without it the image is built for no board."
           },
           "out_name": {
             "type": "string",
@@ -189,13 +214,13 @@
     {
       "name": "lamella_identify_device",
       "title": "Identify a board",
-      "description": "HELLO a Lamella Link target and return what it is: board name (from its product_model), chip IDCODE + device id when the firmware reports them, negotiated capabilities, and the resolved chip SKU. Read-only -- does not deploy or run anything.",
+      "description": "HELLO a Lamella Link target and return what it is: the board (from its product_model), its architecture and firmware build when the firmware reports them, the chip's own id under the scheme the firmware declares, the negotiated capabilities, and each resident runtime. It writes nothing to the board, though its HELLO takes the board back from a program it is running, as every tool that connects to a board does.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "target": {
             "type": "string",
-            "description": "COM port (e.g. 'COM9') or 'usb'[':'<serial>]."
+            "description": "Where the board is: `usb`, `usb:<serial>` or `usb:<vid>:<pid>[:<serial>]` for a board's own USB, a serial port such as `COM9`, or `tcp:<host>[:<port>]` for a board on a network. lamella_list_devices lists the boards attached here and the target to give for each."
           }
         },
         "required": [
@@ -203,24 +228,33 @@
         ]
       },
       "annotations": {
-        "readOnlyHint": true,
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true,
         "openWorldHint": true
       }
     },
     {
       "name": "lamella_run_on_device",
-      "title": "Run on device (Lamella Link interpreter)",
-      "description": "Compile a submission and run it ON THE DEVICE over Lamella Link -- the target runs the CIL on its interpreter and returns the output. Transient (nothing is flashed). Use this to exercise real hardware (GPIO, peripherals) without a persistent deploy.",
+      "title": "Run on a board (stored, then followed)",
+      "description": "Compile a C# program, store it in a board's flash over Lamella Link and run it there, then answer with what it printed and how it ended: what `lamella run <file> --device <d>` does. The board starts it without a reset, under its own scheduler, threads, locks and blocking calls included, so nothing the program prints is lost. The program is STORED: it replaces the program the board stores, and the board runs it at every reset until another is deployed. The run is followed until the program ends or the server's run timeout passes (20 seconds, or --run-timeout); a program still running then goes on running on the board, and the answer says so: the next tool that connects to the board takes it back. A board whose firmware runs a program only under the debugger is refused, naming lamella_debug_launch. A C# program binds against the corlib, which is implicit, and against the libraries it names in `references`: every other library, System.Device.Gpio among them, is a separate reference, as in a .NET project. A program using a library it does not name is refused before the board is opened, naming the library to add. The answer names each assembly the image carries, which build of it, and how much code it puts in the image. The image is built for the board that answers: it carries that board's bus table, and binds its chip family's build of a library built per family, such as System.Device.Gpio with the family's bus drivers.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "target": {
             "type": "string",
-            "description": "COM port or usb target."
+            "description": "Where the board is: `usb`, `usb:<serial>` or `usb:<vid>:<pid>[:<serial>]` for a board's own USB, a serial port such as `COM9`, or `tcp:<host>[:<port>]` for a board on a network. lamella_list_devices lists the boards attached here and the target to give for each."
           },
           "code": {
             "type": "string",
             "description": "The C# program source."
+          },
+          "references": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The libraries the program uses besides the corlib, each named as its assembly is named, such as \"System.Device.Gpio\". The corlib is implicit; every other library is a separate reference, as a .NET project names one. The tool's description lists the libraries this server can reference."
           }
         },
         "required": [
@@ -230,29 +264,36 @@
       },
       "annotations": {
         "readOnlyHint": false,
-        "destructiveHint": false,
+        "destructiveHint": true,
         "openWorldHint": true
       }
     },
     {
       "name": "lamella_deploy",
       "title": "Deploy to board (persistent)",
-      "description": "Compile -> bake -> chunk-deploy a program to a board's FLASH over Lamella Link, so it boots on reset. Optionally boot it immediately (run=true). This OVERWRITES the resident image on the board.",
+      "description": "Compile a C# program, bake it and store it in a board's FLASH over Lamella Link, so the board runs it at every reset: what `lamella deploy <file> --device <d>` does. This OVERWRITES the program the board stores; a board that already stores exactly this program is sent nothing. With `run` (the default) the board then starts it from a reset; lamella_run_on_device starts it and answers with what it prints. A C# program binds against the corlib, which is implicit, and against the libraries it names in `references`: every other library, System.Device.Gpio among them, is a separate reference, as in a .NET project. A program using a library it does not name is refused before the board is opened, naming the library to add. The answer names each assembly the image carries, which build of it, and how much code it puts in the image. The image is built for the board that answers: it carries that board's bus table, and binds its chip family's build of a library built per family, such as System.Device.Gpio with the family's bus drivers.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "target": {
             "type": "string",
-            "description": "COM port or usb target."
+            "description": "Where the board is: `usb`, `usb:<serial>` or `usb:<vid>:<pid>[:<serial>]` for a board's own USB, a serial port such as `COM9`, or `tcp:<host>[:<port>]` for a board on a network. lamella_list_devices lists the boards attached here and the target to give for each."
           },
           "code": {
             "type": "string",
             "description": "The C# program source."
           },
+          "references": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The libraries the program uses besides the corlib, each named as its assembly is named, such as \"System.Device.Gpio\". The corlib is implicit; every other library is a separate reference, as a .NET project names one. The tool's description lists the libraries this server can reference."
+          },
           "run": {
             "type": "boolean",
             "default": true,
-            "description": "Boot the image immediately after deploy."
+            "description": "Start the program once it is stored, from a reset, as the board starts it at power-up. With false it starts at the board's next reset."
           }
         },
         "required": [
@@ -269,13 +310,13 @@
     {
       "name": "lamella_deploy_status",
       "title": "Resident image status",
-      "description": "Query the board's resident deployed image -- returns the content checksum if it holds a valid image, or that none is present. Read-only. Compare to a freshly-baked image to skip a redundant re-deploy.",
+      "description": "Ask a board whether it stores a deployed image: the image's content checksum when it holds one it has verified, or that it holds none. It writes nothing to the board, though its HELLO takes the board back from a program it is running, as every tool that connects to a board does. lamella_deploy and lamella_run_on_device already send nothing to a board that stores exactly the image they build.",
       "inputSchema": {
         "type": "object",
         "properties": {
           "target": {
             "type": "string",
-            "description": "COM port or usb target."
+            "description": "Where the board is: `usb`, `usb:<serial>` or `usb:<vid>:<pid>[:<serial>]` for a board's own USB, a serial port such as `COM9`, or `tcp:<host>[:<port>]` for a board on a network. lamella_list_devices lists the boards attached here and the target to give for each."
           }
         },
         "required": [
@@ -283,7 +324,9 @@
         ]
       },
       "annotations": {
-        "readOnlyHint": true,
+        "readOnlyHint": false,
+        "destructiveHint": true,
+        "idempotentHint": true,
         "openWorldHint": true
       }
     },
@@ -338,7 +381,7 @@
     {
       "name": "lamella_debug_launch",
       "title": "Debug: launch session",
-      "description": "Start a SOURCE-LEVEL debug session on a board: deploy the program, attach, and stop at entry. Returns a session id (pass it to the other debug tools) and the initial stop (reason + source location). Overwrites the resident image.",
+      "description": "Start a SOURCE-LEVEL debug session on a board: deploy the program, attach, and stop at entry. Returns a session id (pass it to the other debug tools) and the initial stop (reason + source location). Overwrites the resident image. A C# program binds against the corlib, which is implicit, and against the libraries it names in `references`: every other library, System.Device.Gpio among them, is a separate reference, as in a .NET project. A program using a library it does not name is refused, naming the library to add. The answer names each assembly the image carries, which build of it, and how much code it puts in the image. The image is built for the board that answers: it carries that board's bus table, and binds its chip family's build of a library built per family, such as System.Device.Gpio with the family's bus drivers.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -349,6 +392,13 @@
           "code": {
             "type": "string",
             "description": "The C# program source."
+          },
+          "references": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "The libraries the program uses besides the corlib, each named as its assembly is named, such as \"System.Device.Gpio\". The corlib is implicit; every other library is a separate reference, as a .NET project names one. The tool's description lists the libraries this server can reference."
           }
         },
         "required": [
@@ -397,7 +447,7 @@
     {
       "name": "lamella_debug_continue",
       "title": "Debug: continue",
-      "description": "Resume the session until the next breakpoint, an exit, or a fault. Returns the stop (reason, source location, exit code / fault message).",
+      "description": "Resume the session until the next breakpoint, an exit, or a fault. Returns the stop (reason, source location, exit code / fault message). It waits at most 20 seconds for the stop, and says so when the program is still running then.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -417,7 +467,7 @@
     {
       "name": "lamella_debug_step",
       "title": "Debug: step",
-      "description": "Single-step the session at source granularity: 'in' (step into calls), 'over' (step over), or 'out' (run to return). Returns the new stop location.",
+      "description": "Single-step the session at source granularity: 'in' (step into calls), 'over' (step over), or 'out' (run to return). Returns the new stop location. It waits at most 20 seconds for the stop, and says so when the program is still running then.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -492,7 +542,7 @@
     {
       "name": "lamella_debug_eval",
       "title": "Debug: evaluate",
-      "description": "Evaluate an expression / submission in the session's Debug Console (compiled + run through the Lamella Link engine) and return its output. Runs code on the device.",
+      "description": "Read one variable of the paused session by name -- a local or an argument of a stack frame -- as a debugger's Watch row reads it, and return its value and type. Only a single name is read: anything longer is refused, because nothing that could evaluate it can see the paused frame. It runs no code on the board.",
       "inputSchema": {
         "type": "object",
         "properties": {
@@ -500,7 +550,12 @@
             "type": "string"
           },
           "expression": {
-            "type": "string"
+            "type": "string",
+            "description": "The variable's name, such as \"count\"."
+          },
+          "frame": {
+            "type": "integer",
+            "description": "Frame index (0 = innermost)."
           }
         },
         "required": [
@@ -509,7 +564,7 @@
         ]
       },
       "annotations": {
-        "readOnlyHint": false,
+        "readOnlyHint": true,
         "openWorldHint": true
       }
     },

@@ -1,9 +1,15 @@
 // Lamella managed corlib (from scratch). -- System.Convert
 namespace System
 {
+#if LAMELLA_SURFACE_NETFX_2_0
+    public static class Convert
+#else
     public sealed class Convert
+#endif
     {
+#if !LAMELLA_SURFACE_NETFX_2_0
         private Convert() { }
+#endif
 
         public static int ToInt32(string value)
         {

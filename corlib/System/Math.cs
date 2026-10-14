@@ -1,9 +1,15 @@
 // Lamella managed corlib (from scratch). -- System.Math
 namespace System
 {
+#if LAMELLA_SURFACE_NETFX_2_0
+    public static class Math
+#else
     public sealed class Math
+#endif
     {
+#if !LAMELLA_SURFACE_NETFX_2_0
         private Math() { }
+#endif
 
 #if LAMELLA_SURFACE_FLOAT
         public const double PI = 3.14159265358979323846;

@@ -1807,6 +1807,48 @@ extern "C" fn lamella_clock_now_ms() -> u64 {
     monotonic_now_ms().unwrap_or(0)
 }
 
+extern "C" {
+    /// The bus table of the board the build names, as the AOT link lays it: a STRONG
+    /// `lamella_board_buses` over the table's words when the build names a board with one, or else
+    /// the WEAK one-word default below, whose first word is not the table's `LBUS` header -- no
+    /// table, so every bus is absent. `Lamella.Hardware.BoardBuses` reads it through the two entries
+    /// after it.
+    #[link_name = "lamella_board_buses"]
+    static BOARD_BUSES: u32;
+}
+
+core::arch::global_asm!(
+    ".weak lamella_board_buses",
+    ".align 2",
+    ".type lamella_board_buses, %object",
+    "lamella_board_buses:",
+    ".word 0",
+    ".size lamella_board_buses, 4",
+);
+
+/// Word `index` of the linked bus table, for `lamella-board-buses`' lookups. Unbounded by design: the
+/// link checks the table it lays (`lamella_board_buses::check`), and the lookups read only what its
+/// header and rows declare -- the default's one word included, since a first word other than `LBUS`
+/// ends every lookup there.
+fn board_buses_word_at(index: usize) -> Option<u32> {
+    Some(unsafe { core::ptr::addr_of!(BOARD_BUSES).add(index).read() })
+}
+
+/// `Lamella.Hardware.BoardBuses.Length(kind, bus)` on a linked image: -1 when the image carries no
+/// table, 0 for a bus the table lacks or a negative argument, and that bus's descriptor word count
+/// otherwise -- the answers the interpreter gives from a baked image's table.
+#[no_mangle]
+extern "C" fn lamella_board_buses_length(kind: i32, bus: i32) -> i32 {
+    lamella_board_buses::length(board_buses_word_at, kind, bus)
+}
+
+/// `Lamella.Hardware.BoardBuses.Word(kind, bus, index)` on a linked image: word `index` of that bus's
+/// descriptor, and 0 outside it.
+#[no_mangle]
+extern "C" fn lamella_board_buses_word(kind: i32, bus: i32, index: i32) -> u32 {
+    lamella_board_buses::word(board_buses_word_at, kind, bus, index)
+}
+
 /// Mock monotonic clock (ms) for the self-contained reactor demo; the `net` build reads the real clock
 /// seam. Zero-initialized, so it is `.bss` in the statics window a boot path clears -- the clock
 /// starts at zero, which is the no-clock answer, rather than at whatever RAM held.
@@ -2830,6 +2872,37 @@ mod collector {
     /// How many `u32` words [`MARK_BASE`] addresses. Zero until the heap is adopted.
     static mut MARK_WORDS: usize = 0;
 
+    /// The SECOND SEGMENT's mark bitmap: the top of the PSRAM window, carved off before the rest is
+    /// handed to the heap, as [`MARK_BASE`] is carved off the band. Null until the PSRAM is adopted,
+    /// and for good when the board's startup did not bring it up.
+    #[cfg(feature = "second-segment")]
+    static mut SECOND_MARK_BASE: *mut u32 = core::ptr::null_mut();
+    /// How many `u32` words [`SECOND_MARK_BASE`] addresses. Zero until the PSRAM is adopted.
+    #[cfg(feature = "second-segment")]
+    static mut SECOND_MARK_WORDS: usize = 0;
+    /// The SECOND SEGMENT's forwarding index, carved below its bitmap: what lets a collection find
+    /// where each survivor lands without replaying the segment from its base, once per reference.
+    /// Null until the PSRAM is adopted.
+    #[cfg(feature = "second-segment")]
+    static mut SECOND_INDEX_BASE: *mut u32 = core::ptr::null_mut();
+    /// How many `u32` words [`SECOND_INDEX_BASE`] addresses. Zero until the PSRAM is adopted.
+    #[cfg(feature = "second-segment")]
+    static mut SECOND_INDEX_WORDS: usize = 0;
+    /// The BAND's forwarding index, also carved off the PSRAM, below the second segment's: the band
+    /// keeps all of its SRAM for objects. Null while there is no PSRAM, and the band is then
+    /// collected without one, as on every other board.
+    #[cfg(feature = "second-segment")]
+    static mut FIRST_INDEX_BASE: *mut u32 = core::ptr::null_mut();
+    /// How many `u32` words [`FIRST_INDEX_BASE`] addresses. Zero until the PSRAM is adopted.
+    #[cfg(feature = "second-segment")]
+    static mut FIRST_INDEX_WORDS: usize = 0;
+
+    /// The two words above `HEAP_END` that a test harness's startup seeds with a SECOND SEGMENT's base
+    /// and end, as it seeds the first band's: RAM at a second address, for a harness that has no board
+    /// to ask. A board build with a PSRAM asks its board instead, and never reads these.
+    #[cfg(all(feature = "second-segment-seeded", not(feature = "psram-heap")))]
+    const SECOND_SEED: *mut u32 = 0x2000_0108 as *mut u32;
+
     /// The pinned payload addresses gathered for the collection in progress; `PIN_COUNT` is how many of
     /// them are live, and `PIN_OVERFLOW` records that there were more than [`MAX_PINS`].
     static mut PINS: [u32; MAX_PINS] = [0u32; MAX_PINS];
@@ -2909,6 +2982,7 @@ mod collector {
     /// would report everything past its end as unreachable. Both answer `false`, the allocation fails,
     /// and `lamella_heap_exhausted` says so loudly -- which is the honest outcome, because a collector
     /// that cannot prove an object dead must not reclaim it.
+    #[cfg(not(feature = "second-segment"))]
     fn collect_device_heap(heap: &mut lamella_gc::DeviceHeap) -> bool {
         unsafe {
             PIN_COUNT = 0;
@@ -2942,6 +3016,134 @@ mod collector {
             &pins[..pin_count],
             marks,
         )
+    }
+
+    /// [`collect_device_heap`] for a heap that can have a SECOND SEGMENT, the PSRAM: the same pins and
+    /// the same root walk, and one collection over both segments, each with its own bitmap.
+    ///
+    /// `second` is `None` when the board's startup did not bring the PSRAM up, and then this collects
+    /// the band alone. Either way it refuses as the one-segment hook refuses: an overflowed pin list,
+    /// or a bitmap short of its segment, answers `false` having moved nothing.
+    #[cfg(feature = "second-segment")]
+    fn collect_device_heap(heap: &mut lamella_gc::DeviceHeap, second: Option<&mut lamella_gc::DeviceHeap>) -> bool {
+        unsafe {
+            PIN_COUNT = 0;
+            PIN_OVERFLOW = false;
+        }
+        lamella_gc_walk_roots_impl(Some(gather_pin));
+        if unsafe { PIN_OVERFLOW } {
+            return false;
+        }
+        let (pins, marks) = unsafe {
+            (
+                &*core::ptr::addr_of!(PINS),
+                core::slice::from_raw_parts_mut(MARK_BASE, MARK_WORDS),
+            )
+        };
+        if marks.is_empty() {
+            return false;
+        }
+        let (second_marks, first_index, second_index) = unsafe {
+            (
+                carved(SECOND_MARK_BASE, SECOND_MARK_WORDS),
+                carved(FIRST_INDEX_BASE, FIRST_INDEX_WORDS),
+                carved(SECOND_INDEX_BASE, SECOND_INDEX_WORDS),
+            )
+        };
+        let pin_count = unsafe { PIN_COUNT };
+        heap.collect_no_alloc_spanning(
+            second,
+            |visit: &mut dyn FnMut(&mut lamella_gc::Ref, lamella_gc::RootKind)| {
+                let mut parked: RootVisitor<'_> = visit;
+                unsafe {
+                    ACTIVE_VISITOR = core::ptr::addr_of_mut!(parked) as *mut core::ffi::c_void;
+                }
+                lamella_gc_walk_roots_impl(Some(report_root));
+                unsafe {
+                    ACTIVE_VISITOR = core::ptr::null_mut();
+                }
+            },
+            &pins[..pin_count],
+            lamella_gc::SegmentScratch { marks, index: first_index },
+            lamella_gc::SegmentScratch { marks: second_marks, index: second_index },
+        )
+    }
+
+    /// The `words` words at `base` that [`adopt_second_segment`] carved, or the empty slice for none.
+    ///
+    /// # Safety
+    /// Inside the allocator's critical section, with `base` and `words` as `adopt_second_segment` set
+    /// them: a band of the window nothing else addresses, or zero words.
+    #[cfg(feature = "second-segment")]
+    unsafe fn carved(base: *mut u32, words: usize) -> &'static mut [u32] {
+        if words == 0 {
+            return &mut [];
+        }
+        unsafe { core::slice::from_raw_parts_mut(base, words) }
+    }
+
+    /// Hands the heap its SECOND SEGMENT, beside the band [`ensure_device_heap`] has just adopted:
+    /// the PSRAM the board's startup brought up, or the window a test harness seeded. Carved off the
+    /// top of the window, as the band's bitmap is carved off the band: the segment's mark bitmap, its
+    /// forwarding index, and the band's forwarding index, sized for `band_len` bytes of band.
+    ///
+    /// **No exclusive or atomic access may ever touch a word of this segment or its bitmap.** The
+    /// RP2350 supports exclusive accesses only in SRAM: to any other memory a store-exclusive still
+    /// WRITES and reports failure (datasheet 2.1.6), so a load/store-exclusive loop on a PSRAM word
+    /// corrupts it and never finishes. The collector marks with plain loads and stores, and nothing
+    /// in this archive makes an atomic read-modify-write on a heap word.
+    ///
+    /// A board whose startup did not bring the PSRAM up has no window, nor does a harness that seeded
+    /// none, and the heap then stays the band alone. Adopting zeroes the window, as adopting the band
+    /// zeroes the band.
+    ///
+    /// # Safety
+    /// Called once, from [`ensure_device_heap`], inside the allocator's critical section. The window
+    /// must be one nothing else in the image uses: the PSRAM the board's startup brought up, or RAM
+    /// the harness set aside.
+    #[cfg(feature = "second-segment")]
+    unsafe fn adopt_second_segment(band_len: usize) {
+        let Some((base, size)) = second_segment_window() else {
+            return;
+        };
+        let mark_bytes = lamella_gc::mark_words_for(size) * 4;
+        let second_index_bytes = lamella_gc::forwarding_index_words_for(size) * 4;
+        let first_index_bytes = lamella_gc::forwarding_index_words_for(band_len) * 4;
+        let heap_len = size.saturating_sub(mark_bytes + second_index_bytes + first_index_bytes) & !3;
+        if heap_len <= super::HEAP_MIN_BYTES {
+            return;
+        }
+        let first_index = base + heap_len;
+        let second_index = first_index + first_index_bytes;
+        let marks = second_index + second_index_bytes;
+        unsafe {
+            FIRST_INDEX_BASE = first_index as *mut u32;
+            FIRST_INDEX_WORDS = first_index_bytes / 4;
+            SECOND_INDEX_BASE = second_index as *mut u32;
+            SECOND_INDEX_WORDS = second_index_bytes / 4;
+            SECOND_MARK_BASE = marks as *mut u32;
+            SECOND_MARK_WORDS = (base + size - marks) / 4;
+            lamella_gc::lamella_gc_init_device_second_segment(base as *mut u8, heap_len);
+        }
+    }
+
+    /// Where the second segment is: the board's PSRAM window, or the one the harness seeded.
+    #[cfg(feature = "psram-heap")]
+    fn second_segment_window() -> Option<(usize, usize)> {
+        lamella_board_support::psram_window()
+    }
+
+    /// Where the second segment is: the window the harness's startup seeded above `HEAP_END`, or none
+    /// when it seeded an empty one.
+    #[cfg(all(feature = "second-segment-seeded", not(feature = "psram-heap")))]
+    fn second_segment_window() -> Option<(usize, usize)> {
+        let (base, end) = unsafe {
+            (
+                core::ptr::read_volatile(SECOND_SEED) as usize,
+                core::ptr::read_volatile(SECOND_SEED.add(1)) as usize,
+            )
+        };
+        (end > base).then_some((base, end - base))
     }
 
     /// Whether the `DeviceHeap` has adopted the image's heap band yet.
@@ -2984,6 +3186,8 @@ mod collector {
 
             lamella_gc::lamella_gc_init_device_heap(base as *mut u8, heap_len);
             lamella_gc::set_device_collect_hook(collect_device_heap);
+            #[cfg(feature = "second-segment")]
+            adopt_second_segment(heap_len);
         }
     }
 

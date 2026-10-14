@@ -909,7 +909,7 @@ pub fn check_rp2350_stamp(bytes: &[u8], aot_target: Option<&str>) -> Result<(), 
 /// answer "which of several identical things". They are not identical things: they live in
 /// different namespaces, they are discovered by different mechanisms, and a reader who typed the
 /// one the route did not want got no complaint -- the value was simply passed to something that
-/// interpreted it differently. A system bootloader over USB DFU is the third: `--device` names it,
+/// interpreted it differently. A system bootloader over USB DFU is the third: `--dfu` names it,
 /// and since it is not a probe, `LAMELLA_PROBE_SERIAL` does not name it either.
 ///
 /// # Errors
@@ -929,7 +929,7 @@ Name the drive with --volume <name>, or ask for the probe route with --via probe
                     .to_owned(),
             ),
             (None, Some(_)) => Err(
-                "--device names a system bootloader over USB DFU, and this write goes to a bootloader \
+                "--dfu names a system bootloader over USB DFU, and this write goes to a bootloader \
 DRIVE.\n\n\
 Name the drive with --volume <name>."
                     .to_owned(),
@@ -940,14 +940,14 @@ Name the drive with --volume <name>."
             (Some(_), _) => Err(
                 "--probe names a debug probe, and this write goes to the part's system bootloader \
 over USB DFU.\n\n\
-Name the bootloader with --device <serial> when several are attached, or ask for the probe route \
+Name the bootloader with --dfu <serial> when several are attached, or ask for the probe route \
 with --via probe."
                     .to_owned(),
             ),
             (None, Some(_)) => Err(
                 "--volume names a bootloader drive, and this write goes to the part's system bootloader \
 over USB DFU, which presents none.\n\n\
-Name the bootloader with --device <serial> when several are attached, or ask for the probe route \
+Name the bootloader with --dfu <serial> when several are attached, or ask for the probe route \
 with --via probe."
                     .to_owned(),
             ),
@@ -960,7 +960,7 @@ Name the probe with --probe <serial>, or ask for the drive with --via volume."
                     .to_owned(),
             ),
             (None, Some(_)) => Err(
-                "--device names a system bootloader over USB DFU, and this write goes over a PROBE.\n\n\
+                "--dfu names a system bootloader over USB DFU, and this write goes over a PROBE.\n\n\
 Name the probe with --probe <serial>."
                     .to_owned(),
             ),
@@ -2477,7 +2477,7 @@ mod tests {
     }
 
     /// A system bootloader over DFU is neither a probe nor a drive, so neither of their options can
-    /// name one, and each refusal names the option that can; `--device` names it, and names nothing
+    /// name one, and each refusal names the option that can; `--dfu` names it, and names nothing
     /// on any other route.
     #[test]
     fn a_dfu_bootloader_is_named_by_its_own_option_and_by_no_other() {
@@ -2485,10 +2485,10 @@ mod tests {
 
         let error =
             selector_for(dfu, Some("SERIAL00"), None, None).expect_err("a bootloader is not a probe");
-        assert!(error.contains("--device <serial>"), "and it names the option that IS right: {error}");
+        assert!(error.contains("--dfu <serial>"), "and it names the option that IS right: {error}");
 
         let error = selector_for(dfu, None, Some("D:"), None).expect_err("a bootloader is not a drive");
-        assert!(error.contains("--device <serial>"), "and it names the option that IS right: {error}");
+        assert!(error.contains("--dfu <serial>"), "and it names the option that IS right: {error}");
         assert!(!error.contains("--probe"), "a probe's option names no bootloader: {error}");
 
         assert_eq!(

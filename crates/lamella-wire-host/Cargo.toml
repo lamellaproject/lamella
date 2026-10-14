@@ -30,9 +30,15 @@ lamella-usbbulk = { path = "../lamella-usbbulk", optional = true }
 lamella-cil-runtime = { path = "../lamella-cil-runtime" }
 lamella-assemble = { path = "../lamella-assemble", optional = true }
 lamella-metadata = { path = "../lamella-metadata", optional = true }
+# Names the member a call token stands for, so a refusal names each place a baked image would stop
+# (`refusal`). Already in the tree via lamella-metadata.
+lamella-token = { path = "../lamella-token", optional = true }
 # The `baked` link's host-side bake step (load the submission's PE, write the flash image).
 # Already in the tree via lamella-runner; declared so the link can name its API.
 lamella-load = { path = "../lamella-load", optional = true, default-features = false }
+# The board catalog, behind `boards`: a build for a board takes that board's bus table and its chip
+# family's builds, and a route to running firmware builds for the board whose product model answered.
+lamella-catalog = { path = "../lamella-catalog", optional = true }
 # The debug seam (the DebugBackend trait, a dependency-free leaf): WireHostBackend
 # implements it over the wire's debug channel, so lamella-dap drives a DEVICE unchanged.
 lamella-debug-backend = { path = "../lamella-debug-backend", optional = true }
@@ -63,11 +69,27 @@ carrier = []
 # present). A wasm build leaves this off (the browser compiles in-process via lamella-wasm), keeping
 # the carrier-neutral core.
 repl-host = ["dep:lamella-assemble", "dep:lamella-metadata"]
+# For TESTS ONLY: `LcscCompiler::discover` also looks at this source tree's test corlib
+# (`crates/lamella-load/tests/fixtures/corlib.dll`), before the places a user's build looks. A crate
+# that tests through the search turns this on in its `[dev-dependencies]`, so its tests bind that
+# corlib wherever they run, and nothing built for use ever looks there: a tool that fell back to
+# it would run a program against a test input instead of the class library, and say nothing.
+fixture-corlib = []
+# For TESTS ONLY: `loopback`, a board's deploy serve in the test's own process over a flash region in
+# memory, for the tests of a host that sends a program to firmware. A crate turns it on in its
+# `[dev-dependencies]`. It exists only where `baked` is on as well, and implies nothing, so a test
+# build without the bake is not given it.
+loopback-board = []
 # The baked-image link for PE-less targets (Capabilities::BAKED_IMAGE): each submission's
 # compiled PE is loaded + baked host-side and the IMAGE crosses the wire (BakedSerialLink,
 # eval_image_blocking). Forwards the runner's baked-image knob (which pins loads to
 # Assembly<'static>; the link leaks one buffer per evaluation, the accepted host pattern).
-baked = ["lamella-runner/baked-image", "dep:lamella-load", "dep:lamella-metadata"]
+baked = ["lamella-runner/baked-image", "dep:lamella-load", "dep:lamella-metadata", "dep:lamella-token", "boards"]
+# A build for a board (`boards`): the reference set it compiles against, with the board's chip-family
+# builds in place of the shared ones, the bus table its image carries, and the board a HELLO answers
+# as. The `lamella` command builds for a board without baking (its linked tier), so this stands apart
+# from `baked`, which takes it.
+boards = ["repl-host", "dep:lamella-catalog"]
 # WireHostBackend: the lamella-debug-backend seam over the wire's debug channel (serial
 # carrier). A code location crosses the seam as an opaque address packing the wire's
 # (method_id, offset) pair.
@@ -81,3 +103,5 @@ workspace = true
 
 [dev-dependencies]
 lamella-flash-format = { path = "../lamella-flash-format" }
+# A test compiles a library named as the corlib is, which takes the lexer's library target.
+lamella-syntax = { path = "../lamella-syntax" }

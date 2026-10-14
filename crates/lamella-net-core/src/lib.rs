@@ -146,9 +146,9 @@ pub trait NetBackend: core::fmt::Debug {
     }
 
     /// A LIVE snapshot of interface `index` (`0..interface_count`), or `None` if out of range. Read
-    /// fresh on each managed property get, so `OperationalStatus` / `IPv4Address` reflect the CURRENT
-    /// link -- a cable pulled between two reads shows `Down`, a DHCP lease that just bound shows the
-    /// new address.
+    /// fresh on each managed read, so `OperationalStatus` and the addresses `GetIPProperties()` reports
+    /// reflect the CURRENT link -- a cable pulled between two reads shows `Down`, a DHCP lease that just
+    /// bound shows the new address.
     fn interface_info(&mut self, index: u32) -> Option<InterfaceInfo> {
         let _ = index;
         None

@@ -436,6 +436,15 @@ impl WireHostBackend {
         })
     }
 
+    /// This backend launching `image` in place of the one it was opened with: for a host that builds
+    /// the image for the board that answered this backend's HELLO ([`Self::identity`]), and so opens
+    /// it before there is an image to give.
+    #[must_use]
+    pub fn with_image(mut self, image: Vec<u8>) -> Self {
+        self.image = image;
+        self
+    }
+
     /// Attach a pre-built source map (`lamella_srcmap` JSON, e.g. `<image>.srcmap.json`) so the session is
     /// source-level. `None` or unparseable JSON leaves it IL-level.
     #[must_use]

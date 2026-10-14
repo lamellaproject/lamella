@@ -73,6 +73,21 @@ pub struct Project {
     pub references: Vec<PathBuf>,
     /// The source files to compile, in a stable order.
     pub sources: Vec<PathBuf>,
+    /// The board the project builds for, where `<LamellaTargetBoard>` names one.
+    pub board: Option<NamedBoard>,
+}
+
+/// The board a project names with `<LamellaTargetBoard>`.
+///
+/// **THE PROPERTY IS THE PROJECT's SPELLING OF `--board`**, and Lamella RHU reads the same one: a
+/// project that names its board builds for it with no option on the command line, on either
+/// product. The vendor prefix keeps it clear of any property a Microsoft SDK defines.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NamedBoard {
+    /// The board's id, as `lamella boards` lists it.
+    pub id: String,
+    /// The 1-based line of the property, for a message that sends the reader to it.
+    pub line: u32,
 }
 
 /// One element of a project file, as scanned.
@@ -353,7 +368,7 @@ impl Project {
     /// A file that cannot be read, is not well formed, or asks for something this reader does not
     /// recognize -- each naming what it found.
     pub fn read_file(path: &Path, verb: &str) -> Result<Self, String> {
-        let text = std::fs::read_to_string(path).map_err(|error| {
+        let text = crate::text::read_text(path).map_err(|error| {
             format!("lamella {verb}: read the project {}: {error}", path.display())
         })?;
         let document = read(&text)
@@ -401,6 +416,7 @@ impl Project {
         let mut assembly_name = None;
         let mut lang_version = None;
         let mut allow_unsafe = false;
+        let mut board = None;
         let mut references: Vec<(String, Option<String>, u32)> = Vec::new();
         let mut included = Vec::new();
         let mut removed = Vec::new();
@@ -417,6 +433,10 @@ impl Project {
                         "assemblyname" => assembly_name = Some(value),
                         "langversion" => lang_version = Some(value),
                         "allowunsafeblocks" => allow_unsafe = value.eq_ignore_ascii_case("true"),
+                        "lamellatargetboard" => {
+                            board = (!value.is_empty())
+                                .then(|| NamedBoard { id: value, line: property.line });
+                        }
                         _ => unrecognized.push(Unrecognized {
                             name: property.name.clone(),
                             within: "PropertyGroup".to_owned(),
@@ -510,7 +530,119 @@ impl Project {
             allow_unsafe,
             references,
             sources,
+            board,
         })
+    }
+}
+
+/// The board a build of `path` is for: the one `--board` names (`flag`), the one the project at
+/// `path` names with `<LamellaTargetBoard>`, or both when they name the same board. `None` when
+/// neither names one, and for a file that is not a project, `flag` alone.
+///
+/// **ONE BOARD PER BUILD.** The option and the property say the same thing, so two different
+/// answers are a contradiction, and building for either would ignore the other without saying so.
+///
+/// # Errors
+/// A project that cannot be read, one naming a board this build does not know, and the option and
+/// the property naming different boards.
+pub fn board_for_build(verb: &str, path: &Path, flag: Option<&str>) -> Result<Option<String>, String> {
+    let named = if crate::flash::is_project(path) {
+        Project::read_file(path, verb)?.board
+    } else {
+        None
+    };
+    let Some(named) = named else {
+        return Ok(flag.map(str::to_owned));
+    };
+    known_board(verb, path, &named)?;
+    match flag {
+        Some(flag) if flag != named.id => Err(format!(
+            "lamella {verb}: --board names {flag}, and {}, line {}, names {} with \
+             <LamellaTargetBoard>.\n\n\
+             A build is for one board. Drop --board to build for the project's, or change the \
+             property.\n\n\
+             Nothing was built.",
+            path.display(),
+            named.line,
+            named.id
+        )),
+        _ => Ok(Some(named.id)),
+    }
+}
+
+/// The catalog's row for the board a project names, or a refusal that sends the reader to the line
+/// that names it.
+fn known_board(
+    verb: &str,
+    path: &Path,
+    named: &NamedBoard,
+) -> Result<lamella_bsp_gen::strata::BoardTable, String> {
+    lamella_catalog::load_board(&named.id).ok_or_else(|| {
+        format!(
+            "lamella {verb}: {}, line {}: <LamellaTargetBoard> names {:?}, which is no board \
+             this build knows.\n\n\
+             `lamella boards` lists the ones it does. Nothing was built.",
+            path.display(),
+            named.line,
+            named.id
+        )
+    })
+}
+
+/// What a route to firmware already running on a board checks once the board has answered and
+/// before anything is sent: that it is the board the project names.
+#[derive(Debug, Clone)]
+pub struct BoardCheck {
+    /// The project that names the board.
+    project: PathBuf,
+    /// The board it names.
+    named: NamedBoard,
+    /// The product model that board answers a HELLO with. Zero when its facts declare none.
+    product_model: u16,
+}
+
+impl BoardCheck {
+    /// The check for sending `path` to a running board: `None` for a file that is not a project,
+    /// and for a project that names no board.
+    ///
+    /// # Errors
+    /// A project that cannot be read, and one naming a board this build does not know.
+    pub fn for_file(verb: &str, path: &Path) -> Result<Option<Self>, String> {
+        if !crate::flash::is_project(path) {
+            return Ok(None);
+        }
+        let Some(named) = Project::read_file(path, verb)?.board else {
+            return Ok(None);
+        };
+        let product_model = u16::try_from(known_board(verb, path, &named)?.product_model).unwrap_or(0);
+        Ok(Some(Self { project: path.to_path_buf(), named, product_model }))
+    }
+
+    /// Whether the board that answered as `answered` (its HELLO's product model) may take the
+    /// program, and the refusal when it is another board.
+    ///
+    /// A board that answers with no product model, or a project board whose facts declare none,
+    /// cannot be told apart from any other, so the program goes.
+    ///
+    /// # Errors
+    /// The board that answered being another board than the one the project names.
+    pub fn against(&self, verb: &str, answered: u16) -> Result<(), String> {
+        let unknown = lamella_wire::product_model::UNKNOWN;
+        if answered == unknown || self.product_model == unknown || answered == self.product_model {
+            return Ok(());
+        }
+        let answered_name = lamella_wire_host::on_device::the_board(lamella_wire_host::board_name(answered));
+        Err(format!(
+            "lamella {verb}: {}, line {}, names {} with <LamellaTargetBoard>, and the board that \
+             answered is {answered_name} (product model {answered}).\n\n\
+             A program built for one board is not sent to another. Connect {}, or change the \
+             property.\n\n\
+             Nothing was sent.",
+            self.project.display(),
+            self.named.line,
+            self.named.id,
+            self.named.id
+        ))
     }
 }
 
@@ -865,6 +997,113 @@ mod tests {
         assert_eq!(project.output_type, OutputType::Exe);
     }
 
+    /// A project file of the test's own, `App.csproj` holding `properties` in its `PropertyGroup`,
+    /// with `Program.cs` beside it.
+    fn project_with(name: &str, properties: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lamella-board-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        std::fs::write(dir.join("Program.cs"), "class Program { static void Main() { } }\n")
+            .expect("write the program");
+        std::fs::write(
+            dir.join("App.csproj"),
+            format!(
+                "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    \
+                 <TargetFramework>lamella1.0</TargetFramework>\n{properties}  </PropertyGroup>\n\
+                 </Project>\n"
+            ),
+        )
+        .expect("write the project");
+        dir.join("App.csproj")
+    }
+
+    /// **`<LamellaTargetBoard>` IS READ, WITH ITS LINE**, and an empty one names no board, as an
+    /// empty property is unset to MSBuild. The last one wins, as MSBuild's last definition does.
+    #[test]
+    fn the_target_board_property_is_read_with_its_line() {
+        let named = project_with("named", "    <LamellaTargetBoard>rpi-pico2-w</LamellaTargetBoard>\n");
+        let project = Project::read_file(&named, "build").expect("a project naming its board");
+        assert_eq!(project.board, Some(NamedBoard { id: "rpi-pico2-w".to_owned(), line: 4 }));
+
+        let empty = project_with("empty", "    <LamellaTargetBoard></LamellaTargetBoard>\n");
+        assert_eq!(Project::read_file(&empty, "build").expect("it reads").board, None);
+
+        let twice = project_with(
+            "twice",
+            "    <LamellaTargetBoard>rpi-pico2</LamellaTargetBoard>\n    \
+             <LamellaTargetBoard>rpi-pico2-w</LamellaTargetBoard>\n",
+        );
+        let board = Project::read_file(&twice, "build").expect("it reads").board;
+        assert_eq!(board.map(|board| (board.id, board.line)), Some(("rpi-pico2-w".to_owned(), 5)));
+        for path in [named, empty, twice] {
+            let _ = std::fs::remove_dir_all(path.parent().expect("its directory"));
+        }
+    }
+
+    /// **ONE BOARD PER BUILD.** The option or the property names it; both may name it; naming two
+    /// different boards is refused with both, and the line of the property.
+    #[test]
+    fn a_build_takes_its_board_from_the_option_or_the_property_and_never_two() {
+        let named = project_with("one", "    <LamellaTargetBoard>rpi-pico2-w</LamellaTargetBoard>\n");
+        let unnamed = project_with("none", "");
+        let board = |path: &Path, flag| board_for_build("build", path, flag);
+
+        assert_eq!(board(&named, None), Ok(Some("rpi-pico2-w".to_owned())), "the property alone");
+        assert_eq!(board(&named, Some("rpi-pico2-w")), Ok(Some("rpi-pico2-w".to_owned())), "both, agreeing");
+        assert_eq!(board(&unnamed, Some("rpi-pico2")), Ok(Some("rpi-pico2".to_owned())), "the option alone");
+        assert_eq!(board(&unnamed, None), Ok(None), "neither");
+        assert_eq!(board(Path::new("Program.cs"), Some("rpi-pico2")), Ok(Some("rpi-pico2".to_owned())));
+
+        let error = board(&named, Some("rpi-pico2")).expect_err("two boards");
+        assert!(error.contains("--board names rpi-pico2"), "{error}");
+        assert!(error.contains("line 4, names rpi-pico2-w"), "{error}");
+        assert!(error.contains("Nothing was built"), "{error}");
+        crate::rendered::assert_renders_cleanly(&error, crate::rendered::four_space_sample);
+        for path in [named, unnamed] {
+            let _ = std::fs::remove_dir_all(path.parent().expect("its directory"));
+        }
+    }
+
+    /// **A BOARD THIS BUILD DOES NOT KNOW IS REFUSED AT THE LINE THAT NAMES IT**, before anything
+    /// is compiled for it, by every route that reads the property.
+    #[test]
+    fn an_unknown_target_board_is_refused_at_its_line() {
+        let typo = project_with("typo", "    <LamellaTargetBoard>rpi-pico2w</LamellaTargetBoard>\n");
+        let error = board_for_build("build", &typo, None).expect_err("no such board");
+        assert!(error.contains("line 4: <LamellaTargetBoard> names \"rpi-pico2w\""), "{error}");
+        assert!(error.contains("`lamella boards`"), "{error}");
+        let error = BoardCheck::for_file("deploy", &typo).expect_err("no such board, on a --device route");
+        assert!(error.starts_with("lamella deploy:"), "{error}");
+        let _ = std::fs::remove_dir_all(typo.parent().expect("its directory"));
+    }
+
+    /// **A PROGRAM BUILT FOR ONE BOARD IS NOT SENT TO ANOTHER.** A `--device` route checks the
+    /// board's HELLO against the project's board, and a board that answers with no product model
+    /// cannot be told apart from any other, so it passes.
+    #[test]
+    fn a_device_route_refuses_a_board_the_project_does_not_name() {
+        let named = project_with("device", "    <LamellaTargetBoard>rpi-pico2-w</LamellaTargetBoard>\n");
+        let check = BoardCheck::for_file("run", &named)
+            .expect("the project reads")
+            .expect("it names a board");
+        assert_eq!(check.against("run", lamella_wire::product_model::PICO2_W), Ok(()));
+        assert_eq!(check.against("run", lamella_wire::product_model::UNKNOWN), Ok(()));
+        let error = check
+            .against("run", lamella_wire::product_model::PICO2)
+            .expect_err("a Pico 2 is not a Pico 2 W");
+        assert!(error.contains("names rpi-pico2-w with <LamellaTargetBoard>"), "{error}");
+        assert!(error.contains("the Raspberry Pi Pico 2 (product model 2)"), "{error}");
+        assert!(error.contains("Nothing was sent"), "{error}");
+        crate::rendered::assert_renders_cleanly(&error, crate::rendered::four_space_sample);
+
+        let unnamed = project_with("device-none", "");
+        assert!(BoardCheck::for_file("run", &unnamed).expect("it reads").is_none());
+        assert!(BoardCheck::for_file("run", Path::new("Program.cs")).expect("a source file").is_none());
+        for path in [named, unnamed] {
+            let _ = std::fs::remove_dir_all(path.parent().expect("its directory"));
+        }
+    }
+
     /// **A MONIKER THAT IS NOT OURS IS REFUSED BY NAME**, with both spellings that would work.
     #[test]
     fn another_moniker_is_refused_and_shows_both_spellings() {
@@ -954,5 +1193,54 @@ mod tests {
         assert!(error.contains("ItemGroup"), "{error}");
         assert!(error.contains("PropertyGroup"), "{error}");
         assert!(error.contains("line 2"), "and where it opened: {error}");
+    }
+
+    /// A directory of the test's own, holding `Program.cs`, for a project file to be written into.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("lamella-project-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        std::fs::write(dir.join("Program.cs"), "class Program { static void Main() { } }\n")
+            .expect("write the program");
+        dir
+    }
+
+    /// **A BYTE-ORDER MARK NAMES THE ENCODING, AS IT DOES FOR MSBuild, AND IS NOT PART OF THE
+    /// PROJECT.** Windows PowerShell 5.1's `Set-Content -Encoding utf8` writes UTF-8 with a mark, and
+    /// its `Out-File` writes UTF-16 with one. The UTF-8 mark was refused as "line 1: expected an
+    /// element", and UTF-16 before the scan began; MSBuild reads all three.
+    #[test]
+    fn a_project_saved_with_a_byte_order_mark_reads_as_the_same_project() {
+        let dir = scratch("marked");
+        let text = "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup>\
+                    <TargetFramework>lamella1.0</TargetFramework>\
+                    <AssemblyName>Marked</AssemblyName></PropertyGroup></Project>";
+        for (what, bytes) in crate::text::as_windows_tools_save(text) {
+            let path = dir.join("App.csproj");
+            std::fs::write(&path, bytes).expect("write the project");
+            let project = Project::read_file(&path, "build")
+                .unwrap_or_else(|error| panic!("{what}: {error}"));
+            assert_eq!(project.assembly_name, "Marked", "{what}");
+            assert_eq!(project.sources, [dir.join("Program.cs")], "{what}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A PROJECT WITH NO MARK IS UTF-8, OR IT IS REFUSED, AS MSBuild REFUSES IT**, and the
+    /// refusal says what to do rather than quoting the decoder.
+    #[test]
+    fn a_project_that_is_not_utf8_and_has_no_mark_is_refused_by_what_to_do() {
+        let dir = scratch("unmarked");
+        let path = dir.join("App.csproj");
+        std::fs::write(
+            &path,
+            b"<Project Sdk=\"Microsoft.NET.Sdk\"><!-- \x93quoted\x94 --><PropertyGroup>\
+              <TargetFramework>lamella1.0</TargetFramework></PropertyGroup></Project>",
+        )
+        .expect("write the project");
+        let error = Project::read_file(&path, "build").expect_err("not UTF-8, and no mark");
+        assert!(error.starts_with("lamella build: read the project"), "{error}");
+        assert!(error.contains("Save it as UTF-8"), "says what to do: {error}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

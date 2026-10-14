@@ -3,6 +3,8 @@ namespace System
 {
     public abstract class Array : ICloneable, System.Collections.IEnumerable
     {
+        internal Array() { }
+
         public int Length { [Lamella.Runtime.RuntimeProvided] get { return 0; } }
         public int Rank { [Lamella.Runtime.RuntimeProvided] get { return 0; } }
         [Lamella.Runtime.RuntimeProvided] public int GetLength(int dimension) { return 0; }

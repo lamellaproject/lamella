@@ -23,6 +23,9 @@ lamella-gc = { path = "../../../crates/lamella-gc", default-features = false, fe
 # A path dependency rather than a copy, for the reason stated just above: a device that rounded
 # differently from the tier a program was previewed on would disagree one last digit at a time.
 lamella-softmath = { path = "../../../crates/lamella-softmath" }
+# The bus table's one reading -- the SAME crate the interpreter, the bake and the AOT link use, so a
+# linked image answers `Lamella.Hardware.BoardBuses` exactly as the interpreter does from a baked one.
+lamella-board-buses = { path = "../../../crates/lamella-board-buses" }
 # The networking + TLS C-ABI layer (feature `net`): the same NetBackend/TlsBackend stacks
 # the interpreter binds, exported as lamella_net_* / lamella_tls_* archive members. Pulled
 # in HERE as a dependency (never as a second staticlib) so the image keeps exactly one
@@ -74,8 +77,19 @@ clock-board = []
 # archive, built in its own directory, never the default path the gates build into.
 board-rpi-pico2 = ["console-board", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-rpi-pico2"]
 board-rpi-pico2-w = ["console-board", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-rpi-pico2-w"]
-board-pimoroni-pico-plus-2 = ["console-board", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-pimoroni-pico-plus-2"]
-board-pimoroni-pico-plus-2-w = ["console-board", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-pimoroni-pico-plus-2-w"]
+board-pimoroni-pico-plus-2 = ["console-board", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-pimoroni-pico-plus-2", "psram-heap"]
+board-pimoroni-pico-plus-2-w = ["console-board", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-pimoroni-pico-plus-2-w", "psram-heap"]
+# The managed heap takes the PSRAM the board's startup brought up as its SECOND SEGMENT: objects go
+# to the SRAM band first and spill into the PSRAM once it is full, and one collection covers both.
+# Selected by the board features of a board that fits a PSRAM, never on its own: the window comes
+# from that board's half, so without a board it has nothing to read.
+psram-heap = ["dep:lamella-board-support", "second-segment"]
+# The same SECOND SEGMENT, with its window SEEDED by the image's startup in the two words above
+# `HEAP_END`, as the first band is seeded: for a test harness that has RAM at a second address and no
+# board, such as QEMU's mps2-an505. No board build selects it; `psram-heap` wins if both are set.
+second-segment-seeded = ["second-segment"]
+# What the two above share: the heap can have a second segment. Not selected on its own.
+second-segment = ["lamella-gc/second-segment"]
 net = ["dep:lamella-runtime-support-net"]
 # The image SPEAKS Lamella Link: carrier frame loop + codec. This is the knob that costs flash, and
 # it is a prerequisite for both of the others below. It supplies no board carrier of its own -- the

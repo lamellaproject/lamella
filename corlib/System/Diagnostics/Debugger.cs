@@ -1,11 +1,17 @@
 // Lamella managed corlib (from scratch). -- System.Diagnostics.Debugger
 namespace System.Diagnostics
 {
+#if LAMELLA_SURFACE_NETCORE_2_0
+    public static class Debugger
+#else
     public sealed class Debugger
+#endif
     {
+#if !LAMELLA_SURFACE_NETCORE_2_0
         private Debugger() { }
+#endif
 
-        public const string DefaultCategory = "";
+        public static readonly string DefaultCategory;
 
         public static void Break() { }
 

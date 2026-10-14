@@ -21,6 +21,9 @@ lamella-decimal = { path = "../../../crates/lamella-decimal" }
 # A path dependency rather than a copy, for the reason stated just above: a device that rounded
 # differently from the tier a program was previewed on would disagree one last digit at a time.
 lamella-softmath = { path = "../../../crates/lamella-softmath" }
+# The bus table's one reading -- the SAME crate the interpreter, the bake and the AOT link use, so a
+# linked image answers `Lamella.Hardware.BoardBuses` exactly as the interpreter does from a baked one.
+lamella-board-buses = { path = "../../../crates/lamella-board-buses" }
 
 [lib]
 crate-type = ["staticlib"]

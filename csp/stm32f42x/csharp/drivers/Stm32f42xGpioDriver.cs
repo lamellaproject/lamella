@@ -31,8 +31,6 @@ public sealed class Stm32f42xGpioDriver : GpioDriver
 
     protected override int PinCount { get { return PortCount * PinsPerPort; } }
 
-    protected override int ConvertPinNumberToLogicalNumberingScheme(int pinNumber) { return pinNumber; }
-
     protected override void OpenPin(int pinNumber) { }
 
     protected override void ClosePin(int pinNumber)

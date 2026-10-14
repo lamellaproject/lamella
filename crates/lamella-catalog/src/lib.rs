@@ -7,7 +7,7 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/catalog.rs"));
 }
 
-pub use generated::{BOARD_PYTHON, BOARDS, MODULES, PARTS};
+pub use generated::{BOARD_PYTHON, BOARDS, BUS_TABLES, MODULES, PARTS};
 
 /// The board with `id`, parsed from the embedded catalog.
 #[must_use]
@@ -27,20 +27,39 @@ pub fn load_board(id: &str) -> Option<BoardTable> {
 /// than saying it could not follow the chain.
 #[must_use]
 pub fn load_part(board: &BoardTable) -> Option<PartRow> {
-    let (family, part) = if board.module.is_empty() {
-        (board.family.clone(), board.part.clone())
-    } else {
-        let (_, text) = MODULES.iter().find(|(id, _)| *id == board.module)?;
-        let Ok(Strata::Module(module)) = parse(text) else {
-            return None;
-        };
-        (module.family.clone(), module.part.clone())
-    };
+    let (family, part) = chip_of(board)?;
     let (_, text) = PARTS.iter().find(|(id, _)| *id == family)?;
     let Ok(Strata::Parts(parts)) = parse(text) else {
         return None;
     };
     parts.rows.into_iter().find(|row| row.part == part)
+}
+
+/// The chip family `board` is built around: its own `family`, or the family of the module it
+/// carries. `None` when the board names a module this build does not have.
+#[must_use]
+pub fn family_of(board: &BoardTable) -> Option<String> {
+    chip_of(board).map(|(family, _)| family)
+}
+
+/// The bus table an image built for board `id` carries, or `None` when the board's family has no
+/// table: the words the host writes into the baked image, and links beside an AOT image.
+#[must_use]
+pub fn bus_table(id: &str) -> Option<&'static [u32]> {
+    BUS_TABLES.iter().find(|(board, _)| *board == id).map(|(_, table)| *table)
+}
+
+/// The board's chip as `(family, part)`, following a module-carrying board through its module:
+/// the one place that hop is made.
+fn chip_of(board: &BoardTable) -> Option<(String, String)> {
+    if board.module.is_empty() {
+        return Some((board.family.clone(), board.part.clone()));
+    }
+    let (_, text) = MODULES.iter().find(|(id, _)| *id == board.module)?;
+    let Ok(Strata::Module(module)) = parse(text) else {
+        return None;
+    };
+    Some((module.family, module.part))
 }
 
 /// A board and its part row together, or a message saying which hop failed.
@@ -203,6 +222,42 @@ mod tests {
         assert!(!board.module.is_empty());
         let part = load_part(&board).expect("a module board must still resolve to a part");
         assert!(part.flash > 0 && part.ram > 0, "with real budgets: {part:?}");
+    }
+
+    /// Every embedded bus table is the one bsp-gen derives from the board's facts today, and only a
+    /// board whose family has a table carries one. A generated file left stale, or a catalog built
+    /// before it was regenerated, fails here by board.
+    #[test]
+    fn every_bus_table_is_the_one_bsp_gen_derives() {
+        use lamella_bsp_gen::strata::{BUS_TABLE_FAMILIES, bus_table as derive, load_family, resolve_board};
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("..");
+        let mut sets = std::collections::BTreeMap::new();
+        let mut tables = 0;
+        for (id, _) in BOARDS {
+            let board = load_board(id).unwrap_or_else(|| panic!("{id}: board.toml parses"));
+            let family = family_of(&board).unwrap_or_else(|| panic!("{id}: its family resolves"));
+            if !BUS_TABLE_FAMILIES.contains(&family.as_str()) {
+                assert_eq!(bus_table(id), None, "{id}: a {family} board carries a bus table");
+                continue;
+            }
+            let set = sets
+                .entry(family.clone())
+                .or_insert_with(|| load_family(&repo, &family).unwrap_or_else(|e| panic!("{family}: {e}")));
+            let resolved = resolve_board(set, board).unwrap_or_else(|e| panic!("{id}: {e}"));
+            let derived = derive(set, &resolved).unwrap_or_else(|e| panic!("{id}: {e}"));
+            assert_eq!(bus_table(id), Some(derived.as_slice()), "{id}: the embedded table is stale; regenerate");
+            tables += 1;
+        }
+        assert_eq!(tables, BUS_TABLES.len(), "every embedded table belongs to a board of a table family");
+        assert!(tables >= 4, "the four RP2350 boards carry tables");
+    }
+
+    /// A module-carrying board's family is its module's, as its part is.
+    #[test]
+    fn a_module_carrying_boards_family_is_its_modules() {
+        let board = load_board("arduino-mkr1000").expect("the mkr1000 board file");
+        assert_eq!(family_of(&board).as_deref(), Some("samd21"));
+        assert_eq!(family_of(&load_board("rpi-pico2").expect("pico2")).as_deref(), Some("rp2350"));
     }
 
     /// The two ways a board id fails must not read alike.

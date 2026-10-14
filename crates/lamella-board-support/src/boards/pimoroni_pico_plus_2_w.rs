@@ -1,5 +1,6 @@
-//! The Pimoroni Pico Plus 2 W: an RP2350B with a 12 MHz crystal and a radio module. Its console is
-//! UART0, transmitting on GP0, which a debug probe or any USB serial adapter bridges to a host.
+//! The Pimoroni Pico Plus 2 W: an RP2350B with a 12 MHz crystal, a radio module and 8 MB of QSPI
+//! PSRAM. Its console is UART0, transmitting on GP0, which a debug probe or any USB serial adapter
+//! bridges to a host.
 
 use crate::rp2350;
 
@@ -8,7 +9,8 @@ use crate::rp2350;
 mod bindings;
 
 /// The board as its generated bindings state it: the console on the `uart0` carrier at 115200 baud
-/// under the default plan, and that plan.
+/// under the default plan, that plan, and the PSRAM on the QSPI memory interface's second chip
+/// select.
 pub const BOARD: rp2350::Board = rp2350::Board {
     console: rp2350::Console {
         uart_base: bindings::UART0_BASE,
@@ -27,5 +29,11 @@ pub const BOARD: rp2350::Board = rp2350::Board {
         pll_usb_fbdiv: bindings::PLL_USB_FBDIV_PLL_150_48,
         pll_usb_prim: bindings::PLL_USB_PRIM_PLL_150_48,
     },
+    psram: Some(rp2350::Psram::from_facts(
+        bindings::PSRAM_CS_PIN,
+        bindings::MEMORY_PSRAM_PART,
+        bindings::MEMORY_PSRAM_BASE,
+        bindings::MEMORY_PSRAM_SIZE,
+    )),
 }
 .checked();

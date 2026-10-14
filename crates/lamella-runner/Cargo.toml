@@ -41,7 +41,7 @@ debug-names = ["lamella-load/debug-names"]
 profile-full = [
     "lamella-load/NETMFv4_4", "lamella-load/exceptions", "float", "lamella-load/gc",
     "lamella-load/finalizers", "lamella-load/math-transcendental", "typed-references",
-    "lamella-load/varargs", "generics",
+    "lamella-load/varargs", "generics", "board-buses",
 ]
 # cfg-testable passthroughs for the Value variants the debug `<val>` encoder names: the encoder
 # compiles on every profile and emits the float/typedref tags only where the tier carries them.
@@ -54,6 +54,10 @@ typed-references = ["lamella-load/typed-references"]
 # loader refuses a generic program instead of mis-running one, so leaving it off costs a program
 # that will not run, never a wrong answer.
 generics = ["lamella-load/generics"]
+# The board's bus table, served to System.Device's factories. A CAPABILITY AXIS like `generics`: both
+# profiles that carry the NETMF surface name it, and the kernel floor does not, so a floor-tier part
+# refuses an image that calls it, at boot and by name.
+board-buses = ["lamella-load/board-buses"]
 # profile-full's surface WITHOUT floating point: the full NETMF type/exception/collection surface,
 # no `float` and no transcendentals. It exists because a part can be roomy enough for the surface and
 # not for the float BCL on top of it -- float costs roughly 62 KiB of flash, which can be the
@@ -62,7 +66,7 @@ generics = ["lamella-load/generics"]
 # from `float` / `math-transcendental`.
 profile-no-float = [
     "lamella-load/NETMFv4_4", "lamella-load/exceptions", "lamella-load/gc",
-    "lamella-load/finalizers", "typed-references", "lamella-load/varargs", "generics",
+    "lamella-load/finalizers", "typed-references", "lamella-load/varargs", "generics", "board-buses",
 ]
 profile-minimal = ["lamella-load/bcl", "lamella-load/exceptions", "lamella-load/gc"]
 # RUN_IMAGE support: boot + run a baked flash image (Module::from_baked) as the runner's execution
@@ -94,6 +98,9 @@ repl-session = ["debug-names"]
 # adds the observable value displays + the reference-survival case.
 [dev-dependencies]
 lamella-assemble = { path = "../lamella-assemble" }
+# The board facts' own parser, so the deploy-window test reads a board's flash exactly as the RP2350
+# firmware's build script does.
+lamella-bsp-gen = { path = "../lamella-bsp-gen" }
 # The FAT backend (with mkfs) so the baked-deploy e2e test can mount a real RAM FatFs at /sd through
 # the StorageProvider seam -- the host twin of sam4s's device SD boot-mount.
 lamella-fs-fat = { path = "../lamella-fs-fat", features = ["format"] }

@@ -16,6 +16,12 @@ Third-party components:
   Copyright The Mbed TLS Contributors, under your choice of the Apache License,
   Version 2.0 or the GNU General Public License v2.0 or later. See that directory's
   LICENSE.
+- The Python implementation (the crates/lamella-py-* crates) -- the parts that
+  compatibility with CPython dictates: the public names and shapes of the Python
+  standard library functions and classes that it implements, and the exception
+  messages it reproduces (from CPython, the reference implementation of Python),
+  Copyright (c) 2001 Python Software Foundation, under the Python Software Foundation
+  License. See crates/lamella-py-runtime/pystdlib/LICENSE-CPYTHON.
 - The managed class libraries (corlib/ and libs/) -- the parts that compatibility
   with .NET dictates: the public type and member names and shapes of the .NET class
   libraries and of dotnet/iot that they implement, and the default exception messages

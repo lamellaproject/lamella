@@ -10,7 +10,7 @@ namespace System.IO
             set { _coreNewLine = (object)value == null ? "\n" : value; }
         }
 
-        public abstract void Write(char value);
+        public virtual void Write(char value) { }
 
         public virtual void Write(string value)
         {

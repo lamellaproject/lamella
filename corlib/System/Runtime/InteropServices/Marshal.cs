@@ -1,9 +1,15 @@
 // Lamella managed corlib (from scratch). -- System.Runtime.InteropServices.Marshal
 namespace System.Runtime.InteropServices
 {
+#if LAMELLA_SURFACE_NETFX_2_0
+    public static class Marshal
+#else
     public sealed class Marshal
+#endif
     {
+#if !LAMELLA_SURFACE_NETFX_2_0
         private Marshal() { }
+#endif
 
         public static System.IntPtr AllocHGlobal(int cb) { return System.IntPtr.FromRawValue(__AllocHGlobal(cb)); }
         public static System.IntPtr AllocHGlobal(System.IntPtr cb) { return System.IntPtr.FromRawValue(__AllocHGlobal(System.IntPtr.ToRawValue(cb))); }

@@ -1,6 +1,5 @@
 // Lamella.Boards.RaspberryPi.Pico2 -- the Raspberry Pi Pico 2 (RP2350A) board-support package.
 using System;
-using System.Device.Adc;
 using System.Device.Analog;
 using System.Device.Gpio;
 using System.Device.I2c;
@@ -26,8 +25,8 @@ namespace Lamella.Boards.RaspberryPi
 
         /// <summary>Binds this board's buses to the driver table, so a program writes plain
         /// dotnet/iot -- `SpiDevice.Create(settings)`, `new GpioController()` -- and never names
-        /// a Lamella type. Touching `Pico2` at all is what arms it, which is why the samples
-        /// construct the board first.</summary>
+        /// a Lamella type. Touching `Pico2` at all is what arms it, and constructing
+        /// <see cref="TargetBoard"/> touches it.</summary>
         /// <remarks>A TYPE INITIALIZER rather than the instance constructor, deliberately: the
         /// table refuses a second bind of the same id rather than replacing it, and this class is
         /// instantiable and routinely constructed as a temporary. The language runs a type
@@ -221,18 +220,11 @@ namespace Lamella.Boards.RaspberryPi
                 new uint[4]);
         }
 
-        /// <summary>An ADC controller over the RP2350 SAR converter (the on-chip temperature
-        /// sensor is on <see cref="TemperatureSensorChannel"/>).</summary>
-        public AdcController CreateAdcController()
-        {
-            return new AdcController();
-        }
-
         /// <summary>The on-chip converter as dotnet/iot's analog controller. Each pin is a converter
         /// channel: <see cref="AdcChannelGp26"/> to <see cref="AdcChannelGp29"/> and
         /// <see cref="TemperatureSensorChannel"/> name them.</summary>
         /// <remarks>Creating it touches no hardware; the first pin opened brings the converter up.
-        /// It reads through the same driver as <see cref="CreateAdcController"/>.</remarks>
+        /// It reads through the converter driver the board binds.</remarks>
         /// <param name="chip">Must be 0: the board has one converter.</param>
         /// <exception cref="ArgumentOutOfRangeException"><paramref name="chip"/> is not 0.</exception>
         public AnalogController CreateAnalogController(int chip)

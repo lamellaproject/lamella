@@ -701,43 +701,50 @@ class LifoQueue(Queue):
         return self._items.pop()
 
 
-# The binary heap `PriorityQueue` orders by: `heapq`'s own two operations and its own sift
-# algorithm, kept here rather than imported.
+# The binary heap `PriorityQueue` orders by: two sift operations, kept here rather than imported
+# from `heapq`.
 #
 # Importing a module builds every function in it as a heap object, and a priority queue needs two of
-# the sixteen `heapq` defines -- so the two are here and the import is not.
+# the functions `heapq` defines -- so the two are here and the import is not.
 #
-# This is `heapq`'s algorithm rather than a rewrite of it, and the distinction matters: a heap's
-# order among EQUAL entries is a property of the sift and of nothing else, so a heap that merely
-# sorts correctly is still a different data structure. Parents move down until the new item fits,
-# and a pop bubbles the smaller child up before sifting the last element back down.
-def _heap_siftdown(heap, startpos, pos):
-    newitem = heap[pos]
-    while pos > startpos:
-        parentpos = (pos - 1) >> 1
-        parent = heap[parentpos]
-        if newitem < parent:
-            heap[pos] = parent
-            pos = parentpos
-            continue
-        break
-    heap[pos] = newitem
+# They are `heapq`'s own two sifts, specialized to a min-heap sifted from the root, and the
+# distinction matters: a heap's order among EQUAL entries is a property of the sift and of nothing
+# else, so a heap that merely sorts correctly is still a different data structure. A put climbs the
+# new entry toward the root, one exchange per step, while it is less than its parent. A get moves the
+# last entry to the root, carries it down to a leaf through the smaller child (the right one when the
+# two are equal), and then climbs it back up. Either raises RuntimeError when a comparison changes the
+# queue's length, as `heapq` does.
 
 
-def _heap_siftup(heap, pos):
-    endpos = len(heap)
-    startpos = pos
-    newitem = heap[pos]
-    childpos = 2 * pos + 1
-    while childpos < endpos:
-        rightpos = childpos + 1
-        if rightpos < endpos and not heap[childpos] < heap[rightpos]:
-            childpos = rightpos
-        heap[pos] = heap[childpos]
-        pos = childpos
-        childpos = 2 * pos + 1
-    heap[pos] = newitem
-    _heap_siftdown(heap, startpos, pos)
+def _heap_climb(heap, pos):
+    size = len(heap)
+    while pos > 0:
+        parent = (pos - 1) // 2
+        rises = heap[pos] < heap[parent]
+        if len(heap) != size:
+            raise RuntimeError("list changed size during iteration")
+        if not rises:
+            break
+        heap[pos], heap[parent] = heap[parent], heap[pos]
+        pos = parent
+
+
+def _heap_sink(heap):
+    size = len(heap)
+    pos = 0
+    child = 1
+    while child < size:
+        right = child + 1
+        if right < size:
+            left_smaller = heap[child] < heap[right]
+            if len(heap) != size:
+                raise RuntimeError("list changed size during iteration")
+            if not left_smaller:
+                child = right
+        heap[pos], heap[child] = heap[child], heap[pos]
+        pos = child
+        child = 2 * pos + 1
+    _heap_climb(heap, pos)
 
 
 class PriorityQueue(Queue):
@@ -746,16 +753,17 @@ class PriorityQueue(Queue):
 
     def _put(self, item):
         self._items.append(item)
-        _heap_siftdown(self._items, 0, len(self._items) - 1)
+        _heap_climb(self._items, len(self._items) - 1)
 
     def _get(self):
-        last = self._items.pop()
-        if self._items:
-            smallest = self._items[0]
-            self._items[0] = last
-            _heap_siftup(self._items, 0)
-            return smallest
-        return last
+        items = self._items
+        last = items.pop()
+        if not items:
+            return last
+        first = items[0]
+        items[0] = last
+        _heap_sink(items)
+        return first
 
 
 # What `wait()` is being asked to wait FOR. Strings, exactly as in CPython, so a program that prints

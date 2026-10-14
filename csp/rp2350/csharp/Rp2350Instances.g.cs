@@ -51,5 +51,6 @@ namespace Lamella.Generated
         public const uint PWM_BASE = 0x400A8000;
         public const uint PWM_RESET_BIT = 16;
         public const uint PWM_RESET_MASK = 0x10000;
+        public const uint QMI_BASE = 0x400D0000;
     }
 }

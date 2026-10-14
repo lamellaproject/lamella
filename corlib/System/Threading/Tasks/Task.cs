@@ -64,24 +64,44 @@ namespace System.Threading.Tasks
         public bool Wait(int millisecondsTimeout)
         {
             if (millisecondsTimeout < -1) throw new ArgumentOutOfRangeException("millisecondsTimeout");
-            if (_completed) { ThrowIfFaulted(); return true; }
+            if (!ParkFor(millisecondsTimeout)) return false;
+            ThrowIfFaulted();
+            return true;
+        }
+
+        internal void ParkUntilSettled()
+        {
+            if (_completed) return;
+            lock (this)
+            {
+                while (!_completed) Monitor.Wait(this);
+            }
+        }
+
+        private bool ParkFor(int millisecondsTimeout)
+        {
+            if (millisecondsTimeout < 0)
+            {
+                ParkUntilSettled();
+                return true;
+            }
+            if (_completed) return true;
             lock (this)
             {
                 int start = Environment.TickCount;
                 while (!_completed)
                 {
-                    if (millisecondsTimeout < 0)
-                    {
-                        Monitor.Wait(this);
-                        continue;
-                    }
                     int elapsed = unchecked(Environment.TickCount - start);
                     if (elapsed >= millisecondsTimeout) return false;
                     if (!Monitor.Wait(this, millisecondsTimeout - elapsed)) return false;
                 }
             }
-            ThrowIfFaulted();
             return true;
+        }
+#else
+        internal void ParkUntilSettled()
+        {
+            if (!_completed) throw new PlatformNotSupportedException();
         }
 #endif
 
@@ -89,23 +109,63 @@ namespace System.Threading.Tasks
 
         internal void SetException(Exception exception) { Settle(exception); }
 
+        internal bool TrySettle(Exception exception)
+        {
+            return Complete(exception, false);
+        }
+
         private void Settle(Exception exception)
         {
-            if (_completed) throw new InvalidOperationException("The task is already completed.");
-            _exception = exception;
-            _completed = true;
+            Complete(exception, true);
+        }
+
+        internal const string AlreadySettled = "An attempt was made to transition a task to a final state when it had already completed.";
+
+        private bool Complete(Exception exception, bool refuseIfSettled)
+        {
+            Action first;
+            Action[] rest;
+            int restCount;
+            bool settled;
 #if LAMELLA_SURFACE_THREADS
             lock (this)
             {
-                Monitor.PulseAll(this);
+                settled = TransitionLocked(exception, out first, out rest, out restCount);
             }
+#else
+            settled = TransitionLocked(exception, out first, out rest, out restCount);
 #endif
-            Action first = _continuation;
-            Action[] rest = _more;
-            int restCount = _moreCount;
+            if (!settled)
+            {
+                if (refuseIfSettled) throw new InvalidOperationException(AlreadySettled);
+                return false;
+            }
+            RunContinuations(first, rest, restCount);
+            return true;
+        }
+
+        internal bool TransitionLocked(Exception exception, out Action first, out Action[] rest, out int restCount)
+        {
+            first = null;
+            rest = null;
+            restCount = 0;
+            if (_completed) return false;
+            _exception = exception;
+            _completed = true;
+#if LAMELLA_SURFACE_THREADS
+            Monitor.PulseAll(this);
+#endif
+            first = _continuation;
+            rest = _more;
+            restCount = _moreCount;
             _continuation = null;
             _more = null;
             _moreCount = 0;
+            return true;
+        }
+
+        internal static void RunContinuations(Action first, Action[] rest, int restCount)
+        {
             if (first != null) first();
             for (int i = 0; i < restCount; i++)
             {
@@ -117,7 +177,22 @@ namespace System.Threading.Tasks
         {
             if (continuation == null) return;
             if (_completed) { continuation(); return; }
-            if (_continuation == null) { _continuation = continuation; return; }
+            bool stored;
+#if LAMELLA_SURFACE_THREADS
+            lock (this)
+            {
+                stored = TryStoreLocked(continuation);
+            }
+#else
+            stored = TryStoreLocked(continuation);
+#endif
+            if (!stored) continuation();
+        }
+
+        private bool TryStoreLocked(Action continuation)
+        {
+            if (_completed) return false;
+            if (_continuation == null) { _continuation = continuation; return true; }
             if (_more == null) _more = new Action[2];
             if (_moreCount == _more.Length)
             {
@@ -127,11 +202,17 @@ namespace System.Threading.Tasks
             }
             _more[_moreCount] = continuation;
             _moreCount = _moreCount + 1;
+            return true;
         }
 
         internal void ThrowIfFaulted()
         {
             if (_exception != null) throw _exception;
+        }
+
+        internal void ThrowIfFaultedAggregate()
+        {
+            if (_exception != null) throw new AggregateException(_exception);
         }
     }
 }

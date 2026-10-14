@@ -1089,14 +1089,25 @@ impl<'a> Assembly<'a> {
     /// a call to its callee. Returns `None` for a token that is neither.
     #[must_use]
     pub fn resolve_method(&self, token: Token) -> Option<ResolvedMethod<'a>> {
+        self.resolve_method_owned_by(token, |method_index| self.method_owner(method_index))
+    }
+
+    /// [`Assembly::resolve_method`], with the owning type of a `MethodDef` answered by `owner`.
+    ///
+    /// The one resolution both forms share: a caller with a single token asks
+    /// [`Assembly::method_owner`], and a pass over a whole table asks a [`MethodOwners`] index
+    /// built once, so the two can differ only in how long the owner takes to find.
+    fn resolve_method_owned_by(
+        &self,
+        token: Token,
+        owner: impl Fn(u32) -> Option<TypeDef<'a>>,
+    ) -> Option<ResolvedMethod<'a>> {
         match token.table() {
             table::METHOD_DEF => {
                 let method = self.method(token.row())?;
                 Some(ResolvedMethod {
                     name: method.name(),
-                    declaring_type: self
-                        .method_owner(token.row())
-                        .and_then(|owner| owner.name()),
+                    declaring_type: owner(token.row()).and_then(|owner| owner.name()),
                     signature: method.signature(),
                     kind: MethodKind::Definition(token.row()),
                 })
@@ -1190,6 +1201,9 @@ impl<'a> Assembly<'a> {
 
     /// The `TypeDef` that owns the method at `method_index`, found by the method
     /// ranges the `TypeDef.MethodList` column delimits.
+    ///
+    /// This walks the TypeDef table, so a pass that asks it once per row of another table pays
+    /// rows x types; such a pass builds a [`MethodOwners`] index first.
     fn method_owner(&self, method_index: u32) -> Option<TypeDef<'a>> {
         (1..=self.tables.row_count(table::TYPE_DEF)).find_map(|type_index| {
             let (first, last) = self.child_range(table::TYPE_DEF, type_index, 5, table::METHOD_DEF);
@@ -1198,6 +1212,14 @@ impl<'a> Assembly<'a> {
                 index: type_index,
             })
         })
+    }
+
+    /// The type declaring the attribute constructor `constructor`, with a `MethodDef`'s owner read
+    /// from `owners`: the identity of an attribute in metadata, since a `CustomAttribute` row
+    /// (II.22.10) names its constructor and never its type.
+    fn attribute_type(&self, constructor: Token, owners: &MethodOwners<'a>) -> Option<TypeName<'a>> {
+        self.resolve_method_owned_by(constructor, |method_index| owners.owner(method_index))
+            .and_then(|ctor| ctor.declaring_type)
     }
 
     /// The namespace and name of a type token -- a `TypeRef` or `TypeDef` (the two
@@ -1378,14 +1400,14 @@ impl<'a> Assembly<'a> {
     /// number.
     #[must_use]
     pub fn tokens_with_attribute(&self, namespace: &str, name: &str) -> BTreeSet<Token> {
+        let owners = MethodOwners::new(*self);
         let mut found = BTreeSet::new();
         for index in 1..=self.tables.row_count(table::CUSTOM_ATTRIBUTE) {
             let Some(row) = self.tables.row(table::CUSTOM_ATTRIBUTE, index) else {
                 continue;
             };
             let matches = self
-                .resolve_method(row.token(1))
-                .and_then(|ctor| ctor.declaring_type)
+                .attribute_type(row.token(1), &owners)
                 .is_some_and(|declaring| declaring.namespace == namespace && declaring.name == name);
             if matches {
                 found.insert(row.token(0));
@@ -1525,6 +1547,7 @@ impl<'a> Assembly<'a> {
     /// for an unresolvable attribute ctor, so a foreign attribute is skipped.
     #[must_use]
     pub fn param_array_params(&self) -> BTreeSet<u32> {
+        let owners = MethodOwners::new(*self);
         let mut params = BTreeSet::new();
         for index in 1..=self.tables.row_count(table::CUSTOM_ATTRIBUTE) {
             let Some(row) = self.tables.row(table::CUSTOM_ATTRIBUTE, index) else {
@@ -1535,8 +1558,7 @@ impl<'a> Assembly<'a> {
                 continue;
             }
             let is_param_array = self
-                .resolve_method(row.token(1))
-                .and_then(|target| target.declaring_type)
+                .attribute_type(row.token(1), &owners)
                 .is_some_and(|name| {
                     name.namespace == "System" && name.name == "ParamArrayAttribute"
                 });
@@ -1553,6 +1575,7 @@ impl<'a> Assembly<'a> {
     /// [`Assembly::param_array_params`]) to avoid an O(rows)-per-method scan of the BCL.
     #[must_use]
     pub fn conditional_symbols(&self) -> BTreeMap<u32, Vec<Box<str>>> {
+        let owners = MethodOwners::new(*self);
         let mut map: BTreeMap<u32, Vec<Box<str>>> = BTreeMap::new();
         for index in 1..=self.tables.row_count(table::CUSTOM_ATTRIBUTE) {
             let Some(row) = self.tables.row(table::CUSTOM_ATTRIBUTE, index) else {
@@ -1563,8 +1586,7 @@ impl<'a> Assembly<'a> {
                 continue;
             }
             let is_conditional = self
-                .resolve_method(row.token(1))
-                .and_then(|target| target.declaring_type)
+                .attribute_type(row.token(1), &owners)
                 .is_some_and(|name| {
                     name.namespace == "System.Diagnostics" && name.name == "ConditionalAttribute"
                 });
@@ -1588,6 +1610,7 @@ impl<'a> Assembly<'a> {
     /// [`Assembly::conditional_symbols`]) to avoid an O(rows)-per-method scan of the BCL.
     #[must_use]
     pub fn unmanaged_callers_only(&self) -> BTreeMap<u32, Option<Box<str>>> {
+        let owners = MethodOwners::new(*self);
         let mut exports = BTreeMap::new();
         for index in 1..=self.tables.row_count(table::CUSTOM_ATTRIBUTE) {
             let Some(row) = self.tables.row(table::CUSTOM_ATTRIBUTE, index) else {
@@ -1598,8 +1621,7 @@ impl<'a> Assembly<'a> {
                 continue;
             }
             let is_unmanaged_callers_only = self
-                .resolve_method(row.token(1))
-                .and_then(|target| target.declaring_type)
+                .attribute_type(row.token(1), &owners)
                 .is_some_and(|name| name.name == "UnmanagedCallersOnlyAttribute");
             if !is_unmanaged_callers_only {
                 continue;
@@ -1624,6 +1646,9 @@ impl<'a> Assembly<'a> {
 
     /// The constant value attached to `parent` (a Field/Param/Property token),
     /// from the `Constant` table (II.22.9), or `None` if it has no constant.
+    ///
+    /// This scans the table for one parent. A caller asking about every field or parameter of an
+    /// assembly wants [`Assembly::constants`], which reads the table once.
     #[must_use]
     pub fn constant(&self, parent: Token) -> Option<ConstantValue> {
         for index in 1..=self.tables.row_count(table::CONSTANT) {
@@ -1636,6 +1661,35 @@ impl<'a> Assembly<'a> {
             }
         }
         None
+    }
+
+    /// Every [`Assembly::constant`] answer at once: the value of each Field, Param and Property
+    /// that has one, keyed by its token, read in ONE pass over the `Constant` table (II.22.9).
+    ///
+    /// It answers exactly as asking each token would. The first row naming a parent decides it,
+    /// so a parent whose first row does not decode is absent, as [`Assembly::constant`] answers
+    /// `None` for it, even when a later row names the same parent; and the pass ends at a row that
+    /// cannot be read, where that scan ends too.
+    #[must_use]
+    pub fn constants(&self) -> BTreeMap<Token, ConstantValue> {
+        let mut values = BTreeMap::new();
+        let mut decided = BTreeSet::new();
+        for index in 1..=self.tables.row_count(table::CONSTANT) {
+            let Some(row) = self.tables.row(table::CONSTANT, index) else {
+                break;
+            };
+            let owner = row.token(1);
+            if !decided.insert(owner) {
+                continue;
+            }
+            let element_type = row.raw(0) as u8;
+            if let Ok(blob) = self.image.blob().get(row.raw(2))
+                && let Some(value) = decode_constant(element_type, blob)
+            {
+                values.insert(owner, value);
+            }
+        }
+        values
     }
 
     /// The `[first, last)` child run for a type located through a map table
@@ -1678,6 +1732,61 @@ impl<'a> Assembly<'a> {
         };
         (first, last)
     }
+}
+
+/// The `TypeDef` owning each `MethodDef` row, read in one pass over the TypeDef table's method
+/// runs (II.22.37): [`Assembly::method_owner`]'s answer for every row at once, so a pass over
+/// another table can ask it per row without walking the types each time.
+struct MethodOwners<'a> {
+    assembly: Assembly<'a>,
+    /// The owning `TypeDef` row of each `MethodDef` row from 0 through the last readable one,
+    /// indexed by the `MethodDef` row; 0 where no run contains the row.
+    owners: Vec<u32>,
+}
+
+impl<'a> MethodOwners<'a> {
+    fn new(assembly: Assembly<'a>) -> MethodOwners<'a> {
+        let methods = readable_rows(&assembly.tables, table::METHOD_DEF);
+        let mut owners = alloc::vec![0; methods as usize + 1];
+        for type_index in 1..=assembly.tables.row_count(table::TYPE_DEF) {
+            let (first, last) =
+                assembly.child_range(table::TYPE_DEF, type_index, 5, table::METHOD_DEF);
+            for method_index in first..last.min(methods.saturating_add(1)) {
+                let owner = &mut owners[method_index as usize];
+                if *owner == 0 {
+                    *owner = type_index;
+                }
+            }
+        }
+        MethodOwners { assembly, owners }
+    }
+
+    /// The `TypeDef` that owns the method at `method_index`, as [`Assembly::method_owner`] answers.
+    fn owner(&self, method_index: u32) -> Option<TypeDef<'a>> {
+        match self.owners.get(method_index as usize) {
+            Some(0) => None,
+            Some(&index) => Some(TypeDef {
+                assembly: self.assembly,
+                index,
+            }),
+            None => self.assembly.method_owner(method_index),
+        }
+    }
+}
+
+/// How many of `table`'s rows read: a prefix of the table, since its rows lie end to end and a
+/// header may claim more of them than its data holds.
+fn readable_rows(tables: &Tables<'_>, table: u8) -> u32 {
+    let (mut readable, mut at_most) = (0, tables.row_count(table));
+    while readable < at_most {
+        let middle = readable + (at_most - readable).div_ceil(2);
+        if tables.row(table, middle).is_some() {
+            readable = middle;
+        } else {
+            at_most = middle - 1;
+        }
+    }
+    readable
 }
 
 /// The single string argument of a `[Conditional("X")]` value blob (II.23.3): the `0x0001`
@@ -2702,5 +2811,183 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// A metadata root holding only `tables`, each `(table, claimed rows, row bytes)` in ascending
+    /// table order, beside a `#Blob` heap of `blobs` and an empty `#Strings`.
+    ///
+    /// A table's bytes may hold fewer rows than it claims, as a truncated file's do -- but only the
+    /// last table's, since every table starts where the rows its predecessors CLAIM would end.
+    fn metadata_with_tables(tables: &[(u8, u32, Vec<u8>)], blobs: &[u8]) -> Vec<u8> {
+        let strings = [0u8, 0, 0, 0];
+        let mut stream = Vec::new();
+        stream.extend_from_slice(&0u32.to_le_bytes());
+        stream.extend_from_slice(&[2, 0, 0, 0]);
+        let valid = tables.iter().fold(0u64, |valid, (table, _, _)| valid | (1u64 << table));
+        stream.extend_from_slice(&valid.to_le_bytes());
+        stream.extend_from_slice(&0u64.to_le_bytes());
+        for (_, claimed, _) in tables {
+            stream.extend_from_slice(&claimed.to_le_bytes());
+        }
+        for (_, _, rows) in tables {
+            stream.extend_from_slice(rows);
+        }
+        let headers_len = 24 + (8 + 12) + (8 + 8) + (8 + 4);
+        let blob_offset = headers_len + strings.len();
+        let tables_offset = blob_offset + blobs.len();
+        let mut root = Vec::new();
+        root.extend_from_slice(&METADATA_SIGNATURE.to_le_bytes());
+        root.extend_from_slice(&[1, 0, 1, 0]);
+        root.extend_from_slice(&0u32.to_le_bytes());
+        root.extend_from_slice(&4u32.to_le_bytes());
+        root.extend_from_slice(b"v1\0\0");
+        root.extend_from_slice(&0u16.to_le_bytes());
+        root.extend_from_slice(&3u16.to_le_bytes());
+        root.extend_from_slice(&(headers_len as u32).to_le_bytes());
+        root.extend_from_slice(&(strings.len() as u32).to_le_bytes());
+        root.extend_from_slice(b"#Strings\0\0\0\0");
+        root.extend_from_slice(&(blob_offset as u32).to_le_bytes());
+        root.extend_from_slice(&(blobs.len() as u32).to_le_bytes());
+        root.extend_from_slice(b"#Blob\0\0\0");
+        root.extend_from_slice(&(tables_offset as u32).to_le_bytes());
+        root.extend_from_slice(&(stream.len() as u32).to_le_bytes());
+        root.extend_from_slice(b"#~\0\0");
+        assert_eq!(root.len(), headers_len);
+        root.extend_from_slice(&strings);
+        root.extend_from_slice(blobs);
+        root.extend_from_slice(&stream);
+        root
+    }
+
+    /// TypeDef rows whose `MethodList` columns are `method_lists`, over a MethodDef table that
+    /// claims `claimed` rows and holds `present` of them.
+    fn methods_owned_by(method_lists: &[u16], claimed: u32, present: u32) -> Vec<u8> {
+        let mut types = Vec::new();
+        for list in method_lists {
+            types.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
+            types.extend_from_slice(&list.to_le_bytes());
+        }
+        let methods = alloc::vec![0u8; 14 * present as usize];
+        metadata_with_tables(
+            &[
+                (table::TYPE_DEF, method_lists.len() as u32, types),
+                (table::METHOD_DEF, claimed, methods),
+            ],
+            &[0],
+        )
+    }
+
+    #[test]
+    fn the_method_owner_index_answers_as_the_walk_for_every_row() {
+        let cases: [(&[u16], u32, u32); 5] = [
+            (&[1, 1, 3, 3, 6], 7, 7),
+            (&[1, 4, 2, 6], 7, 7),
+            (&[0, 9, 3], 5, 5),
+            (&[1, 3, 5], 10, 4),
+            (&[], 3, 3),
+        ];
+        for (method_lists, claimed, present) in cases {
+            let root = methods_owned_by(method_lists, claimed, present);
+            let assembly =
+                Assembly::from_image(MetadataImage::parse_metadata_root(&root).unwrap()).unwrap();
+            assert_eq!(readable_rows(&assembly.tables, table::METHOD_DEF), present);
+            let owners = MethodOwners::new(assembly);
+            for method_index in 0..=claimed + 2 {
+                assert_eq!(
+                    owners.owner(method_index).map(|owner| owner.token()),
+                    assembly.method_owner(method_index).map(|owner| owner.token()),
+                    "lists {method_lists:?}, {claimed} rows claimed and {present} present: row \
+                     {method_index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_constant_index_answers_as_the_scan_for_every_parent() {
+        let blobs = [0, 4, 42, 0, 0, 0, 4, 7, 0, 0, 0, 4, 0, 0, 0, 0, 1, 0xFF];
+        let field = |row: u16| row << 2;
+        let param = |row: u16| (row << 2) | 1;
+        let property = |row: u16| (row << 2) | 2;
+        let rows: [(u8, u16, u16); 8] = [
+            (element::I4, field(1), 1),
+            (element::I4, field(1), 6),
+            (element::CLASS, param(2), 11),
+            (0x99, field(3), 1),
+            (element::I4, field(3), 6),
+            (element::I4, property(1), 16),
+            (element::I4, field(4), 1),
+            (element::I4, param(5), 6),
+        ];
+        let mut bytes = Vec::new();
+        for (element_type, parent, value) in &rows[..6] {
+            bytes.extend_from_slice(&[*element_type, 0]);
+            bytes.extend_from_slice(&parent.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        let root = metadata_with_tables(&[(table::CONSTANT, rows.len() as u32, bytes)], &blobs);
+        let assembly =
+            Assembly::from_image(MetadataImage::parse_metadata_root(&root).unwrap()).unwrap();
+        let constants = assembly.constants();
+        for parent_table in [table::FIELD, table::PARAM, table::PROPERTY] {
+            for row in 0..=6 {
+                let parent = Token::new(parent_table, row);
+                assert_eq!(
+                    constants.get(&parent).cloned(),
+                    assembly.constant(parent),
+                    "{parent:?}"
+                );
+            }
+        }
+        assert_eq!(
+            constants.get(&Token::new(table::FIELD, 1)),
+            Some(&ConstantValue::I4(42))
+        );
+        assert_eq!(
+            constants.get(&Token::new(table::PARAM, 2)),
+            Some(&ConstantValue::Null)
+        );
+        assert_eq!(constants.len(), 2, "{constants:?}");
+    }
+
+    #[test]
+    fn both_indexes_answer_as_their_scans_over_a_whole_corlib() {
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures/corlib.dll");
+        let Ok(bytes) = std::fs::read(fixture) else {
+            return;
+        };
+        let assembly = Assembly::read(std::boxed::Box::leak(bytes.into_boxed_slice()))
+            .expect("the committed corlib fixture reads");
+        let owners = MethodOwners::new(assembly);
+        let methods = assembly.tables.row_count(table::METHOD_DEF);
+        assert!(methods > 1000, "the fixture has methods to ask about: {methods}");
+        for method_index in 0..=methods + 1 {
+            assert_eq!(
+                owners.owner(method_index).map(|owner| owner.token()),
+                assembly.method_owner(method_index).map(|owner| owner.token()),
+                "MethodDef row {method_index}"
+            );
+        }
+        let constants = assembly.constants();
+        let same = |a: Option<&ConstantValue>, b: Option<&ConstantValue>| match (a, b) {
+            (Some(ConstantValue::R4(x)), Some(ConstantValue::R4(y))) => x.to_bits() == y.to_bits(),
+            (Some(ConstantValue::R8(x)), Some(ConstantValue::R8(y))) => x.to_bits() == y.to_bits(),
+            _ => a == b,
+        };
+        let mut answered = 0;
+        for parent_table in [table::FIELD, table::PARAM, table::PROPERTY] {
+            for row in 1..=assembly.tables.row_count(parent_table) {
+                let parent = Token::new(parent_table, row);
+                let scanned = assembly.constant(parent);
+                answered += usize::from(scanned.is_some());
+                let indexed = constants.get(&parent);
+                assert!(
+                    same(indexed, scanned.as_ref()),
+                    "{parent:?}: {indexed:?} != {scanned:?}"
+                );
+            }
+        }
+        assert!(answered > 100, "the fixture's constants: {answered}");
+        assert_eq!(constants.len(), answered);
     }
 }

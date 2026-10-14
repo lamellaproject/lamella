@@ -23,6 +23,7 @@ use lamella_load::{
     load_delta, load_delta_with_corlib, load_library,
 };
 use lamella_metadata::Assembly;
+use lamella_wire_host::engine::LcscCompiler;
 use lamella_cil_runtime::intrinsics::object_to_string;
 use lamella_cil_runtime::{MethodId, Module, ObjectRef, Vm, run};
 use std::path::{Path, PathBuf};
@@ -142,66 +143,20 @@ struct Toolchain {
 }
 
 impl Toolchain {
-    /// Sources the reference assemblies the compiler resolves the BCL against, corlib-first:
-    /// `LAMELLA_CORLIB` (an explicit Lamella corlib.dll -- fully self-hosted), else a `corlib.dll`
-    /// beside the executable or in the working directory, else the dev tree's built corlib
-    /// fixture, else a directory of reference assemblies named by `LAMELLA_REF_DIR`. The corlib
-    /// ships as source (`corlib/`), so a fresh checkout builds its own:
-    /// `lcsc corlib/*/*.cs /out:corlib.dll`.
+    /// The corlib the compiler resolves the BCL against: the one [`LcscCompiler::discover`] finds,
+    /// which is the search the `lamella` command and the MCP servers make, so a line typed here
+    /// binds the corlib a program run by them binds.
+    ///
+    /// **THE CORLIB ALONE.** A session over one corlib holds it resident, so the corlib members a
+    /// line names resolve by name ([`IncrementalSession::open_compiler_with_corlib`]); the
+    /// libraries beside it are left out.
     fn discover() -> Result<Toolchain, String> {
-        if let Some(path) = env::var_os("LAMELLA_CORLIB") {
-            let path = PathBuf::from(path);
-            let bytes = fs::read(&path)
-                .map_err(|error| format!("cannot read LAMELLA_CORLIB {}: {error}", path.display()))?;
-            return Ok(Toolchain { references: vec![bytes] });
-        }
-        for candidate in local_corlib_candidates() {
-            if let Ok(bytes) = fs::read(&candidate) {
-                return Ok(Toolchain { references: vec![bytes] });
-            }
-        }
-        if let Some(dir) = env::var_os("LAMELLA_REF_DIR") {
-            let references = reference_dlls(&PathBuf::from(dir))?;
-            return Ok(Toolchain { references });
-        }
-        Err("no reference assemblies: set LAMELLA_CORLIB to a Lamella corlib.dll (build one from \
-             the shipped sources: `lcsc corlib/*/*.cs /out:corlib.dll`), put a corlib.dll beside \
-             the executable, or set LAMELLA_REF_DIR to a directory of reference assemblies"
-            .to_owned())
+        let compiler = LcscCompiler::discover()?;
+        let corlib = compiler.references().first().cloned().ok_or_else(|| {
+            "the reference-assembly search answered with no corlib".to_owned()
+        })?;
+        Ok(Toolchain { references: vec![corlib] })
     }
-}
-
-fn local_corlib_candidates() -> Vec<PathBuf> {
-    let mut candidates = Vec::new();
-    if let Ok(exe) = env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("corlib.dll"));
-        }
-    }
-    candidates.push(PathBuf::from("corlib.dll"));
-    candidates.push(PathBuf::from("managed").join("corlib.dll"));
-    candidates.push(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../lamella-load/tests/fixtures/corlib.dll"),
-    );
-    candidates
-}
-
-fn reference_dlls(ref_dir: &Path) -> Result<Vec<Vec<u8>>, String> {
-    let mut paths: Vec<PathBuf> = fs::read_dir(ref_dir)
-        .map_err(|error| format!("cannot read ref dir {}: {error}", ref_dir.display()))?
-        .flatten()
-        .map(|entry| entry.path())
-        .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll")))
-        .collect();
-    paths.sort();
-    let references: Vec<Vec<u8>> = paths
-        .iter()
-        .filter_map(|path| fs::read(path).ok())
-        .collect();
-    if references.is_empty() {
-        return Err(format!("no reference assemblies (*.dll) found in {}", ref_dir.display()));
-    }
-    Ok(references)
 }
 
 struct TempProgram {
@@ -422,10 +377,9 @@ impl IncrementalSession {
         Self::open_from_bytes(&bootstrap, Some(compiler), Some(&corlib), None)
     }
 
-    /// Opens a compiler-driven incremental session over the reference set DISCOVERED the same way
-    /// [`ReplSession::new`] discovers it -- `LAMELLA_CORLIB`, else a `corlib.dll` beside the
-    /// executable, else `LAMELLA_REF_DIR`. The zero-configuration constructor an interactive
-    /// front end needs.
+    /// Opens a compiler-driven incremental session over the corlib DISCOVERED the same way
+    /// [`ReplSession::new`] discovers it, by [`LcscCompiler::discover`]'s search. The
+    /// zero-configuration constructor an interactive front end needs.
     ///
     /// **An interactive front end needs this constructor specifically, and the reason is
     /// reference-typed state.** Every other compiler-driven constructor here makes the CALLER supply
@@ -434,30 +388,17 @@ impl IncrementalSession {
     /// `string s = "hi";` then `s + "!"` prints `!!`, a wrong answer with no error. Discovering the
     /// reference set was the whole of the gap; the incremental emit behind it already worked.
     ///
-    /// The single-reference case -- the normal one, a Lamella `corlib.dll` -- takes the RESIDENT
-    /// corlib path, so managed corlib members a submission names resolve by name. A multi-reference
-    /// set (`LAMELLA_REF_DIR`) type-checks against all of them with none resident, which is
-    /// [`IncrementalSession::open_compiler`]'s existing behaviour and its existing limits.
+    /// It takes the RESIDENT corlib path, so the managed corlib members a submission names resolve
+    /// by name.
     ///
     /// # Errors
     /// Returns `Err` when no reference assemblies can be discovered, or for any reason
     /// [`IncrementalSession::open_compiler_with_corlib`] does.
     pub fn open_compiler_discovered() -> Result<IncrementalSession, String> {
         let tools = Toolchain::discover()?;
-        match tools.references.split_first() {
+        match tools.references.first() {
+            Some(corlib) => Self::open_compiler_with_corlib(corlib),
             None => Err("no reference assemblies were discovered".to_string()),
-            Some((corlib, [])) => Self::open_compiler_with_corlib(corlib),
-            Some(_) => {
-                let assemblies = tools
-                    .references
-                    .iter()
-                    .map(|bytes| {
-                        Assembly::read(bytes)
-                            .map_err(|error| format!("cannot read reference metadata: {error:?}"))
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                Self::open_compiler(&assemblies)
-            }
         }
     }
 

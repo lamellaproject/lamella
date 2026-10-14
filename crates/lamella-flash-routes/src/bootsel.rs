@@ -35,7 +35,7 @@ pub struct Waiting {
 impl Waiting {
     /// What to print in the listing's target column.
     ///
-    /// **A BOOTLOADER VOLUME IS NOT A `--target`, AND THIS MUST NOT PRETEND OTHERWISE.** Nothing
+    /// **A BOOTLOADER VOLUME IS NOT A `--device`, AND THIS MUST NOT PRETEND OTHERWISE.** Nothing
     /// speaks Lamella Link to a board in this state; it takes an image and reboots. Printing
     /// something that looked pasteable would send a reader to a verb that cannot reach it, so the
     /// column says what the board IS instead.

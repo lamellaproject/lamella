@@ -2,9 +2,15 @@
 #if LAMELLA_SURFACE_THREADS
 namespace System.Threading
 {
+#if LAMELLA_SURFACE_NETFX_2_0
+    public static class Interlocked
+#else
     public sealed class Interlocked
+#endif
     {
+#if !LAMELLA_SURFACE_NETFX_2_0
         private Interlocked() { }
+#endif
 
         public static int Increment(ref int location) { location = location + 1; return location; }
         public static int Decrement(ref int location) { location = location - 1; return location; }

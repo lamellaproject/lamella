@@ -87,8 +87,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "lamella-board-buses"
+version = "0.0.0"
+
+[[package]]
 name = "lamella-board-support"
 version = "0.0.0"
+dependencies = [
+ "lamella-psram-qspi",
+]
 
 [[package]]
 name = "lamella-cil"
@@ -101,6 +108,7 @@ dependencies = [
 name = "lamella-cil-runtime"
 version = "0.0.0"
 dependencies = [
+ "lamella-board-buses",
  "lamella-cil",
  "lamella-decimal",
  "lamella-net-core",
@@ -158,6 +166,10 @@ name = "lamella-pin-events"
 version = "0.0.0"
 
 [[package]]
+name = "lamella-psram-qspi"
+version = "0.1.0"
+
+[[package]]
 name = "lamella-reactor"
 version = "0.0.0"
 
@@ -165,6 +177,7 @@ version = "0.0.0"
 name = "lamella-runtime-support"
 version = "0.0.0"
 dependencies = [
+ "lamella-board-buses",
  "lamella-board-support",
  "lamella-decimal",
  "lamella-gc",

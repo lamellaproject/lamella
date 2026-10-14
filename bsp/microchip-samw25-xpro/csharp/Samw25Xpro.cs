@@ -12,8 +12,8 @@ namespace Lamella.Boards.Microchip
 
         /// <summary>Binds this board's GPIO block to the driver table, so a program writes plain
         /// dotnet/iot -- <c>new GpioController()</c> -- and never names a Lamella type. Touching
-        /// <see cref="Samw25Xpro"/> at all is what arms it, which is why a program constructs the
-        /// board first.</summary>
+        /// <see cref="Samw25Xpro"/> at all is what arms it, and constructing
+        /// <see cref="TargetBoard"/> touches it.</summary>
         /// <remarks>A TYPE INITIALIZER rather than the instance constructor, for the reason
         /// <see cref="Lamella.Hardware.Buses.BindGpio"/> documents: the table refuses a second bind
         /// of the same kind rather than replacing it, and this class is instantiable and routinely

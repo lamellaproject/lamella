@@ -3,6 +3,7 @@
 use crate::args::{self, Spec};
 use lamella_wire::{Capabilities, Negotiated};
 use lamella_wire_host::{UsbTransport, hello_blocking, list_serial, open_target};
+use std::fmt::Write as _;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -16,28 +17,51 @@ const BAUD: u32 = 115_200;
 /// the number of attached boards is the whole command's runtime.
 const IDENTIFY_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// One attached board, as the listing sees it.
+/// What a row of the listing is, which decides the option that takes its id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// Something a program is sent to over Lamella Link: what `--device` takes.
+    Device,
+    /// A debug probe a board may be wired to: what `--probe` takes.
+    Probe,
+    /// A bootloader or programming drive an image is copied to: what `--volume` takes.
+    Drive,
+}
+
+/// One attached thing, as the listing sees it.
 struct Attached {
-    /// What to paste into `--target`.
-    target: String,
-    /// Which carrier the target names.
-    carrier: &'static str,
-    /// What this is, in whatever terms the operating system reported.
-    what: String,
+    /// The word the option for its kind takes.
+    id: String,
+    /// Which option that is.
+    kind: Kind,
+    /// What it is, in whatever terms the operating system reported.
+    description: String,
+}
+
+/// What a device said when `--identify` asked it.
+struct Answer {
+    /// The board it answered as, when it answered.
+    board: Option<String>,
+    /// One word for how it answered, the status .NET lists a device with.
+    status: &'static str,
+    /// Everything it said, or why it said nothing.
+    detail: String,
 }
 
 const USAGE: &str = "\
 usage: lamella devices [--identify] [--all-devices]
 
-Lists what is attached and, for each, THE WORD YOU PASS TO ANOTHER VERB -- so the first column can
-be copied straight into --target or --probe rather than translated.
+Lists what is attached, as .NET lists the devices a program can run on: each one's ID, which is
+the word --device takes, with its type, its status and what it is. Debug probes and bootloader
+drives follow, each under the word --probe or --volume takes when a board is written over one.
 
 A board in its bootloader is listed here too. It is still attached, and it is the one somebody
 holding a new board is most likely to be looking for.
 
---identify asks each board what it is, over the wire, rather than reporting what the operating
-system said about the port. That costs a round trip per board and is the answer worth having when
-two boards look alike.
+--identify asks each device what it is, over the wire, rather than reporting what the operating
+system said about the port: the board it answers as becomes its description, and how it answered
+its status. That costs a round trip per device and is the answer worth having when two boards look
+alike.
 
 --all-devices also lists the vendor-class USB devices this build decided are not debug probes. Use
 it when a probe of yours is missing from the listing above: it is either not attached, or it is in
@@ -57,20 +81,23 @@ pub fn devices_command(args: &[String]) -> ExitCode {
 
     let (mut attached, passed_over) = enumerate();
     for waiting in lamella_flash_routes::bootsel::waiting() {
-        let what = format!("{}  ({})", waiting.state(), waiting.volume);
-        attached.push(Attached { target: waiting.describe(), carrier: "volume", what });
+        let mut description = waiting.state();
+        if let Some(serial) = &waiting.serial {
+            description.push_str(&format!("  serial {serial}"));
+        }
+        attached.push(Attached { id: waiting.volume.clone(), kind: Kind::Drive, description });
     }
     if attached.is_empty() {
         print!("{}", nothing_found());
         return ExitCode::SUCCESS;
     }
 
-    let width = attached.iter().map(|board| board.target.len()).max().unwrap_or(0).max(6);
-    println!("{:<width$}  {:<7}  {}", "TARGET", "CARRIER", "WHAT", width = width);
-    for board in &attached {
-        println!("{:<width$}  {:<7}  {}", board.target, board.carrier, board.what, width = width);
-    }
-    println!("\n{} attached. Paste a TARGET into --target.", attached.len());
+    let identifying = parsed.flag("--identify");
+    let answers: Vec<Option<Answer>> = attached
+        .iter()
+        .map(|one| (identifying && one.kind == Kind::Device).then(|| ask(&one.id)))
+        .collect();
+    print!("{}", render(&attached, &answers));
     if !passed_over.is_empty() {
         let count = passed_over.len();
         println!(
@@ -86,19 +113,20 @@ pub fn devices_command(args: &[String]) -> ExitCode {
             println!("  Pass --all-devices to list them.");
         }
     }
-    if attached.iter().any(|board| board.carrier == "volume") {
+    if attached.iter().any(|one| one.kind == Kind::Drive) {
         println!(
-            "A `(bootloader)` or `(volume)` row takes an image by having one COPIED to it, so it\n\
-             has no --target -- nothing there speaks a protocol. `(bootloader)` means the chip is\n\
-             halted waiting; `(volume)` is an on-board programmer, and that board may be running."
+            "A DRIVE takes an image by having one COPIED to it, so it is no --device: nothing there\n\
+             speaks a protocol. A bootloader's drive means the chip is halted waiting; an on-board\n\
+             programmer's drive is there while that board runs."
         );
     }
 
-    if parsed.flag("--identify") {
+    if identifying {
         println!("\nidentifying (a board answers only while Lamella firmware is running on it):");
-        for board in &attached {
-            println!("\n  {}", board.target);
-            for line in identify(&board.target).lines() {
+        for (one, answer) in attached.iter().zip(&answers) {
+            let Some(answer) = answer else { continue };
+            println!("\n  {}", one.id);
+            for line in answer.detail.lines() {
                 println!("    {line}");
             }
         }
@@ -119,42 +147,43 @@ fn enumerate() -> (Vec<Attached>, Vec<lamella_probe::PassedOver>) {
     let mut passed_over = Vec::new();
     let probes = lamella_probe::list_reporting(&mut passed_over);
     for probe in &probes {
-        let target = match &probe.serial {
-            Some(serial) => format!("--probe {serial}"),
-            None => format!("--probe ? ({:04x}:{:04x})", probe.vendor_id, probe.product_id),
+        let id = match &probe.serial {
+            Some(serial) => serial.clone(),
+            None => format!("? ({:04x}:{:04x}, no serial)", probe.vendor_id, probe.product_id),
         };
         let product = probe.product.clone().unwrap_or_else(|| "debug probe".to_owned());
         attached.push(Attached {
-            target,
-            carrier: "probe",
-            what: format!("{product}  a board may be wired to this over SWD"),
+            id,
+            kind: Kind::Probe,
+            description: format!("{product}  a board may be wired to this over SWD"),
         });
     }
     if let Ok(boards) = UsbTransport::list() {
         for board in boards {
-            let target = match &board.serial_number {
+            let id = match &board.serial_number {
                 Some(serial) => {
                     format!("usb:{:04x}:{:04x}:{serial}", board.vendor_id, board.product_id)
                 }
                 None => format!("usb:{:04x}:{:04x}", board.vendor_id, board.product_id),
             };
-            let what = board.product.clone().unwrap_or_else(|| "(no product string)".to_owned());
-            attached.push(Attached { target, carrier: "usb", what });
+            let description =
+                board.product.clone().unwrap_or_else(|| "(no product string)".to_owned());
+            attached.push(Attached { id, kind: Kind::Device, description });
         }
     }
     let ports = list_serial();
     for port in &ports {
-        let (target, note) = serial_target(port, &ports);
-        let mut what = describe(port);
+        let (id, note) = serial_target(port, &ports);
+        let mut description = describe(port);
         if port.serial_number.as_deref().is_some_and(|serial| {
             probes.iter().any(|probe| probe.serial.as_deref() == Some(serial))
         }) {
-            what.push_str("  [the UART bridge of the probe above, not a board]");
+            description.push_str("  [the UART bridge of the probe below, not a board]");
         }
         if let Some(note) = note {
-            what.push_str(&format!("  {note}"));
+            description.push_str(&format!("  {note}"));
         }
-        attached.push(Attached { target, carrier: "serial", what });
+        attached.push(Attached { id, kind: Kind::Device, description });
     }
     (attached, passed_over)
 }
@@ -206,22 +235,117 @@ fn describe(port: &lamella_wire_host::SerialPortDesc) -> String {
     what
 }
 
-/// HELLO `target` and render what came back, or why nothing did.
+/// HELLO the device `id` names, and say what came back, or why nothing did.
 ///
-/// The target is opened through [`open_target`], which is the ONE place that knows the target
-/// syntax. Reading a target string here instead would put a second copy of that grammar behind the
-/// listing that prints it, which is the one place it must not be.
-fn identify(target: &str) -> String {
-    let mut transport = match open_target(target, BAUD, IDENTIFY_TIMEOUT) {
+/// The id is opened through [`open_target`], which is the ONE place that knows the device
+/// syntax. Reading an id here instead would put a second copy of that grammar behind the listing
+/// that prints it, which is the one place it must not be.
+fn ask(id: &str) -> Answer {
+    let mut transport = match open_target(id, BAUD, IDENTIFY_TIMEOUT) {
         Ok(transport) => transport,
-        Err(error) => return format!("cannot open it: {error:?}"),
+        Err(error) => {
+            return Answer {
+                board: None,
+                status: "Cannot open",
+                detail: format!("cannot open it: {error:?}"),
+            };
+        }
     };
     match hello_blocking(&mut transport, 1, host_caps(), IDENTIFY_TIMEOUT) {
-        Ok(negotiated) => render_identity(&negotiated),
-        Err(lamella_wire::TransportError::VersionMismatch { target_min, target_max }) => {
-            lamella_wire_host::version_mismatch(lamella_wire::PROTOCOL_VERSION, target_min, target_max)
+        Ok(negotiated) => {
+            let model = negotiated.identity.product_model;
+            let board = lamella_wire::product_model::name(model)
+                .map_or_else(|| format!("a board this build does not know (product model {model})"), str::to_owned);
+            Answer { board: Some(board), status: "Online", detail: render_identity(&negotiated) }
         }
-        Err(_) => "no answer -- this is normal unless Lamella firmware is running on it".to_owned(),
+        Err(lamella_wire::TransportError::VersionMismatch { target_min, target_max }) => Answer {
+            board: None,
+            status: "Needs update",
+            detail: lamella_wire_host::version_mismatch(
+                lamella_wire::PROTOCOL_VERSION,
+                target_min,
+                target_max,
+            ),
+        },
+        Err(_) => Answer {
+            board: None,
+            status: "No answer",
+            detail: "no answer -- this is normal unless Lamella firmware is running on it".to_owned(),
+        },
+    }
+}
+
+/// The listing: the devices as .NET lists them -- an ID, a type, a status and a description, from
+/// the `@(Devices)` item's identity and its `Type`, `Status` and `Description` -- and then the probes
+/// and the drives, each under the word the option that takes it takes. `answers` is each row's
+/// `--identify` answer, when there is one.
+///
+/// **THE FIRST COLUMN OF THE DEVICES IS WHAT `--device` TAKES**, and nothing else is in that
+/// table: a probe and a drive are written through, never run on, so their words are `--probe`'s
+/// and `--volume`'s and they are listed apart.
+fn render(attached: &[Attached], answers: &[Option<Answer>]) -> String {
+    let mut text = String::new();
+    let rows = |kind: Kind| attached.iter().zip(answers).filter(move |(one, _)| one.kind == kind);
+    let devices: Vec<Vec<String>> = rows(Kind::Device)
+        .map(|(one, answer)| {
+            let answer = answer.as_ref();
+            vec![
+                one.id.clone(),
+                "Device".to_owned(),
+                answer.map_or("-", |answer| answer.status).to_owned(),
+                answer
+                    .and_then(|answer| answer.board.clone())
+                    .unwrap_or_else(|| one.description.clone()),
+            ]
+        })
+        .collect();
+    table(&mut text, &["ID", "TYPE", "STATUS", "DESCRIPTION"], &devices);
+    for (kind, heading) in [(Kind::Probe, "PROBE"), (Kind::Drive, "DRIVE")] {
+        let listed: Vec<Vec<String>> =
+            rows(kind).map(|(one, _)| vec![one.id.clone(), one.description.clone()]).collect();
+        if !text.is_empty() && !listed.is_empty() {
+            text.push('\n');
+        }
+        table(&mut text, &[heading, "DESCRIPTION"], &listed);
+    }
+    let _ = write!(
+        text,
+        "\n{} attached. --device takes an ID; a board is written over a PROBE with --probe, or \
+         through a DRIVE with --volume.\n",
+        attached.len()
+    );
+    text
+}
+
+/// `rows` under `headings`, each column as wide as its widest cell, the last unpadded. Nothing at
+/// all when there are no rows: an empty table says nothing a reader needs.
+fn table(text: &mut String, headings: &[&str], rows: &[Vec<String>]) {
+    if rows.is_empty() {
+        return;
+    }
+    let widths: Vec<usize> = (0..headings.len())
+        .map(|column| {
+            rows.iter()
+                .map(|row| row[column].chars().count())
+                .chain([headings[column].len()])
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let mut line = |cells: Vec<&str>| {
+        let last = cells.len() - 1;
+        for (column, cell) in cells.into_iter().enumerate() {
+            if column == last {
+                text.push_str(cell);
+            } else {
+                let _ = write!(text, "{cell:<width$}  ", width = widths[column]);
+            }
+        }
+        text.push('\n');
+    };
+    line(headings.to_vec());
+    for row in rows {
+        line(row.iter().map(String::as_str).collect());
     }
 }
 
@@ -351,6 +475,54 @@ mod tests {
         let (target, note) = serial_target(&all[3], &all);
         assert_eq!(target, "COM3", "a port with no serial has only its name");
         assert!(note.is_none());
+    }
+
+    /// **THE DEVICES ARE LISTED AS .NET LISTS THEM, AND ONLY THEY ARE IN THAT TABLE.** Each device
+    /// row opens with the word `--device` takes, then its type and status; an answer to
+    /// `--identify` names the board and how it answered; probes and drives are listed apart, under
+    /// the words their own options take.
+    #[test]
+    fn devices_are_listed_as_dotnet_lists_them_and_probes_and_drives_apart() {
+        let row = |id: &str, kind, description: &str| Attached {
+            id: id.to_owned(),
+            kind,
+            description: description.to_owned(),
+        };
+        let attached = [
+            row("usb:39e9:0001:SERIAL0000000001", Kind::Device, "Lamella Link device"),
+            row("COM8", Kind::Device, "COM8  USB Serial Device  (2e8a:000a)"),
+            row("PROBE00001", Kind::Probe, "Debugprobe on Pico (CMSIS-DAP)  a board may be wired to this over SWD"),
+            row("D:\\", Kind::Drive, "RP2350  HALTED in its bootloader, waiting for an image"),
+        ];
+        let answer = |board: Option<&str>, status| {
+            Some(Answer { board: board.map(str::to_owned), status, detail: String::new() })
+        };
+        let answers = [answer(Some("Raspberry Pi Pico 2 W"), "Online"), answer(None, "No answer"), None, None];
+
+        let text = render(&attached, &answers);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("ID ") && lines[0].ends_with("STATUS     DESCRIPTION"), "{text}");
+        let type_column = lines[0].find("TYPE").expect("a TYPE column");
+        assert!(lines[1].starts_with("usb:39e9:0001:SERIAL0000000001  Device  Online"), "{text}");
+        assert!(lines[1].ends_with("Raspberry Pi Pico 2 W"), "the board it answered as: {text}");
+        assert!(lines[2].starts_with("COM8 ") && lines[2].contains("Device  No answer"), "{text}");
+        assert!(lines[2].ends_with("COM8  USB Serial Device  (2e8a:000a)"), "the OS's words, unanswered: {text}");
+        for device in &lines[1..3] {
+            assert_eq!(device.find("Device"), Some(type_column), "the columns line up: {text}");
+        }
+        assert_eq!(lines[3], "", "a probe is no device: {text}");
+        assert!(lines[4].starts_with("PROBE ") && lines[5].starts_with("PROBE00001  Debugprobe"), "{text}");
+        assert_eq!(lines[6], "", "{text}");
+        assert!(lines[7].starts_with("DRIVE ") && lines[8].starts_with("D:\\ "), "{text}");
+        assert!(text.contains("4 attached. --device takes an ID"), "{text}");
+        assert!(text.lines().all(|line| line == line.trim_end()), "no padding after the last column: {text}");
+
+        let unasked = render(&attached[..1], &[None]);
+        assert!(unasked.lines().nth(1).is_some_and(|line| line.contains("Device  -       Lamella Link device")), "{unasked}");
+        assert!(
+            !unasked.lines().any(|line| line.starts_with("PROBE") || line.starts_with("DRIVE")),
+            "an empty table is not printed: {unasked}"
+        );
     }
 
     /// A carrier this build was compiled without must be reported as such rather than as a board

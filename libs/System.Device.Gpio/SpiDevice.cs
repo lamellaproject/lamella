@@ -52,18 +52,16 @@ namespace System.Device.Spi
         /// the bus from then until its chip select is released, so two threads' transfers never
         /// interleave. Creating the device applies its settings once, which drives its chip select
         /// idle before any other device's transfer.</para>
-        /// <para>A <see cref="SpiConnectionSettings.ChipSelectLine"/> that is neither -1 nor one of
-        /// the bus's chip selects is refused at the device's first transfer with an
-        /// <see cref="System.IO.IOException"/> that names the bus's chip selects, as dotnet/iot's
-        /// Linux device refuses it when it opens <c>/dev/spidev</c><i>B</i>.<i>C</i> at its first
-        /// transfer.</para>
+        /// <para>A bus the board does not have, or any bus of a program built for no board, and a
+        /// <see cref="SpiConnectionSettings.ChipSelectLine"/> that is neither -1 nor one of the bus's
+        /// chip selects, are refused at the device's first transfer with an
+        /// <see cref="System.IO.IOException"/> that says which, as dotnet/iot's Linux device refuses
+        /// them when it opens <c>/dev/spidev</c><i>B</i>.<i>C</i> at its first transfer.</para>
         /// </remarks>
-        /// <exception cref="System.InvalidOperationException">No driver is bound for the
-        /// settings' bus.</exception>
         public static SpiDevice Create(SpiConnectionSettings settings)
         {
             if ((object)settings == null) throw new System.ArgumentNullException("settings");
-            return new DriverSpiDevice(settings.Clone(), Buses.ResolveSpi(settings.BusId), false);
+            return new DriverSpiDevice(settings.Clone(), Buses.FindSpi(settings.BusId), false);
         }
 
         /// <summary>Disposes this instance.</summary>
@@ -97,7 +95,7 @@ namespace System.Device.Spi
             _oneIn = new byte[1];
             _none = new byte[0];
             int line = settings.ChipSelectLine;
-            _selectable = line == -1 || (line >= 0 && line < driver.ChipSelectCount);
+            _selectable = (object)driver != null && (line == -1 || (line >= 0 && line < driver.ChipSelectCount));
             if (_selectable)
             {
                 EnterBus();
@@ -119,7 +117,7 @@ namespace System.Device.Spi
 
         internal uint NativeBusIdentity
         {
-            get { return _driver.NativeBusIdentity; }
+            get { return (object)_driver == null ? 0u : _driver.NativeBusIdentity; }
         }
 
         public override void Read(System.Span<byte> buffer)
@@ -194,6 +192,7 @@ namespace System.Device.Spi
         private void RefuseUnlessSelectable()
         {
             if (_selectable) return;
+            if ((object)_driver == null) throw new System.IO.IOException(Buses.MissingSpi(_settings.BusId));
             throw new System.IO.IOException(NotAChipSelect());
         }
 
@@ -230,7 +229,7 @@ namespace System.Device.Spi
 
         protected override void Dispose(bool disposing)
         {
-            if (!disposing) return;
+            if (!disposing || (object)_driver == null) return;
             if (_ownsDriver)
             {
                 _driver.Dispose();

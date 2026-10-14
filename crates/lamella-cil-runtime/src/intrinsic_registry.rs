@@ -51,6 +51,10 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(bitconverter_int64_bits_to_double),
     #[cfg(feature = "float")]
     entry!(bitconverter_single_to_int32_bits),
+    #[cfg(feature = "board-buses")]
+    entry!(board_buses_length),
+    #[cfg(feature = "board-buses")]
+    entry!(board_buses_word),
     #[cfg(feature = "NETMFv4_4")]
     entry!(boolean_parse),
     entry!(boolean_to_string),

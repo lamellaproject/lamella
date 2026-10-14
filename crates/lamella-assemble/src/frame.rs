@@ -90,7 +90,7 @@ pub struct Frame {
     /// the outer's `Temp(0)` would then read the inner's spilled value. Behind a `RefCell` for
     /// the same reason `local_types` is: emission holds the frame by shared reference.
     temp_scopes: RefCell<Vec<Vec<u16>>>,
-    constructor_of: Option<TypeSymbol>,
+    constructor_of: Option<(TypeSymbol, bool)>,
 }
 
 impl Frame {
@@ -131,16 +131,20 @@ impl Frame {
     ///
     /// **THE TYPE IS PART OF THE ANSWER AND NOT DECORATION:** 17.4.2 names a constructor of the
     /// class that DECLARES the field, so a derived class's constructor addresses an inherited
-    /// readonly field through a copy exactly as an ordinary method does.
-    pub fn set_constructor_of(&mut self, owner: Option<TypeSymbol>) {
-        self.constructor_of = owner;
+    /// readonly field through a copy exactly as an ordinary method does. **SO IS WHICH
+    /// CONSTRUCTOR**, the `bool` (`true` for `.cctor`): a static readonly field is a variable only
+    /// in the static constructor, and an instance one only in an instance constructor.
+    pub fn set_constructor_of(&mut self, constructor: Option<(TypeSymbol, bool)>) {
+        self.constructor_of = constructor;
     }
 
-    /// The type whose constructor is being emitted, if this body is one. See
-    /// [`Frame::set_constructor_of`].
+    /// The type whose constructor is being emitted, and whether it is the static constructor, if
+    /// this body is one. See [`Frame::set_constructor_of`].
     #[must_use]
-    pub fn constructor_of(&self) -> Option<&TypeSymbol> {
-        self.constructor_of.as_ref()
+    pub fn constructor_of(&self) -> Option<(&TypeSymbol, bool)> {
+        self.constructor_of
+            .as_ref()
+            .map(|(owner, is_static)| (owner, *is_static))
     }
 
     /// The slot a name occupies, if any.

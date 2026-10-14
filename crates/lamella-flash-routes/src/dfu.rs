@@ -703,7 +703,7 @@ pub fn choose_device<'a>(
             )),
             [] => Err(format!(
                 "no attached DFU bootloader reports serial {serial}. Attached under vendor {vendor_id:04x}:\n{listing}\n\n\
-                 Name one with --device <serial>."
+                 Name one with --dfu <serial>."
             )),
             several => Err(format!(
                 "{} attached DFU bootloaders report serial {serial}, so it names none of them:\n{listing}",
@@ -716,7 +716,7 @@ pub fn choose_device<'a>(
         [] => Err(format!("no DFU bootloader under vendor {vendor_id:04x} is attached.")),
         several => Err(format!(
             "{} DFU bootloaders are attached under vendor {vendor_id:04x} and none was named:\n{listing}\n\n\
-             Name one with --device <serial>.",
+             Name one with --dfu <serial>.",
             several.len()
         )),
     }

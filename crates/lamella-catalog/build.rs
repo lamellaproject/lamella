@@ -11,11 +11,16 @@ fn main() {
     let parts = collect(&repo.join("csp"), Path::new("parts.toml"));
     let modules = collect(&repo.join("csp"), Path::new("module.toml"));
     let board_python = collect(&repo.join("bsp"), &Path::new("python").join("board.py"));
+    let bus_tables = collect(&repo.join("bsp"), &Path::new("rust").join("bus_table.rs"));
 
     println!("cargo:rerun-if-changed={}", repo.join("bsp").display());
     println!("cargo:rerun-if-changed={}", repo.join("csp").display());
-    for path in
-        boards.values().chain(parts.values()).chain(modules.values()).chain(board_python.values())
+    for path in boards
+        .values()
+        .chain(parts.values())
+        .chain(modules.values())
+        .chain(board_python.values())
+        .chain(bus_tables.values())
     {
         println!("cargo:rerun-if-changed={}", path.display());
     }
@@ -47,7 +52,19 @@ fn main() {
     for (id, path) in &board_python {
         out.push_str(&format!("    ({id:?}, include_str!({:?})),\n", path.display().to_string()));
     }
-    out.push_str("];\n");
+    out.push_str(
+        "];\n\n/// Every board's GENERATED bus table, by board id: the words the host writes into an image \
+         built\n/// for that board. A board whose family has no table has no entry.\npub const BUS_TABLES: \
+         &[(&str, &[u32])] = &[\n",
+    );
+    for (index, id) in bus_tables.keys().enumerate() {
+        out.push_str(&format!("    ({id:?}, bus_tables::board_{index}::BUS_TABLE),\n"));
+    }
+    out.push_str("];\n\nmod bus_tables {\n");
+    for (index, path) in bus_tables.values().enumerate() {
+        out.push_str(&format!("    #[path = {:?}]\n    pub mod board_{index};\n", path.display().to_string()));
+    }
+    out.push_str("}\n");
 
     let dest = PathBuf::from(std::env::var_os("OUT_DIR").expect("out dir")).join("catalog.rs");
     std::fs::write(&dest, out).expect("write catalog");

@@ -538,6 +538,9 @@ pub struct ControlPin {
     /// position that reaches two GPIOs. The board's adc binding gives a twin the same analog pad
     /// setup as its channel's own pad, since a pull left on it loads the reading.
     pub twin: String,
+    /// Whether the board's own circuit drives the line, so a program's GPIO controller refuses
+    /// it: a radio's control lines, which the radio's driver runs. Pin-wired rows only.
+    pub reserved: bool,
 }
 
 impl Default for ControlPin {
@@ -551,6 +554,7 @@ impl Default for ControlPin {
             address: -1,
             pull: String::new(),
             twin: String::new(),
+            reserved: false,
         }
     }
 }
@@ -715,6 +719,11 @@ pub struct MemoryRegion {
     /// turns the board's citation into a checked fact -- the two are held equal at generation
     /// time rather than trusted to have been copied correctly.
     pub window: String,
+    /// The fitted device as the board's schematic prints it (`[memory.<region>.device] part`),
+    /// empty when the board names none. A bring-up that serves more than one part chooses the
+    /// part's commands and limits by this name, so it is emitted; a description of the part
+    /// belongs in the record's `source`.
+    pub part: String,
     /// The FITTED DEVICE's shape, as named integer facts: what the controller must be told about
     /// the part this board soldered on. Which keys are legal depends on the controller, so the
     /// reader takes any scalar and RESOLUTION enforces the set -- the knowledge of what an SDRAM
@@ -3190,6 +3199,7 @@ fn control_pin_key(
         ("role", RawValue::Str(s)) => pin.role = s.clone(),
         ("address", RawValue::Int(i)) => pin.address = i.value,
         ("twin", v @ RawValue::Inline(_)) => pin.twin = as_pin_ref(line, "twin", v)?.pin,
+        ("reserved", RawValue::Int(i)) => pin.reserved = i.value != 0,
         ("source", RawValue::Str(_)) => {}
         (other, _) => return Err(err(line, &format!("unexpected control-pin key '{other}'"))),
     }
@@ -4075,7 +4085,8 @@ fn build_board(
                     }
                 }
                 At::MemoryDevice(index) => match (key.as_str(), value) {
-                    ("part" | "source" | "notes", RawValue::Str(_)) => {}
+                    ("part", RawValue::Str(s)) => table.memory[index].part = s.clone(),
+                    ("source" | "notes", RawValue::Str(_)) => {}
                     (fact, RawValue::Int(i)) => {
                         let region = &mut table.memory[index];
                         if region.device.iter().any(|(k, _)| k == fact) {
@@ -4380,6 +4391,12 @@ fn build_board(
             return Err(format!(
                 "board {}: two memory regions are named '{}'",
                 table.board, region.name
+            ));
+        }
+        if region.part.chars().any(|c| c.is_whitespace() || c == ',') {
+            return Err(format!(
+                "board {}: memory region '{}' names its part as '{}' -- a part is the name the schematic prints, and a description of it belongs in the record's source",
+                table.board, region.name, region.part
             ));
         }
     }
@@ -4967,6 +4984,12 @@ pub fn resolve_board(set: &FamilySet, board: BoardTable) -> Result<ResolvedBoard
     }
     validate_bindings(set, &bindings, &part, &board.board)?;
     for line in board.devices.iter().chain(module_pins.iter()) {
+        if line.reserved && line.pin.is_empty() {
+            return Err(format!(
+                "board {}: device '{}' is reserved but wired to no pin -- only a pin-wired line can be kept from a program's GPIO controller",
+                board.board, line.name
+            ));
+        }
         if !line.pin.is_empty() && line.active.is_empty() {
             return Err(format!(
                 "board {}: device '{}' is wired to {} and states no `active` level -- write one of {} \
@@ -5683,6 +5706,77 @@ fn emit_pins_swift(map: &ExtIntMap, regen: &str) -> Result<String, String> {
 #[must_use]
 pub fn bindings_class(board: &str) -> String {
     format!("{}Bindings", pascal(board))
+}
+
+/// The name of the class a board's C# package declares by hand beside its generated bindings: the
+/// bindings name less the maker the board's id begins with, so `rpi-pico2-w` gives `Pico2W`. Its
+/// namespace is `Lamella.Boards.` and the board's [`vendor_segment`], and `build-boards.ps1` names the
+/// board's assembly by the same rule.
+#[must_use]
+pub fn board_class(board: &str) -> String {
+    let name = pascal(board);
+    let maker = board.split('-').next().unwrap_or_default();
+    match name.get(maker.len()..) {
+        Some(rest) if !rest.is_empty() => rest.to_string(),
+        _ => name,
+    }
+}
+
+/// The file the generated half of `Lamella.Hardware.TargetBoard` is written to, in a board's
+/// `csharp` directory.
+pub const TARGET_BOARD_FACTS_FILE: &str = "TargetBoardFacts.g.cs";
+
+/// Emits the generated half of `Lamella.Hardware.TargetBoard` for one board: the board's id, which is
+/// the name a build selects the board by, and the call that arms the board.
+///
+/// The hand-written half is `bsp/TargetBoard.cs`, and `build-boards.ps1` compiles both into the
+/// board's assembly. `board_class` is the class the board's package declares by hand
+/// ([`board_class`]), when it declares one. Its type initializer binds the board's buses, so arming
+/// reads its `BoardModel`, which runs that initializer the first time and nothing after. A read
+/// rather than a construction, because a class's constructor may do more than bind: the Pico 2's
+/// raises the clock tree. A board whose package declares no class has nothing to bind, and arming it
+/// reads the generated bindings' identity alone.
+#[must_use]
+pub fn emit_target_board_facts_csharp(
+    resolved: &ResolvedBoard,
+    board_class: Option<&str>,
+    sources: &[String],
+    regen: &str,
+) -> String {
+    let id = &resolved.board.board;
+    let arm = match board_class {
+        Some(class) => format!(
+            "        /// <summary>Binds the board's buses, and answers the board's wire identity: reading a\n        \
+             /// static of the board's class runs its type initializer, which binds them the first time\n        \
+             /// and does nothing after.</summary>\n        \
+             internal static int Arm()\n        {{\n            \
+             return global::Lamella.Boards.{vendor}.{class}.BoardModel;\n        }}\n",
+            vendor = vendor_segment(&resolved.board.vendor),
+        ),
+        None => format!(
+            "        /// <summary>Answers the board's wire identity, and binds nothing: this board's package\n        \
+             /// declares no class that binds its buses.</summary>\n        \
+             internal static int Arm()\n        {{\n            \
+             return {bindings}.BOARD_MODEL;\n        }}\n",
+            bindings = bindings_class(id),
+        ),
+    };
+    format!(
+        "// GENERATED by lamella-bsp-gen from {list} -- DO NOT EDIT.\n\
+         // Regenerate: {regen}\n\
+         //\n\
+         // What Lamella.Hardware.TargetBoard answers on the {id}: its name, and how it is armed.\n\
+         namespace Lamella.Generated\n\
+         {{\n    \
+         internal static class TargetBoardFacts\n    \
+         {{\n        \
+         /// <summary>The board's id, the name a build selects this board by.</summary>\n        \
+         internal const string Name = \"{id}\";\n\n\
+         {arm}    \
+         }}\n\
+         }}\n",
+        list = sources.join(" + "),
+    )
 }
 
 /// One resolved uart-binding emission: the values the neutral binding contract names, derived
@@ -10428,6 +10522,9 @@ fn memory_rows(set: &FamilySet, resolved: &ResolvedBoard) -> Result<Vec<Row>, St
         if !region.controller.is_empty() {
             text(&mut rows, format!("{prefix}_CONTROLLER"), &region.controller);
         }
+        if !region.part.is_empty() {
+            text(&mut rows, format!("{prefix}_PART"), &region.part);
+        }
         uint(&mut rows, format!("{prefix}_OPTIONAL"), u32::from(region.optional).to_string());
     }
     for region in &board.memory {
@@ -13189,6 +13286,9 @@ pub fn emit_board_python(
             if !region.controller.is_empty() {
                 entry.push_str(&format!(", \"controller\": \"{}\"", region.controller));
             }
+            if !region.part.is_empty() {
+                entry.push_str(&format!(", \"part\": \"{}\"", region.part));
+            }
             entry.push_str(&format!(
                 ", \"optional\": {}",
                 if region.optional { "True" } else { "False" }
@@ -14378,11 +14478,202 @@ fn layout_languages(block: &BlockTable, source: &str, swift: bool) -> Result<Vec
     Ok(family.iter().copied().filter(|language| block.emits(language)).collect())
 }
 
+/// A bus table's first word, "LBUS" read as a little-endian `u32`.
+pub const BUS_TABLE_MAGIC: u32 = 0x5355_424C;
+/// The bus table format this generator writes.
+pub const BUS_TABLE_VERSION: u32 = 1;
+/// A row of the board's GPIO controller, which is always bus 0.
+pub const BUS_KIND_GPIO: u32 = 1;
+/// A row of an I2C bus.
+pub const BUS_KIND_I2C: u32 = 2;
+/// A row of an SPI bus.
+pub const BUS_KIND_SPI: u32 = 3;
+
+/// The families whose `System.Device.Gpio` build carries their drivers. A row's words are what
+/// one of those drivers is constructed from, so a board of any other family has no table, and an
+/// image built for it answers that it has none.
+pub const BUS_TABLE_FAMILIES: &[&str] = &["rp2350"];
+
+/// The generated file, beside a board's other generated Rust, that holds its bus table.
+pub const BUS_TABLE_FILE: &str = "bus_table.rs";
+
+/// The bus table the host writes into an image built for `board`, as little-endian words: the
+/// header (magic, version, the board's `product_model`, the row count), then each row as its kind,
+/// its bus number, its word count and its words, sorted by kind and then bus. A bus is numbered by
+/// its block (I2C0 is bus 0), and a row's words are the family driver's binding, in the order its
+/// constructor takes them. A board with no buses gets the header and no rows.
+///
+/// # Errors
+/// When the board's family is not in [`BUS_TABLE_FAMILIES`], when a value does not fit a word,
+/// or when the board states a bus or a line the family's row shape cannot carry.
+pub fn bus_table(set: &FamilySet, board: &ResolvedBoard) -> Result<Vec<u32>, String> {
+    let id = &board.board.board;
+    let mut rows = match set.family.as_str() {
+        "rp2350" => rp2350_bus_rows(set, board)?,
+        other => {
+            return Err(format!(
+                "{id}: family '{other}' has no bus table, because its System.Device.Gpio build carries no drivers"
+            ));
+        }
+    };
+    rows.sort_by_key(|(kind, bus, _)| (*kind, *bus));
+    for pair in rows.windows(2) {
+        if (pair[0].0, pair[0].1) == (pair[1].0, pair[1].1) {
+            return Err(format!(
+                "{id}: two rows describe bus {} of kind {}, and a program can open only one of them",
+                pair[0].1, pair[0].0
+            ));
+        }
+    }
+    let model = u32::try_from(board.board.product_model)
+        .map_err(|_| format!("{id}: product_model {} does not fit a word", board.board.product_model))?;
+    let count = u32::try_from(rows.len()).map_err(|_| format!("{id}: too many buses for one table"))?;
+    let mut words = vec![BUS_TABLE_MAGIC, BUS_TABLE_VERSION, model, count];
+    for (kind, bus, row) in rows {
+        words.push(kind);
+        words.push(bus);
+        words.push(u32::try_from(row.len()).map_err(|_| format!("{id}: a row too long for one table"))?);
+        words.extend(row);
+    }
+    Ok(words)
+}
+
+/// One row of a bus table before it is laid out: kind, bus number, words.
+type BusRow = (u32, u32, Vec<u32>);
+
+/// The RP2350's rows, read from the same emissions every language's constants are rendered from,
+/// so a row and the board's constants cannot disagree.
+fn rp2350_bus_rows(set: &FamilySet, resolved: &ResolvedBoard) -> Result<Vec<BusRow>, String> {
+    let id = &resolved.board.board;
+    let emissions = resolve_board_emissions(set, resolved)?;
+    let mut rows = vec![(BUS_KIND_GPIO, 0, rp2350_gpio_words(resolved)?)];
+    for i2c in &emissions.dw_i2cs {
+        // Rp2350I2cBinding's constructor order.
+        let values = [
+            i2c.base,
+            i2c.reset_mask,
+            i2c.io_sda_ctrl,
+            i2c.pads_sda,
+            i2c.io_scl_ctrl,
+            i2c.pads_scl,
+            i2c.funcsel,
+            i2c.ic_clk_hz,
+        ];
+        rows.push((BUS_KIND_I2C, bus_number(id, &i2c.instance)?, bus_words(id, &i2c.prefix, &values)?));
+    }
+    for spi in &emissions.pl022_spis {
+        let signal = |name: &str| {
+            spi.signals
+                .iter()
+                .find(|(signal, _, _)| signal == name)
+                .map(|(_, io_ctrl, pads)| [*io_ctrl, *pads])
+                .ok_or_else(|| format!("{id}: {} states no {name} signal, and its bus row needs one", spi.prefix))
+        };
+        let selects = emissions
+            .chip_selects
+            .iter()
+            .find(|table| table.prefix == spi.prefix)
+            .map(|table| table.pins.clone())
+            .unwrap_or_default();
+        // Rp2350SpiBinding's constructor order, its select array counted and then listed.
+        let mut values = vec![spi.base, spi.reset_mask];
+        values.extend(signal("miso")?);
+        values.extend(signal("sck")?);
+        values.extend(signal("mosi")?);
+        values.extend([spi.funcsel, spi.sspclk_hz, selects.len() as i64]);
+        values.extend(selects);
+        rows.push((BUS_KIND_SPI, bus_number(id, &spi.instance)?, bus_words(id, &spi.prefix, &values)?));
+    }
+    Ok(rows)
+}
+
+/// The GPIO row, in Rp2350GpioDriver's constructor order: the mask of the bank-0 lines the board
+/// reserves, the number of paired pins, then each pin and the partner pad the board wires to it.
+fn rp2350_gpio_words(resolved: &ResolvedBoard) -> Result<Vec<u32>, String> {
+    let id = &resolved.board.board;
+    let gpio = |pin: &str| {
+        split_pin(pin)
+            .map(|(_, index)| index)
+            .ok_or_else(|| format!("{id}: '{pin}' is not a GPIO, and the GPIO row numbers its pins"))
+    };
+    let mut reserved = 0u32;
+    let mut pairs = Vec::new();
+    for line in resolved.board.devices.iter().chain(resolved.module_pins.iter()) {
+        if line.reserved {
+            let index = gpio(&line.pin)?;
+            if index >= 32 {
+                return Err(format!(
+                    "{id}: device '{}' reserves {}, but the RP2350 GPIO driver's reserved mask covers GP0 to GP31",
+                    line.name, line.pin
+                ));
+            }
+            reserved |= 1 << index;
+        }
+        if !line.twin.is_empty() {
+            pairs.push(gpio(&line.twin)?);
+            pairs.push(gpio(&line.pin)?);
+        }
+    }
+    let mut words = vec![reserved, u32::try_from(pairs.len() / 2).map_err(|_| format!("{id}: too many paired pins"))?];
+    words.extend(pairs);
+    Ok(words)
+}
+
+/// A bus's number: the block number its instance ends in (`i2c0` is bus 0).
+fn bus_number(board: &str, instance: &str) -> Result<u32, String> {
+    let digits = &instance[instance.trim_end_matches(|c: char| c.is_ascii_digit()).len()..];
+    digits.parse::<u32>().map_err(|_| {
+        format!("{board}: instance '{instance}' ends in no block number, and a bus is numbered by its block")
+    })
+}
+
+/// A row's values as words, refusing one a word cannot hold rather than truncating it.
+fn bus_words(board: &str, prefix: &str, values: &[i64]) -> Result<Vec<u32>, String> {
+    values
+        .iter()
+        .map(|value| {
+            u32::try_from(*value).map_err(|_| format!("{board}: {prefix}'s bus row holds {value}, which does not fit a word"))
+        })
+        .collect()
+}
+
+/// A board's `bus_table.rs`: [`bus_table`]'s words as one constant, a row to a line.
+fn emit_bus_table_rust(board: &str, words: &[u32], sources: &[String], regen: &str) -> String {
+    let mut out = String::new();
+    let what = format!(
+        "The bus table the host writes into an image built for {board}: the header, then one row per\n// bus, each its kind (1 GPIO, 2 I2C, 3 SPI), bus number, word count and words."
+    );
+    emit_rust_header(&mut out, &what, sources, regen);
+    let word = |value: &u32| if *value >= 0x100 { format!("0x{value:X}") } else { value.to_string() };
+    let line = |row: &[u32], what: String| {
+        format!("    {}, // {what}\n", row.iter().map(word).collect::<Vec<_>>().join(", "))
+    };
+    out.push_str("\n/// The table as little-endian words.\npub const BUS_TABLE: &[u32] = &[\n");
+    let (header, mut rest) = words.split_at(4.min(words.len()));
+    out.push_str(&line(header, "LBUS, version, product model, rows".to_string()));
+    while rest.len() >= 3 {
+        let length = rest[2] as usize + 3;
+        let (row, tail) = rest.split_at(length.min(rest.len()));
+        let kind = match row[0] {
+            BUS_KIND_GPIO => "GPIO",
+            BUS_KIND_I2C => "I2C",
+            BUS_KIND_SPI => "SPI",
+            _ => "kind",
+        };
+        out.push_str(&line(row, format!("{kind} bus {}", row[1])));
+        rest = tail;
+    }
+    out.push_str("];\n");
+    out
+}
+
 /// Generates every artifact of a family: the C# layout classes, the instances class (C# and
 /// its 1:1 Rust twin), the pad-to-EXTINT lookup when the pin table states the die's EIC map, and
 /// per board under `bsp/*/board.toml` whose family (or module's family) matches, a bindings class
-/// (C#) plus its 1:1 Rust twin -- one strata load, every projection, so gate A freshness and the
-/// gate B anchors cover all of them together.
+/// (C#) plus its 1:1 Rust twin, the generated half of the board's `Lamella.Hardware.TargetBoard`
+/// ([`emit_target_board_facts_csharp`]) and, for a family in [`BUS_TABLE_FAMILIES`], the board's
+/// [`bus_table`] -- one strata load, every projection, so gate A freshness and the gate B anchors
+/// cover all of them together.
 pub fn generate_family(repo_root: &std::path::Path, family: &str) -> Result<Vec<Generated>, String> {
     let regen = format!("cargo run -p lamella-bsp-gen -- gen-family . {family}");
     let set = load_family(repo_root, family)?;
@@ -14484,10 +14775,31 @@ pub fn generate_family(repo_root: &std::path::Path, family: &str) -> Result<Vec<
             path: format!("bsp/{dir}/csharp/{}.g.cs", bindings_class(&id)),
             contents: emit_board_csharp(&set, &resolved, &sources, &regen)?,
         });
+        let class = board_class(&id);
+        let declared = repo_root.join(format!("bsp/{dir}/csharp/{class}.cs")).is_file();
+        let mut facts_sources = vec![format!("bsp/{dir}/board.toml")];
+        if declared {
+            facts_sources.push(format!("bsp/{dir}/csharp/{class}.cs"));
+        }
+        out.push(Generated {
+            path: format!("bsp/{dir}/csharp/{TARGET_BOARD_FACTS_FILE}"),
+            contents: emit_target_board_facts_csharp(
+                &resolved,
+                declared.then_some(class.as_str()),
+                &facts_sources,
+                &regen,
+            ),
+        });
         out.push(Generated {
             path: format!("bsp/{dir}/rust/{}_bindings.rs", snake(&id)),
             contents: emit_board_rust(&set, &resolved, &sources, &regen)?,
         });
+        if BUS_TABLE_FAMILIES.contains(&family) {
+            out.push(Generated {
+                path: format!("bsp/{dir}/rust/{BUS_TABLE_FILE}"),
+                contents: emit_bus_table_rust(&id, &bus_table(&set, &resolved)?, &sources, &regen),
+            });
+        }
         out.push(Generated {
             path: format!("bsp/{dir}/python/board.py"),
             contents: emit_board_python(&set, &resolved, &sources, &regen)?,
@@ -14523,6 +14835,33 @@ op = "write"
 reg = "CTRL"
 value = 0x2
 "#;
+
+    /// A board's hand-written class is its bindings name less its maker, as `build-boards.ps1` names
+    /// the board's assembly; and `TargetBoard`'s generated half arms through that class's static,
+    /// or reads the bindings' identity where the package declares no class.
+    #[test]
+    fn target_board_facts_name_the_board_and_arm_its_class() {
+        assert_eq!(board_class("rpi-pico2-w"), "Pico2W");
+        assert_eq!(board_class("pimoroni-pico-plus-2"), "PicoPlus2");
+        assert_eq!(board_class("bbc-micro-bit-v2"), "MicroBitV2");
+        assert_eq!(board_class("automationdirect-p1am-100"), "P1am100");
+
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let set = load_family(&repo, "rp2350").expect("the rp2350 family loads");
+        let board = |id: &str| {
+            let Strata::Board(board) = parse(&read(&repo.join(format!("bsp/{id}/board.toml"))).expect("reads"))
+                .expect("parses")
+            else {
+                panic!("{id} is a board")
+            };
+            resolve_board(&set, board).expect("resolves")
+        };
+        let armed = emit_target_board_facts_csharp(&board("rpi-pico2-w"), Some("Pico2W"), &[], "regen");
+        assert!(armed.contains("internal const string Name = \"rpi-pico2-w\";"), "{armed}");
+        assert!(armed.contains("return global::Lamella.Boards.RaspberryPi.Pico2W.BoardModel;"), "{armed}");
+        let bare = emit_target_board_facts_csharp(&board("rpi-pico2"), None, &[], "regen");
+        assert!(bare.contains("return RpiPico2Bindings.BOARD_MODEL;"), "{bare}");
+    }
 
     /// A chip select is numbered as its family's GPIO driver numbers the pin, and the family decides:
     /// the RP2350's `GP7` and an ST part's `PG7` split to the same port and index, and are pins 7 and
@@ -14988,6 +15327,45 @@ source = "s"
         assert!(parse(&unnamed).unwrap_err().contains("states no name"));
         let collided = source.replace("name = \"sdram\"", "name = \"qspi\"");
         assert!(parse(&collided).unwrap_err().contains("two memory regions are named"));
+    }
+
+    #[test]
+    fn a_regions_fitted_part_is_kept_as_the_name_the_schematic_prints() {
+        let source = r#"
+[table]
+kind = "board"
+board = "b"
+vendor = "vend"
+family = "fam"
+part = "p"
+product_model = 1
+
+[[memory]]
+name = "psram"
+kind = "ram"
+base = 0x11000000
+size = 0x800000
+controller = "qmi"
+optional = true
+source = "the board schematic"
+
+[memory.psram.device]
+part = "APS6404L-3SQR-ZR"
+source = "the board schematic"
+
+[[plans]]
+name = "n"
+default = true
+source = "s"
+"#;
+        let Strata::Board(board) = parse(source).expect("parses") else { panic!("kind") };
+        assert_eq!(board.memory[0].part, "APS6404L-3SQR-ZR");
+        assert!(board.memory[0].device.is_empty());
+        let described = source.replace("\"APS6404L-3SQR-ZR\"", "\"APS6404L-3SQR-ZR, 8 MB QSPI PSRAM\"");
+        assert!(parse(&described).unwrap_err().contains("a part is the name the schematic prints"));
+        let unnamed = source.replace("part = \"APS6404L-3SQR-ZR\"\n", "");
+        let Strata::Board(board) = parse(&unnamed).expect("parses") else { panic!("kind") };
+        assert!(board.memory[0].part.is_empty(), "a board that names no part states none");
     }
 
     #[test]

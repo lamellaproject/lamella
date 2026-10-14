@@ -283,10 +283,16 @@ namespace Lamella.Generated
         /// -- memory regions the board fits: SIZE is what a program may reach, which a device's own
         /// size may exceed; a region with a CONTROLLER does not exist until that instance is brought
         /// up, and touching it first is a bus fault rather than a wrong value --
-        public const uint MEMORY_REGION_COUNT = 1;
+        public const uint MEMORY_REGION_COUNT = 2;
         public const string MEMORY_FLASH_KIND = "flash";
         public const uint MEMORY_FLASH_SIZE = 0x1000000;
         public const uint MEMORY_FLASH_OPTIONAL = 0;
+        public const string MEMORY_PSRAM_KIND = "ram";
+        public const uint MEMORY_PSRAM_BASE = 0x11000000;
+        public const uint MEMORY_PSRAM_SIZE = 0x800000;
+        public const string MEMORY_PSRAM_CONTROLLER = "qmi";
+        public const string MEMORY_PSRAM_PART = "APS6404L-3SQR-ZR";
+        public const uint MEMORY_PSRAM_OPTIONAL = 1;
 
         /// -- connectors: the sockets a removable module plugs into. The socket is board truth --
         /// it is on the schematic and identical on every unit -- and what is plugged into it is not,

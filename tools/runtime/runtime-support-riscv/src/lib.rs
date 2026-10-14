@@ -1214,6 +1214,48 @@ unsafe fn monitor_pulse_impl(obj: u32, one: bool) {
 }
 
 
+extern "C" {
+    /// The bus table of the board the build names, as the AOT link lays it: a STRONG
+    /// `lamella_board_buses` over the table's words when the build names a board with one, or else
+    /// the WEAK one-word default below, whose first word is not the table's `LBUS` header -- no
+    /// table, so every bus is absent. `Lamella.Hardware.BoardBuses` reads it through the two entries
+    /// after it, as on ARM.
+    #[link_name = "lamella_board_buses"]
+    static BOARD_BUSES: u32;
+}
+
+core::arch::global_asm!(
+    ".weak lamella_board_buses",
+    ".align 2",
+    ".type lamella_board_buses, @object",
+    "lamella_board_buses:",
+    ".word 0",
+    ".size lamella_board_buses, 4",
+);
+
+/// Word `index` of the linked bus table, for `lamella-board-buses`' lookups. Unbounded by design: the
+/// link checks the table it lays (`lamella_board_buses::check`), and the lookups read only what its
+/// header and rows declare -- the default's one word included, since a first word other than `LBUS`
+/// ends every lookup there.
+fn board_buses_word_at(index: usize) -> Option<u32> {
+    Some(unsafe { core::ptr::addr_of!(BOARD_BUSES).add(index).read() })
+}
+
+/// `Lamella.Hardware.BoardBuses.Length(kind, bus)` on a linked image: -1 when the image carries no
+/// table, 0 for a bus the table lacks or a negative argument, and that bus's descriptor word count
+/// otherwise -- the answers the interpreter gives from a baked image's table.
+#[no_mangle]
+extern "C" fn lamella_board_buses_length(kind: i32, bus: i32) -> i32 {
+    lamella_board_buses::length(board_buses_word_at, kind, bus)
+}
+
+/// `Lamella.Hardware.BoardBuses.Word(kind, bus, index)` on a linked image: word `index` of that bus's
+/// descriptor, and 0 outside it.
+#[no_mangle]
+extern "C" fn lamella_board_buses_word(kind: i32, bus: i32, index: i32) -> u32 {
+    lamella_board_buses::word(board_buses_word_at, kind, bus, index)
+}
+
 core::arch::global_asm!(
     ".weak __lamella_stackmaps_start",
     ".weak __lamella_stackmaps_end",

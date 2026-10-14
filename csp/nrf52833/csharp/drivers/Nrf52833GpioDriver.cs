@@ -41,8 +41,6 @@ public sealed class Nrf52833GpioDriver : GpioDriver
 
     protected override int PinCount { get { return 42; } }
 
-    protected override int ConvertPinNumberToLogicalNumberingScheme(int pinNumber) { return pinNumber; }
-
     protected override void OpenPin(int pinNumber) { }
 
     protected override void ClosePin(int pinNumber)

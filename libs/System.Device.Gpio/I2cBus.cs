@@ -19,13 +19,20 @@ namespace System.Device.I2c
         /// releasing the address for a later <see cref="CreateDevice"/>.</summary>
         public abstract void RemoveDevice(int deviceAddress);
 
-        /// <summary>Creates a bus channel for <paramref name="busId"/>, over the driver the
-        /// board bound for that bus. Devices created from the bus share it.</summary>
-        /// <exception cref="System.InvalidOperationException">No driver is bound for
-        /// <paramref name="busId"/>.</exception>
+        /// <summary>Creates a bus channel for <paramref name="busId"/>, over the driver of that bus
+        /// on the board the program was built for. Devices created from the bus share it.</summary>
+        /// <exception cref="System.IO.IOException">The board has no such bus, or the program was
+        /// built for no board.</exception>
         public static I2cBus Create(int busId)
         {
-            return new DriverI2cBus(busId, Buses.ResolveI2c(busId));
+            return new DriverI2cBus(busId, Open(busId));
+        }
+
+        internal static I2cDriver Open(int busId)
+        {
+            I2cDriver driver = Buses.FindI2c(busId);
+            if ((object)driver == null) throw new System.IO.IOException(Buses.MissingI2c(busId));
+            return driver;
         }
 
         /// <summary>Disposes this instance.</summary>

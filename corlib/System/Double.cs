@@ -4,12 +4,12 @@ namespace System
 {
     public struct Double : IComparable, IFormattable
     {
-        public static readonly double MaxValue = BitConverter.Int64BitsToDouble(0x7FEFFFFFFFFFFFFFL);
-        public static readonly double MinValue = BitConverter.Int64BitsToDouble(unchecked((long)0xFFEFFFFFFFFFFFFF));
-        public static readonly double Epsilon = BitConverter.Int64BitsToDouble(0x0000000000000001L);
-        public static readonly double NaN = BitConverter.Int64BitsToDouble(0x7FF8000000000000L);
-        public static readonly double PositiveInfinity = BitConverter.Int64BitsToDouble(0x7FF0000000000000L);
-        public static readonly double NegativeInfinity = BitConverter.Int64BitsToDouble(unchecked((long)0xFFF0000000000000));
+        public const double MaxValue = 1.7976931348623157E+308;
+        public const double MinValue = -1.7976931348623157E+308;
+        public const double Epsilon = 4.9406564584124654E-324;
+        public const double NaN = (double)0.0 / (double)0.0;
+        public const double PositiveInfinity = (double)1.0 / (double)0.0;
+        public const double NegativeInfinity = (double)(-1.0) / (double)0.0;
 
         public static bool IsNaN(double d)
         {

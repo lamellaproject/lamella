@@ -9,11 +9,13 @@ registers its lookup with the device TLS backend (`lamella_tls_mbedtls::set_syst
 
 `src/roots.der` is the concatenated DER of every root in the **Mozilla CA certificate store**, and
 `src/bundle.rs` is a subject-DN index over it (sorted, for a binary search). Both are **generated**
-by `gen/gen_roots.py` from the official curl distribution of the Mozilla store:
+by `lamella-tls-roots-gen`, the host tool in the crate of that name beside this one, from the
+official curl distribution of the Mozilla store:
 
 - Upstream: <https://curl.se/ca/cacert.pem> (curl's `mk-ca-bundle.pl` extract of Mozilla NSS's
-  `certdata.txt`). Fetched in-session; the `.pem` itself is **not committed** (`gen/.gitignore`) --
-  only the generated `roots.der` + `bundle.rs` are, exactly as the Unicode tables are generated.
+  `certdata.txt`). Fetched when regenerating; the `.pem` itself is **not committed**
+  (`gen/.gitignore`) -- only the generated `roots.der` + `bundle.rs` are, exactly as the Unicode
+  tables are generated.
 - The snapshot date is carried in the crate as `MOZILLA_SNAPSHOT` (from the bundle's own
   "Certificate data from Mozilla as of" line).
 
@@ -32,10 +34,10 @@ A baked bundle is a **point-in-time snapshot** and the trust store is a living t
   (a new CA), **removed / distrusted** (a CA that misbehaved), and every root also **expires** --
   several roots in any snapshot expire within a few years of it.
 - Practical guidance for firmware authors:
-  - **Refresh periodically.** Regenerate this crate (`python gen/gen_roots.py` after re-fetching
-    `cacert.pem`) and reflash on a cadence you can sustain -- at minimum before a bundled root you
-    rely on expires. `MOZILLA_SNAPSHOT` tells tooling how old the baked store is so a build/deploy
-    step can warn past a chosen staleness threshold.
+  - **Refresh periodically.** Regenerate this crate (`lamella-tls-roots-gen` after re-fetching
+    `cacert.pem`, as below) and reflash on a cadence you can sustain -- at minimum before a
+    bundled root you rely on expires. `MOZILLA_SNAPSHOT` tells tooling how old the baked store is
+    so a build/deploy step can warn past a chosen staleness threshold.
   - **Prefer pinning for long-lived, single-endpoint devices.** If a device only ever talks to one
     service you control, pin that service's certificate (`VerifyMode::PinnedCert`) rather than
     carrying the whole web's roots -- it never goes stale against a store you don't control, costs
@@ -53,8 +55,13 @@ handshake. The full store stays flash-resident DER; only the matching root is ev
 
 ## Regenerate
 
+From this crate's directory:
+
 ```text
 curl -sS -o gen/cacert.pem https://curl.se/ca/cacert.pem
-python gen/gen_roots.py            # rewrites src/roots.der + src/bundle.rs
-cargo test -p lamella-tls-roots
+cargo run -p lamella-tls-roots-gen -- gen/cacert.pem src   # rewrites src/roots.der + src/bundle.rs
+cargo test -p lamella-tls-roots -p lamella-tls-roots-gen
 ```
+
+The tool replaces the two files only after every certificate in `cacert.pem` has parsed, and the
+same `cacert.pem` always gives the same bytes.

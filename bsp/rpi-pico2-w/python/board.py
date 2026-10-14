@@ -238,6 +238,7 @@ INSTANCES = {
     "ticks": {"block": "ticks", "base": 0x40108000},
     "trng": {"block": "trng", "base": 0x400F0000, "reset_bit": 0x19},
     "pwm": {"block": "pwm", "base": 0x400A8000, "reset_bit": 0x10},
+    "qmi": {"block": "qmi", "base": 0x400D0000},
 }
 
 PLANS = {

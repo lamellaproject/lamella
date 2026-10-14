@@ -1808,6 +1808,7 @@ impl Rewriter {
                                 TypeSymbol::Special(SpecialType::Void),
                             ),
                             receiver: Some(Box::new(self.machine_this())),
+                            virtual_slot: false,
                         },
                         ty: action_symbol(),
                     },
@@ -2038,12 +2039,14 @@ pub(crate) fn map_expr(expr: &BoundExpr, replace: &mut dyn FnMut(&BoundExpr) -> 
             delegate_type,
             target,
             receiver,
+            virtual_slot,
         } => BoundExprKind::DelegateCreation {
             delegate_type: delegate_type.clone(),
             target: target.clone(),
             receiver: receiver
                 .as_ref()
                 .map(|receiver| Box::new(map_expr(receiver, replace))),
+            virtual_slot: *virtual_slot,
         },
         BoundExprKind::Binary {
             operator,

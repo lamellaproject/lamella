@@ -153,7 +153,7 @@ namespace System.Net.NetworkInformation
             {
                 sb.Append((int)ifaces[i].OperationalStatus);
                 sb.Append(':');
-                sb.Append(ifaces[i].IPv4Address);
+                sb.Append(ifaces[i].PackedIPv4);
                 sb.Append(';');
             }
             return sb.ToString();

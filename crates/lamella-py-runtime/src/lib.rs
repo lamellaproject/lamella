@@ -14,6 +14,7 @@ pub mod i2c;
 pub mod adc;
 pub mod fileio;
 pub(crate) mod board_binding;
+pub(crate) mod heapq;
 pub mod pystdlib;
 pub(crate) mod shims;
 pub(crate) mod tables;

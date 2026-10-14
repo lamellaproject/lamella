@@ -1,9 +1,15 @@
 // Lamella managed corlib (from scratch). -- System.Environment
 namespace System
 {
+#if LAMELLA_SURFACE_NETFX_2_0
+    public static class Environment
+#else
     public sealed class Environment
+#endif
     {
+#if !LAMELLA_SURFACE_NETFX_2_0
         private Environment() { }
+#endif
 
         public static string NewLine { get { return "\r\n"; } }
 

@@ -151,8 +151,40 @@ struct FreeNode {
     next: *mut FreeNode,
 }
 
-/// The segregated-fit heap over one contiguous region. Not `Sync` on its own; wrap in
-/// [`LockedHeap`] for a global allocator.
+/// How many regions [`Heap::add_region`] takes beyond the first.
+const SPILL_REGIONS: usize = 3;
+
+/// A region added after the first, carved by a frontier of its own.
+#[derive(Clone, Copy)]
+struct Spill {
+    base: *mut u8,
+    frontier: *mut u8,
+    end: *mut u8,
+}
+
+impl Spill {
+    const NONE: Spill = Spill {
+        base: core::ptr::null_mut(),
+        frontier: core::ptr::null_mut(),
+        end: core::ptr::null_mut(),
+    };
+}
+
+/// Carves `size` bytes advanced to `align` from `*frontier`, below `end`, or null when they do not
+/// fit there.
+fn carve_from(frontier: &mut *mut u8, end: *mut u8, size: usize, align: usize) -> *mut u8 {
+    let addr = *frontier as usize;
+    let aligned = (addr + align - 1) & !(align - 1);
+    let next = aligned.saturating_add(size);
+    if next > end as usize {
+        return core::ptr::null_mut();
+    }
+    *frontier = next as *mut u8;
+    aligned as *mut u8
+}
+
+/// The segregated-fit heap over one contiguous region, and over the regions added after it. Not
+/// `Sync` on its own; wrap in [`LockedHeap`] for a global allocator.
 pub struct Heap {
     /// The managed region.
     base: *mut u8,
@@ -164,6 +196,11 @@ pub struct Heap {
     classes: [*mut FreeNode; CLASS_COUNT],
     /// The free LARGE blocks, taken best fit (null when there are none) -- see [`Request::large`].
     large: *mut LargeNode,
+    /// The regions [`Heap::add_region`] added, in order, each carved only once the regions before
+    /// it cannot hold a request.
+    spill: [Spill; SPILL_REGIONS],
+    /// How many of `spill` hold a region.
+    spill_count: usize,
     /// Bytes the region has handed out and not taken back -- see [`Heap::live`].
     ///
     /// Maintained HERE rather than by a counting wrapper around the allocator, and on a CAS-less
@@ -182,6 +219,8 @@ impl Heap {
             frontier: core::ptr::null_mut(),
             classes: [core::ptr::null_mut(); CLASS_COUNT],
             large: core::ptr::null_mut(),
+            spill: [Spill::NONE; SPILL_REGIONS],
+            spill_count: 0,
             live: 0,
         }
     }
@@ -198,7 +237,29 @@ impl Heap {
         self.frontier = base;
         self.classes = [core::ptr::null_mut(); CLASS_COUNT];
         self.large = core::ptr::null_mut();
+        self.spill_count = 0;
         self.live = 0;
+    }
+
+    /// Adds the `size`-byte region at `base` after the ones the heap already has. A request is
+    /// carved from the first region that can hold it, so a heap given a fast region first and a
+    /// slow one after carves from the slow one only what the fast one cannot hold: a block too large
+    /// for the room left in the fast one goes to the slow one, and the requests after it still come
+    /// from the fast one while they fit.
+    ///
+    /// False when the heap already holds as many regions as it takes; the region is then not used.
+    ///
+    /// # Safety
+    /// As [`Heap::init`]: `base` must be non-null, aligned to at least [`MIN_BLOCK`], and
+    /// reference `size` writable bytes not aliased elsewhere, for the heap's whole life.
+    pub unsafe fn add_region(&mut self, base: *mut u8, size: usize) -> bool {
+        if self.spill_count == SPILL_REGIONS {
+            return false;
+        }
+        let end = unsafe { base.add(size) };
+        self.spill[self.spill_count] = Spill { base, frontier: base, end };
+        self.spill_count += 1;
+        true
     }
 
     /// Allocates for a prepared `request`, or null on exhaustion. A class hit pops its free
@@ -231,17 +292,20 @@ impl Heap {
         carved
     }
 
-    /// Carves `size` bytes from the bump frontier, advanced to `align`, or null if it would
-    /// pass the region end.
+    /// Carves `size` bytes, advanced to `align`, from the first region's bump frontier, or else
+    /// from the first added region whose own frontier can hold them; null when none can.
     fn carve(&mut self, size: usize, align: usize) -> *mut u8 {
-        let addr = self.frontier as usize;
-        let aligned = (addr + align - 1) & !(align - 1);
-        let next = aligned.saturating_add(size);
-        if next > self.end as usize {
-            return core::ptr::null_mut();
+        let carved = carve_from(&mut self.frontier, self.end, size, align);
+        if !carved.is_null() {
+            return carved;
         }
-        self.frontier = next as *mut u8;
-        aligned as *mut u8
+        for spill in &mut self.spill[..self.spill_count] {
+            let carved = carve_from(&mut spill.frontier, spill.end, size, align);
+            if !carved.is_null() {
+                return carved;
+            }
+        }
+        core::ptr::null_mut()
     }
 
     /// Takes the free large block that fits `size` bytes most closely, handing what it does not
@@ -252,8 +316,9 @@ impl Heap {
     /// each size its own block back.
     ///
     /// A walk inside the lock, and a bounded one: every node is a free block bigger than every
-    /// class, so the list cannot hold more than the region's size over [`LARGEST_CLASS`] of them --
-    /// twelve in a 256 KiB arena, each a load and a compare.
+    /// class, so the list cannot hold more than the regions' size over [`LARGEST_CLASS`] of them --
+    /// twelve in a 256 KiB arena and about four hundred over 8 MiB of external RAM, each a load and
+    /// a compare.
     fn take_large(&mut self, size: usize) -> *mut u8 {
         let mut best: *mut *mut LargeNode = core::ptr::null_mut();
         let mut best_size = usize::MAX;
@@ -326,19 +391,27 @@ impl Heap {
         }
     }
 
-    /// Bytes never yet carved from the region -- the headroom remaining (does not count
+    /// Bytes never yet carved from any region -- the headroom remaining (does not count
     /// bytes sitting on free lists, which are already reusable).
     #[must_use]
     pub fn frontier_free(&self) -> usize {
-        self.end as usize - self.frontier as usize
+        self.spill[..self.spill_count]
+            .iter()
+            .map(|spill| spill.end as usize - spill.frontier as usize)
+            .sum::<usize>()
+            + (self.end as usize - self.frontier as usize)
     }
 
-    /// Bytes carved from the region so far (the high-water frontier). Monotonic -- the
+    /// Bytes carved from every region so far (the high-water frontiers). Monotonic -- a
     /// frontier never retreats (freed blocks recycle via their class list, they do not
     /// un-carve), so a lock-free mirror of this value is a sound diagnostic.
     #[must_use]
     fn carved(&self) -> usize {
-        self.frontier as usize - self.base as usize
+        self.spill[..self.spill_count]
+            .iter()
+            .map(|spill| spill.frontier as usize - spill.base as usize)
+            .sum::<usize>()
+            + (self.frontier as usize - self.base as usize)
     }
 
     /// Bytes handed out and not yet returned: what a collector's pressure probe has to ask.
@@ -457,6 +530,15 @@ impl LockedHeap {
         self.with(|heap| unsafe { heap.init(base, size) });
     }
 
+    /// Adds the `size`-byte region at `base` after the heap's others (see [`Heap::add_region`]):
+    /// false when the heap holds as many as it takes.
+    ///
+    /// # Safety
+    /// As [`Heap::add_region`]: `base`/`size` describe a valid, exclusively-owned region.
+    pub unsafe fn add_region(&self, base: *mut u8, size: usize) -> bool {
+        self.with(|heap| unsafe { heap.add_region(base, size) })
+    }
+
     /// Runs `body` holding the lock (the spin arm -- targets with atomic CAS).
     #[cfg(target_has_atomic = "8")]
     fn with<T>(&self, body: impl FnOnce(&mut Heap) -> T) -> T {
@@ -488,7 +570,7 @@ impl LockedHeap {
         critical_section(|| body(unsafe { &mut *self.heap.get() }))
     }
 
-    /// Bytes never yet carved from the region (takes the lock).
+    /// Bytes never yet carved from any region (takes the lock).
     #[must_use]
     pub fn frontier_free(&self) -> usize {
         self.with(|heap| heap.frontier_free())
@@ -971,5 +1053,107 @@ mod tests {
         }
         assert_eq!(h.live_lockfree(), 0, "everything freed, nothing counted live");
         free_region(region, layout);
+    }
+
+    /// A second host region, to add to a test heap.
+    fn extra(size: usize) -> (*mut u8, SysLayout) {
+        let layout = SysLayout::from_size_align(size, 16).unwrap();
+        (unsafe { sys_alloc(layout) }, layout)
+    }
+
+    /// Whether `ptr` lies in the `size` bytes at `base`.
+    fn inside(ptr: *mut u8, base: *mut u8, size: usize) -> bool {
+        (base as usize..base as usize + size).contains(&(ptr as usize))
+    }
+
+    /// Requests the first region cannot hold come from the region added after it, and only those:
+    /// a block too large for the room left in the first goes to the second, and the small requests
+    /// after it still come from the first while they fit.
+    #[test]
+    fn an_added_region_takes_only_what_the_first_cannot_hold() {
+        let (h, region, layout) = heap(64 * 1024);
+        let (slow, slow_layout) = extra(1024 * 1024);
+        assert!(unsafe { h.add_region(slow, 1024 * 1024) });
+        let small = Layout::from_size_align(48, 8).unwrap();
+        let big = Layout::from_size_align(100 * 1024, 16).unwrap();
+        let (first, large, after) = unsafe { (h.alloc(small), h.alloc(big), h.alloc(small)) };
+        assert!(inside(first, region, 64 * 1024), "a small block comes from the first region");
+        assert!(inside(large, slow, 1024 * 1024), "a block the first cannot hold comes from the second");
+        assert!(inside(after, region, 64 * 1024), "the next small block still comes from the first");
+        let mut spilled = 0;
+        let mut blocks = Vec::new();
+        for _ in 0..2000 {
+            let p = unsafe { h.alloc(small) };
+            assert!(!p.is_null());
+            if inside(p, slow, 1024 * 1024) {
+                spilled += 1;
+            } else {
+                assert!(inside(p, region, 64 * 1024));
+            }
+            blocks.push(p);
+        }
+        assert!(spilled > 0, "once the first region is full, small blocks come from the second");
+        for p in blocks.into_iter().chain([first, after]) {
+            unsafe { h.dealloc(p, small) };
+        }
+        unsafe { h.dealloc(large, big) };
+        assert_eq!(h.live_lockfree(), 0);
+        free_region(region, layout);
+        free_region(slow, slow_layout);
+    }
+
+    /// A request no region can hold is refused without spending any of them: every region's room
+    /// is still there for the requests that do fit.
+    #[test]
+    fn a_request_no_region_can_hold_spends_none_of_them() {
+        let (h, region, layout) = heap(64 * 1024);
+        let (slow, slow_layout) = extra(256 * 1024);
+        assert!(unsafe { h.add_region(slow, 256 * 1024) });
+        let room = h.frontier_free();
+        assert_eq!(room, 320 * 1024, "the room counts every region");
+        let huge = Layout::from_size_align(512 * 1024, 16).unwrap();
+        assert!(unsafe { h.alloc(huge) }.is_null(), "no region holds it");
+        assert_eq!(h.frontier_free(), room, "and none was spent on it");
+        let small = Layout::from_size_align(48, 8).unwrap();
+        let p = unsafe { h.alloc(small) };
+        assert!(inside(p, region, 64 * 1024), "small requests still come from the first region");
+        unsafe { h.dealloc(p, small) };
+        free_region(region, layout);
+        free_region(slow, slow_layout);
+    }
+
+    /// The carved high-water and the room left count every region, and `init` forgets the regions
+    /// added before it.
+    #[test]
+    fn the_counts_cover_every_region_and_init_forgets_them() {
+        let (h, region, layout) = heap(64 * 1024);
+        let (slow, slow_layout) = extra(128 * 1024);
+        assert!(unsafe { h.add_region(slow, 128 * 1024) });
+        let big = Layout::from_size_align(96 * 1024, 16).unwrap();
+        let p = unsafe { h.alloc(big) };
+        assert!(inside(p, slow, 128 * 1024));
+        assert_eq!(h.carved_lockfree(), 96 * 1024, "the carve in the added region counts");
+        assert_eq!(h.frontier_free(), 64 * 1024 + 32 * 1024);
+        unsafe { h.init(region, 64 * 1024) };
+        assert_eq!(h.frontier_free(), 64 * 1024, "init forgets the added region");
+        free_region(region, layout);
+        free_region(slow, slow_layout);
+    }
+
+    /// The heap takes three regions beyond the first, and refuses a fourth.
+    #[test]
+    fn a_heap_takes_three_added_regions_and_refuses_a_fourth() {
+        let (h, region, layout) = heap(16 * 1024);
+        let extras: Vec<(*mut u8, SysLayout)> = (0..4).map(|_| extra(16 * 1024)).collect();
+        let added: Vec<bool> = extras
+            .iter()
+            .map(|&(base, _)| unsafe { h.add_region(base, 16 * 1024) })
+            .collect();
+        assert_eq!(added, [true, true, true, false]);
+        assert_eq!(h.frontier_free(), 4 * 16 * 1024, "the refused region is not counted");
+        free_region(region, layout);
+        for (base, layout) in extras {
+            free_region(base, layout);
+        }
     }
 }

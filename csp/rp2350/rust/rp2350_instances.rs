@@ -46,3 +46,4 @@ pub const TRNG_RESET_MASK: u32 = 0x2000000;
 pub const PWM_BASE: u32 = 0x400A8000;
 pub const PWM_RESET_BIT: u32 = 16;
 pub const PWM_RESET_MASK: u32 = 0x10000;
+pub const QMI_BASE: u32 = 0x400D0000;

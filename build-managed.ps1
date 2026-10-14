@@ -2,6 +2,8 @@
 #
 #   pwsh -File build-managed.ps1 [-OutDir <dir>] [-Lcsc <path>] [-Define <symbols>]
 #   pwsh -File build-managed.ps1 -PrintSurface        # the default symbols, one per line
+#   pwsh -File build-managed.ps1 -PrintFamilySources <family>   # the csp sources that family's
+#                                                     # System.Device.Gpio carries, one per line
 #
 # The Rust side is `cargo build`; this is the other half. It compiles `corlib/` and every
 # assembly under `libs/` with `lcsc` (this repository's C# compiler, built from `crates/lcsc`),
@@ -25,7 +27,11 @@ param(
     # Print the default surface and exit, so anything that needs to know what a plain build compiles
     # asks this script instead of pattern-matching its text. A reader of the text cannot tell a
     # member of the list from a symbol named anywhere else in the file.
-    [switch]$PrintSurface
+    [switch]$PrintSurface,
+    # Print the `csp/<family>/csharp` sources the family's System.Device.Gpio carries and exit, so
+    # build-boards.ps1 leaves out of a board's assembly exactly what this script compiles into that
+    # build: one reader of the list serves both scripts.
+    [string]$PrintFamilySources
 )
 
 $ErrorActionPreference = 'Stop'
@@ -78,6 +84,30 @@ $DefaultSurface = @(
     'LAMELLA_SURFACE_TUPLES'
 )
 if ($PrintSurface) { $DefaultSurface | ForEach-Object { Write-Output $_ }; exit 0 }
+
+# The `csp/<family>/csharp` sources `libs/System.Device.Gpio/Families/<family>.sources` lists, as
+# paths relative to that directory with '/' separators: what the family's System.Device.Gpio carries.
+# A blank line or one that starts with '#' is not an entry. An entry that names no source there is
+# refused, so a source renamed or removed cannot leave the family build without a type it was meant to
+# carry.
+function Get-FamilySources([string]$family) {
+    $list = Join-Path $root "libs/System.Device.Gpio/Families/$family.sources"
+    if (-not (Test-Path -LiteralPath $list)) {
+        throw "libs/System.Device.Gpio/Families/$family.sources does not exist: it lists the csp/$family/csharp sources the $family build of System.Device.Gpio carries"
+    }
+    $entries = @()
+    foreach ($line in [IO.File]::ReadAllLines($list)) {
+        $entry = $line.Trim()
+        if (-not $entry -or $entry.StartsWith('#')) { continue }
+        if (-not $entry.EndsWith('.cs') -or -not (Test-Path -LiteralPath (Join-Path $root "csp/$family/csharp/$entry") -PathType Leaf)) {
+            throw "libs/System.Device.Gpio/Families/$family.sources lists '$entry', which is not a C# source in csp/$family/csharp"
+        }
+        $entries += $entry
+    }
+    if (-not $entries.Count) { throw "libs/System.Device.Gpio/Families/$family.sources lists no sources" }
+    $entries
+}
+if ($PrintFamilySources) { Get-FamilySources $PrintFamilySources | ForEach-Object { Write-Output $_ }; exit 0 }
 if (-not $Define) { $Define = $DefaultSurface }
 
 # A capability that cannot stand on its own names what it rests on. A surface offering the members
@@ -109,7 +139,8 @@ foreach ($symbol in $SurfaceRequires.Keys) {
 }
 
 # Every assembly under libs/, in an order where each is built after what it references. `references`
-# names other entries in this list; all of them reference the corlib implicitly.
+# names other entries in this list; all of them reference the corlib implicitly. A row may carry
+# `held = '<reason>'`, and is then reported on every run instead of built.
 $Assemblies = @(
     # Its own assembly, and the contrast with `System.Device.Pwm`'s fold below is the whole reason. Upstream's
     # `System.Device.Gpio` holds Gpio, I2c, Pwm and Spi and no Analog, so folding `System.Device.Pwm`
@@ -137,24 +168,7 @@ $Assemblies = @(
     # The board's Wi-Fi radio. It references System.Net.NetworkInformation because the addresses a
     # board holds on the network are that assembly's report, which WiFiAdapter.WaitForAddress reads.
     @{ name = 'Lamella.Net.WiFi';                      references = @('System.Net.NetworkInformation') },
-    @{ name = 'Lamella.IO.Storage';                    references = @('System.Device.Gpio') },
-    # The `nanoFramework.` prefix marks a compatibility surface: the types keep nanoFramework's
-    # namespaces so unmodified nanoFramework source compiles, and the ASSEMBLY name is what says
-    # this is not the authoritative .NET design.
-    # It references Lamella.Hardware and not the other way round: the AdcDriver seam and the
-    # AdcControllers binding ship from there, so a program reaching an ADC needs no compatibility
-    # assembly. This assembly holds the nanoFramework-shaped surface over that seam.
-    @{ name = 'nanoFramework.System.Device.Adc';       references = @('Lamella.Hardware') },
-    @{ name = 'nanoFramework.System.IO.FileSystem';    references = @() },
-    # The NETMF compatibility tier, so an existing Microsoft.SPOT.Hardware program compiles unchanged.
-    # `Microsoft.SPOT.*` is already unambiguous about whose design it is, so the assembly takes NETMF's
-    # own name with no prefix -- unlike the nanoFramework rows above, whose namespaces are `System.*`.
-    # It shims onto System.Device.Gpio and so is built after it.
-    #
-    # HELD: this tier needs nested-type identity, which the compiler that builds it does not yet
-    # have. The row stays in the list and is reported on every run rather than dropped.
-    @{ name = 'Microsoft.SPOT.Hardware';                references = @('System.Device.Gpio');
-       held = 'nested-type identity' }
+    @{ name = 'Lamella.IO.Storage';                    references = @('System.Device.Gpio') }
 )
 
 # An assembly present on disk but missing from the list above would be silently skipped, and a
@@ -227,10 +241,10 @@ if ($Define -contains 'LAMELLA_SURFACE_SPAN') {
 #
 # EVERY CALLER MUST WRAP THIS IN @(). PowerShell unrolls a function's output onto the pipeline, so a
 # single-source assembly comes back as a bare STRING no matter what this function does internally --
-# and a bare string splats one CHARACTER at a time into the compiler's argument list
-# (`lcsc: cannot read 'E'`). The array-subexpression has to be at the assignment, which is why it is
-# not hidden in here. No assembly under libs/ has one source file today; the wrapping stays because
-# the next one added might.
+# and a bare string is not a list: `+` and `+=` join text onto it rather than adding sources, and a
+# splat passes it one CHARACTER at a time (`lcsc: cannot read 'E'`). The array-subexpression has to
+# be at the assignment, which is why it is not hidden in here. No assembly under libs/ has one
+# source file today; the wrapping stays because the next one added might.
 function Get-Sources($dir, [switch]$Recurse) {
     $files = if ($Recurse) { Get-ChildItem $dir -Filter *.cs -Recurse } else { Get-ChildItem $dir -Filter *.cs }
     $full = @($files | ForEach-Object { $_.FullName })
@@ -246,6 +260,27 @@ function Get-Sources($dir, [switch]$Recurse) {
     $paths
 }
 
+# Compiles $Sources with lcsc, passing the rest of the arguments as its options, and leaves lcsc's
+# exit code in $LASTEXITCODE as a direct call would.
+#
+# The sources go in a response file, never on the command line itself. Windows refuses a command
+# line longer than 32,767 characters, and every source path on it repeats the folder this tree sits
+# in, so the corlib's sources alone passed that limit under a folder path of about sixty characters:
+# where the tree was unpacked decided whether it built, and every source added lowered the limit.
+# lcsc reads csc's `@file`. Each path is written on its own line in quotes, so a space in it stays
+# inside the one argument, and a backslash before a quote or at the end is doubled, as the quoting
+# rules require.
+function Invoke-Lcsc([string[]]$Sources) {
+    $list = [System.IO.Path]::GetTempFileName()
+    try {
+        $lines = @($Sources | ForEach-Object { '"' + ($_ -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1') + '"' })
+        [System.IO.File]::WriteAllLines($list, [string[]]$lines, [System.Text.UTF8Encoding]::new($false))
+        & $Lcsc "@$list" @args
+    } finally {
+        Remove-Item -LiteralPath $list -Force -ErrorAction SilentlyContinue
+    }
+}
+
 # --- corlib ------------------------------------------------------------------------------------
 $corlibDll = Join-Path $out 'corlib.dll'
 $corlibSrc = @(Get-Sources (Join-Path $root 'corlib') -Recurse)
@@ -253,7 +288,7 @@ Write-Host "corlib ($($corlibSrc.Count) sources) -> $corlibDll"
 # /unsafe: the corlib carries unsafe source (String's char* constructors and its pinnable
 # reference). None of the libs/ assemblies do, so the flag stays on the one compilation that
 # needs it rather than becoming a blanket -- the point of an opt-in is that it is scoped.
-& $Lcsc @corlibSrc @langArg @defineArg /unsafe "/out:$corlibDll" /debug-
+Invoke-Lcsc $corlibSrc @langArg @defineArg /unsafe "/out:$corlibDll" /debug-
 if ($LASTEXITCODE -ne 0) { throw "corlib compile failed ($LASTEXITCODE)" }
 
 # --- libs --------------------------------------------------------------------------------------
@@ -277,9 +312,72 @@ foreach ($assembly in $Assemblies) {
     $refs = @("/reference:$corlibDll")
     foreach ($r in $assembly.references) { $refs += "/reference:$(Join-Path $out "$r.dll")" }
     Write-Host "$name ($($src.Count) sources) -> $dll"
-    & $Lcsc @src @langArg @defineArg @refs /target:library "/out:$dll" /debug-
+    Invoke-Lcsc $src @langArg @defineArg @refs /target:library "/out:$dll" /debug-
     if ($LASTEXITCODE -ne 0) { throw "$name compile failed ($LASTEXITCODE)" }
     $built += "$name.dll"
+}
+
+# --- System.Device.Gpio, once per family -----------------------------------------------------------
+# A program that only calls dotnet/iot's factories names no board class, so the drivers its buses
+# need cannot come from a board's assembly: each family with a `libs/System.Device.Gpio/Families/
+# <family>.cs` gets a System.Device.Gpio of its own, at `families/<family>/System.Device.Gpio.dll`,
+# holding the drivers that file constructs from a board's bus table. It is built from the shared
+# sources, that file (in place of BoardDrivers.cs, by LAMELLA_FAMILY_DRIVERS) and the
+# `csp/<family>/csharp` sources `Families/<family>.sources` lists: those drivers and the bindings and
+# register layouts they take. The build for a board takes it in place of the shared one, so it
+# presents the shared one's public surface unchanged, and beside it the csp types it carries, public.
+#
+# EACH OF THOSE TYPES IS IN EXACTLY ONE ASSEMBLY. build-boards.ps1 leaves the listed sources out of
+# the assembly for a board of the family and compiles that assembly against this build instead. The
+# AOT tier names a method by its type's full name and signature, not by its assembly, and keeps every
+# definition of a name the program reaches, so a type compiled into both assemblies defines each
+# method the program reaches twice, and the image does not link.
+$gpio = $Assemblies | Where-Object { $_.name -eq 'System.Device.Gpio' }
+$gpioSrc = @(Get-Sources (Join-Path $root 'libs/System.Device.Gpio'))
+foreach ($extra in $gpio.extraSources) { $gpioSrc += @(Get-Sources (Join-Path $root "libs/$extra")) }
+$familyDefineArg = @("/define:$(@($Define + 'LAMELLA_FAMILY_DRIVERS') -join ';')")
+$familyFiles = @(Get-Sources (Join-Path $root 'libs/System.Device.Gpio/Families'))
+foreach ($familyFile in $familyFiles) {
+    $family = [IO.Path]::GetFileNameWithoutExtension($familyFile)
+    $csp = Join-Path $root "csp/$family/csharp"
+    if (-not (Test-Path $csp)) { throw "libs/System.Device.Gpio/Families/$family.cs names a family with no csp/$family/csharp" }
+    $listed = @(Get-FamilySources $family | Sort-Object -Unique)
+    $work = Join-Path ([IO.Path]::GetTempPath()) "lamella-gpio-$family-$PID"
+    if (Test-Path $work) { Remove-Item -Recurse -Force $work }
+    $copies = @()
+    # In the order Get-Sources sorts them, not the list's, so the metadata layout does not depend on
+    # how the list is written.
+    foreach ($file in @(Get-Sources $csp -Recurse)) {
+        $relative = $file.Substring($csp.TrimEnd('\', '/').Length + 1).Replace('\', '/')
+        if ($listed -notcontains $relative) { continue }
+        $copy = Join-Path $work $relative
+        New-Item -ItemType Directory -Force (Split-Path $copy -Parent) | Out-Null
+        # Bytes in and bytes out, so the copy differs from its original only where a declaration
+        # changed: build-managed.sh makes the same edit with sed, and the two outputs are compared.
+        # Inside this assembly an override of GpioDriver's `protected internal` members must say so,
+        # where the source says `protected`, as it must wherever it compiles outside this assembly:
+        # in a test that builds a driver from its source, and in a board's assembly for a family with
+        # no build of its own. Dispose(bool) is the one plain `protected` virtual the seams declare,
+        # so it keeps its modifier.
+        $text = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($file))
+        $text = [regex]::Replace($text, '(?m)^([ \t]*)protected override(?![^\n]*Dispose\()', '${1}protected internal override')
+        [IO.File]::WriteAllBytes($copy, [Text.Encoding]::UTF8.GetBytes($text))
+        $copies += $copy
+    }
+    if ($copies.Count -ne $listed.Count) {
+        throw "libs/System.Device.Gpio/Families/$family.sources lists $($listed.Count) sources and csp/$family/csharp yielded $($copies.Count) of them"
+    }
+    $src = $gpioSrc + @($familyFile) + $copies
+    $dir = Join-Path $out "families/$family"
+    New-Item -ItemType Directory -Force $dir | Out-Null
+    $dll = Join-Path $dir 'System.Device.Gpio.dll'
+    $refs = @("/reference:$corlibDll", "/reference:$(Join-Path $out 'Lamella.Hardware.dll')")
+    Write-Host "System.Device.Gpio for $family ($($src.Count) sources) -> $dll"
+    Invoke-Lcsc $src @langArg @familyDefineArg @refs /target:library "/out:$dll" /debug-
+    $exit = $LASTEXITCODE
+    Remove-Item -Recurse -Force $work
+    if ($exit -ne 0) { throw "System.Device.Gpio for $family compile failed ($exit)" }
+    $built += "families/$family/System.Device.Gpio.dll"
 }
 
 # An assembly this script STOPPED producing is the one file in $out nothing overwrites, so it sits
@@ -289,11 +387,14 @@ foreach ($assembly in $Assemblies) {
 # script's output.
 $folded = @($Assemblies | ForEach-Object { $_.extraSources } | Where-Object { $_ })
 $heldOut = @($Assemblies | Where-Object { $_.held } | ForEach-Object { $_.name })
-foreach ($gone in @($folded + $heldOut)) {
+# The compatibility libraries are external and not built here, so one of their assemblies in $out is
+# stale, and anything that references it by name would still find it.
+$external = @('Microsoft.SPOT.Hardware', 'nanoFramework.System.Device.Adc', 'nanoFramework.System.IO.FileSystem')
+foreach ($gone in @($folded + $heldOut + $external)) {
     $stale = Join-Path $out "$gone.dll"
-    if (Test-Path $stale) {
+    if (Test-Path -LiteralPath $stale) {
         Write-Host "$gone.dll -- REMOVED from $out, this script no longer produces it"
-        Remove-Item $stale
+        Remove-Item -LiteralPath $stale
     }
 }
 

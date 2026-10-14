@@ -13,14 +13,12 @@ namespace System.Device.Spi
         private SpiMode _mode;
 
         /// <summary>Initializes a new instance of the settings for the device on
-        /// <paramref name="busId"/> with no chip-select line (-1): the driver drives no select,
-        /// and selecting the device is the caller's.</summary>
-        public SpiConnectionSettings(int busId) : this(busId, -1) { }
-
-        /// <summary>Initializes a new instance of the settings for the device on
         /// <paramref name="busId"/> using <paramref name="chipSelectLine"/> as the
-        /// chip-select line (-1 if not used).</summary>
-        public SpiConnectionSettings(int busId, int chipSelectLine)
+        /// chip-select line.</summary>
+        /// <param name="busId">The bus ID the device is connected to.</param>
+        /// <param name="chipSelectLine">The chip-select line, or -1, the default, for none: the
+        /// driver then drives no select, and selecting the device is the caller's.</param>
+        public SpiConnectionSettings(int busId, int chipSelectLine = -1)
         {
             _busId = busId;
             _chipSelectLine = chipSelectLine;

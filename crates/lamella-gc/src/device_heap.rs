@@ -595,6 +595,159 @@ impl DeviceHeap {
         }
     }
 
+    /// [`Self::collect_no_alloc`] over this heap AND a SECOND SEGMENT: a region at an unrelated address
+    /// that the heap spills into once this one is full, such as a PSRAM beside a part's SRAM. One mark
+    /// pass covers both, each compacts in place, and no object moves from one to the other.
+    ///
+    /// `second` is the second segment, which is itself a `DeviceHeap` over its own region, and each
+    /// segment works in the [`SegmentScratch`] the embedder hands it. With `second` absent this
+    /// collects this heap alone and `second_scratch` is unread. **Answers `false` having moved
+    /// nothing** when a bitmap is short of its segment or the two regions overlap.
+    ///
+    /// `enumerate_roots` is called twice, as for [`Self::collect_no_alloc`], and a root or a pin may
+    /// address either segment.
+    #[cfg(all(feature = "gc-collect", any(test, feature = "second-segment")))]
+    pub fn collect_no_alloc_spanning<R>(
+        &mut self,
+        second: Option<&mut DeviceHeap>,
+        enumerate_roots: R,
+        pinned: &[u32],
+        scratch: SegmentScratch<'_>,
+        second_scratch: SegmentScratch<'_>,
+    ) -> bool
+    where
+        R: FnMut(&mut dyn FnMut(&mut Ref, crate::heap::RootKind)),
+    {
+        self.collect_spanning_with(
+            &PtrResolver,
+            second,
+            enumerate_roots,
+            pinned,
+            scratch,
+            second_scratch,
+        )
+    }
+
+    /// [`Self::collect_no_alloc_spanning`] through any resolver, so a host test can collect a heap
+    /// whose headers are table indices rather than descriptor addresses.
+    #[cfg(all(feature = "gc-collect", any(test, feature = "second-segment")))]
+    fn collect_spanning_with<R>(
+        &mut self,
+        resolver: &dyn TypeResolver,
+        second: Option<&mut DeviceHeap>,
+        enumerate_roots: R,
+        pinned: &[u32],
+        scratch: SegmentScratch<'_>,
+        second_scratch: SegmentScratch<'_>,
+    ) -> bool
+    where
+        R: FnMut(&mut dyn FnMut(&mut Ref, crate::heap::RootKind)),
+    {
+        use crate::heap::{Compacted, MarkBits};
+        use crate::segments::{Segment, mark_compact_segments};
+        let mut answers = [Compacted { top: 0, free: 0 }; 2];
+        let first = Segment {
+            bytes: &mut *self.region,
+            base: self.base,
+            top: self.top,
+            index: scratch.index,
+        };
+        match second {
+            None => {
+                let mut bits = [MarkBits::new(scratch.marks)];
+                let mut segments = [first];
+                if !mark_compact_segments(
+                    &mut segments,
+                    &mut bits,
+                    resolver,
+                    enumerate_roots,
+                    pinned,
+                    &mut answers[..1],
+                ) {
+                    return false;
+                }
+            }
+            Some(second) => {
+                let mut bits = [
+                    MarkBits::new(scratch.marks),
+                    MarkBits::new(second_scratch.marks),
+                ];
+                let mut segments = [
+                    first,
+                    Segment {
+                        bytes: &mut *second.region,
+                        base: second.base,
+                        top: second.top,
+                        index: second_scratch.index,
+                    },
+                ];
+                if !mark_compact_segments(
+                    &mut segments,
+                    &mut bits,
+                    resolver,
+                    enumerate_roots,
+                    pinned,
+                    &mut answers,
+                ) {
+                    return false;
+                }
+                second.top = answers[1].top;
+                second.free = answers[1].free;
+            }
+        }
+        self.top = answers[0].top;
+        self.free = answers[0].free;
+        true
+    }
+
+    /// Allocates from `first` and then from `second`, and when the object fits in neither, runs
+    /// `collect` over both once and tries again in the same order. Answers the payload pointer, or
+    /// null when the object fits nowhere after the collection or `collect` declined.
+    ///
+    /// This is the order a heap with a second segment keeps: the first segment is the faster memory,
+    /// so it serves every object it can hold, and the second takes what the first cannot.
+    ///
+    /// # Safety
+    /// As [`Self::alloc`]: `type_desc` must be a valid [`DeviceTypeDesc`] address the backend emitted.
+    #[cfg(any(test, feature = "second-segment"))]
+    pub unsafe fn alloc_spanning(
+        first: &mut DeviceHeap,
+        mut second: Option<&mut DeviceHeap>,
+        payload_size: u32,
+        type_desc: *const DeviceTypeDesc,
+        collect: impl FnOnce(&mut DeviceHeap, Option<&mut DeviceHeap>) -> bool,
+    ) -> *mut u8 {
+        if let Some(found) =
+            unsafe { Self::alloc_in_either(first, second.as_deref_mut(), payload_size, type_desc) }
+        {
+            return found;
+        }
+        if !collect(first, second.as_deref_mut()) {
+            return core::ptr::null_mut();
+        }
+        unsafe { Self::alloc_in_either(first, second, payload_size, type_desc) }
+            .unwrap_or(core::ptr::null_mut())
+    }
+
+    /// One attempt of [`Self::alloc_spanning`]: `first`, then `second`.
+    ///
+    /// # Safety
+    /// As [`Self::alloc`].
+    #[cfg(any(test, feature = "second-segment"))]
+    unsafe fn alloc_in_either(
+        first: &mut DeviceHeap,
+        second: Option<&mut DeviceHeap>,
+        payload_size: u32,
+        type_desc: *const DeviceTypeDesc,
+    ) -> Option<*mut u8> {
+        if let Some(reference) = unsafe { first.alloc(payload_size, type_desc) } {
+            return Some(first.payload_ptr(reference));
+        }
+        let second = second?;
+        let reference = unsafe { second.alloc(payload_size, type_desc) }?;
+        Some(second.payload_ptr(reference))
+    }
+
     /// [`Self::collect`], with `pinned` naming the payload addresses (region-relative, as a
     /// [`Ref`] carries them) of objects the compaction must leave WHERE THEY ARE -- what a C#
     /// `fixed` statement's holder slot promises. See [`crate::heap::Heap::collect_with_pins`] for
@@ -674,6 +827,21 @@ impl DeviceHeap {
         }
     }
 
+}
+
+
+/// The storage one segment's collection works in, which the embedder owns and sizes, as it owns the
+/// one-segment collection's bitmap.
+#[cfg(all(feature = "gc-collect", any(test, feature = "second-segment")))]
+pub struct SegmentScratch<'a> {
+    /// The mark bitmap: at least [`DeviceHeap::mark_words`] words for the segment. A shorter one
+    /// refuses the collection.
+    pub marks: &'a mut [u32],
+    /// The forwarding index: `forwarding_index_words_for` words for the segment's region, or empty
+    /// for none. Without one the collection is the same and finds each survivor's new place by
+    /// replaying the segment from its base, which costs the number of references times the number of
+    /// objects; with one it replays a chunk.
+    pub index: &'a mut [u32],
 }
 
 #[cfg(test)]
@@ -1061,5 +1229,192 @@ mod tests {
         let (base, len) = make_region(1024);
         let heap = unsafe { DeviceHeap::from_raw(base, len) };
         assert_eq!(heap.mark_words(), 8);
+    }
+
+    /// A heap with a SECOND SEGMENT, as the host can hold one: the first at the SRAM address and the
+    /// second BELOW it, where the RP2350 maps its PSRAM, each `len` bytes. Headers are table indices,
+    /// so a test collects through a [`crate::heap::TableResolver`]; nothing here dereferences one.
+    fn two_segments(len: usize) -> (DeviceHeap, DeviceHeap) {
+        let (first, _) = make_region(len);
+        let (second, _) = make_region(len);
+        unsafe {
+            (
+                DeviceHeap::from_raw(first, len),
+                based_at(DeviceHeap::from_raw(second, len), 0x1100_0000),
+            )
+        }
+    }
+
+    /// `heap` with its address space moved to `base`, before anything is allocated: what a host test
+    /// needs to hold two segments at once, since `DeviceHeap::base_of` gives every host region
+    /// [`DeviceHeap::HOST_BASE`].
+    fn based_at(mut heap: DeviceHeap, base: u32) -> DeviceHeap {
+        assert_eq!(heap.top, ALIGN, "a heap is re-based only while it is empty");
+        heap.base = base;
+        heap
+    }
+
+    /// A table index posing as a descriptor address, which is all `alloc` does with one: store it.
+    fn table_type(index: u32) -> *const DeviceTypeDesc {
+        index as usize as *const DeviceTypeDesc
+    }
+
+    /// The word at `at` in whichever of the two heaps holds that address.
+    fn word_in(heaps: [&DeviceHeap; 2], at: u32) -> u32 {
+        let heap = heaps
+            .into_iter()
+            .find(|h| at >= h.base() && ((at - h.base()) as usize) < h.region.len())
+            .unwrap();
+        let p = heap.payload_ptr(Ref(at));
+        unsafe { p.cast::<u32>().read_unaligned() }
+    }
+
+    /// Writes `value` at `at`, an address in `heap`.
+    fn put_in(heap: &DeviceHeap, at: u32, value: u32) {
+        unsafe {
+            heap.payload_ptr(Ref(at))
+                .cast::<u32>()
+                .write_unaligned(value)
+        }
+    }
+
+    /// THE FIRST SEGMENT SERVES EVERY OBJECT IT CAN HOLD, AND THE SECOND TAKES THE REST, with no
+    /// collection while either has room.
+    #[test]
+    fn allocation_fills_the_first_segment_then_the_second() {
+        let (mut first, mut second) = two_segments(20);
+        let mut landed = Vec::new();
+        for _ in 0..4 {
+            let p = unsafe {
+                DeviceHeap::alloc_spanning(
+                    &mut first,
+                    Some(&mut second),
+                    4,
+                    table_type(0),
+                    |_, _| panic!("no collection while a segment has room"),
+                )
+            };
+            landed.push(p);
+        }
+        let in_first = |p: *mut u8| first.region.as_ptr_range().contains(&(p as *const u8));
+        assert!(
+            in_first(landed[0]) && in_first(landed[1]),
+            "the first two land in the first segment"
+        );
+        assert!(
+            !in_first(landed[2]) && !in_first(landed[3]),
+            "the next two spill into the second"
+        );
+        assert_eq!(
+            second.reference_at(landed[2]),
+            Ref(0x1100_0000 + ALIGN + HEADER_SIZE)
+        );
+    }
+
+    /// OUT OF MEMORY IN BOTH SEGMENTS RUNS ONE COLLECTION OVER BOTH, AND THE RETRY LANDS. A live pair
+    /// that refers across the segments survives it intact, its references rewritten, and the garbage
+    /// in each segment is what the retry reuses.
+    #[cfg(all(feature = "gc-collect", feature = "host-heap"))]
+    #[test]
+    fn out_of_memory_in_both_collects_over_both_then_the_retry_lands() {
+        use crate::heap::{RootKind, TableResolver, TypeDesc};
+        let descs = vec![
+            TypeDesc {
+                payload_size: 4,
+                ref_offsets: Vec::new(),
+                tagged_offsets: Vec::new(),
+            },
+            TypeDesc {
+                payload_size: 4,
+                ref_offsets: vec![0],
+                tagged_offsets: Vec::new(),
+            },
+        ];
+        let weak = alloc::collections::BTreeMap::new();
+        let resolver = TableResolver {
+            type_descs: &descs,
+            weak_offsets: &weak,
+        };
+        let (mut first, mut second) = two_segments(20);
+        let (_garbage_first, a, _garbage_second, b) = unsafe {
+            (
+                first.alloc(4, table_type(0)).unwrap(),
+                first.alloc(4, table_type(1)).unwrap(),
+                second.alloc(4, table_type(0)).unwrap(),
+                second.alloc(4, table_type(1)).unwrap(),
+            )
+        };
+        put_in(&first, a.0, b.0);
+        put_in(&second, b.0, a.0);
+
+        let mut roots = [a];
+        let (mut marks, mut second_marks) = ([0u32; 8], [0u32; 8]);
+        let (mut index, mut second_index) = ([0u32; 2], [0u32; 2]);
+        let mut collections = 0;
+        let p = unsafe {
+            DeviceHeap::alloc_spanning(&mut first, Some(&mut second), 4, table_type(0), |f, s| {
+                collections += 1;
+                f.collect_spanning_with(
+                    &resolver,
+                    s,
+                    |visit: &mut dyn FnMut(&mut Ref, RootKind)| {
+                        for root in &mut roots {
+                            visit(root, RootKind::Object);
+                        }
+                    },
+                    &[],
+                    SegmentScratch {
+                        marks: &mut marks,
+                        index: &mut index,
+                    },
+                    SegmentScratch {
+                        marks: &mut second_marks,
+                        index: &mut second_index,
+                    },
+                )
+            })
+        };
+        assert_eq!(collections, 1, "one collection, over both segments");
+        assert!(
+            !p.is_null(),
+            "the retry must land after the garbage is reclaimed"
+        );
+        let a = roots[0];
+        assert_eq!(
+            a,
+            Ref(DeviceHeap::HOST_BASE + ALIGN + HEADER_SIZE),
+            "a slid down in the first segment"
+        );
+        assert_eq!(
+            first.reference_at(p),
+            Ref(a.0 + 8),
+            "and the new object took the space above it"
+        );
+        let b = word_in([&first, &second], a.0);
+        assert_eq!(
+            b,
+            0x1100_0000 + ALIGN + HEADER_SIZE,
+            "a's field names b, slid down in the second segment"
+        );
+        assert_eq!(
+            word_in([&first, &second], b),
+            a.0,
+            "b's field names a's new place"
+        );
+        assert_eq!(second.top(), ALIGN + 8, "the second segment kept b alone");
+    }
+
+    /// A DECLINED COLLECTION IS OUT OF MEMORY: nothing was reclaimed, so nothing is retried onto.
+    #[test]
+    fn a_declined_collection_leaves_the_allocation_out_of_memory() {
+        let (mut first, mut second) = two_segments(12);
+        let p = unsafe {
+            first.alloc(4, table_type(0)).unwrap();
+            second.alloc(4, table_type(0)).unwrap();
+            DeviceHeap::alloc_spanning(&mut first, Some(&mut second), 4, table_type(0), |_, _| {
+                false
+            })
+        };
+        assert!(p.is_null());
     }
 }

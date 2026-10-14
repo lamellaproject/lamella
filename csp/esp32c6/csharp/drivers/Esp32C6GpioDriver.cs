@@ -26,8 +26,6 @@ public sealed class Esp32C6GpioDriver : GpioDriver
 
     protected override int PinCount { get { return 31; } }
 
-    protected override int ConvertPinNumberToLogicalNumberingScheme(int pinNumber) { return pinNumber; }
-
     protected override void OpenPin(int pinNumber) { }
 
     protected override void ClosePin(int pinNumber)

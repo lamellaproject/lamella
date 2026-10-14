@@ -1,0 +1,26 @@
+[package]
+name = "lamella-psram-qspi"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+description = "A no_std bring-up for a QSPI PSRAM part behind a microcontroller's memory-mapped flash interface: the part's command set and timing limits as a value, the memory window's timing derived from them and the system clock, a read-back proof over the window, and the RP2350's QSPI memory interface (its second chip select) as the host behind a feature."
+license = "MIT OR Apache-2.0"
+keywords = ["psram", "qspi", "rp2350", "no-std", "embedded"]
+categories = ["embedded", "no-std", "hardware-support"]
+
+[lib]
+name = "lamella_psram_qspi"
+path = "src/lib.rs"
+
+# The crate is written on `core` alone and takes no dependency.
+[dependencies]
+
+[features]
+# The RP2350's QSPI memory interface (the QMI) as the host: the second chip
+# select's pad and function, the direct-mode command sequence that wakes the
+# part, memory window 1's timing and format registers, and the cache
+# maintenance the proof needs. Register access lives in that module alone.
+rp2350-qmi = []
+
+# The crate stands alone; it never joins an enclosing workspace.
+[workspace]

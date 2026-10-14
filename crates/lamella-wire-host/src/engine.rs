@@ -189,18 +189,11 @@ impl ReplLink for BakedSerialLink {
 }
 
 /// Load a compiled program app-only (the intrinsic-path load -- the PE-less target's BCL
-/// surface) and bake it to one self-contained image.
+/// surface) and bake it to one self-contained image, refusing one such an image cannot run
+/// ([`crate::refusal::bake_alone`]).
 #[cfg(all(feature = "serial", feature = "baked"))]
 fn bake_program(program: &[u8]) -> Result<Vec<u8>, String> {
-    let program: &'static [u8] = Box::leak(program.to_vec().into_boxed_slice());
-    let assembly = lamella_metadata::Assembly::read(program)
-        .map_err(|error| format!("program does not parse: {error:?}"))?;
-    let loaded =
-        lamella_load::load(&assembly).map_err(|error| format!("program load: {error}"))?;
-    let mut module = loaded.module;
-    module
-        .write_baked(Some(loaded.entry))
-        .map_err(|error| format!("bake: {error:?}"))
+    crate::refusal::bake_alone(Box::leak(program.to_vec().into_boxed_slice()))
 }
 
 /// How a submission folds into the session transcript.
@@ -451,8 +444,11 @@ impl Repl {
 /// `Assembly` views per submission (matching the browser's in-wasm compiler). This is the host
 /// compile seam the `lamella-repl` CLI and the DAP Debug Console both pass to [`Repl::new`].
 #[cfg(feature = "repl-host")]
+#[derive(Clone)]
 pub struct LcscCompiler {
     references: Vec<Vec<u8>>,
+    /// The folder the reference set was read from; see [`Self::folder`].
+    folder: std::path::PathBuf,
     /// The file the source was read from, when there is one; see [`Self::for_source_file`].
     source_path: Option<String>,
 }
@@ -471,11 +467,19 @@ impl LcscCompiler {
         self
     }
 
-    /// Sources the reference assemblies to bind against, corlib FIRST: the directory named by
-    /// `LAMELLA_REF_DIR`, else `LAMELLA_CORLIB` (an explicit Lamella corlib.dll -- fully
-    /// self-hosted), else a `corlib.dll` beside the executable or in the working directory, else
-    /// the dev tree's built corlib fixture. `Err` only when none is found; a fresh checkout builds
-    /// its own corlib from the shipped sources (`lcsc corlib/*/*.cs /out:corlib.dll`).
+    /// Sources the reference assemblies to bind against, corlib FIRST, from the first of these
+    /// places that holds a corlib:
+    ///
+    /// 1. the folder `LAMELLA_REF_DIR` names: every assembly in it;
+    /// 2. the corlib `LAMELLA_CORLIB` names, and the libraries beside it;
+    /// 3. a `corlib.dll` beside the executable, and the libraries beside it;
+    /// 4. a `corlib.dll` in the working directory, and the libraries beside it;
+    /// 5. `managed/` in the source tree this tool was built from, which is where
+    ///    `build-managed.ps1` and `build-managed.sh` write the class library.
+    ///
+    /// `Err` when none of them holds one, naming the build step that writes it. This is the one
+    /// search: the `lamella` command, `lamella-repl`, `lamella-mcp` and `lamella-dap` each take their
+    /// reference set, and the corlib they run against, from here.
     ///
     /// **IT SOURCES A SET, NOT A FILE.** Whatever [`Self::references`] hands back is the whole
     /// binding surface a host offers, so a corlib-only answer makes every shipped library invisible
@@ -484,48 +488,163 @@ impl LcscCompiler {
     ///
     /// `LAMELLA_REF_DIR` is consulted BEFORE the corlib probes, because each probe returns on its
     /// first hit: an explicit override that a default can silence is not an override.
+    ///
+    /// **THE SOURCE TREE'S TEST CORLIB IS NOT ONE OF THESE PLACES.** It is an input to this tree's
+    /// tests, and a tool that fell back to it would run a program against something other than the
+    /// class library without saying so. Only a test build looks there: the `fixture-corlib` feature,
+    /// which each crate that tests through this search turns on for its tests alone. A test build
+    /// looks there first, so every test binds the same corlib whatever else the tree holds.
     pub fn discover() -> Result<LcscCompiler, String> {
-        if let Some(dir) = std::env::var_os("LAMELLA_REF_DIR") {
-            let references = Self::references_in_dir(std::path::Path::new(&dir))?;
-            if !references.is_empty() {
-                return Ok(LcscCompiler {
-                    references,
-                    source_path: None,
-                });
+        let ref_dir = std::env::var_os("LAMELLA_REF_DIR").map(std::path::PathBuf::from);
+        let corlib = std::env::var_os("LAMELLA_CORLIB").map(std::path::PathBuf::from);
+        let places = Self::implicit_places(cfg!(any(test, feature = "fixture-corlib")));
+        let (references, folder) = Self::search(ref_dir.as_deref(), corlib.as_deref(), &places)?;
+        Ok(LcscCompiler { references, folder, source_path: None })
+    }
+
+    /// A compiler over the reference set in `dir`, every assembly in it with the corlib first: the
+    /// set `LAMELLA_REF_DIR` names, taken from a folder given here rather than from the environment.
+    ///
+    /// # Errors
+    /// A folder that cannot be read, or that holds no corlib.
+    pub fn in_folder(dir: &std::path::Path) -> Result<LcscCompiler, String> {
+        Ok(LcscCompiler {
+            references: Self::references_in_dir(dir)?,
+            folder: dir.to_path_buf(),
+            source_path: None,
+        })
+    }
+
+    /// The folder the reference set was read from: the one `LAMELLA_REF_DIR` names, or the one
+    /// holding the corlib the search found.
+    #[must_use]
+    pub fn folder(&self) -> &std::path::Path {
+        &self.folder
+    }
+
+    /// This compiler with the assemblies built for chip family `family` in place of the shared
+    /// assemblies of the same names, and the names of the ones it replaced.
+    ///
+    /// A family's builds sit in `families/<family>/` beside the reference set, where
+    /// `build-managed.ps1` and `build-managed.sh` write them: `System.Device.Gpio` built with the
+    /// family's bus drivers. Each has the public surface of the shared build it stands in for, so a
+    /// program binds to it exactly as to the shared one, and a build for one of the family's boards
+    /// compiles, bakes and links against it.
+    ///
+    /// Each takes its namesake's place, so the corlib stays first. One with no namesake in the set
+    /// is not added, because the shared set is what a program may bind against.
+    #[must_use]
+    pub fn for_family(mut self, family: &str) -> (LcscCompiler, Vec<String>) {
+        let dir = self.folder.join("families").join(family);
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .flatten()
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll")))
+            .collect();
+        paths.sort();
+        let mut replaced = Vec::new();
+        for path in paths {
+            let Ok(bytes) = std::fs::read(&path) else { continue };
+            let Some(name) = assembly_name_of(&bytes) else { continue };
+            let namesake = self
+                .references
+                .iter()
+                .position(|shared| assembly_name_of(shared).as_deref() == Some(name.as_str()));
+            if let Some(position) = namesake {
+                self.references[position] = bytes;
+                replaced.push(name);
             }
         }
-        if let Some(path) = std::env::var_os("LAMELLA_CORLIB") {
-            let path = std::path::PathBuf::from(&path);
-            let bytes = std::fs::read(&path)
+        (self, replaced)
+    }
+
+    /// The libraries in this set that some chip family builds its own of: each one with a namesake
+    /// in a `families/<family>/` folder beside the set, which [`Self::for_family`] puts in its
+    /// place. Sorted, each named once.
+    #[must_use]
+    pub fn built_per_family(&self) -> Vec<String> {
+        let shared = self.library_names();
+        let mut names: Vec<String> = std::fs::read_dir(self.folder.join("families"))
+            .into_iter()
+            .flatten()
+            .flatten()
+            .flat_map(|family| std::fs::read_dir(family.path()).into_iter().flatten().flatten())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("dll")))
+            .filter_map(|path| std::fs::read(path).ok())
+            .filter_map(|bytes| assembly_name_of(&bytes))
+            .filter(|name| shared.contains(name))
+            .collect();
+        names.sort();
+        names.dedup();
+        names
+    }
+
+    /// The source tree this tool was built from: the folder that holds `crates/`.
+    ///
+    /// It is the path the compiler was given, so a tree moved after it was built, or a binary
+    /// copied out of it, no longer reaches it. That is the same limit as the `libs/` lookup in
+    /// [`Self::with_libraries_beside`], and the search then falls through to its refusal.
+    fn source_tree() -> &'static std::path::Path {
+        let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        manifest.parent().and_then(std::path::Path::parent).unwrap_or(manifest)
+    }
+
+    /// Each `corlib.dll` [`Self::discover`] tries when no variable names one, in the order it tries
+    /// them. A test build tries the source tree's test corlib first.
+    fn implicit_places(test_build: bool) -> Vec<std::path::PathBuf> {
+        let tree = Self::source_tree();
+        let mut places = Vec::new();
+        if test_build {
+            places.push(
+                ["crates", "lamella-load", "tests", "fixtures", "corlib.dll"]
+                    .iter()
+                    .fold(tree.to_path_buf(), |path, part| path.join(part)),
+            );
+        }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(dir) = exe.parent()
+        {
+            places.push(dir.join("corlib.dll"));
+        }
+        places.push(std::path::PathBuf::from("corlib.dll"));
+        places.push(tree.join("managed").join("corlib.dll"));
+        places
+    }
+
+    /// The reference set the first of these holds, corlib first, and the folder it was read from:
+    /// the folder `ref_dir`, then the corlib `corlib`, then each of `places`.
+    ///
+    /// # Errors
+    /// A folder or corlib that was named and cannot be read, and none of them holding a corlib.
+    fn search(
+        ref_dir: Option<&std::path::Path>,
+        corlib: Option<&std::path::Path>,
+        places: &[std::path::PathBuf],
+    ) -> Result<(Vec<Vec<u8>>, std::path::PathBuf), String> {
+        if let Some(dir) = ref_dir {
+            return Ok((Self::references_in_dir(dir)?, dir.to_path_buf()));
+        }
+        if let Some(path) = corlib {
+            let bytes = std::fs::read(path)
                 .map_err(|error| format!("cannot read LAMELLA_CORLIB {}: {error}", path.display()))?;
-            return Ok(LcscCompiler {
-                references: Self::with_libraries_beside(&path, bytes),
-                source_path: None,
-            });
+            return Ok((Self::with_libraries_beside(path, bytes), Self::folder_of(path)));
         }
-        let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(dir) = exe.parent() {
-                candidates.push(dir.join("corlib.dll"));
+        for place in places {
+            if let Ok(bytes) = std::fs::read(place) {
+                return Ok((Self::with_libraries_beside(place, bytes), Self::folder_of(place)));
             }
         }
-        candidates.push(std::path::PathBuf::from("corlib.dll"));
-        candidates.push(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join("../lamella-load/tests/fixtures/corlib.dll"),
-        );
-        for candidate in candidates {
-            if let Ok(bytes) = std::fs::read(&candidate) {
-                return Ok(LcscCompiler {
-                    references: Self::with_libraries_beside(&candidate, bytes),
-                    source_path: None,
-                });
-            }
-        }
-        Err("no reference assemblies: set LAMELLA_CORLIB to a Lamella corlib.dll (build one from \
-             the shipped sources: `lcsc corlib/*/*.cs /out:corlib.dll`), put a corlib.dll beside \
-             the executable, or set LAMELLA_REF_DIR to a directory of reference assemblies"
-            .to_owned())
+        let tree = Self::source_tree();
+        Err(format!(
+            "no class library to compile against: build it with `pwsh -File build-managed.ps1` \
+             (Windows) or `./build-managed.sh` (Linux, macOS) in {}, which writes it to {}; or set \
+             LAMELLA_REF_DIR to a folder holding corlib.dll and the libraries",
+            tree.display(),
+            tree.join("managed").display()
+        ))
     }
 
     /// Every `*.dll` in `dir` as a reference set, **corlib first**.
@@ -555,6 +674,14 @@ impl LcscCompiler {
         })?;
         paths.swap(0, corlib);
         Ok(paths.iter().filter_map(|path| std::fs::read(path).ok()).collect())
+    }
+
+    /// The folder holding `corlib`: the working directory for a bare file name.
+    fn folder_of(corlib: &std::path::Path) -> std::path::PathBuf {
+        match corlib.parent() {
+            Some(dir) if !dir.as_os_str().is_empty() => dir.to_path_buf(),
+            _ => std::path::PathBuf::from("."),
+        }
     }
 
     /// Whether a path names a corlib, by file name and case-insensitively.
@@ -630,6 +757,34 @@ impl LcscCompiler {
     pub fn references(&self) -> &[Vec<u8>] {
         &self.references
     }
+
+    /// The names the libraries in this set give themselves, the corlib's left out, in the set's
+    /// order. A library whose bytes do not parse has no name to give and is left out too.
+    #[must_use]
+    pub fn library_names(&self) -> Vec<String> {
+        self.references.iter().skip(1).filter_map(|bytes| assembly_name_of(bytes)).collect()
+    }
+
+    /// This compiler binding against the corlib and those of its libraries whose names `keep`
+    /// answers true for: a set cut from its own, as a project names some of the libraries a
+    /// folder holds. The corlib stays first.
+    #[must_use]
+    pub fn keeping(&self, keep: impl Fn(&str) -> bool) -> LcscCompiler {
+        let references = self
+            .references
+            .iter()
+            .enumerate()
+            .filter(|(position, bytes)| *position == 0 || assembly_name_of(bytes).is_some_and(|name| keep(&name)))
+            .map(|(_, bytes)| bytes.clone())
+            .collect();
+        LcscCompiler { references, folder: self.folder.clone(), source_path: self.source_path.clone() }
+    }
+}
+
+/// The name an assembly's own metadata gives it, or `None` for bytes that are not an assembly.
+#[cfg(feature = "repl-host")]
+fn assembly_name_of(bytes: &[u8]) -> Option<String> {
+    lamella_metadata::Assembly::read(bytes).ok()?.assembly_name().map(String::from)
 }
 
 #[cfg(feature = "repl-host")]
@@ -1164,6 +1319,147 @@ mod tests {
 
         assert!(error.contains("no corlib.dll"), "the reason names what is missing: {error}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **THE CLASS LIBRARY `build-managed.ps1` WRITES IS FOUND WITH NOTHING SET**, so a clone that
+    /// has followed the README's two build steps runs a program with no variable to set.
+    #[test]
+    fn a_build_for_use_ends_its_search_at_the_class_library_of_its_own_source_tree() {
+        let tree = LcscCompiler::source_tree();
+        assert!(
+            tree.join("crates").join("lamella-wire-host").join("Cargo.toml").exists(),
+            "the source tree is the folder holding crates/: {}",
+            tree.display()
+        );
+        let places = LcscCompiler::implicit_places(false);
+        let managed = tree.join("managed").join("corlib.dll");
+        assert_eq!(places.last(), Some(&managed), "the last place is build-managed's output: {places:?}");
+    }
+
+    /// **NOTHING BUILT FOR USE LOOKS AT THE TEST CORLIB**, so no program runs against a test input
+    /// while the tool says nothing.
+    #[test]
+    fn a_build_for_use_never_looks_at_the_test_corlib() {
+        let tests = LcscCompiler::source_tree().join("crates").join("lamella-load").join("tests");
+        for place in LcscCompiler::implicit_places(false) {
+            assert!(!place.starts_with(&tests), "{} is the test corlib", place.display());
+        }
+    }
+
+    /// **A TEST BUILD BINDS THE TEST CORLIB, AND LOOKS AT IT FIRST**, so every test binds the same
+    /// corlib whatever else the tree holds: a `managed/` built from older sources included.
+    #[test]
+    fn a_test_build_looks_at_the_test_corlib_before_any_other_place() {
+        let fixture = ["crates", "lamella-load", "tests", "fixtures", "corlib.dll"]
+            .iter()
+            .fold(LcscCompiler::source_tree().to_path_buf(), |path, part| path.join(part));
+        let places = LcscCompiler::implicit_places(true);
+        assert_eq!(places.first(), Some(&fixture));
+        assert_eq!(&places[1..], &LcscCompiler::implicit_places(false)[..], "and then the same places");
+    }
+
+    /// **A CLASS LIBRARY IN A `managed/` FOLDER IS TAKEN AS A SET**, corlib first and its libraries
+    /// with it, as a corlib beside the executable is.
+    #[test]
+    fn a_class_library_in_a_managed_folder_is_found_with_its_libraries() {
+        let Some(fixtures) = fixtures() else { return };
+        let tree = scratch("managed-place");
+        let managed = tree.join("managed");
+        std::fs::create_dir_all(&managed).expect("create managed/");
+        for name in ["corlib.dll", "System.Device.Gpio.dll"] {
+            std::fs::copy(fixtures.join(name), managed.join(name)).expect("stage the class library");
+        }
+        let places = [tree.join("absent").join("corlib.dll"), managed.join("corlib.dll")];
+
+        let (set, folder) = LcscCompiler::search(None, None, &places).expect("the class library is there");
+
+        let corlib = std::fs::read(managed.join("corlib.dll")).expect("read back the corlib");
+        let gpio = std::fs::read(managed.join("System.Device.Gpio.dll")).expect("read back the library");
+        assert_eq!(set.first(), Some(&corlib), "the corlib first");
+        assert!(set.contains(&gpio), "and the library beside it");
+        assert_eq!(folder, managed, "and the set says the folder it came from");
+        let _ = std::fs::remove_dir_all(&tree);
+    }
+
+    /// An assembly named `name` declaring `class Mark` in namespace `name`, compiled against the
+    /// fixture corlib.
+    fn assembly_named(fixtures: &std::path::Path, name: &str) -> Vec<u8> {
+        let corlib = std::fs::read(fixtures.join("corlib.dll")).expect("the corlib fixture");
+        let corlib = lamella_metadata::Assembly::read(&corlib).expect("the corlib parses");
+        let source = format!("namespace {name}\n{{\n    public static class Mark\n    {{\n        static void Main() {{ }}\n    }}\n}}\n");
+        lamella_assemble::compile_source(&source, "Mark.cs", name, name, &[corlib], false)
+            .image
+            .unwrap_or_else(|| panic!("{name} compiles"))
+    }
+
+    /// **A FAMILY's BUILD STANDS IN FOR THE SHARED ASSEMBLY OF ITS NAME**, found in
+    /// `families/<family>/` beside the set and put in that assembly's place, so the corlib stays
+    /// first. An assembly there that the set has no namesake for is not added, and another family's
+    /// builds are not taken.
+    #[test]
+    fn a_familys_build_stands_in_for_the_shared_assembly_of_its_name() {
+        let Some(fixtures) = fixtures() else { return };
+        let dir = scratch("family-builds");
+        for name in ["corlib.dll", "System.Device.Gpio.dll"] {
+            std::fs::copy(fixtures.join(name), dir.join(name)).expect("stage the class library");
+        }
+        let family = dir.join("families").join("rp2350");
+        std::fs::create_dir_all(&family).expect("create families/rp2350");
+        let stand_in = assembly_named(&fixtures, "System.Device.Gpio");
+        std::fs::write(family.join("System.Device.Gpio.dll"), &stand_in).expect("write the family build");
+        std::fs::write(family.join("Elsewhere.dll"), assembly_named(&fixtures, "Elsewhere"))
+            .expect("write an assembly the set has no namesake for");
+
+        let shared = LcscCompiler::in_folder(&dir).expect("the set");
+        assert_eq!(shared.folder(), dir.as_path());
+        let before = shared.references().to_vec();
+        let (built, replaced) = shared.for_family("rp2350");
+
+        assert_eq!(replaced, ["System.Device.Gpio"]);
+        assert_eq!(built.references().len(), before.len(), "nothing is added");
+        assert_eq!(built.references()[0], before[0], "the corlib stays first");
+        assert!(built.references().contains(&stand_in), "the family build is in the set");
+        let gpio = std::fs::read(dir.join("System.Device.Gpio.dll")).expect("read back the shared build");
+        assert!(!built.references().contains(&gpio), "and the shared one is not");
+
+        let (other, none) = LcscCompiler::in_folder(&dir).expect("the set").for_family("nrf52833");
+        assert!(none.is_empty(), "a family with no builds replaces nothing: {none:?}");
+        assert_eq!(other.references(), &before[..]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A NAMED FOLDER OUTRANKS A NAMED CORLIB, AND EITHER OUTRANKS EVERY PLACE.** Each holds a
+    /// different file here, so the answer says which one was taken.
+    #[test]
+    fn a_named_folder_outranks_a_named_corlib_and_both_outrank_every_place() {
+        let dir = scratch("ranks");
+        for (folder, bytes) in [("named-folder", b"folder"), ("named-corlib", b"corlib"), ("place", b"places")] {
+            std::fs::create_dir_all(dir.join(folder)).expect("create a folder");
+            std::fs::write(dir.join(folder).join("corlib.dll"), bytes).expect("write a corlib");
+        }
+        let folder = dir.join("named-folder");
+        let corlib = dir.join("named-corlib").join("corlib.dll");
+        let places = [dir.join("place").join("corlib.dll")];
+        let first = |set: Result<(Vec<Vec<u8>>, std::path::PathBuf), String>| set.expect("found").0.first().cloned();
+
+        assert_eq!(first(LcscCompiler::search(Some(&folder), Some(&corlib), &places)), Some(b"folder".to_vec()));
+        assert_eq!(first(LcscCompiler::search(None, Some(&corlib), &places)), Some(b"corlib".to_vec()));
+        assert_eq!(first(LcscCompiler::search(None, None, &places)), Some(b"places".to_vec()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **WITH NOTHING FOUND, THE REFUSAL NAMES THE BUILD STEP THAT WRITES THE CLASS LIBRARY**, and
+    /// where it writes it. A bare `lcsc` line cannot build it: the corlib needs the capability
+    /// symbols `build-managed.ps1` passes.
+    #[test]
+    fn with_nothing_found_the_refusal_names_the_build_step_and_where_it_writes() {
+        let error = LcscCompiler::search(None, None, &[]).expect_err("there is nothing to find");
+        let managed = LcscCompiler::source_tree().join("managed");
+        assert!(error.contains("pwsh -File build-managed.ps1"), "{error}");
+        assert!(error.contains("./build-managed.sh"), "{error}");
+        assert!(error.contains(&managed.display().to_string()), "where it writes: {error}");
+        assert!(error.contains("LAMELLA_REF_DIR"), "and the variable that names another: {error}");
+        assert!(!error.contains("lcsc"), "{error}");
     }
 }
 

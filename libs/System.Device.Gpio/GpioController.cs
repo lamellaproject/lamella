@@ -5,46 +5,53 @@ namespace System.Device.Gpio
     public class GpioController : System.IDisposable
     {
         private readonly GpioDriver _driver;
-        private readonly PinNumberingScheme _numbering;
         private readonly bool[] _open;
 
-        /// <summary>Creates a controller over the board's GPIO driver, using logical pin
-        /// numbering.</summary>
-        /// <exception cref="System.InvalidOperationException">No GPIO driver is bound.</exception>
-        public GpioController() : this(PinNumberingScheme.Logical, Lamella.Hardware.Buses.ResolveGpio())
+        /// <summary>Creates a controller over the board's GPIO driver.</summary>
+        /// <exception cref="System.PlatformNotSupportedException">The program was built for no
+        /// board, or for one with no GPIO controller.</exception>
+        public GpioController() : this(BoardDriver())
         {
         }
 
-        /// <summary>Creates a controller over the board's GPIO driver, using the given numbering
-        /// scheme.</summary>
-        /// <exception cref="System.InvalidOperationException">No GPIO driver is bound.</exception>
-        public GpioController(PinNumberingScheme numberingScheme)
-            : this(numberingScheme, Lamella.Hardware.Buses.ResolveGpio())
+        private static GpioDriver BoardDriver()
         {
+            GpioDriver driver = Lamella.Hardware.Buses.FindGpio();
+            if ((object)driver == null)
+            {
+                throw new System.PlatformNotSupportedException(Lamella.Hardware.Buses.MissingGpio());
+            }
+            return driver;
         }
 
-        /// <summary>Creates a controller over <paramref name="driver"/> using the given numbering scheme.</summary>
-        public GpioController(PinNumberingScheme numberingScheme, GpioDriver driver)
+        /// <summary>Creates a controller over <paramref name="driver"/>.</summary>
+        /// <param name="driver">The driver that manages all of the pin operations for the
+        /// controller.</param>
+        public GpioController(GpioDriver driver)
         {
-            if ((object)driver == null) throw new System.ArgumentNullException("driver");
-            _numbering = numberingScheme;
             _driver = driver;
-            _open = new bool[driver.PinCount];
+            if ((object)driver != null)
+            {
+                _open = new bool[driver.PinCount];
+            }
         }
-
-        /// <summary>The numbering scheme used to represent pins.</summary>
-        public PinNumberingScheme NumberingScheme { get { return _numbering; } }
 
         /// <summary>The number of pins provided by the controller.</summary>
-        public virtual int PinCount { get { return _driver.PinCount; } }
-
-        private int Logical(int pinNumber)
+        public virtual int PinCount
         {
-            if (_numbering == PinNumberingScheme.Logical)
+            get
             {
-                return pinNumber;
+                CheckDriverValid();
+                return _driver.PinCount;
             }
-            return _driver.ConvertPinNumberToLogicalNumberingScheme(pinNumber);
+        }
+
+        private void CheckDriverValid()
+        {
+            if ((object)_driver == null)
+            {
+                throw new System.ObjectDisposedException("GpioController");
+            }
         }
 
         /// <summary>Opens a pin so it is ready to use.</summary>
@@ -71,7 +78,11 @@ namespace System.Device.Gpio
         }
 
         /// <summary>Whether a specific pin is open.</summary>
-        public virtual bool IsPinOpen(int pinNumber) { return _open[Logical(pinNumber)]; }
+        public virtual bool IsPinOpen(int pinNumber)
+        {
+            CheckDriverValid();
+            return _open[pinNumber];
+        }
 
         /// <summary>Closes an open pin.</summary>
         public void ClosePin(int pinNumber)
@@ -83,51 +94,77 @@ namespace System.Device.Gpio
         /// <param name="pinNumber">The pin number, in this controller's numbering scheme.</param>
         protected virtual void OpenPinCore(int pinNumber)
         {
-            int logical = Logical(pinNumber);
-            _driver.OpenPin(logical);
-            _open[logical] = true;
+            CheckDriverValid();
+            _driver.OpenPin(pinNumber);
+            _open[pinNumber] = true;
         }
 
         /// <summary>Closes a pin. The overridable half of <see cref="ClosePin(int)"/>.</summary>
         /// <param name="pinNumber">The pin number, in this controller's numbering scheme.</param>
         protected virtual void ClosePinCore(int pinNumber)
         {
-            int logical = Logical(pinNumber);
-            _driver.ClosePin(logical);
-            _open[logical] = false;
+            CheckDriverValid();
+            _driver.ClosePin(pinNumber);
+            _open[pinNumber] = false;
         }
 
         /// <summary>Sets the mode of a pin.</summary>
-        public virtual void SetPinMode(int pinNumber, PinMode mode) { _driver.SetPinMode(Logical(pinNumber), mode); }
+        public virtual void SetPinMode(int pinNumber, PinMode mode)
+        {
+            CheckDriverValid();
+            _driver.SetPinMode(pinNumber, mode);
+        }
 
         /// <summary>Gets the mode of a pin.</summary>
-        public virtual PinMode GetPinMode(int pinNumber) { return _driver.GetPinMode(Logical(pinNumber)); }
+        public virtual PinMode GetPinMode(int pinNumber)
+        {
+            CheckDriverValid();
+            return _driver.GetPinMode(pinNumber);
+        }
 
         /// <summary>Whether a pin supports a specific mode.</summary>
-        public virtual bool IsPinModeSupported(int pinNumber, PinMode mode) { return _driver.IsPinModeSupported(Logical(pinNumber), mode); }
+        public virtual bool IsPinModeSupported(int pinNumber, PinMode mode)
+        {
+            CheckDriverValid();
+            return _driver.IsPinModeSupported(pinNumber, mode);
+        }
 
         /// <summary>Reads the current value of a pin.</summary>
-        public virtual PinValue Read(int pinNumber) { return _driver.Read(Logical(pinNumber)); }
+        public virtual PinValue Read(int pinNumber)
+        {
+            CheckDriverValid();
+            return _driver.Read(pinNumber);
+        }
 
         /// <summary>Writes a value to a pin.</summary>
-        public virtual void Write(int pinNumber, PinValue value) { _driver.Write(Logical(pinNumber), value); }
+        public virtual void Write(int pinNumber, PinValue value)
+        {
+            CheckDriverValid();
+            _driver.Write(pinNumber, value);
+        }
 
         /// <summary>Toggles the current value of a pin.</summary>
-        public virtual void Toggle(int pinNumber) { _driver.Toggle(Logical(pinNumber)); }
+        public virtual void Toggle(int pinNumber)
+        {
+            CheckDriverValid();
+            _driver.Toggle(pinNumber);
+        }
 
         /// <summary>Adds a callback that is invoked when <paramref name="pinNumber"/> has an event
         /// of type <paramref name="eventTypes"/>.</summary>
         public virtual void RegisterCallbackForPinValueChangedEvent(
             int pinNumber, PinEventTypes eventTypes, PinChangeEventHandler callback)
         {
-            _driver.AddCallbackForPinValueChangedEvent(Logical(pinNumber), eventTypes, callback);
+            CheckDriverValid();
+            _driver.AddCallbackForPinValueChangedEvent(pinNumber, eventTypes, callback);
         }
 
         /// <summary>Removes a callback that was being invoked for the pin at
         /// <paramref name="pinNumber"/>.</summary>
         public virtual void UnregisterCallbackForPinValueChangedEvent(int pinNumber, PinChangeEventHandler callback)
         {
-            _driver.RemoveCallbackForPinValueChangedEvent(Logical(pinNumber), callback);
+            CheckDriverValid();
+            _driver.RemoveCallbackForPinValueChangedEvent(pinNumber, callback);
         }
 
         /// <summary>Disposes the controller and its driver.</summary>
@@ -142,7 +179,7 @@ namespace System.Device.Gpio
         /// </param>
         protected virtual void Dispose(bool disposing)
         {
-            if (disposing)
+            if (disposing && (object)_driver != null)
             {
                 _driver.Dispose();
             }

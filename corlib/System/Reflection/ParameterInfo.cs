@@ -20,7 +20,7 @@ namespace System.Reflection
         public int Position { get { return _position; } }
         public Type ParameterType { get { return _parameterType; } }
         public string Name { get { return _name; } }
-        public MethodBase Member { get { return _member; } }
+        public MemberInfo Member { get { return _member; } }
 
         public object[] GetCustomAttributes(bool inherit)
         {

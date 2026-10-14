@@ -1,5 +1,7 @@
 //! The RP2350 deployed-image flash region, programmed through the
-//! chip's bootrom flash API -- the QSPI flash controller (QMI) is never driven directly.
+//! chip's bootrom flash API -- the QSPI flash controller (QMI) is never driven directly. Each flash
+//! operation runs inside `psram_flash::keeping_psram`, so a PSRAM on chip select 1 keeps its
+//! contents and its reads.
 //!
 //! Facts from the RP2350 datasheet (5.4, "Bootrom APIs"):
 //! - The bootrom publishes its functions through a lookup helper whose 16-bit pointer sits at
@@ -25,6 +27,11 @@
 extern crate alloc;
 
 use alloc::vec::Vec;
+
+/// A PSRAM on chip select 1, kept through each flash operation below: the board crate's own module,
+/// taken by path because this firmware links the board crate only on the boards that fit one.
+#[path = "../../lamella-board-support/src/psram_flash.rs"]
+mod psram_flash;
 
 /// The deployed-image region: XIP window address and length. Disjoint from the firmware, which
 /// links from `0x10000000`, so programming it never touches running code.
@@ -159,8 +166,10 @@ impl Rp2350Flash {
         ) else {
             return false;
         };
-        range_erase_in_ram(cif, cex, cre, cfc, offset, len);
-        restore_xip_mode();
+        psram_flash::keeping_psram(&mut psram_flash::Chip, || {
+            range_erase_in_ram(cif, cex, cre, cfc, offset, len);
+            restore_xip_mode();
+        });
         true
     }
 
@@ -175,9 +184,12 @@ impl Rp2350Flash {
         ) else {
             return -1;
         };
-        let status = flash_ops_in_ram(cif, cex, cfo, cfc, erase_addr, erase_len, program_addr, program_src, program_len);
-        restore_xip_mode();
-        status
+        psram_flash::keeping_psram(&mut psram_flash::Chip, || {
+            let status =
+                flash_ops_in_ram(cif, cex, cfo, cfc, erase_addr, erase_len, program_addr, program_src, program_len);
+            restore_xip_mode();
+            status
+        })
     }
 }
 

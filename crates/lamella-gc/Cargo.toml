@@ -37,6 +37,12 @@ host-heap = []
 # none (no heap at all -- the consumer's own gate), bump (this feature off), collected
 # (this feature on).
 gc-collect = []
+# A device heap with a SECOND SEGMENT: a region at an unrelated address that allocation spills into
+# once the first is full, such as the PSRAM some boards fit beside the part's SRAM. One collection
+# covers both, each compacts in place, and no object moves between them. Off, the heap is the one
+# region it always was and every image builds as before; the runtime archive selects it only for a
+# board that fits a PSRAM.
+second-segment = []
 
 [lints]
 workspace = true

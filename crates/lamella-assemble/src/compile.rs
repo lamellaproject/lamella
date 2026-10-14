@@ -11,9 +11,9 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use lamella_syntax::version::LanguageVersion;
 use lamella_binder::{
-    Binder, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, CodeNamespace, ConversionKind,
+    AttributeValue, Binder, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, CodeNamespace, ConversionKind,
     Diagnostic as BinderDiagnostic, FieldReference, Model, SpecialType, TypeSymbol,
-    bind_type, collect_into, load_assembly,
+    bind_type, collect_into, load_references,
     parameter_symbol, resolve_constants,
 };
 use lamella_cil::{Instruction, MethodBodyImage, Opcode, Operand, encode_with_offsets, write_method_body};
@@ -512,9 +512,10 @@ fn compile_with_target(
     language_version: LanguageVersion,
     target: OutputKind,
 ) -> Compilation {
-    let diagnostics: Vec<Diagnostic> = lamella_binder::bind_compilation_unit_with_options(
+    let imported = load_references(references, assembly_name);
+    let diagnostics: Vec<Diagnostic> = lamella_binder::bind_compilation_unit_with_reference_model(
         unit,
-        references,
+        imported.clone(),
         lamella_binder::BindOptions {
             unsafe_option_missing,
             language_version,
@@ -527,7 +528,8 @@ fn compile_with_target(
     .collect();
     let had_error = diagnostics.iter().any(Diagnostic::is_error);
     let units = core::slice::from_ref(unit);
-    let Some(program) = ValidatedProgram::from_clean_bind(units, references, had_error) else {
+    let Some(program) = ValidatedProgram::from_clean_bind(units, references, &imported, had_error)
+    else {
         return Compilation {
             diagnostics,
             image: None,
@@ -643,11 +645,12 @@ fn compile_sources_on_this_stack(
         };
     }
     let mut any_error = false;
+    let imported = load_references(references, assembly_name);
     for (per_unit, unit_diagnostics) in diagnostics
         .iter_mut()
-        .zip(lamella_binder::bind_compilation_units_with_options(
+        .zip(lamella_binder::bind_compilation_units_with_reference_model(
             &units,
-            references,
+            imported.clone(),
             lamella_binder::BindOptions {
                 unsafe_option_missing,
                 language_version,
@@ -666,7 +669,8 @@ fn compile_sources_on_this_stack(
         *per_unit = suppressed;
     }
     let debug = emit_debug.then_some(sources);
-    let Some(program) = ValidatedProgram::from_clean_bind(&units, references, any_error) else {
+    let Some(program) = ValidatedProgram::from_clean_bind(&units, references, &imported, any_error)
+    else {
         return MultiCompilation {
             diagnostics,
             image: None,
@@ -698,7 +702,8 @@ fn compile_sources_on_this_stack(
     }
 }
 
-/// The binder model for `units` over their references: the reference types first,
+/// The binder model for `units` over their references (`imported`, which
+/// [`lamella_binder::load_references`] read): the reference types first,
 /// then every unit's own, with signature names qualified TO WHAT THEY MEAN IN THEIR OWN SCOPE
 /// and the base chain linked across the whole. The qualification step matches the diagnostic
 /// path ([`bind_compilation_unit_with_references`], via the binder crate's
@@ -707,15 +712,8 @@ fn compile_sources_on_this_stack(
 /// matches a qualified argument, so the emit-time call resolution silently fails ("a call that
 /// did not resolve") -- and a simple name shared by two namespaces resolves to the WRONG one or
 /// to none.
-fn reference_model(
-    units: &[CompilationUnit],
-    references: &[Assembly],
-    assembly_name: &str,
-) -> Model {
-    let mut model = Model::new();
-    for reference in references {
-        load_assembly(&mut model, reference, assembly_name);
-    }
+fn reference_model(units: &[CompilationUnit], imported: &Model) -> Model {
+    let mut model = imported.clone();
     for unit in units {
         collect_into(&mut model, unit);
     }
@@ -744,6 +742,9 @@ fn reference_model(
 struct ValidatedProgram<'a, 'r> {
     units: &'a [CompilationUnit],
     references: &'a [Assembly<'r>],
+    /// `references` as the bind read them ([`lamella_binder::load_references`], under the
+    /// assembly name being built): what emission resolves against.
+    imported: &'a Model,
 }
 
 impl<'a, 'r> ValidatedProgram<'a, 'r> {
@@ -754,9 +755,14 @@ impl<'a, 'r> ValidatedProgram<'a, 'r> {
     fn from_clean_bind(
         units: &'a [CompilationUnit],
         references: &'a [Assembly<'r>],
+        imported: &'a Model,
         had_error: bool,
     ) -> Option<Self> {
-        (!had_error).then_some(ValidatedProgram { units, references })
+        (!had_error).then_some(ValidatedProgram {
+            units,
+            references,
+            imported,
+        })
     }
 }
 
@@ -824,7 +830,7 @@ fn build_image(
     }
     emit_is_readonly_attribute(&mut image, binder.model(), &mut tokens);
     for unit in units {
-        emit_global_attributes(&mut image, &binder, &mut tokens, &unit.global_attributes);
+        emit_global_attributes(&mut image, &mut binder, &mut tokens, &unit.global_attributes);
     }
     emit_exception_base_chains(&mut image, binder.model(), &tokens);
     finish_image(image, entry_point, debug, module_name, embed_pdb, target)
@@ -857,7 +863,7 @@ fn emit_source_types(
 ) -> Result<SourceTypes, crate::EmitError> {
     let units = program.units;
     let references = program.references;
-    let model = reference_model(units, references, assembly_name);
+    let model = reference_model(units, program.imported);
     let mut binder = Binder::with_model(model);
     let mut tokens = assign_tokens(units, &mut binder, partials, synthesized);
     tokens.set_native_interop(native_interop);
@@ -985,17 +991,16 @@ fn exception_base_chain_tags(model: &Model, symbol: &TypeSymbol) -> Option<Vec<u
 }
 
 /// Emits a `CustomAttribute` row for each user attribute applied to `parent` (24.2): the
-/// attribute type's constructor (matched by positional-argument count) and a value blob of
-/// its fixed arguments (II.23.3). An attribute whose type/constructor does not resolve, or
-/// whose arguments are not constant literals this encodes, is skipped (lenient -- the same
-/// posture as an unlowered construct).
+/// constructor overload resolution chose and a value blob of its fixed and named arguments
+/// (II.23.3), each the value [`Binder::bind_attribute`] resolved. An attribute that does not bind
+/// is skipped.
 ///
 /// A `[return:]` section on a method (24.4) attaches to the method's return value: a `Param`
 /// row of sequence 0 is minted for the return and the attribute hangs off it. Other explicit
 /// targets are not routed here yet.
 fn emit_attributes(
     image: &mut ImageBuilder,
-    binder: &Binder,
+    binder: &mut Binder,
     tokens: &mut Tokens,
     enclosing: &TypeSymbol,
     parent: Token,
@@ -1020,12 +1025,12 @@ fn emit_attributes(
                     Some("MarshalAs" | "MarshalAsAttribute")
                 )
             {
-                if let Some(spec) = interop::marshal_spec_of(binder, attribute) {
+                if let Some(spec) = interop::marshal_spec_of(binder, enclosing, attribute) {
                     image.add_field_marshal(attribute_parent, &spec.encode());
                 }
                 continue;
             }
-            emit_one_attribute(image, binder, tokens, enclosing, attribute_parent, attribute);
+            emit_one_attribute(image, binder, tokens, Some(enclosing), attribute_parent, attribute);
         }
     }
 }
@@ -1036,11 +1041,10 @@ fn emit_attributes(
 /// from metadata (e.g. `[assembly: Lamella.Runtime.RequiresCapability("net.tls")]`).
 fn emit_global_attributes(
     image: &mut ImageBuilder,
-    binder: &Binder,
+    binder: &mut Binder,
     tokens: &mut Tokens,
     sections: &[AttributeSection],
 ) {
-    let enclosing = TypeSymbol::Special(SpecialType::Object);
     for section in sections {
         let is_assembly = section.target.as_deref() != Some("module");
         let parent = match section.target.as_deref() {
@@ -1066,7 +1070,7 @@ fn emit_global_attributes(
                     continue;
                 }
             }
-            emit_one_attribute(image, binder, tokens, &enclosing, parent, attribute);
+            emit_one_attribute(image, binder, tokens, None, parent, attribute);
         }
     }
 }
@@ -1158,83 +1162,39 @@ fn parse_assembly_version(text: &str) -> Option<(u16, u16, u16, u16)> {
 
 fn emit_one_attribute(
     image: &mut ImageBuilder,
-    binder: &Binder,
+    binder: &mut Binder,
     tokens: &mut Tokens,
-    enclosing: &TypeSymbol,
+    enclosing: Option<&TypeSymbol>,
     parent: Token,
     attribute: &lamella_syntax::ast::Attribute,
 ) {
-    let mut positional: Vec<&Expr> = Vec::new();
-    let mut named: Vec<(&str, &Expr)> = Vec::new();
-    for argument in &attribute.arguments {
-        match argument {
-            AttributeArgument::Positional(expr) => positional.push(expr),
-            AttributeArgument::Named { name, value } => named.push((name, value)),
-        }
-    }
-    let Some((attribute_ty, constructor)) =
-        resolve_attribute(binder, &attribute.name, positional.len())
-    else {
+    let Some(bound) = binder.bind_attribute(enclosing, attribute) else {
         return;
     };
-    let parameters = constructor.parameters.clone();
-    let is_params = constructor.is_params;
     let mut blob = alloc::vec![0x01u8, 0x00];
-    for (index, parameter) in parameters.iter().enumerate() {
-        if is_params && index + 1 == parameters.len() {
-            let TypeSymbol::Array { element, rank: 1 } = binder.resolve_type(parameter) else {
-                return;
-            };
-            let rest = &positional[index.min(positional.len())..];
-            let direct = rest.len() == 1
-                && matches!(
-                    rest[0].kind,
-                    ExprKind::ArrayCreation { .. } | ExprKind::Literal(Literal::Null)
-                );
-            if direct {
-                if encode_value(binder, tokens, enclosing, rest[0], parameter, &mut blob).is_none() {
-                    return;
-                }
-            } else {
-                let Ok(count) = u32::try_from(rest.len()) else {
-                    return;
-                };
-                blob.extend_from_slice(&count.to_le_bytes());
-                for arg in rest {
-                    if encode_value(binder, tokens, enclosing, arg, &element, &mut blob).is_none() {
-                        return;
-                    }
-                }
-            }
-            break;
-        }
-        let Some(expr) = positional.get(index) else {
-            let Some(default) = constructor.parameter_default(index) else {
-                return;
-            };
-            if encode_default(binder, tokens, default, parameter, &mut blob).is_none() {
-                return;
-            }
-            continue;
-        };
-        if encode_value(binder, tokens, enclosing, expr, parameter, &mut blob).is_none() {
+    for (value, parameter) in bound.fixed.iter().zip(&bound.constructor.parameters) {
+        if encode_attribute_value(binder, tokens, value, parameter, &mut blob).is_none() {
             return;
         }
     }
-    let Ok(named_count) = u16::try_from(named.len()) else {
+    let Ok(named_count) = u16::try_from(bound.named.len()) else {
         return;
     };
     blob.extend_from_slice(&named_count.to_le_bytes());
-    for (name, value) in &named {
-        if encode_named_argument(binder, tokens, enclosing, &attribute_ty, name, value, &mut blob)
-            .is_none()
-        {
+    for named in &bound.named {
+        blob.push(if named.is_field { 0x53 } else { 0x54 });
+        if encode_field_or_prop_type(binder, &named.ty, &mut blob).is_none() {
+            return;
+        }
+        encode_ser_string(&named.name, &mut blob);
+        if encode_attribute_value(binder, tokens, &named.value, &named.ty, &mut blob).is_none() {
             return;
         }
     }
-    if tokens.method(&attribute_ty, ".ctor", &parameters).is_none() {
+    let parameters = bound.constructor.parameters.clone();
+    if tokens.method(&bound.class, ".ctor", &parameters).is_none() {
         let constructor_ref = lamella_binder::MethodReference {
-            declaring_type: attribute_ty.clone(),
+            declaring_type: bound.class.clone(),
             name: ".ctor".into(),
             parameters: parameters.clone(),
             return_type: TypeSymbol::Special(SpecialType::Void),
@@ -1245,253 +1205,124 @@ fn emit_one_attribute(
         };
         mint_member_ref(&constructor_ref, image, tokens);
     }
-    let Some(constructor) = tokens.method(&attribute_ty, ".ctor", &parameters) else {
+    let Some(constructor) = tokens.method(&bound.class, ".ctor", &parameters) else {
         return;
     };
     image.add_custom_attribute(parent, constructor, &blob);
 }
 
-/// Resolves an attribute name to its type and the constructor taking `arg_count` positional
-/// arguments, trying the name as written and with an `Attribute` suffix (24.2). `None` if neither
-/// resolves to a type with such a constructor.
-fn resolve_attribute(
-    binder: &Binder,
-    name: &QualifiedName,
-    arg_count: usize,
-) -> Option<(TypeSymbol, lamella_binder::MethodSymbol)> {
-    let model = binder.model();
-    for candidate in attribute_candidates(name) {
-        let resolved = binder.resolve_type(&candidate);
-        if let Some(info) = model.get_by_symbol(&resolved) {
-            let constructor = info
-                .constructors
-                .iter()
-                .find(|constructor| constructor.parameters.len() == arg_count)
-                .or_else(|| {
-                    info.constructors.iter().find(|constructor| {
-                        !constructor.is_vararg && constructor.accepts_argument_count(arg_count)
-                    })
-                });
-            if let Some(constructor) = constructor {
-                return Some((resolved, constructor.clone()));
-            }
-        }
-    }
-    None
-}
-
-/// The candidate type symbols for an attribute name: as written, and with an `Attribute`
-/// suffix on the final identifier (`[My]` -> `My`, then `MyAttribute`).
-fn attribute_candidates(name: &QualifiedName) -> Vec<TypeSymbol> {
-    let parts: Vec<Box<str>> = name.parts.iter().cloned().collect();
-    let mut suffixed = parts.clone();
-    if let Some(last) = suffixed.last_mut() {
-        let mut full = String::from(&**last);
-        full.push_str("Attribute");
-        *last = full.into();
-    }
-    alloc::vec![
-        TypeSymbol::Named(parts.into()),
-        TypeSymbol::Named(suffixed.into()),
-    ]
-}
-
-/// Encodes one attribute argument value into the blob by its target type (II.23.3): an
-/// integral/bool/char/string literal, a `typeof(T)` (the type's name as a SerString), an
-/// enum constant (its underlying integer), or a single-dimension array (`SZARRAY`: the
-/// element count then each element, or `0xFFFFFFFF` for null). `None` (skip the attribute)
-/// for anything else. The target type is first resolved through the namespaces in scope, so
-/// a simple-named enum or array element (`AttributeTargets`, not `System.AttributeTargets`)
-/// finds its model entry.
-fn encode_value(
+/// Writes one attribute argument's value into a blob (II.23.3), held at `ty`, the type of the
+/// parameter or named member it is given to: a constant at that type's width (an enum at its
+/// underlying type's), a `typeof` as the type's name, an `SZARRAY` as its element count and then
+/// each element (`0xFFFFFFFF` for a null array), and a value given to an `object` as its own type
+/// and then the value at that type. `None` for a value the blob has no encoding for.
+fn encode_attribute_value(
     binder: &Binder,
     tokens: &Tokens,
-    enclosing: &TypeSymbol,
-    expr: &Expr,
+    value: &AttributeValue,
     ty: &TypeSymbol,
     blob: &mut Vec<u8>,
 ) -> Option<()> {
-    let resolved = binder.resolve_type(ty);
-    if let TypeSymbol::Array { element, rank: 1 } = &resolved {
-        return encode_array(binder, tokens, enclosing, expr, element, blob);
-    }
-    if let ExprKind::Name { name, .. } = &expr.kind {
-        if let Some(constant) = binder
-            .model()
-            .get_by_symbol(enclosing)
-            .and_then(|info| info.find_field(name).and_then(|f| f.constant.clone()))
-        {
-            return encode_literal(&constant, &resolved, blob);
+    let ty = binder.resolve_type(ty);
+    match value {
+        AttributeValue::Array(None) => blob.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes()),
+        AttributeValue::Array(Some(elements)) => {
+            let TypeSymbol::Array { element, rank: 1 } = &ty else {
+                return None;
+            };
+            let count = u32::try_from(elements.len()).ok()?;
+            blob.extend_from_slice(&count.to_le_bytes());
+            for item in elements {
+                encode_attribute_value(binder, tokens, item, element, blob)?;
+            }
         }
-    }
-    match &expr.kind {
-        ExprKind::Literal(literal) => encode_literal(literal, &resolved, blob),
-        ExprKind::TypeOf(target) => {
-            encode_ser_string(&type_serialization_name(target), blob);
-            Some(())
+        AttributeValue::Type(target) => encode_ser_string(&type_name(&binder.resolve_type(target)), blob),
+        AttributeValue::Boxed(own, inner) => {
+            encode_field_or_prop_type(binder, own, blob)?;
+            encode_attribute_value(binder, tokens, inner, own, blob)?;
         }
-        _ => {
-            let (enum_ty, value) = enum_argument_value(binder, &resolved, expr)?;
-            let underlying = tokens
-                .enum_underlying(&enum_ty)
-                .unwrap_or_else(|| enum_underlying(binder.model(), &enum_ty));
-            encode_integer(underlying, value as u64, blob)
-        }
-    }
-}
-
-/// Encodes a `SZARRAY` fixed-argument value (II.23.3): a 4-byte element count (`0xFFFFFFFF`
-/// for a null array), then each element encoded in turn at the array's `element` type. The
-/// argument is a `null` literal or a `new T[] { ... }` creation with a constant initializer;
-/// anything else yields `None` (skip the attribute).
-fn encode_array(
-    binder: &Binder,
-    tokens: &Tokens,
-    enclosing: &TypeSymbol,
-    expr: &Expr,
-    element: &TypeSymbol,
-    blob: &mut Vec<u8>,
-) -> Option<()> {
-    if let ExprKind::Literal(Literal::Null) = &expr.kind {
-        blob.extend_from_slice(&0xFFFF_FFFFu32.to_le_bytes());
-        return Some(());
-    }
-    let ExprKind::ArrayCreation {
-        initializer: Some(initializer),
-        ..
-    } = &expr.kind
-    else {
-        return None;
-    };
-    let ExprKind::ArrayInitializer(elements) = &initializer.kind else {
-        return None;
-    };
-    let count = u32::try_from(elements.len()).ok()?;
-    blob.extend_from_slice(&count.to_le_bytes());
-    for element_expr in elements {
-        encode_value(binder, tokens, enclosing, element_expr, element, blob)?;
+        AttributeValue::Constant(literal) => encode_attribute_constant(binder, tokens, literal, &ty, blob)?,
     }
     Some(())
 }
 
-/// The enum type and underlying integer value of an enum-constant argument `E.Member`. When
-/// the target type `resolved` is the enum, its member gives the value directly (so a
-/// reference-assembly enum resolves without a bare-name model lookup); otherwise the enum is
-/// derived from the expression itself (a simple-named, this-module enum).
-fn enum_argument_value(
+/// Writes a constant held at `ty` (II.23.3): an enum as its underlying integer, a `bool` as one
+/// byte, a `char` as two, a real at its own width, and a string as a `SerString`. A null string or
+/// `Type` is the single byte `0xFF`, and a null `object` is a null string, `0E FF`, as csc writes it.
+fn encode_attribute_constant(
     binder: &Binder,
-    resolved: &TypeSymbol,
-    expr: &Expr,
-) -> Option<(TypeSymbol, i64)> {
-    let model = binder.model();
-    if let ExprKind::MemberAccess { name, .. } = &expr.kind {
-        if let Some(info) = model.get_by_symbol(resolved) {
-            if info.kind == lamella_binder::TypeKind::Enum {
-                if let Some(value) = info
-                    .find_field(name)
-                    .and_then(|field| field.constant.as_ref())
-                    .and_then(lamella_binder::literal_int_value)
-                {
-                    return Some((resolved.clone(), value));
-                }
-            }
-        }
+    tokens: &Tokens,
+    literal: &Literal,
+    ty: &TypeSymbol,
+    blob: &mut Vec<u8>,
+) -> Option<()> {
+    if binder
+        .model()
+        .get_by_symbol(ty)
+        .is_some_and(|info| info.kind == lamella_binder::TypeKind::Enum)
+    {
+        let Literal::Integer { value, .. } = literal else {
+            return None;
+        };
+        let underlying = tokens
+            .enum_underlying(ty)
+            .unwrap_or_else(|| enum_underlying(binder.model(), ty));
+        return encode_integer(underlying, *value, blob);
     }
-    enum_member_constant(model, expr)
-}
-
-/// Encodes a constant literal by its target type.
-fn encode_literal(literal: &Literal, ty: &TypeSymbol, blob: &mut Vec<u8>) -> Option<()> {
+    if is_system_type(ty, "Type") {
+        return matches!(literal, Literal::Null).then(|| blob.push(0xFF));
+    }
     let TypeSymbol::Special(special) = ty else {
         return None;
     };
     match (special, literal) {
-        (SpecialType::Boolean, Literal::Boolean(value)) => blob.push(u8::from(*value)),
-        (SpecialType::Char, Literal::Character(value)) => {
-            blob.extend_from_slice(&value.to_le_bytes());
-        }
-        (SpecialType::String, Literal::String(units)) => {
-            encode_ser_string_units(units, blob);
-        }
+        (SpecialType::Object, Literal::Null) => blob.extend_from_slice(&[0x0E, 0xFF]),
         (SpecialType::String, Literal::Null) => blob.push(0xFF),
+        (SpecialType::String, Literal::String(units)) => encode_ser_string_units(units, blob),
+        (SpecialType::Boolean, Literal::Boolean(value)) => blob.push(u8::from(*value)),
+        (SpecialType::Char, Literal::Character(value)) => blob.extend_from_slice(&value.to_le_bytes()),
+        (SpecialType::Char, Literal::Integer { value, .. }) => {
+            blob.extend_from_slice(&(*value as u16).to_le_bytes());
+        }
+        (SpecialType::Single, Literal::Real { bits, .. }) => {
+            blob.extend_from_slice(&(f64::from_bits(*bits) as f32).to_bits().to_le_bytes());
+        }
+        (SpecialType::Double, Literal::Real { bits, .. }) => blob.extend_from_slice(&bits.to_le_bytes()),
         (_, Literal::Integer { value, .. }) => return encode_integer(*special, *value, blob),
         _ => return None,
     }
     Some(())
 }
 
-/// Encodes an omitted parameter's default value (`literal`) as the fixed argument for `parameter`:
-/// an enum's as its underlying integer, everything else as [`encode_literal`] writes the type.
-fn encode_default(
-    binder: &Binder,
-    tokens: &Tokens,
-    literal: &Literal,
-    parameter: &TypeSymbol,
-    blob: &mut Vec<u8>,
-) -> Option<()> {
-    let resolved = binder.resolve_type(parameter);
-    let is_enum = binder
-        .model()
-        .get_by_symbol(&resolved)
-        .is_some_and(|info| info.kind == lamella_binder::TypeKind::Enum);
-    if is_enum {
-        let Literal::Integer { value, .. } = literal else {
-            return None;
-        };
-        let underlying = tokens
-            .enum_underlying(&resolved)
-            .unwrap_or_else(|| enum_underlying(binder.model(), &resolved));
-        return encode_integer(underlying, *value, blob);
+/// Writes the `FieldOrPropType` of a value whose type the blob states (II.23.3) -- a named
+/// argument's member, or a value given to an `object`: a primitive's element-type code, `0x50` for
+/// `System.Type`, `0x51` for `object`, `0x55` and the name for an enum, and `0x1D` then the
+/// element's for a single-dimensional array.
+fn encode_field_or_prop_type(binder: &Binder, ty: &TypeSymbol, blob: &mut Vec<u8>) -> Option<()> {
+    let ty = binder.resolve_type(ty);
+    if let TypeSymbol::Array { element, rank: 1 } = &ty {
+        blob.push(0x1D);
+        return encode_field_or_prop_type(binder, element, blob);
     }
-    encode_literal(literal, &resolved, blob)
-}
-
-/// Encodes a named attribute argument (II.23.3): the FIELD (0x53) / PROPERTY (0x54) tag, the
-/// target's element type, its name, and the value. The target is resolved as a field or
-/// property of the attribute type. `None` (skip) if it is neither or cannot be encoded.
-fn encode_named_argument(
-    binder: &Binder,
-    tokens: &Tokens,
-    enclosing: &TypeSymbol,
-    attribute_ty: &TypeSymbol,
-    name: &str,
-    value: &Expr,
-    blob: &mut Vec<u8>,
-) -> Option<()> {
-    let (tag, target_ty) = {
-        let info = binder.model().get_by_symbol(attribute_ty)?;
-        if let Some(field) = info.find_field(name) {
-            (0x53u8, field.ty.clone())
-        } else if let Some(property) = info.find_property(name) {
-            (0x54u8, property.ty.clone())
-        } else {
-            return None;
-        }
-    };
-    let target_ty = binder.resolve_type(&target_ty);
-    blob.push(tag);
-    encode_element_type(binder.model(), &target_ty, blob)?;
-    encode_ser_string(name, blob);
-    encode_value(binder, tokens, enclosing, value, &target_ty, blob)
-}
-
-/// Encodes the FieldOrPropType of a named argument (II.23.3): a primitive's element-type
-/// code, `0x50` for `System.Type`, or `0x55` and the enum's name for an enum.
-fn encode_element_type(model: &Model, ty: &TypeSymbol, blob: &mut Vec<u8>) -> Option<()> {
-    if let TypeSymbol::Special(special) = ty {
+    if ty == TypeSymbol::Special(SpecialType::Object) {
+        blob.push(0x51);
+        return Some(());
+    }
+    if let TypeSymbol::Special(special) = &ty {
         blob.push(primitive_element_code(*special)?);
         return Some(());
     }
-    if is_system_type(ty, "Type") {
+    if is_system_type(&ty, "Type") {
         blob.push(0x50);
         return Some(());
     }
-    if model
-        .get_by_symbol(ty)
+    if binder
+        .model()
+        .get_by_symbol(&ty)
         .is_some_and(|info| info.kind == lamella_binder::TypeKind::Enum)
     {
         blob.push(0x55);
-        encode_ser_string(&type_name(ty), blob);
+        encode_ser_string(&type_name(&ty), blob);
         return Some(());
     }
     None
@@ -1515,12 +1346,6 @@ fn primitive_element_code(special: SpecialType) -> Option<u8> {
         SpecialType::String => 0x0E,
         _ => return None,
     })
-}
-
-/// The CLR name a `typeof(T)` serializes to in a custom attribute (II.23.3) -- the type's
-/// namespace-qualified name (the runtime resolves it in the attribute's assembly / mscorlib).
-fn type_serialization_name(target: &TypeRef) -> String {
-    type_name(&bind_type(target))
 }
 
 /// Whether a static `Main` has a valid entry-point signature (10.1): return type `void` or `int`,
@@ -1566,27 +1391,6 @@ fn joined_name(namespace: &str, name: &str) -> String {
 /// Whether `ty` is the named BCL type `System.<name>`.
 fn is_system_type(ty: &TypeSymbol, name: &str) -> bool {
     matches!(split_type_name(ty), Some((namespace, type_name)) if namespace == "System" && type_name == name)
-}
-
-/// Resolves an enum-constant argument `E.V` to its enum type and underlying integer value.
-fn enum_member_constant(model: &Model, expr: &Expr) -> Option<(TypeSymbol, i64)> {
-    let ExprKind::MemberAccess { receiver, name } = &expr.kind else {
-        return None;
-    };
-    let ExprKind::Name { name: enum_name, .. } = &receiver.kind else {
-        return None;
-    };
-    let enum_ty = TypeSymbol::Named([enum_name.clone()].into());
-    let info = model.get_by_symbol(&enum_ty)?;
-    if info.kind != lamella_binder::TypeKind::Enum {
-        return None;
-    }
-    let value = info
-        .find_field(name)?
-        .constant
-        .as_ref()
-        .and_then(lamella_binder::literal_int_value)?;
-    Some((enum_ty, value))
 }
 
 /// Whether `ty` is System.Enum or System.ValueType -- the two abstract classes that extend
@@ -1779,11 +1583,14 @@ pub(crate) fn build_submission_delta(
     module_name: &str,
     assembly_name: &str,
 ) -> Result<Vec<u8>, crate::EmitError> {
-    let mut tokens = Tokens::new();
-    let mut image = ImageBuilder::new(module_name, assembly_name);
-    let object = image.object_type();
-
-    if !type_members.is_empty() {
+    let emit_types = |synthesized: crate::tokens::InstanceRows| {
+        let mut tokens = Tokens::new();
+        let mut image = ImageBuilder::new(module_name, assembly_name);
+        if type_members.is_empty() {
+            return Ok((image, tokens, None));
+        }
+        tokens.expect_instance_rows(synthesized);
+        let object = image.object_type();
         let mut next_type = 1u32;
         let mut next_field = 0u32;
         let mut next_method = 0u32;
@@ -1813,8 +1620,28 @@ pub(crate) fn build_submission_delta(
             None,
             &partials,
         )?;
+        Ok::<_, crate::EmitError>((image, tokens, Some(binder)))
+    };
+    let (mut image, mut tokens, mut binder) = emit_types(crate::tokens::InstanceRows::new())?;
+    if let Err(mismatch) = check_method_rows(&image, &tokens) {
+        let measured = tokens.take_instance_rows_written();
+        if measured.is_empty() {
+            return Err(mismatch);
+        }
+        (image, tokens, binder) = emit_types(measured)?;
         check_method_rows(&image, &tokens)?;
     }
+    if let Some(binder) = binder.as_mut() {
+        let pending_lambdas = core::mem::take(&mut tokens.pending_lambdas);
+        if !pending_lambdas.is_empty() || !tokens.pending_instance_bodies.is_empty() {
+            emit_closure_types(&mut image, binder, &mut tokens, pending_lambdas)?;
+        }
+        let pending_async = core::mem::take(&mut tokens.pending_async);
+        for pending in pending_async {
+            emit_async_machine(&mut image, binder, &mut tokens, pending)?;
+        }
+    }
+    let object = image.object_type();
 
     mint_named_type_token(repl_type, &mut image, &mut tokens);
     mint_references(bound, &mut image, &mut tokens);
@@ -2160,7 +1987,7 @@ fn emit_generic_parameters(
 /// name is an image the CLR refuses to load.
 fn emit_interface(
     image: &mut ImageBuilder,
-    binder: &Binder,
+    binder: &mut Binder,
     tokens: &mut Tokens,
     namespace: &str,
     declaration: &TypeDecl,
@@ -2381,7 +2208,7 @@ fn emit_interface(
 /// the one signature here that a type parameter cannot reach.
 fn emit_delegate(
     image: &mut ImageBuilder,
-    binder: &Binder,
+    binder: &mut Binder,
     tokens: &mut Tokens,
     namespace: &str,
     declaration: &DelegateDecl,
@@ -2498,7 +2325,7 @@ fn emit_delegate(
 /// reserved by the token pre-pass, so later types stay aligned.
 fn emit_enum(
     image: &mut ImageBuilder,
-    binder: &Binder,
+    binder: &mut Binder,
     tokens: &mut Tokens,
     namespace: &str,
     declaration: &EnumDecl,
@@ -3170,7 +2997,7 @@ fn emit_type_inner(
         if !declares_static_constructor {
             flags |= TYPE_BEFORE_FIELD_INIT;
         }
-        let struct_layout = interop::struct_layout(binder, &declaration.attributes);
+        let struct_layout = interop::struct_layout(binder, &enclosing, &declaration.attributes);
         if let Some(layout) = &struct_layout {
             flags = (flags & !(interop::LAYOUT_MASK | interop::STRING_FORMAT_MASK)) | layout.type_flags;
         }
@@ -3217,8 +3044,8 @@ fn emit_type_inner(
         } = member
         {
             emit_field(image, binder, tokens, &enclosing, modifiers, ty, declarators)?;
-            let field_offset = interop::field_offset(binder, attributes);
-            let marshal = interop::marshal_spec(binder, attributes);
+            let field_offset = interop::field_offset(binder, &enclosing, attributes);
+            let marshal = interop::marshal_spec(binder, &enclosing, attributes);
             let user_attributes =
                 interop::without_pseudo_custom(attributes, interop::is_pseudo_custom_field_attribute);
             for declarator in declarators {
@@ -4050,7 +3877,7 @@ fn event_accessor_body(field: &str, operator: AssignmentOperator) -> Stmt {
 /// dispatches to the overriding method in a derived type.
 fn emit_bodyless_method(
     image: &mut ImageBuilder,
-    binder: &Binder,
+    binder: &mut Binder,
     tokens: &mut Tokens,
     enclosing: &TypeSymbol,
     modifiers: &[Modifier],
@@ -4704,7 +4531,7 @@ fn ends_in_params_array(parameters: &[Parameter]) -> bool {
 /// values are read from.
 fn emit_declared_parameter_metadata(
     image: &mut ImageBuilder,
-    binder: &Binder,
+    binder: &mut Binder,
     tokens: &mut Tokens,
     enclosing: &TypeSymbol,
     method: Token,
@@ -4726,7 +4553,7 @@ fn emit_declared_parameter_metadata(
         let Some(&param) = rows.get(index) else {
             continue;
         };
-        if let Some(spec) = interop::marshal_spec(binder, &parameter.attributes) {
+        if let Some(spec) = interop::marshal_spec(binder, enclosing, &parameter.attributes) {
             image.add_field_marshal(param, &spec.encode());
         }
     }
@@ -4984,7 +4811,7 @@ fn string_literal_value(expr: &Expr) -> Option<String> {
 /// boundary the target cannot honor.
 fn emit_pinvoke_method(
     image: &mut ImageBuilder,
-    binder: &Binder,
+    binder: &mut Binder,
     tokens: &mut Tokens,
     enclosing: &TypeSymbol,
     modifiers: &[Modifier],
@@ -8210,6 +8037,7 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             delegate_type,
             target,
             receiver,
+            ..
         } => {
             if let Some(receiver) = receiver {
                 mint_in_expr(receiver, image, tokens);
@@ -8908,9 +8736,7 @@ fn mint_generic_definition_ref(
         .iter()
         .chain(core::iter::once(&instantiation.return_type))
     {
-        if !mentions_type_parameter(ty, &instantiation.type_parameters) {
-            mint_named_type_token(ty, image, tokens);
-        }
+        mint_open_signature_type(ty, &instantiation.type_parameters, image, tokens);
     }
     let parameter_sigs: Result<Vec<TypeSig>, _> = instantiation
         .parameters
@@ -8989,9 +8815,7 @@ fn mint_instantiated_generic_definition_ref(
         .iter()
         .chain(core::iter::once(&declaring.return_type))
     {
-        if !mentions_type_parameter(ty, &open_names) {
-            mint_named_type_token(ty, image, tokens);
-        }
+        mint_open_signature_type(ty, &open_names, image, tokens);
     }
     let parameter_sigs: Result<Vec<TypeSig>, _> = declaring
         .parameters
@@ -10924,15 +10748,7 @@ fn collect_type_tokens(
                 }
                 match explicit_interface {
                     Some(_) => tokens.insert_method(&declaring, &row_name, &params, token),
-                    None => {
-                        tokens.insert_method(&declaring, name, &params, token);
-                        if modifiers.contains(&Modifier::Virtual)
-                            || modifiers.contains(&Modifier::Override)
-                            || modifiers.contains(&Modifier::Abstract)
-                        {
-                            tokens.insert_virtual_method(&declaring, name, &params);
-                        }
-                    }
+                    None => tokens.insert_method(&declaring, name, &params, token),
                 }
             }
             Member::Operator {
@@ -11392,6 +11208,7 @@ fn join_namespace(outer: &str, name: &QualifiedName) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lamella_binder::load_assembly;
     use lamella_syntax::parser::parse_compilation_unit;
 
     /// A diagnostic in Lamella's namespace renders with Lamella's prefix, and a diagnostic in
@@ -12288,7 +12105,8 @@ mod tests {
             "the source must BIND cleanly at C# 4: {:?}",
             diagnostics.iter().map(|d| alloc::format!("{}", d.kind)).collect::<Vec<_>>()
         );
-        let program = ValidatedProgram::from_clean_bind(&units, &references, false)
+        let imported = load_references(&references, "test");
+        let program = ValidatedProgram::from_clean_bind(&units, &references, &imported, false)
             .expect("the barrier is minted from the assertion above");
         let (image, _) = build_image(&program, "test.dll", "test", None, false, false, OutputKind::Inferred)
             .expect("an optional parameter emits");
@@ -12414,7 +12232,8 @@ mod tests {
                 diagnostic.kind
             );
         }
-        let program = ValidatedProgram::from_clean_bind(&units, &references, false)
+        let imported = load_references(&references, "test");
+        let program = ValidatedProgram::from_clean_bind(&units, &references, &imported, false)
             .expect("the barrier is minted from the assertion above, not from a bare `false`");
         let (image, _) = build_image(&program, "test.dll", "test", None, false, false, OutputKind::Inferred)
             .expect("a generic declaration emits");
@@ -13243,7 +13062,8 @@ mod tests {
                 diagnostic.kind
             );
         }
-        let program = ValidatedProgram::from_clean_bind(&units, &references, false)
+        let imported = load_references(&references, "test");
+        let program = ValidatedProgram::from_clean_bind(&units, &references, &imported, false)
             .expect("the barrier is minted from the assertion above");
         let (image, _) = build_image(&program, "test.dll", "test", None, false, false, OutputKind::Inferred)
             .expect("an imported generic in a signature emits");
@@ -14657,8 +14477,9 @@ mod tests {
     fn validated_program_is_minted_only_by_a_clean_bind() {
         let no_units: &[CompilationUnit] = &[];
         let no_refs: &[Assembly] = &[];
-        assert!(ValidatedProgram::from_clean_bind(no_units, no_refs, false).is_some());
-        assert!(ValidatedProgram::from_clean_bind(no_units, no_refs, true).is_none());
+        let imported = Model::new();
+        assert!(ValidatedProgram::from_clean_bind(no_units, no_refs, &imported, false).is_some());
+        assert!(ValidatedProgram::from_clean_bind(no_units, no_refs, &imported, true).is_none());
     }
 
     #[test]
@@ -16511,7 +16332,7 @@ mod tests {
 
     #[test]
     fn a_constructor_carries_its_custom_attributes() {
-        let source = "class MarkAttribute { }\nclass C\n{\n    [Mark] public C() { }\n    static void Main() { }\n}\n";
+        let source = "namespace System { public class Attribute { } }\nclass MarkAttribute : System.Attribute { }\nclass C\n{\n    [Mark] public C() { }\n    static void Main() { }\n}\n";
         let unit = parse_compilation_unit(source).unit;
         let image = compile_unit(&unit, "c.dll", "c").image.expect("an image");
         let assembly = Assembly::read(&image).expect("the image reads back");
@@ -16549,7 +16370,8 @@ mod tests {
             version: LanguageVersion::CSharp11,
             ..LexOptions::default()
         };
-        let source = "namespace System.Diagnostics.CodeAnalysis { public class SetsRequiredMembersAttribute { } } \
+        let source = "namespace System { public class Attribute { } } \
+             namespace System.Diagnostics.CodeAnalysis { public class SetsRequiredMembersAttribute : Attribute { } } \
              namespace App { \
                public class Base { public required int F; public Base() { } \
                  [System.Diagnostics.CodeAnalysis.SetsRequiredMembers] public Base(int f) { F = f; } } \
@@ -16686,7 +16508,8 @@ mod tests {
         assert_eq!(consumer_codes(&plain), Vec::<u16>::new());
 
         let exempt_image = build_library(
-            "namespace System.Diagnostics.CodeAnalysis { public class SetsRequiredMembersAttribute { } } \
+            "namespace System { public class Attribute { } } \
+             namespace System.Diagnostics.CodeAnalysis { public class SetsRequiredMembersAttribute : Attribute { } } \
              namespace Lib { public class C { public required int F; \
                [System.Diagnostics.CodeAnalysis.SetsRequiredMembers] public C() { F = 1; } } }",
         );
@@ -18313,11 +18136,12 @@ mod tests {
     /// against a compiler emitting the wrong code.
     ///
     ///
-    /// The attribute classes derive from nothing, the convention every attribute test in this
-    /// module uses: `System.Attribute` needs a corlib, these tests take no reference, and the
-    /// attribute readers match on the NAME and the constructor arity rather than on a base type.
+    /// These tests take no reference, so the source declares the `System.Attribute` its attribute
+    /// classes derive from. Each must derive from it: an attribute class that does not is CS0616
+    /// wherever it is applied (21.3), under csc and here.
     const INTEROP_DECLARATIONS: &str = "
         using System.Runtime.InteropServices;
+        namespace System { public class Attribute { } }
         namespace System.Runtime.InteropServices {
             enum LayoutKind { Sequential = 0, Explicit = 2, Auto = 3 }
             enum CharSet { None = 1, Ansi = 2, Unicode = 3, Auto = 4 }
@@ -18325,16 +18149,16 @@ mod tests {
                 Bool = 2, I4 = 7, U4 = 8, LPStr = 20, ByValTStr = 23,
                 ByValArray = 30, LPArray = 42
             }
-            class StructLayoutAttribute {
+            class StructLayoutAttribute : System.Attribute {
                 public StructLayoutAttribute(LayoutKind value) { }
                 public CharSet CharSet;
                 public int Pack;
                 public int Size;
             }
-            class FieldOffsetAttribute {
+            class FieldOffsetAttribute : System.Attribute {
                 public FieldOffsetAttribute(int offset) { }
             }
-            class MarshalAsAttribute {
+            class MarshalAsAttribute : System.Attribute {
                 public MarshalAsAttribute(UnmanagedType unmanagedType) { }
                 public UnmanagedType ArraySubType;
                 public int SizeConst;
@@ -18456,6 +18280,35 @@ mod tests {
             rows,
             alloc::vec![(String::from("Ex"), 0, 16), (String::from("Seq"), 1, 0)],
             "a ClassLayout row iff Pack or Size is nonzero"
+        );
+    }
+
+    /// A layout argument written as an EXPRESSION is its value, as any attribute argument is:
+    /// csc 10.0.301 writes `.pack 2` for `Pack = 1 + 1`, `.size 16` for `Size = 4 * 4` and offset 4
+    /// for `[FieldOffset(2 * 2)]`, and a `const` of the type is in reach.
+    #[test]
+    fn a_layout_argument_written_as_an_expression_is_its_value() {
+        let image = interop_image(
+            "
+            [StructLayout(LayoutKind.Sequential, Pack = 1 + 1)] struct Packed { public byte X; public int Y; }
+            [StructLayout(LayoutKind.Explicit, Size = 4 * 4)] struct Sized {
+                const int Base = 8;
+                [FieldOffset(2 * 2)] public int First;
+                [FieldOffset(Base)] public int Second;
+            }
+            ",
+        );
+        let mut classes = class_layout_rows(&image);
+        classes.sort();
+        assert_eq!(
+            classes,
+            alloc::vec![(String::from("Packed"), 2, 0), (String::from("Sized"), 0, 16)]
+        );
+        let mut fields = field_layout_rows(&image);
+        fields.sort();
+        assert_eq!(
+            fields,
+            alloc::vec![(String::from("First"), 4), (String::from("Second"), 8)]
         );
     }
 
@@ -18671,7 +18524,8 @@ static class Program { static int Main() { return Helper(); } static int Helper(
         assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
         let units = [parsed.unit];
         let references = [corlib];
-        let program = ValidatedProgram::from_clean_bind(&units, &references, false)
+        let imported = load_references(&references, "test");
+        let program = ValidatedProgram::from_clean_bind(&units, &references, &imported, false)
             .expect("the bind is taken as clean");
         let partials = index_partial_types(&units, &[]);
         let emit = |measured| {

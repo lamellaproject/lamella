@@ -20,6 +20,7 @@ pub mod reference;
 pub mod resolve;
 pub mod special;
 pub mod statement;
+mod struct_layout;
 pub mod symbols;
 pub mod types;
 
@@ -28,7 +29,8 @@ pub use complete::{
     Completion, CompletionKind, Hover, SignatureHelp, complete, hover, signature_help,
 };
 pub use bound::{
-    Binder, BoundExpr, BoundExprKind, BoundInitializer, BoundInitializerTarget,
+    AttributeClass, AttributeValue, Binder, BoundAttribute, BoundExpr, BoundExprKind,
+    BoundInitializer, BoundInitializerTarget, NamedAttributeValue,
     BoundSwitchArm,
     BoundMemberInitializer, BoundMemberInitializerValue, Capture, ConversionKind, DeclaredField,
     FieldInstantiation, FieldReference, ConvertingStep, MethodInstantiation, MethodReference,
@@ -41,12 +43,12 @@ pub use declaration::{
     declared_indexer_accessor_name, declared_member_name, fold_parameter_default, resolve_constants,
 };
 pub use diagnostic::{CodeNamespace, Diagnostic, DiagnosticKind};
-pub use flow::{always_exits, check_definite_assignment, switch_section_reachability};
+pub use flow::{always_exits, check_definite_assignment, is_const_true, switch_section_reachability};
 pub use program::{
-    BindOptions, bind_compilation_unit, bind_compilation_unit_with_model, bind_compilation_unit_with_references, bind_compilation_unit_with_dialect, bind_compilation_unit_with_options, bind_compilation_unit_with_references_and_options,
-    bind_compilation_units_with_options, bind_compilation_units_with_references, bind_compilation_units_with_references_and_options,
+    BindOptions, bind_compilation_unit, bind_compilation_unit_with_model, bind_compilation_unit_with_references, bind_compilation_unit_with_dialect, bind_compilation_unit_with_options, bind_compilation_unit_with_reference_model, bind_compilation_unit_with_references_and_options,
+    bind_compilation_units_with_options, bind_compilation_units_with_reference_model, bind_compilation_units_with_references, bind_compilation_units_with_references_and_options,
 };
-pub use reference::load_assembly;
+pub use reference::{load_assembly, load_references};
 pub use resolve::{TypeTable, resolve_type};
 pub use special::SpecialType;
 pub use statement::{

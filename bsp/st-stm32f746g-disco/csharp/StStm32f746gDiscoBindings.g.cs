@@ -122,12 +122,14 @@ namespace Lamella.Generated
         public const uint MEMORY_QSPI_BASE = 0x90000000;
         public const uint MEMORY_QSPI_SIZE = 0x1000000;
         public const string MEMORY_QSPI_CONTROLLER = "quadspi";
+        public const string MEMORY_QSPI_PART = "N25Q128A13EF840E";
         public const uint MEMORY_QSPI_OPTIONAL = 1;
         public const string MEMORY_SDRAM_KIND = "ram";
         public const uint MEMORY_SDRAM_BASE = 0xC0000000;
         public const uint MEMORY_SDRAM_SIZE = 0x800000;
         public const uint MEMORY_SDRAM_DEVICE_SIZE = 0x1000000;
         public const string MEMORY_SDRAM_CONTROLLER = "fmc";
+        public const string MEMORY_SDRAM_PART = "MT48LC4M32B2B5-6A";
         public const uint MEMORY_SDRAM_OPTIONAL = 1;
 
         /// -- the flash fitted to 'qspi': what the controller must be told about the DEVICE, as

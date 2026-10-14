@@ -35,7 +35,7 @@ pub enum Kind {
     Source,
     /// Bytes a chip takes, written by a probe: `flash`.
     ChipImage,
-    /// A payload the firmware already on a board loads: `deploy --target`.
+    /// A payload the firmware already on a board loads: `deploy --device`.
     WirePayload,
 }
 

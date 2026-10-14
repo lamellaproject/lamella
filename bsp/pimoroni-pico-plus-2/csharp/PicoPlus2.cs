@@ -1,6 +1,5 @@
 // Lamella.Boards.Pimoroni.PicoPlus2 -- the Pimoroni Pico Plus 2 (RP2350B).
 using System;
-using System.Device.Adc;
 using System.Device.Analog;
 using System.Device.Gpio;
 using System.Device.I2c;
@@ -21,8 +20,8 @@ namespace Lamella.Boards.Pimoroni
 
         /// <summary>Binds this board's buses to the driver table, so a program writes plain
         /// dotnet/iot -- <c>SpiDevice.Create(settings)</c>, <c>new GpioController()</c> -- and never
-        /// names a Lamella type. Touching <see cref="PicoPlus2"/> at all is what arms it, which is
-        /// why a program constructs the board first.</summary>
+        /// names a Lamella type. Touching <see cref="PicoPlus2"/> at all is what arms it, and constructing
+        /// <see cref="TargetBoard"/> touches it.</summary>
         /// <remarks>A TYPE INITIALIZER rather than the instance constructor: the table refuses a
         /// second bind of the same id rather than replacing it, and this class is instantiable and
         /// routinely constructed as a temporary. The language runs a type initializer once per
@@ -113,19 +112,12 @@ namespace Lamella.Boards.Pimoroni
                     PimoroniPicoPlus2Bindings.ADC_CHANNEL2_TWIN_PADS, 0u, 0u, 0u, 0u, 0u });
         }
 
-        /// <summary>An ADC controller over the RP2350B's SAR converter (the on-chip temperature
-        /// sensor is on <see cref="TemperatureSensorChannel"/>). Channels 5 and 7 read the button
-        /// and the PSRAM chip select and refuse to open.</summary>
-        public AdcController CreateAdcController()
-        {
-            return new AdcController();
-        }
-
         /// <summary>The on-chip converter as dotnet/iot's analog controller. Each pin is a converter
         /// channel: <see cref="AdcChannelGp40"/> to <see cref="AdcChannelGp43"/> and
         /// <see cref="TemperatureSensorChannel"/> name them.</summary>
         /// <remarks>Creating it touches no hardware; the first pin opened brings the converter up.
-        /// It reads through the same driver as <see cref="CreateAdcController"/>.</remarks>
+        /// It reads through the converter driver the board binds.
+        /// Channels 5 and 7 read the button and the PSRAM chip select and refuse to open.</remarks>
         /// <param name="chip">Must be 0: the board has one converter.</param>
         /// <exception cref="ArgumentOutOfRangeException"><paramref name="chip"/> is not 0.</exception>
         public AnalogController CreateAnalogController(int chip)

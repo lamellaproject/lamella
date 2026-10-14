@@ -713,6 +713,7 @@ impl Lowering<'_> {
                     delegate_type: delegate_type.clone(),
                     target,
                     receiver: Some(Box::new(receiver)),
+                    virtual_slot: false,
                 },
             };
         };

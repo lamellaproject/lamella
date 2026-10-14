@@ -172,9 +172,8 @@ class Thread:
     # `Thread(target=fn, args=(...))`, or a subclass overriding `run`.
 
     def __init__(self, group=None, target=None, name=None, args=(), kwargs=None, daemon=None):
-        # CPython's own line, kept verbatim including the `assert`: it raises AssertionError, not
-        # ValueError, and a program that catches one does not catch the other. Written as an assert
-        # rather than a raise so the shape as well as the message matches upstream.
+        # An assert, as on CPython: a group other than None raises AssertionError with this message,
+        # not a ValueError, and a program that catches one does not catch the other.
         assert group is None, "group argument must be None for now"
         if kwargs:
             raise NotImplementedError(

@@ -7,6 +7,8 @@ use lamella_syntax::lexer::{LexOptions, Normalization, NullableOption, OutputKin
 use lamella_syntax::version::{Feature, LanguageVersion, LanguageVersionError};
 use std::process::ExitCode;
 
+mod response_file;
+
 /// The parsed command line.
 struct Options {
     sources: Vec<String>,
@@ -20,6 +22,14 @@ struct Options {
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    let base = std::env::current_dir().unwrap_or_default();
+    let args = match response_file::expand(&args, &base) {
+        Ok(args) => args,
+        Err(message) => {
+            eprintln!("{message}");
+            return ExitCode::from(2);
+        }
+    };
     if wants_help(&args) {
         println!("{USAGE}");
         return ExitCode::SUCCESS;
@@ -41,9 +51,9 @@ fn main() -> ExitCode {
     }
 }
 
-/// Parses csc-style options. Bare arguments are the source files (one or more);
-/// `/reference:` (`-r:`) names a reference assembly, `/out:` the output, and
-/// `/debug-` suppresses the PDB (it is emitted by default).
+/// Parses csc-style options, after any response file has been expanded in place. Bare arguments
+/// are the source files (one or more); `/reference:` (`-r:`) names a reference assembly, `/out:`
+/// the output, and `/debug-` suppresses the PDB (it is emitted by default).
 fn parse_args(args: &[String]) -> Result<Options, String> {
     let mut sources = Vec::new();
     let mut output = None;
@@ -182,6 +192,12 @@ usage: lcsc <source.cs>... [options]
 
   <source.cs>...          one or more C# sources; all compile into ONE assembly
                           (each is its own PDB document).
+  @<file>                 read further arguments from a response file, as csc does. They take the
+                          place of @<file>, so a later option still overrides an earlier one.
+                          Spaces and tabs separate arguments, \"...\" groups one, a # where an
+                          argument would begin comments out the rest of its line, and an @<file>
+                          inside is read in turn. Relative paths, a response file's own included,
+                          are taken from the current directory.
   /out:<path>             output assembly path (default: the first source's name, .dll).
   /reference:<dll>        reference a metadata assembly (repeatable; also -r:, --reference=).
                           NOTHING IS REFERENCED IMPLICITLY: every assembly a compilation uses is

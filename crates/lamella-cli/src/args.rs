@@ -195,14 +195,14 @@ mod tests {
     const DEPLOY: Spec = Spec {
         verb: "deploy",
         usage: None,
-        values: &["--target", "--board"],
+        values: &["--device", "--board"],
         flags: &["--no-run"],
     };
 
     #[test]
     fn reads_values_flags_and_positionals() {
-        let parsed = parse(&words("Program.cs --target COM8 --no-run"), &DEPLOY).expect("parses");
-        assert_eq!(parsed.value("--target"), Some("COM8"));
+        let parsed = parse(&words("Program.cs --device COM8 --no-run"), &DEPLOY).expect("parses");
+        assert_eq!(parsed.value("--device"), Some("COM8"));
         assert!(parsed.flag("--no-run"));
         assert!(!parsed.flag("--never-given"));
         assert_eq!(parsed.only_positional("deploy", "source file"), Ok("Program.cs"));
@@ -216,12 +216,12 @@ mod tests {
     fn an_unknown_option_is_refused_and_the_message_lists_the_real_ones() {
         let error = parse(&words("Program.cs --port COM8"), &DEPLOY).expect_err("refuses");
         assert!(error.contains("--port"), "it names what was wrong: {error}");
-        assert!(error.contains("--target"), "and what to write instead: {error}");
+        assert!(error.contains("--device"), "and what to write instead: {error}");
     }
 
     #[test]
     fn a_value_option_at_the_end_is_refused_rather_than_dropped() {
-        let error = parse(&words("Program.cs --target"), &DEPLOY).expect_err("refuses");
+        let error = parse(&words("Program.cs --device"), &DEPLOY).expect_err("refuses");
         assert!(error.contains("wants a value"), "got {error}");
     }
 
@@ -279,7 +279,7 @@ mod tests {
     #[test]
     fn a_verb_without_prose_still_answers_with_its_options() {
         let text = help_text(&DEPLOY);
-        assert!(text.contains("--target"), "it names the real options: {text}");
+        assert!(text.contains("--device"), "it names the real options: {text}");
         assert!(text.contains("lamella --help"), "and where the prose lives: {text}");
     }
 
@@ -290,7 +290,7 @@ mod tests {
 
     #[test]
     fn only_positional_reports_both_ways_of_being_wrong() {
-        let none = parse(&words("--target COM8"), &DEPLOY).expect("parses");
+        let none = parse(&words("--device COM8"), &DEPLOY).expect("parses");
         assert!(none.only_positional("deploy", "source file").is_err());
         let two = parse(&words("a.cs b.cs"), &DEPLOY).expect("parses");
         let error = two.only_positional("deploy", "source file").expect_err("refuses two");

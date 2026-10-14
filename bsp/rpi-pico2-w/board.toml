@@ -137,30 +137,35 @@ b = { pin = "GP15" }
 
 # --- The CYW43439's fixed control lines (Pico 2 W datasheet p.9 + schematic). The DATA
 #     line is a SHARED half-duplex DI/DO/IRQ line and CLK is a clock: neither has an
-#     asserted level, so no `active` is stated (the WINC module_pins precedent). ---
+#     asserted level, so no `active` is stated (the WINC module_pins precedent). All four are
+#     `reserved`: the radio's driver runs them, so a program's GPIO controller refuses them. ---
 
 [[devices]]
 name = "cyw43439-wl-reg-on"
 pin = "GP23"
 active = "high"
+reserved = true
 source = "Pico 2 W datasheet p.9 + schematic: WL_REG_ON = GPIO23 (the chip's power-on/regulator enable, driven high to power it)"
 
 [[devices]]
 name = "cyw43439-data"
 pin = "GP24"
 active = "none"
+reserved = true
 source = "Pico 2 W datasheet p.9 + schematic: the gSPI DATA line (DI + DO + IRQ share GPIO24)"
 
 [[devices]]
 name = "cyw43439-cs"
 pin = "GP25"
 active = "low"
+reserved = true
 source = "Pico 2 W datasheet p.9 + schematic: gSPI CS = GPIO25 (active low)"
 
 [[devices]]
 name = "cyw43439-clk"
 pin = "GP29"
 active = "none"
+reserved = true
 source = "Pico 2 W datasheet p.9 + schematic: gSPI CLK = GPIO29"
 
 # --- THE USER LED IS NOT ON THIS CHIP, AND THAT IS WHY THERE IS NO ROW FOR IT ------------------
