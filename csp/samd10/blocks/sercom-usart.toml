@@ -1,6 +1,6 @@
 # SERCOM in USART mode on the SAM D10 family -- the BLOCK layout: register offsets are
-# SERCOM-instance-relative; nothing in this file names an instance, a pin, a board, or a clock
-# plan. Instance bases/ids live in ../instances.toml; board wiring lives in bsp/<board>/board.toml.
+# SERCOM-instance-relative; nothing in this file names an instance, a pin, a board, or a clock plan.
+# Instance bases/ids live in ../instances.toml; board wiring lives in bsp/boards/<board>/board.toml.
 #
 # THE REGISTER SUMMARY DOCUMENTS TWO USARTs, NOT ONE. Table 25-4 lists CTRLB, INTENCLR, INTENSET
 # and INTFLAG TWICE at the same offsets, once per clocking variant: the internal-clock USART has

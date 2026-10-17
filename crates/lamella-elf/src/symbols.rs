@@ -87,11 +87,70 @@ fn function<'a>(entry: &[u8], strings: &'a [u8], arm: bool) -> Option<Function<'
         2 => Binding::Weak,
         _ => return None,
     };
-    let rest = strings.get(name as usize..)?;
-    let end = rest.iter().position(|&byte| byte == 0)?;
-    let name = core::str::from_utf8(&rest[..end]).ok().filter(|name| !name.is_empty())?;
+    let name = name_at(strings, name)?;
     let address = if arm { value & !1 } else { value };
     Some(Function { address, size, binding, name })
+}
+
+/// The non-empty UTF-8 name at `offset` in a string table, ending inside it.
+fn name_at(strings: &[u8], offset: u32) -> Option<&str> {
+    let rest = strings.get(offset as usize..)?;
+    let end = rest.iter().position(|&byte| byte == 0)?;
+    core::str::from_utf8(&rest[..end]).ok().filter(|name| !name.is_empty())
+}
+
+/// `STT_OBJECT`, in the low four bits of `st_info`: the symbol names a data object.
+const STT_OBJECT: u8 = 1;
+
+/// A data object an image's symbol table names: a variable, a buffer, a table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DataObject {
+    /// The address of the object's first byte.
+    pub address: u32,
+    /// How many bytes the object covers, `st_size`; zero where its producer gave it no size.
+    pub size: u32,
+}
+
+/// The data object `elf`'s symbol table names `name`.
+///
+/// The entry is read from a little-endian ELF32 file's `SHT_SYMTAB` sections, as [`functions`]
+/// reads its entries, and kept when its type is `STT_OBJECT` and it is defined in a section of the
+/// file. A global or weak definition is taken over a local one of the same name: a local name may
+/// be repeated by every object a link combined, and a global name may not. A file that is not a
+/// little-endian ELF32 file, or that defines no such object, names none.
+#[must_use]
+pub fn object(elf: &[u8], name: &str) -> Option<DataObject> {
+    if elf.len() < 20 || elf[..4] != [0x7F, b'E', b'L', b'F'] || elf[4] != 1 || elf[5] != 1 {
+        return None;
+    }
+    let headers = crate::section_headers(elf);
+    let mut local = None;
+    for table in headers.iter().filter(|header| header.kind == SHT_SYMTAB) {
+        let strings = headers
+            .get(table.link as usize)
+            .filter(|header| header.kind == SHT_STRTAB)
+            .and_then(|header| header.data);
+        let (Some(entries), Some(strings)) = (table.data, strings) else {
+            continue;
+        };
+        for entry in entries.chunks_exact(crate::SYM_SIZE) {
+            let word = |at: usize| {
+                u32::from_le_bytes([entry[at], entry[at + 1], entry[at + 2], entry[at + 3]])
+            };
+            let (info, section) = (entry[12], u16::from_le_bytes([entry[14], entry[15]]));
+            let defined = section != crate::SHN_UNDEF && section < SHN_LORESERVE;
+            if info & 0x0F != STT_OBJECT || !defined || name_at(strings, word(0)) != Some(name) {
+                continue;
+            }
+            let found = DataObject { address: word(4), size: word(8) };
+            match info >> 4 {
+                1 | 2 => return Some(found),
+                0 => local = local.or(Some(found)),
+                _ => {}
+            }
+        }
+    }
+    local
 }
 
 #[cfg(test)]

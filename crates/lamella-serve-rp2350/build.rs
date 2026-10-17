@@ -192,8 +192,8 @@ fn deploy_region_base(whole_flash_bytes: usize) -> usize {
     base
 }
 
-/// The board this build is for, named by its `bsp/` folder. The features pick it, exactly as they
-/// pick the firmware's board bindings and the identity it answers a host with.
+/// The board this build is for, named by its folder in `bsp/boards/`. The features pick it, exactly
+/// as they pick the firmware's board bindings and the identity it answers a host with.
 fn board() -> &'static str {
     let on = |feature: &str| std::env::var_os(format!("CARGO_FEATURE_{feature}")).is_some();
     assert!(
@@ -222,10 +222,8 @@ fn board() -> &'static str {
 fn board_flash_bytes(board: &str) -> usize {
     use lamella_bsp_gen::strata::{self, Strata};
 
-    let facts = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../bsp")
-        .join(board)
-        .join("board.toml");
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let facts = lamella_bsp_gen::boards::board_dir(&repo, board).join("board.toml");
     println!("cargo:rerun-if-changed={}", facts.display());
     let text = std::fs::read_to_string(&facts)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", facts.display()));

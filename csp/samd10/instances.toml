@@ -1,6 +1,7 @@
 # INSTANCE map for the SAM D10 family: every placed block copy, its base, and its per-instance ids.
-# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
-# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The
+# record schema is uniform across rows; -1 marks a field that does not apply to a row and emits
+# nothing.
 #
 # READ INDEPENDENTLY FROM THE SAM D10's OWN TABLE 11-1, not carried over from `csp/samd11`. The two
 # tables then agree row for row on every peripheral they share -- and they differ by one: the SAM

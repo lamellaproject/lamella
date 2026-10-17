@@ -1,5 +1,5 @@
 # The SAMG55 instance map: every placed block copy, its base, and its peripheral id. Layout truth
-# lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml.
+# lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml.
 #
 # THE RECORD IS THE SAM3X's AND NOT THE SAM D/L ONE. On this architecture the peripheral id (Table 9-1)
 # is BOTH the PMC clock-control bit (PMC_PCER0 bit `pid` for pid < 32) AND the NVIC interrupt line

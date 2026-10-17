@@ -1,7 +1,7 @@
 # SERCOM in USART mode on the Microchip SAMD21 family -- the BLOCK layout: register
 # offsets are SERCOM-instance-relative; nothing in this file names an instance, a pin, a board,
 # or a clock plan. Instance bases/ids live in ../instances.toml;
-# board wiring lives in bsp/<board>/board.toml.
+# board wiring lives in bsp/boards/<board>/board.toml.
 #
 # Register offsets and bit widths are transcribed from the datasheet (ch 26).
 

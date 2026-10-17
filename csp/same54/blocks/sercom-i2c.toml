@@ -1,6 +1,7 @@
 # SERCOM in I2C MASTER mode on the Microchip SAM D5x/E5x family -- the BLOCK layout: register
 # offsets are SERCOM-instance-relative; nothing in this file names an instance, a pin, a board or a
-# clock plan. Instance bases live in ../instances.toml; board wiring lives in bsp/<board>/board.toml.
+# clock plan. Instance bases live in ../instances.toml; board wiring lives in
+# bsp/boards/<board>/board.toml.
 #
 # Authored from the per-register description headings in 36.10 ("Offset: 0x.."), one register at a
 # time. Those headings are the datasheet's authoritative per-register statement, and taking each one

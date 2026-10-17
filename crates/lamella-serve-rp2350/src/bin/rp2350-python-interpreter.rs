@@ -39,10 +39,10 @@
 //! f64, so the feature pulls `python-float` in and would quietly turn that tier back into a float
 //! build. It is omitted there for that reason and for no other.
 //!
-//! Board facts: Raspberry Pi Pico 2 W datasheet + the generated `bsp/rpi-pico2-w` bindings; chip
-//! registers: RP2350 datasheet. The wireless -- the driver on its PIO engine, and the station that
-//! makes it one network device -- is brought up by `pico_wifi.rs`, shared with the C# interpreter
-//! firmware.
+//! Board facts: Raspberry Pi Pico 2 W datasheet + the generated `bsp/boards/rpi-pico2-w` bindings;
+//! chip registers: RP2350 datasheet. The wireless -- the driver on its PIO engine, and the station
+//! that makes it one network device -- is brought up by `pico_wifi.rs`, shared with the C#
+//! interpreter firmware.
 //!
 //! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-python-interpreter --profile flash
 //!        --target thumbv8m.main-none-eabi --features python,rp2350,python-float,python-threading,python-complex,python-reflection
@@ -77,11 +77,11 @@ static IMAGE_DEF: [u32; 5] = [0xffff_ded3, 0x1021_0142, 0x0000_01ff, 0x0000_0000
 mod startup;
 
 #[cfg(all(target_os = "none", not(feature = "python-net")))]
-#[path = "../../../../bsp/rpi-pico2/rust/rpi_pico2_bindings.rs"]
+#[path = "../../../../bsp/boards/rpi-pico2/rust/rpi_pico2_bindings.rs"]
 #[allow(dead_code)]
 mod board_bindings;
 #[cfg(all(target_os = "none", feature = "python-net"))]
-#[path = "../../../../bsp/rpi-pico2-w/rust/rpi_pico2_w_bindings.rs"]
+#[path = "../../../../bsp/boards/rpi-pico2-w/rust/rpi_pico2_w_bindings.rs"]
 #[allow(dead_code)]
 mod board_bindings;
 #[cfg(target_os = "none")]

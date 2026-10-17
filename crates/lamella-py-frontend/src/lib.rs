@@ -141,7 +141,7 @@ pub fn compile_str_for_profile(
 
 /// Compile Python `source` against ONE BOARD's generated facts: `import board` plus every
 /// `board.*` the program reads are resolved to constants before compilation, and the import is
-/// dropped. `board_source` is a generated `bsp/<board>/python/board.py`.
+/// dropped. `board_source` is a generated `bsp/boards/<board>/python/board.py`.
 ///
 /// This is how a tier with no filesystem and no import machinery reads the same facts the
 /// interpreter loads at run time -- the program is spelled identically either way; only the moment

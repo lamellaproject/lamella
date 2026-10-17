@@ -44,6 +44,10 @@ const PACKET: usize = 64;
 /// over-long began to fit, and the refusal correctly did not fire.
 pub const MAX_PACKET: usize = 1024;
 
+/// The SWD clock [`Dap::connect_swd`] and [`Dap::connect_swd_from_dormant`] ask the probe for before
+/// their first sequence. A session stays at it until [`set_clock`](Dap::set_clock) asks for another.
+pub const CONNECT_CLOCK_HZ: u32 = 1_000_000;
+
 /// How many stale replies [`Dap::command`] will discard while looking for its own echo. Small on
 /// purpose: it only has to cover the replies an abandoned session can leave queued, and each read
 /// past the backlog costs a full transport timeout.
@@ -374,10 +378,21 @@ impl<T: Transport> Dap<T> {
     }
 
     /// Connects to the target over SWD: select the port, set the clock, then send the
-    /// line-reset and JTAG-to-SWD switch sequence (ADIv5). Clocks at 1 MHz; see
+    /// line-reset and JTAG-to-SWD switch sequence (ADIv5). Clocks at [`CONNECT_CLOCK_HZ`]; see
     /// [`connect_swd_at`](Self::connect_swd_at) to choose the rate.
     pub fn connect_swd(&mut self) -> Result<(), DapError> {
-        self.connect_swd_at(1_000_000)
+        self.connect_swd_at(CONNECT_CLOCK_HZ)
+    }
+
+    /// Asks the probe to clock every transfer after this one at `clock_hz` or below --
+    /// `DAP_SWJ_Clock`.
+    ///
+    /// **THE RATE IS A CEILING**: the command selects the MAXIMUM SWCLK frequency, so a probe that
+    /// cannot make `clock_hz` exactly runs below it, never above. A probe that refuses the rate
+    /// answers `DAP_ERROR`, reported as [`DapError::Status`].
+    pub fn set_clock(&mut self, clock_hz: u32) -> Result<(), DapError> {
+        self.command(&proto::swj_clock(clock_hz))?;
+        Ok(())
     }
 
     /// Asks the PROBE to reset the target, however this probe must -- `DAP_ResetTarget`.
@@ -427,7 +442,7 @@ impl<T: Transport> Dap<T> {
     /// wiring is fine.
     pub fn connect_swd_at(&mut self, clock_hz: u32) -> Result<(), DapError> {
         self.connect_port(Port::Swd)?;
-        self.command(&proto::swj_clock(clock_hz))?;
+        self.set_clock(clock_hz)?;
         self.command(&proto::swd_configure(0, false))?;
         self.command(&proto::transfer_configure(0, 250, 100))?;
         self.adopt_packet_size();
@@ -455,7 +470,7 @@ impl<T: Transport> Dap<T> {
     /// costs more to find than an absent one.
     pub fn connect_swd_from_dormant(&mut self) -> Result<(), DapError> {
         self.connect_port(Port::Swd)?;
-        self.command(&proto::swj_clock(1_000_000))?;
+        self.set_clock(CONNECT_CLOCK_HZ)?;
         self.command(&proto::swj_sequence(8, &[0xff]))?;
         self.command(&proto::swj_sequence(128, &DORMANT_TO_SWD_ALERT))?;
         self.command(&proto::swj_sequence(12, &[0xa0, 0x01]))?;
@@ -1526,6 +1541,24 @@ mod tests {
         assert!(
             matches!(err, DapError::Unsupported { command } if command == proto::cmd::SWD_SEQUENCE),
             "expected an Unsupported naming DAP_SWD_Sequence, got: {err}"
+        );
+    }
+
+    /// The clock goes out as `DAP_SWJ_Clock` with the rate in hertz, little-endian, and a probe's
+    /// refusal of it fails the call.
+    #[test]
+    fn a_clock_is_asked_for_in_hertz_and_a_refusal_is_reported() {
+        let mut dap = Dap::new(Mock::new(vec![
+            echo(proto::cmd::SWJ_CLOCK, &[proto::DAP_OK]),
+            echo(proto::cmd::SWJ_CLOCK, &[proto::DAP_ERROR]),
+        ]));
+        dap.set_clock(10_000_000).unwrap();
+        assert_eq!(dap.transport().sent, vec![vec![0x11, 0x80, 0x96, 0x98, 0x00]]);
+        let err = dap.set_clock(100_000_000).unwrap_err();
+        assert!(
+            matches!(err, DapError::Status { command, status }
+                if command == proto::cmd::SWJ_CLOCK && status == proto::DAP_ERROR),
+            "expected a Status naming DAP_SWJ_Clock, got: {err}"
         );
     }
 

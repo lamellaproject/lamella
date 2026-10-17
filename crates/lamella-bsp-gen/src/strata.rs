@@ -1,5 +1,6 @@
 //! The v2 strata dialect and its emitters.
 
+use crate::boards::{board_dirs, BOARDS_DIR};
 use crate::{brackets_open, err, format_int, pascal, strip_comment, Calibration, Channel, Fact, Field, Int, RawValue, Step, StepValue, ValueCursor};
 
 
@@ -5729,8 +5730,8 @@ pub const TARGET_BOARD_FACTS_FILE: &str = "TargetBoardFacts.g.cs";
 /// Emits the generated half of `Lamella.Hardware.TargetBoard` for one board: the board's id, which is
 /// the name a build selects the board by, and the call that arms the board.
 ///
-/// The hand-written half is `bsp/TargetBoard.cs`, and `build-boards.ps1` compiles both into the
-/// board's assembly. `board_class` is the class the board's package declares by hand
+/// The hand-written half is `bsp/common/csharp/TargetBoard.cs`, and `build-boards.ps1` compiles
+/// both into the board's assembly. `board_class` is the class the board's package declares by hand
 /// ([`board_class`]), when it declares one. Its type initializer binds the board's buses, so arming
 /// reads its `BoardModel`, which runs that initializer the first time and nothing after. A read
 /// rather than a construction, because a class's constructor may do more than bind: the Pico 2's
@@ -12600,7 +12601,7 @@ pub fn emit_board_swift(
 
 
 /// Emits a board's bindings as the generated Python `board` module,
-/// `bsp/<board>/python/board.py`:
+/// `bsp/boards/<board>/python/board.py`:
 /// role handles whose values are the role-id strings, per-role FACTS dicts carrying
 /// the SAME resolved values as the C# bindings class under ONE mechanical renaming rule
 /// (`VCP_SERCOM_BASE` -> `FACTS["vcp"]["sercom_base"]`; the anchors stay string-greppable
@@ -14667,10 +14668,10 @@ fn emit_bus_table_rust(board: &str, words: &[u32], sources: &[String], regen: &s
     out
 }
 
-/// Generates every artifact of a family: the C# layout classes, the instances class (C# and
-/// its 1:1 Rust twin), the pad-to-EXTINT lookup when the pin table states the die's EIC map, and
-/// per board under `bsp/*/board.toml` whose family (or module's family) matches, a bindings class
-/// (C#) plus its 1:1 Rust twin, the generated half of the board's `Lamella.Hardware.TargetBoard`
+/// Generates every artifact of a family: the C# layout classes, the instances class (C# and its 1:1
+/// Rust twin), the pad-to-EXTINT lookup when the pin table states the die's EIC map, and per board
+/// under `bsp/boards/*/board.toml` whose family (or module's family) matches, a bindings class (C#)
+/// plus its 1:1 Rust twin, the generated half of the board's `Lamella.Hardware.TargetBoard`
 /// ([`emit_target_board_facts_csharp`]) and, for a family in [`BUS_TABLE_FAMILIES`], the board's
 /// [`bus_table`] -- one strata load, every projection, so gate A freshness and the gate B anchors
 /// cover all of them together.
@@ -14735,15 +14736,7 @@ pub fn generate_family(repo_root: &std::path::Path, family: &str) -> Result<Vec<
         }
     }
 
-    let bsp_root = repo_root.join("bsp");
-    let mut board_paths: Vec<_> = std::fs::read_dir(&bsp_root)
-        .map_err(|e| format!("{}: {e}", bsp_root.display()))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path().join("board.toml"))
-        .filter(|p| p.is_file())
-        .collect();
-    board_paths.sort();
-    for path in board_paths {
+    for path in board_dirs(repo_root)?.into_iter().map(|dir| dir.join("board.toml")) {
         let Strata::Board(board) = parse(&read(&path)?)? else {
             return Err(format!("{}: expected kind = \"board\"", path.display()));
         };
@@ -14763,26 +14756,26 @@ pub fn generate_family(repo_root: &std::path::Path, family: &str) -> Result<Vec<
             .ok_or_else(|| format!("{}: has no board directory", path.display()))?;
         if dir != id && !dir.ends_with(&format!("-{id}")) {
             return Err(format!(
-                "bsp/{dir}/board.toml states board = \"{id}\" -- a board directory is its id, or its id behind a vendor prefix"
+                "{BOARDS_DIR}/{dir}/board.toml states board = \"{id}\" -- a board directory is its id, or its id behind a vendor prefix"
             ));
         }
         let resolved = resolve_board(&set, board)?;
-        let mut sources = vec![format!("bsp/{dir}/board.toml"), format!("csp/{family}/ strata")];
+        let mut sources = vec![format!("{BOARDS_DIR}/{dir}/board.toml"), format!("csp/{family}/ strata")];
         if !resolved.board.module.is_empty() {
             sources.insert(1, format!("csp/{}/module.toml", resolved.board.module));
         }
         out.push(Generated {
-            path: format!("bsp/{dir}/csharp/{}.g.cs", bindings_class(&id)),
+            path: format!("{BOARDS_DIR}/{dir}/csharp/{}.g.cs", bindings_class(&id)),
             contents: emit_board_csharp(&set, &resolved, &sources, &regen)?,
         });
         let class = board_class(&id);
-        let declared = repo_root.join(format!("bsp/{dir}/csharp/{class}.cs")).is_file();
-        let mut facts_sources = vec![format!("bsp/{dir}/board.toml")];
+        let declared = repo_root.join(format!("{BOARDS_DIR}/{dir}/csharp/{class}.cs")).is_file();
+        let mut facts_sources = vec![format!("{BOARDS_DIR}/{dir}/board.toml")];
         if declared {
-            facts_sources.push(format!("bsp/{dir}/csharp/{class}.cs"));
+            facts_sources.push(format!("{BOARDS_DIR}/{dir}/csharp/{class}.cs"));
         }
         out.push(Generated {
-            path: format!("bsp/{dir}/csharp/{TARGET_BOARD_FACTS_FILE}"),
+            path: format!("{BOARDS_DIR}/{dir}/csharp/{TARGET_BOARD_FACTS_FILE}"),
             contents: emit_target_board_facts_csharp(
                 &resolved,
                 declared.then_some(class.as_str()),
@@ -14791,22 +14784,22 @@ pub fn generate_family(repo_root: &std::path::Path, family: &str) -> Result<Vec<
             ),
         });
         out.push(Generated {
-            path: format!("bsp/{dir}/rust/{}_bindings.rs", snake(&id)),
+            path: format!("{BOARDS_DIR}/{dir}/rust/{}_bindings.rs", snake(&id)),
             contents: emit_board_rust(&set, &resolved, &sources, &regen)?,
         });
         if BUS_TABLE_FAMILIES.contains(&family) {
             out.push(Generated {
-                path: format!("bsp/{dir}/rust/{BUS_TABLE_FILE}"),
+                path: format!("{BOARDS_DIR}/{dir}/rust/{BUS_TABLE_FILE}"),
                 contents: emit_bus_table_rust(&id, &bus_table(&set, &resolved)?, &sources, &regen),
             });
         }
         out.push(Generated {
-            path: format!("bsp/{dir}/python/board.py"),
+            path: format!("{BOARDS_DIR}/{dir}/python/board.py"),
             contents: emit_board_python(&set, &resolved, &sources, &regen)?,
         });
         if swift {
             out.push(Generated {
-                path: format!("bsp/{dir}/swift/{}.swift", bindings_class(&id)),
+                path: format!("{BOARDS_DIR}/{dir}/swift/{}.swift", bindings_class(&id)),
                 contents: emit_board_swift(&set, &resolved, &sources, &regen)?,
             });
         }
@@ -14849,7 +14842,7 @@ value = 0x2
         let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
         let set = load_family(&repo, "rp2350").expect("the rp2350 family loads");
         let board = |id: &str| {
-            let Strata::Board(board) = parse(&read(&repo.join(format!("bsp/{id}/board.toml"))).expect("reads"))
+            let Strata::Board(board) = parse(&read(&crate::boards::board_dir(&repo, id).join("board.toml")).expect("reads"))
                 .expect("parses")
             else {
                 panic!("{id} is a board")
@@ -16595,7 +16588,7 @@ resolution_bits = "16..20, depending only on the oversampling setting"
         assert!(error.contains("minted token 0"), "{error}");
     }
 
-    const ZERO: &str = include_str!("../../../bsp/arduino-zero/board.toml");
+    const ZERO: &str = include_str!("../../../bsp/boards/arduino-zero/board.toml");
 
     fn board_text(text: &str) -> Result<BoardTable, String> {
         match parse(text)? {
@@ -16656,7 +16649,7 @@ resolution_bits = "16..20, depending only on the oversampling setting"
         }
     }
 
-    const PICO2_W: &str = include_str!("../../../bsp/rpi-pico2-w/board.toml");
+    const PICO2_W: &str = include_str!("../../../bsp/boards/rpi-pico2-w/board.toml");
 
     /// The Pico 2 W's file with `section` in place of its own `[csharp_interpreter]`, which is its last.
     fn pico2_w_with(section: &str) -> Result<BoardTable, String> {

@@ -1,6 +1,6 @@
-# The SAML22 instance map: every placed block copy, its base, and its per-instance ids.
-# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
-# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+# The SAML22 instance map: every placed block copy, its base, and its per-instance ids. Layout truth
+# lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
+# uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
 # SERCOM2's BASE IS 0x42000C00 AND THE PERIPHERALS TABLE SAYS 0x42000A00. The table is wrong; see
 # parts.toml, which states the evidence in full. In short: every other SERCOM in Table 12-1 strides

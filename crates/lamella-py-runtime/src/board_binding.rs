@@ -28,7 +28,7 @@ pub(crate) fn role_facts(model: &mut ObjectModel, role: &str) -> Result<Value, T
     let namespace = model.module_namespace(module);
     let Some(facts) = model.dict_get_str(namespace, "FACTS") else {
         let message = "the board module carries no FACTS -- expected the generated \
-                       bsp/<board>/python/board.py";
+                       bsp/boards/<board>/python/board.py";
         return Err(model.with_message(Trap::ValueError, message));
     };
     let Some(descriptor) = model.dict_get_str(facts, role) else {

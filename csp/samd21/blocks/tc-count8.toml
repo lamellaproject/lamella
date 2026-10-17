@@ -1,7 +1,7 @@
 # The TC (Timer/Counter) on the Microchip SAMD21 family in its 8-bit counter mode -- the BLOCK
 # layout: register offsets are instance-relative; nothing in this file names a board, a pin wiring
 # or a clock plan. The instances live in ../instances.toml; which outputs a board wires lives in
-# bsp/<board>/board.toml.
+# bsp/boards/<board>/board.toml.
 #
 # THE SAME TC IN A DIFFERENT MODE HAS A DIFFERENT MAP. CTRLA.MODE selects 8, 16 or 32 bits, and
 # COUNT, PER and the CCx registers change width and place with it (Tables 30-4 to 30-6), so this

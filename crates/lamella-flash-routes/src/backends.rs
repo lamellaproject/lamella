@@ -25,8 +25,8 @@ use lamella_cmsis_dap_stm32::{
     Stm32C0Flash, Stm32F4Flash, Stm32H7Flash, Stm32L0Flash, Stm32L4Flash, Stm32U5Flash,
     stm32_dev_id, stm32_flash_size_bytes, stm32f7_read_sector_sizes,
 };
-use lamella_flash_backend::{FlashBackend, FlashError, Image, PartIdentity};
-use lamella_probe_core::{TargetAccess, TargetAccessExt};
+use lamella_flash_backend::{FlashBackend, FlashError, Image, PartIdentity, Report};
+use lamella_probe_core::{ProbeError, TargetAccess, TargetAccessExt};
 
 /// Leaves a written part running its image: every hardware breakpoint removed, then a reset to run.
 ///
@@ -122,14 +122,8 @@ impl<A: TargetAccess> MicrobitDaplink<A> {
     /// report more bytes than were written, which the contract's comparison correctly refuses as a
     /// short-read's mirror image.
     fn read_span(&mut self, image: &Image<'_>) -> Result<Vec<u8>, FlashError> {
-        let words = image.bytes.len().div_ceil(4);
-        let read = self.target.read_words(image.base, words)?;
-        let mut bytes = Vec::with_capacity(words * 4);
-        for word in read {
-            bytes.extend_from_slice(&word.to_le_bytes());
-        }
-        bytes.truncate(image.bytes.len());
-        Ok(bytes)
+        let read = self.target.read_words(image.base, image.bytes.len().div_ceil(4))?;
+        Ok(bytes_of(&read, image.bytes.len()))
     }
 }
 
@@ -149,6 +143,16 @@ fn to_words(bytes: &[u8]) -> Vec<u32> {
         .collect()
 }
 
+/// Words read off a part as the bytes they hold, little-endian, cut to the `length` an image has.
+///
+/// Fewer bytes than `length` when fewer words were read, so a short read stays short and the
+/// contract reports it as one rather than as a mismatch.
+fn bytes_of(words: &[u32], length: usize) -> Vec<u8> {
+    let mut bytes: Vec<u8> = words.iter().flat_map(|word| word.to_le_bytes()).collect();
+    bytes.truncate(length);
+    bytes
+}
+
 /// An RP2350 over an SWD probe, programmed by the chip's own bootrom flash API.
 ///
 /// **THE ALTERNATIVE TO THE BOOTLOADER VOLUME, AND THE ONLY ROUTE TO THIS PART THAT CAN VERIFY.**
@@ -161,13 +165,20 @@ fn to_words(bytes: &[u8]) -> Vec<u32> {
 /// here is empty and the erase happens inside [`program`](FlashBackend::program). The contract's
 /// ORDER still holds: [`identify`](FlashBackend::identify) runs before `program` is ever called,
 /// which is the guarantee that matters.
-pub struct Rp2350Probe<A: TargetAccess> {
+pub struct Rp2350Probe<A: TargetAccess, S = fn(&str)> {
     target: A,
     expect: PartIdentity,
+    /// Where the part routine's progress lines go: the caller's lines, never this process's own
+    /// standard output, which a caller may need for something else entirely.
+    say: S,
+    /// The image as the part routine's verify read it back, once [`program`](FlashBackend::program)
+    /// has run.
+    read: Option<Vec<u32>>,
 }
 
 impl<A: TargetAccess> Rp2350Probe<A> {
-    /// A backend for a part whose debug port answered `idcode`.
+    /// A backend for a part whose debug port answered `idcode`, saying nothing as it goes until
+    /// [`saying`](Rp2350Probe::saying) gives it somewhere to.
     ///
     /// The connect happens before construction because the part crate's `connect` is concrete over
     /// its transport rather than generic over [`TargetAccess`] -- so the reading is taken first and
@@ -180,6 +191,20 @@ impl<A: TargetAccess> Rp2350Probe<A> {
                 value: u64::from(idcode),
                 what,
             },
+            say: |_| {},
+            read: None,
+        }
+    }
+}
+
+impl<A: TargetAccess, S> Rp2350Probe<A, S> {
+    /// The same backend, giving each progress line of the write to `say`.
+    pub fn saying<T: FnMut(&str)>(self, say: T) -> Rp2350Probe<A, T> {
+        Rp2350Probe {
+            target: self.target,
+            expect: self.expect,
+            say,
+            read: self.read,
         }
     }
 }
@@ -189,7 +214,7 @@ impl<A: TargetAccess> Rp2350Probe<A> {
 /// Rows 0x000..0x003 hold the 64-bit chip id, one 32-bit read per two rows.
 const OTP_CHIPID_BASE: u32 = 0x4013_0000;
 
-impl<A: TargetAccess> FlashBackend for Rp2350Probe<A> {
+impl<A: TargetAccess, S: FnMut(&str)> FlashBackend for Rp2350Probe<A, S> {
     fn mechanism(&self) -> &'static str {
         "an SWD probe, by the chip's own bootrom flash API"
     }
@@ -229,24 +254,32 @@ impl<A: TargetAccess> FlashBackend for Rp2350Probe<A> {
     }
 
     fn program(&mut self, image: &Image<'_>) -> Result<(), FlashError> {
-        lamella_cmsis_dap_rp2350::flash_image(&mut self.target, image.bytes, |line| {
-            println!("  {line}");
+        let say = &mut self.say;
+        let read = lamella_cmsis_dap_rp2350::flash_image(&mut self.target, image.bytes, |line| {
+            say(&format!("  {line}"));
         })?;
+        self.read = Some(read);
         Ok(())
     }
 
-    /// Every byte, read back through the XIP window.
+    /// Every byte, as the part routine's verify read it back through the XIP window.
     ///
-    /// **THIS IS A SECOND, INDEPENDENT CHECK.** `flash_image` verifies internally as it programs;
-    /// this reads the flash again afterwards and lets the contract do the comparison. The two are
-    /// deliberately not folded together -- a verify inside the routine that did the writing shares
-    /// every assumption the writing made, and the point of the outer one is that it does not.
+    /// **ONE READ, AND THE CONTRACT STILL COMPARES IT.** `flash_image` reads the whole image back
+    /// after programming it, fails on the first word that differs, and hands back what it read; the
+    /// contract compares those bytes against the caller's image, as it does on every route. A
+    /// second read would be the same window read the same way, and would cost a second whole read
+    /// of the image. The comparison against the caller's own bytes is what is kept, because a
+    /// verify inside the routine that did the writing shares that routine's own conversion of the
+    /// image into words. A route whose part routine reads nothing back reads here instead.
     ///
-    /// The core is halted first: `flash_image` resets the chip to run the new image, and reading
-    /// flash out from under a running program is a race the reader would lose silently.
-    /// [`finish`](Self::finish) starts it again.
+    /// Read here only if [`program`](FlashBackend::program) has not run, with the core halted first:
+    /// `flash_image` resets the chip to run the new image, and reading flash out from under a running
+    /// program is a race the reader would lose silently. [`finish`](Self::finish) starts it again.
     fn read_back(&mut self, image: &Image<'_>) -> Option<Result<Vec<u8>, FlashError>> {
-        Some(self.read_span(image))
+        Some(match self.read.take() {
+            Some(words) => Ok(bytes_of(&words, image.bytes.len())),
+            None => self.read_span(image),
+        })
     }
 
     fn finish(&mut self) -> Result<(), FlashError> {
@@ -255,19 +288,75 @@ impl<A: TargetAccess> FlashBackend for Rp2350Probe<A> {
     }
 }
 
-impl<A: TargetAccess> Rp2350Probe<A> {
+impl<A: TargetAccess, S> Rp2350Probe<A, S> {
     /// Halt, then read back exactly the bytes `image` covers.
     fn read_span(&mut self, image: &Image<'_>) -> Result<Vec<u8>, FlashError> {
         self.target.halt()?;
-        let words = image.bytes.len().div_ceil(4);
-        let read = self.target.read_words(image.base, words)?;
-        let mut bytes = Vec::with_capacity(words * 4);
-        for word in read {
-            bytes.extend_from_slice(&word.to_le_bytes());
-        }
-        bytes.truncate(image.bytes.len());
-        Ok(bytes)
+        let read = self.target.read_words(image.base, image.bytes.len().div_ceil(4))?;
+        Ok(bytes_of(&read, image.bytes.len()))
     }
+}
+
+/// Why a write through the RP2350 route failed.
+pub(crate) enum Rp2350Failure {
+    /// A transfer the part did not complete at the faster clock, or the probe not taking that
+    /// clock: a failure a write at the fallback clock may not meet.
+    AtSpeed(String),
+    /// Anything else, worded for a reader: a write at the fallback clock would meet it too.
+    Other(String),
+}
+
+/// What a write through the RP2350 route that failed at `clock_hz` with `error` is.
+///
+/// **ONLY A TRANSFER FAULT AT THE FASTER CLOCK IS ONE THE SLOWER CLOCK CAN ANSWER**: no acknowledge,
+/// a WAIT the probe's retries did not outlast, a FAULT, or a parity error, which the probe reports
+/// in the acknowledge's place. Those are what an SWD clock too fast for the wiring between probe and
+/// part gives. A wrong part, a read-back that found other bytes, a probe that stopped answering:
+/// none of those is the clock's doing, and a second write would only make its reader wait twice for
+/// one error.
+pub(crate) fn rp2350_failure(error: FlashError, clock_hz: u32) -> Rp2350Failure {
+    match error {
+        FlashError::Probe(fault @ ProbeError::Ack(_))
+            if clock_hz != lamella_cmsis_dap_rp2350::FALLBACK_SWD_CLOCK_HZ =>
+        {
+            Rp2350Failure::AtSpeed(fault.to_string())
+        }
+        error => Rp2350Failure::Other(error.to_string()),
+    }
+}
+
+/// Writes through the RP2350 route at the part's faster SWD clock, and when that write fails at it,
+/// says so in one line and makes the whole write again, from the start, at the fallback clock.
+///
+/// `attempt` opens the route at the clock it is given and makes one whole write: the connect, the
+/// erase, the program, the read-back and the start. **THE WRITE IS MADE AGAIN WHOLE, NEVER
+/// RESUMED**, so the second is the route's write at the clock the other CMSIS-DAP routes run at,
+/// and checks every byte as the first would have. Its failure is the answer: there is no third.
+pub(crate) fn write_rp2350(
+    mut attempt: impl FnMut(u32, &mut dyn FnMut(&str)) -> Result<Report, Rp2350Failure>,
+    say: &mut dyn FnMut(&str),
+) -> Result<Report, String> {
+    use lamella_cmsis_dap_rp2350::{FALLBACK_SWD_CLOCK_HZ, SWD_CLOCK_HZ};
+
+    match attempt(SWD_CLOCK_HZ, say) {
+        Ok(report) => Ok(report),
+        Err(Rp2350Failure::Other(why)) => Err(why),
+        Err(Rp2350Failure::AtSpeed(why)) => {
+            say(&format!(
+                "the write at {} failed ({why}), so it is made again from the start at {}",
+                megahertz(SWD_CLOCK_HZ),
+                megahertz(FALLBACK_SWD_CLOCK_HZ)
+            ));
+            attempt(FALLBACK_SWD_CLOCK_HZ, say).map_err(|failure| match failure {
+                Rp2350Failure::AtSpeed(why) | Rp2350Failure::Other(why) => why,
+            })
+        }
+    }
+}
+
+/// A clock in hertz as a reader says it: `10 MHz`, `1 MHz`, `2.5 MHz`.
+fn megahertz(hz: u32) -> String {
+    format!("{} MHz", f64::from(hz) / 1_000_000.0)
 }
 
 /// An RP2040 over an SWD probe, programmed by the chip's own bootrom flash API.
@@ -282,13 +371,20 @@ impl<A: TargetAccess> Rp2350Probe<A> {
 /// [`program`](FlashBackend::program). The contract's ORDER still holds --
 /// [`identify`](FlashBackend::identify) runs before `program` is ever called.
 ///
-pub struct Rp2040Probe<A: TargetAccess> {
+pub struct Rp2040Probe<A: TargetAccess, S = fn(&str)> {
     target: A,
     expect: PartIdentity,
+    /// Where the part routine's progress lines go: the caller's lines, never this process's own
+    /// standard output, which a caller may need for something else entirely.
+    say: S,
+    /// The image as the part routine's verify read it back, once [`program`](FlashBackend::program)
+    /// has run.
+    read: Option<Vec<u32>>,
 }
 
 impl<A: TargetAccess> Rp2040Probe<A> {
-    /// A backend for a part whose debug port answered `idcode`.
+    /// A backend for a part whose debug port answered `idcode`, saying nothing as it goes until
+    /// [`saying`](Rp2040Probe::saying) gives it somewhere to.
     ///
     /// The connect happens before construction because the part crate's `connect` is concrete over
     /// its transport rather than generic over [`TargetAccess`] -- selecting one debug port out of
@@ -301,11 +397,25 @@ impl<A: TargetAccess> Rp2040Probe<A> {
                 value: u64::from(idcode),
                 what,
             },
+            say: |_| {},
+            read: None,
         }
     }
 }
 
-impl<A: TargetAccess> FlashBackend for Rp2040Probe<A> {
+impl<A: TargetAccess, S> Rp2040Probe<A, S> {
+    /// The same backend, giving each progress line of the write to `say`.
+    pub fn saying<T: FnMut(&str)>(self, say: T) -> Rp2040Probe<A, T> {
+        Rp2040Probe {
+            target: self.target,
+            expect: self.expect,
+            say,
+            read: self.read,
+        }
+    }
+}
+
+impl<A: TargetAccess, S: FnMut(&str)> FlashBackend for Rp2040Probe<A, S> {
     fn mechanism(&self) -> &'static str {
         "an SWD probe, by the chip's own bootrom flash API"
     }
@@ -346,20 +456,25 @@ impl<A: TargetAccess> FlashBackend for Rp2040Probe<A> {
     }
 
     fn program(&mut self, image: &Image<'_>) -> Result<(), FlashError> {
-        lamella_cmsis_dap_rp2040::flash_image(&mut self.target, image.bytes, |line| {
-            println!("  {line}");
+        let say = &mut self.say;
+        let read = lamella_cmsis_dap_rp2040::flash_image(&mut self.target, image.bytes, |line| {
+            say(&format!("  {line}"));
         })?;
+        self.read = Some(read);
         Ok(())
     }
 
-    /// Every byte, read back through the execute-in-place window.
+    /// Every byte, as the part routine's verify read it back through the execute-in-place window.
     ///
-    /// **THIS IS A SECOND, INDEPENDENT CHECK.** `flash_image` verifies internally as it programs;
-    /// this reads the flash again afterwards and lets the contract do the comparison. The two are
-    /// deliberately not folded together -- a verify inside the routine that did the writing shares
-    /// every assumption the writing made, and the point of the outer one is that it does not.
+    /// **ONE READ, AND THE CONTRACT STILL COMPARES IT**, as on the [`Rp2350Probe`]: `flash_image`
+    /// reads the whole image back after programming it and hands back what it read, and the
+    /// contract compares those bytes against the caller's image. Read here only if
+    /// [`program`](FlashBackend::program) has not run.
     fn read_back(&mut self, image: &Image<'_>) -> Option<Result<Vec<u8>, FlashError>> {
-        Some(self.read_span(image))
+        Some(match self.read.take() {
+            Some(words) => Ok(bytes_of(&words, image.bytes.len())),
+            None => self.read_span(image),
+        })
     }
 
     fn finish(&mut self) -> Result<(), FlashError> {
@@ -368,19 +483,13 @@ impl<A: TargetAccess> FlashBackend for Rp2040Probe<A> {
     }
 }
 
-impl<A: TargetAccess> Rp2040Probe<A> {
+impl<A: TargetAccess, S> Rp2040Probe<A, S> {
     /// Read back exactly the bytes `image` covers.
     ///
     fn read_span(&mut self, image: &Image<'_>) -> Result<Vec<u8>, FlashError> {
         self.target.halt()?;
-        let words = image.bytes.len().div_ceil(4);
-        let read = self.target.read_words(image.base, words)?;
-        let mut bytes = Vec::with_capacity(words * 4);
-        for word in read {
-            bytes.extend_from_slice(&word.to_le_bytes());
-        }
-        bytes.truncate(image.bytes.len());
-        Ok(bytes)
+        let read = self.target.read_words(image.base, image.bytes.len().div_ceil(4))?;
+        Ok(bytes_of(&read, image.bytes.len()))
     }
 }
 
@@ -852,20 +961,38 @@ impl crate::StFamily {
 /// Same as [`Rp2350Probe`]: the probe is opened, brought into SWD and given memory access by the
 /// caller, and this type takes it from there. The first thing it does is a read that touches
 /// nothing, so identify-before-erase holds regardless.
-pub struct StProbe<A: TargetAccess> {
+pub struct StProbe<A: TargetAccess, S = fn(&str)> {
     target: A,
     plan: &'static StPlan,
     /// The watchdog freeze register as the write found it, put back before the part is released.
     watchdogs_found: Option<u32>,
+    /// Where each step of the write is said as it starts: the caller's lines, so a write that takes
+    /// half a minute is not a silent one.
+    say: S,
 }
 
 impl<A: TargetAccess> StProbe<A> {
-    /// A backend for the family `plan` describes, reached through `target`.
+    /// A backend for the family `plan` describes, reached through `target`, saying nothing as it
+    /// goes until [`saying`](StProbe::saying) gives it somewhere to.
     pub fn new(target: A, plan: &'static StPlan) -> Self {
         StProbe {
             target,
             plan,
             watchdogs_found: None,
+            say: |_| {},
+        }
+    }
+}
+
+impl<A: TargetAccess, S> StProbe<A, S> {
+    /// The same backend, saying each step of the write to `say` -- the erase, the program and the
+    /// read-back -- as it starts it.
+    pub fn saying<T: FnMut(&str)>(self, say: T) -> StProbe<A, T> {
+        StProbe {
+            target: self.target,
+            plan: self.plan,
+            watchdogs_found: self.watchdogs_found,
+            say,
         }
     }
 
@@ -1032,18 +1159,12 @@ impl<A: TargetAccess> StProbe<A> {
     /// Read back exactly the bytes `image` covers. The core is already halted by
     /// [`erase`](FlashBackend::erase) and stays halted until [`finish`](FlashBackend::finish).
     fn read_span(&mut self, image: &Image<'_>) -> Result<Vec<u8>, FlashError> {
-        let words = image.bytes.len().div_ceil(4);
-        let read = self.target.read_words(image.base, words)?;
-        let mut bytes = Vec::with_capacity(words * 4);
-        for word in read {
-            bytes.extend_from_slice(&word.to_le_bytes());
-        }
-        bytes.truncate(image.bytes.len());
-        Ok(bytes)
+        let read = self.target.read_words(image.base, image.bytes.len().div_ceil(4))?;
+        Ok(bytes_of(&read, image.bytes.len()))
     }
 }
 
-impl<A: TargetAccess> FlashBackend for StProbe<A> {
+impl<A: TargetAccess, S: FnMut(&str)> FlashBackend for StProbe<A, S> {
     fn mechanism(&self) -> &'static str {
         "an SWD probe, by the part's own flash controller"
     }
@@ -1123,6 +1244,10 @@ impl<A: TargetAccess> FlashBackend for StProbe<A> {
         for bank in &banks {
             self.unlock(*bank)?;
         }
+        if let Some(first) = granules.first() {
+            let erased: u64 = granules.iter().map(|granule| u64::from(granule.size)).sum();
+            (self.say)(&format!("  erasing {erased} bytes from {:#010x}...", first.start));
+        }
         for granule in granules {
             self.erase_granule(granule)?;
         }
@@ -1146,6 +1271,7 @@ impl<A: TargetAccess> FlashBackend for StProbe<A> {
             self.unlock(*bank)?;
         }
         let padded = padded_to_program_granule(image.bytes, self.plan);
+        (self.say)(&format!("  programming {} bytes from {:#010x}...", padded.len(), image.base));
         let programmed = self.program_from(image.base, &padded);
         let mut locked = Ok(());
         for bank in &banks {
@@ -1161,8 +1287,10 @@ impl<A: TargetAccess> FlashBackend for StProbe<A> {
     /// Every byte, read back over the same wire that wrote them.
     ///
     /// A probe has a read-back, so this must use it: `None` here is a statement that the MECHANISM
-    /// has none, and would be false.
+    /// has none, and would be false. **THE ONE READ-BACK OF THIS ROUTE**: the part's own controller
+    /// programs and reads nothing back, so this is where the image is verified, once.
     fn read_back(&mut self, image: &Image<'_>) -> Option<Result<Vec<u8>, FlashError>> {
+        (self.say)("  verifying (full read-back over SWD)...");
         Some(self.read_span(image))
     }
 
@@ -1609,14 +1737,8 @@ impl<A: TargetAccess> SamProbe<A> {
 
     /// Read back exactly the bytes `image` covers, over the same wire that wrote them.
     fn read_span(&mut self, image: &Image<'_>) -> Result<Vec<u8>, FlashError> {
-        let words = image.bytes.len().div_ceil(4);
-        let read = self.target.read_words(image.base, words)?;
-        let mut bytes = Vec::with_capacity(words * 4);
-        for word in read {
-            bytes.extend_from_slice(&word.to_le_bytes());
-        }
-        bytes.truncate(image.bytes.len());
-        Ok(bytes)
+        let read = self.target.read_words(image.base, image.bytes.len().div_ceil(4))?;
+        Ok(bytes_of(&read, image.bytes.len()))
     }
 
     /// Split a SAM3X image across the two planes, refusing every state that would put bytes

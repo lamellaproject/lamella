@@ -1,5 +1,5 @@
-# The SAM3X instance map: every placed block copy, its base, and its peripheral id. Layout
-# truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. On the SAM3X the
+# The SAM3X instance map: every placed block copy, its base, and its peripheral id. Layout truth
+# lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. On the SAM3X the
 # peripheral id (Table 9-1) is BOTH the PMC clock-control index (PMC_PCER0/PCDR0 bit for id < 32,
 # PMC_PCER1 for id >= 32) AND the NVIC interrupt line -- one number, so one field. -1 marks a row
 # with no peripheral id (the PMC itself is the clock controller; it is not gated).

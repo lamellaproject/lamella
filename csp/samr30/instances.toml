@@ -1,6 +1,6 @@
-# The SAMR30 instance map: every placed block copy, its base, and its per-instance ids.
-# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
-# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+# The SAMR30 instance map: every placed block copy, its base, and its per-instance ids. Layout truth
+# lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
+# uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
 # THE RECORD IS THE PCHCTRL FAMILIES', because on this architecture which APB mask register gates
 # an instance is per-instance rather than always APBC. On this part it is three different registers

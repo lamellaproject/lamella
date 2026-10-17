@@ -1,22 +1,24 @@
 # Builds each board's C# support package into a REFERENCE ASSEMBLY: `Lamella.Boards.<Vendor>.<Board>.dll`.
 #
 #   pwsh -File build-boards.ps1 [-OutDir <dir>] [-Lcsc <path>] [-Define <symbols>] [-Board <name>]
+#   pwsh -File build-boards.ps1 -PrintBoards [-Family <family>]   # every board's directory, one per line
 #
 # -Define defaults to the surface `build-managed.ps1` compiles at, which `build-managed.ps1
 # -PrintSurface` names, so a board assembly built without it matches the libraries it references.
 #
-# Each board's package under `bsp/<board>/csharp/` binds that board's buses to its chip's drivers.
-# Compiling it into a reference assembly is what lets a program name its board once and then use the
-# standard device APIs without naming a Lamella type again:
+# Each board's package under `bsp/boards/<board>/csharp/` binds that board's buses to its chip's
+# drivers. Compiling it into a reference assembly is what lets a program name its board once and
+# then use the standard device APIs without naming a Lamella type again:
 #
 #     new TargetBoard();                            // the board it was built for: binds its buses
 #     GpioController gpio = new GpioController();   // standard dotnet/iot, no Lamella type named
 #     GpioPin led = gpio.OpenPin(25, PinMode.Output);
 #
-# `Lamella.Hardware.TargetBoard` is one source, `bsp/TargetBoard.cs`, compiled into every board's
-# assembly beside the board's generated `TargetBoardFacts`, which names the board and arms it. So the
-# class is the same on every board, and the board a program constructs is the one whose assembly it
-# was built against.
+# `Lamella.Hardware.TargetBoard` is one source, `bsp/common/csharp/TargetBoard.cs`, compiled into
+# every board's assembly beside the board's generated `TargetBoardFacts`, which names the board and
+# arms it. So the class is the same on every board, and the board a program constructs is the one
+# whose assembly it was built against. Every other source in `bsp/common/csharp/` is compiled into
+# every board's assembly too.
 #
 # `build-managed.ps1` is the other half and runs FIRST: it builds corlib + libs/ into -OutDir, and
 # this reads them back as references. Run that, then this.
@@ -27,9 +29,9 @@
 # targets one board, so it references one board.
 #
 # Each assembly is its board plus its chip family, which is the smallest self-contained unit: the
-# generated bindings and the board class come from `bsp/<board>/csharp/`, and the register layouts,
-# binding descriptors and drivers they name come from `csp/<family>/csharp/`. Neither half compiles
-# alone.
+# generated bindings and the board class come from `bsp/boards/<board>/csharp/`, and the register
+# layouts, binding descriptors and drivers they name come from `csp/<family>/csharp/`. Neither half
+# compiles alone.
 #
 # A family with a System.Device.Gpio of its own (`build-managed.ps1` builds one for each
 # `libs/System.Device.Gpio/Families/<family>.cs`, at `families/<family>/`) carries some of those csp
@@ -43,11 +45,47 @@ param(
     [string]$OutDir = 'managed',
     [string]$Lcsc,
     [string[]]$Define,
-    [string]$Board
+    [string]$Board,
+    [switch]$PrintBoards,
+    [string]$Family
 )
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
+
+# Every board: each directory under `bsp/boards/` that holds a `board.toml`, sorted by name. This is
+# the one list of the boards, so a script that walks them reads it through -PrintBoards rather than
+# listing `bsp/boards/` itself.
+function Get-BoardDirectories {
+    @(Get-ChildItem (Join-Path $root 'bsp/boards') -Directory |
+        Where-Object { Test-Path (Join-Path $_.FullName 'board.toml') } |
+        Sort-Object Name)
+}
+
+# The chip family whose C# a board needs. A board states `family` directly; a MODULE board states
+# `module`, and the module states the family it wraps (the ATSAMW25 is a SAMD21G18A plus a radio,
+# so its boards compile the samd21 drivers).
+function Resolve-Family($boardDir) {
+    $toml = Get-Content (Join-Path $boardDir 'board.toml') -Raw
+    if ($toml -match '(?m)^\s*family\s*=\s*"([^"]+)"') { return $Matches[1] }
+    if ($toml -match '(?m)^\s*module\s*=\s*"([^"]+)"') {
+        $modulePath = Join-Path $root "csp/$($Matches[1])/module.toml"
+        if (-not (Test-Path $modulePath)) { throw "$($boardDir): module '$($Matches[1])' has no csp/*/module.toml" }
+        if ((Get-Content $modulePath -Raw) -match '(?m)^\s*family\s*=\s*"([^"]+)"') { return $Matches[1] }
+        throw "$($boardDir): module '$($Matches[1])' states no family"
+    }
+    throw "$($boardDir)/board.toml states neither family nor module"
+}
+
+# -PrintBoards answers before anything is built: every board's directory, or with -Family only the
+# boards of that chip family, resolved as a build resolves it.
+if ($PrintBoards) {
+    $listed = Get-BoardDirectories
+    if ($Family) { $listed = @($listed | Where-Object { (Resolve-Family $_.FullName) -eq $Family }) }
+    $listed | ForEach-Object { Write-Output $_.FullName }
+    exit 0
+}
+if ($Family) { throw '-Family narrows what -PrintBoards lists; a build selects one board with -Board' }
 
 # The reference set every board assembly gets. Uniform rather than per-board: a hand-maintained
 # table of which board needs the ADC surface would drift from the sources it describes, and an
@@ -60,10 +98,13 @@ $BoardReferences = @(
     'System.Device.Analog'             # AnalogController, which the boards with a converter hand out
 )
 
-# The source every board assembly compiles beside its own: the hand-written half of
-# `Lamella.Hardware.TargetBoard`. Its other half is the board's generated `TargetBoardFacts.g.cs`.
-$TargetBoardSource = Join-Path $root 'bsp/TargetBoard.cs'
-if (-not (Test-Path $TargetBoardSource)) { throw "$TargetBoardSource is missing: every board assembly compiles it" }
+# The sources every board assembly compiles beside its own, those under `bsp/common/csharp/`: among
+# them the hand-written half of `Lamella.Hardware.TargetBoard`, whose other half is the board's
+# generated `TargetBoardFacts.g.cs`.
+$CommonSources = Join-Path $root 'bsp/common/csharp'
+if (-not (Test-Path (Join-Path $CommonSources 'TargetBoard.cs'))) {
+    throw "$CommonSources holds no TargetBoard.cs: every board assembly compiles it"
+}
 
 # --- Locate the compiler (same contract as build-managed.ps1) -----------------------------------
 if (-not $Lcsc) {
@@ -176,21 +217,6 @@ function Resolve-ExtensionSources($root, $standards) {
     $out
 }
 
-# The chip family whose C# a board needs. A board states `family` directly; a MODULE board states
-# `module`, and the module states the family it wraps (the ATSAMW25 is a SAMD21G18A plus a radio,
-# so its boards compile the samd21 drivers).
-function Resolve-Family($boardDir) {
-    $toml = Get-Content (Join-Path $boardDir 'board.toml') -Raw
-    if ($toml -match '(?m)^\s*family\s*=\s*"([^"]+)"') { return $Matches[1] }
-    if ($toml -match '(?m)^\s*module\s*=\s*"([^"]+)"') {
-        $modulePath = Join-Path $root "csp/$($Matches[1])/module.toml"
-        if (-not (Test-Path $modulePath)) { throw "$($boardDir): module '$($Matches[1])' has no csp/*/module.toml" }
-        if ((Get-Content $modulePath -Raw) -match '(?m)^\s*family\s*=\s*"([^"]+)"') { return $Matches[1] }
-        throw "$($boardDir): module '$($Matches[1])' states no family"
-    }
-    throw "$($boardDir)/board.toml states neither family nor module"
-}
-
 # The assembly's board name: the GENERATED bindings name, less the maker it begins with. A board id is
 # `<maker>-<product>`, and the assembly's vendor segment already says who made the board, so keeping
 # the maker in the board part would say it twice -- `Lamella.Boards.RaspberryPi.RpiPico2` rather than
@@ -201,12 +227,12 @@ function Resolve-Family($boardDir) {
 function Resolve-BoardName($csharpDir, $dirName) {
     $bindings = @(Get-ChildItem $csharpDir -Filter '*Bindings.g.cs')
     if ($bindings.Count -ne 1) {
-        throw "bsp/$dirName/csharp: expected exactly one *Bindings.g.cs to name the board, found $($bindings.Count). Regenerate the family."
+        throw "bsp/boards/$dirName/csharp: expected exactly one *Bindings.g.cs to name the board, found $($bindings.Count). Regenerate the family."
     }
     $name = $bindings[0].Name -replace 'Bindings\.g\.cs$', ''
     $maker = ($dirName -split '-', 2)[0]
     if ($name.Length -le $maker.Length -or -not $name.StartsWith($maker, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "bsp/$dirName/csharp/$($bindings[0].Name): the generated name does not begin with the maker '$maker' its directory names. Regenerate the family."
+        throw "bsp/boards/$dirName/csharp/$($bindings[0].Name): the generated name does not begin with the maker '$maker' its directory names. Regenerate the family."
     }
     $name.Substring($maker.Length)
 }
@@ -218,20 +244,18 @@ function Resolve-BoardVendor($csharpDir, $dirName) {
     $bindings = @(Get-ChildItem $csharpDir -Filter '*Bindings.g.cs')
     $text = Get-Content $bindings[0].FullName -Raw
     if ($text -notmatch 'BOARD_VENDOR\s*=\s*"([^"]+)"') {
-        throw "bsp/$dirName/csharp/$($bindings[0].Name): no BOARD_VENDOR. Regenerate the family."
+        throw "bsp/boards/$dirName/csharp/$($bindings[0].Name): no BOARD_VENDOR. Regenerate the family."
     }
     $Matches[1]
 }
 
 # --- Build --------------------------------------------------------------------------------------
-$boards = @(Get-ChildItem (Join-Path $root 'bsp') -Directory |
-    Where-Object { Test-Path (Join-Path $_.FullName 'csharp') } |
-    Sort-Object Name)
+$boards = @(Get-BoardDirectories | Where-Object { Test-Path (Join-Path $_.FullName 'csharp') })
 if ($Board) {
     $boards = @($boards | Where-Object { $_.Name -eq $Board })
-    if (-not $boards.Count) { throw "no board '$Board' with a csharp/ directory under bsp/" }
+    if (-not $boards.Count) { throw "no board '$Board' with a csharp/ directory under bsp/boards/" }
 }
-if (-not $boards.Count) { throw 'no bsp/*/csharp directories found' }
+if (-not $boards.Count) { throw 'no bsp/boards/*/csharp directories found' }
 
 $built = @()
 # Each family's list of the csp sources its own System.Device.Gpio carries, asked once per family.
@@ -246,7 +270,7 @@ foreach ($boardDir in $boards) {
     # skipping would leave the board with no assembly and no error, which surfaces much later as a
     # program unable to reference its own board.
     if (-not (Test-Path $familyCs)) {
-        throw "bsp/$($boardDir.Name) needs csp/$family/csharp, which does not exist. Generate the family's C# or the board class cannot compile."
+        throw "bsp/boards/$($boardDir.Name) needs csp/$family/csharp, which does not exist. Generate the family's C# or the board class cannot compile."
     }
 
     $standards = @(Resolve-ConnectorStandards $boardDir.FullName)
@@ -273,7 +297,7 @@ foreach ($boardDir in $boards) {
         }
         $cspNote = "csp/$family less its System.Device.Gpio's $($FamilySources[$family].Count)"
     }
-    $src = $cspSrc + @(Get-Sources (Join-Path $boardDir.FullName 'csharp') -Recurse) + $extSrc + @($TargetBoardSource)
+    $src = $cspSrc + @(Get-Sources (Join-Path $boardDir.FullName 'csharp') -Recurse) + $extSrc + @(Get-Sources $CommonSources -Recurse)
     $dll = Join-Path $out "Lamella.Boards.$qualified.dll"
     $refs = @($BoardReferences | ForEach-Object {
             $reference = if ($_ -eq 'System.Device.Gpio') { $gpioDll } else { Join-Path $out "$_.dll" }
@@ -281,7 +305,7 @@ foreach ($boardDir in $boards) {
         })
 
     $extNote = if ($extSrc.Count) { " + $($extSrc.Count) ext" } else { '' }
-    Write-Host "Lamella.Boards.$qualified ($($src.Count) sources: $cspNote + bsp/$($boardDir.Name)$extNote) -> $dll"
+    Write-Host "Lamella.Boards.$qualified ($($src.Count) sources: $cspNote + bsp/boards/$($boardDir.Name)$extNote) -> $dll"
     & $Lcsc @src @defineArg @refs /target:library "/out:$dll" /debug-
     # The argument vector goes in the message. A compiler that rejects its COMMAND LINE prints no
     # `error CS` diagnostic at all, so an exit code on its own reads as a crash in sources the line

@@ -120,7 +120,8 @@ pub enum Programmer {
     EdbgOnboard {
         /// Which controller to drive. A key into routines, not a mechanism.
         family: SamFamily,
-        /// Which EDBG product id this kit reports, from `bsp/<board>/board.toml`'s `usb_pid`.
+        /// Which EDBG product id this kit reports, from `bsp/boards/<board>/board.toml`'s
+        /// `usb_pid`.
         ///
         /// **A BOARD FACT AND NOT A FAMILY ONE**, exactly as `probe_id` is on
         /// [`Programmer::StlinkOnboard`]: two SAM D21 kits answer `0x2169` and three Xplained Pro
@@ -1235,6 +1236,10 @@ pub fn refuse_unless_it_fits(
 /// `lamella flash` has already decided. A server acting for an agent wants
 /// [`write_scoped`] instead.
 ///
+/// `say` takes the lines a route says as it writes, each step as it starts. **NOTHING HERE WRITES
+/// TO STANDARD OUTPUT**, which belongs to the caller: a program's own output under `lamella run`,
+/// and a protocol's frames under a server.
+///
 /// # Errors
 /// Anything that stops a write, already worded for a reader.
 pub fn write(
@@ -1242,8 +1247,9 @@ pub fn write(
     placement: &placement::Placement,
     image: &[u8],
     probe: Option<&str>,
+    say: &mut dyn FnMut(&str),
 ) -> Result<lamella_flash_backend::Report, String> {
-    write_with(programmer, placement, image, probe, &lamella_flash_backend::Allow::Any)
+    write_with(programmer, placement, image, probe, &lamella_flash_backend::Allow::Any, say)
 }
 
 /// Write `image` through `programmer`, at the address `placement` gives, permitting only the parts
@@ -1251,7 +1257,7 @@ pub fn write(
 ///
 /// **THE PERMISSION IS THE CONTRACT'S TO ENFORCE, NOT THIS FUNCTION'S**, which is why it is handed
 /// straight through: it has to be checked after the part identifies itself and before anything is
-/// erased, and only `lamella_flash_backend::flash` is in that position.
+/// erased, and only `lamella_flash_backend::flash` is in that position. `say` is [`write`]'s.
 ///
 /// # Errors
 /// Anything that stops a write, already worded for a reader.
@@ -1261,8 +1267,9 @@ pub fn write_scoped(
     image: &[u8],
     selector: Option<&str>,
     allow: &lamella_flash_backend::Allow,
+    say: &mut dyn FnMut(&str),
 ) -> Result<lamella_flash_backend::Report, String> {
-    write_with(programmer, placement, image, selector, allow)
+    write_with(programmer, placement, image, selector, allow, say)
 }
 
 /// What a refusal to find a system bootloader tells its reader.
@@ -1322,6 +1329,7 @@ fn write_with(
     image: &[u8],
     probe: Option<&str>,
     allow: &lamella_flash_backend::Allow,
+    say: &mut dyn FnMut(&str),
 ) -> Result<lamella_flash_backend::Report, String> {
     let image = lamella_flash_backend::Image {
         bytes: image,
@@ -1342,23 +1350,39 @@ fn write_with(
             .map_err(|why| why.to_string());
         }
         Programmer::Rp2350Probe { base } => {
+            use crate::backends::Rp2350Failure;
+
             let selector = lamella_probe::Selector::named_or_environment(probe);
-            let session = lamella_probe::open(&selector)
-                .map_err(|why| describe_probe_choice(&why, &selector, probe, programmer))?;
-            let mut dap = lamella_probe_core::ArmDap::new(session.into_dap());
-            let idcode = lamella_cmsis_dap_rp2350::connect(&mut dap)
-                .map_err(|why| format!("connecting to the RP2350: {why:?}"))?;
-            let mut backend = crate::backends::Rp2350Probe::new(dap, idcode, RP2350_SETTLES);
-            return lamella_flash_backend::flash(
-                &mut backend,
-                &lamella_flash_backend::Image {
-                    bytes: image.bytes,
-                    base,
+            let image = lamella_flash_backend::Image {
+                bytes: image.bytes,
+                base,
+            };
+            return crate::backends::write_rp2350(
+                |clock_hz, say| {
+                    let session = lamella_probe::open(&selector).map_err(|why| {
+                        Rp2350Failure::Other(describe_probe_choice(&why, &selector, probe, programmer))
+                    })?;
+                    let mut dap = lamella_probe_core::ArmDap::new(session.into_dap());
+                    let idcode = lamella_cmsis_dap_rp2350::connect(&mut dap).map_err(|why| {
+                        Rp2350Failure::Other(format!("connecting to the RP2350: {why:?}"))
+                    })?;
+                    if clock_hz != lamella_cmsis_dap_rp2350::FALLBACK_SWD_CLOCK_HZ {
+                        lamella_cmsis_dap_rp2350::set_swd_clock(&mut dap, clock_hz).map_err(|why| {
+                            Rp2350Failure::AtSpeed(format!("the probe did not take the clock: {why}"))
+                        })?;
+                    }
+                    let mut backend = crate::backends::Rp2350Probe::new(dap, idcode, RP2350_SETTLES)
+                        .saying(&mut *say);
+                    lamella_flash_backend::flash(
+                        &mut backend,
+                        &image,
+                        lamella_flash_backend::VerifyPolicy::ReadBack,
+                        allow,
+                    )
+                    .map_err(|why| crate::backends::rp2350_failure(why, clock_hz))
                 },
-                lamella_flash_backend::VerifyPolicy::ReadBack,
-                allow,
-            )
-            .map_err(|why| why.to_string());
+                say,
+            );
         }
         Programmer::EdbgOnboard { family, .. } | Programmer::SamExternalProbe { family } => {
             let dap = open_sam_route(programmer, probe)?;
@@ -1388,6 +1412,7 @@ fn write_with(
                         &image,
                         allow,
                         "the attached ST-LINK",
+                        say,
                     );
                 }
             }
@@ -1404,7 +1429,7 @@ fn write_with(
             }
             dap.init_mem()
                 .map_err(|why| format!("opening memory access through the attached probe: {why}"))?;
-            let mut backend = crate::backends::StProbe::new(dap, family.plan());
+            let mut backend = crate::backends::StProbe::new(dap, family.plan()).saying(&mut *say);
             return lamella_flash_backend::flash(
                 &mut backend,
                 &image,
@@ -1458,7 +1483,8 @@ fn write_with(
             let mut dap = lamella_probe_core::ArmDap::new(session.into_dap());
             let idcode = lamella_cmsis_dap_rp2040::connect(&mut dap)
                 .map_err(|why| format!("connecting to the RP2040: {why}"))?;
-            let mut backend = crate::backends::Rp2040Probe::new(dap, idcode, RP2040_SETTLES);
+            let mut backend =
+                crate::backends::Rp2040Probe::new(dap, idcode, RP2040_SETTLES).saying(&mut *say);
             return lamella_flash_backend::flash(
                 &mut backend,
                 &lamella_flash_backend::Image {
@@ -1473,7 +1499,7 @@ fn write_with(
         Programmer::StlinkOnboard { family, probe_id } => {
             let stlink =
                 lamella_stlink::StLink::open(probe_id, probe).map_err(describe_stlink_choice)?;
-            return write_through_stlink(stlink, family, &image, allow, "the board's ST-LINK");
+            return write_through_stlink(stlink, family, &image, allow, "the board's ST-LINK", say);
         }
     };
 
@@ -1528,13 +1554,15 @@ where
 }
 
 /// Writes `image` through an opened ST-LINK on `family`'s plan: the family's attach, memory access,
-/// then the plan's erase, program and read-back. `through` names the probe in a refusal.
+/// then the plan's erase, program and read-back, each said to `say` as it starts. `through` names
+/// the probe in a refusal.
 fn write_through_stlink(
     mut stlink: lamella_stlink::StLink,
     family: StFamily,
     image: &lamella_flash_backend::Image<'_>,
     allow: &lamella_flash_backend::Allow,
     through: &str,
+    say: &mut dyn FnMut(&str),
 ) -> Result<lamella_flash_backend::Report, String> {
     use lamella_probe_core::TargetAccess as _;
 
@@ -1552,7 +1580,7 @@ fn write_through_stlink(
     stlink
         .init_mem()
         .map_err(|why| format!("opening memory access through {through}: {why}"))?;
-    let mut backend = crate::backends::StProbe::new(stlink, family.plan());
+    let mut backend = crate::backends::StProbe::new(stlink, family.plan()).saying(say);
     lamella_flash_backend::flash(
         &mut backend,
         image,
@@ -1936,6 +1964,47 @@ pub fn cannot_write(board: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **NO ROUTE WRITES TO A STANDARD STREAM.** What a route says goes to the `say` its caller
+    /// passes, because both streams are the caller's: standard output carries a program's own
+    /// output under `lamella run` and a protocol's frames under a stdio server, where one stray
+    /// line is a frame no client can parse.
+    ///
+    /// Read from the sources, so the paths no test can drive without a board are covered too.
+    #[test]
+    fn no_route_writes_to_a_standard_stream() {
+        fn sources(dir: &std::path::Path, found: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).expect("the crate's sources can be listed") {
+                let path = entry.expect("a directory entry").path();
+                if path.is_dir() {
+                    sources(&path, found);
+                } else if path.extension().is_some_and(|extension| extension == "rs") {
+                    found.push(path);
+                }
+            }
+        }
+        let writes = [
+            concat!("print", "!("),
+            concat!("println", "!("),
+            concat!("dbg", "!("),
+            concat!("stdout", "("),
+            concat!("stderr", "("),
+        ];
+        let mut files = Vec::new();
+        sources(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut files);
+        assert!(files.len() > 5, "the crate's sources were found: {files:?}");
+        let mut found = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("a source file reads as text");
+            for (index, line) in text.lines().enumerate() {
+                let code = line.split("//").next().unwrap_or_default();
+                if writes.iter().any(|write| code.contains(write)) {
+                    found.push(format!("{}:{}: {}", file.display(), index + 1, line.trim()));
+                }
+            }
+        }
+        assert!(found.is_empty(), "a route wrote to a standard stream:\n{}", found.join("\n"));
+    }
 
     /// The build question is answered for every board, in the three states a board can be in.
     ///

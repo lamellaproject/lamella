@@ -124,8 +124,21 @@ pub enum Ack {
     Unknown(u8),
 }
 
+/// The transfer response's protocol-error bit (CMSIS-DAP `DAP_Transfer`, Transfer Response bit 3):
+/// the probe found the SWD exchange itself broken -- a parity error on the data the target sent.
+const PROTOCOL_ERROR: u8 = 1 << 3;
+
 impl Ack {
+    /// The acknowledge a transfer response reports: its bits 2..0.
+    ///
+    /// **A PROTOCOL ERROR IS NEVER AN `Ok`**, whatever the acknowledge bits beside it say. The data
+    /// of a transfer whose parity failed is not data, and a parity error is one of the failures an
+    /// SWD clock too fast for the wiring gives; read as `Ok`, the word would be handed on as the one
+    /// the target sent.
     fn from_bits(bits: u8) -> Ack {
+        if bits & PROTOCOL_ERROR != 0 {
+            return Ack::Unknown(bits & 0x0f);
+        }
         match bits & 0b111 {
             0b001 => Ack::Ok,
             0b010 => Ack::Wait,
@@ -410,5 +423,19 @@ mod tests {
                 got: 0x06
             })
         );
+    }
+
+    /// A protocol error is reported in place of an acknowledge or beside one, and in neither case is
+    /// the transfer's data taken.
+    #[test]
+    fn a_protocol_error_is_never_read_as_an_acknowledge() {
+        let alone = parse_read(&[0x05, 0x00, 0x08]).unwrap();
+        assert_eq!((alone.ack, alone.data), (Ack::Unknown(0x08), None));
+        let beside_ok = parse_read(&[0x05, 0x01, 0x09, 0x77, 0x14, 0xb1, 0x0b]).unwrap();
+        assert_eq!((beside_ok.ack, beside_ok.data), (Ack::Unknown(0x09), None));
+        let (_, block) = parse_block_write(&[0x06, 0x03, 0x00, 0x09]).unwrap();
+        assert_eq!(block, Ack::Unknown(0x09));
+        let (_, fault) = parse_block_write(&[0x06, 0x03, 0x00, 0x04]).unwrap();
+        assert_eq!(fault, Ack::Fault, "the acknowledges themselves read as before");
     }
 }

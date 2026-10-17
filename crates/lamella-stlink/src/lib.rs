@@ -69,6 +69,36 @@ pub mod product_id {
     /// copy. A family is a fact about the hardware, so it belongs beside the ids and not beside a
     /// command-line flag.
     pub const V3_FAMILY: [u16; 5] = [V3E, V3_NO_BRIDGE_ALT, V3S, V3_BRIDGE_ALT, V3PWR];
+
+    /// Every product id above: each ST-Link this crate speaks to, so a listing can recognize all of
+    /// them by the same set.
+    pub const ALL: [u16; 8] = [V2, V2_1, V2EC, V3E, V3_NO_BRIDGE_ALT, V3S, V3_BRIDGE_ALT, V3PWR];
+
+    /// The name a listing shows for `product_id`, or `None` when it is not one of [`ALL`].
+    ///
+    /// The id names a generation and whether the probe carries a bridge, nothing finer: an
+    /// STLINK-V3E and an STLINK-V3EC share one id, so both are named for what they share.
+    #[must_use]
+    pub fn name(product_id: u16) -> Option<&'static str> {
+        match product_id {
+            V2 => Some("ST-LINK/V2"),
+            V2_1 | V2EC => Some("ST-LINK/V2-1"),
+            V3E | V3_NO_BRIDGE_ALT => Some("STLINK-V3"),
+            V3S | V3_BRIDGE_ALT => Some("STLINK-V3 with bridge"),
+            V3PWR => Some("STLINK-V3PWR"),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a USB vendor and product id are an ST-Link's: ST's vendor id and one of
+/// [`product_id::ALL`].
+///
+/// A test of the ids alone, so a listing can recognize an ST-Link among devices it has already
+/// enumerated without opening any of them.
+#[must_use]
+pub fn is_st_link(vendor_id: u16, product_id: u16) -> bool {
+    vendor_id == ST_VENDOR_ID && product_id::ALL.contains(&product_id)
 }
 
 const CMD_GET_VERSION: u8 = 0xf1;
@@ -1807,5 +1837,47 @@ mod application_voltage_tests {
     #[test]
     fn no_target_is_not_reported_as_an_over_voltage() {
         assert!(StLink::application_voltage_warning(0.0).is_none());
+    }
+}
+
+#[cfg(test)]
+mod recognition_tests {
+    use super::{ST_VENDOR_ID, is_st_link, product_id};
+
+    /// `ALL` is every id the module declares, the V3 family included, each once.
+    #[test]
+    fn all_holds_every_declared_id_once() {
+        for id in [product_id::V2, product_id::V2_1, product_id::V2EC]
+            .into_iter()
+            .chain(product_id::V3_FAMILY)
+        {
+            assert_eq!(
+                product_id::ALL.iter().filter(|&&listed| listed == id).count(),
+                1,
+                "{id:#06x} must appear in ALL exactly once"
+            );
+        }
+        assert_eq!(product_id::ALL.len(), 3 + product_id::V3_FAMILY.len());
+    }
+
+    /// Every id a listing recognizes has a name to show, and an id it does not recognize has none.
+    #[test]
+    fn every_recognized_id_has_a_name_and_no_other_does() {
+        for id in product_id::ALL {
+            assert!(product_id::name(id).is_some(), "{id:#06x} has no name");
+        }
+        assert_eq!(product_id::name(product_id::V2EC), product_id::name(product_id::V2_1));
+        assert_eq!(product_id::name(product_id::V3E), Some("STLINK-V3"));
+        assert_eq!(product_id::name(0x5740), None);
+    }
+
+    /// The test is the vendor AND the product: ST's other devices and another vendor's use of an
+    /// ST-Link product id are both refused.
+    #[test]
+    fn only_st_with_an_st_link_product_id_is_an_st_link() {
+        assert!(is_st_link(ST_VENDOR_ID, product_id::V2_1));
+        assert!(is_st_link(ST_VENDOR_ID, product_id::V3PWR));
+        assert!(!is_st_link(ST_VENDOR_ID, 0x5740), "ST's virtual COM port is not a probe");
+        assert!(!is_st_link(0x2e8a, product_id::V2_1), "an ST-Link product id under another vendor");
     }
 }

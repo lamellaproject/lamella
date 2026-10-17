@@ -80,19 +80,19 @@ mod startup;
 mod rp2350_flash;
 
 #[cfg(all(target_os = "none", not(feature = "cyw43"), not(feature = "pico-plus-2")))]
-#[path = "../../../../bsp/rpi-pico2/rust/rpi_pico2_bindings.rs"]
+#[path = "../../../../bsp/boards/rpi-pico2/rust/rpi_pico2_bindings.rs"]
 #[allow(dead_code)]
 mod board_bindings;
 #[cfg(all(target_os = "none", feature = "pico-plus-2"))]
-#[path = "../../../../bsp/pimoroni-pico-plus-2/rust/pimoroni_pico_plus_2_bindings.rs"]
+#[path = "../../../../bsp/boards/pimoroni-pico-plus-2/rust/pimoroni_pico_plus_2_bindings.rs"]
 #[allow(dead_code)]
 mod board_bindings;
 #[cfg(all(target_os = "none", feature = "cyw43", not(feature = "pico-plus-2-w")))]
-#[path = "../../../../bsp/rpi-pico2-w/rust/rpi_pico2_w_bindings.rs"]
+#[path = "../../../../bsp/boards/rpi-pico2-w/rust/rpi_pico2_w_bindings.rs"]
 #[allow(dead_code)]
 mod board_bindings;
 #[cfg(all(target_os = "none", feature = "pico-plus-2-w"))]
-#[path = "../../../../bsp/pimoroni-pico-plus-2-w/rust/pimoroni_pico_plus_2_w_bindings.rs"]
+#[path = "../../../../bsp/boards/pimoroni-pico-plus-2-w/rust/pimoroni_pico_plus_2_w_bindings.rs"]
 #[allow(dead_code)]
 mod board_bindings;
 #[cfg(target_os = "none")]
@@ -724,7 +724,7 @@ mod serve {
 
     pub(crate) use crate::systick_clock as clock;
 
-    /// The full name of this board's C# class, in `bsp/<board>/csharp`, which the runtime
+    /// The full name of this board's C# class, in `bsp/boards/<board>/csharp`, which the runtime
     /// initializes before a program's entry point when the program carries it. One bin serves four
     /// boards, so it follows the same feature switch as the board identity in `lamella_main`.
     #[cfg(all(feature = "cyw43", not(feature = "pico-plus-2-w")))]

@@ -1,6 +1,6 @@
 # SERCOM in I2C MASTER mode on the SAM D11 family -- the BLOCK layout: register offsets are
-# SERCOM-instance-relative; nothing in this file names an instance, a pin, a board, or a clock
-# plan. Instance bases/ids live in ../instances.toml; board wiring lives in bsp/<board>/board.toml.
+# SERCOM-instance-relative; nothing in this file names an instance, a pin, a board, or a clock plan.
+# Instance bases/ids live in ../instances.toml; board wiring lives in bsp/boards/<board>/board.toml.
 #
 # THE I2C CHAPTER CARRIES TWO REGISTER MAPS AND THEY OVERLAP AT EVERY OFFSET. Table 27-3 is SLAVE
 # mode (CTRLA.MODE = 100) and table 27-4 is MASTER (MODE = 101). Both define CTRLA at 0x00, CTRLB

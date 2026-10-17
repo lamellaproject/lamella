@@ -72,8 +72,15 @@ impl LoopbackLink {
     }
 }
 
-impl ReplLink for LoopbackLink {
-    fn run(&mut self, seq: u16, program: &[u8]) -> Result<RunResult, TransportError> {
+impl LoopbackLink {
+    /// Runs `program` as [`ReplLink::run`] does, and hands back the collector that followed it:
+    /// the program's two streams apart, and how the run ended -- its stop reason and exit value,
+    /// which tell a program stopped by an exception nothing caught from one that returned the
+    /// same code itself.
+    ///
+    /// # Errors
+    /// As [`ReplLink::run`].
+    pub fn run_collected(&mut self, seq: u16, program: &[u8]) -> Result<RunCollector, TransportError> {
         send_program(&mut self.driver, seq, program)?;
         self.runner.feed(&self.driver.take_sent());
         let mut arena = ArtifactLoad::new();
@@ -81,8 +88,16 @@ impl ReplLink for LoopbackLink {
         while crate::serve_one_with(&mut self.runner, &self.corlib, &mut configure, &mut arena)? {}
         self.driver.feed(&self.runner.take_sent());
         let mut run = RunCollector::new(seq);
-        run.poll(&mut self.driver)?;
-        run.finish().ok_or(TransportError::Closed)
+        if !run.poll(&mut self.driver)? {
+            return Err(TransportError::Closed);
+        }
+        Ok(run)
+    }
+}
+
+impl ReplLink for LoopbackLink {
+    fn run(&mut self, seq: u16, program: &[u8]) -> Result<RunResult, TransportError> {
+        self.run_collected(seq, program)?.finish().ok_or(TransportError::Closed)
     }
 }
 

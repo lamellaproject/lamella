@@ -1153,8 +1153,9 @@ fn an_edbg_route_narrows_to_the_kit_and_not_to_the_vendor() {
 /// Every routed Microchip board names a kit product id that its own board file states.
 ///
 /// **THE ROW AND THE BOARD FILE ARE TWO SPELLINGS OF ONE FACT** -- `usb_pid` in
-/// `bsp/<board>/board.toml` is where board truth lives, and the row is what the router reads. A row
-/// carrying an id the board file does not state would open a debugger that is not on that board.
+/// `bsp/boards/<board>/board.toml` is where board truth lives, and the row is what the router
+/// reads. A row carrying an id the board file does not state would open a debugger that is not on
+/// that board.
 #[test]
 fn the_routed_microchip_kits_carry_their_own_product_ids() {
     use crate::{PROGRAMMING, Programmer};
@@ -3380,6 +3381,9 @@ struct FakeF7 {
     halted: bool,
     /// Whether the firmware the part was running had started its independent watchdog.
     iwdg_started: bool,
+    /// The length in words of each block read of the array, in order: how many times a write read
+    /// the image back.
+    array_reads: Vec<usize>,
 }
 
 impl FakeF7 {
@@ -3401,6 +3405,7 @@ impl FakeF7 {
             apb1_fz: 0,
             halted: false,
             iwdg_started: false,
+            array_reads: Vec::new(),
         }
     }
 
@@ -3582,6 +3587,9 @@ impl TargetAccess for FakeF7 {
     }
 
     fn read_words_into(&mut self, address: u32, out: &mut [u32]) -> Result<(), ProbeError> {
+        if (STM32F7_FLASH_BASE..self.array_end()).contains(&address) {
+            self.array_reads.push(out.len());
+        }
         for (index, slot) in out.iter_mut().enumerate() {
             *slot = self.read_word(address + (index * 4) as u32)?;
         }
@@ -4573,4 +4581,483 @@ fn a_kept_bootloader_on_a_family_that_cannot_keep_one_is_refused() {
     let image = Image { bytes: &bytes, base: placement.base() };
     let why = backend.erase(&image).expect_err("not a SAM D21").to_string();
     assert!(why.contains("keeping one is built for a SAM D21"), "{why}");
+}
+
+/// An RP2350 as its bootrom flash API shows itself to a probe: the ROM table the part routine finds
+/// its four functions in, `flash_op` erasing and programming a byte array behind the XIP window from
+/// the staging RAM a program round fills, and the OTP chip id. Each read of the XIP window is
+/// counted, because how many times a write reads the image back is part of what a route promises.
+///
+/// **THE BOOTROM's NUMBERS ARE WRITTEN OUT HERE**, from RP2350 datasheet 5.4 rather than borrowed
+/// from the part crate, which keeps them private: the magic at 0x10, the table's address at 0x14,
+/// and the Secure-Arm function flag 0x0004. A fake that disagreed with the part crate would fail
+/// the lookup loudly rather than pass.
+struct FakeRp2350 {
+    log: Vec<String>,
+    /// The flash behind the XIP window, from its base.
+    flash: Vec<u8>,
+    /// Every word written outside the flash: the stubs, the staged image, the debug registers.
+    ram: std::collections::HashMap<u32, u32>,
+    /// The ROM from address 0: the magic, the table's address, and the table.
+    rom: Vec<u8>,
+    /// The length in words of each read of the XIP window, in order.
+    xip_reads: Vec<usize>,
+    /// What the next staging write fails with, once: the image crossing the wire into RAM is where
+    /// most of a write's transfers are, so it is where a fault in them lands.
+    fail_staging: Option<ProbeError>,
+}
+
+/// Where the fake's ROM table starts, and the addresses its four functions answer at.
+const RP2350_TABLE: u32 = 0x7000;
+const RP2350_CONNECT_INTERNAL_FLASH: u16 = 0x7100;
+const RP2350_FLASH_EXIT_XIP: u16 = 0x7102;
+const RP2350_FLASH_OP: u16 = 0x7104;
+const RP2350_FLASH_FLUSH_CACHE: u16 = 0x7106;
+/// Where the part routine runs its two secure-setup stubs (the part crate's `STUB_BASE`).
+const RP2350_STUBS: u32 = 0x2000_8000;
+
+impl FakeRp2350 {
+    fn new() -> Self {
+        let mut rom = vec![0u8; RP2350_TABLE as usize + 64];
+        rom[0x10..0x14].copy_from_slice(&0x0002_754d_u32.to_le_bytes());
+        rom[0x14..0x18].copy_from_slice(&RP2350_TABLE.to_le_bytes());
+        let mut at = RP2350_TABLE as usize;
+        for (code, address) in [
+            (*b"IF", RP2350_CONNECT_INTERNAL_FLASH),
+            (*b"EX", RP2350_FLASH_EXIT_XIP),
+            (*b"FO", RP2350_FLASH_OP),
+            (*b"FC", RP2350_FLASH_FLUSH_CACHE),
+        ] {
+            rom[at..at + 2].copy_from_slice(&code);
+            rom[at + 2..at + 4].copy_from_slice(&0x0004_u16.to_le_bytes());
+            rom[at + 4..at + 6].copy_from_slice(&address.to_le_bytes());
+            at += 6;
+        }
+        FakeRp2350 {
+            log: Vec::new(),
+            flash: vec![0xFF; 64 * 1024],
+            ram: std::collections::HashMap::new(),
+            rom,
+            xip_reads: Vec::new(),
+            fail_staging: None,
+        }
+    }
+
+    /// Where `address` falls in the flash, when it is behind the XIP window.
+    fn in_flash(&self, address: u32) -> Option<usize> {
+        let offset = address.checked_sub(lamella_cmsis_dap_rp2350::XIP_BASE)? as usize;
+        (offset < self.flash.len()).then_some(offset)
+    }
+}
+
+impl TargetAccess for FakeRp2350 {
+    fn connect(&mut self) -> Result<(), ProbeError> {
+        Ok(())
+    }
+    fn read_idcode(&mut self) -> Result<u32, ProbeError> {
+        Ok(0x4c01_3477)
+    }
+    fn init_mem(&mut self) -> Result<(), ProbeError> {
+        Ok(())
+    }
+    fn read_word(&mut self, address: u32) -> Result<u32, ProbeError> {
+        if let Some(at) = self.in_flash(address) {
+            let cell = &self.flash[at..at + 4];
+            return Ok(u32::from_le_bytes([cell[0], cell[1], cell[2], cell[3]]));
+        }
+        let at = address as usize;
+        if at + 4 <= self.rom.len() {
+            let cell = &self.rom[at..at + 4];
+            return Ok(u32::from_le_bytes([cell[0], cell[1], cell[2], cell[3]]));
+        }
+        Ok(match address {
+            OTP_CHIPID_BASE => 0x1122_3344,
+            _ if address == OTP_CHIPID_BASE + 4 => 0x5566_7788,
+            0x400e_0810 => self.ram.get(&address).copied().unwrap_or(1),
+            _ => self.ram.get(&address).copied().unwrap_or(0),
+        })
+    }
+    fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+        if self.in_flash(address).is_some() {
+            return Err(ProbeError::Device("flash is written through flash_op, not by a store"));
+        }
+        self.ram.insert(address, value);
+        Ok(())
+    }
+    fn read_words_into(&mut self, address: u32, out: &mut [u32]) -> Result<(), ProbeError> {
+        if self.in_flash(address).is_some() {
+            self.xip_reads.push(out.len());
+        }
+        for (index, slot) in out.iter_mut().enumerate() {
+            *slot = self.read_word(address + (index * 4) as u32)?;
+        }
+        Ok(())
+    }
+    fn write_words(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError> {
+        if let Some(error) = self.fail_staging.take() {
+            self.log.push("staging failed".to_owned());
+            return Err(error);
+        }
+        for (index, word) in words.iter().enumerate() {
+            self.write_word(address + (index * 4) as u32, *word)?;
+        }
+        Ok(())
+    }
+    fn halt(&mut self) -> Result<(), ProbeError> {
+        self.log.push("halt".to_owned());
+        Ok(())
+    }
+    fn is_halted(&mut self) -> Result<bool, ProbeError> {
+        Ok(true)
+    }
+    fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+        self.log.push("reset_and_run".to_owned());
+        Ok(())
+    }
+    fn set_breakpoints(&mut self, addresses: &[u32]) -> Result<(), ProbeError> {
+        assert!(addresses.is_empty(), "a flash arms no breakpoint: {addresses:?}");
+        Ok(())
+    }
+    fn call_target(
+        &mut self,
+        address: u32,
+        args: &[u32],
+        _frame: &lamella_probe_core::CallFrame,
+    ) -> Result<u32, ProbeError> {
+        let named = |function: u16| address == u32::from(function);
+        if address == RP2350_STUBS
+            || named(RP2350_CONNECT_INTERNAL_FLASH)
+            || named(RP2350_FLASH_EXIT_XIP)
+            || named(RP2350_FLASH_FLUSH_CACHE)
+        {
+            return Ok(0);
+        }
+        if !named(RP2350_FLASH_OP) {
+            return Err(ProbeError::Device("a call to an address this fake does not model"));
+        }
+        let (operation, at, length, from) = (args[0] >> 16, args[1], args[2] as usize, args[3]);
+        let offset = self
+            .in_flash(at)
+            .ok_or(ProbeError::Device("a flash_op outside the modelled flash"))?;
+        match operation {
+            0 => {
+                self.flash[offset..offset + length].fill(0xFF);
+                self.log.push(format!("erase {length}"));
+            }
+            1 => {
+                for index in 0..length / 4 {
+                    let word = self.ram.get(&(from + (index * 4) as u32)).copied().unwrap_or(0);
+                    self.flash[offset + index * 4..offset + index * 4 + 4]
+                        .copy_from_slice(&word.to_le_bytes());
+                }
+                self.log.push(format!("program {length}"));
+            }
+            _ => return Err(ProbeError::Device("a flash_op this fake does not model")),
+        }
+        Ok(0)
+    }
+
+    fn read_byte(&mut self, _address: u32) -> Result<u8, ProbeError> {
+        unreachable!("byte access is not part of the flashing path")
+    }
+    fn write_byte(&mut self, _address: u32, _value: u8) -> Result<(), ProbeError> {
+        unreachable!("byte access is not part of the flashing path")
+    }
+    fn read_halfword(&mut self, _address: u32) -> Result<u16, ProbeError> {
+        unreachable!("halfword access is not part of the flashing path")
+    }
+    fn write_halfword(&mut self, _address: u32, _value: u16) -> Result<(), ProbeError> {
+        unreachable!("halfword access is not part of the flashing path")
+    }
+    fn resume(&mut self) -> Result<(), ProbeError> {
+        unreachable!("a flashing backend leaves the part through reset_and_run, not resume")
+    }
+    fn step(&mut self) -> Result<(), ProbeError> {
+        unreachable!("run control is not the flashing path")
+    }
+    fn wait_halted(&mut self) -> Result<(), ProbeError> {
+        unreachable!("run control is not the flashing path")
+    }
+    fn reset_and_halt(&mut self) -> Result<(), ProbeError> {
+        unreachable!("the routine resets by SYSRESETREQ, not by this seam")
+    }
+    fn set_reset(&mut self, _assert: bool) -> Result<u8, ProbeError> {
+        unreachable!("a flashing backend does not drive the reset line directly")
+    }
+    fn read_core_reg(&mut self, _selector: u8) -> Result<u32, ProbeError> {
+        unreachable!("core registers are the call seam's business, and it is modelled whole")
+    }
+    fn write_core_reg(&mut self, _selector: u8, _value: u32) -> Result<(), ProbeError> {
+        unreachable!("core registers are the call seam's business, and it is modelled whole")
+    }
+    fn arm_reset_catch(&mut self) -> Result<(), ProbeError> {
+        unreachable!("the routine catches the reset through DEMCR, written as memory")
+    }
+    fn disarm_reset_catch(&mut self) -> Result<(), ProbeError> {
+        unreachable!("the routine catches the reset through DEMCR, written as memory")
+    }
+    fn set_breakpoint(&mut self, _address: u32) -> Result<(), ProbeError> {
+        unreachable!("breakpoints are not the flashing path")
+    }
+    fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
+        unreachable!("breakpoints are not the flashing path")
+    }
+}
+
+/// Bytes no erased word can be mistaken for.
+fn rp2350_image(len: usize) -> Vec<u8> {
+    (0..len).map(|index| (index % 251) as u8).collect()
+}
+
+/// **THE RP2350 ROUTE SAYS ITS PROGRESS TO ITS CALLER**, each line indented under the caller's own,
+/// and prints none of it: under `lamella run`, standard output is the program's alone.
+#[test]
+fn the_rp2350_route_says_its_progress_to_its_caller() {
+    let bytes = rp2350_image(1000);
+    let lines = std::cell::RefCell::new(Vec::<String>::new());
+    let mut backend = Rp2350Probe::new(FakeRp2350::new(), 0x4c01_3477, "an RP2350")
+        .saying(|line: &str| lines.borrow_mut().push(line.to_owned()));
+    let report = flash(
+        &mut backend,
+        &Image {
+            bytes: &bytes,
+            base: lamella_cmsis_dap_rp2350::XIP_BASE,
+        },
+        VerifyPolicy::ReadBack,
+        &Allow::Any,
+    )
+    .expect("the RP2350 sequence");
+
+    assert_eq!(report.verification, Verification::ReadBack);
+    assert_eq!(&backend.target.flash[..bytes.len()], &bytes[..], "{:?}", backend.target.log);
+    let lines = lines.borrow();
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some("  reset-halt into the secure boot context..."),
+        "{lines:?}"
+    );
+    assert!(lines.iter().any(|line| line == "  verifying (full read-back over XIP)..."), "{lines:?}");
+    assert!(lines.iter().all(|line| line.starts_with("  ")), "{lines:?}");
+}
+
+/// **THE RP2350 ROUTE READS THE IMAGE BACK ONCE**, inside the part routine, and the contract compares
+/// that one read against the caller's bytes. A second read of the same window would take as long
+/// as the first, and could find nothing the first did not.
+#[test]
+fn the_rp2350_route_reads_the_image_back_once() {
+    let bytes = rp2350_image(1000);
+    let mut backend = Rp2350Probe::new(FakeRp2350::new(), 0x4c01_3477, "an RP2350");
+    let report = flash(
+        &mut backend,
+        &Image {
+            bytes: &bytes,
+            base: lamella_cmsis_dap_rp2350::XIP_BASE,
+        },
+        VerifyPolicy::ReadBack,
+        &Allow::Any,
+    )
+    .expect("the RP2350 sequence");
+
+    assert_eq!(report.verification, Verification::ReadBack);
+    assert_eq!(backend.target.xip_reads, vec![256], "{:?}", backend.target.log);
+    let log = &backend.target.log;
+    assert!(!log.iter().any(|step| step == "halt"), "no halt for a second read: {log:?}");
+}
+
+/// Drives [`write_rp2350`] over one fake board kept across its attempts, each attempt's staging write
+/// failing with what `fault` gives for that attempt's clock. Returns what the write returned, the
+/// clock of each attempt, every line said, and the board as the attempts left it.
+fn write_rp2350_on_a_fake(
+    bytes: &[u8],
+    mut fault: impl FnMut(u32) -> Option<ProbeError>,
+) -> (Result<Report, String>, Vec<u32>, Vec<String>, FakeRp2350) {
+    let image = Image {
+        bytes,
+        base: lamella_cmsis_dap_rp2350::XIP_BASE,
+    };
+    let mut board = Some(FakeRp2350::new());
+    let mut clocks = Vec::new();
+    let mut lines = Vec::new();
+    let written = write_rp2350(
+        |clock_hz, say| {
+            clocks.push(clock_hz);
+            let mut fake = board.take().expect("the board, back from the last attempt");
+            fake.fail_staging = fault(clock_hz);
+            let mut backend = Rp2350Probe::new(fake, 0x4c01_3477, "an RP2350").saying(&mut *say);
+            let written = flash(&mut backend, &image, VerifyPolicy::ReadBack, &Allow::Any)
+                .map_err(|why| rp2350_failure(why, clock_hz));
+            board = Some(backend.target);
+            written
+        },
+        &mut |line: &str| lines.push(line.to_owned()),
+    );
+    (written, clocks, lines, board.expect("the board"))
+}
+
+/// The erases, programs and failed stagings on a fake board, in order.
+fn rp2350_steps(board: &FakeRp2350) -> Vec<&str> {
+    board
+        .log
+        .iter()
+        .map(String::as_str)
+        .filter(|step| {
+            step.starts_with("erase") || step.starts_with("program") || *step == "staging failed"
+        })
+        .collect()
+}
+
+/// **A TRANSFER FAULT AT THE FASTER CLOCK MAKES THE WHOLE WRITE AGAIN AT THE FALLBACK CLOCK**: one
+/// line says so, and the second write erases, programs and reads back the whole image from the
+/// start, on the board the first left erased and half-written.
+#[test]
+fn a_transfer_fault_at_the_faster_clock_makes_the_whole_write_again_at_the_fallback_clock() {
+    use lamella_cmsis_dap_rp2350::{FALLBACK_SWD_CLOCK_HZ, SWD_CLOCK_HZ};
+
+    let bytes = rp2350_image(1000);
+    let (written, clocks, lines, board) = write_rp2350_on_a_fake(&bytes, |clock_hz| {
+        (clock_hz == SWD_CLOCK_HZ).then_some(ProbeError::Ack(lamella_probe_core::Ack::Fault))
+    });
+
+    let report = written.expect("the write at the fallback clock");
+    assert_eq!(report.verification, Verification::ReadBack);
+    assert_eq!(clocks, vec![SWD_CLOCK_HZ, FALLBACK_SWD_CLOCK_HZ]);
+    assert_eq!(&board.flash[..bytes.len()], &bytes[..], "{:?}", board.log);
+    assert_eq!(
+        rp2350_steps(&board),
+        ["erase 4096", "staging failed", "erase 4096", "program 1024"],
+        "{:?}",
+        board.log
+    );
+    assert_eq!(board.xip_reads, vec![256], "the second write read the image back, once");
+    let said: Vec<&String> = lines.iter().filter(|line| !line.starts_with("  ")).collect();
+    assert_eq!(
+        said,
+        [&format!(
+            "the write at {} MHz failed (transfer not acknowledged: Fault), so it is made again \
+             from the start at {} MHz",
+            SWD_CLOCK_HZ / 1_000_000,
+            FALLBACK_SWD_CLOCK_HZ / 1_000_000
+        )],
+        "{lines:?}"
+    );
+}
+
+/// **EVERY TRANSFER FAULT IS ONE THE FALLBACK ANSWERS, AND NOTHING ELSE IS**: no acknowledge, a WAIT
+/// past the retries, a FAULT and a parity error at the faster clock; at the fallback clock nothing,
+/// and at either clock no failure that is not a transfer's.
+#[test]
+fn only_a_transfer_fault_at_the_faster_clock_is_answered_at_the_fallback_clock() {
+    use lamella_cmsis_dap_rp2350::{FALLBACK_SWD_CLOCK_HZ, SWD_CLOCK_HZ};
+    use lamella_probe_core::Ack;
+
+    let at_speed = |error: FlashError, clock_hz: u32| {
+        matches!(rp2350_failure(error, clock_hz), Rp2350Failure::AtSpeed(_))
+    };
+    for ack in [Ack::NoAck, Ack::Wait, Ack::Fault, Ack::Unknown(0x08)] {
+        assert!(at_speed(FlashError::Probe(ProbeError::Ack(ack)), SWD_CLOCK_HZ), "{ack:?}");
+        assert!(!at_speed(FlashError::Probe(ProbeError::Ack(ack)), FALLBACK_SWD_CLOCK_HZ), "{ack:?}");
+    }
+    for error in [
+        FlashError::Probe(ProbeError::Transport("the probe stopped answering".to_owned())),
+        FlashError::Probe(ProbeError::Timeout("flash verify mismatch")),
+        FlashError::Verify {
+            address: 0x1000_0000,
+            expected: 1,
+            got: 2,
+        },
+    ] {
+        let named = error.to_string();
+        assert!(!at_speed(error, SWD_CLOCK_HZ), "{named}");
+    }
+}
+
+/// A failure that is not a transfer fault is the answer at once: the write is not made again, and
+/// nothing says it will be.
+#[test]
+fn a_failure_that_is_not_a_transfer_fault_is_not_made_again() {
+    use lamella_cmsis_dap_rp2350::SWD_CLOCK_HZ;
+
+    let bytes = rp2350_image(1000);
+    let (written, clocks, lines, _) = write_rp2350_on_a_fake(&bytes, |_| {
+        Some(ProbeError::Device("the staging RAM refused the image"))
+    });
+
+    let why = written.expect_err("a device error at either clock");
+    assert!(why.contains("the staging RAM refused the image"), "{why}");
+    assert_eq!(clocks, vec![SWD_CLOCK_HZ]);
+    assert!(lines.iter().all(|line| line.starts_with("  ")), "{lines:?}");
+}
+
+/// A transfer fault at the fallback clock is the answer: there is no third write.
+#[test]
+fn a_transfer_fault_at_the_fallback_clock_is_the_answer() {
+    use lamella_cmsis_dap_rp2350::{FALLBACK_SWD_CLOCK_HZ, SWD_CLOCK_HZ};
+
+    let bytes = rp2350_image(1000);
+    let (written, clocks, lines, board) = write_rp2350_on_a_fake(&bytes, |_| {
+        Some(ProbeError::Ack(lamella_probe_core::Ack::NoAck))
+    });
+
+    let why = written.expect_err("a fault at both clocks");
+    assert!(why.contains("NoAck"), "{why}");
+    assert_eq!(clocks, vec![SWD_CLOCK_HZ, FALLBACK_SWD_CLOCK_HZ]);
+    assert_eq!(lines.iter().filter(|line| !line.starts_with("  ")).count(), 1, "{lines:?}");
+    assert_eq!(rp2350_steps(&board), ["erase 4096", "staging failed", "erase 4096", "staging failed"]);
+}
+
+/// **THE RP2040 ROUTE HANDS THE CONTRACT ITS ROUTINE's READ, NOT A SECOND ONE**: what `program` kept
+/// is what `read_back` gives, cut to the image, with nothing read from the part; driven without its
+/// `program`, it reads the part itself, once. Its part routine is the RP2350's in shape but not in
+/// its bootrom, so this drives the backend's half alone.
+#[test]
+fn the_rp2040_route_gives_its_routines_read_rather_than_reading_again() {
+    let bytes = rp2350_image(10);
+    let image = Image {
+        bytes: &bytes,
+        base: lamella_cmsis_dap_rp2040::XIP_BASE,
+    };
+    let mut backend = Rp2040Probe::new(FakeRp2350::new(), 0x0bc1_2477, "an RP2040");
+    backend.read = Some(vec![0x0302_0100, 0x0706_0504, 0x0b0a_0908, 0xffff_ffff]);
+    let read = backend.read_back(&image).expect("a probe route reads back").expect("the kept read");
+    assert_eq!(read, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9], "cut to the image");
+    assert!(backend.target.xip_reads.is_empty(), "nothing was read from the part");
+
+    let read = backend.read_back(&image).expect("a probe route reads back").expect("a read");
+    assert_eq!(read.len(), bytes.len());
+    assert_eq!(backend.target.xip_reads, vec![3], "with nothing kept, one read of the part");
+}
+
+/// **THE ST ROUTE SAYS ITS THREE STEPS, AND READS THE IMAGE BACK ONCE**: the erase, the program and
+/// the read-back, each as it starts, so a write of half a minute on a board is not a silent one; and
+/// its part's controller programs without reading anything back, so the route's own read-back is the
+/// one verify.
+#[test]
+fn the_st_route_says_its_three_steps_and_reads_the_image_back_once() {
+    let bytes = f7_pattern(32 * 1024 + 1);
+    let align = crate::StFamily::F7.plan().program_align as usize;
+    let lines = std::cell::RefCell::new(Vec::<String>::new());
+    let mut backend = StProbe::new(FakeF7::f769(), crate::StFamily::F7.plan())
+        .saying(|line: &str| lines.borrow_mut().push(line.to_owned()));
+    let report = flash(
+        &mut backend,
+        &Image {
+            bytes: &bytes,
+            base: STM32F7_FLASH_BASE,
+        },
+        VerifyPolicy::ReadBack,
+        &Allow::Any,
+    )
+    .expect("the F7 sequence");
+
+    assert_eq!(report.verification, Verification::ReadBack);
+    assert_eq!(
+        *lines.borrow(),
+        [
+            "  erasing 65536 bytes from 0x08000000...".to_owned(),
+            format!("  programming {} bytes from 0x08000000...", bytes.len().div_ceil(align) * align),
+            "  verifying (full read-back over SWD)...".to_owned(),
+        ]
+    );
+    let reads = &backend.target.array_reads;
+    assert_eq!(*reads, vec![bytes.len().div_ceil(4)], "{:?}", backend.target.log);
 }

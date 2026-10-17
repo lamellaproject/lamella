@@ -1,6 +1,6 @@
-# The SAMD20 instance map: every placed block copy, its base, and its per-instance ids.
-# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
-# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+# The SAMD20 instance map: every placed block copy, its base, and its per-instance ids. Layout truth
+# lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
+# uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
 # EVERY VALUE BELOW WAS READ OFF THE SAM D20'S OWN TABLE 11-1. That matters more on this family
 # than on most, because the SAM D21 resemblance is close enough to invite a copy and the copy

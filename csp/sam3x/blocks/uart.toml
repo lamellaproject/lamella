@@ -1,7 +1,7 @@
 # The UART peripheral on the Microchip/Atmel SAM3X / SAM3A family -- the BLOCK layout:
 # register offsets are UART-instance-relative; nothing here names an instance, a pin, a board, or a
 # clock plan. Instance bases/ids live in ../instances.toml; board wiring
-# lives in bsp/<board>/board.toml.
+# lives in bsp/boards/<board>/board.toml.
 #
 # The SAM3X UART is a single-mode peripheral (no USART-style mode register), always 8 data bits +
 # 1 stop bit; parity is chosen by MR.PAR. Transcribed from the SAM3X/A datasheet (Atmel-11057) ch 34.

@@ -982,6 +982,7 @@ That is set when the server starts.",
             &prepared.bytes,
             selector.as_deref(),
             &self.scope.identities(),
+            &mut |line| eprintln!("lamella-mcp: {line}"),
         ) {
             Ok(report) => text_result(
                 format!(
@@ -1426,9 +1427,9 @@ fn to_firmware(
         Err(why) => return text_result(why, true),
     };
     let transcript = Transcript::default();
-    let (mut out, mut err) = (transcript.clone(), transcript.clone());
+    let (mut said, mut out, mut err) = (transcript.clone(), transcript.clone(), transcript.clone());
     let (ending, is_error) = match then {
-        Then::Rest | Then::Start => match on_device::store_image(&mut *t, &session, target, &image, &mut out) {
+        Then::Rest | Then::Start => match on_device::store_image(&mut *t, &session, target, &image, &mut said) {
             Err(why) => (why, true),
             Ok(_) if !matches!(then, Then::Start) => {
                 ("not started (run: false). It runs at the board's next reset.".to_owned(), false)
@@ -1439,7 +1440,7 @@ fn to_firmware(
             },
         },
         Then::Run(watch) => {
-            match on_device::run_scheduled(&mut *t, &session, target, &image, &mut out, &mut err, watch) {
+            match on_device::run_scheduled(&mut *t, &session, target, &image, &mut said, &mut out, &mut err, watch) {
                 Ok(end) => (format!("\n{}", end.describe(target)), !ran_its_course(&end)),
                 Err(why) => (why, true),
             }
@@ -1981,6 +1982,10 @@ const META_PROTOCOL_VERSION: &str = "io.modelcontextprotocol/protocolVersion";
 /// The `_meta` key a discovery result reports server identity under.
 const META_SERVER_INFO: &str = "io.modelcontextprotocol/serverInfo";
 
+/// The version this server reports as its identity: the package's own, the one `lamella_version`
+/// and `lamella --version` report too, so the three never disagree.
+const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// JSON-RPC error code for `UnsupportedProtocolVersionError`.
 ///
 /// It is what tells a modern client it has reached a MODERN server that cannot speak its revision,
@@ -2144,7 +2149,7 @@ fn main() {
                             "_meta": {
                                 META_SERVER_INFO: {
                                     "name": "lamella-mcp",
-                                    "version": "0.2.0"
+                                    "version": SERVER_VERSION
                                 }
                             }
                         })),
@@ -2163,7 +2168,7 @@ fn main() {
                         json!({
                             "protocolVersion": negotiate_protocol(asked),
                             "capabilities": { "tools": {}, "resources": {} },
-                            "serverInfo": { "name": "lamella-mcp", "version": "0.2.0" }
+                            "serverInfo": { "name": "lamella-mcp", "version": SERVER_VERSION }
                         }),
                     );
                 }

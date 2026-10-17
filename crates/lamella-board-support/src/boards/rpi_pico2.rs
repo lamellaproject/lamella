@@ -4,7 +4,7 @@
 use crate::rp2350;
 
 #[allow(dead_code)]
-#[path = "../../../../bsp/rpi-pico2/rust/rpi_pico2_bindings.rs"]
+#[path = "../../../../bsp/boards/rpi-pico2/rust/rpi_pico2_bindings.rs"]
 mod bindings;
 
 /// The board as its generated bindings state it: the console on the `uart0` carrier at 115200 baud

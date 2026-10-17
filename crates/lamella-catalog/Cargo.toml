@@ -13,3 +13,7 @@ publish = false
 # TEXT and this crate supplies the resolution; the RULE computed over them (a fit verdict, a
 # reconciliation) stays in `lamella-bsp-gen` and is not restated here.
 lamella-bsp-gen = { path = "../lamella-bsp-gen" }
+
+[build-dependencies]
+# The one list of the boards, which the build script embeds.
+lamella-bsp-gen = { path = "../lamella-bsp-gen" }

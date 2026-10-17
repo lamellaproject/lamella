@@ -7,13 +7,14 @@ fn main() {
     let repo = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").expect("manifest dir"))
         .join("..")
         .join("..");
-    let boards = collect(&repo.join("bsp"), Path::new("board.toml"));
-    let parts = collect(&repo.join("csp"), Path::new("parts.toml"));
-    let modules = collect(&repo.join("csp"), Path::new("module.toml"));
-    let board_python = collect(&repo.join("bsp"), &Path::new("python").join("board.py"));
-    let bus_tables = collect(&repo.join("bsp"), &Path::new("rust").join("bus_table.rs"));
+    let board_dirs = lamella_bsp_gen::boards::board_dirs(&repo).unwrap_or_else(|error| panic!("{error}"));
+    let boards = collect(&board_dirs, Path::new("board.toml"));
+    let parts = collect(&subdirectories(&repo.join("csp")), Path::new("parts.toml"));
+    let modules = collect(&subdirectories(&repo.join("csp")), Path::new("module.toml"));
+    let board_python = collect(&board_dirs, &Path::new("python").join("board.py"));
+    let bus_tables = collect(&board_dirs, &Path::new("rust").join("bus_table.rs"));
 
-    println!("cargo:rerun-if-changed={}", repo.join("bsp").display());
+    println!("cargo:rerun-if-changed={}", repo.join(lamella_bsp_gen::boards::BOARDS_DIR).display());
     println!("cargo:rerun-if-changed={}", repo.join("csp").display());
     for path in boards
         .values()
@@ -70,23 +71,29 @@ fn main() {
     std::fs::write(&dest, out).expect("write catalog");
 }
 
-/// Every immediate subdirectory of `root` containing `file`, as `id -> path`, sorted by id so the
-/// generated table is stable across builds (an unstable order is a diff on every rebuild).
+/// Every one of `dirs` containing `file`, as `id -> path` where the id is the directory's name,
+/// sorted by id so the generated table is stable across builds (an unstable order is a diff on every
+/// rebuild).
 ///
-/// `file` is a path RELATIVE to each subdirectory, so a fact stated one level down
+/// `file` is a path RELATIVE to each directory, so a fact stated one level down
 /// (`<board>/python/board.py`) is collected by the same walk as one stated at the top.
-fn collect(root: &Path, file: &Path) -> BTreeMap<String, PathBuf> {
+fn collect(dirs: &[PathBuf], file: &Path) -> BTreeMap<String, PathBuf> {
     let mut found = BTreeMap::new();
-    let Ok(entries) = std::fs::read_dir(root) else {
-        return found;
-    };
-    for entry in entries.flatten() {
-        let candidate = entry.path().join(file);
+    for dir in dirs {
+        let candidate = dir.join(file);
         if candidate.is_file()
-            && let Some(id) = entry.file_name().to_str()
+            && let Some(id) = dir.file_name().and_then(|name| name.to_str())
         {
             found.insert(id.to_string(), candidate);
         }
     }
     found
+}
+
+/// Every immediate subdirectory of `root`, or none when `root` cannot be read.
+fn subdirectories(root: &Path) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return Vec::new();
+    };
+    entries.flatten().map(|entry| entry.path()).collect()
 }

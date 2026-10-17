@@ -9,6 +9,7 @@ pub mod fit;
 pub mod reconcile;
 pub mod strata;
 pub mod compose;
+pub mod boards;
 
 /// An integer fact plus how the table spelled it (hex spelling is preserved in the emission,
 /// so a generated file reads like the table that produced it).

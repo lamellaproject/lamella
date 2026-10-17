@@ -433,8 +433,8 @@ const DESCRIPTOR_TIMEOUT: Duration = Duration::from_millis(250);
 /// tool is far worse than an error"*. The control path is the same trade and had not been given the
 /// same answer.
 ///
-/// So the request goes out as an overlapped control transfer instead, which the same
-/// poll-and-abort loop the pipes use can bound and cancel. The setup packet is the standard
+/// So the request goes out as an overlapped control transfer instead, which a wait on its event can
+/// bound and an abort can cancel, as the pipes' transfers are. The setup packet is the standard
 /// GET_DESCRIPTOR that `WinUsb_GetDescriptor` issues internally: direction device-to-host, `wValue`
 /// the type and index, `wIndex` the language id.
 unsafe fn descriptor_bounded(
@@ -1188,22 +1188,22 @@ interface {} alt {} class {:#04x}/{:#04x}/{:#04x}, {} endpoint(s)",
             if WinUsb_WritePipe(self.wu, endpoint, data.as_ptr(), data.len() as u32, &mut n, &ov) == 0 {
                 if GetLastError() == ERROR_IO_PENDING {
                     const WRITE_TIMEOUT: Duration = Duration::from_millis(2000);
-                    const ERROR_IO_INCOMPLETE: u32 = 996;
-                    let deadline = std::time::Instant::now() + WRITE_TIMEOUT;
-                    loop {
-                        if WinUsb_GetOverlappedResult(self.wu, &ov, &mut n, 0) != 0 {
-                            break;
-                        }
-                        let code = GetLastError();
-                        if code != ERROR_IO_INCOMPLETE {
+                    let waited = WaitForSingleObject(self.ev, WRITE_TIMEOUT.as_millis() as u32);
+                    if waited == WAIT_OBJECT_0 {
+                        if WinUsb_GetOverlappedResult(self.wu, &ov, &mut n, 0) == 0 {
+                            let code = GetLastError();
                             return Err(Error::Os(format!("WinUsb write failed (error {code})")));
                         }
-                        if std::time::Instant::now() >= deadline {
-                            WinUsb_AbortPipe(self.wu, endpoint);
-                            let _ = WinUsb_GetOverlappedResult(self.wu, &ov, &mut n, 1);
-                            return Err(Error::Timeout);
-                        }
-                        std::thread::sleep(Duration::from_millis(1));
+                    } else {
+                        let wait_failure = (waited != WAIT_TIMEOUT).then(|| GetLastError());
+                        WinUsb_AbortPipe(self.wu, endpoint);
+                        let _ = WinUsb_GetOverlappedResult(self.wu, &ov, &mut n, 1);
+                        return Err(match wait_failure {
+                            None => Error::Timeout,
+                            Some(code) => {
+                                Error::Os(format!("waiting for the bulk write failed (error {code})"))
+                            }
+                        });
                     }
                 } else {
                     let code = GetLastError();
@@ -1236,30 +1236,30 @@ interface {} alt {} class {:#04x}/{:#04x}/{:#04x}, {} endpoint(s)",
             if WinUsb_ReadPipe(self.wu, endpoint, buf.as_mut_ptr(), buf.len() as u32, &mut got, &ov) == 0 {
                 let err = GetLastError();
                 if err == ERROR_IO_PENDING {
-                    const ERROR_IO_INCOMPLETE: u32 = 996;
-                    let deadline = std::time::Instant::now() + timeout;
-                    loop {
-                        if WinUsb_GetOverlappedResult(self.wu, &ov, &mut got, 0) != 0 {
-                            break;
+                    let waited = WaitForSingleObject(self.ev, wait_milliseconds(ms));
+                    if waited == WAIT_OBJECT_0 {
+                        if WinUsb_GetOverlappedResult(self.wu, &ov, &mut got, 0) == 0 {
+                            return Err(match GetLastError() {
+                                ERROR_SEM_TIMEOUT => Error::Timeout,
+                                code => Error::Os(format!("WinUsb read failed (error {code})")),
+                            });
                         }
-                        match GetLastError() {
-                            ERROR_IO_INCOMPLETE => {
-                                if std::time::Instant::now() >= deadline {
-                                    WinUsb_AbortPipe(self.wu, endpoint);
-                                    let _ = WinUsb_GetOverlappedResult(self.wu, &ov, &mut got, 1);
-                                    // The transfer can finish between the last check and the abort.
-                                    // What it delivered is in `buf` and counted in `got`, so it is
-                                    // returned; only a read that delivered nothing is a timeout.
-                                    if got > 0 {
-                                        return Ok(got as usize);
-                                    }
-                                    return Err(Error::Timeout);
-                                }
-                                std::thread::sleep(Duration::from_millis(1));
+                    } else {
+                        let wait_failure = (waited != WAIT_TIMEOUT).then(|| GetLastError());
+                        WinUsb_AbortPipe(self.wu, endpoint);
+                        let _ = WinUsb_GetOverlappedResult(self.wu, &ov, &mut got, 1);
+                        // The transfer can finish between the end of the wait and the abort.
+                        // What it delivered is in `buf` and counted in `got`, so it is returned;
+                        // only a read that delivered nothing is a timeout.
+                        if got > 0 {
+                            return Ok(got as usize);
+                        }
+                        return Err(match wait_failure {
+                            None => Error::Timeout,
+                            Some(code) => {
+                                Error::Os(format!("waiting for the bulk read failed (error {code})"))
                             }
-                            ERROR_SEM_TIMEOUT => return Err(Error::Timeout),
-                            code => return Err(Error::Os(format!("WinUsb read failed (error {code})"))),
-                        }
+                        });
                     }
                 } else if err == ERROR_SEM_TIMEOUT {
                     return Err(Error::Timeout);
@@ -1479,5 +1479,27 @@ mod tests {
         assert_eq!(utf16_until_nul(&wide("WinUSB\0trailing")), "WinUSB");
         assert_eq!(utf16_until_nul(&wide("unterminated")), "unterminated");
         assert_eq!(utf16_until_nul(&[]), "");
+    }
+
+    /// **NO TRANSFER IS WAITED FOR BY SLEEPING.** Every pending transfer in this file is waited for
+    /// on its own event, bounded by its deadline, so it is answered the moment it completes.
+    /// Sleeping between checks of a pending transfer makes the sleeps most of every probe command's
+    /// round trip.
+    ///
+    /// Read from the source, because no test can drive a pending transfer without a device.
+    #[test]
+    fn no_transfer_is_waited_for_by_sleeping() {
+        let sleeps = [concat!("thread::", "sleep"), concat!("Sleep", "(")];
+        let source = include_str!("windows.rs");
+        let found: Vec<String> = source
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| {
+                let code = line.split("//").next().unwrap_or_default();
+                sleeps.iter().any(|sleep| code.contains(sleep))
+            })
+            .map(|(index, line)| format!("windows.rs:{}: {}", index + 1, line.trim()))
+            .collect();
+        assert!(found.is_empty(), "a transfer is waited for by sleeping:\n{}", found.join("\n"));
     }
 }

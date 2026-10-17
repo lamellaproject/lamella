@@ -177,3 +177,60 @@ fn the_section_header_reader_reads_sh_link_in_both_classes() {
     let elf64 = elf64_with_a_link(7);
     assert_eq!(crate::section_headers(&elf64)[1].link, 7, "ELF64");
 }
+
+/// `__rhu_console_log` at offset 1 and `other` at 19.
+const OBJECT_STRINGS: &[u8] = b"\0__rhu_console_log\0other\0";
+
+#[test]
+fn a_data_object_is_read_by_name_with_its_address_and_size() {
+    let symbols = table(&[
+        entry(19, 0x2000_0000, 4, GLOBAL | OBJECT, 1),
+        entry(1, 0x2004_0000, 16_400, GLOBAL | OBJECT, 1),
+    ]);
+    assert_eq!(
+        object(&image(ARM, &symbols, OBJECT_STRINGS, 2), "__rhu_console_log"),
+        Some(DataObject { address: 0x2004_0000, size: 16_400 }),
+        "an object's value is its address as the table gives it, with no bit cleared"
+    );
+}
+
+#[test]
+fn a_global_object_is_taken_over_a_local_one_of_the_same_name() {
+    let symbols = table(&[
+        entry(1, 0x2000_0100, 8, LOCAL | OBJECT, 1),
+        entry(1, 0x2000_0200, 8, WEAK | OBJECT, 1),
+    ]);
+    let elf = image(ARM, &symbols, OBJECT_STRINGS, 2);
+    assert_eq!(object(&elf, "__rhu_console_log").map(|found| found.address), Some(0x2000_0200));
+    let only_local = table(&[entry(1, 0x2000_0100, 8, LOCAL | OBJECT, 1)]);
+    let elf = image(ARM, &only_local, OBJECT_STRINGS, 2);
+    assert_eq!(object(&elf, "__rhu_console_log").map(|found| found.address), Some(0x2000_0100));
+}
+
+#[test]
+fn only_an_object_defined_in_the_file_is_read() {
+    let symbols = table(&[
+        entry(1, 0x100, 8, GLOBAL | FUNC, 1),
+        entry(1, 0x100, 8, GLOBAL, 1),
+        entry(1, 0x100, 8, GLOBAL | OBJECT, 0),
+        entry(1, 0x100, 8, GLOBAL | OBJECT, 0xFFF1),
+        entry(1, 0x100, 8, (10 << 4) | OBJECT, 1),
+    ]);
+    let elf = image(ARM, &symbols, OBJECT_STRINGS, 2);
+    assert_eq!(
+        object(&elf, "__rhu_console_log"),
+        None,
+        "a function, an untyped symbol, an undefined or absolute object and an unknown binding are \
+         each passed over"
+    );
+    assert_eq!(object(&elf, "missing"), None);
+}
+
+#[test]
+fn a_file_that_is_not_a_little_endian_elf32_file_names_no_objects() {
+    let symbols = table(&[entry(1, 0x100, 8, GLOBAL | OBJECT, 1)]);
+    let mut big_endian = image(ARM, &symbols, OBJECT_STRINGS, 2);
+    big_endian[5] = 2;
+    assert_eq!(object(&big_endian, "__rhu_console_log"), None);
+    assert_eq!(object(b"not an ELF file", "__rhu_console_log"), None);
+}

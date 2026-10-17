@@ -4,11 +4,11 @@ version = 4
 
 [[package]]
 name = "lamella-board-buses"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-decimal"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-runtime-support-riscv"
@@ -21,4 +21,4 @@ dependencies = [
 
 [[package]]
 name = "lamella-softmath"
-version = "0.0.0"
+version = "0.1.0"

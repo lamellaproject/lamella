@@ -1,6 +1,6 @@
 # SERCOM in SPI mode on the SAM D11 family -- the BLOCK layout: register offsets are
-# SERCOM-instance-relative; nothing in this file names an instance, a pin, a board, or a clock
-# plan. Instance bases/ids live in ../instances.toml; board wiring lives in bsp/<board>/board.toml.
+# SERCOM-instance-relative; nothing in this file names an instance, a pin, a board, or a clock plan.
+# Instance bases/ids live in ../instances.toml; board wiring lives in bsp/boards/<board>/board.toml.
 #
 # ONE SERCOM, THREE REGISTER MAPS. This mode shares its offsets with the USART and I2C maps at the
 # same base -- CTRLA 0x00, CTRLB 0x04, INTFLAG 0x18, DATA 0x28 in all three -- and the FIELDS

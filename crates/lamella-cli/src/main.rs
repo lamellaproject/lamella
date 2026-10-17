@@ -10,7 +10,10 @@ mod attach;
 mod bake;
 mod deploy;
 mod devices;
+mod ending;
 mod flash;
+mod image_run;
+mod own_lines;
 mod program;
 mod project;
 // Test-only: the one place that says what a rendered message may and may not contain.
@@ -25,7 +28,7 @@ fn main() -> ExitCode {
     let rest = args.get(1..).unwrap_or_default();
     match args.first().map(String::as_str) {
         Some("devices") => devices::devices_command(rest),
-        Some("run") => program::run_command(rest),
+        Some("run") => program::run_command(rest).finish(),
         Some("board-module-run") => program::board_module_run_command(rest),
         Some("build") => program::build_command(rest),
         Some("flash") => flash::flash_command(rest),
@@ -188,7 +191,7 @@ mod tests {
             ("boards", super::verdicts::boards_command),
             ("fit", super::verdicts::fit_command),
             ("reconcile", super::verdicts::reconcile_command),
-            ("run", super::program::run_command),
+            ("run", |args| super::program::run_command(args).finish()),
             ("build", super::program::build_command),
             ("flash", super::flash::flash_command),
             ("devices", super::devices::devices_command),

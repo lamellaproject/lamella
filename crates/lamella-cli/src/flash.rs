@@ -283,7 +283,7 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    write_image(chosen, &placement, &prepared.bytes, selector.as_deref())
+    write_image_here(chosen, &placement, &prepared.bytes, selector.as_deref())
 }
 
 /// The user-row step asked for alongside `--replace-bootloader`, which the command refuses: the
@@ -383,52 +383,58 @@ VERIFICATION WAS SKIPPED at your \
 
 
 /// Write `image` through `programmer` at the address `placement` gives, settling which physical
-/// board first.
+/// board first, and say what happened, a line at a time, to the verb's own output.
 ///
 /// Shared by `flash` and by `deploy --board`, so the probe ladder, the interactive rung and the
 /// reporting are identical whether the bytes were compiled a moment ago or read off disk. The
-/// board cannot tell the difference and neither should the output.
-fn write_image(
+/// board cannot tell the difference and neither should the output. `run` writes an image through
+/// here as well, with its lines on standard error, where it keeps everything of its own.
+///
+/// # Errors
+/// Anything that stopped the write, worded for a reader; the caller prints it in its own style.
+pub(crate) fn write_image(
     programmer: Programmer,
     placement: &Placement,
     image: &[u8],
     probe: Option<&str>,
-) -> ExitCode {
-    let probe = match choose_board(programmer, probe) {
-        Ok(chosen) => chosen,
-        Err(error) => {
-            eprintln!("lamella: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
+    say: &mut dyn FnMut(&str),
+) -> Result<(), String> {
+    let probe = choose_board(programmer, probe)?;
     let wrapped = wrap_for_route(programmer, image);
     let image = match &wrapped {
         Some((bytes, line)) => {
-            println!("{line}");
+            say(line);
             &bytes[..]
         }
         None => image,
     };
     if let Some(line) = placement_line(placement) {
-        println!("{line}");
+        say(&line);
     }
-    println!("writing over {}...", programmer.description());
-    match write(programmer, placement, image, probe.as_deref()) {
-        Ok(report) => {
-            println!(
-                "  the part answered {:#x} -- {}",
-                report.identity.value, report.identity.what
-            );
-            println!("{}", completion_line(programmer, &report));
-            if let Some(bootloader) = placement.kept() {
-                let wait = match bootloader.reset_wait_ms {
-                    Some(ms) => format!(", after the {ms} ms it waits on a reset"),
-                    None => String::new(),
-                };
-                println!("  the {} starts it{wait}", bootloader.name);
-            }
-            ExitCode::SUCCESS
-        }
+    say(&format!("writing over {}...", programmer.description()));
+    let report = write(programmer, placement, image, probe.as_deref(), &mut *say)?;
+    say(&format!("  the part answered {:#x} -- {}", report.identity.value, report.identity.what));
+    say(&completion_line(programmer, &report));
+    if let Some(bootloader) = placement.kept() {
+        let wait = match bootloader.reset_wait_ms {
+            Some(ms) => format!(", after the {ms} ms it waits on a reset"),
+            None => String::new(),
+        };
+        say(&format!("  the {} starts it{wait}", bootloader.name));
+    }
+    Ok(())
+}
+
+/// [`write_image`] for `flash` and `deploy`: its lines on standard output, and its failure on
+/// standard error.
+fn write_image_here(
+    programmer: Programmer,
+    placement: &Placement,
+    image: &[u8],
+    probe: Option<&str>,
+) -> ExitCode {
+    match write_image(programmer, placement, image, probe, &mut |line| println!("{line}")) {
+        Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("lamella: {error}");
             ExitCode::FAILURE
@@ -532,7 +538,7 @@ pub fn deploy_to_chip(
             return ExitCode::FAILURE;
         }
     };
-    write_image(chosen, &placement, &image, selector.as_deref())
+    write_image_here(chosen, &placement, &image, selector.as_deref())
 }
 
 /// Where `deploy --board` writes the image it compiled for `row`'s board through `route`.

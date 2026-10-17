@@ -89,6 +89,11 @@ lamella-flash-format = { path = "../lamella-flash-format" }
 # none, and report that absence as though it had looked. A listing that cannot see a whole probe
 # family is worse than no listing: it answers "nothing is attached" with authority.
 lamella-probe = { path = "../lamella-probe", features = ["usbbulk"] }
+# The ST-Link's ids, so the listing names an ST-Link among the vendor-class devices the CMSIS-DAP
+# filter passes over -- by its vendor and product id, without opening it.
+lamella-stlink = { path = "../lamella-stlink" }
+# `devices --json`.
+serde_json = "1"
 # The Python tier: the front end that bundles a program and the interpreter that runs one, so
 # `run` and `build` take a .py exactly as they take a .cs. The verbs are language-neutral from the
 # first commit because that is not retrofittable -- a verb meaning C# alone, given a Python mode
@@ -105,8 +110,7 @@ lamella-py-bytecode = { path = "../lamella-py-bytecode" }
 # `cargo build -p lamella-cli --features bake`.
 lamella-load = { path = "../lamella-load", optional = true }
 # The bake's refusal names each member a program reaches and the board could not run, so it reads
-# the violations `lamella-load`'s module reports, whose type is this crate's. Already in the tree
-# through `lamella-load` and `lamella-wire-host`, so this adds no crate, and no feature of its own.
+# the violations `lamella-load`'s module reports, whose type is this crate's.
 lamella-cil-runtime = { path = "../lamella-cil-runtime", optional = true, default-features = false }
 # The metadata token a violation carries, read back into the member it names.
 lamella-token = { path = "../lamella-token", optional = true }
@@ -116,11 +120,22 @@ lamella-token = { path = "../lamella-token", optional = true }
 # which rides the debug session.
 lamella-debug-backend = { path = "../lamella-debug-backend", optional = true }
 
+# Ctrl+C during a run of an image on a board, noticed through the console's control handler so the
+# run lets go of the board before it ends the way a program stopped by Ctrl+C ends; and the code
+# Windows gives such a program.
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }
+
+# The same on Linux and macOS, through SIGINT.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
+# The digest a sidecar records, for the image runs' tests to write sidecars that check out.
+lamella-pe = { path = "../lamella-pe" }
 # The deploy serve a board's firmware runs, driven in-process by the erase tests, so the exchange
-# is proven against the firmware's own code rather than against scripted answers. It is already a
-# dependency through lamella-wire-host, with the same features; under `bake` it carries
-# `baked-image`, which those tests need.
+# is proven against the firmware's own code rather than against scripted answers. Under `bake` it
+# carries `baked-image`, which those tests need.
 lamella-runner = { path = "../lamella-runner" }
 # The reference-assembly search as a TEST build makes it: it also looks at this source tree's test
 # corlib, first, so these tests bind that corlib wherever they run. Nothing built for use looks there.

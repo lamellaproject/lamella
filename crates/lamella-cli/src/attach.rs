@@ -1,12 +1,13 @@
 //! `lamella run --device`: run a program on a board with its output on your terminal.
 
+use crate::ending::Ended;
+use crate::own_lines::{OwnLines, say};
 use lamella_debug_backend::{DebugBackend, Stop};
 use lamella_wire::Capabilities;
 use lamella_wire_host::debug_backend::WireHostBackend;
 use lamella_wire_host::on_device::{self, RunEnd, Watch};
 use std::io::Write;
 use std::path::Path;
-use std::process::ExitCode;
 use std::time::Duration;
 
 /// The default serial baud for a Lamella Link carrier (USB-CDC ignores it; a real UART wants it).
@@ -17,41 +18,45 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 
 
 /// Compile `path`, deploy it to the firmware at `target`, and run it there, streaming its output.
-pub fn run_on_target(path: &Path, target: &str) -> ExitCode {
+pub fn run_on_target(path: &Path, target: &str) -> Ended {
     let board = match crate::project::BoardCheck::for_file("run", path) {
         Ok(board) => board,
         Err(error) => {
             eprintln!("{error}");
-            return ExitCode::FAILURE;
+            return Ended::Failed;
         }
     };
     if let Err(refusal) = crate::bake::refuse_uncompilable(path, cannot_run_on_a_target) {
         eprintln!("{refusal}");
-        return ExitCode::FAILURE;
+        return Ended::Failed;
     }
 
     let Some((mut transport, session)) =
         crate::deploy::connect("run", target, on_device::run_caps(), board.as_ref())
     else {
-        return ExitCode::FAILURE;
+        return Ended::Failed;
     };
     let answered = lamella_wire_host::boards::board_answering(session.identity.product_model);
     let image = match crate::bake::image_for_firmware(path, "run", cannot_run_on_a_target, answered.as_deref()) {
         Ok(image) => image,
         Err(error) => {
             eprintln!("{error}");
-            return ExitCode::FAILURE;
+            return Ended::Failed;
         }
     };
-    println!("built {} B from {}", image.len(), path.display());
+    let mut err = std::io::stderr();
+    say(&mut err, &format!("built {} B from {}", image.len(), path.display()));
     if !session.caps.has(Capabilities::EXEC_NO_RESET) {
         drop(transport);
         let board = on_device::the_board(lamella_wire_host::board_name(session.identity.product_model));
-        println!(
-            "{}'s firmware runs a program over this connection only under the debugger, which steps \
-             ONE thread:\na program that starts a thread or waits on a socket stops there. Firmware \
-             built from this\nrelease runs it under the board's scheduler.\n",
-            on_device::capitalized(&board)
+        say(
+            &mut err,
+            &format!(
+                "{}'s firmware runs a program over this connection only under the debugger, which \
+                 steps ONE thread:\na program that starts a thread or waits on a socket stops there. \
+                 Firmware built from this\nrelease runs it under the board's scheduler.",
+                on_device::capitalized(&board)
+            ),
         );
         return run_under_the_debugger(image, target);
     }
@@ -60,68 +65,64 @@ pub fn run_on_target(path: &Path, target: &str) -> ExitCode {
         &session,
         target,
         &image,
+        &mut OwnLines::new(std::io::stderr()),
         &mut std::io::stdout(),
         &mut std::io::stderr(),
         Watch::to_the_end(),
     );
     match ran {
-        Ok(end) => report_end(&end, target, &mut std::io::stdout(), &mut std::io::stderr()),
+        Ok(end) => report_end(&end, target, &mut err),
         Err(refusal) => {
-            eprintln!("lamella run: {refusal}");
-            ExitCode::FAILURE
+            say(&mut err, &refusal);
+            Ended::Failed
         }
     }
 }
 
-/// The line a run's end gets, and the exit code it gives this tool.
-///
-/// The program's exit code is REPORTED rather than forwarded: a nonzero code would be
-/// indistinguishable from the tool failing.
-fn report_end(end: &RunEnd, target: &str, out: &mut dyn Write, err: &mut dyn Write) -> ExitCode {
-    let said = end.describe(target);
+/// The line a run's end gets, on standard error, and how the run ends: with the program's own exit
+/// code when it returned one, and with 1 for every other end.
+fn report_end(end: &RunEnd, target: &str, err: &mut dyn Write) -> Ended {
+    say(err, &end.describe(target));
     match end {
-        RunEnd::Done(code) => {
-            let _ = writeln!(out, "\n{said}");
-            if *code == 0 { ExitCode::SUCCESS } else { ExitCode::FAILURE }
-        }
-        RunEnd::Dropped(_) => {
-            let _ = writeln!(err, "\nlamella run: {said}");
-            ExitCode::FAILURE
-        }
-        _ => {
-            let _ = writeln!(err, "\n{said}");
-            ExitCode::FAILURE
-        }
+        RunEnd::Done(code) => Ended::Program(*code),
+        RunEnd::Trapped => Ended::Uncaught,
+        _ => Ended::Failed,
     }
 }
 
 /// Run `image` at `target` under the debugger, for a board whose firmware cannot start a stored
 /// program without a reset: deployed, started halted, then resumed and watched.
-fn run_under_the_debugger(image: Vec<u8>, target: &str) -> ExitCode {
+fn run_under_the_debugger(image: Vec<u8>, target: &str) -> Ended {
+    let mut err = std::io::stderr();
     let mut backend = match WireHostBackend::open_target(target, BAUD, image, TIMEOUT) {
         Ok(backend) => backend,
         Err(error) => {
-            eprintln!("lamella run: cannot open {target}: {error:?}");
-            eprintln!(
-                "\nthis build can open: {}.\n\
-                 `lamella devices` lists what is attached and what to write here.",
-                lamella_wire_host::available_carriers().join(", ")
+            say(
+                &mut err,
+                &format!(
+                    "cannot open {target}: {error:?}\n\nthis build can open: {}.\n`lamella devices` \
+                     lists what is attached and what to write here.",
+                    lamella_wire_host::available_carriers().join(", ")
+                ),
             );
-            return ExitCode::FAILURE;
+            return Ended::Failed;
         }
     };
     if let Err(reason) = backend.launch() {
-        eprintln!(
-            "lamella run: {target} would not take the program: {reason}.\n\n\
-             This board's firmware runs a program over this connection only under the debugger, so \
-             it has to\noffer the debug capabilities -- stepping and breakpoints. A board whose \
-             firmware does not can\nstill take `lamella deploy`, which needs neither."
+        say(
+            &mut err,
+            &format!(
+                "{target} would not take the program: {reason}.\n\nThis board's firmware runs a program \
+                 over this connection only under the debugger, so it has to\noffer the debug \
+                 capabilities -- stepping and breakpoints. A board whose firmware does not can\nstill \
+                 take `lamella deploy`, which needs neither."
+            ),
         );
-        return ExitCode::FAILURE;
+        return Ended::Failed;
     }
 
-    println!("running on {target}; output follows.\n");
-    stream(&mut backend)
+    say(&mut err, &format!("running on {target}; output follows."));
+    stream(&mut backend, &mut err)
 }
 
 /// `run --device`'s wording for a source it cannot compile.
@@ -152,7 +153,7 @@ fn cannot_run_on_a_target(path: &Path, what: &crate::deploy::Uncompilable) -> St
 /// **EVERY STOP DRAINS THE OUTPUT BEFORE IT IS ACTED ON.** A program that faults has usually
 /// printed something explaining itself, and printing the fault first would put the explanation
 /// after the complaint.
-fn stream(backend: &mut WireHostBackend) -> ExitCode {
+fn stream(backend: &mut WireHostBackend, err: &mut dyn Write) -> Ended {
     show(backend);
     let mut stop = backend.resume();
     loop {
@@ -161,24 +162,21 @@ fn stream(backend: &mut WireHostBackend) -> ExitCode {
             Stop::Running => stop = backend.poll(),
             Stop::Done => {
                 let code = backend.exit_code();
-                println!("\nthe program ended, exit code {code}.");
-                return if code == 0 {
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::FAILURE
-                };
+                say(err, &format!("the program ended, exit code {code}."));
+                return Ended::Program(code);
             }
             Stop::Fault(why) => {
-                eprintln!("\nthe program stopped: {why}");
-                return ExitCode::FAILURE;
+                say(err, &format!("the program stopped: {why}"));
+                return Ended::Uncaught;
             }
             Stop::Breakpoint | Stop::Step => {
-                eprintln!(
-                    "\nthe target halted, which `run` has no way to continue from -- it sets no \
+                say(
+                    err,
+                    "the target halted, which `run` has no way to continue from -- it sets no \
                      breakpoints.\nA debugger session (the editor, over `lamella-dap`) is the tool \
-                     that can."
+                     that can.",
                 );
-                return ExitCode::FAILURE;
+                return Ended::Failed;
             }
         }
     }
@@ -199,10 +197,10 @@ fn show(backend: &mut WireHostBackend) {
 /// next command that connects takes the board back.
 #[must_use]
 pub fn forever_warning() -> String {
-    "(the program is deployed to the board and stays there: the board runs it at every reset until \
-     another\n is deployed. A program that loops forever runs until you stop this tool, and stopping \
-     it may leave the\n program running; the next `lamella run` or `lamella deploy` takes the board \
-     back.)\n"
+    "the program is deployed to the board and stays there: the board runs it at every reset until \
+     another\nis deployed. A program that loops forever runs until you stop this tool, and stopping \
+     it may leave the\nprogram running; the next `lamella run` or `lamella deploy` takes the board \
+     back."
         .to_owned()
 }
 
@@ -215,7 +213,7 @@ mod tests {
     #[test]
     fn the_warning_names_both_the_cost_and_the_recovery() {
         let text = forever_warning();
-        assert!(text.contains("may leave the\n program running"), "the cost: {text}");
+        assert!(text.contains("may leave the\nprogram running"), "the cost: {text}");
         assert!(text.contains("takes the board back"), "the recovery: {text}");
         assert!(text.contains("runs it at every reset"), "and what stays on the board: {text}");
     }
@@ -234,26 +232,28 @@ mod tests {
         );
     }
 
-    /// **HOW A RUN ENDED IS SAID WHERE A TERMINAL SHOWS IT, AND ONLY A RETURN OF 0 IS SUCCESS.** The
-    /// program's exit code goes to standard output and is reported rather than forwarded; every other
-    /// end goes to standard error, and a lost connection is this command's failure, so it names the
-    /// command.
+    /// **HOW A RUN ENDED IS THIS TOOL'S LINE, ON STANDARD ERROR, AND THE PROGRAM'S CODE COMES
+    /// BACK.** A program's exit code is the run's, unchanged; a trap is 1; every other end is 1;
+    /// and every line of the end is marked as this tool's.
     #[test]
-    fn a_run_end_is_said_on_the_stream_a_terminal_reads_it_from() {
+    fn a_run_end_is_said_on_standard_error_as_this_tools() {
         let said = |end: RunEnd| {
-            let (mut out, mut err) = (Vec::new(), Vec::new());
-            let code = report_end(&end, "usb", &mut out, &mut err);
-            (format!("{code:?}"), String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap())
+            let mut err = Vec::new();
+            let ended = report_end(&end, "usb", &mut err);
+            (ended, String::from_utf8(err).unwrap())
         };
-        let (success, failure) = (format!("{:?}", ExitCode::SUCCESS), format!("{:?}", ExitCode::FAILURE));
-        assert_eq!(said(RunEnd::Done(0)), (success, "\nthe program ended, exit code 0.\n".to_owned(), String::new()));
-        assert_eq!(said(RunEnd::Done(3)).0, failure, "exit 3 is reported, and is not success");
-        let (code, out, err) = said(RunEnd::Trapped);
-        assert_eq!((code, out.as_str()), (failure, ""));
-        assert_eq!(err, "\nthe program stopped: it trapped, as reported above.\n");
-        let (_, _, err) = said(RunEnd::Dropped(lamella_wire::TransportError::Closed));
-        assert!(err.starts_with("\nlamella run: the connection to usb dropped while the program was running"), "{err}");
-        let (_, _, err) = said(RunEnd::NoLongerRunning);
-        assert!(err.starts_with("\nthe program is no longer running on the board"), "{err}");
+        assert_eq!(said(RunEnd::Done(0)), (Ended::Program(0), "lamella: the program ended, exit code 0.\n".to_owned()));
+        assert_eq!(said(RunEnd::Done(3)).0, Ended::Program(3), "exit 3 comes back as 3");
+        assert_eq!(
+            said(RunEnd::Trapped),
+            (Ended::Uncaught, "lamella: the program stopped: it trapped, as reported above.\n".to_owned())
+        );
+        let (ended, err) = said(RunEnd::Dropped(lamella_wire::TransportError::Closed));
+        assert_eq!(ended, Ended::Failed);
+        assert!(err.starts_with("lamella: the connection to usb dropped while the program was running"), "{err}");
+        let (ended, err) = said(RunEnd::NoLongerRunning);
+        assert_eq!(ended, Ended::Failed);
+        assert!(err.starts_with("lamella: the program is no longer running on the board"), "{err}");
+        assert!(err.lines().all(|line| line.starts_with("lamella:")), "{err}");
     }
 }

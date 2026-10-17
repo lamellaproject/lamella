@@ -346,22 +346,24 @@ impl RunEnd {
 /// this way the board answers on the carrier this route is already reading. The session must have
 /// [`Capabilities::EXEC_NO_RESET`] ([`run_caps`] offers it).
 ///
-/// What the store says, and the program's standard output, go to `out`; the program's standard
-/// error and debug channel go to `err`.
+/// What the store and the start say goes to `say`; the program's standard output goes to `out`,
+/// and its standard error and debug channel to `err`.
 ///
 /// # Errors
 /// The store's refusal ([`store_image`]), or a start the board did not make: each a sentence that
 /// names no command.
+#[allow(clippy::too_many_arguments)]
 pub fn run_scheduled(
     transport: &mut impl Transport,
     session: &Negotiated,
     target: &str,
     image: &[u8],
+    say: &mut dyn Write,
     out: &mut dyn Write,
     err: &mut dyn Write,
     watch: Watch,
 ) -> Result<RunEnd, String> {
-    store_image(transport, session, target, image, out)?;
+    store_image(transport, session, target, image, say)?;
     if let Err(failure) = start_execution(
         transport,
         RUN_SEQ,
@@ -373,8 +375,8 @@ pub fn run_scheduled(
             "the program is stored on {target}, and {failure}. It starts at the board's next reset."
         ));
     }
-    let _ = writeln!(out, "running on {target}; output follows.\n");
-    let _ = out.flush();
+    let _ = writeln!(say, "running on {target}; output follows.\n");
+    let _ = say.flush();
     Ok(follow(transport, RUN_SEQ, out, err, watch))
 }
 
@@ -801,11 +803,13 @@ mod tests {
             let session = hello(&mut board, run_caps());
             assert!(session.caps.has(Capabilities::EXEC_NO_RESET), "the firmware's serve starts without a reset");
 
-            let (mut out, mut err) = (Vec::new(), Vec::new());
-            let end = run_scheduled(&mut board, &session, "usb", &image, &mut out, &mut err, Watch::to_the_end());
-            let (out, err) = (String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap());
-            assert!(!board.reset, "the board did not reset to start it: {out}{err}");
-            assert!(out.contains("running on usb; output follows."), "{out}{err}");
+            let (mut said, mut out, mut err) = (Vec::new(), Vec::new(), Vec::new());
+            let end = run_scheduled(&mut board, &session, "usb", &image, &mut said, &mut out, &mut err, Watch::to_the_end());
+            let (said, out, err) =
+                (String::from_utf8(said).unwrap(), String::from_utf8(out).unwrap(), String::from_utf8(err).unwrap());
+            assert!(!board.reset, "the board did not reset to start it: {said}{out}{err}");
+            assert!(said.contains("running on usb; output follows."), "{said}{out}{err}");
+            assert!(!out.contains("running on") && !out.contains("deploy"), "the program's output alone: {out}");
             for line in ["main 0", "main 2", "worker 0", "worker 2", "joined, count 6"] {
                 assert!(out.contains(line), "{line}: {out}{err}");
             }

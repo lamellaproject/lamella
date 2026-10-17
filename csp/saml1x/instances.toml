@@ -1,6 +1,6 @@
-# The SAML1X instance map: every placed block copy, its base, and its per-instance ids.
-# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
-# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+# The SAML1X instance map: every placed block copy, its base, and its per-instance ids. Layout truth
+# lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
+# uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
 # ONE MAP FOR BOTH PARTS. Table 12-1 carries a SINGLE base-address column and the SAM L10 and SAM
 # L11 share every value below -- see parts.toml, which states the difference table that settles it.

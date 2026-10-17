@@ -2,7 +2,7 @@
 # layout: register offsets are instance-relative; nothing in this file names a board, a pin wiring
 # or a clock plan. The instances live in ../instances.toml, each with its compare channels, its
 # waveform outputs, its counter size and its generic clock's ceiling; which outputs a board wires
-# lives in bsp/<board>/board.toml.
+# lives in bsp/boards/<board>/board.toml.
 #
 # Every offset is read from the register summary 31.7 and every bit position from the register's
 # OWN description (31.8.1 to 31.8.22), by word coordinates on the page. PARTIAL: the registers the

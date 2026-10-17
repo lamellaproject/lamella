@@ -1,6 +1,6 @@
 # The ADC on the Microchip SAMD21 family -- the BLOCK layout: register offsets are
 # instance-relative; nothing in this file names a board, a pin wiring or a clock plan. The instance
-# lives in ../instances.toml; which AIN pads a board wires lives in bsp/<board>/board.toml.
+# lives in ../instances.toml; which AIN pads a board wires lives in bsp/boards/<board>/board.toml.
 #
 # Every offset, width and bit position is read from each register's OWN description (33.8.1 to
 # 33.8.20) and checked against the bit grid on the same page.

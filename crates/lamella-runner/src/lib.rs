@@ -24,7 +24,7 @@ pub mod carriers;
 
 use alloc::boxed::Box;
 use alloc::format;
-use alloc::string::{String, ToString};
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use lamella_cil_runtime::memory::SafeMemory;
@@ -639,34 +639,71 @@ pub fn run_program_with(
     program_bytes: &[u8],
     configure: &mut dyn FnMut(&mut Vm),
 ) -> RunResult {
+    let (mut result, fault) = run_program_reporting(corlib_bytes, program_bytes, configure);
+    match fault {
+        Some(Fault::NotStarted(reason)) => result.stdout = reason,
+        Some(Fault::Trapped(report)) => push_line(&mut result.stdout, &report),
+        None => {}
+    }
+    result
+}
+
+/// Why an in-process run of a program ended without the program finishing.
+enum Fault {
+    /// It never started: an assembly that did not parse, or did not load. The text is the reason.
+    NotStarted(String),
+    /// It trapped. The text is the report, `TRAP: ` and the trap's sentence.
+    Trapped(String),
+}
+
+impl Fault {
+    /// The runner's own words about the run, which belong on the error stream.
+    fn into_text(self) -> String {
+        match self {
+            Fault::NotStarted(text) | Fault::Trapped(text) => text,
+        }
+    }
+}
+
+/// [`run_program_with`] with the fault kept apart from the program's own output: the program's
+/// console and its exit code, and why the runner, rather than the program, ended the run.
+///
+/// **THE FAULT SAYS A RUN TRAPPED, AND THE EXIT CODE CANNOT**: a trapped run ends with 70, and so
+/// does a `Main` that returns 70.
+fn run_program_reporting(
+    corlib_bytes: &[u8],
+    program_bytes: &[u8],
+    configure: &mut dyn FnMut(&mut Vm),
+) -> (RunResult, Option<Fault>) {
+    let not_started =
+        |reason: String| (RunResult { exit: -1, stdout: String::new() }, Some(Fault::NotStarted(reason)));
     let corlib_bytes = lamella_load::resident_bytes(corlib_bytes);
     let program_bytes = lamella_load::resident_bytes(program_bytes);
     let corlib = match Assembly::read(corlib_bytes) {
         Ok(assembly) => assembly,
-        Err(error) => return failure(&format!("corlib does not parse: {error:?}")),
+        Err(error) => return not_started(format!("corlib does not parse: {error:?}")),
     };
     let program = match Assembly::read(program_bytes) {
         Ok(assembly) => assembly,
-        Err(error) => return failure(&format!("program does not parse: {error:?}")),
+        Err(error) => return not_started(format!("program does not parse: {error:?}")),
     };
     let loaded = match load_with_corlib(&corlib, &program) {
         Ok(loaded) => loaded,
-        Err(error) => return failure(&format!("load failed: {error}")),
+        Err(error) => return not_started(format!("load failed: {error}")),
     };
     let mut vm = Vm::default();
     configure_machine(&mut vm, configure);
     publish_wall_clock(&loaded.module, &mut vm);
     let outcome = run(&loaded.module, &mut vm, loaded.entry, Vec::new());
-    let mut stdout = String::from_utf16_lossy(vm.output());
-    let exit = match outcome {
-        Ok(Some(Value::Int32(code))) => code,
-        Ok(_) => 0,
-        Err(trap) => {
-            push_line(&mut stdout, &format!("TRAP: {trap}"));
-            TRAP_EXIT
-        }
-    };
-    RunResult { exit, stdout }
+    let stdout = String::from_utf16_lossy(vm.output());
+    match outcome {
+        Ok(Some(Value::Int32(code))) => (RunResult { exit: code, stdout }, None),
+        Ok(_) => (RunResult { exit: 0, stdout }, None),
+        Err(trap) => (
+            RunResult { exit: TRAP_EXIT, stdout },
+            Some(Fault::Trapped(format!("TRAP: {trap}"))),
+        ),
+    }
 }
 
 /// Append `line` to `output` as a line of its own: after a newline when the output so far stops
@@ -681,10 +718,6 @@ fn push_line(output: &mut String, line: &str) {
     }
     output.push_str(line);
     output.push('\n');
-}
-
-fn failure(reason: &str) -> RunResult {
-    RunResult { exit: -1, stdout: reason.to_string() }
 }
 
 /// Installs this crate's own [`Vm`] seams, then the embedder's, in that order.
@@ -3913,15 +3946,23 @@ pub fn serve_one_with(
             }
             transport.send(exec::EXEC_ACK, frame.seq, &[exec::ack::STARTED])?;
             #[cfg(feature = "baked-image")]
-            let result = if kind == load::LOAD_IMAGE {
-                run_image_with(artifact.to_vec(), configure)
+            let (result, fault) = if kind == load::LOAD_IMAGE {
+                let image: &'static [u8] = Box::leak(artifact.to_vec().into_boxed_slice());
+                run_image_reporting(image, None, configure, &mut |_vm| true)
             } else {
-                run_program_with(corlib_bytes, artifact, configure)
+                let (result, fault) = run_program_reporting(corlib_bytes, artifact, configure);
+                (result, fault.map(Fault::into_text))
             };
             #[cfg(not(feature = "baked-image"))]
-            let result = run_program_with(corlib_bytes, artifact, configure);
+            let (result, fault) = {
+                let (result, fault) = run_program_reporting(corlib_bytes, artifact, configure);
+                (result, fault.map(Fault::into_text))
+            };
             send_output(transport, debug::output::STDOUT, &result.stdout)?;
-            let why = if result.exit == 70 { debug::reason::TRAP } else { debug::reason::DONE };
+            if let Some(text) = &fault {
+                send_output(transport, debug::output::STDERR, text)?;
+            }
+            let why = if fault.is_some() { debug::reason::TRAP } else { debug::reason::DONE };
             send_stopped_result(transport, frame.seq, why, result.exit)?;
         }
         _ => return Ok(false),

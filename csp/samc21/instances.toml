@@ -1,6 +1,6 @@
-# The SAMC21 instance map: every placed block copy, its base, and its per-instance ids.
-# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
-# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+# The SAMC21 instance map: every placed block copy, its base, and its per-instance ids. Layout truth
+# lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
+# uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
 # THE RECORD IS NOT THE SAM D21 LINE'S, AND THE DIFFERENCE IS THE POINT. Those families carry
 # `apbc_bit` -- the APB gate is always APBC there, so the register is a constant and only the bit

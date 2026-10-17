@@ -1,6 +1,6 @@
-# SERCOM in I2C MASTER mode on the Microchip SAMD21 family -- the BLOCK layout: register offsets
-# are SERCOM-instance-relative; nothing in this file names an instance, a pin, a board, or a clock
-# plan. Instance bases/ids live in ../instances.toml; board wiring lives in bsp/<board>/board.toml.
+# SERCOM in I2C MASTER mode on the Microchip SAMD21 family -- the BLOCK layout: register offsets are
+# SERCOM-instance-relative; nothing in this file names an instance, a pin, a board, or a clock plan.
+# Instance bases/ids live in ../instances.toml; board wiring lives in bsp/boards/<board>/board.toml.
 #
 # Authored from the datasheet, NOT from the sibling sercom-usart.toml: the two modes
 # share a SERCOM and a CTRLA.MODE field position, and share nothing else worth assuming. Every

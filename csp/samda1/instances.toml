@@ -1,6 +1,6 @@
-# The SAMDA1 instance map: every placed block copy, its base, and its per-instance ids.
-# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
-# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+# The SAMDA1 instance map: every placed block copy, its base, and its per-instance ids. Layout truth
+# lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
+# uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
 # EVERY VALUE BELOW WAS READ OFF THE SAM DA1'S OWN TABLE 14-1, AND THE RESULT IS THAT THEY ALL
 # AGREE WITH THE SAM D21'S. That agreement is a FINDING rather than a shortcut taken, and saying

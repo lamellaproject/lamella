@@ -1,7 +1,7 @@
 # SERCOM in SPI mode on the Microchip SAMD21 family -- the BLOCK layout: register offsets are
 # SERCOM-instance-relative; nothing in this file names an instance, a pin, a board, or a clock
 # plan. Instance bases/ids live in ../instances.toml; board wiring lives in
-# bsp/<board>/board.toml.
+# bsp/boards/<board>/board.toml.
 #
 # The SAME SERCOM peripheral the usart block describes, in a DIFFERENT mode -- so the two files
 # share instances and a clock path but NOT a register map, and neither may be read for the other.

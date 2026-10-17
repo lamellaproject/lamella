@@ -277,7 +277,7 @@ checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "lamella-aead-host"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "aes-siv",
  "lamella-cil-runtime",
@@ -285,11 +285,11 @@ dependencies = [
 
 [[package]]
 name = "lamella-alloc"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-aot"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-asm-arm32",
  "lamella-asm-riscv32",
@@ -313,19 +313,19 @@ dependencies = [
 
 [[package]]
 name = "lamella-asm-arm32"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-asm-riscv32"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-asm-wasm"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-assemble"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-binder",
  "lamella-cil",
@@ -337,7 +337,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-binder"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-metadata",
  "lamella-syntax",
@@ -346,39 +346,39 @@ dependencies = [
 
 [[package]]
 name = "lamella-board-buses"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-board-support"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-psram-qspi",
 ]
 
 [[package]]
 name = "lamella-bsp-gen"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-wire",
 ]
 
 [[package]]
 name = "lamella-catalog"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-bsp-gen",
 ]
 
 [[package]]
 name = "lamella-cil"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-token",
 ]
 
 [[package]]
 name = "lamella-cil-runtime"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-board-buses",
  "lamella-cil",
@@ -394,7 +394,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-aot",
  "lamella-assemble",
@@ -411,28 +411,33 @@ dependencies = [
  "lamella-js-frontend",
  "lamella-load",
  "lamella-metadata",
+ "lamella-pe",
  "lamella-probe",
  "lamella-probe-core",
  "lamella-py-bytecode",
  "lamella-py-frontend",
  "lamella-py-runtime",
  "lamella-runner",
+ "lamella-stlink",
  "lamella-syntax",
  "lamella-token",
  "lamella-wire",
  "lamella-wire-host",
+ "libc",
+ "serde_json",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "lamella-clock-host"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "lamella-cmsis-dap"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-probe",
  "lamella-probe-core",
@@ -442,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-cmsis-dap-nrf"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-aot",
  "lamella-asm-arm32",
@@ -458,7 +463,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-cmsis-dap-rp2040"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-cmsis-dap",
  "lamella-probe",
@@ -468,7 +473,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-cmsis-dap-rp2350"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-cmsis-dap",
  "lamella-probe",
@@ -478,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-cmsis-dap-sam"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-cmsis-dap",
  "lamella-probe",
@@ -488,7 +493,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-cmsis-dap-stm32"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-cmsis-dap",
  "lamella-probe",
@@ -500,7 +505,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-dap"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-assemble",
  "lamella-cil",
@@ -517,7 +522,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-dap-probe"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-debug-backend",
  "lamella-probe",
@@ -527,7 +532,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-dap-wire"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-dap",
  "lamella-wire-host",
@@ -535,7 +540,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-debug-agent"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-mmio",
  "lamella-wire",
@@ -543,11 +548,11 @@ dependencies = [
 
 [[package]]
 name = "lamella-debug-backend"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-debug-device"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-aot",
  "lamella-cmsis-dap",
@@ -560,7 +565,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-debug-server"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-aot",
  "lamella-assemble",
@@ -580,26 +585,26 @@ dependencies = [
 
 [[package]]
 name = "lamella-decimal"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-dwarf"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-elf",
 ]
 
 [[package]]
 name = "lamella-elf"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-esp-serial"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-esp-serial-host"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-esp-serial",
  "libc",
@@ -608,21 +613,21 @@ dependencies = [
 
 [[package]]
 name = "lamella-flash-backend"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-probe-core",
 ]
 
 [[package]]
 name = "lamella-flash-format"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-elf",
 ]
 
 [[package]]
 name = "lamella-flash-routes"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-aot",
  "lamella-bsp-gen",
@@ -646,35 +651,35 @@ dependencies = [
 
 [[package]]
 name = "lamella-fs-fat"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-cil-runtime",
 ]
 
 [[package]]
 name = "lamella-fs-mem"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-cil-runtime",
 ]
 
 [[package]]
 name = "lamella-fw-store"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-wire",
 ]
 
 [[package]]
 name = "lamella-gc"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-aot",
 ]
 
 [[package]]
 name = "lamella-generics"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-cil",
  "lamella-ir",
@@ -684,19 +689,19 @@ dependencies = [
 
 [[package]]
 name = "lamella-heap"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-ir"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-js-bytecode"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-js-frontend"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-js-bytecode",
  "lamella-regexp",
@@ -706,7 +711,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-linkd"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-wire",
  "lamella-wire-host",
@@ -714,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-linker"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-elf",
  "lamella-ir",
@@ -722,7 +727,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-load"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-cil",
  "lamella-cil-runtime",
@@ -735,7 +740,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-mcp"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-assemble",
  "lamella-bsp-gen",
@@ -755,14 +760,14 @@ dependencies = [
 
 [[package]]
 name = "lamella-mdns"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-wire",
 ]
 
 [[package]]
 name = "lamella-metadata"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-cil",
  "lamella-token",
@@ -770,15 +775,15 @@ dependencies = [
 
 [[package]]
 name = "lamella-mmio"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-net-core"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-net-smoltcp"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-net-core",
  "smoltcp",
@@ -786,7 +791,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-pe"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-metadata",
  "lamella-token",
@@ -794,11 +799,11 @@ dependencies = [
 
 [[package]]
 name = "lamella-pin-events"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-probe"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-cmsis-dap",
  "lamella-probe-core",
@@ -808,7 +813,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-probe-core"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-psram-qspi"
@@ -816,14 +821,14 @@ version = "0.1.0"
 
 [[package]]
 name = "lamella-py-bytecode"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-wtf8",
 ]
 
 [[package]]
 name = "lamella-py-frontend"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-aot",
  "lamella-asm-arm32",
@@ -837,7 +842,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-py-runtime"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-gc",
  "lamella-net-core",
@@ -851,18 +856,18 @@ dependencies = [
 
 [[package]]
 name = "lamella-reactor"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-regexp"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-unicode",
 ]
 
 [[package]]
 name = "lamella-repl"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-assemble",
  "lamella-cil-runtime",
@@ -874,7 +879,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-runner"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-assemble",
  "lamella-bsp-gen",
@@ -889,7 +894,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-runtime-support-debug"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-debug-agent",
  "lamella-fw-store",
@@ -898,7 +903,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-runtime-support-net"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-cil-runtime",
  "lamella-heap",
@@ -909,18 +914,18 @@ dependencies = [
 
 [[package]]
 name = "lamella-sd-core"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-sd-sdmmc"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-sd-core",
 ]
 
 [[package]]
 name = "lamella-sd-spi"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-cil-runtime",
  "lamella-sd-core",
@@ -928,7 +933,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-sdmmc-stm32"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-mmio",
  "lamella-sd-core",
@@ -937,18 +942,18 @@ dependencies = [
 
 [[package]]
 name = "lamella-serial-mem"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-cil-runtime",
 ]
 
 [[package]]
 name = "lamella-serve-core"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-serve-rp2350"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "critical-section",
  "lamella-board-support",
@@ -976,11 +981,11 @@ dependencies = [
 
 [[package]]
 name = "lamella-softmath"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-stlink"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-cmsis-dap-stm32",
  "lamella-probe-core",
@@ -989,7 +994,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-storage"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-cil-runtime",
  "lamella-fs-fat",
@@ -998,14 +1003,14 @@ dependencies = [
 
 [[package]]
 name = "lamella-syntax"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-unicode",
 ]
 
 [[package]]
 name = "lamella-tls-mbedtls"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "cc",
  "lamella-cil-runtime",
@@ -1013,23 +1018,23 @@ dependencies = [
 
 [[package]]
 name = "lamella-tls-roots"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-tls-roots-gen"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-token"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-unicode"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-usbbulk"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
@@ -1037,7 +1042,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-usbhid"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "libc",
  "windows-sys 0.59.0",
@@ -1045,7 +1050,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-wasm"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-aot",
  "lamella-assemble",
@@ -1069,7 +1074,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-wasm-bridge"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-asm-wasm",
  "lamella-cil-runtime",
@@ -1080,7 +1085,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-wasm-interp"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-asm-wasm",
  "libm",
@@ -1088,7 +1093,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-wch-link"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-probe",
  "lamella-usbbulk",
@@ -1100,7 +1105,7 @@ version = "0.1.0"
 
 [[package]]
 name = "lamella-wifi-cyw4343x-smoltcp"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-net-core",
  "lamella-wifi-cyw4343x",
@@ -1109,14 +1114,14 @@ dependencies = [
 
 [[package]]
 name = "lamella-wifi-images"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-pe",
 ]
 
 [[package]]
 name = "lamella-winc1500"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-cmsis-dap",
  "lamella-cmsis-dap-sam",
@@ -1127,11 +1132,11 @@ dependencies = [
 
 [[package]]
 name = "lamella-wire"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lamella-wire-host"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-assemble",
  "lamella-catalog",
@@ -1153,7 +1158,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-wire-net"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-net-core",
  "lamella-wire",
@@ -1161,11 +1166,11 @@ dependencies = [
 
 [[package]]
 name = "lamella-wtf8"
-version = "0.0.0"
+version = "0.1.0"
 
 [[package]]
 name = "lcsc"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "lamella-assemble",
  "lamella-metadata",

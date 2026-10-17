@@ -27,6 +27,14 @@ pub struct Manifest {
     /// is the payload-agnostic principle this verb is built on: a board does not care what wrote
     /// its bytes, so neither may the code that writes them.
     pub producer: Option<String>,
+    /// The file name of the linked ELF the build wrote beside the artifact, when it names one: the
+    /// file whose symbols give a `bin` artifact's addresses.
+    pub elf: Option<String>,
+    /// The channel the program's console stream was built to use: `memory`, `probe`, `uart0`,
+    /// `uart1` or `off`.
+    pub console_channel: Option<String>,
+    /// The channel the log stream was built to use, in the same words.
+    pub log_channel: Option<String>,
 }
 
 /// The schema version this reads.
@@ -139,8 +147,16 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
         base,
         sha256,
         bytes,
-        producer: object.get("producer").and_then(serde_json::Value::as_str).map(str::to_owned),
+        producer: optional(object, "producer"),
+        elf: optional(object, "elf"),
+        console_channel: optional(object, "console_channel"),
+        log_channel: optional(object, "log_channel"),
     })
+}
+
+/// An optional string field.
+fn optional(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+    object.get(key).and_then(serde_json::Value::as_str).map(str::to_owned)
 }
 
 /// A required string field.
@@ -393,7 +409,24 @@ mod tests {
         assert_eq!(manifest.board, "mps2-an500");
         assert_eq!(manifest.base, Some(0), "the padded spelling is the same address");
         assert_eq!(manifest.producer.as_deref(), Some("ilc+rhu-link"));
+        assert_eq!(manifest.elf.as_deref(), Some("app.elf"));
+        assert_eq!((manifest.console_channel.as_deref(), manifest.log_channel.as_deref()), (None, None));
         assert!(check_identity(&manifest, bytes, Some("bin")).is_ok());
+    }
+
+    /// The two channel words the image was built with, under the keys its producer names them by,
+    /// and a record without them still reads: the words are read where a reader needs them.
+    #[test]
+    fn the_channel_words_read_when_present_and_are_not_required() {
+        let text = record_for(b"image", "elf", "null").replace(
+            "\"schema\":1",
+            "\"schema\":1,\"console_channel\":\"memory\",\"log_channel\":\"off\"",
+        );
+        let manifest = parse(&text).expect("a record with its channels");
+        assert_eq!(manifest.console_channel.as_deref(), Some("memory"));
+        assert_eq!(manifest.log_channel.as_deref(), Some("off"));
+        let without = parse(&record_for(b"image", "elf", "null")).expect("a record without them");
+        assert_eq!((without.console_channel, without.log_channel, without.elf), (None, None, None));
     }
 
     #[test]

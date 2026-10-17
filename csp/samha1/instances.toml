@@ -1,6 +1,6 @@
-# The SAMHA1 instance map: every placed block copy, its base, and its per-instance ids.
-# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
-# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+# The SAMHA1 instance map: every placed block copy, its base, and its per-instance ids. Layout truth
+# lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
+# uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
 # ONE MAP SERVES BOTH SERIES, AND THAT IS A MEASUREMENT RATHER THAN AN ASSUMPTION. The E and G
 # are documented in two separate datasheets, and their Table 14-1 peripheral maps were compared

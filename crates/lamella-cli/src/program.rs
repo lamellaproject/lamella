@@ -1,10 +1,12 @@
 //! `lamella run` and `lamella build`: a program, in whichever language it is written.
 
 use crate::args::{self, Spec};
+use crate::ending::Ended;
 use lamella_catalog::{self as catalog, BOARD_PYTHON};
 use lamella_bsp_gen::fit::fit;
+use lamella_wire_host::debug::reason;
 use lamella_wire_host::engine::{
-    LcscCompiler, LoopbackLink, Outcome, Repl, ReplError, ReplLink, install_host_clock,
+    CompileFailure, LcscCompiler, LoopbackLink, ReplCompiler, ReplError, install_host_clock,
 };
 use lamella_js_frontend::interpreter::{Completion, Interpreter};
 use lamella_js_frontend::value::JsValue;
@@ -57,7 +59,7 @@ which is not what `run` means to a reader.
     (neither)         run it on this machine
     --device <d>      run it ON the board at <d>, with its output here";
 
-const RUN_USAGE: &str = "\
+pub(crate) const RUN_USAGE: &str = "\
 usage: lamella run <file.cs|file.csproj|file.py|file.js> [--device <d>]
 
 Compiles and runs the program, and STAYS until it ends -- its output appears here as it is
@@ -82,26 +84,35 @@ among them, and the ones a project's <Reference> elements name -- keeping only w
 A Python program and a JavaScript program run on this machine.
 
 Two questions this verb does not answer: whether a program FITS a board is `build --board <id>`,
-and putting it on a board while returning you to your shell is `deploy`.";
+and putting it on a board while returning you to your shell is `deploy`.
 
-/// `lamella run <file> [--board <id>]`: compile and run on this machine.
-pub fn run_command(args: &[String]) -> ExitCode {
-    let spec =
-        Spec { verb: "run", usage: Some(RUN_USAGE), values: &["--board", "--device"], flags: &[] };
+The run ends with the program's own exit code. When this tool cannot run it, or an exception
+nothing caught stops it, the run ends with 1 and says why on standard error.";
+
+/// `lamella run <file> [--device <d>]`: compile and run on this machine, or on a board.
+///
+/// It ends as the program ended: [`Ended::finish`] turns the answer into this process's exit.
+pub fn run_command(args: &[String]) -> Ended {
+    let separator = args.iter().position(|argument| argument == "--").unwrap_or(args.len());
+    if args[..separator].iter().any(|argument| argument == crate::image_run::MANIFEST) {
+        return crate::image_run::run_manifest(&args[..separator], args.get(separator + 1..).unwrap_or_default());
+    }
+    let spec = Spec { verb: "run", usage: Some(RUN_USAGE), values: &["--board", "--device"], flags: &[] };
     let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
-        Err(halt) => return halt.code(),
+        Err(args::Halt::Help) => return Ended::Program(0),
+        Err(args::Halt::Bad) => return Ended::Failed,
     };
     let path = match parsed.only_positional("run", "source file") {
         Ok(path) => Path::new(path).to_path_buf(),
         Err(error) => {
             eprintln!("{error}\n\n{}", RUN_USAGE.lines().next().unwrap_or_default());
-            return ExitCode::FAILURE;
+            return Ended::Failed;
         }
     };
     if parsed.value("--board").is_some() {
         eprintln!("lamella run: {BOTH_MODES}");
-        return ExitCode::FAILURE;
+        return Ended::Failed;
     }
     if let Some(target) = parsed.value("--device") {
         return run_on_target(&path, target);
@@ -114,7 +125,7 @@ pub fn run_command(args: &[String]) -> ExitCode {
         Ok(read) => read,
         Err(error) => {
             eprintln!("lamella run: {error}");
-            return ExitCode::FAILURE;
+            return Ended::Failed;
         }
     };
     match language {
@@ -135,13 +146,16 @@ pub fn run_command(args: &[String]) -> ExitCode {
 ///
 /// **`print` and not `console.log`**: `console` is not in the standard either, and inventing that
 /// namespace on the realm would put a browser's shape where the standard has none.
-fn run_javascript(path: &Path, source: &str) -> ExitCode {
+///
+/// A program that ran to its end is 0, and one a throw nothing caught stopped is 1, as `node` ends
+/// them: the language gives a program no exit code of its own here.
+fn run_javascript(path: &Path, source: &str) -> Ended {
     let parsed = lamella_js_frontend::parse_script(source);
     if parsed.has_errors() {
         for diagnostic in parsed.diagnostics.iter().filter(|d| d.is_error()) {
             eprintln!("{}: {}", path.display(), diagnostic.message);
         }
-        return ExitCode::FAILURE;
+        return Ended::Failed;
     }
 
     let mut interpreter = javascript_realm();
@@ -157,12 +171,12 @@ fn run_javascript(path: &Path, source: &str) -> ExitCode {
     match interpreter.run_source(source) {
         Ok(Completion::Throw(value)) => {
             eprintln!("{}: uncaught {}", path.display(), interpreter.describe(&value));
-            ExitCode::FAILURE
+            Ended::Uncaught
         }
-        Ok(_) => ExitCode::SUCCESS,
+        Ok(_) => Ended::Program(0),
         Err(error) => {
             eprintln!("{}: {error}", path.display());
-            ExitCode::FAILURE
+            Ended::Failed
         }
     }
 }
@@ -216,20 +230,20 @@ fn seed() -> u64 {
 
 /// Run on a board in a build that can, and name the missing feature in one that cannot.
 #[cfg(feature = "bake")]
-fn run_on_target(path: &Path, target: &str) -> ExitCode {
-    println!("{}", crate::attach::forever_warning());
+fn run_on_target(path: &Path, target: &str) -> Ended {
+    crate::own_lines::say(&mut std::io::stderr(), &crate::attach::forever_warning());
     crate::attach::run_on_target(path, target)
 }
 
 #[cfg(not(feature = "bake"))]
-fn run_on_target(_path: &Path, _target: &str) -> ExitCode {
+fn run_on_target(_path: &Path, _target: &str) -> Ended {
     eprintln!(
         "lamella run: this build cannot run a program on a board.\n\n\
          Doing so bakes it into an image first, which needs the `bake` feature:\n\
          \x20   cargo build -p lamella-cli --features bake\n\n\
          Without a --device this build runs the program on THIS machine, which needs nothing."
     );
-    ExitCode::FAILURE
+    Ended::Failed
 }
 
 /// Compile a C# program and run it on the host interpreter.
@@ -240,23 +254,74 @@ fn run_on_target(_path: &Path, _target: &str) -> ExitCode {
 /// hardware belongs on `deploy`, which takes a source file and `--unsafe`, and the diagnostic below
 /// says so where it comes up. **Not `flash`**, which takes an image rather than a source file and
 /// declares no `--unsafe` at all.
-fn run_csharp(path: &Path, source: &str) -> ExitCode {
+fn run_csharp(path: &Path, source: &str) -> Ended {
     let compiler = match LcscCompiler::discover() {
         Ok(compiler) => compiler.for_source_file(&path.display().to_string()),
         Err(error) => {
             eprintln!("lamella run: {error}");
-            return ExitCode::FAILURE;
+            return Ended::Failed;
         }
     };
     let Some(corlib) = compiler.references().first().cloned() else {
         eprintln!("lamella run: the compiler found no reference assemblies");
-        return ExitCode::FAILURE;
+        return Ended::Failed;
     };
-    let mut repl = Repl::new(
-        Box::new(compiler),
-        Box::new(LoopbackLink::new(corlib, install_host_clock)),
-    );
-    report(repl.eval_program(source))
+    let assembly = match compiler.compile(source) {
+        Ok(assembly) => assembly,
+        Err(CompileFailure::Diagnostics(text)) => return refuse_diagnostics(&text),
+        Err(CompileFailure::Toolchain(detail)) => {
+            eprintln!("lamella run: {}", ReplError::Compile(detail));
+            return Ended::Failed;
+        }
+    };
+    report(run_here(corlib, &assembly))
+}
+
+/// A program's run on this machine: what it wrote to each stream, and how it ended.
+#[derive(Debug)]
+struct HostRun {
+    /// What the program wrote to its standard output.
+    stdout: String,
+    /// What it wrote to its standard error, with the runner's report of how it failed, if it
+    /// did, at the end.
+    stderr: String,
+    /// How it ended.
+    ended: Ended,
+}
+
+/// Runs a compiled program on this machine against `corlib`, the one it was bound against.
+///
+/// **THE STOP SAYS HOW IT ENDED, AND THE CODE ALONE CANNOT.** An exception nothing caught ends a
+/// run with the code a program could return itself, so the code is the program's only when the
+/// run completed; a trap is 1, whatever its code.
+///
+/// # Errors
+/// A link that failed, which is this tool's failure rather than the program's.
+fn run_here(corlib: Vec<u8>, assembly: &[u8]) -> Result<HostRun, ReplError> {
+    let mut link = LoopbackLink::new(corlib, install_host_clock);
+    let run = link.run_collected(1, assembly).map_err(ReplError::Transport)?;
+    let ended = match (run.stop_reason(), run.exit_value()) {
+        (Some(reason::DONE), Some(code)) => Ended::Program(code),
+        (Some(reason::TRAP), _) => Ended::Uncaught,
+        _ => Ended::Failed,
+    };
+    Ok(HostRun { stdout: run.stdout, stderr: run.stderr, ended })
+}
+
+/// The compiler's diagnostics, and a word on the one a reader of this verb meets most.
+fn refuse_diagnostics(text: &str) -> Ended {
+    eprintln!("{text}");
+    if text.contains("CS0227") {
+        eprintln!(
+            "\nunsafe code is off by default, as it is in csc without /unsafe -- and this \
+             verb has no switch\nfor it, because a raw pointer at a device register means \
+             nothing on this machine. A program that\ndrives hardware goes on a board:\n\
+             \x20   lamella deploy <file> --board <id> --unsafe\n\n\
+             Not `flash`: that verb writes an image somebody already built, so it\n\
+             takes no --unsafe -- by the time it runs, the compiling is over."
+        );
+    }
+    Ended::Failed
 }
 
 /// Compile a C# project and run it on the host interpreter, as a single source file is run.
@@ -268,12 +333,12 @@ fn run_csharp(path: &Path, source: &str) -> ExitCode {
 /// **A PROJECT THAT NAMES LIBRARIES IS REFUSED, NOT RUN.** This machine runs a program against the
 /// class library alone, so a name that resolves into a library of the project's own would load with
 /// nothing to resolve to -- a failure that would point at the program rather than at this verb.
-fn run_project(path: &Path) -> ExitCode {
-    match project_outcome(path) {
-        Ok(outcome) => report(outcome),
+fn run_project(path: &Path) -> Ended {
+    match project_run(path) {
+        Ok(run) => report(run),
         Err(refusal) => {
             eprintln!("{refusal}");
-            ExitCode::FAILURE
+            Ended::Failed
         }
     }
 }
@@ -284,7 +349,7 @@ fn run_project(path: &Path) -> ExitCode {
 /// # Errors
 /// A project that cannot be read or compiled, a class library, or a project naming libraries of its
 /// own, each with the sentence that says so.
-fn project_outcome(path: &Path) -> Result<Result<Outcome, ReplError>, String> {
+fn project_run(path: &Path) -> Result<Result<HostRun, ReplError>, String> {
     let project = program_project(
         path,
         "run",
@@ -292,15 +357,7 @@ fn project_outcome(path: &Path) -> Result<Result<Outcome, ReplError>, String> {
         &format!("lamella build {} --board <id> --format <f>", path.display()),
     )?;
     let (assembly, corlib) = compile_project_assembly(&project, &[], None, "run")?;
-    let mut link = LoopbackLink::new(corlib, install_host_clock);
-    Ok(link
-        .run(1, &assembly)
-        .map_err(ReplError::Transport)
-        .map(|ran| Outcome::Ran {
-            output: ran.stdout,
-            exit: ran.exit,
-            persisted: false,
-        }))
+    Ok(run_here(corlib, &assembly))
 }
 
 /// The C# project at `path`, read as a program, or why it is not one: a class library has no entry
@@ -356,70 +413,124 @@ pub(crate) fn program_project(
     Ok(project)
 }
 
-/// What `run` shows for a C# program, however it was compiled: its output, and -- when it did not
-/// exit 0 -- the code it exited with and what that code can mean.
+/// What `run` shows for a C# program, however it was compiled, and how it ends.
 ///
 /// **ONE REPORTER FOR BOTH ROUTES**, so a source file and a project that run the same program are
 /// reported the same way rather than by two copies that drift.
-fn report(outcome: Result<Outcome, ReplError>) -> ExitCode {
-    match outcome {
-        Ok(Outcome::Ran { output, exit, .. }) => {
-            print_run(&output, exit, &mut std::io::stdout(), &mut std::io::stderr())
-        }
-        Ok(Outcome::CompileError(text)) => {
-            eprintln!("{text}");
-            if text.contains("CS0227") {
-                eprintln!(
-                    "\nunsafe code is off by default, as it is in csc without /unsafe -- and this \
-                     verb has no switch\nfor it, because a raw pointer at a device register means \
-                     nothing on this machine. A program that\ndrives hardware goes on a board:\n\
-                     \x20   lamella deploy <file> --board <id> --unsafe\n\n\
-                     Not `flash`: that verb writes an image somebody already built, so it\n\
-                     takes no --unsafe -- by the time it runs, the compiling is over."
-                );
-            }
-            ExitCode::FAILURE
-        }
-        Ok(Outcome::Empty) => ExitCode::SUCCESS,
+fn report(run: Result<HostRun, ReplError>) -> Ended {
+    match run {
+        Ok(run) => print_host_run(&run, &mut std::io::stdout(), &mut std::io::stderr()),
         Err(error) => {
             eprintln!("lamella run: {error}");
-            ExitCode::FAILURE
+            Ended::Failed
         }
     }
 }
 
-/// Print a run's output to `out`, and -- when it did not exit 0 -- the code it exited with and what
-/// that code can mean to `err`.
-fn print_run(output: &str, exit: i32, out: &mut dyn std::io::Write, err: &mut dyn std::io::Write) -> ExitCode {
-    let _ = write!(out, "{output}");
-    if exit == 0 {
-        return ExitCode::SUCCESS;
-    }
+/// Prints a run on this machine -- what the program wrote to each stream, on that stream -- and
+/// ends as it ended.
+///
+/// Nothing of this tool's is added to a program's own ending, whatever its code, as `dotnet run`,
+/// `python` and `node` add nothing: the code itself is the answer, and an exception's report is
+/// already on standard error.
+fn print_host_run(run: &HostRun, out: &mut dyn std::io::Write, err: &mut dyn std::io::Write) -> Ended {
+    let _ = write!(out, "{}", run.stdout);
     let _ = out.flush();
-    let _ = writeln!(err, "lamella run: the program exited {exit}");
-    let _ = write!(err, "{}", exit_note(exit));
-    ExitCode::FAILURE
+    let _ = write!(err, "{}", run.stderr);
+    if run.ended == Ended::Failed {
+        let _ = writeln!(
+            err,
+            "lamella run: the run ended without the program's exit code, so how the program ended is \
+             not known."
+        );
+    }
+    run.ended
 }
 
 /// Compile a Python program and run it on the host interpreter, optionally against a board's
 /// generated `board` module.
-fn run_python(path: &Path, source: &str, board: Option<&str>) -> ExitCode {
-    let bundle = match compile_python(path, source, board) {
-        Ok(bundle) => bundle,
+fn run_python(path: &Path, source: &str, board: Option<&str>) -> Ended {
+    match python_run(path, source, board) {
+        Ok(run) => print_host_run(&run, &mut std::io::stdout(), &mut std::io::stderr()),
         Err(error) => {
             eprintln!("lamella run: {error}");
-            return ExitCode::FAILURE;
+            Ended::Failed
         }
-    };
+    }
+}
+
+/// A Python program's run on this machine: what it wrote to each stream, and how it ended.
+///
+/// # Errors
+/// A program that does not compile.
+fn python_run(path: &Path, source: &str, board: Option<&str>) -> Result<HostRun, String> {
+    let bundle = compile_python(path, source, board)?;
     let mut model = lamella_py_runtime::ObjectModel::new(Vec::new(), 16 * 1024 * 1024);
     model.set_clock(host_wall_ns, host_monotonic_ns, host_sleep_ns);
-    if let Err(trap) = lamella_py_runtime::run_bundle(bundle, &mut model) {
-        print!("{}", model.take_stdout());
-        report_trap(&mut model, &trap);
-        return ExitCode::FAILURE;
+    let outcome = lamella_py_runtime::run_bundle(bundle, &mut model);
+    let stdout = model.take_stdout();
+    let mut stderr = model.take_stderr();
+    let ended = match outcome {
+        Ok(_) => Ended::Program(0),
+        Err(trap) => {
+            let (ended, said) = python_ending(&mut model, &trap);
+            stderr.push_str(&said);
+            ended
+        }
+    };
+    Ok(HostRun { stdout, stderr, ended })
+}
+
+/// How a Python program a trap stopped ended, and what is said about it on standard error.
+///
+/// **`SystemExit` IS AN EXIT, NOT A FAILURE**: it is what `sys.exit` raises, and its code is the
+/// program's own (see [`system_exit`]). Any other exception nothing caught is 1, reported as
+/// CPython's last line reports it, its type and its message.
+fn python_ending(
+    model: &mut lamella_py_runtime::ObjectModel,
+    trap: &lamella_py_runtime::Trap,
+) -> (Ended, String) {
+    let Some(exception) = model.take_pending_exception() else {
+        return (Ended::Uncaught, format!("{trap:?}\n"));
+    };
+    let Some(name) = model.exception_type_name(exception).map(str::to_owned) else {
+        return (Ended::Uncaught, format!("{trap:?}\n"));
+    };
+    if name == "SystemExit" {
+        return system_exit(model, exception);
     }
-    print!("{}", model.take_stdout());
-    ExitCode::SUCCESS
+    match model.exception_message(exception).filter(|message| !message.is_empty()) {
+        Some(message) => (Ended::Uncaught, format!("{name}: {message}\n")),
+        None => (Ended::Uncaught, format!("{name}\n")),
+    }
+}
+
+/// The ending a `SystemExit` asks for, as Python's documentation gives it: no argument, or `None`,
+/// is 0; an integer is that code; anything else is printed on standard error, and is 1.
+///
+/// An integer outside the 32 bits an exit code carries is printed and is 1 as well.
+fn system_exit(
+    model: &mut lamella_py_runtime::ObjectModel,
+    exception: lamella_py_runtime::Value,
+) -> (Ended, String) {
+    let args = model
+        .getattr(exception, "args", &mut lamella_py_runtime::InlineCache::default())
+        .ok();
+    let elements = args.and_then(|args| model.seq_elements(args)).unwrap_or_default();
+    let code = match (elements.as_slice(), args) {
+        ([], _) => return (Ended::Program(0), String::new()),
+        ([one], _) => *one,
+        (_, Some(tuple)) => tuple,
+        (_, None) => return (Ended::Program(1), String::new()),
+    };
+    if code.is_none() {
+        return (Ended::Program(0), String::new());
+    }
+    if let Some(number) = code.as_int().and_then(|number| i32::try_from(number).ok()) {
+        return (Ended::Program(number), String::new());
+    }
+    let text = model.display(code).unwrap_or_else(|_| model.repr(code));
+    (Ended::Program(1), format!("{text}\n"))
 }
 
 /// Compile a Python program to a bundle: the entry module plus every module its imports reach.
@@ -450,15 +561,6 @@ fn compile_python(
     };
     lamella_py_frontend::compile_bundle("__main__", source, &resolve)
         .map_err(|error| format!("compile {}: {error}", path.display()))
-}
-
-/// Report a trap: an uncaught Python exception by its type name, any other trap by its kind.
-fn report_trap(model: &mut lamella_py_runtime::ObjectModel, trap: &lamella_py_runtime::Trap) {
-    let pending = model.take_pending_exception();
-    match pending.and_then(|exception| model.exception_type_name(exception).map(String::from)) {
-        Some(name) => eprintln!("{name}"),
-        None => eprintln!("{trap:?}"),
-    }
 }
 
 /// Refuses every `#:` file-based-app directive this tool does not act on, by name.
@@ -560,7 +662,7 @@ pub fn board_module_run_command(args: &[String]) -> ExitCode {
             );
             ExitCode::FAILURE
         }
-        Language::Python => run_python(&path, &source, Some(id)),
+        Language::Python => run_python(&path, &source, Some(id)).finish(),
         Language::JavaScript => {
             eprintln!(
                 "lamella board-module-run: {} is JavaScript. This path serves a generated `board` \
@@ -1523,42 +1625,6 @@ fn build_python(path: &Path, source: &str, board: Option<&str>) -> Result<Built,
     })
 }
 
-/// The exit code the interpreter uses when a program is stopped by an exception nothing caught.
-const ABORTED_ON_EXCEPTION: i32 = 70;
-
-/// What a nonzero exit means, where this tool knows something the number does not say.
-///
-/// **70 IS TWO DIFFERENT ANSWERS AND THE RUNNER CANNOT TELL THEM APART.** The interpreter aborts on
-/// an unhandled exception with 70, and a program whose own `Main` returns 70 exits identically --
-/// so `lamella run` printed the same line for a thrown `InvalidOperationException` and for
-/// `return 70`, with nothing to choose between them.
-///
-/// **THE EXCEPTION'S TYPE, MESSAGE AND LOCATION DO NOT CROSS THE SEAM AT ALL**, so this cannot
-/// report them and must not imply that looking harder would find them. What it can do is say which
-/// two things the number means and name the way a program can usually answer it itself -- its own
-/// output DOES cross, so a `catch` that prints reaches the reader when the abort does not.
-///
-/// **"USUALLY" IS MEASURED AND NOT A HEDGE.** Some aborts skip the handler: a `new GpioController()`
-/// on the host exits 70 with neither the `try` body's output nor the `catch`'s, which is a trap
-/// rather than an exception and no handler can see it. Promising that a `catch` always answers the
-/// question would send those readers to write one that stays silent.
-///
-/// Empty for every other code: a program that returns 3 means whatever its author decided, and this
-/// tool has nothing to add to it.
-fn exit_note(exit: i32) -> String {
-    if exit != ABORTED_ON_EXCEPTION {
-        return String::new();
-    }
-    "\nThat code means one of two things, and the code alone cannot tell you which:\n\
-     \x20 - the program was stopped by an exception nothing caught, or\n\
-     \x20 - its own Main returned 70.\n\n\
-     A TRAP: line above this one settles it. It is printed when an exception escaped, and it\n\
-     carries that exception's type and message. No TRAP: line means the program returned 70 itself.\n\n\
-     Some aborts skip the handler and print nothing further -- which is itself the answer, because\n\
-     an exception a catch cannot see is not an exception.\n"
-        .to_owned()
-}
-
 /// Why no fit verdict can be given for `built` on `board`, when that is the case.
 ///
 /// **A BOARD THAT DECLARES NO CARRIER CANNOT RUN AN ARTIFACT THAT IS LOADED INTO FIRMWARE**, so the
@@ -1668,11 +1734,11 @@ fn host_sleep_ns(nanos: i64) {
 mod tests {
     use super::*;
 
-    /// **The TRAP line is on screen before the note that points up at it**, in the one screen both
+    /// **A trapped run's output is on screen before its trap report**, in the one screen both
     /// streams write to. Standard output is buffered by line and standard error is not, so output
-    /// that ends mid-line waits in its buffer while the note goes straight out.
+    /// that ends mid-line waits in its buffer while the report goes straight out.
     #[test]
-    fn a_trapped_runs_output_is_on_screen_before_the_note_that_points_at_it() {
+    fn a_trapped_runs_output_is_on_screen_before_its_trap_report() {
         use std::cell::RefCell;
         use std::io::{LineWriter, Write};
         use std::rc::Rc;
@@ -1692,13 +1758,137 @@ mod tests {
         let screen = Screen(Rc::new(RefCell::new(Vec::new())));
         let mut out = LineWriter::new(screen.clone());
         let mut err = screen.clone();
-        print_run("hello\nTRAP: unhandled exception: System.Exception: boom", 70, &mut out, &mut err);
+        let run = HostRun {
+            stdout: "hello, with no newline".to_owned(),
+            stderr: "TRAP: unhandled exception: System.Exception: boom\n".to_owned(),
+            ended: Ended::Uncaught,
+        };
+        assert_eq!(print_host_run(&run, &mut out, &mut err), Ended::Uncaught);
         drop(out);
 
         let shown = String::from_utf8(screen.0.borrow().clone()).expect("text");
-        let trap = shown.find("TRAP:").expect("the TRAP line is shown");
-        let note = shown.find("lamella run: the program exited 70").expect("the note is shown");
-        assert!(trap < note, "the note came before the TRAP line it points up at:\n{shown}");
+        assert_eq!(shown, "hello, with no newlineTRAP: unhandled exception: System.Exception: boom\n");
+    }
+
+    /// **A PROGRAM'S OWN ENDING IS NOT ANNOTATED**, whatever its code; a run that ended without
+    /// one says so, as this tool's failure.
+    #[test]
+    fn a_programs_own_ending_is_not_annotated_and_a_lost_one_is_said() {
+        let printed = |ended: Ended| {
+            let (mut out, mut err) = (Vec::new(), Vec::new());
+            let run = HostRun { stdout: "out\n".to_owned(), stderr: String::new(), ended };
+            let returned = print_host_run(&run, &mut out, &mut err);
+            (returned, String::from_utf8(out).expect("text"), String::from_utf8(err).expect("text"))
+        };
+        for code in [0, 3, 70, -1] {
+            assert_eq!(printed(Ended::Program(code)), (Ended::Program(code), "out\n".to_owned(), String::new()));
+        }
+        let (ended, _, err) = printed(Ended::Failed);
+        assert_eq!(ended, Ended::Failed);
+        assert!(err.starts_with("lamella run: the run ended without the program's exit code"), "{err}");
+    }
+
+    /// A program compiled from `source`, run on this machine, or `None` where this build has no
+    /// reference assemblies to compile against.
+    fn ran_here(source: &str) -> Option<HostRun> {
+        let compiler = LcscCompiler::discover().ok()?;
+        let corlib = compiler.references().first().cloned().expect("a corlib");
+        let assembly = compiler.compile(source).unwrap_or_else(|_| panic!("compiles: {source}"));
+        Some(run_here(corlib, &assembly).expect("runs"))
+    }
+
+    /// **A C# PROGRAM'S CODE COMES BACK UNCHANGED, 70 INCLUDED, AND AN EXCEPTION NOTHING CAUGHT IS
+    /// 1.** The runner ends both with 70, and only its stop tells them apart.
+    #[test]
+    fn a_csharp_programs_code_comes_back_and_an_uncaught_exception_is_one() {
+        let Some(returned) = ran_here("class P { static int Main() { return 70; } }") else { return };
+        assert_eq!(returned.ended, Ended::Program(70));
+        assert!(returned.stderr.is_empty(), "{}", returned.stderr);
+        let three = ran_here("class P { static int Main() { System.Console.WriteLine(\"three\"); return 3; } }")
+            .expect("compiles");
+        assert_eq!((three.ended, three.stdout.as_str()), (Ended::Program(3), "three\n"));
+        let thrown = ran_here(
+            "class P { static int Main() { System.Console.WriteLine(\"before\"); \
+             throw new System.InvalidOperationException(\"boom\"); } }",
+        )
+        .expect("compiles");
+        assert_eq!(thrown.ended, Ended::Uncaught);
+        assert_eq!(thrown.stdout, "before\n", "the program's output stays on its own stream");
+        assert!(thrown.stderr.starts_with("TRAP: ") && thrown.stderr.contains("boom"), "{}", thrown.stderr);
+    }
+
+    /// A Python program run on this machine from `source`.
+    fn python(source: &str) -> HostRun {
+        python_run(Path::new("program.py"), source, None).expect("compiles")
+    }
+
+    /// **`sys.exit` GIVES ITS CODE BACK AS PYTHON DOES**: none or `None` is 0, an integer is
+    /// itself, and anything else is printed on standard error and is 1.
+    #[test]
+    fn a_python_programs_exit_comes_back_as_python_gives_it() {
+        assert_eq!(python("import sys\nsys.exit(3)\n").ended, Ended::Program(3));
+        assert_eq!(python("import sys\nsys.exit(70)\n").ended, Ended::Program(70));
+        assert_eq!(python("import sys\nsys.exit()\n").ended, Ended::Program(0));
+        assert_eq!(python("import sys\nsys.exit(None)\n").ended, Ended::Program(0));
+        let said = python("print('first')\nimport sys\nsys.exit('bye')\n");
+        assert_eq!((said.ended, said.stdout.as_str(), said.stderr.as_str()), (Ended::Program(1), "first\n", "bye\n"));
+        assert_eq!(python("print('done')\n").ended, Ended::Program(0));
+    }
+
+    /// **AN EXCEPTION NOTHING CAUGHT IS 1, REPORTED AS PYTHON'S LAST LINE REPORTS IT**, and what
+    /// the program wrote to `sys.stderr` reaches standard error before it.
+    #[test]
+    fn a_python_exception_nothing_caught_is_one_and_its_stderr_is_shown() {
+        let failed = python(
+            "import sys\nsys.stderr.write('warned\\n')\nraise ValueError('not a number')\n",
+        );
+        assert_eq!(failed.ended, Ended::Uncaught);
+        assert_eq!(failed.stderr, "warned\nValueError: not a number\n");
+    }
+
+    /// A JavaScript program written to a file of the test's own, run as `lamella run` runs it.
+    fn javascript(name: &str, source: &str) -> Ended {
+        let dir = std::env::temp_dir().join(format!("lamella-cli-{}-js-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let path = dir.join("program.js");
+        std::fs::write(&path, source).expect("write the program");
+        let ended = run_command(&[path.display().to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+        ended
+    }
+
+    /// **A JAVASCRIPT PROGRAM ENDS AS `node` ENDS IT**: 0 when it ran to its end, 1 when a throw
+    /// nothing caught stopped it, and 1 when it did not parse.
+    #[test]
+    fn a_javascript_program_ends_as_node_ends_it() {
+        assert_eq!(javascript("ok", "print(6 * 7);\n"), Ended::Program(0));
+        assert_eq!(javascript("throws", "throw new Error('boom');\n"), Ended::Uncaught);
+        assert_eq!(javascript("broken", "let = ;\n"), Ended::Failed);
+    }
+
+    /// **THE RUN AN SDK ASKS FOR IS CHOSEN BY `--manifest` ALONE, AND THE VERB A PERSON TYPES IS
+    /// THE ONE IT WAS**: an image named as the file to run is refused as it always was, the image
+    /// run's other options are unknown to the verb, and a `--manifest` after `--` is the program's.
+    #[test]
+    fn only_a_manifest_chooses_the_image_run_and_the_public_verb_is_unchanged() {
+        let dir = std::env::temp_dir().join(format!("lamella-cli-{}-image-mode", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let image = dir.join("app.bin");
+        std::fs::write(&image, b"bytes").expect("write the image");
+        let source = dir.join("program.js");
+        std::fs::write(&source, "print(1);\n").expect("write the program");
+        let line = |words: &[&str]| words.iter().map(|word| (*word).to_owned()).collect::<Vec<_>>();
+        let (image, source) = (image.display().to_string(), source.display().to_string());
+        assert_eq!(run_command(&line(&[&image])), Ended::Failed, "an image is no source file");
+        for option in ["--probe", "--timeout"] {
+            assert_eq!(run_command(&line(&[&source, option, "5"])), Ended::Failed, "{option}");
+        }
+        assert_eq!(run_command(&line(&[&source, "--", "--manifest", "m"])), Ended::Failed);
+        let manifest = format!("{image}.manifest.json");
+        assert_eq!(run_command(&line(&["--manifest", &manifest])), Ended::Failed, "no manifest there");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A project directory of the test's own: `App.csproj` of `output_type` with `items` inside its
@@ -1776,15 +1966,13 @@ mod tests {
             return;
         }
         let project = project_at("runs", "Exe", "", PRINTS);
-        let exit = run_command(&[project.to_string_lossy().into_owned()]);
-        assert_eq!(format!("{exit:?}"), format!("{:?}", ExitCode::SUCCESS));
-        match project_outcome(&project) {
-            Ok(Ok(Outcome::Ran { output, exit, .. })) => {
-                assert_eq!(output, "from the project\n", "the program's own output");
-                assert_eq!(exit, 0);
+        assert_eq!(run_command(&[project.to_string_lossy().into_owned()]), Ended::Program(0));
+        match project_run(&project) {
+            Ok(Ok(run)) => {
+                assert_eq!(run.stdout, "from the project\n", "the program's own output");
+                assert_eq!(run.ended, Ended::Program(0));
             }
             Ok(Err(error)) => panic!("the run failed: {error:?}"),
-            Ok(Ok(_)) => panic!("the project ran as something other than a program"),
             Err(refusal) => panic!("refused: {refusal}"),
         }
         let _ = std::fs::remove_dir_all(project.parent().expect("its directory"));
@@ -1811,13 +1999,12 @@ mod tests {
             std::fs::write(&project, project_bytes).expect("write the project");
             let directory = project.parent().expect("its directory").to_path_buf();
             std::fs::write(directory.join("Program.cs"), source_bytes).expect("write the program");
-            match project_outcome(&project) {
-                Ok(Ok(Outcome::Ran { output, exit, .. })) => {
-                    assert_eq!(output, "from the project\n", "{what}: the program's own output");
-                    assert_eq!(exit, 0, "{what}");
+            match project_run(&project) {
+                Ok(Ok(run)) => {
+                    assert_eq!(run.stdout, "from the project\n", "{what}: the program's own output");
+                    assert_eq!(run.ended, Ended::Program(0), "{what}");
                 }
                 Ok(Err(error)) => panic!("{what}: the run failed: {error:?}"),
-                Ok(Ok(_)) => panic!("{what}: the project ran as something other than a program"),
                 Err(refusal) => panic!("{what}: refused: {refusal}"),
             }
             let _ = std::fs::remove_dir_all(directory);
@@ -1847,7 +2034,7 @@ mod tests {
     #[test]
     fn a_library_project_and_one_naming_libraries_are_refused_by_run() {
         let library = project_at("library", "Library", "", PRINTS);
-        let refusal = project_outcome(&library).expect_err("a class library has no entry point");
+        let refusal = project_run(&library).expect_err("a class library has no entry point");
         assert!(
             refusal.contains("builds a class library") && refusal.contains("<Reference>"),
             "{refusal}"
@@ -1862,7 +2049,7 @@ mod tests {
             gpio.display()
         );
         let referencing = project_at("referencing", "Exe", &items, PRINTS);
-        let refusal = project_outcome(&referencing).expect_err("its libraries are not linked here");
+        let refusal = project_run(&referencing).expect_err("its libraries are not linked here");
         assert!(
             refusal.contains("references libraries of its own")
                 && refusal.contains("System.Device.Gpio.dll")
@@ -1944,55 +2131,6 @@ mod tests {
                 "Second.cs(2,5): error LAM0001: this build cannot emit that construct"
             )
         );
-    }
-
-    /// **THE SAME LINE FOR A THROWN EXCEPTION AND FOR `return 70`.** Measured before this note
-    /// existed: a program throwing `InvalidOperationException` and one whose `Main` returns 70
-    /// produced byte-identical output, `lamella run: the program exited 70`, with nothing to choose
-    /// between them and nothing to read.
-    #[test]
-    fn exit_seventy_says_which_two_things_it_means_and_does_not_promise_more() {
-        let note = exit_note(70);
-        assert!(
-            note.contains("one of two things"),
-            "it names the ambiguity: {note}"
-        );
-        assert!(
-            note.contains("nothing caught"),
-            "and the abort case: {note}"
-        );
-        assert!(
-            note.contains("TRAP:"),
-            "and it points at the line that settles it: {note}"
-        );
-        assert!(
-            note.contains("returned 70"),
-            "and the ordinary case: {note}"
-        );
-        assert!(
-            !note.contains("do not reach here"),
-            "and it no longer denies a report the runner now prints: {note}"
-        );
-        assert!(
-            note.contains("catch"),
-            "and the way to answer it from the program: {note}"
-        );
-        assert!(
-            note.contains("skip the handler"),
-            "and says when it will not fire: {note}"
-        );
-    }
-
-    /// **EVERY OTHER CODE MEANS WHATEVER ITS AUTHOR DECIDED.** A note attached to those would be
-    /// this tool inventing a meaning for somebody else's number.
-    #[test]
-    fn a_program_that_chose_its_own_exit_code_is_not_annotated() {
-        for code in [1, 2, 3, 69, 71, -1] {
-            assert!(
-                exit_note(code).is_empty(),
-                "{code} is the program's own answer"
-            );
-        }
     }
 
     fn artifact(what: &'static str, loaded_into_firmware: bool) -> Built {
@@ -2284,9 +2422,10 @@ mod tests {
         assert_eq!(assembly_name(Path::new(".cs")), "_cs", "and can never come out empty");
     }
 
-    /// **THE BOARD MODULE HAS TO TRAVEL WITH THE BINARY.** Serving `bsp/<board>/python/board.py`
-    /// off disk would work only inside a checkout, which is exactly not where the person running
-    /// a program against a board they do not own yet is standing.
+    /// **THE BOARD MODULE HAS TO TRAVEL WITH THE BINARY.** Serving
+    /// `bsp/boards/<board>/python/board.py` off disk would work only inside a checkout, which is
+    /// exactly not where the person running a program against a board they do not own yet is
+    /// standing.
     #[test]
     fn every_board_carries_its_generated_python_module() {
         assert!(

@@ -50,6 +50,45 @@ const AIRCR_SYSRESETREQ: u32 = 0x05fa_0004;
 const DHCSR: u32 = 0xe000_edf0;
 const DHCSR_DEBUGEN: u32 = 0xa05f_0001;
 
+/// The SWD clock a write through this part's flash route runs its transfers at, once [`connect`]
+/// has woken the part at [`FALLBACK_SWD_CLOCK_HZ`] and read its `DPIDR` there.
+///
+/// The part's SW-DP runs reliably up to 50 MHz, with 10 MHz typical (datasheet, SWCLK pin
+/// characteristics), but the wiring between probe and part decides what a link carries, and the
+/// datasheet's advice for unreliable SWD is a lower clock. So a write that meets a transfer fault at
+/// this rate is made again, whole and from the start, at [`FALLBACK_SWD_CLOCK_HZ`].
+pub const SWD_CLOCK_HZ: u32 = 10_000_000;
+
+/// The SWD clock [`connect`] wakes the part at, and the one a write that met a transfer fault at
+/// [`SWD_CLOCK_HZ`] is made again at.
+pub const FALLBACK_SWD_CLOCK_HZ: u32 = lamella_cmsis_dap::CONNECT_CLOCK_HZ;
+
+/// How many times the probe retries a transfer the part answers WAIT, at [`FALLBACK_SWD_CLOCK_HZ`].
+/// AP accesses around a reset, and while the bootrom flash helpers hold the bus, legitimately answer
+/// WAIT.
+const WAIT_RETRIES: u16 = 64;
+
+/// [`WAIT_RETRIES`] at `clock_hz`. The budget is counted in retries, and the wire time of a retry
+/// shrinks as the clock rises, so it is scaled with the clock to span at least the time it spans at
+/// [`FALLBACK_SWD_CLOCK_HZ`]: a WAIT the part answers for that long is still ridden out at a faster
+/// clock, and one it answers for longer is a fault there as it is at the slower one.
+fn wait_retries_at(clock_hz: u32) -> u16 {
+    let scale = (clock_hz / FALLBACK_SWD_CLOCK_HZ).max(1);
+    u16::try_from(u32::from(WAIT_RETRIES).saturating_mul(scale)).unwrap_or(u16::MAX)
+}
+
+/// Runs the session's transfers at `clock_hz` from here on: the clock, and the probe's WAIT budget
+/// scaled with it to span at least the time it spans at [`FALLBACK_SWD_CLOCK_HZ`]. Bound to the
+/// CMSIS-DAP stack, as [`connect`] is, and for its reason.
+pub fn set_swd_clock<T: Transport>(
+    target: &mut ArmDap<Dap<T>>,
+    clock_hz: u32,
+) -> Result<(), ProbeError> {
+    target.inner_mut().set_clock(clock_hz)?;
+    target.inner_mut().configure_transfers(0, wait_retries_at(clock_hz), 0)?;
+    Ok(())
+}
+
 /// Connect to the RP2350 over SWD and return its DPIDR: wake the dormant DP (harmless when it
 /// is already awake), give the probe a WAIT-retry budget, and select the core-0 MEM-AP.
 ///
@@ -61,7 +100,7 @@ const DHCSR_DEBUGEN: u32 = 0xa05f_0001;
 /// neutral seam.
 pub fn connect<T: Transport>(target: &mut ArmDap<Dap<T>>) -> Result<u32, ProbeError> {
     target.inner_mut().connect_swd_from_dormant()?;
-    target.inner_mut().configure_transfers(0, 64, 0)?;
+    target.inner_mut().configure_transfers(0, WAIT_RETRIES, 0)?;
     let idcode = match target.read_idcode() {
         Ok(idcode) => idcode,
         Err(ProbeError::Ack(_)) => {
@@ -155,12 +194,14 @@ pub fn rom_function<A: TargetAccess>(target: &mut A, c1: u8, c2: u8) -> Result<u
 
 /// Flash `image` to the start of QSPI flash (the XIP base) via the bootrom, verify it by
 /// reading back through the coherent (cache-flushed) XIP window, and reset the chip to boot it.
-/// `log` receives progress lines.
+/// `log` receives progress lines. Returns the words the verify read: the whole page-padded image,
+/// as the flash holds it now, so a caller can compare them against its own copy of the image
+/// without reading the flash a second time.
 pub fn flash_image<A: TargetAccess>(
     target: &mut A,
     image: &[u8],
     mut log: impl FnMut(&str),
-) -> Result<(), ProbeError> {
+) -> Result<Vec<u32>, ProbeError> {
     if image.is_empty() {
         return Err(ProbeError::Timeout("image empty"));
     }
@@ -244,7 +285,7 @@ pub fn flash_image<A: TargetAccess>(
     target.write_word(BOOTLOCK_FLASH_OP, 0)?;
     log("flashed + verified; resetting to boot the image.");
     target.reset_and_run()?;
-    Ok(())
+    Ok(readback)
 }
 
 #[cfg(test)]
@@ -254,5 +295,37 @@ mod tests {
         assert_eq!(0x880a_f380u32.to_le_bytes(), [0x80, 0xf3, 0x0a, 0x88]);
         assert_eq!(0x4770_6011u32.to_le_bytes(), [0x11, 0x60, 0x70, 0x47]);
         assert_eq!(0xbe00_2780u32.to_le_bytes()[2..], [0x00, 0xbe]);
+    }
+
+    #[test]
+    fn the_wait_budget_spans_at_least_its_time_at_the_fallback_clock() {
+        assert_eq!(super::wait_retries_at(super::FALLBACK_SWD_CLOCK_HZ), 64);
+        assert_eq!(super::wait_retries_at(4_000_000), 256);
+        assert_eq!(
+            super::wait_retries_at(super::SWD_CLOCK_HZ),
+            64 * (super::SWD_CLOCK_HZ / super::FALLBACK_SWD_CLOCK_HZ) as u16
+        );
+        assert_eq!(super::wait_retries_at(500_000), 64, "never fewer than at the fallback clock");
+        assert_eq!(super::wait_retries_at(u32::MAX), u16::MAX);
+    }
+
+    /// The faster clock goes out with its WAIT budget, in that order, and nothing else is sent.
+    #[test]
+    fn a_faster_clock_is_set_with_its_wait_budget() {
+        use lamella_cmsis_dap::proto;
+        use lamella_cmsis_dap::testing::{Mock, echo};
+
+        let mut target = lamella_probe_core::ArmDap::new(lamella_cmsis_dap::Dap::new(Mock::new(vec![
+            echo(proto::cmd::SWJ_CLOCK, &[proto::DAP_OK]),
+            echo(proto::cmd::TRANSFER_CONFIGURE, &[proto::DAP_OK]),
+        ])));
+        super::set_swd_clock(&mut target, 4_000_000).unwrap();
+        assert_eq!(
+            target.inner().transport().sent,
+            vec![
+                vec![0x11, 0x00, 0x09, 0x3d, 0x00],
+                vec![0x04, 0x00, 0x00, 0x01, 0x00, 0x00],
+            ]
+        );
     }
 }

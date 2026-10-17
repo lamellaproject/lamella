@@ -1,6 +1,6 @@
-# The SAMR21 instance map: every placed block copy, its base, and its per-instance ids.
-# Layout truth lives in blocks/*.toml; wiring truth lives in bsp/<board>/board.toml. The record
-# schema is uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
+# The SAMR21 instance map: every placed block copy, its base, and its per-instance ids. Layout truth
+# lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
+# uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
 # EVERY VALUE BELOW WAS READ OFF THE SAM R21'S OWN TABLE 10-1. The SERCOM rows then agree with
 # the SAMD21's, value for value -- which is a RESULT here rather than an assumption, and the

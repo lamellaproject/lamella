@@ -299,7 +299,9 @@ pub fn rom_function<A: TargetAccess>(target: &mut A, c1: u8, c2: u8) -> Result<u
 /// Flash `image` to the start of QSPI flash, verify it by reading back through the restored
 /// execute-in-place window, and leave the core halted for the caller to reset.
 ///
-/// `log` receives progress lines.
+/// `log` receives progress lines. Returns the words the verify read: the whole page-padded image,
+/// as the flash holds it now, so a caller can compare them against its own copy of the image
+/// without reading the flash a second time.
 ///
 /// # The addresses, because two of them are not the same number
 ///
@@ -325,7 +327,7 @@ pub fn flash_image<A: TargetAccess>(
     target: &mut A,
     image: &[u8],
     mut log: impl FnMut(&str),
-) -> Result<(), ProbeError> {
+) -> Result<Vec<u32>, ProbeError> {
     if image.is_empty() {
         return Err(ProbeError::Device("image empty"));
     }
@@ -364,10 +366,10 @@ pub fn flash_image<A: TargetAccess>(
         &mut log,
     );
     let released = hold_core1(target, false);
-    outcome?;
+    let readback = outcome?;
     released?;
     log("flashed + verified; the core is halted, ready to be reset into the image.");
-    Ok(())
+    Ok(readback)
 }
 
 /// The six bootrom entry points the flash sequence calls, resolved once.
@@ -385,7 +387,7 @@ fn program_and_verify<A: TargetAccess>(
     image: &[u8],
     rom: FlashRom,
     log: &mut impl FnMut(&str),
-) -> Result<(), ProbeError> {
+) -> Result<Vec<u32>, ProbeError> {
     let mut words: Vec<u32> = image
         .chunks(4)
         .map(|c| {
@@ -435,7 +437,7 @@ fn program_and_verify<A: TargetAccess>(
         log(&format!("VERIFY FAILED at word {first_bad} (byte offset {:#x})", first_bad * 4));
         return Err(ProbeError::Device("flash verify mismatch"));
     }
-    Ok(())
+    Ok(readback)
 }
 
 /// Hold core 1 in reset, or release it.
