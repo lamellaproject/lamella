@@ -14,10 +14,10 @@ lamella-clock-host = { path = "../lamella-clock-host" }
 # it pulls in the interpreter stack (lamella-load / -cil-runtime / -metadata) transitively.
 lamella-runner = { path = "../lamella-runner" }
 lamella-wire = { path = "../lamella-wire" }
-# Host-only: the serial carrier for the USB-CDC / UART transport. OPTIONAL + behind the `serial`
-# feature, so a WASM build (Lamella Code's REPL worker) compiles the carrier-neutral REPL
-# core -- run_program + the driver + the protocol -- without it.
-serialport = { version = "4", optional = true }
+# Host-only: the operating system's serial port, the carrier for the USB-CDC / UART transport.
+# OPTIONAL + behind the `serial` feature, so a WASM build (Lamella Code's REPL worker) compiles the
+# carrier-neutral REPL core -- run_program + the driver + the protocol -- without it.
+lamella-serial-port = { path = "../lamella-serial-port", optional = true }
 # Host-only: the native-USB (driverless WinUSB) bulk carrier -- the fast interpreter-flash path for a
 # board with a native USB device peripheral (a WinUSB vendor interface). OPTIONAL, behind the usb feature.
 lamella-usbbulk = { path = "../lamella-usbbulk", optional = true }
@@ -51,7 +51,7 @@ serde_json = { version = "1", optional = true }
 # The serial (USB-CDC / UART) transport. Default ON for a host build; a wasm32 build turns it off
 # (--no-default-features) and supplies its own Transport (a Worker / in-process channel).
 default = ["serial", "repl-host"]
-serial = ["dep:serialport", "carrier"]
+serial = ["dep:lamella-serial-port", "carrier"]
 # The native-USB (driverless WinUSB) carrier (UsbTransport), for a board with a native USB device
 # peripheral. Host-only; coexists with serial (a host build can drive either).
 usb = ["dep:lamella-usbbulk", "carrier"]
@@ -75,6 +75,10 @@ repl-host = ["dep:lamella-assemble", "dep:lamella-metadata"]
 # corlib wherever they run, and nothing built for use ever looks there: a tool that fell back to
 # it would run a program against a test input instead of the class library, and say nothing.
 fixture-corlib = []
+# A build for a package: `LcscCompiler::discover` never looks into the source tree this crate was
+# compiled from (its `managed/` and `libs/`), which a packaged tool does not have and whose path it
+# must not carry. `lamella-cli`'s feature of the same name turns it on.
+packaged = []
 # For TESTS ONLY: `loopback`, a board's deploy serve in the test's own process over a flash region in
 # memory, for the tests of a host that sends a program to firmware. A crate turns it on in its
 # `[dev-dependencies]`. It exists only where `baked` is on as well, and implies nothing, so a test

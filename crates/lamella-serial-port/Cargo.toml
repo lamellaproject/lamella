@@ -1,0 +1,27 @@
+[package]
+name = "lamella-serial-port"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The operating system's serial port: open one by name with its line settings, read and write with time-outs, set DTR and RTS, discard and count what is buffered, and list the attached ports with their USB identity. Win32 on Windows, the POSIX terminal interface on Linux and macOS, sysfs and IOKit for the listing."
+publish = false
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_Devices_Communication",
+    "Win32_System_IO",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_System_Registry",
+    "Win32_System_Ioctl",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

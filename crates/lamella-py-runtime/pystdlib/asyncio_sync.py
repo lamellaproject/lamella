@@ -701,69 +701,21 @@ class LifoQueue(Queue):
         return self._items.pop()
 
 
-# The binary heap `PriorityQueue` orders by: two sift operations, kept here rather than imported
-# from `heapq`.
-#
-# Importing a module builds every function in it as a heap object, and a priority queue needs two of
-# the functions `heapq` defines -- so the two are here and the import is not.
-#
-# They are `heapq`'s own two sifts, specialized to a min-heap sifted from the root, and the
-# distinction matters: a heap's order among EQUAL entries is a property of the sift and of nothing
-# else, so a heap that merely sorts correctly is still a different data structure. A put climbs the
-# new entry toward the root, one exchange per step, while it is less than its parent. A get moves the
-# last entry to the root, carries it down to a leaf through the smaller child (the right one when the
-# two are equal), and then climbs it back up. Either raises RuntimeError when a comparison changes the
-# queue's length, as `heapq` does.
-
-
-def _heap_climb(heap, pos):
-    size = len(heap)
-    while pos > 0:
-        parent = (pos - 1) // 2
-        rises = heap[pos] < heap[parent]
-        if len(heap) != size:
-            raise RuntimeError("list changed size during iteration")
-        if not rises:
-            break
-        heap[pos], heap[parent] = heap[parent], heap[pos]
-        pos = parent
-
-
-def _heap_sink(heap):
-    size = len(heap)
-    pos = 0
-    child = 1
-    while child < size:
-        right = child + 1
-        if right < size:
-            left_smaller = heap[child] < heap[right]
-            if len(heap) != size:
-                raise RuntimeError("list changed size during iteration")
-            if not left_smaller:
-                child = right
-        heap[pos], heap[child] = heap[child], heap[pos]
-        pos = child
-        child = 2 * pos + 1
-    _heap_climb(heap, pos)
-
-
 class PriorityQueue(Queue):
     # Lowest first, by the items' own ordering. Entries are usually `(priority, payload)` tuples,
     # which is what makes ties break on the payload rather than on arrival.
+    #
+    # The entries are a binary heap kept by the native `_heapq`, so equal entries leave in `heapq`'s
+    # order, and a comparison that changes the queue's length raises its RuntimeError. The import is
+    # inside the two methods that use it: a program that never makes a priority queue never imports it.
 
     def _put(self, item):
-        self._items.append(item)
-        _heap_climb(self._items, len(self._items) - 1)
+        import _heapq
+        _heapq.heappush(self._items, item)
 
     def _get(self):
-        items = self._items
-        last = items.pop()
-        if not items:
-            return last
-        first = items[0]
-        items[0] = last
-        _heap_sink(items)
-        return first
+        import _heapq
+        return _heapq.heappop(self._items)
 
 
 # What `wait()` is being asked to wait FOR. Strings, exactly as in CPython, so a program that prints

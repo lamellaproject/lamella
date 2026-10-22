@@ -25,6 +25,16 @@ namespace Lamella.Boards.Adafruit
             AdafruitFeatherM0AdaloggerBindings.SD_CARD_DETECT_PORT_BASE,
             AdafruitFeatherM0AdaloggerBindings.SD_CARD_DETECT_PIN);
 
+        /// <summary>The logical bus id of the microSD socket's SPI (MOSI PB10, SCK PB11 and MISO
+        /// PA12, on SERCOM4), as <c>SpiConnectionSettings</c> names it.</summary>
+        public const int SdSpiBusId = 0;
+
+        /// <summary>The microSD socket's chip select (Arduino D4, PA08), as a pin number -- the pin
+        /// <c>Storage.MountSdOverSpi</c> takes. It is the first of the SD bus's chip selects, so
+        /// <c>SpiConnectionSettings.ChipSelectLine</c> 0 selects it too.</summary>
+        public static readonly int SdChipSelectPin =
+            LogicalPin(AdafruitFeatherM0AdaloggerBindings.SD_SPI_CS_PORT_BASE, AdafruitFeatherM0AdaloggerBindings.SD_SPI_CS_PIN);
+
         /// <summary>Binds this board's GPIO block to the driver table, so a program writes plain
         /// dotnet/iot -- <c>new GpioController()</c> -- and never names a Lamella type. Touching
         /// <see cref="FeatherM0Adalogger"/> at all is what arms it, and constructing
@@ -39,9 +49,32 @@ namespace Lamella.Boards.Adafruit
         static FeatherM0Adalogger()
         {
             Buses.BindGpio(new GpioDriverFactory(MakeGpio));
+            Buses.BindSpi(SdSpiBusId, new SpiDriverFactory(MakeSdSpi));
         }
 
         private static GpioDriver MakeGpio() { return new Samd21GpioDriver(); }
+
+        private static SpiDriver MakeSdSpi()
+        {
+            return new Samd21SpiDriver(new Samd21SercomSpiBinding(
+                AdafruitFeatherM0AdaloggerBindings.SD_SPI_SERCOM_BASE,
+                AdafruitFeatherM0AdaloggerBindings.SD_SPI_GCLK_CLKCTRL_VALUE,
+                AdafruitFeatherM0AdaloggerBindings.SD_SPI_APBC_MASK,
+                AdafruitFeatherM0AdaloggerBindings.SD_SPI_PMUX_MOSI_REG,
+                AdafruitFeatherM0AdaloggerBindings.SD_SPI_PMUX_MOSI_SHIFT,
+                AdafruitFeatherM0AdaloggerBindings.SD_SPI_PINCFG_MOSI_REG,
+                AdafruitFeatherM0AdaloggerBindings.SD_SPI_PMUX_SCK_REG,
+                AdafruitFeatherM0AdaloggerBindings.SD_SPI_PMUX_SCK_SHIFT,
+                AdafruitFeatherM0AdaloggerBindings.SD_SPI_PINCFG_SCK_REG,
+                AdafruitFeatherM0AdaloggerBindings.SD_SPI_PMUX_MISO_REG,
+                AdafruitFeatherM0AdaloggerBindings.SD_SPI_PMUX_MISO_SHIFT,
+                AdafruitFeatherM0AdaloggerBindings.SD_SPI_PINCFG_MISO_REG,
+                AdafruitFeatherM0AdaloggerBindings.SD_SPI_PMUX_FUNC,
+                AdafruitFeatherM0AdaloggerBindings.SD_SPI_DOPO,
+                AdafruitFeatherM0AdaloggerBindings.SD_SPI_DIPO,
+                AdafruitFeatherM0AdaloggerBindings.SD_SPI_CORE_CLOCK_HZ,
+                new int[] { (int)AdafruitFeatherM0AdaloggerBindings.SD_SPI_CHIP_SELECT0 }));
+        }
 
         /// <summary>The family PORT driver this board bound, over every pin on the part.</summary>
         /// <remarks>THE SAME INSTANCE <see cref="GpioController"/> drives. One block has one

@@ -14,7 +14,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Samd21SpiDriver : SpiDriver
+internal sealed class Samd21SpiDriver : SpiDriver
 {
     private readonly uint _ctrla;
     private readonly uint _ctrlb;

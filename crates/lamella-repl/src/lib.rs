@@ -68,7 +68,8 @@ fn eval_in(source_line: &str, tools: &Toolchain, work: &TempProgram) -> Result<S
     let program = load(&assembly).map_err(|error| format!("cannot load: {error}"))?;
 
     let mut vm = host_vm();
-    match run(&program.module, &mut vm, program.entry, Vec::new()) {
+    let args = lamella_cil_runtime::entry_args(&program.module, &mut vm, program.entry);
+    match run(&program.module, &mut vm, program.entry, args) {
         Ok(_) => Ok(vm.output_string()),
         Err(trap) => Err(format!("trap: {trap}")),
     }

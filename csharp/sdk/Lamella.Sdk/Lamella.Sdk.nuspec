@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>Lamella.Sdk</id>
+    <version>$version$</version>
+    <!-- Packing writes here what every package carries: authors, license, licenseUrl, projectUrl, copyright and repository. -->
+    <description>The MSBuild project SDK for C# programs that run on Lamella. A project that names it and targets lamella1.0 builds with dotnet build, and dotnet run runs it on this computer, under Lamella's interpreter, or on a connected board running Lamella's firmware.</description>
+    <packageTypes>
+      <packageType name="MSBuildSdk" />
+    </packageTypes>
+  </metadata>
+</package>

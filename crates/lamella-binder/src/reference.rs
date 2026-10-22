@@ -1,6 +1,7 @@
 //! Loading a reference assembly's types into the binder's [`Model`].
 
 use crate::bound::integer_literal;
+use crate::declaration::real_constant;
 use crate::special::SpecialType;
 use crate::symbols::{
     TypeParameterConstraints,
@@ -545,6 +546,10 @@ fn member_accessibility(flags: u32) -> Accessibility {
 /// S()`, `T t = default(T)` -- and for a `const` whose value is `null`. [`Literal::Null`] is what
 /// the binder holds for all of those when they are declared in source, so a call or a use site
 /// treats the imported one the same way.
+///
+/// **A NaN IS READ AS .NET's NaN**, whatever bits the referenced assembly holds for it -- a
+/// payload, the positive sign, the signaling bit -- because csc writes every use of any of them as
+/// .NET's NaN: `0xFFF8000000000000` for a `double`, `0xFFC00000` for a `float`.
 fn constant_to_literal(value: ConstantValue) -> Option<Literal> {
     Some(match value {
         ConstantValue::Bool(b) => Literal::Boolean(b),
@@ -557,14 +562,8 @@ fn constant_to_literal(value: ConstantValue) -> Option<Literal> {
         ConstantValue::U4(n) => integer_literal(i64::from(n)),
         ConstantValue::I8(n) => integer_literal(n),
         ConstantValue::U8(n) => integer_literal(n as i64),
-        ConstantValue::R4(f) => Literal::Real {
-            bits: f64::from(f).to_bits(),
-            suffix: RealSuffix::Float,
-        },
-        ConstantValue::R8(f) => Literal::Real {
-            bits: f.to_bits(),
-            suffix: RealSuffix::Double,
-        },
+        ConstantValue::R4(f) => real_constant(f64::from(f), RealSuffix::Float),
+        ConstantValue::R8(f) => real_constant(f, RealSuffix::Double),
         ConstantValue::String(units) => Literal::String(units.into_boxed_slice()),
         ConstantValue::Null => Literal::Null,
     })
@@ -811,5 +810,41 @@ mod tests {
             "System.IO.Stream"
         );
         assert_eq!(named_symbol("", "Widget").to_string(), "Widget");
+    }
+
+    /// A referenced constant that is a NaN is read as .NET's NaN, whatever its bits: csc writes
+    /// `0xFFF8000000000000` and `0xFFC00000` for a use of one with a payload, of the positive NaN
+    /// and of a signaling one, measured. Every other value is read exactly.
+    #[test]
+    fn a_referenced_nan_constant_is_read_as_dotnets_nan() {
+        let real = |bits: u64, suffix| Some(Literal::Real { bits, suffix });
+        let doubles: [u64; 4] = [
+            0x7FF8_0000_0000_0000,
+            0x7FF8_0000_0000_0123,
+            0xFFF0_0000_0000_0789,
+            0x7FF0_0000_0000_0001,
+        ];
+        for bits in doubles {
+            assert_eq!(
+                constant_to_literal(ConstantValue::R8(f64::from_bits(bits))),
+                real(0xFFF8_0000_0000_0000, RealSuffix::Double),
+                "{bits:#018X}"
+            );
+        }
+        for bits in [0x7FC0_0000u32, 0x7FC0_0123, 0xFF80_0789, 0x7F80_0001] {
+            assert_eq!(
+                constant_to_literal(ConstantValue::R4(f32::from_bits(bits))),
+                real(0xFFF8_0000_0000_0000, RealSuffix::Float),
+                "{bits:#010X}"
+            );
+        }
+        assert_eq!(
+            constant_to_literal(ConstantValue::R8(-0.0)),
+            real((-0.0f64).to_bits(), RealSuffix::Double)
+        );
+        assert_eq!(
+            constant_to_literal(ConstantValue::R4(f32::MAX)),
+            real(f64::from(f32::MAX).to_bits(), RealSuffix::Float)
+        );
     }
 }

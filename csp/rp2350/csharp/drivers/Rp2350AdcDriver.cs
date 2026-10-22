@@ -4,7 +4,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Rp2350AdcDriver : AdcDriver
+internal sealed class Rp2350AdcDriver : AdcDriver
 {
     private readonly uint _cs;
     private readonly uint _result;
@@ -99,6 +99,13 @@ public sealed class Rp2350AdcDriver : AdcDriver
     /// <summary>The channels of the board's package: its pin channels, then the temperature sensor
     /// (five on the QFN-60, nine on the QFN-80).</summary>
     public override int ChannelCount { get { return _channelCount; } }
+
+    /// <summary>The GPIO a pin channel reads, from the binding's channel map; -1 for the temperature
+    /// sensor, which no pin reads.</summary>
+    public override int PinOfChannel(int channel)
+    {
+        return ChannelPin(channel);
+    }
 
     /// <summary>12-bit SAR (ENOB min 9 / typ 9.5 per the datasheet's electrical table).</summary>
     public override int ResolutionInBits { get { return _resolutionBits; } }

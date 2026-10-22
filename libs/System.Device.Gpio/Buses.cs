@@ -4,13 +4,13 @@ using System.Device.Gpio;
 namespace Lamella.Hardware
 {
     /// <summary>Creates the SPI driver for a bus, on first use.</summary>
-    public delegate SpiDriver SpiDriverFactory();
+    internal delegate SpiDriver SpiDriverFactory();
 
     /// <summary>Creates the I2C driver for a bus, on first use.</summary>
-    public delegate I2cDriver I2cDriverFactory();
+    internal delegate I2cDriver I2cDriverFactory();
 
     /// <summary>Creates the GPIO driver, on first use.</summary>
-    public delegate GpioDriver GpioDriverFactory();
+    internal delegate GpioDriver GpioDriverFactory();
 
 #if LAMELLA_SURFACE_FLOAT
     /// <summary>Creates output <paramref name="channel"/> of one PWM chip at
@@ -22,7 +22,7 @@ namespace Lamella.Hardware
     /// <c>frequency</c> or <c>dutyCyclePercentage</c>, and a channel that is already open with
     /// <see cref="System.InvalidOperationException"/>. Disposing the channel it returned releases it,
     /// so the same channel can then be created again.</remarks>
-    public delegate System.Device.Pwm.PwmChannel PwmChannelFactory(int channel, int frequency, double dutyCyclePercentage);
+    internal delegate System.Device.Pwm.PwmChannel PwmChannelFactory(int channel, int frequency, double dutyCyclePercentage);
 #endif
 
     /// <summary>The board's map from bus id to the driver that serves it.
@@ -31,7 +31,7 @@ namespace Lamella.Hardware
     /// names a driver. A bus comes from a factory a board's class binds, or else from the bus table
     /// of the board the program was built for, whose drivers the board's family build of this
     /// assembly carries.</summary>
-    public sealed class Buses
+    internal sealed class Buses
     {
         /// <summary>The number of logical buses of each kind, and of PWM chips, so valid ids are 0
         /// to <c>BusCount - 1</c>. A bus id or a chip is a LOGICAL index the board maps onto a
@@ -152,7 +152,7 @@ namespace Lamella.Hardware
         /// this caches it after the first call, so a device from
         /// <see cref="System.Device.Spi.SpiDevice.Create(System.Device.Spi.SpiConnectionSettings)"/>
         /// and a driver from here are the same object acting on the same registers.</para>
-        /// <para>That guarantee is the reason this is public. Code doing bring-up or a self-test
+        /// <para>That guarantee is the reason this exists. Code doing bring-up or a self-test
         /// often needs BOTH the portable facade and a control that only the concrete driver exposes
         /// -- a loopback bit, a receive drain, the realized clock. Without this the only way to
         /// reach the driver is to construct a SECOND one over the same registers, which reads as

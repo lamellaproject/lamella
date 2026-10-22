@@ -2,7 +2,7 @@
 namespace Lamella.Hardware
 {
     /// <summary>Base class for ADC drivers: convert analog inputs to digital counts.</summary>
-    public abstract class AdcDriver : System.IDisposable
+    internal abstract class AdcDriver : System.IDisposable
     {
         /// <summary>The span of the chip's channel numbers: every channel is numbered below it.</summary>
         /// <remarks>On a converter whose channel numbers are its multiplexer's input codes, the
@@ -18,6 +18,16 @@ namespace Lamella.Hardware
         public virtual bool IsChannelSupported(int channel)
         {
             return channel >= 0 && channel < ChannelCount;
+        }
+
+        /// <summary>The board pin <paramref name="channel"/> reads, numbered as the board numbers its
+        /// pins, or -1 when no pin reads it: an internal input such as a temperature sensor.</summary>
+        /// <remarks>The default answers -1 for every channel, which is right for a converter whose
+        /// board wires none of its inputs to a pin. A board's analog controller opens a pin by this
+        /// number, so a channel no pin reads cannot be opened there.</remarks>
+        public virtual int PinOfChannel(int channel)
+        {
+            return -1;
         }
 
         /// <summary>The width, in bits, of a conversion result.</summary>

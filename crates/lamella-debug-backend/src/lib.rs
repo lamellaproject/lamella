@@ -22,6 +22,16 @@ pub trait DebugBackend {
     /// different remedies, and only the backend knows which it was.
     fn launch(&mut self) -> Result<(), String>;
 
+    /// Takes control of a target that is already running its program, instead of starting it: the
+    /// program is not restarted, and the target is left halted where it was, ready for breakpoints and
+    /// `configurationDone`, as [`DebugBackend::launch`] leaves a target it started.
+    ///
+    /// `Err(reason)` says the target could not be attached to, in words the adapter shows the user.
+    /// The default refuses, because a target this backend cannot attach to is started with `launch`.
+    fn attach(&mut self) -> Result<(), String> {
+        Err(String::from("this target cannot be attached to; start it with launch"))
+    }
+
     /// Resumes until a breakpoint, completion, or fault. Interpreter: run the
     /// `Session`. Device: clear the halt and run until a BPU match / the program ends.
     fn resume(&mut self) -> Stop;
@@ -60,6 +70,41 @@ pub trait DebugBackend {
     /// adapter can tell the user instead of ending the session as though it had been.
     fn release(&mut self) -> Result<(), String> {
         Ok(())
+    }
+
+    /// Whether [`DebugBackend::terminate`] can succeed on this backend, so a client offers to end the
+    /// program only where it can be ended. The default is `false`, matching `terminate`'s own default
+    /// of refusing.
+    fn can_terminate(&self) -> bool {
+        false
+    }
+
+    /// Ends the program being debugged, for a user who stops the session rather than leaving the
+    /// program to run on. The session's hold on the target ends with the program, so the adapter
+    /// does not [`DebugBackend::release`] a target it terminated.
+    ///
+    /// `Err(reason)` says the program could not be ended and may still be running or stopped, in
+    /// words the adapter shows the user. The default refuses; a backend that overrides this says
+    /// `true` from [`DebugBackend::can_terminate`].
+    fn terminate(&mut self) -> Result<(), String> {
+        Err(String::from("this target cannot end the program it is debugging"))
+    }
+
+    /// Whether [`DebugBackend::restart`] can succeed on this backend. The default is `false`, and a
+    /// client that is told so restarts a session by ending it and starting a new one.
+    fn can_restart(&self) -> bool {
+        false
+    }
+
+    /// Starts the program again from the beginning, within the same session. The target is left as
+    /// [`DebugBackend::launch`] leaves it, stopped at its first location, with the breakpoints and
+    /// exception filters last set still armed and nothing carried over from the run it replaces.
+    ///
+    /// `Err(reason)` says the program could not be restarted, in words the adapter shows the user.
+    /// The default refuses; a backend that overrides this says `true` from
+    /// [`DebugBackend::can_restart`].
+    fn restart(&mut self) -> Result<(), String> {
+        Err(String::from("this target cannot restart the program it is debugging"))
     }
 
     /// The program's exit code once it has run to completion ([`Stop::Done`]): the entry method's
@@ -147,6 +192,29 @@ pub trait DebugBackend {
         None
     }
 
+    /// The exception filters this target can stop on, which a client offers its user. Empty, the
+    /// default, means the target cannot stop on an exception: no filter is offered, and an exception
+    /// nothing catches ends the run as a [`Stop::Fault`].
+    fn exception_filters(&self) -> &[ExceptionFilter] {
+        &[]
+    }
+
+    /// Replaces the exception filters armed on the target: from now on it stops with
+    /// [`Stop::Exception`] wherever one of `filters` matches. `filters` holds only filters that
+    /// [`DebugBackend::exception_filters`] offered, each at most once, and an empty list disarms
+    /// every filter.
+    ///
+    /// `Err(reason)` says the filters could not be armed, in words the adapter shows the user. The
+    /// default arms nothing and accepts only the empty list, which is all a target that offers no
+    /// filter is ever sent.
+    fn set_exception_filters(&mut self, filters: &[ExceptionFilter]) -> Result<(), String> {
+        if filters.is_empty() {
+            Ok(())
+        } else {
+            Err(String::from("this target cannot stop on an exception"))
+        }
+    }
+
     /// The call stack, innermost frame first (DAP's order). Each frame carries its
     /// opaque address, a display name, and a 1-based line (the CIL index until the
     /// compiler's sequence points map it to source).
@@ -159,6 +227,25 @@ pub trait DebugBackend {
     fn resolve_source_breakpoint(&self, document: &str, line: u32) -> Option<u64> {
         let _ = (document, line);
         None
+    }
+
+    /// Whether [`DebugBackend::resolve_function_breakpoint`] can find methods by name on this
+    /// backend, so a client offers function breakpoints only where they can bind. The default is
+    /// `false`.
+    fn can_break_on_functions(&self) -> bool {
+        false
+    }
+
+    /// Resolves a function breakpoint to the opaque address of the first instruction of each method
+    /// `name` names (the same space as `stack` / `set_breakpoints`), or to nothing when no method has
+    /// that name. `name` is as the user typed it: a method's name, optionally qualified by its type
+    /// and namespace (`Main`, `Program.Main`, `Demo.Program.Main`).
+    ///
+    /// Several addresses are one breakpoint bound in several places -- the overloads of a method,
+    /// for one -- and the adapter arms them all. The default resolves nothing.
+    fn resolve_function_breakpoint(&self, name: &str) -> Vec<u64> {
+        let _ = name;
+        Vec::new()
     }
 
     /// The source location a code `address` (from `stack`) maps to, or `None` without a
@@ -313,6 +400,34 @@ pub enum Stop {
     Running,
     /// A fault ended the run, with a human-readable description.
     Fault(String),
+    /// Stopped on an exception that an armed filter ([`DebugBackend::set_exception_filters`])
+    /// matched, where it was thrown, with the program's frames still there to inspect. The run goes
+    /// on from here when it is resumed.
+    Exception(ExceptionInfo),
+}
+
+/// Where a target stops on an exception, as a client offers the choice to its user.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ExceptionFilter {
+    /// Wherever an exception is thrown, whether or not something catches it.
+    All,
+    /// Where an exception is thrown that nothing will catch: the throw that would otherwise end the
+    /// run.
+    Uncaught,
+}
+
+/// The exception a target stopped on ([`Stop::Exception`]).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ExceptionInfo {
+    /// The exception's type as the target names it: a managed exception's full type name
+    /// (`System.InvalidOperationException`), or the processor's name for a fault it took.
+    pub type_name: String,
+    /// The exception's message, empty when it has none.
+    pub message: String,
+    /// The filter this stop answers. [`ExceptionFilter::Uncaught`] says nothing will catch the
+    /// exception, so the run ends if it goes on; [`ExceptionFilter::All`] says only that it was
+    /// thrown.
+    pub filter: ExceptionFilter,
 }
 
 /// One call-stack frame: an opaque code address, a display name, and a 1-based line.

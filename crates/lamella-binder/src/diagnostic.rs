@@ -965,6 +965,26 @@ pub enum DiagnosticKind {
     /// a `Main` in a generic class are each `CS5001`, while `void`/`int` x `()`/`(string[])` are
     /// the four that work -- in a struct or a class, public or private.
     NoEntryPoint,
+    /// `CS7022` (a warning): a method that would be an entry point is ignored, because the
+    /// program's TOP-LEVEL STATEMENTS are its entry point (C# 9). One per such method, at its name.
+    TopLevelStatementsIgnoreMain {
+        /// The ignored method as csc names it: its enclosing types, dotted, then `Main` and its
+        /// parameter types -- `C.Main()`, `O.I.Main(string[])`.
+        method: Box<str>,
+    },
+    /// `CS8801`: code outside the top-level statements names a local variable or local function
+    /// they declare. Their outermost names are found before the global namespace's own, so such a
+    /// name is an error rather than whatever it would otherwise mean (C# 9).
+    TopLevelLocalUsedOutside {
+        /// The local's name.
+        name: Box<str>,
+    },
+    /// `CS8802`: a second compilation unit has top-level statements; only one may (C# 9).
+    /// Reported at its first statement.
+    TopLevelStatementsInSeveralUnits,
+    /// `CS8805`: a library is compiled from a program with top-level statements, which are an
+    /// entry point and need an executable (C# 9). Reported at the first statement.
+    TopLevelStatementsNeedExecutable,
     /// `CS0428`: a method group is used where a non-delegate type is expected (it was not
     /// invoked and does not convert to the target).
     MethodGroupToNonDelegate {
@@ -2502,6 +2522,10 @@ impl DiagnosticKind {
             DiagnosticKind::NoEnclosingLoop => 139,
             DiagnosticKind::MultipleEntryPoints => 17,
             DiagnosticKind::NoEntryPoint => 5001,
+            DiagnosticKind::TopLevelStatementsIgnoreMain { .. } => 7022,
+            DiagnosticKind::TopLevelLocalUsedOutside { .. } => 8801,
+            DiagnosticKind::TopLevelStatementsInSeveralUnits => 8802,
+            DiagnosticKind::TopLevelStatementsNeedExecutable => 8805,
             DiagnosticKind::MethodGroupToNonDelegate { .. } => 428,
             DiagnosticKind::ConstantExpected => 150,
             DiagnosticKind::ConstantOfTypeExpected { .. } => 9135,
@@ -2762,7 +2786,8 @@ impl DiagnosticKind {
             | DiagnosticKind::SwitchExpressionNotExhaustive
             | DiagnosticKind::ExternMemberHasNoAttributes { .. }
             | DiagnosticKind::ExternConstructor { .. }
-            | DiagnosticKind::NullableAnnotationOutsideContext => Severity::Warning,
+            | DiagnosticKind::NullableAnnotationOutsideContext
+            | DiagnosticKind::TopLevelStatementsIgnoreMain { .. } => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -3196,6 +3221,21 @@ impl fmt::Display for DiagnosticKind {
                 f,
                 "Program does not contain a static 'Main' method suitable for an entry point"
             ),
+            DiagnosticKind::TopLevelStatementsIgnoreMain { method } => write!(
+                f,
+                "The entry point of the program is global code; ignoring '{method}' entry point."
+            ),
+            DiagnosticKind::TopLevelLocalUsedOutside { name } => write!(
+                f,
+                "Cannot use local variable or local function '{name}' declared in a top-level \
+                 statement in this context."
+            ),
+            DiagnosticKind::TopLevelStatementsInSeveralUnits => {
+                write!(f, "Only one compilation unit can have top-level statements.")
+            }
+            DiagnosticKind::TopLevelStatementsNeedExecutable => {
+                write!(f, "Program using top-level statements must be an executable.")
+            }
             DiagnosticKind::MethodGroupToNonDelegate { method, target } => write!(
                 f,
                 "Cannot convert method group '{method}' to non-delegate type '{target}'"

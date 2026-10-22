@@ -2,7 +2,7 @@
 
 use crate::args::{self, Spec};
 use lamella_catalog::{self as catalog, BOARDS};
-use lamella_bsp_gen::fit::{Budget, BudgetSource, Fit, FitVerdict, fit};
+use lamella_bsp_gen::fit::{Budget, BudgetSource, Fit, FitVerdict, fit, fit_external};
 use lamella_bsp_gen::reconcile::{
     Claim, ClaimStatus, Observation, Outcome, ReconcileVerdict, reconcile,
 };
@@ -24,10 +24,14 @@ A `-` in the FLASH column means nobody has stated how that board is programmed y
 cannot be. The board id in the first column is what --board takes everywhere else.";
 
 const FIT_USAGE: &str = "\
-usage: lamella fit --board <id> --image-bytes <n>
+usage: lamella fit --board <id> --image-bytes <n> [--window-bytes <n>]
 
 Answers whether an image of <n> bytes fits that board, from the board facts alone -- no hardware,
 no image, no compiler. `lamella build --format` prints the byte count to pass.
+
+--window-bytes is the size of the half of an image the board keeps in its external flash, on a
+board that has one. That half is judged against the external flash, and --image-bytes, then the
+half the part boots from, against the part's own flash.
 
 It answers about FLASH. A program that fits may still fail to run for want of RAM, which is a
 different question this verb does not claim to answer.";
@@ -102,7 +106,7 @@ pub fn fit_command(args: &[String]) -> ExitCode {
     let spec = Spec {
         verb: "fit",
         usage: Some(FIT_USAGE),
-        values: &["--board", "--image-bytes"],
+        values: &["--board", "--image-bytes", "--window-bytes"],
         flags: &[],
     };
     let parsed = match args::parse_or_halt(args, &spec) {
@@ -134,8 +138,51 @@ pub fn fit_command(args: &[String]) -> ExitCode {
         }
     };
 
+    let window = match parsed.value("--window-bytes").map(str::parse::<i64>) {
+        None => None,
+        Some(Ok(bytes)) if bytes >= 0 => Some(bytes),
+        Some(_) => {
+            eprintln!("lamella fit: --window-bytes takes a size: 0 bytes or more.");
+            return ExitCode::FAILURE;
+        }
+    };
+    let external = match window.map(|bytes| fit_external(&board, bytes)) {
+        None => None,
+        Some(Some(judged)) => Some(judged),
+        Some(None) => {
+            eprintln!(
+                "lamella fit: {board_id} states no external flash, so --window-bytes has nothing to be \
+                 judged against."
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
     let verdict = fit(&board, &part, image_bytes);
     print!("{}", render(board_id, &verdict));
+    let Some((budget, external_fit)) = external else {
+        return exit_for(&verdict);
+    };
+    let region = match &budget.source {
+        BudgetSource::Board { region } => region.as_str(),
+        BudgetSource::Part => "",
+    };
+    let window_bytes = window.unwrap_or(0);
+    match &external_fit {
+        Fit::Fits { headroom } => println!(
+            "\nexternal flash: FITS -- {window_bytes} B of {} B in board region '{region}', {headroom} B to spare",
+            budget.bytes
+        ),
+        Fit::Exceeds { over } => println!(
+            "\nexternal flash: DOES NOT FIT -- {window_bytes} B against {} B in board region '{region}', \
+             {over} B over",
+            budget.bytes
+        ),
+        Fit::Unknown { missing } => println!("\nexternal flash: UNKNOWN -- {missing}"),
+    }
+    if matches!(external_fit, Fit::Exceeds { .. }) {
+        return ExitCode::FAILURE;
+    }
     exit_for(&verdict)
 }
 

@@ -31,5 +31,9 @@ namespace Lamella.Generated
         public const uint SYSCFG_RCC_EN_OFF = 68;
         public const uint SYSCFG_RCC_EN_BIT = 14;
         public const uint SYSCFG_RCC_EN_MASK = 0x4000;
+        public const uint QUADSPI_BASE = 0xA0001000;
+        public const uint QUADSPI_RCC_EN_OFF = 56;
+        public const uint QUADSPI_RCC_EN_BIT = 1;
+        public const uint QUADSPI_RCC_EN_MASK = 0x2;
     }
 }

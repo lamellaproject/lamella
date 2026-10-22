@@ -13,7 +13,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Nrf52833SpiDriver : SpiDriver
+internal sealed class Nrf52833SpiDriver : SpiDriver
 {
     private readonly uint _eventsReady;
     private readonly uint _intenclr;

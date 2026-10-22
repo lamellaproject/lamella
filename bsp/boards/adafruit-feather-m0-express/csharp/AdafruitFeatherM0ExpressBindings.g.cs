@@ -13,6 +13,27 @@ namespace Lamella.Generated
         // -- identity --
         public const int BOARD_MODEL = 16;
         public const string BOARD_VENDOR = "Adafruit";
+
+        /// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+        /// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+        /// peripherals of the same kind can share no register at all, so a consumer that selects a
+        /// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+        /// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+        /// name a driver; and a uart is a different register map on every family, so the kind does
+        /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+        public const string HEADER_I2C_DRIVER_FAMILY = "samd21-sercom";
+
+        // -- HEADER_I2C: a sercom-i2c binding descriptor (the CORE-CLOCK RATE, not a
+        // divisor: an I2C bus speed is a runtime Configure choice) --
+        public const uint HEADER_I2C_SERCOM_BASE = 0x42001400;
+        public const uint HEADER_I2C_IRQ = 12;
+        public const uint HEADER_I2C_GCLK_CLKCTRL_VALUE = 0x4017;
+        public const uint HEADER_I2C_APBC_MASK = 0x20;
+        public const uint HEADER_I2C_PMUX_REG = 0x4100443B;
+        public const uint HEADER_I2C_PMUX_PAIR = 0x22;
+        public const uint HEADER_I2C_PINCFG_SDA_REG = 0x41004456;
+        public const uint HEADER_I2C_PINCFG_SCL_REG = 0x41004457;
+        public const uint HEADER_I2C_CORE_CLOCK_HZ = 8000000;
         public const uint DEVICE_COUNT = 2;
 
         // -- on-board devices: PORT group base + pin index + mask --

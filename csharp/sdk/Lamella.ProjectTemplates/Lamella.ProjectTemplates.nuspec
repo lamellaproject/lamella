@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>Lamella.ProjectTemplates</id>
+    <version>$version$</version>
+    <!-- Packing writes here what every package carries: authors, license, licenseUrl, projectUrl, copyright and repository. -->
+    <description>Templates for dotnet new that create C# programs for Lamella: dotnet new lamella-app creates a project that builds with dotnet build and runs with dotnet run. Install them with dotnet new install Lamella.ProjectTemplates.</description>
+    <packageTypes>
+      <packageType name="Template" />
+    </packageTypes>
+  </metadata>
+</package>

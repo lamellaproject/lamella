@@ -33,7 +33,8 @@ use lamella_syntax::ast::{
     NamespaceMember, Parameter, ParameterModifier, QualifiedName, Stmt, StmtKind, TypeDecl, TypeKind,
     TypeParameter,
     TypeRef, UsingDirective, VariableDeclarator, auto_property_backing_field_name,
-    explicit_interface_member_name, is_auto_property,
+    explicit_interface_member_name, is_auto_property, TOP_LEVEL_ASYNC_ENTRY_POINT,
+    TOP_LEVEL_ENTRY_POINT,
 };
 use lamella_syntax::diagnostic::{Diagnostic as SyntaxDiagnostic, Severity};
 use lamella_syntax::lexer::{LexOptions, OutputKind};
@@ -820,6 +821,7 @@ fn build_image(
         mut tokens,
         entry_point,
     } = source;
+    let entry_point = tokens.top_level_entry_point.or(entry_point);
     let pending_lambdas = core::mem::take(&mut tokens.pending_lambdas);
     if !pending_lambdas.is_empty() || !tokens.pending_instance_bodies.is_empty() {
         emit_closure_types(&mut image, &mut binder, &mut tokens, pending_lambdas)?;
@@ -1285,7 +1287,7 @@ fn encode_attribute_constant(
             blob.extend_from_slice(&(*value as u16).to_le_bytes());
         }
         (SpecialType::Single, Literal::Real { bits, .. }) => {
-            blob.extend_from_slice(&(f64::from_bits(*bits) as f32).to_bits().to_le_bytes());
+            blob.extend_from_slice(&lamella_binder::single_constant(*bits).to_bits().to_le_bytes());
         }
         (SpecialType::Double, Literal::Real { bits, .. }) => blob.extend_from_slice(&bits.to_le_bytes()),
         (_, Literal::Integer { value, .. }) => return encode_integer(*special, *value, blob),
@@ -3020,6 +3022,9 @@ fn emit_type_inner(
         let user_attributes =
             interop::without_pseudo_custom(&declaration.attributes, interop::is_pseudo_custom_type_attribute);
         emit_attributes(image, binder, tokens, &enclosing, type_token, &user_attributes);
+        if declaration.from_top_level_statements && later.is_empty() {
+            emit_compiler_generated_marker(image, tokens, type_token);
+        }
         type_token
         }
     };
@@ -3229,6 +3234,8 @@ fn emit_type_inner(
                 ..
             } => {
                 tokens.next_impl_flags = method_impl_flags(attributes);
+                let async_entry_point = declaration.from_top_level_statements
+                    && &**name == TOP_LEVEL_ASYNC_ENTRY_POINT;
                 let token = emit_one_method(
                     image,
                     binder,
@@ -3243,10 +3250,20 @@ fn emit_type_inner(
                     *is_vararg,
                     body,
                     explicit_interface.as_ref(),
-                    0,
+                    if async_entry_point { SPECIAL_NAME } else { 0 },
                     debug,
                 )?;
                 emit_attributes(image, binder, tokens, &enclosing, token, attributes);
+                if async_entry_point {
+                    emit_debugger_step_through(image, tokens, token);
+                }
+                if declaration.from_top_level_statements
+                    && (async_entry_point
+                        || (&**name == TOP_LEVEL_ENTRY_POINT
+                            && !modifiers.contains(&Modifier::Async)))
+                {
+                    tokens.top_level_entry_point = Some(token);
+                }
                 if entry_point.is_none()
                     && &**name == "Main"
                     && modifiers.contains(&Modifier::Static)
@@ -7311,6 +7328,22 @@ fn emit_compiler_generated_marker(image: &mut ImageBuilder, tokens: &mut Tokens,
     image.add_custom_attribute(target, constructor, &[0x01, 0x00, 0x00, 0x00]);
 }
 
+/// `[System.Diagnostics.DebuggerStepThrough]` on a method the compiler wrote around a program's
+/// own code -- the synchronous entry point of top-level statements that await, as csc marks it --
+/// so a debugger steps through it into the statements it runs.
+fn emit_debugger_step_through(image: &mut ImageBuilder, tokens: &mut Tokens, target: Token) {
+    let Some(constructor) = synthesized_attribute_ctor(
+        image,
+        tokens,
+        "System.Diagnostics",
+        "DebuggerStepThroughAttribute",
+        &[],
+    ) else {
+        return;
+    };
+    image.add_custom_attribute(target, constructor, &[0x01, 0x00, 0x00, 0x00]);
+}
+
 /// `[System.Diagnostics.DebuggerBrowsable(DebuggerBrowsableState.Never)]` on an auto-property's
 /// backing field, as csc emits: a debugger then shows the PROPERTY and not the field behind it,
 /// which is the whole reason the field has a name no program can type.
@@ -7638,7 +7671,7 @@ fn constant_row(
             }
         }
         (SpecialType::Single, Literal::Real { bits, .. }) => {
-            value.extend_from_slice(&(f64::from_bits(*bits) as f32).to_le_bytes());
+            value.extend_from_slice(&lamella_binder::single_constant(*bits).to_le_bytes());
         }
         (SpecialType::Double, Literal::Real { bits, .. }) => {
             value.extend_from_slice(&f64::from_bits(*bits).to_le_bytes());

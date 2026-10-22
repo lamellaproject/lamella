@@ -1,0 +1,27 @@
+<Project Sdk="Lamella.Sdk/$version$">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>lamella1.0</TargetFramework>
+<!--#if (hasBoard) -->
+    <!-- The board this program runs on, by its id. dotnet run sends it only to a board of this
+         kind. -->
+    <LamellaTargetBoard>lamella-board-id</LamellaTargetBoard>
+<!--#else -->
+    <!-- No board is named, so dotnet run runs this program on this computer, under Lamella's
+         interpreter. With a board running Lamella's firmware or a debug probe attached, dotnet run
+         asks where to run it, this computer first; a script or a CI job, where it cannot ask, names
+         the device local with dotnet run's device option. To run it on a board, name the board by
+         its id; dotnet run then sends it only to a board of that kind.
+    <LamellaTargetBoard>rpi-pico2</LamellaTargetBoard>
+    -->
+<!--#endif -->
+  </PropertyGroup>
+<!--#if (hasBoard) -->
+
+  <ItemGroup>
+    <PackageReference Include="System.Device.Gpio" Version="4.2.0" />
+  </ItemGroup>
+<!--#endif -->
+
+</Project>

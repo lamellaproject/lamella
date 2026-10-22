@@ -12,15 +12,15 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
     SetupDiGetDeviceInterfaceDetailW, SetupDiGetDeviceInterfacePropertyW,
 };
-use windows_sys::Win32::Devices::Properties::{DEVPROPKEY, DEVPROPTYPE};
+use windows_sys::Win32::Devices::Properties::DEVPROPTYPE;
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{
     HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_STATUS_SUCCESS, HidD_FreePreparsedData, HidD_GetAttributes,
     HidD_GetHidGuid, HidD_GetPreparsedData, HidD_GetProductString, HidD_GetSerialNumberString,
     HidP_GetCaps, PHIDP_PREPARSED_DATA,
 };
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_IO_PENDING, GetLastError, HANDLE, INVALID_HANDLE_VALUE, WAIT_OBJECT_0,
-    WAIT_TIMEOUT,
+    CloseHandle, DEVPROPKEY, ERROR_IO_PENDING, GetLastError, HANDLE, INVALID_HANDLE_VALUE,
+    WAIT_OBJECT_0, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING, ReadFile,
@@ -93,7 +93,7 @@ unsafe fn hid_string(handle: HANDLE, serial: bool) -> Option<String> {
     } else {
         HidD_GetProductString(handle, buf.as_mut_ptr().cast(), bytes)
     };
-    if ok == 0 {
+    if !ok {
         return None;
     }
     let len = buf.iter().position(|&w| w == 0).unwrap_or(buf.len());
@@ -206,7 +206,7 @@ unsafe fn for_each_hid(
 unsafe fn attributes(handle: HANDLE) -> Option<HIDD_ATTRIBUTES> {
     let mut attrs: HIDD_ATTRIBUTES = mem::zeroed();
     attrs.Size = mem::size_of::<HIDD_ATTRIBUTES>() as u32;
-    (HidD_GetAttributes(handle, &mut attrs) != 0).then_some(attrs)
+    HidD_GetAttributes(handle, &mut attrs).then_some(attrs)
 }
 
 /// The top-level HID usage and the report byte-lengths (each including the leading report-id byte),
@@ -222,7 +222,7 @@ struct HidCaps {
 
 unsafe fn hid_caps(handle: HANDLE) -> Option<HidCaps> {
     let mut preparsed: PHIDP_PREPARSED_DATA = mem::zeroed();
-    if HidD_GetPreparsedData(handle, &mut preparsed) == 0 {
+    if !HidD_GetPreparsedData(handle, &mut preparsed) {
         return None;
     }
     let mut caps: HIDP_CAPS = mem::zeroed();

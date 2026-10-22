@@ -12,7 +12,7 @@ namespace Lamella.Hardware
     /// with <see cref="Configure"/> when another device's were applied last, asserting its chip
     /// select, the transfer, and releasing the select. Code that drives this driver directly can
     /// take the same lock to keep the bus's devices off it meanwhile.</remarks>
-    public abstract class SpiDriver : System.IDisposable
+    internal abstract class SpiDriver : System.IDisposable
     {
         internal SpiDevice ConfiguredFor;
 

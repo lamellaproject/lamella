@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2013/05/nuspec.xsd">
+  <metadata>
+    <id>Lamella.Tools.$rid$</id>
+    <version>$version$</version>
+    <!-- Packing writes here what every package carries: authors, license, licenseUrl, projectUrl, copyright and repository. -->
+    <description>The lamella tool for $rid$. Lamella.Sdk runs it to build a lamella1.0 project, to list the boards dotnet run offers, and to run a program; restore downloads the one for the machine the .NET SDK runs on, at the SDK's own version.</description>
+  </metadata>
+</package>

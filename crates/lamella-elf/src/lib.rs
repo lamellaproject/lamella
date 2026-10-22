@@ -1144,6 +1144,31 @@ pub struct FlatImage {
 /// assert!(image.bytes.ends_with(&[0x00, 0xBF, 0x00, 0xBF]));
 /// ```
 pub fn flat_image(bytes: &[u8]) -> Result<FlatImage, ElfError> {
+    flatten(&load_segments(bytes)?)
+}
+
+/// One loadable segment of a linked executable: where its bytes belong, by physical address, and
+/// the bytes the file carries for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LoadSegment<'a> {
+    /// The physical address (`p_paddr`) the first byte belongs at.
+    pub address: u32,
+    /// The bytes the file carries for the segment: `p_filesz` of them.
+    pub bytes: &'a [u8],
+}
+
+/// Every `PT_LOAD` segment of a linked ELF32 executable that carries file bytes, in program-header
+/// order, by physical address.
+///
+/// The listing [`flat_image`] flattens. A caller that writes regions separately -- a part's own
+/// flash and a flash outside it, say -- takes the segments, groups them by region and flattens each
+/// group with [`flatten`], rather than flattening the whole and finding a gap of hundreds of
+/// megabytes between the regions.
+///
+/// # Errors
+/// [`ElfError::NotExecutableElf32`] for anything but a little-endian ELF32 executable, and
+/// [`ElfError::Truncated`] for a program header or segment that runs past the file.
+pub fn load_segments(bytes: &[u8]) -> Result<Vec<LoadSegment<'_>>, ElfError> {
     const PT_LOAD: u32 = 1;
     const ET_EXEC: u16 = 2;
     const PHDR_SIZE: usize = 32;
@@ -1177,7 +1202,7 @@ pub fn flat_image(bytes: &[u8]) -> Result<FlatImage, ElfError> {
         return Err(ElfError::Truncated);
     }
 
-    let mut loads: Vec<(u32, &[u8])> = Vec::new();
+    let mut loads = Vec::new();
     for i in 0..phnum {
         let p = phoff + i * phentsize;
         if u32_at(p)? != PT_LOAD {
@@ -1192,25 +1217,35 @@ pub fn flat_image(bytes: &[u8]) -> Result<FlatImage, ElfError> {
         let data = bytes
             .get(offset..offset + filesz)
             .ok_or(ElfError::Truncated)?;
-        loads.push((paddr, data));
+        loads.push(LoadSegment { address: paddr, bytes: data });
     }
-    if loads.is_empty() {
+    Ok(loads)
+}
+
+/// `segments` flattened into one image from the lowest address any of them claims to the highest,
+/// the gaps between them zero-filled.
+///
+/// # Errors
+/// [`ElfError::NoLoadableContent`] for no segments -- see [`flat_image`] for why that is an error
+/// and not an empty image.
+pub fn flatten(segments: &[LoadSegment<'_>]) -> Result<FlatImage, ElfError> {
+    if segments.is_empty() {
         return Err(ElfError::NoLoadableContent);
     }
 
-    let base = loads.iter().map(|(a, _)| *a).min().expect("non-empty");
-    let end = loads
+    let base = segments.iter().map(|segment| segment.address).min().expect("non-empty");
+    let end = segments
         .iter()
-        .map(|(a, d)| u64::from(*a) + d.len() as u64)
+        .map(|segment| u64::from(segment.address) + segment.bytes.len() as u64)
         .max()
         .expect("non-empty");
     let span = usize::try_from(end - u64::from(base)).map_err(|_| ElfError::Truncated)?;
 
     let mut out = Vec::new();
     out.resize(span, 0u8);
-    for (paddr, data) in loads {
-        let at = (paddr - base) as usize;
-        out[at..at + data.len()].copy_from_slice(data);
+    for segment in segments {
+        let at = (segment.address - base) as usize;
+        out[at..at + segment.bytes.len()].copy_from_slice(segment.bytes);
     }
     Ok(FlatImage { base, bytes: out })
 }

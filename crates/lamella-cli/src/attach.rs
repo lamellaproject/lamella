@@ -30,14 +30,25 @@ pub fn run_on_target(path: &Path, target: &str) -> Ended {
         eprintln!("{refusal}");
         return Ended::Failed;
     }
+    run_image_on_target(path, target, board.as_ref(), |answered| {
+        crate::bake::image_for_firmware(path, "run", cannot_run_on_a_target, answered)
+    })
+}
 
-    let Some((mut transport, session)) =
-        crate::deploy::connect("run", target, on_device::run_caps(), board.as_ref())
+/// Deploy the image `image_for` builds for the board that answers at `target`, and run it there,
+/// streaming its output; `path` names the program in what is said.
+pub fn run_image_on_target(
+    path: &Path,
+    target: &str,
+    board: Option<&crate::project::BoardCheck>,
+    image_for: impl FnOnce(Option<&str>) -> Result<Vec<u8>, String>,
+) -> Ended {
+    let Some((mut transport, session)) = crate::deploy::connect("run", target, on_device::run_caps(), board)
     else {
         return Ended::Failed;
     };
     let answered = lamella_wire_host::boards::board_answering(session.identity.product_model);
-    let image = match crate::bake::image_for_firmware(path, "run", cannot_run_on_a_target, answered.as_deref()) {
+    let image = match image_for(answered.as_deref()) {
         Ok(image) => image,
         Err(error) => {
             eprintln!("{error}");
@@ -167,6 +178,15 @@ fn stream(backend: &mut WireHostBackend, err: &mut dyn Write) -> Ended {
             }
             Stop::Fault(why) => {
                 say(err, &format!("the program stopped: {why}"));
+                return Ended::Uncaught;
+            }
+            Stop::Exception(info) => {
+                let what = if info.message.is_empty() {
+                    info.type_name
+                } else {
+                    format!("{}: {}", info.type_name, info.message)
+                };
+                say(err, &format!("the program stopped on an exception: {what}"));
                 return Ended::Uncaught;
             }
             Stop::Breakpoint | Stop::Step => {

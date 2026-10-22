@@ -63,5 +63,15 @@ namespace Lamella.Generated
         public const uint BUTTON0_BANK = 0;
         public const uint BUTTON0_MASK = 0x1;
         public const uint BUTTON0_ACTIVE_LOW = 0;
+
+        /// -- memory regions the board fits: SIZE is what a program may reach, which a device's own
+        /// size may exceed; a region with a CONTROLLER does not exist until that instance is brought
+        /// up, and touching it first is a bus fault rather than a wrong value --
+        public const uint MEMORY_REGION_COUNT = 1;
+        public const string MEMORY_QSPI_KIND = "flash";
+        public const uint MEMORY_QSPI_BASE = 0x90000000;
+        public const uint MEMORY_QSPI_SIZE = 0x4000000;
+        public const string MEMORY_QSPI_CONTROLLER = "quadspi";
+        public const uint MEMORY_QSPI_OPTIONAL = 1;
     }
 }

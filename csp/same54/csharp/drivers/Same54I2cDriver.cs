@@ -4,7 +4,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Same54I2cDriver : I2cDriver
+internal sealed class Same54I2cDriver : I2cDriver
 {
     const int WaitBound = 100000;
 

@@ -2,13 +2,12 @@
 namespace Lamella.Hardware
 {
     /// <summary>Creates the ADC driver, on first use.</summary>
-    public delegate AdcDriver AdcDriverFactory();
+    internal delegate AdcDriver AdcDriverFactory();
 
     /// <summary>The board's ADC driver binding. A board binds it once at startup, and everything
-    /// that reads a converter -- <see cref="Adc"/>, every controller from
-    /// <see cref="CreateAnalogController"/>, and any library built over this binding -- resolves
-    /// through here.</summary>
-    public sealed class AdcControllers
+    /// that reads a converter -- <see cref="Adc"/> and every controller from
+    /// <see cref="CreateAnalogController"/> -- resolves through here.</summary>
+    internal sealed class AdcControllers
     {
         private AdcControllers() { }
 
@@ -34,29 +33,21 @@ namespace Lamella.Hardware
         }
 
         /// <summary>A <see cref="System.Device.Analog.AnalogController"/> over the bound ADC driver,
-        /// whose pins are the converter's channels, numbered as the driver numbers them.</summary>
+        /// whose pins are the board's pins, numbered as the board numbers them: each is a pin the
+        /// driver says one of its channels reads.</summary>
         /// <remarks>Creating one touches no hardware and resolves nothing: the driver is resolved,
         /// and the converter brought up, by the first call that needs it. Every controller created
-        /// here, and every other surface over the binding, acts on the same driver instance.</remarks>
+        /// here, and every other surface over the binding, acts on the same driver instance. With no
+        /// driver bound, the controller has no analog pins.</remarks>
         public static System.Device.Analog.AnalogController CreateAnalogController()
         {
             return new AdcAnalogController();
         }
 
         /// <summary>The bound ADC driver, creating it on first use.</summary>
-        /// <remarks>
-        /// <para>THE SAME INSTANCE <see cref="Adc"/> and the analog controllers use. One
-        /// converter has one driver, and this caches it after the first call, so a reading taken
-        /// through <see cref="Adc"/> and one taken through a driver from here act on the same
-        /// registers.</para>
-        /// <para>That guarantee is the reason this is public. Code doing bring-up or a self-test
-        /// often needs BOTH the portable entry points and a control that only the concrete driver
-        /// exposes -- a reference rail, a raw register, a calibration step. Without this the only
-        /// way to reach the driver is to construct a SECOND one over the same converter, which
-        /// reads as working and leaves the entry points talking to the first.</para>
-        /// <para>Ordinary reading should go through <see cref="Adc"/>. Reach for this when you need
-        /// something it cannot express, and cast to the driver type your board bound.</para>
-        /// </remarks>
+        /// <remarks>THE SAME INSTANCE <see cref="Adc"/> and the analog controllers use. One converter
+        /// has one driver, and this caches it after the first call, so every surface over the binding
+        /// acts on the same registers.</remarks>
         /// <exception cref="System.InvalidOperationException">No ADC driver is bound.</exception>
         public static AdcDriver Resolve()
         {

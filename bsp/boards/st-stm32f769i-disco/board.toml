@@ -15,11 +15,6 @@
 # THE USER BUTTON READS THE SAME WAY AND THE MANUAL IS RIGHT ABOUT IT: "when the button is
 # depressed the logic state is 1, otherwise, the logic state is 0". So every control line on this
 # board is active high.
-#
-# NOT MODELLED, AND NAMED SO THE OMISSION IS DELIBERATE: a 128-Mbit SDRAM on the FMC (used as
-# 4M x 32) and a 512-Mbit Quad-SPI NOR flash. Both are the external-memory stratum, which needs
-# the controller instances and block tables this family does not have yet -- the same shape the
-# stm32f7 family already carries for its own two memories.
 
 [table]
 kind = "board"
@@ -56,6 +51,26 @@ instance = "usart1"
 function = "AF7"
 tx = { pin = "PA9" }
 rx = { pin = "PA10" }
+
+# --- external memory -----------------------------------------------------------------------
+#
+# THE QUAD-SPI FLASH DOES NOT EXIST AT RESET. It appears at its base once the quadspi controller is
+# configured, and an access before that is a bus fault rather than a wrong value -- so the region
+# names its controller, and `optional` says the board runs a program without it.
+#
+# TWO PARTS FIT THE FOOTPRINT, SO THE REGION NAMES NO DEVICE. The board's schematic draws a Micron
+# MT25QL512ABB1EW9 and a Macronix MX25L51245GZ2I-08G on the same six nets, so a unit may carry
+# either. They answer different JEDEC identities and take different fast-read frames, which is
+# why a bring-up reads the identity before it uses the part at all.
+
+[[memory]]
+name = "qspi"
+kind = "flash"
+base = 0x90000000
+size = 0x4000000            # 64 MB: both parts the schematic allows are 512 Mbit.
+controller = "quadspi"
+optional = true
+source = "UM2033 Rev 5 section 5.14: a 512-Mbit Quad-SPI NOR flash memory is connected to the Quad-SPI interface of the STM32F769NIH6; its Table 14 names the six lines PB2 QUADSPI_CLK, PB6 QUADSPI_BK1_NCS, PC9 QUADSPI_BK1_IO0, PC10 QUADSPI_BK1_IO1, PE2 QUADSPI_BK1_IO2 and PD13 QUADSPI_BK1_IO3. MB1225 schematic rev B03 sheet 7 draws U12 (Micron MT25QL512ABB1EW9) and U250 (Macronix MX25L51245GZ2I-08G) on the same six nets, chip select pulled up through R86. RM0410 Rev 5 section 14.3.7 and its memory map: the memory-mapped bank at 0x90000000, up to 256 Mbytes, from which code may execute."
 
 # --- the operating point ----------------------------------------------------------------------
 #

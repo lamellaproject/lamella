@@ -5711,7 +5711,7 @@ pub fn bindings_class(board: &str) -> String {
 
 /// The name of the class a board's C# package declares by hand beside its generated bindings: the
 /// bindings name less the maker the board's id begins with, so `rpi-pico2-w` gives `Pico2W`. Its
-/// namespace is `Lamella.Boards.` and the board's [`vendor_segment`], and `build-boards.ps1` names the
+/// namespace is `Lamella.Boards.` and the board's [`vendor_segment`], and `csharp/build-boards.ps1` names the
 /// board's assembly by the same rule.
 #[must_use]
 pub fn board_class(board: &str) -> String {
@@ -5730,7 +5730,7 @@ pub const TARGET_BOARD_FACTS_FILE: &str = "TargetBoardFacts.g.cs";
 /// Emits the generated half of `Lamella.Hardware.TargetBoard` for one board: the board's id, which is
 /// the name a build selects the board by, and the call that arms the board.
 ///
-/// The hand-written half is `bsp/common/csharp/TargetBoard.cs`, and `build-boards.ps1` compiles
+/// The hand-written half is `bsp/common/csharp/TargetBoard.cs`, and `csharp/build-boards.ps1` compiles
 /// both into the board's assembly. `board_class` is the class the board's package declares by hand
 /// ([`board_class`]), when it declares one. Its type initializer binds the board's buses, so arming
 /// reads its `BoardModel`, which runs that initializer the first time and nothing after. A read
@@ -14829,7 +14829,7 @@ reg = "CTRL"
 value = 0x2
 "#;
 
-    /// A board's hand-written class is its bindings name less its maker, as `build-boards.ps1` names
+    /// A board's hand-written class is its bindings name less its maker, as `csharp/build-boards.ps1` names
     /// the board's assembly; and `TargetBoard`'s generated half arms through that class's static,
     /// or reads the bindings' identity where the package declares no class.
     #[test]

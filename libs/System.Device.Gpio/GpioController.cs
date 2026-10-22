@@ -6,6 +6,7 @@ namespace System.Device.Gpio
     {
         private readonly GpioDriver _driver;
         private readonly bool[] _open;
+        private readonly GpioPin[] _pins;
 
         /// <summary>Creates a controller over the board's GPIO driver.</summary>
         /// <exception cref="System.PlatformNotSupportedException">The program was built for no
@@ -33,6 +34,7 @@ namespace System.Device.Gpio
             if ((object)driver != null)
             {
                 _open = new bool[driver.PinCount];
+                _pins = new GpioPin[driver.PinCount];
             }
         }
 
@@ -54,11 +56,21 @@ namespace System.Device.Gpio
             }
         }
 
-        /// <summary>Opens a pin so it is ready to use.</summary>
+        /// <summary>Opens a pin so it is ready to use, and returns it; a pin that is open already is
+        /// returned as it is.</summary>
         public GpioPin OpenPin(int pinNumber)
         {
-            OpenPinCore(pinNumber);
-            return new GpioPin(this, pinNumber);
+            if (!IsPinOpen(pinNumber))
+            {
+                OpenPinCore(pinNumber);
+            }
+            GpioPin pin = _pins[pinNumber];
+            if ((object)pin == null)
+            {
+                pin = new GpioPin(pinNumber, this);
+                _pins[pinNumber] = pin;
+            }
+            return pin;
         }
 
         /// <summary>Opens a pin and sets it to a specific mode.</summary>
@@ -81,7 +93,7 @@ namespace System.Device.Gpio
         public virtual bool IsPinOpen(int pinNumber)
         {
             CheckDriverValid();
-            return _open[pinNumber];
+            return pinNumber >= 0 && pinNumber < _open.Length && _open[pinNumber];
         }
 
         /// <summary>Closes an open pin.</summary>
@@ -106,6 +118,7 @@ namespace System.Device.Gpio
             CheckDriverValid();
             _driver.ClosePin(pinNumber);
             _open[pinNumber] = false;
+            _pins[pinNumber] = null;
         }
 
         /// <summary>Sets the mode of a pin.</summary>

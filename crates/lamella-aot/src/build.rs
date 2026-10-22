@@ -5450,12 +5450,18 @@ fn imported_silent_seams<'a>(
     if imports.is_empty() {
         return found;
     }
+    let friends = !reference.friend_assemblies().is_empty();
     for type_def in reference.type_defs() {
         let Some(type_name) = type_def.name() else {
             continue;
         };
         for method in type_def.methods() {
-            if !named_across_assemblies(&method, method.is_static()) {
+            if !named_across_assemblies(
+                &method,
+                method.is_static(),
+                friends,
+                compiler_generated(type_name.name, &method),
+            ) {
                 continue;
             }
             let Some(method_name) = method.name() else {
@@ -5665,10 +5671,29 @@ fn method_display_names(
 /// must cross the boundary by accessibility (II.23.1.10's low three bits): Family (4), FamORAssem (5)
 /// or Public (6) -- FamANDAssem and below cannot.
 ///
+/// **AN ASSEMBLY THAT NAMES A FRIEND LETS THAT FRIEND CALL ITS INTERNAL MEMBERS BY NAME.** With
+/// `[assembly: InternalsVisibleTo]` (`friends`, II.22.10 rows on the manifest), Assembly (3) and
+/// FamANDAssem (2) cross the boundary too: the friend's compiler bound the call, so its object names
+/// the member, and an internal constructor or static left with an internal symbol had no definition
+/// at link. `generated` excludes what the compiler named -- a member or type whose name begins with
+/// `<`, a lambda's `<Next>b__5_0` in its `<>c` -- because the compiler chooses those names, the same
+/// one can arise in another library, and a friend never calls one by name.
+///
 /// ONE PREDICATE FOR BOTH SIDES OF THE AUDIT: [`library_symbol_names`] exports by it, and
 /// `imported_silent_seams` asks it which of a reference's seams a program can have linked against.
-fn named_across_assemblies(method: &lamella_metadata::Method<'_>, callable: bool) -> bool {
-    method.is_virtual() || (callable && matches!(method.flags() & 0x7, 0x4..=0x6))
+fn named_across_assemblies(
+    method: &lamella_metadata::Method<'_>,
+    callable: bool,
+    friends: bool,
+    generated: bool,
+) -> bool {
+    let lowest = if friends && !generated { 0x2 } else { 0x4 };
+    method.is_virtual() || (callable && (lowest..=0x6).contains(&(method.flags() & 0x7)))
+}
+
+/// Whether a library's member is the compiler's own: its name, or its type's, begins with `<`.
+fn compiler_generated(type_name: &str, method: &lamella_metadata::Method<'_>) -> bool {
+    type_name.starts_with('<') || method.name().is_some_and(|name| name.starts_with('<'))
 }
 
 /// The per-function symbol names for [`build_library_object`]: a cross-assembly-ACCESSIBLE static
@@ -5696,6 +5721,7 @@ fn library_symbol_names<'a>(
 ) -> Vec<alloc::string::String> {
     let mut names: Vec<alloc::string::String> =
         (0..count).map(|i| alloc::format!("{prefix}f{i}")).collect();
+    let friends = !assembly.friend_assemblies().is_empty();
     for type_def in assembly.type_defs() {
         let Some(type_name) = type_def.name() else {
             continue;
@@ -5725,6 +5751,8 @@ fn library_symbol_names<'a>(
             if named_across_assemblies(
                 &method,
                 method.is_static() || is_synth_seam || is_plain_instance,
+                friends,
+                compiler_generated(type_name.name, &method),
             ) {
                 if let (Some(method_name), Some(sig)) =
                     (method.name(), crate::resolver::decodable_signature(&method))

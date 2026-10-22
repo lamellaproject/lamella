@@ -57,3 +57,13 @@ pub const BUTTON0_PIN: u32 = 0;
 pub const BUTTON0_BANK: u32 = 0;
 pub const BUTTON0_MASK: u32 = 0x1;
 pub const BUTTON0_ACTIVE_LOW: u32 = 0;
+
+/// -- memory regions the board fits: SIZE is what a program may reach, which a device's own
+/// size may exceed; a region with a CONTROLLER does not exist until that instance is brought
+/// up, and touching it first is a bus fault rather than a wrong value --
+pub const MEMORY_REGION_COUNT: u32 = 1;
+pub const MEMORY_QSPI_KIND: &str = "flash";
+pub const MEMORY_QSPI_BASE: u32 = 0x90000000;
+pub const MEMORY_QSPI_SIZE: u32 = 0x4000000;
+pub const MEMORY_QSPI_CONTROLLER: &str = "quadspi";
+pub const MEMORY_QSPI_OPTIONAL: u32 = 1;

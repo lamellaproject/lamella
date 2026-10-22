@@ -10,7 +10,7 @@ namespace Lamella.Hardware
     /// this surface deliberately does not carry: a driver produces counts, and a physical quantity
     /// is constructed only where a caller asks for one.</para>
     /// </remarks>
-    public sealed class Adc
+    internal sealed class Adc
     {
         private Adc() { }
 

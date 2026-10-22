@@ -24,9 +24,27 @@ namespace Lamella.Boards.Adafruit
         static FeatherM0Express()
         {
             Buses.BindGpio(new GpioDriverFactory(MakeGpio));
+            Buses.BindI2c(HeaderI2cBusId, new I2cDriverFactory(MakeHeaderI2c));
         }
 
         private static GpioDriver MakeGpio() { return new Samd21GpioDriver(); }
+
+        /// <summary>The logical bus id of the Wire interface's SDA and SCL pins (PA22 and PA23, on
+        /// SERCOM3), as <c>I2cConnectionSettings</c> names it.</summary>
+        public const int HeaderI2cBusId = 0;
+
+        private static I2cDriver MakeHeaderI2c()
+        {
+            return new Samd21I2cDriver(new Samd21SercomI2cBinding(
+                AdafruitFeatherM0ExpressBindings.HEADER_I2C_SERCOM_BASE,
+                AdafruitFeatherM0ExpressBindings.HEADER_I2C_GCLK_CLKCTRL_VALUE,
+                AdafruitFeatherM0ExpressBindings.HEADER_I2C_APBC_MASK,
+                AdafruitFeatherM0ExpressBindings.HEADER_I2C_PMUX_REG,
+                AdafruitFeatherM0ExpressBindings.HEADER_I2C_PMUX_PAIR,
+                AdafruitFeatherM0ExpressBindings.HEADER_I2C_PINCFG_SDA_REG,
+                AdafruitFeatherM0ExpressBindings.HEADER_I2C_PINCFG_SCL_REG,
+                AdafruitFeatherM0ExpressBindings.HEADER_I2C_CORE_CLOCK_HZ));
+        }
 
         /// <summary>The red LED beside the USB jack (Arduino D13) -- the board's blink target, and
         /// the only indicator visible without driving a protocol.</summary>

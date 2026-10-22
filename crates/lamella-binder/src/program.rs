@@ -172,16 +172,19 @@ pub fn bind_compilation_unit_with_reference_model(
     resolve_constants(binder.model_mut(), core::slice::from_ref(unit));
     let target = options.target;
     apply_bind_options(&mut binder, options);
+    let units = core::slice::from_ref(unit);
+    declare_top_level_statements(&mut binder, units);
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
     report_duplicate_types(&mut binder, &unit.members, "", &mut declared_types);
     bind_unit_body(&mut binder, unit);
     binder.report_unused_fields();
-    let entry_points = entry_point_diagnostics(binder.model(), target);
+    let (entry_points, top_level) = program_entry_point_reports(binder.model(), units, target);
     let mut diagnostics = binder.into_diagnostics();
     diagnostics.extend(entry_points);
-    let mut units = [diagnostics];
-    withhold_body_diagnostics_after_declaration_error(&mut units);
-    let [diagnostics] = units;
+    let mut per_unit = [diagnostics];
+    withhold_body_diagnostics_after_declaration_error(&mut per_unit);
+    attach_top_level_reports(&mut per_unit, top_level);
+    let [diagnostics] = per_unit;
     diagnostics
 }
 
@@ -197,16 +200,20 @@ pub fn bind_compilation_unit_with_model(
     qualify_declared_signatures(&mut binder, &unit.usings, &unit.members, "");
     binder.model_mut().link_bases();
     resolve_constants(binder.model_mut(), core::slice::from_ref(unit));
+    let units = core::slice::from_ref(unit);
+    declare_top_level_statements(&mut binder, units);
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
     report_duplicate_types(&mut binder, &unit.members, "", &mut declared_types);
     bind_unit_body(&mut binder, unit);
     binder.report_unused_fields();
-    let entry_points = entry_point_diagnostics(binder.model(), OutputKind::Inferred);
+    let (entry_points, top_level) =
+        program_entry_point_reports(binder.model(), units, OutputKind::Inferred);
     let mut diagnostics = binder.into_diagnostics();
     diagnostics.extend(entry_points);
-    let mut units = [diagnostics];
-    withhold_body_diagnostics_after_declaration_error(&mut units);
-    let [diagnostics] = units;
+    let mut per_unit = [diagnostics];
+    withhold_body_diagnostics_after_declaration_error(&mut per_unit);
+    attach_top_level_reports(&mut per_unit, top_level);
+    let [diagnostics] = per_unit;
     diagnostics
 }
 
@@ -293,7 +300,14 @@ fn report_duplicate_types(
     namespace: &str,
     declared: &mut DeclaredTypes,
 ) {
-    for member in members {
+    let is_top_level = |member: &&NamespaceMember| {
+        matches!(member, NamespaceMember::Type(declaration) if declaration.from_top_level_statements)
+    };
+    let ordered = members
+        .iter()
+        .filter(|member| !is_top_level(member))
+        .chain(members.iter().filter(is_top_level));
+    for member in ordered {
         let (name, key, incoming) = match member {
             NamespaceMember::Namespace(declaration) => {
                 let inner = join_namespace(namespace, &declaration.name);
@@ -858,6 +872,11 @@ pub fn bind_compilation_units_with_reference_model(
     mut model: Model,
     options: BindOptions<'_>,
 ) -> Vec<Vec<Diagnostic>> {
+    let trimmed = crate::top_level::without_later_top_level_statements(units);
+    let (units, several_units) = match &trimmed {
+        Some((kept, reports)) => (kept.as_slice(), reports.clone()),
+        None => (units, Vec::new()),
+    };
     for unit in units {
         collect_into(&mut model, unit);
     }
@@ -869,6 +888,7 @@ pub fn bind_compilation_units_with_reference_model(
     binder.model_mut().link_bases();
     resolve_constants(binder.model_mut(), units);
     apply_bind_options(&mut binder, options);
+    declare_top_level_statements(&mut binder, units);
     let mut declared_types: DeclaredTypes = DeclaredTypes::new();
     let mut per_unit: Vec<Vec<Diagnostic>> = units
         .iter()
@@ -879,12 +899,66 @@ pub fn bind_compilation_units_with_reference_model(
             binder.take_diagnostics()
         })
         .collect();
-    let entry_points = entry_point_diagnostics(binder.model(), target);
+    let (entry_points, top_level) = program_entry_point_reports(binder.model(), units, target);
     if let Some(first) = per_unit.first_mut() {
         first.extend(entry_points);
     }
     withhold_body_diagnostics_after_declaration_error(&mut per_unit);
+    let mut reports = several_units;
+    reports.extend(top_level);
+    attach_top_level_reports(&mut per_unit, reports);
     per_unit
+}
+
+/// The whole-program entry-point reports, in the two places they go: the ordinary rules
+/// ([`entry_point_diagnostics`]) for the first unit's list, or -- when the program has top-level
+/// statements, which are its entry point -- theirs
+/// ([`crate::top_level::top_level_entry_point_diagnostics`]), each with the unit it belongs to.
+///
+/// One function for every entry to the binder, so the choice between the two cannot differ
+/// between them.
+fn program_entry_point_reports(
+    model: &Model,
+    units: &[CompilationUnit],
+    target: OutputKind,
+) -> (Vec<Diagnostic>, Vec<(usize, Diagnostic)>) {
+    match crate::top_level::top_level_entry_point_diagnostics(units, target) {
+        Some(reports) => (Vec::new(), reports),
+        None => (entry_point_diagnostics(model, target), Vec::new()),
+    }
+}
+
+/// Tells the binder the program has TOP-LEVEL STATEMENTS (C# 9), and which names they declare at
+/// their outermost level, before any body is bound -- so `CS8801` does not depend on the order the
+/// bodies are bound in. Only the first unit's count: [`bind_compilation_units_with_reference_model`]
+/// has already removed any later ones.
+fn declare_top_level_statements(binder: &mut Binder, units: &[CompilationUnit]) {
+    if let Some(part) = units.iter().find_map(crate::top_level::top_level_part) {
+        binder.set_top_level_statements(crate::top_level::top_level_local_names(part));
+    }
+}
+
+/// Adds the top-level statements' whole-program reports to the lists of the units they belong to:
+/// `CS8802` and `CS8805` first, where csc lists them, and each `CS7022` after the unit's other
+/// diagnostics.
+///
+/// After the declaration-error filter, which none of them may feed: csc reports a body's own
+/// errors beside a `CS8805` (measured), and a warning withholds nothing.
+fn attach_top_level_reports(per_unit: &mut [Vec<Diagnostic>], reports: Vec<(usize, Diagnostic)>) {
+    for (index, diagnostic) in reports {
+        let Some(unit) = per_unit.get_mut(index) else {
+            continue;
+        };
+        if matches!(
+            diagnostic.kind,
+            DiagnosticKind::TopLevelStatementsInSeveralUnits
+                | DiagnosticKind::TopLevelStatementsNeedExecutable
+        ) {
+            unit.insert(0, diagnostic);
+        } else {
+            unit.push(diagnostic);
+        }
+    }
 }
 
 /// Qualifies every SOURCE-DECLARED signature type in the model to the full name it means in ITS
@@ -3039,7 +3113,9 @@ fn written_as_task_of_t(ty: &lamella_syntax::ast::TypeRef) -> bool {
 /// C# 5 asking for 7.1, LAM0001 from 7.1 up while unbuilt. Guarded on the dialect supporting
 /// async functions, since below 5 the parser's one modifier gate is the whole report.
 fn validate_async_entry_points(binder: &mut Binder, declaration: &TypeDecl) {
-    if !binder.language_version().supports(Feature::AsyncFunction) {
+    if !binder.language_version().supports(Feature::AsyncFunction)
+        || binder.has_top_level_statements()
+    {
         return;
     }
     for member in &declaration.members {

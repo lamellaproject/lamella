@@ -165,7 +165,8 @@ impl DriverSession {
     /// Runs the harness's one-time `Main` on an already-configured [`Vm`] (it must return the
     /// 42 sentinel), then binds the accessors -- the tail both openers share.
     fn bind(module: Module, entry: MethodId, mut vm: Vm) -> Result<DriverSession, BridgeError> {
-        match run(&module, &mut vm, entry, Vec::new()) {
+        let args = lamella_cil_runtime::entry_args(&module, &mut vm, entry);
+        match run(&module, &mut vm, entry, args) {
             Ok(Some(CilValue::Int32(42))) => {}
             Ok(other) => {
                 return Err(BridgeError::Setup(alloc::format!(

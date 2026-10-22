@@ -4,8 +4,8 @@ use crate::args::{self, Spec};
 pub use lamella_flash_routes::{can_flash, uf2_family_for_board};
 use lamella_flash_routes::placement::{BootloaderChoice, Placement, placement_for};
 use lamella_flash_routes::{
-    NoAotTarget, Programmer, Programming, aot_target_for, prepare_image, programmer_for,
-    route_for, selector_for, wrap_for_route, write,
+    NoAotTarget, Programmer, Programming, WindowHalf, aot_target_for, prepare_image,
+    programmer_for, route_for, selector_for, wrap_for_route, write, write_set,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -283,7 +283,8 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    write_image_here(chosen, &placement, &prepared.bytes, selector.as_deref())
+    let window = prepared.window.as_ref().map(|half| (row.board, half));
+    write_image_here(chosen, &placement, &prepared.bytes, window, selector.as_deref())
 }
 
 /// The user-row step asked for alongside `--replace-bootloader`, which the command refuses: the
@@ -396,10 +397,36 @@ pub(crate) fn write_image(
     programmer: Programmer,
     placement: &Placement,
     image: &[u8],
+    window: Option<(&str, &WindowHalf)>,
     probe: Option<&str>,
     say: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
     let probe = choose_board(programmer, probe)?;
+    if let Some((board, half)) = window {
+        say(&format!("writing over {}, with the board's external flash...", programmer.description()));
+        let report = write_set(
+            programmer,
+            board,
+            placement,
+            image,
+            half,
+            probe.as_deref(),
+            &lamella_flash_backend::Allow::Any,
+            &mut *say,
+        )?;
+        say(&format!("  the part answered {:#x} -- {}", report.boot.identity.value, report.boot.identity.what));
+        say(&format!(
+            "  the external flash answered {:06x} -- {}",
+            report.window.identity.value, report.window.identity.what
+        ));
+        say(&format!(
+            "wrote and verified {} B ({}) and {} B of external flash; the board is running it.",
+            report.boot.bytes,
+            programmer.units(report.boot.bytes),
+            report.window.bytes
+        ));
+        return Ok(());
+    }
     let wrapped = wrap_for_route(programmer, image);
     let image = match &wrapped {
         Some((bytes, line)) => {
@@ -431,9 +458,10 @@ fn write_image_here(
     programmer: Programmer,
     placement: &Placement,
     image: &[u8],
+    window: Option<(&str, &WindowHalf)>,
     probe: Option<&str>,
 ) -> ExitCode {
-    match write_image(programmer, placement, image, probe, &mut |line| println!("{line}")) {
+    match write_image(programmer, placement, image, window, probe, &mut |line| println!("{line}")) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("lamella: {error}");
@@ -538,7 +566,7 @@ pub fn deploy_to_chip(
             return ExitCode::FAILURE;
         }
     };
-    write_image_here(chosen, &placement, &image, selector.as_deref())
+    write_image_here(chosen, &placement, &image, None, selector.as_deref())
 }
 
 /// Where `deploy --board` writes the image it compiled for `row`'s board through `route`.
@@ -680,7 +708,7 @@ fn debug_elf_from(
     verb: &str,
     path: &Path,
 ) -> Result<Vec<u8>, String> {
-    require_static_main(&debuggable.assembly, verb, path)?;
+    require_entry_point(&debuggable.assembly, verb, path)?;
     class_library_build(board_id, aot_target, verb, |archive| {
         linked_debug_build(
             &debuggable.assembly,
@@ -1094,7 +1122,7 @@ fn image_from_assembly(
     verb: &str,
     path: &Path,
 ) -> Result<Vec<u8>, String> {
-    require_static_main(assembly, verb, path)?;
+    require_entry_point(assembly, verb, path)?;
     if tier == Tier::ClassLibrary {
         return class_library_build(board_id, aot_target, verb, |archive| {
             linked_build(assembly, corlib, libraries, archive, aot_target, lamella_wire_host::boards::bus_table(Some(board_id)))
@@ -1104,22 +1132,23 @@ fn image_from_assembly(
         .map_err(|error| flat_refusal(verb, aot_target, &error))
 }
 
-/// Refuse an assembly with no static `Main`, naming `path`, the thing the reader typed.
+/// Refuse an assembly with no entry point, naming `path`, the thing the reader typed.
 ///
 /// **THE ENTRY CONTRACT IS CHECKED BEFORE AN IMAGE IS BUILT.** The boot image's reset vector points
-/// at the entry, so an assembly with no static `Main` would produce an image that boots into
+/// at the entry, so an assembly with no entry point would produce an image that boots into
 /// whatever lowered first -- which looks exactly like a board that took the write and then
 /// misbehaved.
-fn require_static_main(assembly: &[u8], verb: &str, path: &Path) -> Result<(), String> {
-    if has_static_main(assembly) {
+fn require_entry_point(assembly: &[u8], verb: &str, path: &Path) -> Result<(), String> {
+    if has_entry_point(assembly) {
         return Ok(());
     }
     Err(format!(
         "lamella {verb}: {} declares no static Main.\n\n\
          A flashed image IS the program: the chip resets straight into it, so it needs one \
          entry point.\nAdd `static void Main()` (or `static int Main()`) to a class in this \
-         file. A sample written as a\nlibrary -- a `Run()` that a harness calls -- has to gain \
-         a Main before it can be deployed on its own.",
+         file, or write the program as\nstatements at the top of the file. A sample written as \
+         a library -- a `Run()` that a harness\ncalls -- has to gain a Main before it can be \
+         deployed on its own.",
         path.display()
     ))
 }
@@ -1436,15 +1465,25 @@ pub fn is_project(path: &Path) -> bool {
         .is_some_and(|extension| extension.eq_ignore_ascii_case("csproj"))
 }
 
-/// Whether `assembly` declares a static method named `Main`.
+/// Whether `assembly` has an entry point.
 ///
 /// A guard on the ENTRY CONTRACT rather than a second copy of the backend's entry search: what is
 /// being asked here is whether the file a person named can be a program at all, and the answer is
 /// worth having before an image exists.
-fn has_static_main(assembly: &[u8]) -> bool {
+///
+/// **THE ENTRY POINT IS THE METHOD THE CLI HEADER NAMES** (ECMA-335 II.25.3.3), which the compiler
+/// chose: a `Main`, or -- for a program written as top-level statements -- the method they became,
+/// which no source can name. Asked the backend's way: the header first, and a static method named
+/// `Main` only for an assembly whose header names none.
+fn has_entry_point(assembly: &[u8]) -> bool {
     let Ok(parsed) = lamella_metadata::Assembly::read(assembly) else {
         return false;
     };
+    let token = parsed.image().entry_point_token();
+    if token >> 24 == u32::from(lamella_metadata::tables::table::METHOD_DEF) && token & 0x00ff_ffff != 0
+    {
+        return true;
+    }
     parsed.type_defs().any(|type_def| {
         type_def.methods().any(|method| method.is_static() && method.name() == Some("Main"))
     })
@@ -2254,6 +2293,56 @@ class Program
             error.contains("Run()"),
             "and the shape it is telling apart: {error}"
         );
+    }
+
+    /// A blink written as `dotnet new console` writes a program: TOP-LEVEL STATEMENTS (C# 9), whose
+    /// entry point is the method the CLI header names, `<Main>$`. Nothing in it is NAMED `Main`.
+    const BLINK_STATEMENTS: &str = "\
+unsafe
+{
+    *(int*)0x50000518 = 0xFFF0;
+    *(int*)0x50000508 = 0xE000;
+    *(int*)0x5000050C = 0x1FF0;
+}
+while (true)
+{
+}
+";
+
+    /// **A PROGRAM WRITTEN AS TOP-LEVEL STATEMENTS IS A PROGRAM**, and the flat image is built from
+    /// it whole.
+    #[test]
+    fn a_program_written_as_top_level_statements_builds_a_flat_image() {
+        if !csharp_compiler_is_available() {
+            return;
+        }
+        let image = build_image(
+            Path::new("Blink.cs"),
+            BLINK_STATEMENTS,
+            "bbc-micro-bit-v1",
+            "microbit",
+            true,
+            Tier::Flat,
+            &[],
+            "deploy",
+        )
+        .unwrap_or_else(|error| panic!("the statements build: {error}"));
+        assert!(image.len() > 64, "{} B is too small to be a program plus a vector table", image.len());
+    }
+
+    /// The debug ELF takes the same program. It needs the class-library tier's runtime support
+    /// archive, which not every machine has built, so it is held here to the part every machine
+    /// reaches: the entry contract, checked before anything is linked.
+    #[test]
+    fn a_program_written_as_top_level_statements_passes_the_debug_build_s_entry_contract() {
+        if !csharp_compiler_is_available() {
+            return;
+        }
+        if let Err(error) =
+            debug_elf_for_board(Path::new("Blink.cs"), BLINK_STATEMENTS, "rpi-pico2-w", true, &[])
+        {
+            assert!(!error.contains("no static Main"), "the debug build refused the entry contract: {error}");
+        }
     }
 
     #[test]

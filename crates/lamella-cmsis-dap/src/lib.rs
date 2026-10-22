@@ -312,7 +312,7 @@ impl<T: Transport> Dap<T> {
     fn command(&mut self, request: &[u8]) -> Result<&[u8], DapError> {
         self.transport.write_packet(request)?;
         let want = request.first().copied().unwrap_or(0);
-        let mut got = 0;
+        let mut got = None;
         let mut matched = None;
         let mut refused = false;
         for _ in 0..=STALE_REPLY_LIMIT {
@@ -321,20 +321,28 @@ impl<T: Transport> Dap<T> {
                 Err(_) if refused => return Err(DapError::Unsupported { command: want }),
                 Err(e) => return Err(e.into()),
             };
-            got = self.reply.first().copied().unwrap_or(0);
-            if got == want {
+            let Some(&echo) = self.reply[..n].first() else {
+                continue;
+            };
+            if echo == want {
                 matched = Some(n);
                 break;
             }
-            refused |= got == proto::INVALID_COMMAND;
+            got = Some(echo);
+            refused |= echo == proto::INVALID_COMMAND;
         }
         let n = match matched {
             Some(n) => n,
             None if refused => return Err(DapError::Unsupported { command: want }),
-            None => return Err(DapError::Unexpected { expected: want, got }),
+            None => {
+                return Err(match got {
+                    Some(got) => DapError::Unexpected { expected: want, got },
+                    None => DapError::Proto(proto::ProtoError::Truncated),
+                });
+            }
         };
         if proto::has_status_byte(want) {
-            let status = self.reply.get(1).copied().unwrap_or(proto::DAP_ERROR);
+            let status = self.reply[..n].get(1).copied().unwrap_or(proto::DAP_ERROR);
             if status != proto::DAP_OK {
                 return Err(DapError::Status { command: want, status });
             }
@@ -1528,6 +1536,46 @@ mod tests {
         let replies = vec![vec![proto::cmd::TRANSFER_BLOCK, 0, 0]; STALE_REPLY_LIMIT + 1];
         let mut dap = Dap::new(Mock::new(replies));
         assert!(matches!(dap.read_idcode(), Err(DapError::Unexpected { .. })));
+    }
+
+    #[test]
+    fn an_empty_reply_is_never_taken_for_the_commands_echo() {
+        let mut dap = Dap::new(Mock::new(vec![vec![]]));
+        let err = dap.info_bytes(0xff).unwrap_err();
+        assert!(
+            matches!(err, DapError::Transport(_)),
+            "expected the missing reply to surface as an error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_status_byte_the_reply_did_not_carry_is_not_read_from_the_last_reply() {
+        let mut dap = Dap::new(Mock::new(vec![
+            echo(proto::cmd::SWJ_CLOCK, &[proto::DAP_OK]),
+            vec![proto::cmd::SWJ_CLOCK],
+        ]));
+        dap.set_clock(1_000_000).unwrap();
+        let err = dap.set_clock(1_000_000).unwrap_err();
+        assert!(
+            matches!(err, DapError::Status { command, .. } if command == proto::cmd::SWJ_CLOCK),
+            "expected the missing status to be reported against DAP_SWJ_Clock, got: {err}"
+        );
+    }
+
+    #[test]
+    fn a_zero_length_packet_ahead_of_the_reply_is_skipped_like_backlog() {
+        let mut dap = Dap::new(Mock::new(vec![vec![], echo(proto::cmd::SWJ_CLOCK, &[proto::DAP_OK])]));
+        dap.set_clock(1_000_000).unwrap();
+    }
+
+    #[test]
+    fn a_probe_that_only_ever_sends_empty_packets_is_reported_as_truncated() {
+        let mut dap = Dap::new(Mock::new(vec![vec![]; STALE_REPLY_LIMIT + 1]));
+        let err = dap.set_clock(1_000_000).unwrap_err();
+        assert!(
+            matches!(err, DapError::Proto(proto::ProtoError::Truncated)),
+            "expected a truncated reply, got: {err}"
+        );
     }
 
     #[test]

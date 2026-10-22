@@ -3,6 +3,9 @@ namespace System.Device.Gpio
 {
     /// <summary>Represents the value of a pin: <see cref="High"/> or <see cref="Low"/>.</summary>
     public struct PinValue
+#if LAMELLA_SURFACE_NETFX_2_0
+        : System.IEquatable<PinValue>
+#endif
     {
         private readonly byte _value;
 

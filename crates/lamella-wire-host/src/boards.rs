@@ -250,7 +250,7 @@ impl ReferenceSet {
              build of it for the {family} chip family, which {board} carries. That build holds the\n\
              family's bus drivers, and without them the program cannot open a bus on {board}.\n\n\
              It is missing from:\n    {}\n\n\
-             build-managed.ps1 (Windows) and build-managed.sh (Linux, macOS) write it beside the \
+             csharp/build-managed.ps1 (Windows) and csharp/build-managed.sh (Linux, macOS) write it beside the \
              rest of the\nclass library. Rebuild the class library with either.\n\n\
              Nothing was built.",
             wanted.display()
@@ -356,7 +356,7 @@ mod tests {
         assert!(refusal.starts_with("the program uses System.Device.Gpio"), "{refusal}");
         assert!(refusal.contains("for the rp2350 chip family, which rpi-pico2"), "{refusal}");
         assert!(refusal.contains(&wanted.display().to_string()), "{refusal}");
-        assert!(refusal.contains("build-managed.ps1") && refusal.ends_with("Nothing was built."), "{refusal}");
+        assert!(refusal.contains("csharp/build-managed.ps1") && refusal.ends_with("Nothing was built."), "{refusal}");
 
         assert_eq!(set.refuse_unmet(&compiled(&set, PRINTS), set.carried()), Ok(()));
         let _ = std::fs::remove_dir_all(&dir);

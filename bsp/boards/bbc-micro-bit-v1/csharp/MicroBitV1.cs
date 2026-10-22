@@ -25,6 +25,7 @@ namespace Lamella.Boards.Bbc
         {
             Buses.BindGpio(new GpioDriverFactory(MakeGpio));
             Buses.BindSpi(EdgeSpiBusId, new SpiDriverFactory(MakeSpi));
+            Buses.BindI2c(I2cBusId, new I2cDriverFactory(MakeI2c), I2cBusHz);
         }
 
         /// <summary>The logical bus id of the edge connector's SPI (SCK P0.23, MISO P0.22, MOSI
@@ -57,7 +58,7 @@ namespace Lamella.Boards.Bbc
         /// <see cref="EdgeSpiBusId"/>, not yet configured.</summary>
         /// <remarks>THE SAME INSTANCE <c>SpiDevice.Create</c> uses for that bus, for the reason
         /// <see cref="Lamella.Hardware.Buses.ResolveSpi"/> gives.</remarks>
-        public SpiDriver CreateSpiDriver()
+        internal SpiDriver CreateSpiDriver()
         {
             return Buses.ResolveSpi(EdgeSpiBusId);
         }
@@ -86,9 +87,19 @@ namespace Lamella.Boards.Bbc
         public static readonly uint I2cFreqWord250k = Nrf51TwiLayout.FREQUENCY_K250;
         public static readonly uint I2cFreqWord400k = Nrf51TwiLayout.FREQUENCY_K400;
 
+        /// <summary>The logical bus id of the board's one I2C bus (TWI0: SCL P0.00, SDA P0.30), as
+        /// <c>I2cConnectionSettings</c> names it. The on-board motion sensor and the edge
+        /// connector's pins 19 and 20 are the same bus, so a scan of it sees whatever is wired to
+        /// the edge as well as what is soldered down. It runs at <see cref="I2cBusHz"/>.</summary>
+        public const int I2cBusId = 0;
+
+        private static I2cDriver MakeI2c() { return new Nrf51I2cDriver(I2cBinding()); }
+
         /// <summary>The `i2c` binding descriptor, built from the generated constants, so the
         /// role's resolved facts arrive in one construction.</summary>
-        public Nrf51TwiBinding CreateI2cBinding()
+        public Nrf51TwiBinding CreateI2cBinding() { return I2cBinding(); }
+
+        private static Nrf51TwiBinding I2cBinding()
         {
             return new Nrf51TwiBinding(
                 BbcMicroBitV1Bindings.I2C_TWI_BASE,
@@ -98,15 +109,13 @@ namespace Lamella.Boards.Bbc
                 BbcMicroBitV1Bindings.I2C_PIN_CNF_SDA_REG);
         }
 
-        /// <summary>The board's I2C bus as the layer-1 driver, configured for
-        /// <see cref="I2cBusHz"/>. The on-board motion sensor and the edge connector's pins 19
-        /// and 20 are the same bus, so a scan here sees whatever is wired to the edge as well as
-        /// what is soldered down.</summary>
-        public I2cDriver CreateI2cBus()
+        /// <summary>The board's I2C bus as the layer-1 driver the board's table binds for
+        /// <see cref="I2cBusId"/>, configured for <see cref="I2cBusHz"/> on its first use.</summary>
+        /// <remarks>THE SAME INSTANCE <c>I2cDevice.Create</c> uses for that bus, for the reason
+        /// <see cref="Lamella.Hardware.Buses.ResolveSpi"/> gives.</remarks>
+        internal I2cDriver CreateI2cBus()
         {
-            Nrf51I2cDriver bus = new Nrf51I2cDriver(CreateI2cBinding());
-            bus.Configure(I2cBusHz);
-            return bus;
+            return Buses.ResolveI2c(I2cBusId);
         }
     }
 }

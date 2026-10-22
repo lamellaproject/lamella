@@ -42,6 +42,11 @@ pub use l4::{
     STM32L4_FLASH_BASE, STM32L4_FLASH_SIZE_REG, STM32L4_PAGE, STM32L4_PARTS, Stm32L4Flash,
 };
 
+/// The quad-SPI NOR flash an F7 board fits outside the chip. Its own module because it is not a
+/// flash controller of the chip's at all: the chip's QUADSPI block is the bus, and the flash part
+/// on the other end is a board's choice, recognized by its identity.
+pub mod qspi;
+
 use lamella_probe_core::{CallFrame, ProbeError, TargetAccess};
 
 /// **Where each ST family keeps the flash size the FACTORY programmed into it.**

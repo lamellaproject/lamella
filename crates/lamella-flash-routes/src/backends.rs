@@ -966,9 +966,20 @@ pub struct StProbe<A: TargetAccess, S = fn(&str)> {
     plan: &'static StPlan,
     /// The watchdog freeze register as the write found it, put back before the part is released.
     watchdogs_found: Option<u32>,
+    /// The board's external flash, when a write reaches it too.
+    window: Option<Window>,
     /// Where each step of the write is said as it starts: the caller's lines, so a write that takes
     /// half a minute is not a silent one.
     say: S,
+}
+
+/// A board's external flash as a write reaches it: the board's facts, and the part the write found
+/// there once it has asked.
+struct Window {
+    flash: &'static crate::external::ExternalFlash,
+    part: Option<&'static lamella_cmsis_dap_stm32::qspi::NorPart>,
+    /// Whether the loader is in the chip's SRAM yet.
+    staged: bool,
 }
 
 impl<A: TargetAccess> StProbe<A> {
@@ -979,6 +990,7 @@ impl<A: TargetAccess> StProbe<A> {
             target,
             plan,
             watchdogs_found: None,
+            window: None,
             say: |_| {},
         }
     }
@@ -992,8 +1004,17 @@ impl<A: TargetAccess, S> StProbe<A, S> {
             target: self.target,
             plan: self.plan,
             watchdogs_found: self.watchdogs_found,
+            window: self.window,
             say,
         }
+    }
+
+    /// The same backend, writing `flash` as well as the part's own: the second region of a
+    /// two-region image, written with [`lamella_flash_backend::flash_set`].
+    #[must_use]
+    pub fn with_window(mut self, flash: &'static crate::external::ExternalFlash) -> Self {
+        self.window = Some(Window { flash, part: None, staged: false });
+        self
     }
 
     /// The probe this backend was built over, handed back once a write is done, for a caller that
@@ -1300,6 +1321,154 @@ impl<A: TargetAccess, S: FnMut(&str)> FlashBackend for StProbe<A, S> {
         }
         leave_running(&mut self.target)?;
         Ok(())
+    }
+}
+
+/// The board's external flash, written beside the part's own: identified by its JEDEC identity,
+/// erased and programmed by the loader the part crate places in the chip's SRAM, and read back
+/// through the controller's memory-mapped window.
+///
+/// **NOTHING HERE ERASES BEFORE THE PART HAS BEEN NAMED**, and [`lamella_flash_backend::flash_set`]
+/// asks for the name before it erases either region.
+impl<A: TargetAccess, S: FnMut(&str)> lamella_flash_backend::WindowSteps for StProbe<A, S> {
+    fn window_base(&self) -> u32 {
+        self.window.as_ref().map_or(0, |window| window.flash.window)
+    }
+
+    /// Bring the controller up, reset the part and read its identity, then refuse a part the board
+    /// does not allow, a part whose block protection is set, and a chip whose option bytes start a
+    /// watchdog the loader would run under. Halts the core first: the controller's pins and clocks
+    /// are the running firmware's otherwise.
+    fn identify_window(&mut self) -> Result<PartIdentity, FlashError> {
+        use lamella_cmsis_dap_stm32::qspi;
+        let Some(window) = self.window.as_mut() else {
+            return Err(FlashError::Refused("this write was given no external flash".to_owned()));
+        };
+        self.target.halt()?;
+        qspi::refuse_hardware_watchdogs(&mut self.target)?;
+        let largest = window.flash.parts.iter().map(|part| part.size_field()).max().unwrap_or(0);
+        qspi::bring_up(&mut self.target, &window.flash.wiring, largest)?;
+        qspi::reset_part(&mut self.target, window.flash.parts[0].reset)?;
+        let identity = qspi::read_identity(&mut self.target)?;
+        let [a, b, c] = identity;
+        let Some(part) = qspi::part_for(identity, window.flash.parts) else {
+            return Err(FlashError::Refused(format!(
+                "the external flash answered the identity {a:02x} {b:02x} {c:02x}, which is none of the \
+                 parts this board fits: {}. Nothing was erased.",
+                window.flash.allowed()
+            )));
+        };
+        qspi::size_for(&mut self.target, part)?;
+        let status = qspi::read_status(&mut self.target, part)?;
+        if status & part.block_protect != 0 {
+            return Err(FlashError::Refused(format!(
+                "the external flash, {}, has block protection set (status {status:#04x}), so part of \
+                 it refuses program and erase. Nothing was erased.",
+                part.name
+            )));
+        }
+        window.part = Some(part);
+        Ok(PartIdentity {
+            value: (u64::from(a) << 16) | (u64::from(b) << 8) | u64::from(c),
+            what: "the external flash's JEDEC identity, which names the part and not this board",
+        })
+    }
+
+    /// Erase every block the span covers, a few blocks per loader call.
+    fn erase_window(&mut self, image: &Image<'_>) -> Result<(), FlashError> {
+        use lamella_cmsis_dap_stm32::qspi;
+        let (part, base) = self.window_part()?;
+        let offset = image.base.saturating_sub(base);
+        if offset % part.block != 0 {
+            return Err(FlashError::Refused(format!(
+                "the external flash's half starts at {:#010x}, which is not the start of one of its \
+                 {} KB blocks",
+                image.base,
+                part.block / 1024
+            )));
+        }
+        self.stage_loader()?;
+        let length = u32::try_from(image.bytes.len()).unwrap_or(u32::MAX);
+        let blocks = length.div_ceil(part.block);
+        (self.say)(&format!(
+            "  erasing {} bytes of the external flash from {:#010x}...",
+            u64::from(blocks) * u64::from(part.block),
+            image.base
+        ));
+        let mut done = 0;
+        while done < blocks {
+            let count = (blocks - done).min(qspi::ERASE_BLOCKS_PER_CALL);
+            qspi::erase_blocks(&mut self.target, part, offset + done * part.block, count)
+                .map_err(window_failure)?;
+            done += count;
+        }
+        Ok(())
+    }
+
+    /// Program the span through the loader, one SRAM buffer per call.
+    fn program_window(&mut self, image: &Image<'_>) -> Result<(), FlashError> {
+        use lamella_cmsis_dap_stm32::qspi;
+        let (part, base) = self.window_part()?;
+        self.stage_loader()?;
+        let offset = image.base.saturating_sub(base);
+        (self.say)(&format!(
+            "  programming {} bytes of the external flash from {:#010x}...",
+            image.bytes.len(),
+            image.base
+        ));
+        for (index, chunk) in image.bytes.chunks(qspi::LOADER_CHUNK).enumerate() {
+            let at = offset.saturating_add(u32::try_from(index * qspi::LOADER_CHUNK).unwrap_or(u32::MAX));
+            qspi::program(&mut self.target, part, at, chunk).map_err(window_failure)?;
+        }
+        Ok(())
+    }
+
+    /// Reset the part, map it with its plain read, and read the span back through the window.
+    fn read_back_window(&mut self, image: &Image<'_>) -> Result<Vec<u8>, FlashError> {
+        let (part, _) = self.window_part()?;
+        (self.say)("  verifying the external flash (full read-back through its window)...");
+        lamella_cmsis_dap_stm32::qspi::map_window(&mut self.target, part)?;
+        self.read_span(image)
+    }
+
+    fn boot_granule(&self) -> u32 {
+        self.plan.program_align
+    }
+}
+
+impl<A: TargetAccess, S> StProbe<A, S> {
+    /// The external flash's part and window base, once [`identify_window`] has named the part.
+    ///
+    /// [`identify_window`]: lamella_flash_backend::WindowSteps::identify_window
+    fn window_part(&self) -> Result<(&'static lamella_cmsis_dap_stm32::qspi::NorPart, u32), FlashError> {
+        match self.window.as_ref() {
+            Some(Window { part: Some(part), flash, .. }) => Ok((part, flash.window)),
+            _ => Err(FlashError::Refused(
+                "the external flash was written before its part was identified".to_owned(),
+            )),
+        }
+    }
+
+    /// Place the loader in SRAM once per write.
+    fn stage_loader(&mut self) -> Result<(), FlashError> {
+        if let Some(window) = self.window.as_mut()
+            && !window.staged
+        {
+            lamella_cmsis_dap_stm32::qspi::stage_loader(&mut self.target)?;
+            window.staged = true;
+        }
+        Ok(())
+    }
+}
+
+/// A loader failure, worded for a reader of a write that stopped partway through the external
+/// flash.
+fn window_failure(error: lamella_cmsis_dap_stm32::qspi::QspiError) -> FlashError {
+    match error {
+        lamella_cmsis_dap_stm32::qspi::QspiError::Probe(error) => FlashError::Probe(error),
+        loader @ lamella_cmsis_dap_stm32::qspi::QspiError::Loader { .. } => {
+            FlashError::Refused(format!("the external flash write stopped: {loader}"))
+        }
     }
 }
 

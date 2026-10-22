@@ -1,7 +1,7 @@
 // A driver for the ST LSM6DSOX six-axis inertial module: find it, configure it, read it.
 
+using System.Device.I2c;
 using Lamella.Generated;
-using Lamella.Hardware;
 
 namespace Lamella.Devices
 {
@@ -50,22 +50,24 @@ namespace Lamella.Devices
 
         private const int NanoGPerLsb = 61000;
 
-        private readonly I2cDriver _bus;
-        private readonly int _address;
+        private readonly I2cDevice _device;
         private readonly byte[] _one = new byte[1];
         private readonly byte[] _reg = new byte[1];
         private readonly byte[] _frame = new byte[(int)Lsm6dsoxPart.BURST_LENGTH];
 
-        /// <summary>Binds to a part at <paramref name="address"/> on an already-configured bus.</summary>
+        /// <summary>Binds to the part at the address <paramref name="i2cDevice"/>'s connection
+        /// settings name.</summary>
         /// <remarks>
-        /// THE ADDRESS IS REQUIRED RATHER THAN DEFAULTED. The part states two and a carrier picks
-        /// one by where it tied a pin, so a default here would be this driver guessing at a fact
-        /// only the board knows.
+        /// THE ADDRESS IS THE CALLER's TO NAME, with <see cref="AddressSa0Low"/> or
+        /// <see cref="AddressSa0High"/>, RATHER THAN DEFAULTED. The part states two and a carrier
+        /// picks one by where it tied a pin, so a default here would be this driver guessing at a
+        /// fact only the board knows.
         /// </remarks>
-        public Lsm6dsox(I2cDriver bus, int address)
+        /// <exception cref="System.ArgumentNullException"><paramref name="i2cDevice"/> is null.</exception>
+        public Lsm6dsox(I2cDevice i2cDevice)
         {
-            _bus = bus;
-            _address = address;
+            if ((object)i2cDevice == null) { throw new System.ArgumentNullException("i2cDevice"); }
+            _device = i2cDevice;
         }
 
         /// <summary>Reads the identity register and reports whether it is one this part accepts.</summary>
@@ -112,8 +114,7 @@ namespace Lamella.Devices
         {
             reading = new Acceleration();
             _reg[0] = (byte)Lsm6dsoxPart.OUTX_L_A_REG;
-            int status = _bus.WriteRead(_address, _reg, 1, _frame, _frame.Length);
-            if (status != I2cDriver.Ok) { return false; }
+            if (!WriteRead(_reg, _frame)) { return false; }
 
             reading.X = ToMilliG(_frame[0], _frame[1]);
             reading.Y = ToMilliG(_frame[2], _frame[3]);
@@ -131,8 +132,7 @@ namespace Lamella.Devices
         {
             value = 0;
             _reg[0] = register;
-            int status = _bus.WriteRead(_address, _reg, 1, _one, 1);
-            if (status != I2cDriver.Ok) { return false; }
+            if (!WriteRead(_reg, _one)) { return false; }
             value = _one[0];
             return true;
         }
@@ -142,7 +142,16 @@ namespace Lamella.Devices
             byte[] payload = new byte[2];
             payload[0] = register;
             payload[1] = value;
-            return _bus.Write(_address, payload, 2) == I2cDriver.Ok;
+            try { _device.Write(new System.ReadOnlySpan<byte>(payload)); }
+            catch (System.IO.IOException) { return false; }
+            return true;
+        }
+
+        private bool WriteRead(byte[] write, byte[] read)
+        {
+            try { _device.WriteRead(new System.ReadOnlySpan<byte>(write), new System.Span<byte>(read)); }
+            catch (System.IO.IOException) { return false; }
+            return true;
         }
     }
 }

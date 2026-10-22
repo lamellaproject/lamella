@@ -24,6 +24,7 @@ namespace Lamella.Boards.Arduino
         static Zero()
         {
             Buses.BindGpio(new GpioDriverFactory(MakeGpio));
+            Buses.BindI2c(HeaderI2cBusId, new I2cDriverFactory(MakeHeaderI2c));
         }
 
         private static GpioDriver MakeGpio() { return new Samd21GpioDriver(); }
@@ -58,7 +59,15 @@ namespace Lamella.Boards.Arduino
         /// <summary>The board's dedicated SDA/SCL header pins beside AREF (D20/D21 = PA22/PA23
         /// on SERCOM3), as an I2C master descriptor. The bus SPEED is not here: it is a runtime
         /// <c>Configure</c> choice derived on the device from the core-clock rate.</summary>
-        public Samd21SercomI2cBinding HeaderI2cBinding()
+        public Samd21SercomI2cBinding HeaderI2cBinding() { return MakeHeaderI2cBinding(); }
+
+        /// <summary>The logical bus id of the SDA/SCL header pins' I2C (D20/D21 = PA22/PA23 on
+        /// SERCOM3), as <c>I2cConnectionSettings</c> names it.</summary>
+        public const int HeaderI2cBusId = 0;
+
+        private static I2cDriver MakeHeaderI2c() { return new Samd21I2cDriver(MakeHeaderI2cBinding()); }
+
+        private static Samd21SercomI2cBinding MakeHeaderI2cBinding()
         {
             return new Samd21SercomI2cBinding(
                 ArduinoZeroBindings.HEADER_I2C_SERCOM_BASE,

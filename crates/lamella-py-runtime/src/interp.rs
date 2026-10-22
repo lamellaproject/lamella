@@ -818,13 +818,9 @@ fn dispatch_inplace_binary(
         let b_elems = model.set_value(rhs).ok_or(Trap::TypeError)?.clone();
         let result = match binop {
             BinOp::BitOr => union_elems_dyn(&a_elems, &b_elems, functions, model, depth)?,
-            BinOp::BitAnd => filter_elems_dyn(&a_elems, &b_elems, true, functions, model, depth)?,
-            BinOp::Sub => filter_elems_dyn(&a_elems, &b_elems, false, functions, model, depth)?,
-            BinOp::BitXor => {
-                let mut r = filter_elems_dyn(&a_elems, &b_elems, false, functions, model, depth)?;
-                r.extend(filter_elems_dyn(&b_elems, &a_elems, false, functions, model, depth)?);
-                r
-            }
+            BinOp::BitAnd => intersect_sets_dyn(&a_elems, &b_elems, functions, model, depth)?,
+            BinOp::Sub => remove_each_dyn(&a_elems, &b_elems, functions, model, depth)?,
+            BinOp::BitXor => symmetric_update_dyn(&a_elems, &b_elems, functions, model, depth)?,
             _ => unreachable!("guarded by the matches! above"),
         };
         model.set_replace_elems(lhs, result)?;
@@ -1052,7 +1048,8 @@ pub(crate) fn elem_eq(
 }
 
 /// Whether `elements` (a detached snapshot -- NOT a borrow of model state, since [`elem_eq`] may
-/// re-enter the interpreter) holds a value equal to `needle`.
+/// re-enter the interpreter) holds a value equal to `needle`. Each stored element is on the left of
+/// `==`, as CPython tests membership, so its own `__eq__` is the one asked first.
 pub(crate) fn elems_contain(
     needle: Value,
     elements: &[Value],
@@ -1060,12 +1057,24 @@ pub(crate) fn elems_contain(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<bool, Trap> {
-    for &e in elements {
-        if elem_eq(needle, e, functions, model, depth)? {
-            return Ok(true);
+    Ok(elems_position(needle, elements, functions, model, depth)?.is_some())
+}
+
+/// The position of the first element of `elements` (a detached snapshot) equal to `needle`, each
+/// stored element on the left of `==` -- the search behind [`elems_contain`] and the set algebra.
+pub(crate) fn elems_position(
+    needle: Value,
+    elements: &[Value],
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Option<usize>, Trap> {
+    for (position, &element) in elements.iter().enumerate() {
+        if elem_eq(element, needle, functions, model, depth)? {
+            return Ok(Some(position));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 /// Dedups `elements` interp-aware, first-seen order -- a set literal / comprehension / `set(iter)`.
@@ -1101,23 +1110,157 @@ pub(crate) fn union_elems_dyn(
     Ok(result)
 }
 
-/// The elements of set snapshot `a` that are (intersection, `keep_common == true`) / are not
-/// (difference) also in `b`, interp-aware.
-pub(crate) fn filter_elems_dyn(
+/// The elements set snapshot `a` shares with `b` (a set snapshot or the elements of any iterable),
+/// in `a`'s order. With `iterate_a`, each element of `a` is searched for in `b` and `a`'s elements
+/// are kept; otherwise each element of `b` is searched for in `a` and `b`'s elements are kept, so an
+/// equal pair yields the object that was iterated, as CPython's intersection does. With
+/// `stop_when_all_matched`, iterating `b` stops once every element of `a` has a match, as
+/// `set.intersection` and `set.issubset` do with an argument that is not a set.
+pub(crate) fn intersect_elems_dyn(
     a: &[Value],
     b: &[Value],
-    keep_common: bool,
+    iterate_a: bool,
+    stop_when_all_matched: bool,
     functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Vec<Value>, Trap> {
+    if iterate_a {
+        let mut result = Vec::new();
+        for &x in a {
+            if elems_contain(x, b, functions, model, depth)? {
+                result.push(x);
+            }
+        }
+        return Ok(result);
+    }
+    let mut matched: Vec<Option<Value>> = alloc::vec![None; a.len()];
+    let mut unmatched = a.len();
+    for &y in b {
+        if stop_when_all_matched && unmatched == 0 {
+            break;
+        }
+        if let Some(position) = elems_position(y, a, functions, model, depth)? {
+            if matched[position].is_none() {
+                matched[position] = Some(y);
+                unmatched -= 1;
+            }
+        }
+    }
+    Ok(matched.into_iter().flatten().collect())
+}
+
+/// `a & b` for two set snapshots: CPython iterates the smaller operand (the right one on a tie) and
+/// searches the other.
+pub(crate) fn intersect_sets_dyn(
+    a: &[Value],
+    b: &[Value],
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Vec<Value>, Trap> {
+    intersect_elems_dyn(a, b, a.len() < b.len(), false, functions, model, depth)
+}
+
+/// `a - b` for two set snapshots, in `a`'s order. CPython searches `b` for each element of `a`,
+/// unless `a` holds more than four times as many elements as `b`; then it removes each element of
+/// `b` from a copy of `a` instead, as [`remove_each_dyn`] does.
+pub(crate) fn difference_sets_dyn(
+    a: &[Value],
+    b: &[Value],
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Vec<Value>, Trap> {
+    if a.len() >> 2 > b.len() {
+        return remove_each_dyn(a, b, functions, model, depth);
+    }
     let mut result = Vec::new();
     for &x in a {
-        if elems_contain(x, b, functions, model, depth)? == keep_common {
+        if !elems_contain(x, b, functions, model, depth)? {
             result.push(x);
         }
     }
     Ok(result)
+}
+
+/// Set snapshot `a` with each element of `items` removed, in `a`'s order: each element of `items` is
+/// searched for among what is left of `a`. This is `-=`, a dict view's `-`, and `set.difference`
+/// with an argument that is not a set or is not the first.
+pub(crate) fn remove_each_dyn(
+    a: &[Value],
+    items: &[Value],
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Vec<Value>, Trap> {
+    let mut result = a.to_vec();
+    for &y in items {
+        if let Some(position) = elems_position(y, &result, functions, model, depth)? {
+            result.remove(position);
+        }
+    }
+    Ok(result)
+}
+
+/// `a ^ b` for two set snapshots: CPython copies `b`, then searches that copy for each element of
+/// `a`, removing the match or adding the element. The result holds `a`'s unmatched elements, then
+/// what is left of `b`.
+pub(crate) fn symmetric_difference_sets_dyn(
+    a: &[Value],
+    b: &[Value],
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Vec<Value>, Trap> {
+    let mut rest = b.to_vec();
+    let mut result = Vec::new();
+    for &x in a {
+        match elems_position(x, &rest, functions, model, depth)? {
+            Some(position) => {
+                rest.remove(position);
+            }
+            None => result.push(x),
+        }
+    }
+    result.extend(rest);
+    Ok(result)
+}
+
+/// `a ^= b`, and a dict view's `^` on either side: CPython copies the left operand, then searches
+/// that copy for each element of the right one, removing the match or adding the element. The result
+/// holds what is left of `a`, then the added elements.
+pub(crate) fn symmetric_update_dyn(
+    a: &[Value],
+    items: &[Value],
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Vec<Value>, Trap> {
+    let mut result = a.to_vec();
+    let mut added = Vec::new();
+    for &y in items {
+        match elems_position(y, &result, functions, model, depth)? {
+            Some(position) => {
+                result.remove(position);
+            }
+            None => added.push(y),
+        }
+    }
+    result.extend(added);
+    Ok(result)
+}
+
+/// Whether set snapshot `a` is a subset of set snapshot `b`. A larger `a` is not, and then no
+/// element is compared, as in CPython; otherwise as [`subset_dyn`].
+pub(crate) fn subset_sets_dyn(
+    a: &[Value],
+    b: &[Value],
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<bool, Trap> {
+    Ok(a.len() <= b.len() && subset_dyn(a, b, functions, model, depth)?)
 }
 
 /// Whether every element of set snapshot `a` is in `b` (`a` is a subset of `b`), interp-aware.
@@ -1136,7 +1279,8 @@ pub(crate) fn subset_dyn(
     Ok(true)
 }
 
-/// Whether set snapshots `a` and `b` share no element (they are disjoint), interp-aware.
+/// Whether set snapshots `a` and `b` share no element (they are disjoint): CPython iterates the
+/// smaller operand (the right one on a tie) and searches the other.
 pub(crate) fn disjoint_dyn(
     a: &[Value],
     b: &[Value],
@@ -1144,8 +1288,24 @@ pub(crate) fn disjoint_dyn(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<bool, Trap> {
-    for &x in a {
-        if elems_contain(x, b, functions, model, depth)? {
+    if a.len() < b.len() {
+        none_in_dyn(a, b, functions, model, depth)
+    } else {
+        none_in_dyn(b, a, functions, model, depth)
+    }
+}
+
+/// Whether no element of `items` is in `elements`, each element of `items` searched for in turn --
+/// also `isdisjoint` with an argument that is not a set, which CPython iterates.
+pub(crate) fn none_in_dyn(
+    items: &[Value],
+    elements: &[Value],
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<bool, Trap> {
+    for &y in items {
+        if elems_contain(y, elements, functions, model, depth)? {
             return Ok(false);
         }
     }
@@ -1171,13 +1331,9 @@ fn try_set_binop_dyn(
     let b_elems = model.set_value(b).ok_or(Trap::TypeError)?.clone();
     let result = match op {
         BinOp::BitOr => union_elems_dyn(&a_elems, &b_elems, functions, model, depth)?,
-        BinOp::BitAnd => filter_elems_dyn(&a_elems, &b_elems, true, functions, model, depth)?,
-        BinOp::Sub => filter_elems_dyn(&a_elems, &b_elems, false, functions, model, depth)?,
-        BinOp::BitXor => {
-            let mut r = filter_elems_dyn(&a_elems, &b_elems, false, functions, model, depth)?;
-            r.extend(filter_elems_dyn(&b_elems, &a_elems, false, functions, model, depth)?);
-            r
-        }
+        BinOp::BitAnd => intersect_sets_dyn(&a_elems, &b_elems, functions, model, depth)?,
+        BinOp::Sub => difference_sets_dyn(&a_elems, &b_elems, functions, model, depth)?,
+        BinOp::BitXor => symmetric_difference_sets_dyn(&a_elems, &b_elems, functions, model, depth)?,
         _ => unreachable!("guarded by the matches! above"),
     };
     let set = if model.is_frozenset(a) {
@@ -1223,8 +1379,8 @@ fn try_set_compare_dyn(
             let a_elems = model.set_value(a).ok_or(Trap::TypeError)?.clone();
             let b_elems = model.set_value(b).ok_or(Trap::TypeError)?.clone();
             match op {
-                CmpOp::Le => subset_dyn(&a_elems, &b_elems, functions, model, depth)?,
-                CmpOp::Ge => subset_dyn(&b_elems, &a_elems, functions, model, depth)?,
+                CmpOp::Le => subset_sets_dyn(&a_elems, &b_elems, functions, model, depth)?,
+                CmpOp::Ge => subset_sets_dyn(&b_elems, &a_elems, functions, model, depth)?,
                 CmpOp::Lt => {
                     a_elems.len() < b_elems.len()
                         && subset_dyn(&a_elems, &b_elems, functions, model, depth)?
@@ -1255,7 +1411,7 @@ pub(crate) fn dedup_pairs(
         model.require_hashable_as(key, HashUse::DictKey)?;
         let mut found = None;
         for (idx, (k, _)) in out.iter().enumerate() {
-            if elem_eq(key, *k, functions, model, depth)? {
+            if elem_eq(*k, key, functions, model, depth)? {
                 found = Some(idx);
                 break;
             }
@@ -1320,7 +1476,9 @@ fn try_dict_binop_dyn(
 /// rhs-only keys; counts combine per the op (sum / difference / min / max) and results <= 0 are
 /// DROPPED (CPython's keep-positive rule -- note `subtract()` the METHOD keeps them, only the
 /// operators strip). Counts must be ints; a non-int is the bare TypeError. Key matching is
-/// interp-aware (`elem_eq`), so a user-`__eq__` key folds correctly.
+/// interp-aware (`elem_eq`), so a user-`__eq__` key folds correctly. Each lhs key is looked up in
+/// rhs, then (except for `&`, whose result holds lhs keys only) each rhs key in lhs, the stored key
+/// on the left of `==` as a dict lookup compares.
 fn counter_op_entries(
     op: BinOp,
     lhs: Value,
@@ -1336,7 +1494,7 @@ fn counter_op_entries(
         let x = model.as_i128(count).ok_or(Trap::TypeError)?;
         let mut y = 0i128;
         for &(other_key, other_count) in &b {
-            if elem_eq(key, other_key, functions, model, depth)? {
+            if elem_eq(other_key, key, functions, model, depth)? {
                 y = model.as_i128(other_count).ok_or(Trap::TypeError)?;
                 break;
             }
@@ -1352,10 +1510,11 @@ fn counter_op_entries(
             out.push((key, n));
         }
     }
-    for &(key, count) in &b {
+    let rhs_only = if matches!(op, BinOp::BitAnd) { &b[..0] } else { &b[..] };
+    for &(key, count) in rhs_only {
         let mut in_lhs = false;
         for &(lhs_key, _) in &a {
-            if elem_eq(key, lhs_key, functions, model, depth)? {
+            if elem_eq(lhs_key, key, functions, model, depth)? {
                 in_lhs = true;
                 break;
             }
@@ -1524,14 +1683,12 @@ fn try_odict_compare_dyn(
     {
         return Ok(None);
     }
-    let a_entries = model.dict_entries(a).unwrap_or_default();
-    let b_entries = model.dict_entries(b).unwrap_or_default();
-    let mut equal = a_entries.len() == b_entries.len();
+    let mut equal = model.dict_equal_dyn(a, b, functions, depth)?;
     if equal {
-        for (&(a_key, a_value), &(b_key, b_value)) in a_entries.iter().zip(&b_entries) {
-            if !elem_eq(a_key, b_key, functions, model, depth)?
-                || !elem_eq(a_value, b_value, functions, model, depth)?
-            {
+        let a_entries = model.dict_entries(a).unwrap_or_default();
+        let b_entries = model.dict_entries(b).unwrap_or_default();
+        for (&(a_key, _), &(b_key, _)) in a_entries.iter().zip(&b_entries) {
+            if !elem_eq(a_key, b_key, functions, model, depth)? {
                 equal = false;
                 break;
             }
@@ -1555,7 +1712,7 @@ fn set_like_elems(value: Value, model: &mut ObjectModel) -> Result<Option<Vec<Va
 /// `None` when neither operand is a keys/items view (a VALUES view has no set protocol and falls
 /// through to the plain TypeError). The result is a plain `set`, as CPython's. The other operand
 /// may be ANY iterable (CPython: `d.keys() & "ab"` works; a non-iterable raises its
-/// `'X' object is not iterable`), deduped up front so a repeating iterable behaves as its set.
+/// `'X' object is not iterable`), and a repeating one counts each element once.
 fn try_view_binop_dyn(
     op: BinOp,
     a: Value,
@@ -1572,29 +1729,47 @@ fn try_view_binop_dyn(
     if !a_view && !b_view {
         return Ok(None);
     }
-    let a_elems = match set_like_elems(a, model)? {
-        Some(elems) => elems,
-        None => {
-            let items = crate::builtins::collect_iterable(model, &[a], functions, depth)?;
-            dedup_elems(items, functions, model, depth)?
-        }
+    let (a_elems, a_iterable) = match set_like_elems(a, model)? {
+        Some(elems) => (elems, false),
+        None => (crate::builtins::collect_iterable(model, &[a], functions, depth)?, true),
     };
-    let b_elems = match set_like_elems(b, model)? {
-        Some(elems) => elems,
-        None => {
-            let items = crate::builtins::collect_iterable(model, &[b], functions, depth)?;
-            dedup_elems(items, functions, model, depth)?
-        }
+    let (b_elems, b_iterable) = match set_like_elems(b, model)? {
+        Some(elems) => (elems, false),
+        None => (crate::builtins::collect_iterable(model, &[b], functions, depth)?, true),
+    };
+    let a_elems = if a_iterable && !matches!(op, BinOp::BitAnd) {
+        dedup_elems(a_elems, functions, model, depth)?
+    } else {
+        a_elems
+    };
+    let b_elems = if b_iterable && matches!(op, BinOp::BitXor) {
+        dedup_elems(b_elems, functions, model, depth)?
+    } else {
+        b_elems
     };
     let result = match op {
         BinOp::BitOr => union_elems_dyn(&a_elems, &b_elems, functions, model, depth)?,
-        BinOp::BitAnd => filter_elems_dyn(&a_elems, &b_elems, true, functions, model, depth)?,
-        BinOp::Sub => filter_elems_dyn(&a_elems, &b_elems, false, functions, model, depth)?,
-        BinOp::BitXor => {
-            let mut r = filter_elems_dyn(&a_elems, &b_elems, false, functions, model, depth)?;
-            r.extend(filter_elems_dyn(&b_elems, &a_elems, false, functions, model, depth)?);
-            r
+        BinOp::BitAnd => {
+            let (view_len, other, other_len) = if a_view {
+                (a_elems.len(), b, b_elems.len())
+            } else {
+                (b_elems.len(), a, a_elems.len())
+            };
+            let other_is_view =
+                matches!(model.dict_view_kind(other), Some(DictViewKind::Keys | DictViewKind::Items));
+            let iterate_view = (model.is_set(other) && view_len <= other_len)
+                || (other_is_view && other_len > view_len);
+            let iterate_a = iterate_view == a_view;
+            let common =
+                intersect_elems_dyn(&a_elems, &b_elems, iterate_a, false, functions, model, depth)?;
+            if iterate_a && a_iterable {
+                dedup_elems(common, functions, model, depth)?
+            } else {
+                common
+            }
         }
+        BinOp::Sub => remove_each_dyn(&a_elems, &b_elems, functions, model, depth)?,
+        BinOp::BitXor => symmetric_update_dyn(&a_elems, &b_elems, functions, model, depth)?,
         _ => unreachable!("guarded by the matches! above"),
     };
     Ok(Some(model.new_set(result)?))
@@ -1637,8 +1812,8 @@ fn try_view_compare_dyn(
                 return Err(Trap::TypeError);
             };
             match op {
-                CmpOp::Le => subset_dyn(&a_elems, &b_elems, functions, model, depth)?,
-                CmpOp::Ge => subset_dyn(&b_elems, &a_elems, functions, model, depth)?,
+                CmpOp::Le => subset_sets_dyn(&a_elems, &b_elems, functions, model, depth)?,
+                CmpOp::Ge => subset_sets_dyn(&b_elems, &a_elems, functions, model, depth)?,
                 CmpOp::Lt => {
                     a_elems.len() < b_elems.len()
                         && subset_dyn(&a_elems, &b_elems, functions, model, depth)?
@@ -4727,7 +4902,7 @@ fn drive_frames(
                     let iterator = iterator_for(container, functions, model, depth + 1)?;
                     let mut found = false;
                     while let Some(item) = py_next_value(iterator, functions, model, depth)? {
-                        if elem_eq(element, item, functions, model, depth)? {
+                        if elem_eq(item, element, functions, model, depth)? {
                             found = true;
                             break;
                         }

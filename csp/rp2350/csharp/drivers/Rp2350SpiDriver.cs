@@ -6,7 +6,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Rp2350SpiDriver : SpiDriver
+internal sealed class Rp2350SpiDriver : SpiDriver
 {
     private readonly uint _cr0;
     private readonly uint _cr1;

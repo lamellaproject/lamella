@@ -2,14 +2,14 @@
 # reproduces CPython's `_random.Random` bit-for-bit, so a seeded sequence is identical to CPython's.
 #
 # The generator core -- the recurrence, the tempering, both seeding procedures and the outputs built
-# on them -- is written clean-room from a written specification of the algorithm. The algorithm is
-# Makoto Matsumoto and Takuji Nishimura's (1998, with the initialization they revised in 2002), and
-# they are credited for it. The array seeding is their 2002 scheme, the one CPython's integer seeding
-# uses, which is what keeps a seeded stream identical to CPython's.
+# on them -- implements the MT19937 algorithm of Makoto Matsumoto and Takuji Nishimura (1998, with the
+# initialization they revised in 2002), who are credited for it. The array seeding is their 2002
+# scheme, the one CPython's integer seeding uses, which is what keeps a seeded stream identical to
+# CPython's.
 #
-# The distribution helpers (randrange / randint / choice / shuffle / sample / uniform / _randbelow)
-# are derived from CPython's `Lib/random.py`, so CPython's license applies to this file; it is in
-# LICENSE-CPYTHON beside it.
+# The helpers built on the generator (randrange / randint / choice / shuffle / sample / uniform)
+# reproduce CPython's output for a given seed exactly: the same values, the same orders, the same
+# number of draws per call, and the same errors.
 #
 # SEED SUPPORT: an int seed (or None) is reproducible. CPython also seeds from str/bytes (a SHA-512
 # digest, version 2) and from a float/other (its hash); both need primitives this runtime does not
@@ -37,9 +37,29 @@ _ARRAY_FINAL_WORD = 0x80000000  # written into word 0 last, so the state is neve
 # The reciprocal 2**-53 and 2**26, spelled as CPython's random_random does, so the double is identical.
 _RECIP_53 = 1.0 / 9007199254740992.0
 
-# The known-sequence types sample() accepts (CPython requires a Sequence; a set/dict/generator is a
-# TypeError there since 3.11). We name the concrete builtins rather than an abc we do not carry.
-_SEQUENCE_TYPES = (list, tuple, range, str, bytes, bytearray)
+# The sequence types sample() accepts, with collections.deque, which it imports only when it needs it.
+# CPython accepts any registered Sequence; with no collections.abc here, the built-in ones are named.
+_SEQUENCE_TYPES = (list, tuple, range, str, bytes, bytearray, memoryview)
+
+
+# An integer argument, converted as operator.index converts it: an int, including a bool or another
+# subclass of int, gives its own value without its type's __index__ being called; anything else goes
+# through its type's __index__. It is written out here because importing the operator module costs
+# object heap.
+def _as_int(value):
+    if issubclass(type(value), int):
+        return int.__index__(value)
+    try:
+        convert = type(value).__index__
+    except AttributeError:
+        name = type(value).__name__
+        raise TypeError("'{}' object cannot be interpreted as an integer".format(name)) from None
+    result = convert(value)
+    if type(result) is not int:
+        if not issubclass(type(result), int):
+            raise TypeError("__index__ returned non-int (type {})".format(type(result).__name__))
+        result = int.__index__(result)
+    return result
 
 
 # The Mersenne Twister generator. Holds the 624-word state `mt` and the read index `mti`; every
@@ -183,98 +203,106 @@ class Random:
     def __deepcopy__(self, memo):
         return self.__copy__()
 
-    # ----- distributions (transcribed from Lib/random.py) -----
+    # ----- the helpers built on the generator -----
 
-    def _randbelow(self, n):
-        # Return a random int in [0, n) using getrandbits, with rejection so the result is unbiased
-        # and consumes words exactly as CPython does.
-        if not n:
-            return 0
-        k = n.bit_length()
-        r = self.getrandbits(k)
-        while r >= n:
-            r = self.getrandbits(k)
-        return r
+    # A uniform int in [0, n), for n >= 1: draw as many bits as n has, and draw again whenever the
+    # value lands at or above n. Even n == 1 draws.
+    def _below(self, n):
+        bits = n.bit_length()
+        while True:
+            value = self.getrandbits(bits)
+            if value < n:
+                return value
 
+    # A random int from range(start, stop, step); randrange(n) draws from range(n). Without stop, step
+    # must be left at the int 1. One draw sequence per call, after every check.
     def randrange(self, start, stop=None, step=1):
-        # Integer-valued arguments (CPython uses operator.index); the arithmetic and the single
-        # _randbelow draw match CPython so the stream stays aligned.
-        istart = start
+        first = start if type(start) is int else _as_int(start)
         if stop is None:
-            if istart > 0:
-                return self._randbelow(istart)
+            if type(step) is not int or step != 1:
+                raise TypeError("Missing a non-None stop argument")
+            if first > 0:
+                return self._below(first)
             raise ValueError("empty range for randrange()")
-        istop = stop
-        width = istop - istart
-        istep = step
-        if istep == 1:
-            if width > 0:
-                return istart + self._randbelow(width)
-            raise ValueError("empty range in randrange(%d, %d)" % (istart, istop))
-        if istep > 0:
-            n = (width + istep - 1) // istep
-        elif istep < 0:
-            n = (width + istep + 1) // istep
-        else:
+        span = (stop if type(stop) is int else _as_int(stop)) - first
+        pace = step if type(step) is int else _as_int(step)
+        if pace == 1:
+            if span > 0:
+                return first + self._below(span)
+            raise ValueError("empty range in randrange({}, {})".format(start, stop))
+        if not pace:
             raise ValueError("zero step for randrange()")
-        if n <= 0:
-            raise ValueError("empty range for randrange()")
-        return istart + istep * self._randbelow(n)
+        # How many values the range holds: span / pace, rounded up.
+        count = -(-span // pace)
+        if count > 0:
+            return first + pace * self._below(count)
+        raise ValueError("empty range in randrange({}, {}, {})".format(start, stop, step))
 
+    # A random int from a to b, both ends included.
     def randint(self, a, b):
-        # Inclusive of both endpoints: randrange(a, b + 1).
-        return self.randrange(a, b + 1)
+        if type(a) is not int:
+            a = _as_int(a)
+        if type(b) is not int:
+            b = _as_int(b)
+        if b < a:
+            raise ValueError("empty range in randint({}, {})".format(a, b))
+        return a + self._below(b - a + 1)
 
+    # A random item of a non-empty sequence, fetched by its index.
     def choice(self, seq):
-        if not len(seq):
+        size = len(seq)
+        if not size:
             raise IndexError("Cannot choose from an empty sequence")
-        return seq[self._randbelow(len(seq))]
+        return seq[self._below(size)]
 
+    # Permutes x in place: from the last position down to the second, each position trades items with
+    # one drawn at or below it (Durstenfeld's form of the Fisher-Yates shuffle).
     def shuffle(self, x):
-        # Fisher-Yates, from the high end -- the exact draw order of CPython's shuffle.
-        randbelow = self._randbelow
-        for i in range(len(x) - 1, 0, -1):
-            j = randbelow(i + 1)
-            x[i], x[j] = x[j], x[i]
+        for p in range(len(x) - 1, 0, -1):
+            q = self._below(p + 1)
+            x[p], x[q] = x[q], x[p]
 
+    # k distinct positions of population, as a new list in the order they were drawn. A population
+    # small enough beside k is copied, and each pick fills its gap with the last item still in play;
+    # a larger one is read in place, with the positions already taken remembered.
     def sample(self, population, k):
         if not isinstance(population, _SEQUENCE_TYPES):
-            raise TypeError("Population must be a sequence.  For dicts or sets, use sorted(d).")
+            from collections import deque
+            if not isinstance(population, deque):
+                raise TypeError("Population must be a sequence.  For dicts or sets, use sorted(d).")
         n = len(population)
         if not 0 <= k <= n:
             raise ValueError("Sample larger than population or is negative")
-        randbelow = self._randbelow
         result = [None] * k
-        # setsize mirrors CPython's `21 + 4 ** ceil(log(k * 3, 4))` for k > 5, but computed in exact
-        # integers: 4 ** ceil(log(t, 4)) is the least power of 4 >= t, and t = k*3 is never itself a
-        # power of 4 (4**m is not divisible by 3), so there is no float tie point to disagree on.
-        setsize = 21
+        # The copy limit: 21, plus the least power of four at or above 3k once k exceeds 5.
+        limit = 21
         if k > 5:
-            target = k * 3
-            power = 1
-            while power < target:
+            triple = k * 3
+            power = 4
+            while power < triple:
                 power *= 4
-            setsize += power
-        if n <= setsize:
-            # An n-length pool is cheaper than a k-length set: swap chosen items out of the pool.
+            limit += power
+        if n <= limit:
             pool = list(population)
+            live = n
             for i in range(k):
-                j = randbelow(n - i)
+                j = self._below(live)
                 result[i] = pool[j]
-                pool[j] = pool[n - i - 1]
+                live -= 1
+                pool[j] = pool[live]
         else:
-            selected = set()
-            selected_add = selected.add
+            taken = {}
             for i in range(k):
-                j = randbelow(n)
-                while j in selected:
-                    j = randbelow(n)
-                selected_add(j)
+                while True:
+                    j = self._below(n)
+                    if j not in taken:
+                        break
+                taken[j] = True
                 result[i] = population[j]
         return result
 
+    # A random float between a and b: a + (b - a) * random(), the difference taken before the draw.
     def uniform(self, a, b):
-        # a <= N <= b (or b <= N <= a); the same float ops as CPython, so N is bit-identical.
         return a + (b - a) * self.random()
 
 

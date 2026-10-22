@@ -337,6 +337,163 @@ pub fn flash(
     })
 }
 
+/// The second region of a two-region image: flash outside the chip, mapped by a controller the
+/// part brings up, and written through the same probe as the region the part boots from.
+///
+/// **THE STEPS AGAIN, AND STILL NOT THE ORDER.** A backend that writes both regions supplies these
+/// beside its [`FlashBackend`] steps, and [`flash_set`] decides when each runs.
+pub trait WindowSteps {
+    /// The address the window's region is written from.
+    fn window_base(&self) -> u32;
+
+    /// Ask the window's part what it is, erasing nothing.
+    ///
+    /// Called BEFORE either region is erased, so a board with no part, or a part the board does not
+    /// allow, is refused with both regions as they were.
+    ///
+    /// # Errors
+    /// When the part does not answer, or answers as a part the board does not allow.
+    fn identify_window(&mut self) -> Result<PartIdentity, FlashError>;
+
+    /// Erase exactly the span `image` covers in the window.
+    ///
+    /// # Errors
+    /// When the erase does not complete.
+    fn erase_window(&mut self, image: &Image<'_>) -> Result<(), FlashError>;
+
+    /// Write `image` into the window.
+    ///
+    /// # Errors
+    /// When the programming operation fails.
+    fn program_window(&mut self, image: &Image<'_>) -> Result<(), FlashError>;
+
+    /// Read back the span `image` covers, through the window as the part maps it.
+    ///
+    /// # Errors
+    /// When the read-back itself fails.
+    fn read_back_window(&mut self, image: &Image<'_>) -> Result<Vec<u8>, FlashError>;
+
+    /// The boot region's program granule in bytes: the unit its commit points are aligned to.
+    fn boot_granule(&self) -> u32;
+}
+
+/// What happened to both regions of a matched set.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetReport {
+    /// The region the part boots from.
+    pub boot: Report,
+    /// The window's region.
+    pub window: Report,
+}
+
+/// The first bytes of the boot region, written after everything else: the initial stack pointer
+/// and the reset vector of a Cortex-M vector table.
+const BOOT_VECTOR: u32 = 8;
+
+/// Write a two-region image -- `boot` where the part boots from and `window` in its external flash --
+/// as one matched set, in an order an interruption cannot turn into a mixed image.
+///
+/// **THE ORDER, AND WHAT EACH STEP LEAVES IF THE WRITE STOPS THERE:**
+///
+/// 1. Both bases checked and both parts identified. Nothing is erased if either disagrees.
+/// 2. The boot region erased. Its reset vector is gone from here on, so the part cannot start.
+/// 3. The window erased and programmed, whole.
+/// 4. The boot region programmed from past its vector to its end, then its vector last.
+/// 5. Both regions read back, the boot region first.
+/// 6. The part released.
+///
+/// **SO A WRITE STOPPED ANYWHERE LEAVES THE OLD SET UNTOUCHED (STOPPED BEFORE STEP 2), A PART THAT
+/// CANNOT START, OR THE WHOLE NEW SET**, and never a program running beside a window it was not
+/// written with -- wherever that program keeps the record it checks its two halves by, and whatever
+/// the image the write replaced would have done with a partial window.
+///
+/// # Errors
+/// The first step that fails, with nothing after it attempted.
+pub fn flash_set<B: FlashBackend + WindowSteps>(
+    backend: &mut B,
+    boot: &Image<'_>,
+    window: &Image<'_>,
+    policy: VerifyPolicy,
+    allow: &Allow,
+) -> Result<SetReport, FlashError> {
+    if boot.base != backend.flash_base() {
+        return Err(FlashError::WrongBase { stated: boot.base, expected: backend.flash_base() });
+    }
+    if window.base != backend.window_base() {
+        return Err(FlashError::WrongBase { stated: window.base, expected: backend.window_base() });
+    }
+    let identity = backend.identify()?;
+    if !allow.permits(&identity) {
+        return Err(FlashError::NotAllowed { found: identity });
+    }
+    let window_identity = backend.identify_window()?;
+
+    backend.erase(boot)?;
+    backend.erase_window(window)?;
+    backend.program_window(window)?;
+    let vector = BOOT_VECTOR.max(backend.boot_granule());
+    for piece in commit_order(boot, &[vector]) {
+        backend.program(&piece)?;
+    }
+
+    let (boot_check, window_check) = match policy {
+        VerifyPolicy::Skip => (Verification::Skipped, Verification::Skipped),
+        VerifyPolicy::ReadBack => {
+            let boot_check = match backend.read_back(boot) {
+                None => Verification::NotPossible(instead_of_read_back(backend)),
+                Some(read) => {
+                    compare(boot, &read?)?;
+                    Verification::ReadBack
+                }
+            };
+            compare(window, &backend.read_back_window(window)?)?;
+            (boot_check, Verification::ReadBack)
+        }
+    };
+
+    backend.finish()?;
+    let mechanism = backend.mechanism();
+    Ok(SetReport {
+        boot: Report {
+            mechanism,
+            identity,
+            base: boot.base,
+            bytes: boot.bytes.len(),
+            verification: boot_check,
+        },
+        window: Report {
+            mechanism,
+            identity: window_identity,
+            base: window.base,
+            bytes: window.bytes.len(),
+            verification: window_check,
+        },
+    })
+}
+
+/// `image` cut at `points` (offsets, ascending) into the pieces a matched set programs, in the order
+/// it programs them: the tail from the last point first, then each earlier piece, the first last.
+/// A point past the image's end cuts nothing.
+fn commit_order<'a>(image: &Image<'a>, points: &[u32]) -> Vec<Image<'a>> {
+    let length = image.bytes.len();
+    let mut cuts: Vec<usize> = points
+        .iter()
+        .map(|point| usize::try_from(*point).unwrap_or(usize::MAX).min(length))
+        .collect();
+    cuts.insert(0, 0);
+    cuts.push(length);
+    cuts.dedup();
+    let mut pieces: Vec<Image<'a>> = cuts
+        .windows(2)
+        .map(|span| Image {
+            bytes: &image.bytes[span[0]..span[1]],
+            base: image.base.saturating_add(u32::try_from(span[0]).unwrap_or(u32::MAX)),
+        })
+        .collect();
+    pieces.reverse();
+    pieces
+}
+
 /// What a mechanism that cannot read back offers instead.
 ///
 fn instead_of_read_back(backend: &impl FlashBackend) -> &'static str {

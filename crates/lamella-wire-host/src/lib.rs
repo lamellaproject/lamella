@@ -26,9 +26,7 @@ pub mod debug_backend;
 use lamella_wire::{Transport, TransportError};
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
 use lamella_wire::{Frame, FrameReader, encode_frame};
-#[cfg(feature = "serial")]
-use serialport::SerialPort;
-#[cfg(any(feature = "serial", feature = "tcp"))]
+#[cfg(feature = "tcp")]
 use std::io::{Read, Write};
 #[cfg(feature = "tcp")]
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
@@ -38,9 +36,43 @@ use std::time::{Duration, Instant};
 /// [`encode_frame`] / [`FrameReader`]; `poll` is non-blocking (a short read timeout).
 #[cfg(feature = "serial")]
 pub struct SerialTransport {
-    port: Box<dyn SerialPort>,
+    port: Box<dyn SerialLine>,
     reader: FrameReader,
-    baud: u32,
+}
+
+/// How long [`SerialTransport::poll`] waits for the line when it holds no whole frame.
+#[cfg(feature = "serial")]
+const POLL_READ: Duration = Duration::from_millis(50);
+
+/// What the serial carrier needs of a line: a read bounded in time, and a write of a whole frame.
+///
+/// The operating system's port is one, and [`SerialTransport::open`] uses it; a test supplies its own
+/// through [`SerialTransport::from_port`] to measure what the carrier asks of the line.
+#[cfg(feature = "serial")]
+pub trait SerialLine: Send {
+    /// Reads whatever has arrived, waiting up to `timeout` for the first byte. Zero is the bound
+    /// elapsing with nothing on the line.
+    ///
+    /// # Errors
+    /// The port's own error when the read fails.
+    fn read(&mut self, buffer: &mut [u8], timeout: Duration) -> Result<usize, lamella_serial_port::Error>;
+
+    /// Writes every byte of `bytes`.
+    ///
+    /// # Errors
+    /// The port's own error when the write fails or stalls.
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), lamella_serial_port::Error>;
+}
+
+#[cfg(feature = "serial")]
+impl SerialLine for lamella_serial_port::Port {
+    fn read(&mut self, buffer: &mut [u8], timeout: Duration) -> Result<usize, lamella_serial_port::Error> {
+        lamella_serial_port::Port::read(self, buffer, Some(timeout))
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<(), lamella_serial_port::Error> {
+        lamella_serial_port::Port::write_all(self, bytes)
+    }
 }
 
 /// Show everything that arrives on the carrier when `LAMELLA_WIRE_TRACE` is set.
@@ -76,8 +108,9 @@ fn trace_received(bytes: &[u8]) {
 
 /// Why a `serial:<id>` target could not be turned into a port name.
 ///
-/// Two states with different remedies, so they are two variants rather than one failure: "plug the
-/// board in / check the serial" against "say which of these you meant". It lives HERE, in the host
+/// States with different remedies, so they are variants rather than one failure: "plug the board
+/// in / check the serial" against "say which of these you meant", and a machine whose ports could
+/// not be listed at all, which is neither. It lives HERE, in the host
 /// crate, and deliberately not in [`TransportError`] -- that type is shared with `no_std` firmware,
 /// where a payload-carrying enum variant measures ~1,950 bytes of flash for a
 /// condition no device can ever be in.
@@ -88,6 +121,9 @@ pub enum ResolveError {
     NoSuchSerial(String),
     /// More than one does. Carries every match, because the useful message names the alternatives.
     Ambiguous(String, Vec<String>),
+    /// The attached ports could not be listed, so no serial was looked for. Read as "no such
+    /// serial", it would send the user to check a board that may be plugged in.
+    List(lamella_serial_port::Error),
 }
 
 #[cfg(feature = "serial")]
@@ -105,6 +141,7 @@ impl core::fmt::Display for ResolveError {
                 ports.len(),
                 ports.join(", ")
             ),
+            Self::List(error) => write!(f, "{error}"),
         }
     }
 }
@@ -130,24 +167,24 @@ impl core::fmt::Display for ResolveError {
 /// writes to the wrong board, and probe serials commonly share a prefix.
 ///
 /// # Errors
-/// [`ResolveError`] if nothing matches or if more than one does.
+/// [`ResolveError`] if nothing matches, if more than one does, or if the attached ports cannot be
+/// listed.
 #[cfg(feature = "serial")]
 pub fn resolve_target(target: &str) -> Result<String, ResolveError> {
     let Some(wanted) = target.strip_prefix("serial:") else {
         return Ok(target.to_string());
     };
     let needle = wanted.to_ascii_lowercase();
-    let matches: Vec<String> = serialport::available_ports()
+    let matches: Vec<String> = lamella_serial_port::list()
+        .map_err(ResolveError::List)?
         .into_iter()
-        .flatten()
-        .filter(|port| match &port.port_type {
-            serialport::SerialPortType::UsbPort(info) => info
-                .serial_number
-                .as_deref()
-                .is_some_and(|actual| actual.to_ascii_lowercase().contains(&needle)),
-            _ => false,
+        .filter(|port| {
+            port.usb
+                .as_ref()
+                .and_then(|usb| usb.serial_number.as_deref())
+                .is_some_and(|actual| actual.to_ascii_lowercase().contains(&needle))
         })
-        .map(|port| port.port_name)
+        .map(|port| port.name)
         .collect();
     match matches.len() {
         0 => Err(ResolveError::NoSuchSerial(wanted.to_string())),
@@ -162,48 +199,48 @@ impl SerialTransport {
     /// `serial:<id>`, which selects the board by its USB serial number (see [`resolve_target`]).
     /// The baud is moot for native USB-CDC but honored for a real UART.
     ///
+    /// A board that resets on DTR or RTS -- an Espressif USB-Serial-JTAG, an Arduino Due's
+    /// programming port -- has both lines held clear, which on Windows means opening it does not
+    /// reset it. On Linux and macOS the operating system asserts both lines as the port opens,
+    /// before they can be cleared, so there the open can reset such a board.
+    ///
     /// # Errors
-    /// [`TransportError::Carrier`] if the port cannot be opened, or if a `serial:` target names no
-    /// board or more than one. Call [`resolve_target`] first when the caller wants to tell a user
-    /// WHICH of those happened -- this signature is shared with the carrier-neutral driver and
-    /// cannot widen without reaching the `no_std` side.
+    /// [`TransportError::Carrier`] if the port cannot be opened, if a `serial:` target names no
+    /// board or more than one, or if the attached ports cannot be listed, which the open needs to
+    /// tell whether the board resets on DTR or RTS. Call [`resolve_target`] first when the caller
+    /// wants to tell a user WHICH of those happened -- this signature is shared with the
+    /// carrier-neutral driver and cannot widen without reaching the `no_std` side.
     pub fn open(target: &str, baud: u32) -> Result<Self, TransportError> {
         let resolved = resolve_target(target).map_err(|_| TransportError::Carrier)?;
         let path = resolved.as_str();
-        let resets_on_dtr = serialport::available_ports()
+        let resets_on_dtr = lamella_serial_port::list()
+            .map_err(|_| TransportError::Carrier)?
             .into_iter()
-            .flatten()
-            .find(|p| p.port_name.eq_ignore_ascii_case(path))
-            .map(|p| match p.port_type {
-                serialport::SerialPortType::UsbPort(ref i) => {
-                    i.vid == 0x303a || (i.vid == 0x2341 && i.pid == 0x003D)
-                }
-                _ => false,
-            })
-            .unwrap_or(false);
-        let mut port = serialport::new(path, baud)
-            .timeout(Duration::from_millis(50))
-            .dtr_on_open(!resets_on_dtr)
-            .open()
+            .find(|port| port.is_opened_by(path))
+            .and_then(|port| port.usb)
+            .is_some_and(|usb| {
+                usb.vendor_id == 0x303a || (usb.vendor_id == 0x2341 && usb.product_id == 0x003D)
+            });
+        let mut port = lamella_serial_port::Port::open(path, &lamella_serial_port::Settings::new(baud))
             .map_err(|_| TransportError::Carrier)?;
         if resets_on_dtr {
-            port.write_data_terminal_ready(false).ok();
-            port.write_request_to_send(false).ok();
+            port.set_dtr(false).ok();
+            port.set_rts(false).ok();
         } else {
-            port.write_data_terminal_ready(true).map_err(|_| TransportError::Carrier)?;
-            port.write_request_to_send(true).ok();
+            port.set_dtr(true).map_err(|_| TransportError::Carrier)?;
+            port.set_rts(true).ok();
         }
         std::thread::sleep(Duration::from_millis(300));
-        Ok(Self::from_port(port, baud))
+        Ok(Self::from_port(Box::new(port)))
     }
 
-    /// Wrap a port the caller already has.
+    /// Wrap a line the caller already has.
     ///
-    /// Exists so the frame-delivery order above can be measured against a port that records what
+    /// Exists so the frame-delivery order above can be measured against a line that records what
     /// it was asked to do. That order is a latency property, invisible to any test that reads what
     /// arrived without also counting how many times the carrier was consulted to get it.
-    pub fn from_port(port: Box<dyn SerialPort>, baud: u32) -> Self {
-        Self { port, reader: FrameReader::new(), baud }
+    pub fn from_port(port: Box<dyn SerialLine>) -> Self {
+        Self { port, reader: FrameReader::new() }
     }
 }
 
@@ -211,15 +248,7 @@ impl SerialTransport {
 impl Transport for SerialTransport {
     fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
         let frame = encode_frame(msg_type, seq, payload).ok_or(TransportError::PayloadTooLarge)?;
-        let wire_ms = 100 + (frame.len() as u64 * 10 * 1000) / u64::from(self.baud.max(1));
-        self.port.set_timeout(Duration::from_millis(wire_ms)).ok();
-        let written = self
-            .port
-            .write_all(&frame)
-            .and_then(|()| self.port.flush());
-        self.port.set_timeout(Duration::from_millis(50)).ok();
-        written.map_err(|_| TransportError::Carrier)?;
-        Ok(())
+        self.port.write_all(&frame).map_err(|_| TransportError::Carrier)
     }
 
     fn poll(&mut self) -> Result<Option<Frame>, TransportError> {
@@ -227,13 +256,12 @@ impl Transport for SerialTransport {
             return Ok(Some(frame));
         }
         let mut buf = [0u8; 512];
-        match self.port.read(&mut buf) {
+        match self.port.read(&mut buf, POLL_READ) {
             Ok(0) => {}
             Ok(n) => {
                 trace_received(&buf[..n]);
                 self.reader.push(&buf[..n]);
             }
-            Err(ref error) if error.kind() == std::io::ErrorKind::TimedOut => {}
             Err(_) => return Err(TransportError::Carrier),
         }
         Ok(self.reader.next_frame())
@@ -320,7 +348,7 @@ impl UsbTransport {
 }
 
 /// A serial port the OS reports, with its USB identity when it is a USB device -- the serial half of the
-/// board picker (an RPi Debug Probe / FTDI / EDBG UART, etc.). Cross-platform via `serialport::available_ports`.
+/// board picker (an RPi Debug Probe / FTDI / EDBG UART, etc.).
 #[cfg(feature = "serial")]
 #[derive(Debug, Clone)]
 pub struct SerialPortDesc {
@@ -338,20 +366,21 @@ pub struct SerialPortDesc {
 
 /// List the OS serial ports (cross-platform: Windows / macOS / Linux), with USB identity where the port is a
 /// USB device -- the serial half of the board picker. A bare (non-USB) UART comes back with `vid`/`pid` `None`.
+/// A machine whose ports cannot be listed lists none.
 #[cfg(feature = "serial")]
 #[must_use]
 pub fn list_serial() -> Vec<SerialPortDesc> {
-    serialport::available_ports()
+    lamella_serial_port::list()
         .unwrap_or_default()
         .into_iter()
         .map(|port| {
-            let (vid, pid, serial_number, product) = match port.port_type {
-                serialport::SerialPortType::UsbPort(info) => {
-                    (Some(info.vid), Some(info.pid), info.serial_number, info.product)
+            let (vid, pid, serial_number, product) = match port.usb {
+                Some(usb) => {
+                    (Some(usb.vendor_id), Some(usb.product_id), usb.serial_number, usb.product)
                 }
-                _ => (None, None, None, None),
+                None => (None, None, None, None),
             };
-            SerialPortDesc { port: port.port_name, vid, pid, serial_number, product }
+            SerialPortDesc { port: port.name, vid, pid, serial_number, product }
         })
         .collect()
 }
@@ -925,6 +954,48 @@ pub fn version_mismatch(host: u16, target_min: u16, target_max: u16) -> String {
     )
 }
 
+/// Waits for an answer: polls `transport` until `hear` takes a frame as the answer, or `timeout`
+/// passes. `Ok(None)` is the deadline passing first.
+///
+/// **The deadline is checked after every frame, not only when the carrier falls silent.** A target
+/// goes on sending frames that answer nothing a wait is for -- a running program's output, the
+/// answers to other requests -- and a wait that read on until silence held past its deadline for as
+/// long as they kept coming, which a printing program can make forever. Every wait for an answer in
+/// this crate is this function, so the rule has one place to be right.
+///
+/// `before_each` runs before every poll, so a wait that sends its request again on an interval does
+/// so whether or not frames are arriving. `hear` is given each frame and the carrier, so a wait can
+/// ask again when an answer arrives out of order; it returns `Ok(Some(answer))` to end the wait,
+/// `Ok(None)` to wait on, and an error to end it with that error. The carrier is polled at least
+/// once, so a zero `timeout` still takes an answer that has already arrived.
+///
+/// # Errors
+/// The carrier's error, or the error `before_each` or `hear` returns.
+pub fn await_answer<C: Transport + ?Sized, T>(
+    transport: &mut C,
+    timeout: Duration,
+    mut before_each: impl FnMut(&mut C) -> Result<(), TransportError>,
+    mut hear: impl FnMut(&mut C, lamella_wire::Frame) -> Result<Option<T>, TransportError>,
+) -> Result<Option<T>, TransportError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        before_each(transport)?;
+        let frame = transport.poll()?;
+        let silent = frame.is_none();
+        if let Some(frame) = frame
+            && let Some(answer) = hear(transport, frame)?
+        {
+            return Ok(Some(answer));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        if silent {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
 /// Host driver, blocking: HELLO the target and return the negotiated session (the chosen
 /// version + the capability INTERSECTION). `host_caps` is what this host offers -- check
 /// the result's caps to pick the PE ([`send_program`]) vs baked ([`send_image`]) path.
@@ -944,37 +1015,31 @@ pub fn hello_blocking(
         caps: host_caps,
     };
     let encoded = hello.encode();
-    let deadline = Instant::now() + timeout;
     let mut next_send = Instant::now();
-    while Instant::now() < deadline {
-        if Instant::now() >= next_send {
-            transport.send(msg::HELLO, seq, &encoded)?;
-            next_send = Instant::now() + Duration::from_millis(250);
-        }
-        while let Some(frame) = transport.poll()? {
-            match frame.msg_type {
-                msg::HELLO_ACK if frame.seq == seq => {
-                    if let Some(ack) = HelloAck::decode(&frame.payload) {
-                        return Ok(host_finish(&ack, host_caps));
-                    }
-                }
-                msg::HELLO_NAK if frame.seq == seq => {
-                    let range = HelloNak::decode(&frame.payload)
-                        .map_or(ProtocolRange { min: 0, max: 0 }, |nak| nak.target_range);
-                    return Err(TransportError::VersionMismatch {
-                        target_min: range.min,
-                        target_max: range.max,
-                    });
-                }
-                msg::ERROR if frame.seq == seq => {
-                    return Err(lamella_wire::error::refusal(&frame.payload));
-                }
-                _ => {}
+    let answered = await_answer(
+        transport,
+        timeout,
+        |transport| {
+            if Instant::now() >= next_send {
+                transport.send(msg::HELLO, seq, &encoded)?;
+                next_send = Instant::now() + Duration::from_millis(250);
             }
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    Err(TransportError::Closed)
+            Ok(())
+        },
+        |_, frame| match frame.msg_type {
+            msg::HELLO_ACK if frame.seq == seq => {
+                Ok(HelloAck::decode(&frame.payload).map(|ack| host_finish(&ack, host_caps)))
+            }
+            msg::HELLO_NAK if frame.seq == seq => {
+                let range = HelloNak::decode(&frame.payload)
+                    .map_or(ProtocolRange { min: 0, max: 0 }, |nak| nak.target_range);
+                Err(TransportError::VersionMismatch { target_min: range.min, target_max: range.max })
+            }
+            msg::ERROR if frame.seq == seq => Err(lamella_wire::error::refusal(&frame.payload)),
+            _ => Ok(None),
+        },
+    )?;
+    answered.ok_or(TransportError::Closed)
 }
 
 /// Host driver, blocking convenience for a real (concurrent) target: send the program, then poll for
@@ -1531,14 +1596,8 @@ fn await_transfer_reply(
     seq: u16,
     timeout: Duration,
 ) -> Result<Vec<u8>, TransportError> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Some(reply) = try_recv_transfer_reply(transport, seq)? {
-            return Ok(reply);
-        }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    Err(TransportError::Closed)
+    await_answer(transport, timeout, |_| Ok(()), |_, frame| transfer_reply(frame, seq))?
+        .ok_or(TransportError::Closed)
 }
 
 /// **DEPLOYING a BUNDLE: the protocol, stated once.** A bundle persists to the target's deploy
@@ -1641,9 +1700,10 @@ pub fn send_bundle_chunk(
 /// Passing it is what lets a [`TransferAck::Rejected`] answer the question it raises without the
 /// caller having tracked the index alongside.
 ///
-/// `Ok(None)` means ONE thing -- nothing has arrived -- so a target that does not implement the
-/// op comes back as [`TransportError::Refused`] rather than as a caller polling a healthy link to
-/// its deadline and blaming the cable.
+/// `Ok(None)` means ONE thing -- the answer has not arrived yet -- so a target that does not
+/// implement the op comes back as [`TransportError::Refused`] rather than as a caller polling a
+/// healthy link to its deadline and blaming the cable. Each call takes at most one frame, so a
+/// target's other traffic cannot hold it.
 ///
 /// # Errors
 /// [`TransportError::Refused`] when the target answered `ERROR` for this sequence; otherwise a
@@ -1676,24 +1736,30 @@ pub fn try_recv_deploy_ack(
         .transpose()
 }
 
-/// The payload of the `XFER_RESULT` answering `seq` once it has arrived, or `Ok(None)` while
-/// nothing has. A frame for another sequence number is passed over.
+/// The payload of the `XFER_RESULT` answering `seq` if it has arrived, or `Ok(None)`. One look:
+/// at most one frame is taken, so a target's other traffic cannot hold the caller.
 ///
 /// # Errors
 /// [`TransportError::Refused`] when the target answered `ERROR` for this sequence; otherwise a
 /// carrier [`TransportError`].
 fn try_recv_transfer_reply(transport: &mut impl Transport, seq: u16) -> Result<Option<Vec<u8>>, TransportError> {
-    use lamella_wire::{Frame, msg};
-    while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
-        if reply_seq != seq {
-            continue;
-        }
-        if msg_type == deploy::XFER_RESULT {
-            return Ok(Some(payload));
-        }
-        if msg_type == msg::ERROR {
-            return Err(lamella_wire::error::refusal(&payload));
-        }
+    await_answer(transport, Duration::ZERO, |_| Ok(()), |_, frame| transfer_reply(frame, seq))
+}
+
+/// The payload of `frame` when it is the `XFER_RESULT` answering `seq`, and `Ok(None)` when it
+/// answers something else.
+///
+/// # Errors
+/// [`TransportError::Refused`] when the frame is the target's `ERROR` for this sequence.
+fn transfer_reply(frame: lamella_wire::Frame, seq: u16) -> Result<Option<Vec<u8>>, TransportError> {
+    if frame.seq != seq {
+        return Ok(None);
+    }
+    if frame.msg_type == deploy::XFER_RESULT {
+        return Ok(Some(frame.payload));
+    }
+    if frame.msg_type == lamella_wire::msg::ERROR {
+        return Err(lamella_wire::error::refusal(&frame.payload));
     }
     Ok(None)
 }
@@ -1792,26 +1858,22 @@ pub fn deploy_status_blocking(
 ) -> Result<DeployStatus, TransportError> {
     use lamella_wire::{Frame, msg};
     transport.send(deploy::DEPLOY_STATUS, seq, &[])?;
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
-            if msg_type == msg::ERROR && reply_seq == seq {
-                return Err(lamella_wire::error::refusal(&payload));
-            }
-            if msg_type == deploy::DEPLOY_STATUS_RESULT && reply_seq == seq {
-                let verified = payload.first().copied() == Some(deploy::deploy_state::VERIFIED);
-                let checksum = payload
-                    .get(2..10)
-                    .filter(|_| verified)
-                    .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap_or_default()));
-                let window =
-                    payload.get(10..14).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap_or_default()));
-                return Ok(DeployStatus { checksum, window });
-            }
+    let answered = await_answer(transport, timeout, |_| Ok(()), |_, Frame { msg_type, seq: reply_seq, payload }| {
+        if msg_type == msg::ERROR && reply_seq == seq {
+            return Err(lamella_wire::error::refusal(&payload));
         }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    Err(TransportError::Closed)
+        if msg_type != deploy::DEPLOY_STATUS_RESULT || reply_seq != seq {
+            return Ok(None);
+        }
+        let verified = payload.first().copied() == Some(deploy::deploy_state::VERIFIED);
+        let checksum = payload
+            .get(2..10)
+            .filter(|_| verified)
+            .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap_or_default()));
+        let window = payload.get(10..14).map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap_or_default()));
+        Ok(Some(DeployStatus { checksum, window }))
+    })?;
+    answered.ok_or(TransportError::Closed)
 }
 
 /// The refusal a deploy makes before it sends anything: [`TransferAck::TooLarge`] when the target
@@ -1869,26 +1931,18 @@ pub fn abort_blocking(
     timeout: Duration,
 ) -> Result<Aborted, TransportError> {
     transport.send(debug::ABORT, seq, &[])?;
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        while let Some(frame) = transport.poll()? {
-            if frame.seq != seq {
-                continue;
-            }
-            match (frame.msg_type, frame.payload.first().copied()) {
-                (exec::EXEC_ACK, Some(exec::ack::IDLE)) => return Ok(Aborted::NothingWasRunning),
-                (debug::EVT_STOPPED, Some(debug::reason::ABORTED)) => {
-                    return Ok(Aborted::StoppedAProgram);
-                }
-                (lamella_wire::msg::ERROR, _) => {
-                    return Err(lamella_wire::error::refusal(&frame.payload));
-                }
-                _ => {}
-            }
+    let answered = await_answer(transport, timeout, |_| Ok(()), |_, frame| {
+        if frame.seq != seq {
+            return Ok(None);
         }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    Err(TransportError::Closed)
+        match (frame.msg_type, frame.payload.first().copied()) {
+            (exec::EXEC_ACK, Some(exec::ack::IDLE)) => Ok(Some(Aborted::NothingWasRunning)),
+            (debug::EVT_STOPPED, Some(debug::reason::ABORTED)) => Ok(Some(Aborted::StoppedAProgram)),
+            (lamella_wire::msg::ERROR, _) => Err(lamella_wire::error::refusal(&frame.payload)),
+            _ => Ok(None),
+        }
+    })?;
+    answered.ok_or(TransportError::Closed)
 }
 
 /// Host driver: pull the target's full resident-profile manifest: the identity, the resident
@@ -1915,26 +1969,23 @@ pub fn profile_manifest_blocking(
     use lamella_wire::{Frame, ProfileManifest};
     let mut held: Vec<u8> = Vec::new();
     transport.send(profile::PROFILE_GET, seq, &0u32.to_le_bytes())?;
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
-            if msg_type != profile::PROFILE_MANIFEST || reply_seq != seq || payload.len() < 8 {
-                continue;
-            }
-            let offset = u32::from_le_bytes(payload[0..4].try_into().unwrap_or_default()) as usize;
-            let total = u32::from_le_bytes(payload[4..8].try_into().unwrap_or_default()) as usize;
-            if offset != held.len() {
-                transport.send(profile::PROFILE_GET, seq, &(held.len() as u32).to_le_bytes())?;
-                continue;
-            }
-            held.extend_from_slice(&payload[8..]);
-            if held.len() >= total {
-                return ProfileManifest::decode(&held).ok_or(TransportError::Closed);
-            }
+    let answered = await_answer(transport, timeout, |_| Ok(()), |transport, Frame { msg_type, seq: reply_seq, payload }| {
+        if msg_type != profile::PROFILE_MANIFEST || reply_seq != seq || payload.len() < 8 {
+            return Ok(None);
         }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    Err(TransportError::Closed)
+        let offset = u32::from_le_bytes(payload[0..4].try_into().unwrap_or_default()) as usize;
+        let total = u32::from_le_bytes(payload[4..8].try_into().unwrap_or_default()) as usize;
+        if offset != held.len() {
+            transport.send(profile::PROFILE_GET, seq, &(held.len() as u32).to_le_bytes())?;
+            return Ok(None);
+        }
+        held.extend_from_slice(&payload[8..]);
+        if held.len() < total {
+            return Ok(None);
+        }
+        ProfileManifest::decode(&held).ok_or(TransportError::Closed).map(Some)
+    })?;
+    answered.ok_or(TransportError::Closed)
 }
 
 /// Host driver: tell the target to start its DEPLOYED artifact now, so deploy-then-run needs no
@@ -2007,27 +2058,23 @@ pub fn start_execution(
     timeout: Duration,
 ) -> Result<(), StartFailure> {
     transport.send(exec::EXEC, seq, &[source, flags]).map_err(StartFailure::Transport)?;
-    let deadline = Instant::now() + timeout;
-    loop {
-        while let Some(frame) = transport.poll().map_err(StartFailure::Transport)? {
-            if frame.seq != seq {
-                continue;
-            }
-            if frame.msg_type == exec::EXEC_ACK {
-                return match frame.payload.first().copied() {
-                    Some(exec::ack::STARTED | exec::ack::RUNNING) => Ok(()),
-                    code => Err(StartFailure::Refused(code)),
-                };
-            }
-            if frame.msg_type == lamella_wire::msg::ERROR {
-                return Err(StartFailure::Transport(lamella_wire::error::refusal(&frame.payload)));
-            }
+    let answered = await_answer(transport, timeout, |_| Ok(()), |_, frame| {
+        if frame.seq != seq {
+            return Ok(None);
         }
-        if Instant::now() >= deadline {
-            return Err(StartFailure::NoAnswer);
+        if frame.msg_type == exec::EXEC_ACK {
+            return Ok(Some(match frame.payload.first().copied() {
+                Some(exec::ack::STARTED | exec::ack::RUNNING) => Ok(()),
+                code => Err(StartFailure::Refused(code)),
+            }));
         }
-        std::thread::sleep(Duration::from_millis(2));
-    }
+        if frame.msg_type == lamella_wire::msg::ERROR {
+            return Err(lamella_wire::error::refusal(&frame.payload));
+        }
+        Ok(None)
+    })
+    .map_err(StartFailure::Transport)?;
+    answered.unwrap_or(Err(StartFailure::NoAnswer))
 }
 
 /// The sentence saying why the target did not start a run, from the code its [`exec::EXEC_ACK`]
@@ -2868,5 +2915,130 @@ mod tests {
         let start = reader.next_frame().expect("the start");
         assert_eq!(start.msg_type, exec::EXEC);
         assert_eq!(start.payload, vec![exec::exec_source::LOADED, 0], "from RAM, running");
+    }
+
+    /// A target that goes on talking to someone else: until `until`, every poll is a frame at
+    /// another sequence number, as a running program's output is, and silence after it. It records
+    /// the type of everything it is sent.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    struct Chatty {
+        until: Instant,
+        sent: Vec<u8>,
+    }
+
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    impl Chatty {
+        /// Chatter for three seconds, longer than any wait below, so a wait that reads on until the
+        /// carrier falls silent is seen to.
+        fn for_a_while() -> Self {
+            Chatty { until: Instant::now() + Duration::from_secs(3), sent: Vec::new() }
+        }
+
+        /// Runs `wait` against chatter and says how long it took, which is under a second for a wait
+        /// of [`CHATTY_BOUND`] that keeps its deadline.
+        fn time<T>(wait: impl FnOnce(&mut Chatty) -> T) -> (T, Chatty, Duration) {
+            let mut target = Chatty::for_a_while();
+            let started = Instant::now();
+            let answer = wait(&mut target);
+            (answer, target, started.elapsed())
+        }
+    }
+
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    impl Transport for Chatty {
+        fn send(&mut self, msg_type: u8, _seq: u16, _payload: &[u8]) -> Result<(), TransportError> {
+            self.sent.push(msg_type);
+            Ok(())
+        }
+
+        fn poll(&mut self) -> Result<Option<Frame>, TransportError> {
+            Ok((Instant::now() < self.until).then(|| Frame {
+                msg_type: debug::EVT_OUTPUT,
+                seq: 0x7777,
+                payload: vec![debug::output::STDOUT, 0, b'.'],
+            }))
+        }
+    }
+
+    /// The bound every wait below is given.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    const CHATTY_BOUND: Duration = Duration::from_millis(600);
+
+    /// **A WAIT ENDS AT ITS DEADLINE WHILE THE TARGET GOES ON TALKING**: every wait for an answer
+    /// passed over frames for other requests and looked at its deadline only when the carrier fell
+    /// silent, so a target sending them without pause -- a printing program -- held it for as long as
+    /// it went on. The handshake is the first such wait, and it also sends its HELLO again on its
+    /// interval while the chatter goes on.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    #[test]
+    fn the_handshake_ends_at_its_deadline_and_asks_again_while_the_target_goes_on_talking() {
+        let caps = lamella_wire::Capabilities(0);
+        let (answer, target, took) = Chatty::time(|target| hello_blocking(target, 1, caps, CHATTY_BOUND));
+        assert!(matches!(answer, Err(TransportError::Closed)), "got {answer:?}");
+        assert!(took < Duration::from_secs(1), "took {took:?}");
+        let hellos = target.sent.iter().filter(|&&sent| sent == lamella_wire::msg::HELLO).count();
+        assert!(hellos >= 2, "asked again every 250 ms: {hellos}");
+    }
+
+    /// As above, for the question about what is deployed.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    #[test]
+    fn the_deploy_status_question_ends_at_its_deadline_while_the_target_goes_on_talking() {
+        let (answer, _, took) = Chatty::time(|target| deploy_status_blocking(target, 1, CHATTY_BOUND));
+        assert_eq!(answer, Err(TransportError::Closed));
+        assert!(took < Duration::from_secs(1), "took {took:?}");
+    }
+
+    /// As above, for an abort.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    #[test]
+    fn an_abort_ends_at_its_deadline_while_the_target_goes_on_talking() {
+        let (answer, _, took) = Chatty::time(|target| abort_blocking(target, 1, CHATTY_BOUND));
+        assert_eq!(answer, Err(TransportError::Closed));
+        assert!(took < Duration::from_secs(1), "took {took:?}");
+    }
+
+    /// As above, for the profile manifest.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    #[test]
+    fn the_profile_question_ends_at_its_deadline_while_the_target_goes_on_talking() {
+        let (answer, _, took) = Chatty::time(|target| profile_manifest_blocking(target, 1, CHATTY_BOUND));
+        assert!(matches!(answer, Err(TransportError::Closed)), "got {answer:?}");
+        assert!(took < Duration::from_secs(1), "took {took:?}");
+    }
+
+    /// As above, for a start, whose timeout is its own failure.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    #[test]
+    fn a_start_ends_at_its_deadline_while_the_target_goes_on_talking() {
+        let (answer, _, took) = Chatty::time(|target| {
+            start_execution(target, 1, exec::exec_source::DEPLOYED, 0, CHATTY_BOUND)
+        });
+        assert_eq!(answer, Err(StartFailure::NoAnswer));
+        assert!(took < Duration::from_secs(1), "took {took:?}");
+    }
+
+    /// As above, for a transfer's acknowledgement; and the look that does not wait takes one frame
+    /// and says the answer is not in yet, rather than reading on while the target talks.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    #[test]
+    fn a_transfer_acknowledgement_ends_at_its_deadline_while_the_target_goes_on_talking() {
+        let (answer, _, took) = Chatty::time(|target| await_transfer_reply(target, 1, CHATTY_BOUND));
+        assert_eq!(answer, Err(TransportError::Closed));
+        assert!(took < Duration::from_secs(1), "took {took:?}");
+        let (answer, _, took) = Chatty::time(|target| try_recv_bundle_ack(target, 1, 0));
+        assert_eq!(answer, Ok(None));
+        assert!(took < Duration::from_millis(100), "took {took:?}");
+    }
+
+    /// As above, for a program's result. Its wait polls a [`RunCollector`], whose poll read until
+    /// the carrier fell silent, so the chatter held the wait inside one poll for as long as it went
+    /// on.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+    #[test]
+    fn a_programs_result_ends_at_its_deadline_while_the_target_goes_on_talking() {
+        let (answer, _, took) = Chatty::time(|target| eval_blocking(target, 1, b"program", CHATTY_BOUND));
+        assert!(matches!(answer, Err(TransportError::Closed)), "got {answer:?}");
+        assert!(took < Duration::from_secs(1), "took {took:?}");
     }
 }

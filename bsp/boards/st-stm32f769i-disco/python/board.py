@@ -67,6 +67,7 @@ INSTANCES = {
     "rcc": {"block": "rcc", "base": 0x40023800},
     "exti": {"block": "exti", "base": 0x40013C00},
     "syscfg": {"block": "syscfg", "base": 0x40013800, "rcc_en_off": 0x44, "rcc_en_bit": 0xE},
+    "quadspi": {"block": "quadspi", "base": 0xA0001000, "rcc_en_off": 0x38, "rcc_en_bit": 0x1},
 }
 
 PLANS = {
@@ -81,4 +82,10 @@ DEVICES = {
     "led0": {"kind": "gpio-out", "port_base": 0x40022400, "pin": 13, "bank": 0, "mask": 0x2000, "active_low": False},
     "led1": {"kind": "gpio-out", "port_base": 0x40022400, "pin": 5, "bank": 0, "mask": 0x20, "active_low": False},
     "button0": {"kind": "gpio-in", "port_base": 0x40020000, "pin": 0, "bank": 0, "mask": 0x1, "active_low": False},
+}
+
+# Memory regions the board fits. A region with a "controller" does not exist until
+# that instance is brought up; touching it first is a bus fault, not a wrong value.
+MEMORY = {
+    "qspi": {"kind": "flash", "base": 0x90000000, "size": 0x4000000, "controller": "quadspi", "optional": True},
 }

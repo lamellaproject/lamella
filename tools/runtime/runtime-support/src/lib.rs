@@ -271,10 +271,13 @@ pub extern "C" fn py_list_grow(header: *mut u32, needed_cap: u32, element_size: 
     }
 }
 
-/// Python `min(a, b)` for two floats: `a` unless `b` is STRICTLY less. This is CPython's own left-to-
-/// right reduce (`result = a; if b < result: result = b`), NOT IEEE `fmin` -- so `a` wins ties, a NaN
-/// in `b` leaves `a` (every compare is false), and signed zero follows the plain `<` (min(-0.0, 0.0) ==
-/// -0.0). Uses the same soft-float `<` (`__ltdf2`) CPython's compare does, so it is bit-for-bit CPython.
+/// Python's `min(a, b)` for two floats: `b` when it is less than `a`, otherwise `a`.
+///
+/// Equal values are a tie and the tie goes to `a`; the two zeros are equal, so `min(0.0, -0.0)`
+/// is `0.0` and `min(-0.0, 0.0)` is `-0.0`. No ordered comparison with a NaN is true, so a NaN
+/// in either position also leaves `a` as the result: `min(nan, 1.0)` is that NaN and
+/// `min(1.0, nan)` is `1.0`. The result is one of the two arguments, unchanged, so a returned
+/// NaN keeps its sign and payload bits.
 #[no_mangle]
 pub extern "C" fn lamella_fmin(a: f64, b: f64) -> f64 {
     if b < a {
@@ -284,8 +287,13 @@ pub extern "C" fn lamella_fmin(a: f64, b: f64) -> f64 {
     }
 }
 
-/// Python `max(a, b)` for two floats: `a` unless `b` is STRICTLY greater (CPython's `result = a; if b >
-/// result: result = b`). Same tie/NaN/signed-zero behavior as [`lamella_fmin`], mirrored.
+/// Python's `max(a, b)` for two floats: `b` when it is greater than `a`, otherwise `a`.
+///
+/// Equal values are a tie and the tie goes to `a`; the two zeros are equal, so `max(0.0, -0.0)`
+/// is `0.0` and `max(-0.0, 0.0)` is `-0.0`. No ordered comparison with a NaN is true, so a NaN
+/// in either position also leaves `a` as the result: `max(nan, 1.0)` is that NaN and
+/// `max(1.0, nan)` is `1.0`. The result is one of the two arguments, unchanged, so a returned
+/// NaN keeps its sign and payload bits.
 #[no_mangle]
 pub extern "C" fn lamella_fmax(a: f64, b: f64) -> f64 {
     if b > a {

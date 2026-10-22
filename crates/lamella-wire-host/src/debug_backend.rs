@@ -99,6 +99,10 @@ pub enum WireTransport {
     /// Shared, because a test has to read what the backend sent AFTER the backend is gone.
     #[cfg(test)]
     Mem(std::sync::Arc<std::sync::Mutex<lamella_wire::MemTransport>>),
+    /// A carrier that has gone away and reads as silence: every send fails and every poll finds
+    /// nothing. `#[cfg(test)]`, like `Mem`.
+    #[cfg(test)]
+    Gone,
 }
 
 impl Transport for WireTransport {
@@ -109,6 +113,8 @@ impl Transport for WireTransport {
             WireTransport::Usb(t) => t.send(msg_type, seq, payload),
             #[cfg(test)]
             WireTransport::Mem(t) => t.lock().expect("the test transport").send(msg_type, seq, payload),
+            #[cfg(test)]
+            WireTransport::Gone => Err(TransportError::Carrier),
         }
     }
     fn poll(&mut self) -> Result<Option<WireFrame>, TransportError> {
@@ -118,6 +124,8 @@ impl Transport for WireTransport {
             WireTransport::Usb(t) => t.poll(),
             #[cfg(test)]
             WireTransport::Mem(t) => t.lock().expect("the test transport").poll(),
+            #[cfg(test)]
+            WireTransport::Gone => Ok(None),
         }
     }
 }
@@ -656,18 +664,21 @@ impl WireHostBackend {
     /// but the few a run can act on. A board that has left the program -- a firmware fault that reset
     /// it into its serve loop -- answers IDLE. So the question separates a program that is quiet from
     /// one that is gone, without disturbing the first.
-    fn ask_whether_running_if_quiet(&mut self) {
+    ///
+    /// # Errors
+    /// The carrier's failure to send the question, which means the connection has gone.
+    fn ask_whether_running_if_quiet(&mut self) -> Result<(), TransportError> {
         let now = Instant::now();
         let asked_recently = self
             .status_asked
             .is_some_and(|(_, at)| now.duration_since(at) < QUIET_BEFORE_ASKING);
         if now.duration_since(self.heard_at) < QUIET_BEFORE_ASKING || asked_recently {
-            return;
+            return Ok(());
         }
         let seq = self.next_seq();
-        if self.transport.borrow_mut().send(exec::EXEC_STATUS, seq, &[]).is_ok() {
-            self.status_asked = Some((seq, now));
-        }
+        self.transport.borrow_mut().send(exec::EXEC_STATUS, seq, &[])?;
+        self.status_asked = Some((seq, now));
+        Ok(())
     }
 
     /// Whether `frame` is the board answering this host's own `EXEC_STATUS` with IDLE.
@@ -1263,7 +1274,9 @@ impl DebugBackend for WireHostBackend {
                 Stop::Running
             }
             Ok(None) => {
-                self.ask_whether_running_if_quiet();
+                if self.ask_whether_running_if_quiet().is_err() {
+                    return Stop::Fault("the wire dropped".to_string());
+                }
                 Stop::Running
             }
             Err(_) => Stop::Fault("the wire dropped".to_string()),
@@ -2015,6 +2028,16 @@ mod tests {
         };
         assert!(reason.contains("nothing is executing"), "{reason}");
         assert!(!backend.session_live, "and there is no session left to detach");
+    }
+
+    #[test]
+    fn a_question_the_carrier_cannot_send_ends_the_session_as_a_dropped_wire() {
+        let (mut backend, _) = running_and_silent_since(3);
+        backend.transport = RefCell::new(WireTransport::Gone);
+        let Stop::Fault(reason) = backend.poll() else {
+            panic!("a carrier that cannot send is not a program running");
+        };
+        assert!(reason.contains("the wire dropped"), "{reason}");
     }
 
     #[test]

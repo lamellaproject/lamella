@@ -988,12 +988,16 @@ pub enum StmtKind {
         /// The guarded statement.
         body: Box<Stmt>,
     },
-    /// A `using ( resource ) statement` (15.13).
+    /// A `using ( resource ) statement` (15.13), or a USING DECLARATION (C# 8), `using T r = e;`,
+    /// whose body is every statement after it in the same block or statement list.
     Using {
         /// The resource acquired for the duration of the body.
         resource: UsingResource,
         /// The guarded statement.
         body: Box<Stmt>,
+        /// Whether this was written as a using declaration. Its variables are then the enclosing
+        /// list's, and so are the variables its body declares at that level.
+        declaration: bool,
     },
     /// A `fixed ( T* id = expr ) statement` (unsafe, 15.7): pins `expr` (an array/string)
     /// for the body and binds `id` to a pointer to its first element.
@@ -1474,9 +1478,33 @@ pub struct TypeDecl {
     /// the default behaviour has to be the class behaviour and only the sites that synthesize
     /// members may ask. `record struct` (C# 10) is the same field on a `TypeKind::Struct`.
     pub record: Option<RecordParts>,
+    /// Whether this is the part of `Program` that a compilation unit's TOP-LEVEL STATEMENTS
+    /// declare (C# 9), rather than a declaration written in the source.
+    ///
+    /// The statements are the body of the part's one method, [`TOP_LEVEL_ENTRY_POINT`], so every
+    /// stage reads them as an ordinary partial class; this flag is for the few rules that are about
+    /// the declaration itself -- `Program` is marked `[CompilerGenerated]` only when no source
+    /// declaration of it exists, and the program's entry point is this part's method.
+    pub from_top_level_statements: bool,
     /// The byte range the declaration covers.
     pub span: Span,
 }
+
+/// The name of the class a compilation unit's top-level statements are a method of (C# 9). The
+/// program may declare `partial class Program` itself, and its members are then that class's too.
+pub const TOP_LEVEL_PROGRAM: &str = "Program";
+
+/// The name of the method a compilation unit's top-level statements become, and the program's
+/// entry point (C# 9). No source can name it: `<`, `>` and `$` are not identifier characters.
+pub const TOP_LEVEL_ENTRY_POINT: &str = "<Main>$";
+
+/// The name of the synchronous method that is the entry point when the top-level statements
+/// `await`: it calls [`TOP_LEVEL_ENTRY_POINT`] and waits for the task it returns, as for any
+/// asynchronous `Main` (ECMA-334 7.1).
+pub const TOP_LEVEL_ASYNC_ENTRY_POINT: &str = "<Main>";
+
+/// How a diagnostic names [`TOP_LEVEL_ENTRY_POINT`]: by what it is, since no source spells it.
+pub const TOP_LEVEL_ENTRY_POINT_DISPLAY: &str = "<top-level-statements-entry-point>";
 
 /// What a `record` declaration carries beyond an ordinary class (C# 9).
 ///

@@ -1278,6 +1278,12 @@ pub struct Binder {
     /// line -- a test, an in-process compile -- has no such policy to apply. The driver sets it,
     /// and `unsafe` written under it is `CS0227`.
     unsafe_option_missing: bool,
+    /// The names the program's TOP-LEVEL STATEMENTS declare at their outermost level (C# 9), or
+    /// `None` when it has none. Code outside the statements that names one is `CS8801`, whatever
+    /// else the name would mean once the global namespace is reached. Set before any body is bound
+    /// ([`Binder::set_top_level_statements`]), so the answer does not depend on which body binds
+    /// first.
+    top_level_locals: Option<alloc::collections::BTreeSet<Box<str>>>,
     /// The nullable context of the file being bound (C# 8.0): whether a `?` over a reference type
     /// is an annotation, a CS8632 warning or, before C# 8.0, a CS8370 error depends on where it is
     /// written. Set per unit by [`Binder::set_nullable_context`]; the default, a disabled context
@@ -1964,6 +1970,17 @@ impl Binder {
     /// Whether `unsafe` may appear at all in this compilation.
     pub(crate) fn unsafe_option_missing(&self) -> bool {
         self.unsafe_option_missing
+    }
+
+    /// Records that the program has TOP-LEVEL STATEMENTS declaring `locals` at their outermost
+    /// level (see [`crate::top_level::top_level_local_names`]).
+    pub fn set_top_level_statements(&mut self, locals: alloc::collections::BTreeSet<Box<str>>) {
+        self.top_level_locals = Some(locals);
+    }
+
+    /// Whether the program has top-level statements, which are then its entry point.
+    pub(crate) fn has_top_level_statements(&self) -> bool {
+        self.top_level_locals.is_some()
     }
 
     /// Binds what follows under `context`, the nullable context of the file it comes from.
@@ -5310,6 +5327,31 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         hits
     }
 
+    /// Whether the simple name `name`, in code OUTSIDE the program's top-level statements, names
+    /// one of their outermost locals -- which it then does, and which is `CS8801` from there.
+    ///
+    /// Once a lookup reaches the global namespace, the statements' names are tried before the
+    /// global namespace's own types and before what the unit imports (C# 9), so a top-level local
+    /// hides a global type or an imported one of the same name (both measured). A type found
+    /// earlier -- nested in an enclosing type, or in an enclosing namespace -- still wins, because
+    /// the lookup never reaches the global namespace (measured: inside `namespace N`, a type
+    /// `N.D` is found and a top-level local `D` is not).
+    fn names_top_level_local_from_outside(&self, name: &str) -> bool {
+        let Some(locals) = &self.top_level_locals else {
+            return false;
+        };
+        if !locals.contains(name)
+            || self
+                .current_method
+                .as_ref()
+                .is_some_and(|method| &*method.name == lamella_syntax::ast::TOP_LEVEL_ENTRY_POINT)
+        {
+            return false;
+        }
+        let hits = self.type_namespaces_containing(name);
+        !matches!(hits.first(), Some((scope, false)) if !scope.is_empty())
+    }
+
     /// Marks the next [`Binder::bind_method`] call as binding a vararg member's body
     /// (`M(..., __arglist)` / `T(..., __arglist)`), so a bare `__arglist` binds to the
     /// runtime argument handle instead of reporting CS0190. `bind_method` consumes the
@@ -5405,9 +5447,14 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.body_initializer_statements = 0;
         self.exit_scope();
         if returns_value && !crate::flow::method_body_always_exits(&bound) {
+            let method = if name == lamella_syntax::ast::TOP_LEVEL_ENTRY_POINT {
+                lamella_syntax::ast::TOP_LEVEL_ENTRY_POINT_DISPLAY
+            } else {
+                name
+            };
             self.diagnostics.push(Diagnostic::new(
                 DiagnosticKind::NotAllPathsReturn {
-                    method: name.into(),
+                    method: method.into(),
                 },
                 body_span,
             ));
@@ -18726,6 +18773,13 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 return bound;
             }
         }
+        if self.names_top_level_local_from_outside(name) {
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::TopLevelLocalUsedOutside { name: name.into() },
+                span,
+            ));
+            return error_expr();
+        }
         if let Some(target) = self.alias_target(name) {
             if let Some(namespace) = self.aliased_namespace(&target) {
                 return BoundExpr {
@@ -19762,14 +19816,8 @@ pub(crate) fn cast_constant(operand: &Literal, target: SpecialType) -> Option<Li
         Literal::Real { bits, .. } => {
             let value = f64::from_bits(*bits);
             match target {
-                S::Single => Some(Literal::Real {
-                    bits: f64::from(value as f32).to_bits(),
-                    suffix: RealSuffix::Float,
-                }),
-                S::Double => Some(Literal::Real {
-                    bits: value.to_bits(),
-                    suffix: RealSuffix::Double,
-                }),
+                S::Single => Some(crate::declaration::real_constant(value, RealSuffix::Float)),
+                S::Double => Some(crate::declaration::real_constant(value, RealSuffix::Double)),
                 _ => coerce_constant(value as i64, target),
             }
         }

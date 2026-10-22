@@ -3,7 +3,7 @@ namespace Lamella.Hardware
 {
     /// <summary>Names the peripheral instance behind an open SPI device, for a native owner that
     /// takes the bus over.</summary>
-    public sealed class SpiNative
+    internal sealed class SpiNative
     {
         private SpiNative() { }
 

@@ -40,6 +40,8 @@
 //!        --target thumbv8m.main-none-eabihf --features serve,rp2350,usb,cyw43,tls,system-roots
 //! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
 //!        --target thumbv8m.main-none-eabihf --features serve,rp2350,usb,pico-plus-2-w,tls,system-roots
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
+//!        --target thumbv8m.main-none-eabi --features serve,rp2350,usb
 //! The fourth is the Pimoroni Pico Plus 2 W: the third's radio and serve, with that board's own
 //! board file and identity. The fifth is the Pimoroni Pico Plus 2: the Pico 2's firmware, with no
 //! radio, and likewise that board's own board file and identity. Each build's deploy window runs
@@ -49,9 +51,9 @@
 //! the runtime's TLS seam, and `system-roots` adds the bundled CA store. They compile mbedTLS and so
 //! need an ARM cross C compiler: `LAMELLA_ARM_GCC`, or `arm-none-eabi-gcc` on PATH (see
 //! `lamella-tls-mbedtls`'s README).
-//! The last three are hard-float builds of the first and of the two TLS builds: the same firmware for
-//! `thumbv8m.main-none-eabihf`, where single-precision arithmetic runs on the M33's FPU. Its FPU has
-//! no double-precision instructions, so `double` stays in software on both targets.
+//! The eighth, ninth and tenth are hard-float builds of the first and of the two TLS builds: the same
+//! firmware for `thumbv8m.main-none-eabihf`, where single-precision arithmetic runs on the M33's FPU.
+//! Its FPU has no double-precision instructions, so `double` stays in software on both targets.
 //! The third is the Pico 2 W, and it is listed for the reason the second is: a build gate covers the
 //! feature combinations it is GIVEN, and this one selects a whole board file, a driver crate and a
 //! network stack that the other two compile nothing of.
@@ -59,6 +61,9 @@
 //! the UART, and a flash-resident corlib so a deployed artifact can be the program's PE alone. It
 //! is listed as its own recipe because a build gate only covers the feature combinations it is
 //! given, and this one selects `#[cfg]` arms the base build compiles nothing of.
+//! The eleventh is the Pico 2's released firmware: the second without the flash-resident corlib, the
+//! build installed on a Pico 2 that has no Lamella firmware yet. It is listed so that a build gate
+//! compiles the exact firmware users receive, not only the builds around it.
 //! Flash: objcopy to .bin; program at 0x10000000 over a debug probe.
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]

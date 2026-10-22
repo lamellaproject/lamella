@@ -33,9 +33,18 @@ namespace Lamella.Boards.Bbc
         public static readonly int AccelerometerAddress = (int)BbcMicroBitV2Bindings.LSM303AGR_ADDRESS;
         public static readonly int MagnetometerAddress = (int)BbcMicroBitV2Bindings.LSM303AGR_MAG_ADDRESS;
 
+        /// <summary>The logical bus id of the internal I2C bus (TWI0: SCL P0.08, SDA P0.16), as
+        /// <c>I2cConnectionSettings</c> names it. The on-board sensors and the KL27 interface chip
+        /// share it, and it runs at <see cref="I2cBusHz"/>.</summary>
+        public const int InternalI2cBusId = 0;
+
+        private static I2cDriver MakeInternalI2c() { return new Nrf52833I2cDriver(InternalI2cBinding()); }
+
         /// <summary>The `internal-i2c` binding descriptor, built from the generated constants,
         /// so the role's resolved facts arrive in one construction.</summary>
-        public Nrf52833TwiBinding CreateInternalI2cBinding()
+        public Nrf52833TwiBinding CreateInternalI2cBinding() { return InternalI2cBinding(); }
+
+        private static Nrf52833TwiBinding InternalI2cBinding()
         {
             return new Nrf52833TwiBinding(
                 BbcMicroBitV2Bindings.INTERNAL_I2C_TWI_BASE,
@@ -45,13 +54,14 @@ namespace Lamella.Boards.Bbc
                 BbcMicroBitV2Bindings.INTERNAL_I2C_PIN_CNF_SDA_REG);
         }
 
-        /// <summary>The internal I2C bus (TWI0) as the layer-1 driver, configured for
-        /// <see cref="I2cBusHz"/>. The on-board sensors and the KL27 interface chip share it.</summary>
-        public I2cDriver CreateI2cBus()
+        /// <summary>The internal I2C bus (TWI0) as the layer-1 driver the board's table binds for
+        /// <see cref="InternalI2cBusId"/>, configured for <see cref="I2cBusHz"/> on its first
+        /// use.</summary>
+        /// <remarks>THE SAME INSTANCE <c>I2cDevice.Create</c> uses for that bus, for the reason
+        /// <see cref="Lamella.Hardware.Buses.ResolveSpi"/> gives.</remarks>
+        internal I2cDriver CreateI2cBus()
         {
-            Nrf52833I2cDriver bus = new Nrf52833I2cDriver(CreateInternalI2cBinding());
-            bus.Configure(I2cBusHz);
-            return bus;
+            return Buses.ResolveI2c(InternalI2cBusId);
         }
 
         /// <summary>Binds this board's GPIO block to the driver table, so a program writes plain
@@ -69,6 +79,7 @@ namespace Lamella.Boards.Bbc
         {
             Buses.BindGpio(new GpioDriverFactory(MakeGpio));
             Buses.BindSpi(EdgeSpiBusId, new SpiDriverFactory(MakeSpi));
+            Buses.BindI2c(InternalI2cBusId, new I2cDriverFactory(MakeInternalI2c), I2cBusHz);
         }
 
         /// <summary>The logical bus id of the edge connector's SPI (edge pins 13, 14 and 15: SCK,
@@ -101,7 +112,7 @@ namespace Lamella.Boards.Bbc
         /// <see cref="EdgeSpiBusId"/>, not yet configured.</summary>
         /// <remarks>THE SAME INSTANCE <c>SpiDevice.Create</c> uses for that bus, for the reason
         /// <see cref="Lamella.Hardware.Buses.ResolveSpi"/> gives.</remarks>
-        public SpiDriver CreateSpiDriver()
+        internal SpiDriver CreateSpiDriver()
         {
             return Buses.ResolveSpi(EdgeSpiBusId);
         }

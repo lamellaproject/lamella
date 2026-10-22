@@ -1,0 +1,13 @@
+<!--
+  Maps the target framework lamella1.0 to the framework Lamella,Version=v1.0. The .NET SDK imports
+  this file through BeforeTargetFrameworkInferenceTargets, which Sdk.props sets, just before it infers
+  a framework from the target framework's name.
+-->
+<Project>
+
+  <PropertyGroup Condition="'$(TargetFramework)' == 'lamella1.0'">
+    <TargetFrameworkIdentifier>Lamella</TargetFrameworkIdentifier>
+    <TargetFrameworkVersion>v1.0</TargetFrameworkVersion>
+  </PropertyGroup>
+
+</Project>

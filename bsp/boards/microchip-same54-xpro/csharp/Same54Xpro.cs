@@ -42,6 +42,7 @@ namespace Lamella.Boards.Microchip
         static Same54Xpro()
         {
             Buses.BindGpio(new GpioDriverFactory(MakeGpio));
+            Buses.BindI2c(Ext1I2cBusId, new I2cDriverFactory(MakeExt1I2c));
         }
 
         private static GpioDriver MakeGpio() { return new Same54GpioDriver(); }
@@ -69,7 +70,9 @@ namespace Lamella.Boards.Microchip
         /// and no divisor of its own -- and the two clock fields are REGISTER ADDRESSES rather than
         /// a composed word and a bare bit, because this family routes each core clock through its
         /// own channel register and gates its SERCOMs from three different APB masks.</remarks>
-        public Same54SercomI2cBinding Ext1I2cBinding()
+        public Same54SercomI2cBinding Ext1I2cBinding() { return MakeExt1I2cBinding(); }
+
+        private static Same54SercomI2cBinding MakeExt1I2cBinding()
         {
             return new Same54SercomI2cBinding(
                 MicrochipSame54XproBindings.EXT1_I2C_SERCOM_BASE,
@@ -84,11 +87,19 @@ namespace Lamella.Boards.Microchip
                 MicrochipSame54XproBindings.EXT1_I2C_CORE_CLOCK_HZ);
         }
 
-        /// <summary>An I2C master driver over EXT1, unconfigured. The caller calls
-        /// <c>Configure</c> with the wire rate it wants.</summary>
-        public I2cDriver CreateExt1I2cDriver()
+        /// <summary>The logical bus id of EXT1's I2C (SDA PA22, SCL PA23, on SERCOM3), as
+        /// <c>I2cConnectionSettings</c> names it.</summary>
+        public const int Ext1I2cBusId = 0;
+
+        private static I2cDriver MakeExt1I2c() { return new Same54I2cDriver(MakeExt1I2cBinding()); }
+
+        /// <summary>EXT1's I2C as the master driver the board's table binds for
+        /// <see cref="Ext1I2cBusId"/>, configured on its first use.</summary>
+        /// <remarks>THE SAME INSTANCE <c>I2cDevice.Create</c> uses for that bus, for the reason
+        /// <see cref="Lamella.Hardware.Buses.ResolveSpi"/> gives.</remarks>
+        internal I2cDriver CreateExt1I2cDriver()
         {
-            return new Same54I2cDriver(Ext1I2cBinding());
+            return Buses.ResolveI2c(Ext1I2cBusId);
         }
 
         /// <summary>The analog input this board offers on EXT1 (ADC1's AIN6 on PB04), as a
@@ -121,7 +132,7 @@ namespace Lamella.Boards.Microchip
         /// <remarks>ONE CHANNEL, and channel 0 is that pad. The converter has sixteen inputs and
         /// this board has handed one pad to the analog function, so the other fifteen would sample
         /// pins the PORT still owns -- a number with no error, meaning nothing.</remarks>
-        public AdcDriver CreateExt1AdcDriver()
+        internal AdcDriver CreateExt1AdcDriver()
         {
             return new Same54AdcDriver(Ext1AdcBinding());
         }

@@ -1308,99 +1308,171 @@ fn str_repr(s: &[u8]) -> String {
     out
 }
 
-/// Renders a `float` exactly as CPython 3.14's `repr(float)`/`str(float)` does (they are identical
-/// for a float): the SHORTEST decimal string that round-trips to the same double, in CPython's
-/// choice of fixed vs exponential notation.
+/// Returns Python's `repr` of a float (its `str` is the same text).
 ///
-/// The rules, from CPython's `format_float_short` (`Python/pystrtod.c`, format code `'r'`):
-/// - `nan`, `inf`, `-inf` render as those literals (lowercase; a NaN never carries a sign).
-/// - Otherwise take the shortest round-trip digits `d0 d1 ...` and the scientific exponent `E`
-///   (value = `d0.d1d2... x 10^E`). Rust's `{:e}` gives exactly this pair.
-/// - Use EXPONENTIAL notation when `E < -4` (i.e. `E <= -5`) or `E >= 16`; the exponent is written
-///   with an explicit sign and at least two digits (`1e-05`, `1e+16`, `1e+308`). A single
-///   significant digit omits the point (`1e+16`, not `1.0e+16`).
-/// - Else FIXED notation, with the decimal point placed after `E + 1` digits; a value with no
-///   fractional part still gets a trailing `.0` (`1.0`, `100.0`) -- CPython's `Py_DTSF_ADD_DOT_0`.
-///
-/// The shortest round-trip scientific form of `value` (`"<mantissa>e<exp>"`, one digit before the
-/// point) with CPython's tie-breaking. Rust's `{:e}` gives the shortest round-trip length but breaks
-/// an exactly-halfway tie AWAY from even, whereas CPython (David Gay's `dtoa`) breaks it TO even. So
-/// re-round to that same number of significant digits with `{:.*e}` (which rounds half-to-even on
-/// the exact value): when the even-tie result still round-trips, it is the one CPython emits (either
-/// the unique shortest, or the even member of a genuine tie); when it does not round-trip (the
-/// correctly-rounded value falls outside the double's interval), Rust's shortest is already correct.
-/// Verified to match CPython 3.14 on a 250k-double random differential, ties included.
-#[cfg(feature = "float")]
-fn shortest_scientific(value: f64) -> String {
-    let shortest = alloc::format!("{value:e}");
-    let mantissa = shortest.split('e').next().unwrap_or(&shortest);
-    let sig = mantissa.chars().filter(char::is_ascii_digit).count();
-    let even = alloc::format!("{value:.*e}", sig.saturating_sub(1));
-    if even.parse::<f64>() == Ok(value) {
-        even
-    } else {
-        shortest
-    }
-}
-
-/// The digit sequence is the shortest that round-trips, with equidistant ties broken to EVEN --
-/// see [`shortest_scientific`] for why Rust's `{:e}` alone is not enough. A 250k-double random
-/// differential confirms it matches CPython 3.14 exactly (see the float corpus).
+/// - The digits are the shortest decimal that reads back as the same
+///   double; when two candidates of that length are equally near the
+///   value, the one whose last digit is even is used.
+/// - A value whose first significant digit sits at a power of ten from
+///   10^-4 to 10^15 is written in fixed notation with at least one digit
+///   after the decimal point, so an integral value ends in `.0`:
+///   `0.0001`, `1.5`, `100000.0`, `9999999999999998.0`.
+/// - Any other magnitude is written in scientific notation: the first
+///   digit, a decimal point and the remaining digits only when there are
+///   any, then `e`, the sign of the exponent and at least two exponent
+///   digits: `1e-05`, `1.5e+16`, `1.7976931348623157e+308`, `5e-324`.
+/// - Zero is `0.0` or `-0.0`; the infinities are `inf` and `-inf`; every
+///   NaN is `nan`, whatever its sign or payload.
 #[cfg(feature = "float")]
 fn format_float(value: f64) -> String {
     format_float_impl(value, true)
 }
 
-/// The shared shortest-round-trip float renderer. `add_point_zero` controls CPython's
-/// `Py_DTSF_ADD_DOT_0`: `true` for `float` (`1.0`, `100.0`), `false` for a `complex` PART (`(1+2j)`,
-/// not `(1.0+2.0j)`) -- the only place the two formats differ (an integer-valued fixed result).
+/// Renders a double either as Python's `repr` of a float (`as_float` is
+/// `true`; see `format_float`) or, with `false`, the way Python's `repr`
+/// of a complex number writes one of its parts, sign included.
+///
+/// A part follows the float rules with one difference: fixed notation
+/// never adds `.0` to an integral value, so `1.0` is written `1`,
+/// `-100000.0` is `-100000` and the zeros are `0` and `-0`. Fractions,
+/// scientific notation, `inf`, `-inf` and `nan` are the same as for a
+/// float. The caller adds the parentheses, the `+` before a non-negative
+/// imaginary part and the `j`; a real part of positive zero is left out
+/// of a complex repr altogether, and that too is the caller's decision.
 #[cfg(feature = "float")]
-fn format_float_impl(value: f64, add_point_zero: bool) -> String {
+fn format_float_impl(value: f64, as_float: bool) -> String {
     if value.is_nan() {
         return String::from("nan");
     }
     if value.is_infinite() {
-        return String::from(if value < 0.0 { "-inf" } else { "inf" });
+        return String::from(if value.is_sign_negative() { "-inf" } else { "inf" });
     }
-    let scientific = shortest_scientific(value);
-    let (negative, rest) = match scientific.strip_prefix('-') {
-        Some(rest) => (true, rest),
-        None => (false, scientific.as_str()),
-    };
-    let (mantissa, exponent) = rest.split_once('e').expect("`{:e}` always has an exponent");
-    let exponent: i32 = exponent.parse().expect("`{:e}` exponent is a valid integer");
-    let mut digits: String = mantissa.chars().filter(|&c| c != '.').collect();
+    let mut out = String::new();
+    if value.is_sign_negative() {
+        out.push('-');
+    }
+    if value == 0.0 {
+        out.push_str(if as_float { "0.0" } else { "0" });
+        return out;
+    }
+    let (digits, exponent) = shortest_digits(value);
+    let count = digits.len() as i32;
+    if (-4..16).contains(&exponent) {
+        if exponent < 0 {
+            out.push_str("0.");
+            for _ in exponent..-1 {
+                out.push('0');
+            }
+            out.push_str(&digits);
+        } else if exponent + 1 >= count {
+            out.push_str(&digits);
+            for _ in count..=exponent {
+                out.push('0');
+            }
+            if as_float {
+                out.push_str(".0");
+            }
+        } else {
+            let (integral, fractional) = digits.split_at((exponent + 1) as usize);
+            out.push_str(integral);
+            out.push('.');
+            out.push_str(fractional);
+        }
+    } else {
+        let (first, rest) = digits.split_at(1);
+        out.push_str(first);
+        if !rest.is_empty() {
+            out.push('.');
+            out.push_str(rest);
+        }
+        out.push('e');
+        out.push(if exponent < 0 { '-' } else { '+' });
+        out.push_str(&alloc::format!("{:02}", exponent.unsigned_abs()));
+    }
+    out
+}
+
+/// The significant digits Python's `repr` chooses for the given finite,
+/// nonzero double, without sign, point or trailing zeros, and the power of
+/// ten of the first digit: the shortest digits that read back as the same
+/// double, the nearest of them to the value, and on an exact tie the
+/// candidate whose last digit is even.
+#[cfg(feature = "float")]
+fn shortest_digits(value: f64) -> (String, i32) {
+    let mut digits = String::new();
+    let mut exponent: i32 = 0;
+    let mut exponent_negative = false;
+    let mut in_exponent = false;
+    // The shortest round-trip rendering is `d.ddde[-]N`, and only its sign,
+    // point and exponent marker are not digits.
+    for byte in alloc::format!("{:e}", value).bytes() {
+        match byte {
+            b'0'..=b'9' if in_exponent => exponent = exponent * 10 + i32::from(byte - b'0'),
+            b'0'..=b'9' => digits.push(char::from(byte)),
+            b'e' => in_exponent = true,
+            b'-' if in_exponent => exponent_negative = true,
+            _ => {}
+        }
+    }
     while digits.len() > 1 && digits.ends_with('0') {
         digits.pop();
     }
-    let ndigits = digits.len() as i32;
-    let decpt = exponent + 1;
+    if exponent_negative {
+        exponent = -exponent;
+    }
+    settle_tie(value, &mut digits);
+    (digits, exponent)
+}
 
-    let body = if !(-4..16).contains(&exponent) {
-        let mut mantissa_out = String::new();
-        mantissa_out.push_str(&digits[..1]);
-        if ndigits > 1 {
-            mantissa_out.push('.');
-            mantissa_out.push_str(&digits[1..]);
-        }
-        let sign = if exponent < 0 { '-' } else { '+' };
-        alloc::format!("{mantissa_out}e{sign}{:02}", exponent.unsigned_abs())
-    } else if decpt <= 0 {
-        alloc::format!("0.{}{digits}", "0".repeat((-decpt) as usize))
-    } else if decpt >= ndigits {
-        let zeros = "0".repeat((decpt - ndigits) as usize);
-        if add_point_zero {
-            alloc::format!("{digits}{zeros}.0")
-        } else {
-            alloc::format!("{digits}{zeros}")
-        }
+/// Replaces the digits by the other candidate when the value lies exactly
+/// halfway between the two shortest candidates and the chosen one ends in
+/// an odd digit: Python's `repr` takes the even one, while the shortest
+/// rendering this is built on rounds such a tie up.
+///
+/// A tie needs the value's exact decimal expansion to be exactly one digit
+/// longer than the chosen digits and to end in 5. Only a value `m * 2^-L`
+/// with `m` odd and `L` from 2 to 25 can be one: an integral value's
+/// expansion is never a lone 5 past a shorter string that reads back, and
+/// past 25 halvings the expansion outgrows every shortest string by more
+/// than one digit. Such a value is `m * 5^L / 10^L` exactly, `m * 5^L`
+/// fits in 128 bits, and the two candidates lie `5 * 10^-L` on either
+/// side of it. Both read back, except below a power of two, where the gap
+/// to the next double is half as wide and the lower candidate reads back
+/// only when `5^(L-1)` exceeds `2^54`.
+#[cfg(feature = "float")]
+fn settle_tie(value: f64, digits: &mut String) {
+    let bits = value.to_bits();
+    let exponent_field = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    let (mantissa, exponent) = if exponent_field == 0 {
+        (fraction, -1074)
     } else {
-        alloc::format!("{}.{}", &digits[..decpt as usize], &digits[decpt as usize..])
+        (fraction | (1u64 << 52), exponent_field - 1075)
     };
-    if negative {
-        alloc::format!("-{body}")
+    let shift = mantissa.trailing_zeros() as i32;
+    let odd_mantissa = mantissa >> shift;
+    let halvings = -(exponent + shift);
+    if !(2..=25).contains(&halvings) {
+        return;
+    }
+    if odd_mantissa == 1 && 5u128.pow(halvings as u32 - 1) <= 1u128 << 54 {
+        return;
+    }
+    let mut expansion: u128 = u128::from(odd_mantissa);
+    for _ in 0..halvings {
+        expansion *= 5;
+    }
+    let chosen = digits.bytes().fold(0u128, |acc, byte| acc * 10 + u128::from(byte - b'0'));
+    let lower = if expansion == 10 * chosen + 5 {
+        chosen
+    } else if expansion + 5 == 10 * chosen {
+        chosen - 1
     } else {
-        body
+        return;
+    };
+    let even = if lower % 2 == 0 { lower } else { lower + 1 };
+    if even != chosen {
+        *digits = alloc::format!("{}", even);
     }
 }
 
@@ -1481,7 +1553,8 @@ fn group_integer_digits(body: &str, separator: char) -> String {
 /// Renders a `complex` as CPython's `repr`/`str` (identical). When the real part is a POSITIVE zero
 /// only the imaginary term shows (`1j`, `-1j`, `0j`); otherwise `(real+imagj)` with the imaginary
 /// term explicitly signed. Each part uses the shortest-round-trip float format WITHOUT a trailing
-/// `.0` (`(1+2j)`, `(2.5-0.5j)`, `(1e+100+2e-05j)`, `(-0-1j)`).
+/// `.0` (`(1+2j)`, `(2.5-0.5j)`, `(1e+100+2e-05j)`, `(-0-1j)`). A NaN part is `nan` whatever its
+/// sign bit, and a NaN imaginary part takes the `+` (`(1+nanj)`).
 #[cfg(feature = "complex")]
 fn format_complex(real: f64, imag: f64) -> String {
     let imag_str = format_float_impl(imag, false);
@@ -1489,7 +1562,7 @@ fn format_complex(real: f64, imag: f64) -> String {
         return alloc::format!("{imag_str}j");
     }
     let real_str = format_float_impl(real, false);
-    let sign = if imag.is_sign_negative() { "" } else { "+" };
+    let sign = if imag_str.starts_with('-') { "" } else { "+" };
     alloc::format!("({real_str}{sign}{imag_str}j)")
 }
 
@@ -5059,7 +5132,7 @@ impl ObjectModel {
                 let elems = self.seqs[slot].clone();
                 let mut n = 0i64;
                 for e in elems {
-                    if crate::interp::elem_eq(*element, e, functions, self, depth)? {
+                    if crate::interp::elem_eq(e, *element, functions, self, depth)? {
                         n += 1;
                     }
                 }
@@ -5071,7 +5144,7 @@ impl ObjectModel {
                 };
                 let elems = self.seqs[slot].clone();
                 for (at, e) in elems.into_iter().enumerate() {
-                    if crate::interp::elem_eq(*element, e, functions, self, depth)? {
+                    if crate::interp::elem_eq(e, *element, functions, self, depth)? {
                         self.seqs[slot].remove(at);
                         return Ok(Value::NONE);
                     }
@@ -5325,7 +5398,7 @@ impl ObjectModel {
         }
         let keys: Vec<Value> = self.dicts[i].iter().map(|(k, _)| *k).collect();
         for (idx, &k) in keys.iter().enumerate() {
-            if crate::interp::elem_eq(key, k, functions, self, depth)? {
+            if crate::interp::elem_eq(k, key, functions, self, depth)? {
                 return Ok(Some(idx));
             }
         }
@@ -5565,16 +5638,17 @@ impl ObjectModel {
             return Ok(false);
         }
         for (key, value) in &ea {
-            let mut matched = false;
+            let mut found = None;
             for (other_key, other_value) in &eb {
-                if crate::interp::elem_eq(*key, *other_key, functions, self, depth)?
-                    && crate::interp::elem_eq(*value, *other_value, functions, self, depth)?
-                {
-                    matched = true;
+                if crate::interp::elem_eq(*other_key, *key, functions, self, depth)? {
+                    found = Some(*other_value);
                     break;
                 }
             }
-            if !matched {
+            let Some(other_value) = found else {
+                return Ok(false);
+            };
+            if !crate::interp::elem_eq(*value, other_value, functions, self, depth)? {
                 return Ok(false);
             }
         }
@@ -17793,14 +17867,21 @@ impl ObjectModel {
         match method_id {
             SET_UNION | SET_INTERSECTION | SET_DIFFERENCE => {
                 let mut acc = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
-                for other in args {
+                for (index, other) in args.iter().enumerate() {
+                    let other_is_set = self.is_set(*other) || self.is_frozenset(*other);
                     let b = self.collect_elements(*other)?;
                     acc = match method_id {
                         SET_UNION => crate::interp::union_elems_dyn(&acc, &b, functions, self, depth)?,
-                        SET_INTERSECTION => {
-                            crate::interp::filter_elems_dyn(&acc, &b, true, functions, self, depth)?
+                        SET_INTERSECTION if other_is_set => {
+                            crate::interp::intersect_sets_dyn(&acc, &b, functions, self, depth)?
                         }
-                        _ => crate::interp::filter_elems_dyn(&acc, &b, false, functions, self, depth)?,
+                        SET_INTERSECTION => crate::interp::intersect_elems_dyn(
+                            &acc, &b, false, true, functions, self, depth,
+                        )?,
+                        _ if index == 0 && other_is_set => {
+                            crate::interp::difference_sets_dyn(&acc, &b, functions, self, depth)?
+                        }
+                        _ => crate::interp::remove_each_dyn(&acc, &b, functions, self, depth)?,
                     };
                 }
                 if frozen {
@@ -17814,9 +17895,12 @@ impl ObjectModel {
                     return Err(Trap::TypeError);
                 };
                 let a = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
-                let b = self.collect_elements(*other)?;
-                let mut r = crate::interp::filter_elems_dyn(&a, &b, false, functions, self, depth)?;
-                r.extend(crate::interp::filter_elems_dyn(&b, &a, false, functions, self, depth)?);
+                let other_is_set = self.is_set(*other) || self.is_frozenset(*other);
+                let mut b = self.collect_elements(*other)?;
+                if !other_is_set {
+                    b = crate::interp::dedup_elems(b, functions, self, depth)?;
+                }
+                let r = crate::interp::symmetric_difference_sets_dyn(&a, &b, functions, self, depth)?;
                 if frozen {
                     self.new_frozenset(r)
                 } else {
@@ -17828,11 +17912,23 @@ impl ObjectModel {
                     return Err(Trap::TypeError);
                 };
                 let a = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
+                let other_is_set = self.is_set(*other) || self.is_frozenset(*other);
                 let b = self.collect_elements(*other)?;
                 let result = match method_id {
-                    SET_ISSUBSET => crate::interp::subset_dyn(&a, &b, functions, self, depth)?,
+                    SET_ISSUBSET if other_is_set => {
+                        crate::interp::subset_sets_dyn(&a, &b, functions, self, depth)?
+                    }
+                    SET_ISSUBSET => {
+                        crate::interp::intersect_elems_dyn(&a, &b, false, true, functions, self, depth)?
+                            .len()
+                            == a.len()
+                    }
+                    SET_ISSUPERSET if other_is_set => {
+                        crate::interp::subset_sets_dyn(&b, &a, functions, self, depth)?
+                    }
                     SET_ISSUPERSET => crate::interp::subset_dyn(&b, &a, functions, self, depth)?,
-                    _ => crate::interp::disjoint_dyn(&a, &b, functions, self, depth)?,
+                    _ if other_is_set => crate::interp::disjoint_dyn(&a, &b, functions, self, depth)?,
+                    _ => crate::interp::none_in_dyn(&b, &a, functions, self, depth)?,
                 };
                 Ok(Value::from_bool(result))
             }
@@ -17855,7 +17951,7 @@ impl ObjectModel {
                 let a = self.set_value(receiver).ok_or(Trap::TypeError)?.clone();
                 let mut position = None;
                 for (i, &e) in a.iter().enumerate() {
-                    if crate::interp::elem_eq(*value, e, functions, self, depth)? {
+                    if crate::interp::elem_eq(e, *value, functions, self, depth)? {
                         position = Some(i);
                         break;
                     }
@@ -18597,6 +18693,9 @@ mod tests {
             (-0.0, -1.0, "(-0-1j)"),
             (-0.0, -0.0, "(-0-0j)"),
             (1e100, 2e-5, "(1e+100+2e-05j)"),
+            (1.0, -f64::NAN, "(1+nanj)"),
+            (-f64::NAN, -f64::NAN, "(nan+nanj)"),
+            (0.0, -f64::NAN, "nanj"),
         ];
         for &(re, im, expected) in cases {
             assert_eq!(format_complex(re, im), expected, "complex({re}, {im})");
@@ -18637,9 +18736,19 @@ mod tests {
             (-0.1, "-0.1"),
             (-1e16, "-1e+16"),
             (-1e-5, "-1e-05"),
+            (9999999999999998.0, "9999999999999998.0"),
+            (9.999999999999999e-05, "9.999999999999999e-05"),
+            (1_125_899_906_842_624.25, "1125899906842624.2"),
+            (1_125_899_906_842_624.75, "1125899906842624.8"),
+            (-1_125_899_906_842_624.25, "-1125899906842624.2"),
+            (1.0 / 33_554_432.0, "2.9802322387695312e-08"),
+            (5e-324, "5e-324"),
+            (2.2250738585072014e-308, "2.2250738585072014e-308"),
+            (f64::MAX, "1.7976931348623157e+308"),
             (f64::INFINITY, "inf"),
             (f64::NEG_INFINITY, "-inf"),
             (f64::NAN, "nan"),
+            (-f64::NAN, "nan"),
         ];
         for &(value, expected) in cases {
             assert_eq!(format_float(value), expected, "repr({value:e})");

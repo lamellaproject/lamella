@@ -14,17 +14,7 @@ publish = false
 # found here is a transport defect by construction.
 lamella-esp-serial = { path = "../lamella-esp-serial" }
 
-[target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_Security",
-    "Win32_Storage_FileSystem",
-    "Win32_Devices_Communication",
-    "Win32_System_IO",
-] }
-
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
+lamella-serial-port = { path = "../lamella-serial-port" }
 
 [lints]
 workspace = true

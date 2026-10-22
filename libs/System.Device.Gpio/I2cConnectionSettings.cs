@@ -3,6 +3,9 @@ namespace System.Device.I2c
 {
     /// <summary>The connection settings of a device on an I2C bus.</summary>
     public sealed class I2cConnectionSettings
+#if LAMELLA_SURFACE_NETFX_2_0
+        : System.IEquatable<I2cConnectionSettings>
+#endif
     {
         private readonly int _busId;
         private readonly int _deviceAddress;

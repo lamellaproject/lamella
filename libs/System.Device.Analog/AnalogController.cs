@@ -13,6 +13,7 @@ namespace System.Device.Analog
     public abstract class AnalogController : System.IDisposable
     {
         private AnalogInputPin[] _openPins;
+        private int _openCount;
 
         /// <summary>Constructs an instance of an analog controller.</summary>
         protected AnalogController()
@@ -48,12 +49,12 @@ namespace System.Device.Analog
             {
                 throw new System.NotSupportedException("Pin " + pinNumber + " is not supporting analog input.");
             }
-            if (IsPinOpen(pinNumber))
+            if (IndexOfOpenPin(pinNumber) >= 0)
             {
                 throw new System.InvalidOperationException("The selected pin is already open.");
             }
             AnalogInputPin openPin = OpenPinCore(pinNumber);
-            Track(pinNumber, openPin);
+            Add(openPin);
             return openPin;
         }
 
@@ -64,75 +65,92 @@ namespace System.Device.Analog
         /// <summary>Whether the given pin is currently open.</summary>
         public virtual bool IsPinOpen(int pinNumber)
         {
-            if (_openPins == null || pinNumber < 0 || pinNumber >= _openPins.Length)
-            {
-                return false;
-            }
-            return _openPins[pinNumber] != null;
+            return IndexOfOpenPin(pinNumber) >= 0;
         }
 
         /// <summary>Closes an open pin, disposing it.</summary>
         /// <remarks>Closing a pin this controller did not open is a no-op, matching upstream, whose
-        /// `List.Remove` simply answers false. <b>The slot is cleared BEFORE the pin is disposed</b>,
-        /// because <see cref="AnalogInputPin.Dispose()"/> calls back here -- upstream is saved from
-        /// the same recursion by `Remove` answering false the second time, and this is that guard
-        /// written where it can be seen. It bounds the recursion; it does not make disposal single,
-        /// and upstream's is not single either -- a pin disposed by a caller has its
+        /// `List.Remove` simply answers false. <b>The pin leaves the open list BEFORE it is
+        /// disposed</b>, because <see cref="AnalogInputPin.Dispose()"/> calls back here -- upstream is
+        /// saved from the same recursion by `Remove` answering false the second time, and this is that
+        /// guard written where it can be seen. It bounds the recursion; it does not make disposal
+        /// single, and upstream's is not single either -- a pin disposed by a caller has its
         /// <c>Dispose(bool)</c> run twice on both runtimes.</remarks>
         public virtual void ClosePin(AnalogInputPin pin)
         {
-            if (pin == null)
+            for (int i = 0; i < _openCount; i++)
             {
-                return;
+                if (object.ReferenceEquals(_openPins[i], pin))
+                {
+                    RemoveAt(i);
+                    pin.Dispose();
+                    return;
+                }
             }
-            int pinNumber = pin.PinNumber;
-            if (_openPins == null || pinNumber < 0 || pinNumber >= _openPins.Length)
-            {
-                return;
-            }
-            if (!object.ReferenceEquals(_openPins[pinNumber], pin))
-            {
-                return;
-            }
-            _openPins[pinNumber] = null;
-            pin.Dispose();
         }
 
-        private void Track(int pinNumber, AnalogInputPin pin)
+        private int IndexOfOpenPin(int pinNumber)
+        {
+            for (int i = 0; i < _openCount; i++)
+            {
+                if (_openPins[i].PinNumber == pinNumber)
+                {
+                    return i;
+                }
+            }
+            return -1;
+        }
+
+        private void Add(AnalogInputPin pin)
         {
             if (_openPins == null)
             {
-                _openPins = new AnalogInputPin[PinCount];
+                _openPins = new AnalogInputPin[4];
             }
-            if (pinNumber >= 0 && pinNumber < _openPins.Length)
+            else if (_openCount == _openPins.Length)
             {
-                _openPins[pinNumber] = pin;
+                AnalogInputPin[] grown = new AnalogInputPin[_openPins.Length * 2];
+                for (int i = 0; i < _openCount; i++)
+                {
+                    grown[i] = _openPins[i];
+                }
+                _openPins = grown;
             }
+            _openPins[_openCount] = pin;
+            _openCount++;
+        }
+
+        private void RemoveAt(int index)
+        {
+            for (int i = index + 1; i < _openCount; i++)
+            {
+                _openPins[i - 1] = _openPins[i];
+            }
+            _openCount--;
+            _openPins[_openCount] = null;
         }
 
         /// <summary>Disposes this controller, closing every pin it still holds open.</summary>
         protected virtual void Dispose(bool disposing)
         {
-            if (_openPins == null)
+            if (_openCount == 0)
             {
                 return;
             }
-            AnalogInputPin[] copy = new AnalogInputPin[_openPins.Length];
-            for (int i = 0; i < _openPins.Length; i++)
+            AnalogInputPin[] copy = new AnalogInputPin[_openCount];
+            for (int i = 0; i < copy.Length; i++)
             {
                 copy[i] = _openPins[i];
             }
             for (int i = 0; i < copy.Length; i++)
             {
-                if (copy[i] != null)
-                {
-                    copy[i].Dispose();
-                }
+                copy[i].Dispose();
             }
-            for (int i = 0; i < _openPins.Length; i++)
+            for (int i = 0; i < _openCount; i++)
             {
                 _openPins[i] = null;
             }
+            _openCount = 0;
         }
 
         /// <summary>Disposes this controller.</summary>

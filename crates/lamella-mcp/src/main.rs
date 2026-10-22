@@ -227,8 +227,7 @@ fn resources_list() -> Value {
 /// scales: a board is one row, and the boards a client actually cares about are the ones it can
 /// see, which `lamella_list_devices` and `lamella_identify_device` report live.
 ///
-/// The models are contiguous from 0, so the scan stops at the first unrecognized value -- the same
-/// idiom `lamella-wire`'s `board-models-json` example uses to emit the JS registry.
+/// The models are contiguous from 0, so the scan stops at the first unrecognized value.
 fn boards_resource_text() -> String {
     let mut out = String::from(
         "# Supported dev boards\n\nThe `product_model` wire values a board reports over Lamella Link:\n\n\
@@ -544,8 +543,8 @@ fn compile_against(set: &ReferenceSet, code: &str) -> Result<Vec<u8>, String> {
 #[cfg(feature = "bake")]
 const NOT_IN_THE_CLASS_LIBRARY: &str =
     "An assembly goes into the image only when the class library holds it, and the one this server\n\
-     compiles against holds no assembly of that name. Rebuild the class library with build-managed.ps1\n\
-     (Windows) or build-managed.sh (Linux, macOS).";
+     compiles against holds no assembly of that name. Rebuild the class library with csharp/build-managed.ps1\n\
+     (Windows) or csharp/build-managed.sh (Linux, macOS).";
 
 /// A program compiled and baked for `board`, against the corlib and the libraries `references`
 /// names, and the set it was built against, which names the build of each library the image carries.
@@ -975,6 +974,37 @@ That is set when the server starts.",
             Ok(prepared) => prepared,
             Err(error) => return text_result(error, true),
         };
+
+        if let Some(half) = &prepared.window {
+            return match lamella_flash_routes::write_set(
+                chosen,
+                row.board,
+                &placement,
+                &prepared.bytes,
+                half,
+                selector.as_deref(),
+                &self.scope.identities(),
+                &mut |line| eprintln!("lamella-mcp: {line}"),
+            ) {
+                Ok(report) => text_result(
+                    format!(
+                        "Wrote {} B to {board} over {}, and {} B to its external flash.\n\
+The part answered {:#x} -- {}.\n\
+The external flash answered {:06x} -- {}.\n\
+Verification: every byte of both was read back and compared.",
+                        report.boot.bytes,
+                        report.boot.mechanism,
+                        report.window.bytes,
+                        report.boot.identity.value,
+                        report.boot.identity.what,
+                        report.window.identity.value,
+                        report.window.identity.what,
+                    ),
+                    false,
+                ),
+                Err(error) => text_result(error, true),
+            };
+        }
 
         match lamella_flash_routes::write_scoped(
             chosen,

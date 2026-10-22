@@ -18,12 +18,14 @@ public enum AdafruitFeatherM0AdaloggerBindings {
     /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
     public static let SD_SPI_DRIVER_FAMILY: String = "samd21-sercom"
 
-    // -- SD_SPI: a sercom-spi binding descriptor (core-clock id UNSHIFTED: the
-    // consumer composes ID | GEN | CLKEN per its runtime-selected plan) --
+    // -- SD_SPI: a sercom-spi binding descriptor (ONE plan: the composed clock word
+    // and the core-clock RATE, from which the driver derives BAUD) --
     public static let SD_SPI_SERCOM_BASE: UInt32 = 0x42001800
     public static let SD_SPI_IRQ: UInt32 = 13
     public static let SD_SPI_APBC_MASK: UInt32 = 0x40
     public static let SD_SPI_GCLK_CORE_ID: UInt32 = 24
+    public static let SD_SPI_GCLK_CLKCTRL_VALUE: UInt32 = 0x4018
+    public static let SD_SPI_CORE_CLOCK_HZ: UInt32 = 8000000
     public static let SD_SPI_PMUX_MOSI_REG: UInt32 = 0x410044B5
     public static let SD_SPI_PMUX_MOSI_SHIFT: UInt32 = 0
     public static let SD_SPI_PINCFG_MOSI_REG: UInt32 = 0x410044CA

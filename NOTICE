@@ -9,9 +9,12 @@ alongside those components and in this file.
 
 Third-party components:
 
-- crates/lamella-syntax/ -- data derived from the Unicode Character Database,
-  Copyright (c) Unicode, Inc., under the Unicode License V3. See LICENSE-UNICODE
-  in that directory.
+- crates/lamella-syntax/ -- code-page tables derived from the Unicode character
+  mapping tables, Copyright (c) Unicode, Inc., under the Unicode License V3. See
+  LICENSE-UNICODE in that directory.
+- crates/lamella-unicode/ -- data derived from the Unicode Character Database,
+  version 16.0.0, Copyright (c) Unicode, Inc., under the Unicode License V3. See
+  LICENSE-UNICODE in that directory.
 - crates/lamella-tls-mbedtls/vendor/mbedtls/ -- Mbed TLS,
   Copyright The Mbed TLS Contributors, under your choice of the Apache License,
   Version 2.0 or the GNU General Public License v2.0 or later. See that directory's

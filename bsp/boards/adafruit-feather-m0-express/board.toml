@@ -18,12 +18,22 @@ sources = [
     "Adafruit Feather M0 Express guide (product 3403): 'ATSAMD21G18 @ 48MHz with 3.3V logic/power', 'Pin #13 red LED for general purpose blinking', 'The NeoPixel is connected to pin #8', '32.768 KHz crystal for clock generation & RTC'",
     "Adafruit ArduinoCore-samd variants/feather_m0_express/variant.cpp pin descriptor table: Arduino D13 = PORTA 17, D8 = PORTA 6, D0/D1 = PORTA 11/10 on SERCOM0",
     "SAMD21 datasheet DS40001882 ch 7 I/O multiplexing: PA06 and PA17 are both present on the 48-pin package (pins 11 and 26)",
+    "Adafruit ArduinoCore-samd 1.7.17, variants/feather_m0_express: variant.cpp lines 72-73 (Arduino pins 26 and 27 are PORTA 22 and PORTA 23 under PIO_SERCOM, 'SDA: SERCOM3/PAD[0]' and 'SCL: SERCOM3/PAD[1]') and variant.h lines 180-185 (one Wire interface, PIN_WIRE_SDA 26, PIN_WIRE_SCL 27, PERIPH_WIRE sercom3); cores/arduino/WVariant.h line 306 (PIO_SERCOM is peripheral function C)",
 ]
 
 [[carriers]]
 kind = "native-usb"         # the chip's own USB device controller; no on-board bridge exists,
 plan = "osc8m-8mhz"         # so there is no fixed bridge identity to state.
 default = true
+
+[[bindings]]                # the Wire interface's SDA and SCL pins (Arduino pins 26 and 27 in
+role = "header-i2c"         # Adafruit's variant), on the SERCOM that variant gives Wire.
+kind = "i2c"
+instance = "sercom3"
+function = "C"
+gclk_gen = 0
+sda = { pin = "PA22" }      # I2C fixes SDA to pad0 and SCL to pad1, so unlike a uart binding
+scl = { pin = "PA23" }      # there is no pad routing for a board to choose -- hence no pads here.
 
 [[plans]]
 name = "osc8m-8mhz"         # the reset oscillator with its prescaler cleared -- the same plan
@@ -51,4 +61,4 @@ exposure = "pads"
 fitted = "no"
 onboard = "none"
 recovery = "flash-bootloader"
-source = "The board's own guide, Debug Interface: "SWCLK & SWDIO - These pads on the bottom are used to program the chip. They can also be connected to an SWD debugger." The pads are on the underside and the guide states no connector, so reaching them needs soldering. The board ships with a UF2 bootloader reached by double-tapping reset, which lives in flash rather than in ROM, so its survival depends on the region a write reaches."
+source = "The board's own guide, Debug Interface: 'SWCLK & SWDIO - These pads on the bottom are used to program the chip. They can also be connected to an SWD debugger.' The pads are on the underside and the guide states no connector, so reaching them needs soldering. The board ships with a UF2 bootloader reached by double-tapping reset, which lives in flash rather than in ROM, so its survival depends on the region a write reaches."

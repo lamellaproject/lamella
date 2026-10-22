@@ -1,6 +1,6 @@
 //! Baking a compiled assembly into the flash image a device runs.
 
-use lamella_wire_host::bake::{self as shared, Refused};
+use lamella_wire_host::bake as shared;
 use lamella_wire_host::boards::ReferenceSet;
 
 /// What a refusal tells a reader whose program calls into an assembly its image cannot carry: the
@@ -19,12 +19,16 @@ pub fn bake(assembly: Vec<u8>, references: &[Vec<u8>], board_buses: Option<&[u32
 }
 
 /// Compile `source` and bake it in one step, against `set` and with the bus table of the board the
-/// set is for -- what a `--device` route sends.
+/// set is for. Only tests make an image from source text this way; a `--device` route compiles the
+/// file or project as `build` does ([`image_for_firmware`]), and both refuse an unmet family build
+/// with [`ReferenceSet::refuse_unmet`]'s words.
 ///
 /// # Errors
 /// A compile failure, reported as the compiler wrote it, a program the set cannot build for its
 /// board ([`ReferenceSet::refuse_unmet`]), or any bake failure.
+#[cfg(test)]
 pub fn compile_and_bake(set: &ReferenceSet, source: &str, verb: &str) -> Result<Vec<u8>, String> {
+    use lamella_wire_host::bake::Refused;
     use lamella_wire_host::engine::{CompileFailure, ReplCompiler};
     let compiler = set.compiler();
     let assembly = compiler.compile(source).map_err(|failure| match failure {
@@ -88,10 +92,53 @@ pub fn image_for_firmware(
     refuse_uncompilable(path, refusal)?;
     let source = crate::text::read_text(path)
         .map_err(|error| format!("lamella {verb}: read {}: {error}", path.display()))?;
-    let set = ReferenceSet::discover(board)
-        .map_err(|error| format!("lamella {verb}: {error}"))?
-        .for_source_file(&path.display().to_string());
-    compile_and_bake(&set, &source, verb)
+    let (assembly, references) =
+        crate::program::compile_csharp_assembly_with_references(path, &source, false, &[], board, verb)?;
+    bake(assembly, &references, lamella_wire_host::boards::bus_table(board))
+}
+
+/// The baked image of `path`, an assembly a build already made, for the board that answered.
+///
+/// **ITS LIBRARIES ARE THE CLASS LIBRARY'S AND THE ONES BESIDE IT**, as a .NET build leaves a
+/// program's own libraries beside it: every library the program references that the class library
+/// does not hold is read from the program's folder, and the libraries those reference with it.
+///
+/// # Errors
+/// An assembly that cannot be read, a library it references that is in neither place, a program
+/// the set cannot build for the board, or any bake failure.
+pub fn image_of_built(path: &std::path::Path, verb: &str, board: Option<&str>) -> Result<Vec<u8>, String> {
+    let read = |path: &std::path::Path| {
+        std::fs::read(path).map_err(|error| format!("lamella {verb}: read {}: {error}", path.display()))
+    };
+    let assembly = read(path)?;
+    let set = ReferenceSet::discover(board).map_err(|error| format!("lamella {verb}: {error}"))?;
+    let offered = set.compiler().library_names();
+    let folder = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let mut references = set.carried().to_vec();
+    let mut pending = vec![assembly.clone()];
+    let mut taken: Vec<String> = Vec::new();
+    while let Some(next) = pending.pop() {
+        let Ok(parsed) = lamella_metadata::Assembly::read(&next) else {
+            continue;
+        };
+        for reference in parsed.assembly_refs() {
+            let Some(name) = reference.name() else {
+                continue;
+            };
+            if offered.iter().any(|offered| offered.eq_ignore_ascii_case(name)) || taken.iter().any(|one| one == name) {
+                continue;
+            }
+            let beside = folder.join(format!("{name}.dll"));
+            if beside.is_file() {
+                let bytes = read(&beside)?;
+                taken.push(name.to_owned());
+                pending.push(bytes.clone());
+                references.push(bytes);
+            }
+        }
+    }
+    set.refuse_unmet(&assembly, &references).map_err(|why| format!("lamella {verb}: {why}"))?;
+    bake(assembly, &references, lamella_wire_host::boards::bus_table(board))
 }
 
 #[cfg(test)]

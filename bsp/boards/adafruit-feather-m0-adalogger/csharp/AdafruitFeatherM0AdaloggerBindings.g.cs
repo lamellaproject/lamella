@@ -31,12 +31,14 @@ namespace Lamella.Generated
         public const uint SD_SPI_CHIP_SELECT_COUNT = 1;
         public const uint SD_SPI_CHIP_SELECT0 = 8;
 
-        // -- SD_SPI: a sercom-spi binding descriptor (core-clock id UNSHIFTED: the
-        // consumer composes ID | GEN | CLKEN per its runtime-selected plan) --
+        // -- SD_SPI: a sercom-spi binding descriptor (ONE plan: the composed clock word
+        // and the core-clock RATE, from which the driver derives BAUD) --
         public const uint SD_SPI_SERCOM_BASE = 0x42001800;
         public const uint SD_SPI_IRQ = 13;
         public const uint SD_SPI_APBC_MASK = 0x40;
         public const uint SD_SPI_GCLK_CORE_ID = 24;
+        public const uint SD_SPI_GCLK_CLKCTRL_VALUE = 0x4018;
+        public const uint SD_SPI_CORE_CLOCK_HZ = 8000000;
         public const uint SD_SPI_PMUX_MOSI_REG = 0x410044B5;
         public const uint SD_SPI_PMUX_MOSI_SHIFT = 0;
         public const uint SD_SPI_PINCFG_MOSI_REG = 0x410044CA;

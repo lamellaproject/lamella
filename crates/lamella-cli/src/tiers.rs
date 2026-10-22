@@ -48,6 +48,11 @@ const ARCHIVE_NAME: &str = "liblamella_runtime_support.a";
 /// The environment variable naming an archive explicitly.
 pub const ARCHIVE_ENV: &str = "LAMELLA_RUNTIME_ARCHIVE";
 
+/// The environment variable naming a folder of archives, laid out as the one beside the executable:
+/// `<triple>/liblamella_runtime_support.a`, and `<triple>/<board>/liblamella_runtime_support.a`
+/// where each board has an archive of its own. The Lamella SDK names the folder it carries.
+pub const FOLDER_ENV: &str = "LAMELLA_RUNTIME_SUPPORT_DIR";
+
 /// Cargo's own variable for where a build writes, honored so a development tree that redirects its
 /// output is still a tree where this can find what it built.
 const CARGO_TARGET_DIR_ENV: &str = "CARGO_TARGET_DIR";
@@ -112,10 +117,16 @@ fn machine_for(triple: &str) -> Option<lamella_elf::Machine> {
 /// No archive found, a file that is not an `ar` archive, or one built for another instruction set.
 /// Each names the path it is talking about.
 pub fn runtime_archive(board: &str, aot_target: &str) -> Result<(PathBuf, Vec<u8>), String> {
-    named_runtime_archive(board, aot_target, std::env::var_os(ARCHIVE_ENV).map(PathBuf::from))
+    named_runtime_archive(
+        board,
+        aot_target,
+        std::env::var_os(ARCHIVE_ENV).map(PathBuf::from),
+        std::env::var_os(FOLDER_ENV).map(PathBuf::from),
+    )
 }
 
-/// [`runtime_archive`] with the override handed in rather than read from the environment.
+/// [`runtime_archive`] with the overrides handed in rather than read from the environment: `named`
+/// an archive, `folder` a folder of them.
 ///
 /// **THE ENVIRONMENT IS READ IN ONE PLACE AND THE RULE IS TESTED IN ANOTHER.** A process-wide
 /// variable is shared by every test in the binary at once, so a test that set one would be deciding
@@ -127,6 +138,7 @@ fn named_runtime_archive(
     board: &str,
     aot_target: &str,
     named: Option<PathBuf>,
+    folder: Option<PathBuf>,
 ) -> Result<(PathBuf, Vec<u8>), String> {
     let Some(row) = row_for(aot_target) else {
         return Err(format!(
@@ -147,6 +159,20 @@ fn named_runtime_archive(
         return check(path, bytes, triple);
     }
     let board = row.per_board.then_some(board);
+    if let Some(folder) = folder {
+        let path = in_folder(&folder, triple, board);
+        return match std::fs::read(&path) {
+            Ok(bytes) => check(path, bytes, triple),
+            Err(error) => Err(format!(
+                "no runtime support archive for {} ({triple}) in the folder {FOLDER_ENV} names: \
+                 {} cannot be read: {error}\n\n\
+                 Nothing else was looked at. An override that a default can silence is not an \
+                 override, so\nthe folder named here is the answer or there is none.",
+                board.unwrap_or(aot_target),
+                path.display()
+            )),
+        };
+    }
     let looked: Vec<PathBuf> = candidates(
         triple,
         board,
@@ -197,19 +223,28 @@ fn no_archive_refusal(
             crate::flash::FLAT_FLAG
         );
     };
-    format!(
+    let refused = format!(
         "no runtime support archive for {board} ({aot_target}, {triple}).\n\n\
          The class-library tier links your program against this archive, so it cannot be built \
          without one.\nOn this target the archive also carries the board's own startup, console \
-         and clock, so each\nboard has an archive of its own. Looked in:\n{places}\n\n\
-         Build it from this checkout with:\n\
+         and clock, so each\nboard has an archive of its own. Looked in:\n{places}\n\n"
+    );
+    let Some(root) = checkout() else {
+        return format!(
+            "{refused}Name one with {ARCHIVE_ENV}, or the folder that holds one for each board with \
+             {FOLDER_ENV}."
+        );
+    };
+    let dev_crate = development_crate(&root);
+    format!(
+        "{refused}Build it from this checkout with:\n\
          \x20   cargo build --release --manifest-path {} --target {triple} --no-default-features \
          --features {}{} --target-dir {}\n\n\
          or name one with {ARCHIVE_ENV}.",
-        development_manifest().display(),
+        dev_crate.join("Cargo.toml").display(),
         board_feature(board),
-        remap_option(triple),
-        development_board_dir(board).display()
+        remap_option(&root, triple),
+        development_board_dir(&dev_crate, board).display()
     )
 }
 
@@ -218,8 +253,7 @@ fn no_archive_refusal(
 ///
 /// Empty for a checkout whose path holds a quote, which the option's TOML string and the shell's
 /// quoting could not both carry; the build then works and keeps the directory.
-fn remap_option(triple: &str) -> String {
-    let root = checkout();
+fn remap_option(root: &Path, triple: &str) -> String {
     let root = root.display().to_string();
     if root.contains('\'') || root.contains('"') {
         return String::new();
@@ -228,28 +262,41 @@ fn remap_option(triple: &str) -> String {
 }
 
 /// The checkout this crate sits in: two directories above it.
-fn checkout() -> PathBuf {
+#[cfg(not(feature = "packaged"))]
+fn checkout() -> Option<PathBuf> {
     let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
-    manifest.ancestors().nth(2).unwrap_or(manifest).to_path_buf()
+    Some(manifest.ancestors().nth(2).unwrap_or(manifest).to_path_buf())
 }
 
-/// The development tree's runtime-support crate: where its sources live, relative to this crate.
+/// None in a packaged build, which looks only where a package puts an archive and carries no path
+/// of the machine it was built on.
+#[cfg(feature = "packaged")]
+fn checkout() -> Option<PathBuf> {
+    None
+}
+
+/// The development tree's runtime-support crate in the checkout `root`.
 ///
-/// Joined a component at a time from the checkout, two directories above this crate, so the path a
-/// refusal prints is one a reader can paste into a shell on any system.
-fn development_crate() -> PathBuf {
-    checkout().join("tools").join("runtime").join("runtime-support")
-}
-
-/// The manifest the board build in [`no_archive_refusal`] names.
-fn development_manifest() -> PathBuf {
-    development_crate().join("Cargo.toml")
+/// Joined a component at a time, so the path a refusal prints is one a reader can paste into a
+/// shell on any system.
+fn development_crate(root: &Path) -> PathBuf {
+    root.join("tools").join("runtime").join("runtime-support")
 }
 
 /// The directory a board's archive is built into in the development tree: one per board, under the
 /// crate's own `target`, so one board's archive never overwrites another's.
-fn development_board_dir(board: &str) -> PathBuf {
-    development_crate().join("target").join(board)
+fn development_board_dir(dev_crate: &Path, board: &str) -> PathBuf {
+    dev_crate.join("target").join(board)
+}
+
+/// Where a folder laid out as the one beside the executable holds the archive for `triple`, and for
+/// `board` on a target where each board has an archive of its own.
+fn in_folder(folder: &Path, triple: &str, board: Option<&str>) -> PathBuf {
+    let dir = folder.join(triple);
+    match board {
+        Some(board) => dir.join(board).join(ARCHIVE_NAME),
+        None => dir.join(ARCHIVE_NAME),
+    }
 }
 
 /// Where an archive for `triple` is looked for, in order. `board` is set for a target whose archive
@@ -260,37 +307,25 @@ fn development_board_dir(board: &str) -> PathBuf {
 /// built the staticlib works without any setting at all.
 fn candidates(triple: &str, board: Option<&str>, cargo_target_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        paths.push(in_folder(&dir.join("runtime-support"), triple, board));
+    }
+    let Some(root) = checkout() else {
+        return paths;
+    };
+    let dev_crate = development_crate(&root);
     if let Some(board) = board {
-        if let Ok(exe) = std::env::current_exe()
-            && let Some(dir) = exe.parent()
-        {
-            paths.push(
-                dir.join("runtime-support")
-                    .join(triple)
-                    .join(board)
-                    .join(ARCHIVE_NAME),
-            );
-        }
         paths.push(
-            development_board_dir(board)
+            development_board_dir(&dev_crate, board)
                 .join(triple)
                 .join("release")
                 .join(ARCHIVE_NAME),
         );
         return paths;
     }
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        paths.push(dir.join("runtime-support").join(triple).join(ARCHIVE_NAME));
-    }
-    paths.push(
-        development_crate()
-            .join("target")
-            .join(triple)
-            .join("release")
-            .join(ARCHIVE_NAME),
-    );
+    paths.push(dev_crate.join("target").join(triple).join("release").join(ARCHIVE_NAME));
     if let Some(target_dir) = cargo_target_dir {
         paths.push(
             target_dir
@@ -464,7 +499,7 @@ mod tests {
     fn a_named_archive_that_cannot_be_read_refuses_rather_than_falling_through() {
         let missing = std::env::temp_dir().join("lamella-tiers-does-not-exist.a");
         let _ = std::fs::remove_file(&missing);
-        let error = named_runtime_archive("bbc-micro-bit-v1", "microbit", Some(missing))
+        let error = named_runtime_archive("bbc-micro-bit-v1", "microbit", Some(missing), None)
             .expect_err("a named archive that is absent is an error, not a hint");
         assert!(
             error.contains(ARCHIVE_ENV),
@@ -479,7 +514,7 @@ mod tests {
     #[test]
     fn a_file_that_is_not_an_archive_is_refused_by_name() {
         let path = write_temp("not-an-archive.a", b"MZ this is a dll, not a staticlib");
-        let error = named_runtime_archive("bbc-micro-bit-v1", "microbit", Some(path))
+        let error = named_runtime_archive("bbc-micro-bit-v1", "microbit", Some(path), None)
             .expect_err("a file that is not an archive cannot be linked");
         assert!(error.contains("not a runtime support archive"), "{error}");
         assert!(
@@ -494,7 +529,7 @@ mod tests {
     #[test]
     fn an_archive_for_another_machine_is_refused_naming_both() {
         let path = write_temp("riscv.a", &archive_of(lamella_elf::Machine::RiscV));
-        let error = named_runtime_archive("bbc-micro-bit-v1", "microbit", Some(path))
+        let error = named_runtime_archive("bbc-micro-bit-v1", "microbit", Some(path), None)
             .expect_err("a RISC-V archive cannot serve a Thumb target");
         assert!(
             error.contains("RiscV"),
@@ -510,7 +545,7 @@ mod tests {
     #[test]
     fn a_matching_archive_is_accepted_and_reports_where_it_came_from() {
         let path = write_temp("arm.a", &archive_of(lamella_elf::Machine::Arm));
-        let (found, bytes) = named_runtime_archive("bbc-micro-bit-v1", "microbit", Some(path.clone()))
+        let (found, bytes) = named_runtime_archive("bbc-micro-bit-v1", "microbit", Some(path.clone()), None)
             .expect("an ARM archive serves a Thumb target");
         assert_eq!(found, path, "it reports the file it used");
         assert!(!bytes.is_empty());
@@ -518,7 +553,7 @@ mod tests {
 
     #[test]
     fn a_target_with_no_plan_has_no_archive_to_look_for() {
-        let error = named_runtime_archive("bbc-micro-bit-v1", "ch32v003", None).expect_err("no plan, no archive");
+        let error = named_runtime_archive("bbc-micro-bit-v1", "ch32v003", None, None).expect_err("no plan, no archive");
         assert!(error.contains("no plan for it"), "{error}");
     }
 
@@ -573,19 +608,21 @@ mod tests {
         ] {
             assert!(command.contains(part), "the command passes {part}: {command}");
         }
+        let root = checkout().expect("a test build is a build from a checkout");
         assert!(
             command.contains(&format!(
                 "--config \"target.thumbv8m.main-none-eabi.rustflags=['--remap-path-prefix={}=']\"",
-                checkout().display()
+                root.display()
             )),
             "and keeps the checkout's directory out of the archive: {command}"
         );
-        let manifest = development_manifest();
+        let dev_crate = development_crate(&root);
+        let manifest = dev_crate.join("Cargo.toml");
         assert!(
             command.contains(&format!("--manifest-path {}", manifest.display())),
             "and the crate's own manifest: {command}"
         );
-        let out = development_board_dir("pimoroni-pico-plus-2-w");
+        let out = development_board_dir(&dev_crate, "pimoroni-pico-plus-2-w");
         assert!(
             command.ends_with(&format!("--target-dir {}", out.display())),
             "and the directory: {command}"
@@ -629,10 +666,48 @@ mod tests {
         }
     }
 
+    /// **THE SDK'S FOLDER IS THE ANSWER OR THERE IS NONE.** It names the archives that belong with
+    /// its class library, so a board it holds no archive for is refused naming the path, rather than
+    /// linked against an archive found elsewhere, which may be from another commit.
+    #[test]
+    fn a_named_folder_is_the_only_place_looked_in() {
+        let folder = std::env::temp_dir().join("lamella-tiers-folder");
+        let board_dir = folder.join("thumbv8m.main-none-eabi").join("rpi-pico2");
+        std::fs::create_dir_all(&board_dir).expect("make the folder");
+        let archive = board_dir.join(ARCHIVE_NAME);
+        std::fs::write(&archive, archive_of(lamella_elf::Machine::Arm)).expect("write the archive");
+
+        let (found, _) = named_runtime_archive("rpi-pico2", "rp2350", None, Some(folder.clone()))
+            .expect("the board's archive in the folder");
+        assert_eq!(found, archive, "it is found under the triple and the board");
+
+        let error = named_runtime_archive("rpi-pico2-w", "rp2350", None, Some(folder.clone()))
+            .expect_err("no archive for this board in the folder");
+        let missing = folder.join("thumbv8m.main-none-eabi").join("rpi-pico2-w").join(ARCHIVE_NAME);
+        assert!(error.contains(FOLDER_ENV), "it names the variable: {error}");
+        assert!(error.contains(&missing.display().to_string()), "and the path: {error}");
+        assert!(error.contains("Nothing else was looked at"), "and looks nowhere else: {error}");
+    }
+
+    /// **ONE LAYOUT.** The folder the SDK names and the one beside the executable are read by the
+    /// same rule, so an archive laid out for one is found in the other.
+    #[test]
+    fn the_folder_beside_the_executable_has_the_named_folders_layout() {
+        let exe = std::env::current_exe().expect("the test's executable");
+        let beside = exe.parent().expect("its folder").join("runtime-support");
+        for (triple, board) in [("thumbv6m-none-eabi", None), ("thumbv8m.main-none-eabi", Some("rpi-pico2"))] {
+            assert_eq!(
+                candidates(triple, board, None).first(),
+                Some(&in_folder(&beside, triple, board)),
+                "the first place looked in for {triple} {board:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_board_archive_for_the_right_machine_is_accepted() {
         let path = write_temp("arm-board.a", &archive_of(lamella_elf::Machine::Arm));
-        let (found, _) = named_runtime_archive("rpi-pico2", "rp2350", Some(path.clone()))
+        let (found, _) = named_runtime_archive("rpi-pico2", "rp2350", Some(path.clone()), None)
             .expect("an ARM archive serves the Cortex-M33");
         assert_eq!(found, path, "it reports the file it used");
     }

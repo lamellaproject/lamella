@@ -4,7 +4,7 @@
 
 use core::cell::RefCell;
 
-use lamella_dap::{Debugger, Message};
+use lamella_dap::{Debugger, InterpreterBackend, Message};
 use lamella_load::{load, load_with_corlib};
 
 use crate::abi::result_buffer;
@@ -34,10 +34,12 @@ fn create(bytes: &[u8], pdb: Option<Vec<u8>>, corlib: Option<&[u8]>) -> u32 {
     let Ok(program) = loaded else {
         return 0;
     };
-    let debugger = match pdb {
-        Some(pdb_bytes) => Debugger::with_source(program.module, program.entry, pdb_bytes),
-        None => Debugger::new(program.module, program.entry),
+    let backend = match pdb {
+        Some(pdb_bytes) => InterpreterBackend::with_pdb(program.module, program.entry, pdb_bytes),
+        None => InterpreterBackend::new(program.module, program.entry),
     };
+    let debugger =
+        Debugger::with_backend(Box::new(backend.configure_machine(crate::clock::install)));
     SESSIONS.with(|sessions| {
         let mut sessions = sessions.borrow_mut();
         sessions.push(Some(debugger));
@@ -221,6 +223,85 @@ mod tests {
         dispose(handle);
         let after = request(handle, br#"{"type":"request","seq":4,"command":"threads"}"#);
         assert_eq!(after, b"[]");
+    }
+
+    /// A program that times a 300 ms `Thread.Sleep` and prints the year `DateTime.Now` reads.
+    const SLEEPS_AND_READS_THE_DATE: &str = "\
+using System;
+using System.Threading;
+
+class Program
+{
+    static int Main()
+    {
+        int before = Environment.TickCount;
+        Thread.Sleep(300);
+        int after = Environment.TickCount;
+        Console.WriteLine(after - before);
+        DateTime now = DateTime.Now;
+        Console.WriteLine(now.Year);
+        return 0;
+    }
+}
+";
+
+    #[test]
+    fn a_debugged_program_sleeps_for_its_time_and_reads_todays_date() {
+        let Some(corlib) = fixture("corlib.dll") else {
+            eprintln!("corlib.dll absent; skipping");
+            return;
+        };
+        let references = [lamella_metadata::Assembly::read(&corlib).expect("the corlib parses")];
+        let compilation = lamella_assemble::compile_source(
+            SLEEPS_AND_READS_THE_DATE,
+            "app.cs",
+            "app.dll",
+            "app",
+            &references,
+            true,
+        );
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
+        );
+        let image = compilation.image.expect("an assembly image");
+        let handle = create(&image, compilation.pdb, Some(corlib.as_slice()));
+        assert_ne!(handle, 0);
+        reply_text(
+            handle,
+            br#"{"type":"request","seq":1,"command":"initialize"}"#,
+        );
+        reply_text(handle, br#"{"type":"request","seq":2,"command":"launch"}"#);
+        let started = std::time::Instant::now();
+        let ran = reply_text(
+            handle,
+            br#"{"type":"request","seq":3,"command":"configurationDone"}"#,
+        );
+        let took = started.elapsed();
+        dispose(handle);
+
+        let replies: Vec<serde_json::Value> = serde_json::from_str(&ran).expect("a JSON array");
+        let printed: String = replies
+            .iter()
+            .filter(|reply| reply["event"] == "output" && reply["body"]["category"] == "stdout")
+            .filter_map(|reply| reply["body"]["output"].as_str())
+            .collect();
+        let lines: Vec<i64> = printed
+            .lines()
+            .map(|line| line.trim().parse().expect("a number"))
+            .collect();
+        assert_eq!(lines.len(), 2, "two lines, not {printed:?}");
+        assert!(
+            lines[0] >= 300,
+            "the program measured {} ms across its 300 ms sleep",
+            lines[0]
+        );
+        assert!(
+            took.as_millis() >= 300,
+            "the session returned after {took:?}, before the sleep's time"
+        );
+        assert!(lines[1] >= 2026, "DateTime.Now read the year {}", lines[1]);
     }
 
     #[test]

@@ -97,7 +97,7 @@ pub(crate) fn run_manifest(options: &[String], after: &[String]) -> Ended {
 }
 
 /// The refusal for a program given arguments, which a program on a board cannot take yet.
-fn arguments_refusal(given: &[&String]) -> String {
+pub(crate) fn arguments_refusal(given: &[&String]) -> String {
     let listed: Vec<String> = given.iter().map(|argument| format!("{argument:?}")).collect();
     format!(
         "a program on a board cannot take arguments yet, so nothing was written (given: {}).",
@@ -202,6 +202,8 @@ pub(crate) struct ImagePlan {
     placement: Placement,
     /// The bytes the route takes.
     bytes: Vec<u8>,
+    /// The image's half for the board's external flash, written with `bytes` as one set.
+    window: Option<lamella_flash_routes::WindowHalf>,
     /// What the file held: `998096 B of ELF`.
     read: String,
     /// Where the image keeps its console ring, and how many bytes it gives it.
@@ -273,6 +275,7 @@ fn plan(image: &Path, time_limit: Option<&str>) -> Result<ImagePlan, String> {
         reach,
         placement,
         bytes: prepared.bytes,
+        window: prepared.window,
         read: prepared.read,
         ring,
         console_off: manifest.console_channel.as_deref() == Some("off"),
@@ -539,7 +542,8 @@ impl Writer for FlashWrite {
         serial: &str,
         say: &mut dyn FnMut(&str),
     ) -> Result<(), String> {
-        crate::flash::write_image(plan.route, &plan.placement, &plan.bytes, Some(serial), say)
+        let window = plan.window.as_ref().map(|half| (plan.board, half));
+        crate::flash::write_image(plan.route, &plan.placement, &plan.bytes, window, Some(serial), say)
     }
 }
 

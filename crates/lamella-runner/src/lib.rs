@@ -694,7 +694,8 @@ fn run_program_reporting(
     let mut vm = Vm::default();
     configure_machine(&mut vm, configure);
     publish_wall_clock(&loaded.module, &mut vm);
-    let outcome = run(&loaded.module, &mut vm, loaded.entry, Vec::new());
+    let args = lamella_cil_runtime::entry_args(&loaded.module, &mut vm, loaded.entry);
+    let outcome = run(&loaded.module, &mut vm, loaded.entry, args);
     let stdout = String::from_utf16_lossy(vm.output());
     match outcome {
         Ok(Some(Value::Int32(code))) => (RunResult { exit: code, stdout }, None),
@@ -1632,6 +1633,21 @@ fn output_header(stream: u8, text: &str) -> [u8; 2] {
     [stream, if text.ends_with('\n') { debug::output::ENDS_ON_LINE_BOUNDARY } else { 0 }]
 }
 
+/// What ends a report of the runner's own on the error stream: nothing when `text` already ends its
+/// line, and a newline when it does not. A report is then a line of its own on the wire, as it is in
+/// the in-process result ([`push_line`]), and whatever a host prints next starts a line of its own.
+#[cfg(feature = "baked-image")]
+fn report_tail(text: &str) -> &'static str {
+    if text.ends_with('\n') { "" } else { "\n" }
+}
+
+/// [`send_output`] of a report of the runner's own, on the error stream as a line of its own
+/// ([`report_tail`]).
+#[cfg(feature = "baked-image")]
+fn send_report(transport: &mut impl Transport, text: &str) -> Result<(), TransportError> {
+    send_output(transport, debug::output::STDERR, &format!("{text}{}", report_tail(text)))
+}
+
 /// Report a RUNTIME FAULT -- a trap, a request the tier cannot serve -- on the ERROR stream, and
 /// build the in-process result that carries it back to the firmware.
 ///
@@ -1648,7 +1664,7 @@ fn fault(
     vm: &Vm,
     text: &str,
 ) -> Result<RunResult, TransportError> {
-    send_output(transport, debug::output::STDERR, text)?;
+    send_report(transport, text)?;
     let mut stdout = String::from_utf16_lossy(vm.output());
     push_line(&mut stdout, text);
     Ok(RunResult { exit: 70, stdout })
@@ -1666,7 +1682,7 @@ fn fault_stop(
     seq: u16,
     text: &str,
 ) -> Result<(), TransportError> {
-    send_output(transport, debug::output::STDERR, text)?;
+    send_report(transport, text)?;
     send_stopped(transport, seq, debug::reason::TRAP, (0, 0), Some(TRAP_EXIT))
 }
 
@@ -1683,8 +1699,10 @@ fn fault_stop(
 /// firmware's raw byte output: the carrier its transport writes to.
 #[cfg(feature = "baked-image")]
 pub fn report_abort(text: &str, sink: &mut dyn FnMut(u8)) {
-    let header = output_header(debug::output::STDERR, text);
-    lamella_wire::write_frame(debug::EVT_OUTPUT, 0, &[&header, text.as_bytes()], sink);
+    let tail = report_tail(text);
+    // The flags describe the frame's whole text, which ends with the tail whenever there is one.
+    let header = output_header(debug::output::STDERR, if tail.is_empty() { text } else { tail });
+    lamella_wire::write_frame(debug::EVT_OUTPUT, 0, &[&header, text.as_bytes(), tail.as_bytes()], sink);
     let (stop, len) = stop_payload(debug::reason::TRAP, (0, 0), Some(TRAP_EXIT));
     lamella_wire::write_frame(debug::EVT_STOPPED, 0, &[&stop[..len]], sink);
 }
@@ -1972,7 +1990,8 @@ pub fn run_debug_session_static(
             return fault_stop(transport, image_seq, &format!("static constructor: {trap}"));
         }
     };
-    let mut session = match Session::new(&module, entry, Vec::new()) {
+    let args = lamella_cil_runtime::entry_args(&module, &mut vm, entry);
+    let mut session = match Session::new(&module, entry, args) {
         Ok(session) => session,
         Err(trap) => return fault_stop(transport, image_seq, &format!("session: {trap}")),
     };
@@ -2002,9 +2021,11 @@ pub fn run_debug_session_static(
                 if at_reported_breakpoint {
                     let stepped =
                         step_to_depth(transport, &module, &mut vm, &mut session, None, caps)?;
-                    if !matches!(stepped, RunStop::Stepped | RunStop::Breakpoint) {
-                        report_stop(transport, frame.seq, stepped, &session, &mut at_reported_breakpoint)?;
-                        return Ok(());
+                    if !matches!(stepped, RunStop::Stepped) {
+                        if !report_stop(transport, frame.seq, stepped, &session, &mut at_reported_breakpoint)? {
+                            return Ok(());
+                        }
+                        continue;
                     }
                     at_reported_breakpoint = false;
                 }
@@ -2251,8 +2272,8 @@ fn run_image_reporting(
             );
         }
     };
-    let outcome =
-        lamella_cil_runtime::run_interruptible(&module, &mut vm, entry, Vec::new(), service);
+    let args = lamella_cil_runtime::entry_args(&module, &mut vm, entry);
+    let outcome = lamella_cil_runtime::run_interruptible(&module, &mut vm, entry, args, service);
     let (exit, fault) = match outcome {
         Ok(lamella_cil_runtime::Ran::Finished(Some(Value::Int32(code)))) => (code, None),
         Ok(lamella_cil_runtime::Ran::Finished(_)) => (0, None),
@@ -3287,7 +3308,8 @@ pub fn run_deployed_with(
     };
     let mut carrier: Result<(), TransportError> = Ok(());
     let mut aborted = None;
-    let outcome = lamella_cil_runtime::run_interruptible(module, &mut vm, entry, Vec::new(), &mut |vm| {
+    let args = lamella_cil_runtime::entry_args(module, &mut vm, entry);
+    let outcome = lamella_cil_runtime::run_interruptible(module, &mut vm, entry, args, &mut |vm| {
         if let Err(error) = stream_output(transport, vm) {
             carrier = Err(error);
             return false;
@@ -4149,7 +4171,22 @@ impl RunCollector {
         Self { unprompted: true, ..Self::default() }
     }
 
-    /// Fold every pending frame into this collector, and report whether the execution has ENDED.
+    /// The most frames one call to [`RunCollector::poll`] or [`RunCollector::poll_streaming`] folds
+    /// before it returns, so a caller that polls in a loop looks at its own deadline at least once
+    /// every this many frames.
+    ///
+    /// **A POLL THAT READ UNTIL THE CARRIER FELL SILENT DID NOT RETURN WHILE THE TARGET WENT ON
+    /// TALKING.** A program printing without pause held it for as long as it printed, and held the
+    /// caller's deadline with it, since a caller looks at its deadline between polls. A caller that
+    /// finds the run still going commonly pauses before it polls again, so the bound is generous: it
+    /// is there to give the caller its deadline back, not to ration what the program says.
+    pub const FRAMES_PER_POLL: usize = 256;
+
+    /// Fold the pending frames into this collector, at most [`RunCollector::FRAMES_PER_POLL`] of
+    /// them, and report whether the execution has ENDED.
+    ///
+    /// `false` says only that it has not ended yet: frames may still be waiting, and a caller polls
+    /// again, as it does while the target is quiet.
     ///
     /// Output is folded wherever it lands, not only where output is expected: it is unsolicited, it
     /// arrives during a request that has not been answered yet, and a loop that drops what it is not
@@ -4177,7 +4214,8 @@ impl RunCollector {
         transport: &mut impl Transport,
         show: &mut dyn FnMut(OutputChunk<'_>),
     ) -> Result<bool, TransportError> {
-        while let Some(frame) = transport.poll()? {
+        for _ in 0..Self::FRAMES_PER_POLL {
+            let Some(frame) = transport.poll()? else { break };
             match frame.msg_type {
                 debug::EVT_OUTPUT => self.take_output(&frame.payload, show),
                 debug::EVT_STOPPED if self.ends_at(frame.seq, &frame.payload) => {
@@ -4621,6 +4659,72 @@ mod tests {
         );
         assert_eq!(run.stdout, "working\n");
         assert_eq!(run.debug, "trace\n");
+    }
+
+    /// A target printing for longer than any caller waits: `left` more one-character frames on
+    /// standard output, then silence.
+    struct Printing {
+        left: usize,
+    }
+
+    impl Transport for Printing {
+        fn send(&mut self, _msg_type: u8, _seq: u16, _payload: &[u8]) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn poll(&mut self) -> Result<Option<lamella_wire::Frame>, TransportError> {
+            if self.left == 0 {
+                return Ok(None);
+            }
+            self.left -= 1;
+            Ok(Some(lamella_wire::Frame {
+                msg_type: debug::EVT_OUTPUT,
+                seq: 0,
+                payload: vec![debug::output::STDOUT, 0, b'.'],
+            }))
+        }
+    }
+
+    /// **A POLL RETURNS WHILE THE TARGET GOES ON PRINTING.** It read until the carrier fell silent,
+    /// so a program printing without pause held it, and the deadline its caller looks at between
+    /// polls, for as long as it printed.
+    #[test]
+    fn a_poll_returns_after_a_bounded_number_of_frames_while_the_target_goes_on_printing() {
+        let printed = 100_000;
+        let mut target = Printing { left: printed };
+        let mut shown = 0;
+        let mut run = RunCollector::new(9);
+        let ended = run.poll_streaming(&mut target, &mut |_chunk| shown += 1).unwrap();
+        assert!(!ended, "output alone does not end an execution");
+        assert_eq!(shown, RunCollector::FRAMES_PER_POLL, "one poll folds at most the bound");
+        assert_eq!(target.left, printed - RunCollector::FRAMES_PER_POLL, "the rest waits on the carrier");
+        assert_eq!(run.stdout.len(), RunCollector::FRAMES_PER_POLL, "what was shown was folded");
+    }
+
+    /// **A CALLER THAT POLLS AGAIN LOSES NOTHING**: output longer than one poll takes is folded in
+    /// order across several, and the stop behind it ends the run.
+    #[test]
+    fn a_run_whose_output_outlasts_one_poll_reaches_its_stop_for_a_caller_that_polls_again() {
+        use lamella_wire::MemTransport;
+
+        let mut target = MemTransport::new();
+        let mut driver = MemTransport::new();
+        let lines = RunCollector::FRAMES_PER_POLL * 3 + 1;
+        for line in 0..lines {
+            send_output(&mut target, debug::output::STDOUT, &format!("{line}\n")).unwrap();
+        }
+        send_stopped_result(&mut target, 9, debug::reason::DONE, 4).unwrap();
+        driver.feed(&target.take_sent());
+
+        let mut run = RunCollector::new(9);
+        let mut polls = 1;
+        while !run.poll(&mut driver).unwrap() {
+            polls += 1;
+            assert!(polls <= 4, "the stop is behind {lines} frames, four polls' worth");
+        }
+        let every_line: String = (0..lines).map(|line| format!("{line}\n")).collect();
+        assert_eq!(run.stdout, every_line, "every line, in order");
+        assert_eq!(run.exit_value(), Some(4));
     }
 
     /// A run no request started ends at the first stop that ends a program, whatever its sequence
@@ -5196,6 +5300,80 @@ mod tests {
         assert_eq!((hit_method, hit_offset), (loop_method, loop_offset));
         let detach = next_event(&mut driver).expect("the detach ack");
         assert_eq!(detach.msg_type, debug::DBG_ACK);
+    }
+
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_resume_stops_at_a_breakpoint_one_instruction_past_the_one_it_resumed_from() {
+        use lamella_wire::MemTransport;
+
+        let Ok(program) = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../lamella-wire-host/tests/fixtures/spin.exe"
+        )) else {
+            return;
+        };
+        let program: &'static [u8] = Box::leak(program.into_boxed_slice());
+        let assembly = Assembly::read(program).expect("fixture parses");
+        let loaded = lamella_load::load(&assembly).expect("fixture loads");
+        let mut module = loaded.module;
+        let image = module.write_baked(Some(loaded.entry)).expect("fixture bakes");
+
+        let stopped = |frame: &lamella_wire::Frame| {
+            assert_eq!(frame.msg_type, debug::EVT_STOPPED, "expected a stop event");
+            let method = u32::from_le_bytes(frame.payload[1..5].try_into().unwrap());
+            let offset = u32::from_le_bytes(frame.payload[5..9].try_into().unwrap());
+            (frame.payload[0], method, offset)
+        };
+
+        const STEPS: u16 = 12;
+        let mut driver = MemTransport::new();
+        let mut runner = MemTransport::new();
+        let mut arena = ArtifactLoad::new();
+        load_then_exec(&mut driver, 1, load::LOAD_IMAGE, &image, exec::exec_flags::START_HALTED);
+        for seq in 0..STEPS {
+            driver.send(debug::DBG_STEP, 2 + seq, &[]).unwrap();
+        }
+        driver.send(debug::DBG_DETACH, 2 + STEPS, &[]).unwrap();
+        runner.feed(&driver.take_sent());
+        drain_baked(&mut runner, &mut arena);
+        driver.feed(&runner.take_sent());
+        assert_eq!(stopped(&next_event(&mut driver).expect("entry stop")).0, debug::reason::ENTRY);
+        let mut trail = Vec::new();
+        for _ in 0..STEPS {
+            let (why, method, offset) = stopped(&next_event(&mut driver).expect("a step stop"));
+            assert_eq!(why, debug::reason::STEP);
+            trail.push((method, offset));
+        }
+        assert_eq!(next_event(&mut driver).expect("the detach ack").msg_type, debug::DBG_ACK);
+        let (first, second) = (trail[trail.len() - 2], trail[trail.len() - 1]);
+
+        let mut both = Vec::new();
+        both.extend_from_slice(&2u16.to_le_bytes());
+        for (method, offset) in [first, second] {
+            both.extend_from_slice(&method.to_le_bytes());
+            both.extend_from_slice(&offset.to_le_bytes());
+        }
+        load_then_exec(&mut driver, 20, load::LOAD_IMAGE, &image, exec::exec_flags::START_HALTED);
+        driver.send(debug::DBG_BREAK, 21, &both).unwrap();
+        driver.send(debug::DBG_RESUME, 22, &[]).unwrap();
+        driver.send(debug::DBG_RESUME, 23, &[]).unwrap();
+        driver.send(debug::DBG_DETACH, 24, &[]).unwrap();
+        runner.feed(&driver.take_sent());
+        drain_baked(&mut runner, &mut arena);
+        driver.feed(&runner.take_sent());
+        assert_eq!(stopped(&next_event(&mut driver).expect("entry stop")).0, debug::reason::ENTRY);
+        assert_eq!(next_event(&mut driver).expect("the break ack").msg_type, debug::DBG_ACK);
+        assert_eq!(
+            stopped(&next_event(&mut driver).expect("the first breakpoint")),
+            (debug::reason::BREAKPOINT, first.0, first.1)
+        );
+        assert_eq!(
+            stopped(&next_event(&mut driver).expect("the second breakpoint")),
+            (debug::reason::BREAKPOINT, second.0, second.1),
+            "the resume from the first breakpoint stops at the one its step-off lands on"
+        );
+        assert_eq!(next_event(&mut driver).expect("the detach ack").msg_type, debug::DBG_ACK);
     }
 
     #[cfg(feature = "baked-image")]
@@ -5824,6 +6002,27 @@ mod tests {
         assert_eq!(run.stderr, text, "the text arrives on the error stream");
         let result = run.finish().expect("an ended run has a result");
         assert_eq!(result.exit, 70);
+    }
+
+    /// A report without a newline of its own is sent as a line all the same, by both paths alike, so
+    /// whatever a host prints next starts a line of its own rather than joining the report.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn an_abort_report_without_a_newline_is_sent_as_a_line() {
+        use lamella_wire::MemTransport;
+
+        let text = "TRAP: the board stopped the program";
+        let mut written = Vec::new();
+        report_abort(text, &mut |byte| written.push(byte));
+        let mut allocating = MemTransport::new();
+        fault_stop(&mut allocating, 0, text).unwrap();
+        assert_eq!(written, allocating.take_sent(), "both paths send the same frames");
+
+        let mut driver = MemTransport::new();
+        driver.feed(&written);
+        let mut run = RunCollector::unprompted();
+        assert!(run.poll(&mut driver).unwrap(), "the TRAP stop ends the run");
+        assert_eq!(run.stderr, format!("{text}\n"), "the report arrives as a line of its own");
     }
 
     /// A string crosses as its text only when both ends offered string values, and as an object

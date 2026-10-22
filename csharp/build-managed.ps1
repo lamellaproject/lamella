@@ -1,8 +1,8 @@
 # Builds Lamella's managed (C#) sources into the assemblies the runtime loads.
 #
-#   pwsh -File build-managed.ps1 [-OutDir <dir>] [-Lcsc <path>] [-Define <symbols>]
-#   pwsh -File build-managed.ps1 -PrintSurface        # the default symbols, one per line
-#   pwsh -File build-managed.ps1 -PrintFamilySources <family>   # the csp sources that family's
+#   pwsh -File csharp/build-managed.ps1 [-OutDir <dir>] [-Lcsc <path>] [-Define <symbols>]
+#   pwsh -File csharp/build-managed.ps1 -PrintSurface        # the default symbols, one per line
+#   pwsh -File csharp/build-managed.ps1 -PrintFamilySources <family>   # the csp sources that family's
 #                                                     # System.Device.Gpio carries, one per line
 #
 # The Rust side is `cargo build`; this is the other half. It compiles `corlib/` and every
@@ -29,13 +29,14 @@ param(
     # member of the list from a symbol named anywhere else in the file.
     [switch]$PrintSurface,
     # Print the `csp/<family>/csharp` sources the family's System.Device.Gpio carries and exit, so
-    # build-boards.ps1 leaves out of a board's assembly exactly what this script compiles into that
+    # csharp/build-boards.ps1 leaves out of a board's assembly exactly what this script compiles into that
     # build: one reader of the list serves both scripts.
     [string]$PrintFamilySources
 )
 
 $ErrorActionPreference = 'Stop'
-$root = $PSScriptRoot
+# The repository root: this script is in its csharp/ folder, and every path it reads is the root's.
+$root = Split-Path $PSScriptRoot -Parent
 
 # The capability surface the assemblies are compiled at: every capability this runtime implements.
 # Each name gates `#if` regions in the sources. A smaller set builds a smaller BCL -- but it must
@@ -249,7 +250,7 @@ function Get-Sources($dir, [switch]$Recurse) {
     $files = if ($Recurse) { Get-ChildItem $dir -Filter *.cs -Recurse } else { Get-ChildItem $dir -Filter *.cs }
     $full = @($files | ForEach-Object { $_.FullName })
     # Sort on the path RELATIVE to $dir with separators normalized to '/', by ORDINAL comparison.
-    # All three parts matter for the sort to agree with build-managed.sh: an absolute prefix differs
+    # All three parts matter for the sort to agree with csharp/build-managed.sh: an absolute prefix differs
     # per machine, '\' (0x5C) and '/' (0x2F) fall on opposite sides of the letters so a raw path sorts
     # differently on Windows than on Unix, and PowerShell's default Sort-Object is culture-aware where
     # `LC_ALL=C sort` is byte order.
@@ -327,7 +328,7 @@ foreach ($assembly in $Assemblies) {
 # register layouts they take. The build for a board takes it in place of the shared one, so it
 # presents the shared one's public surface unchanged, and beside it the csp types it carries, public.
 #
-# EACH OF THOSE TYPES IS IN EXACTLY ONE ASSEMBLY. build-boards.ps1 leaves the listed sources out of
+# EACH OF THOSE TYPES IS IN EXACTLY ONE ASSEMBLY. csharp/build-boards.ps1 leaves the listed sources out of
 # the assembly for a board of the family and compiles that assembly against this build instead. The
 # AOT tier names a method by its type's full name and signature, not by its assembly, and keeps every
 # definition of a name the program reaches, so a type compiled into both assemblies defines each
@@ -353,7 +354,7 @@ foreach ($familyFile in $familyFiles) {
         $copy = Join-Path $work $relative
         New-Item -ItemType Directory -Force (Split-Path $copy -Parent) | Out-Null
         # Bytes in and bytes out, so the copy differs from its original only where a declaration
-        # changed: build-managed.sh makes the same edit with sed, and the two outputs are compared.
+        # changed: csharp/build-managed.sh makes the same edit with sed, and the two outputs are compared.
         # Inside this assembly an override of GpioDriver's `protected internal` members must say so,
         # where the source says `protected`, as it must wherever it compiles outside this assembly:
         # in a test that builds a driver from its source, and in a board's assembly for a family with
@@ -383,7 +384,7 @@ foreach ($familyFile in $familyFiles) {
 # An assembly this script STOPPED producing is the one file in $out nothing overwrites, so it sits
 # there at its old date presenting a surface no source in the tree still describes, so a type
 # that has moved to another assembly resolves from two at once. Only names this script OWNS are removed -- $out also
-# holds board assemblies written by build-boards.ps1, so a blanket clean would delete another
+# holds board assemblies written by csharp/build-boards.ps1, so a blanket clean would delete another
 # script's output.
 $folded = @($Assemblies | ForEach-Object { $_.extraSources } | Where-Object { $_ })
 $heldOut = @($Assemblies | Where-Object { $_.held } | ForEach-Object { $_.name })

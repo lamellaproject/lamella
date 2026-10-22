@@ -220,9 +220,10 @@ namespace Lamella.Boards.RaspberryPi
                 new uint[4]);
         }
 
-        /// <summary>The on-chip converter as dotnet/iot's analog controller. Each pin is a converter
-        /// channel: <see cref="AdcChannelGp26"/> to <see cref="AdcChannelGp29"/> and
-        /// <see cref="TemperatureSensorChannel"/> name them.</summary>
+        /// <summary>The on-chip converter as dotnet/iot's analog controller. A pin is opened by its GPIO
+        /// number, GP26 to GP29: <c>OpenPin(26)</c> reads GP26, converter channel
+        /// <see cref="AdcChannelGp26"/>. The temperature sensor's channel reads no pin, so it does not
+        /// open here.</summary>
         /// <remarks>Creating it touches no hardware; the first pin opened brings the converter up.
         /// It reads through the converter driver the board binds.</remarks>
         /// <param name="chip">Must be 0: the board has one converter.</param>

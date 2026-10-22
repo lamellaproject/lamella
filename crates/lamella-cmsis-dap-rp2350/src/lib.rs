@@ -35,6 +35,30 @@ const STAGE_MAX: usize = 320 * 1024;
 const CALL_SP: u32 = 0x2008_0000;
 const CALL_TRAP: u32 = 0x2000_0000;
 
+/// The most bytes one `flash_op` erase call covers: sixteen sectors, one 64 KiB block.
+///
+/// **THE IMAGE IS ERASED IN CALLS OF THIS SIZE RATHER THAN IN ONE, BECAUSE AN ERASE TAKES LONGER
+/// THE MORE BYTES IT COVERS WHILE A CALL IS POLLED FOR ITS RETURN A FIXED NUMBER OF TIMES.**
+/// `flash_op` erases 4 KiB sectors one at a time unless the boot RAM's `FLASH_DEVINFO` says the
+/// flash device takes the 64 KiB block erase (datasheet 5.4.8.9), and a sector erase is specified
+/// at up to 400 ms on the 16 MB parts these boards carry (the W25Q128JV's tSE: 45 ms typical). So
+/// one call takes at most 6.4 s whatever the image's size, and [`FLASH_OP_POLLS`] covers that
+/// several times over. Every call starts on a 64 KiB boundary, so where the block erase is enabled
+/// a whole call is one block.
+const ERASE_CALL_BYTES: usize = 64 * 1024;
+
+/// How many times a `flash_op` call is polled for its return before it is given up as hung.
+///
+/// A poll is one read through the probe, so the time this spans is the probe's: about 40 s
+/// through a Raspberry Pi Debug Probe. Every call is sized so that its slowest specified case is
+/// a small part of that: an erase by [`ERASE_CALL_BYTES`] (16 sectors at up to 400 ms, 6.4 s) and
+/// a program by [`STAGE_MAX`] (1,280 pages at up to 3 ms, 3.8 s).
+const FLASH_OP_POLLS: u32 = 100_000;
+
+/// How often the erase says how far it has got, in bytes. A whole-board image takes more than a
+/// minute to erase, and a minute without a word reads as a hang.
+const ERASE_PROGRESS_BYTES: usize = 1024 * 1024;
+
 /// Boot-RAM BOOTLOCK1 = the bootrom's `LOCK_FLASH_OP` (datasheet 5.4.4 + the boot-RAM register
 /// map): read to claim (returns `1 << 1` on success, 0 if already claimed), write to unclaim.
 /// A firmware built with SDK-style bootrom locking claims `LOCK_ENABLE` (BOOTLOCK7), and boot
@@ -232,21 +256,34 @@ pub fn flash_image<A: TargetAccess>(
     words.resize(image.len().div_ceil(PAGE_BYTES) * (PAGE_BYTES / 4), 0xFFFF_FFFF);
 
     let frame = CallFrame::new(CALL_SP, CALL_TRAP);
-    let slow = CallFrame { poll_tries: 100_000, ..frame };
+    let slow = CallFrame { poll_tries: FLASH_OP_POLLS, ..frame };
     log("connect_internal_flash + flash_exit_xip...");
     target.call_target(u32::from(connect_internal_flash), &[], &frame)?;
     target.call_target(u32::from(flash_exit_xip), &[], &frame)?;
 
     let erase_len = image.len().div_ceil(SECTOR_BYTES) * SECTOR_BYTES;
-    log(&format!("flash_op ERASE {erase_len} bytes at {XIP_BASE:#010x}..."));
-    let status = target.call_target(
-        u32::from(flash_op),
-        &[CFLASH_SECURE | CFLASH_OP_ERASE, XIP_BASE, erase_len as u32, 0],
-        &slow,
-    )?;
-    if status != 0 {
-        log(&format!("flash_op erase status = {} ({status:#010x})", status as i32));
-        return Err(ProbeError::Timeout("flash_op erase returned an error status"));
+    let calls = erase_calls(erase_len);
+    let count = calls.len();
+    log(&format!(
+        "flash_op ERASE {erase_len} bytes at {XIP_BASE:#010x}, {ERASE_CALL_BYTES} bytes a call..."
+    ));
+    for (index, (address, bytes)) in calls.enumerate() {
+        let call = format!(
+            "flash_op ERASE call {} of {count} ({bytes} bytes at {address:#010x})",
+            index + 1
+        );
+        let args = [CFLASH_SECURE | CFLASH_OP_ERASE, address, bytes, 0];
+        let status = target
+            .call_target(u32::from(flash_op), &args, &slow)
+            .inspect_err(|error| log(&format!("{call} did not complete: {error}")))?;
+        if status != 0 {
+            log(&format!("{call} returned status {} ({status:#010x})", status as i32));
+            return Err(ProbeError::Timeout("flash_op erase returned an error status"));
+        }
+        let erased = (address - XIP_BASE) as usize + bytes as usize;
+        if erased.is_multiple_of(ERASE_PROGRESS_BYTES) && erased < erase_len {
+            log(&format!("erased {erased} of {erase_len} bytes..."));
+        }
     }
 
     let stage_words = STAGE_MAX / 4;
@@ -288,6 +325,15 @@ pub fn flash_image<A: TargetAccess>(
     Ok(readback)
 }
 
+/// The `flash_op` erase calls that erase the first `erase_len` bytes of flash, in address order:
+/// each an XIP address on a 64 KiB boundary and a byte count no larger than [`ERASE_CALL_BYTES`].
+fn erase_calls(erase_len: usize) -> impl ExactSizeIterator<Item = (u32, u32)> {
+    (0..erase_len.div_ceil(ERASE_CALL_BYTES)).map(move |index| {
+        let offset = index * ERASE_CALL_BYTES;
+        (XIP_BASE + offset as u32, (erase_len - offset).min(ERASE_CALL_BYTES) as u32)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     #[test]
@@ -307,6 +353,43 @@ mod tests {
         );
         assert_eq!(super::wait_retries_at(500_000), 64, "never fewer than at the fallback clock");
         assert_eq!(super::wait_retries_at(u32::MAX), u16::MAX);
+    }
+
+    /// The erase calls cover the image's sectors exactly, in address order and without a gap: each
+    /// a whole number of sectors starting on a 64 KiB boundary, and none larger than one block.
+    #[test]
+    fn the_erase_calls_cover_the_image_a_block_at_a_time() {
+        use super::{ERASE_CALL_BYTES, SECTOR_BYTES, XIP_BASE};
+
+        for erase_len in [4096, 65536, 65536 + 4096, 6_504_448, 16 * 1024 * 1024] {
+            let calls: Vec<(u32, u32)> = super::erase_calls(erase_len).collect();
+            assert_eq!(calls.len(), erase_len.div_ceil(ERASE_CALL_BYTES), "{erase_len}");
+            let mut next = XIP_BASE;
+            for &(address, bytes) in &calls {
+                assert_eq!(address, next, "{erase_len}: in order, with no gap");
+                assert_eq!((address - XIP_BASE) as usize % ERASE_CALL_BYTES, 0, "{address:#x}");
+                assert!(bytes > 0 && bytes as usize <= ERASE_CALL_BYTES, "{bytes} at {address:#x}");
+                assert_eq!(bytes as usize % SECTOR_BYTES, 0, "{bytes} at {address:#x}");
+                next += bytes;
+            }
+            assert_eq!((next - XIP_BASE) as usize, erase_len, "the image's sectors and no more");
+        }
+    }
+
+    /// **NO CALL OUTGROWS ITS POLL BUDGET**: the slowest erase call and the slowest program call
+    /// the flash device is specified for each take a fifth or less of the time the budget spans
+    /// through the probe, so a probe that polls five times faster still waits them out.
+    #[test]
+    fn every_flash_op_call_fits_its_poll_budget_five_times_over() {
+        const SECTOR_ERASE_MAX_US: u64 = 400_000;
+        const PAGE_PROGRAM_MAX_US: u64 = 3_000;
+        const POLL_US: u64 = 400;
+
+        let budget_us = u64::from(super::FLASH_OP_POLLS) * POLL_US;
+        let erase_us = (super::ERASE_CALL_BYTES / super::SECTOR_BYTES) as u64 * SECTOR_ERASE_MAX_US;
+        let program_us = (super::STAGE_MAX / super::PAGE_BYTES) as u64 * PAGE_PROGRAM_MAX_US;
+        assert!(erase_us * 5 <= budget_us, "an erase call: {erase_us} us of {budget_us}");
+        assert!(program_us * 5 <= budget_us, "a program call: {program_us} us of {budget_us}");
     }
 
     /// The faster clock goes out with its WAIT budget, in that order, and nothing else is sent.

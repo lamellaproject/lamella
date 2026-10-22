@@ -1,11 +1,7 @@
-So that programs behave as they do on CPython, Lamella's Python implementation (the
-crates/lamella-py-* crates and the modules in this directory) reproduces the public names and
-shapes of the standard library functions and classes it implements, and the exception messages
-CPython raises. Those are used under CPython's license, which follows in full; the zero-clause
-BSD license at its end covers the documentation's code.
-
-random.py's MT19937 generator core was written from a written specification of the algorithm; the
-algorithm is Makoto Matsumoto and Takuji Nishimura's, and random.py credits them for it.
+Lamella's Python implementation (the crates/lamella-py-* crates and the modules in this directory)
+reproduces the parts of CPython that compatibility with it dictates: the public names and shapes of
+the standard library functions and classes it implements; and the exception messages CPython raises.
+Those are used under CPython's license, which follows in full.
 
 ====================================================================================================
 

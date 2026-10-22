@@ -18,7 +18,7 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
     SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA,
 };
-use windows_sys::Win32::Devices::Properties::{DEVPKEY_Device_Service, DEVPROPKEY, DEVPROPTYPE};
+use windows_sys::Win32::Devices::Properties::{DEVPKEY_Device_Service, DEVPROPTYPE};
 use windows_sys::Win32::Devices::Usb::{
     UsbdPipeTypeBulk, WinUsb_ControlTransfer, WinUsb_Free, WinUsb_GetAssociatedInterface,
     WinUsb_GetOverlappedResult,
@@ -29,7 +29,7 @@ use windows_sys::Win32::Devices::Usb::{
 };
 use windows_sys::Win32::Foundation::{WAIT_OBJECT_0,
     CloseHandle, GetLastError, ERROR_IO_PENDING, ERROR_SEM_TIMEOUT, ERROR_SUCCESS, GENERIC_READ,
-    GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
+    DEVPROPKEY, GENERIC_WRITE, HANDLE, INVALID_HANDLE_VALUE, WAIT_TIMEOUT,
 };
 use windows_sys::Win32::Storage::FileSystem::{
     CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OVERLAPPED, FILE_SHARE_READ, FILE_SHARE_WRITE,

@@ -4,7 +4,7 @@ namespace Lamella.Hardware
     /// <summary>One channel of the board's analog-to-digital converter.</summary>
     /// <remarks>Constructing one touches no hardware and checks nothing -- it names a channel. The
     /// first read brings the converter up and refuses a channel the board does not have.</remarks>
-    public struct AdcChannelHandle
+    internal struct AdcChannelHandle
     {
         private readonly int _channel;
 

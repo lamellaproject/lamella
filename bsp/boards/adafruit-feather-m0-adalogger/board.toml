@@ -30,6 +30,7 @@ role = "sd-spi"             # vendor variant file names the instance and the pad
 kind = "spi"
 instance = "sercom4"
 function = "D"              # SERCOM-ALT (Table 7-1 column D), matching those rows.
+gclk_gen = 0
 mosi = { pin = "PB10", pad = 2 }
 sck = { pin = "PB11", pad = 3 }
 miso = { pin = "PA12", pad = 0 }
@@ -71,4 +72,4 @@ exposure = "pads"
 fitted = "no"
 onboard = "none"
 recovery = "flash-bootloader"
-source = "The board's own guide, Debug Interface: "SWCLK & SWDIO - These pads on the bottom are used to program the chip. They can also be connected to an SWD debugger." The pads are on the underside and the guide states no connector, so reaching them needs soldering. The board ships with a UF2 bootloader reached by double-tapping reset, which lives in flash rather than in ROM, so its survival depends on the region a write reaches."
+source = "The board's own guide, Debug Interface: 'SWCLK & SWDIO - These pads on the bottom are used to program the chip. They can also be connected to an SWD debugger.' The pads are on the underside and the guide states no connector, so reaching them needs soldering. The board ships with a UF2 bootloader reached by double-tapping reset, which lives in flash rather than in ROM, so its survival depends on the region a write reaches."

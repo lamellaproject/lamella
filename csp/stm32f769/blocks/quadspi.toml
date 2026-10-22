@@ -1,0 +1,274 @@
+# BLOCK layout: the STM32F769 QUADSPI. Offsets are instance-base-relative; the instance base + RCC
+# enable routing live in ../instances.toml. Every register is 32 bits wide; DR is the one whose
+# byte and halfword accesses the manual defines, each moving that many bytes of its FIFO.
+#
+# Cross-block bring-up (RCC enables, GPIO muxing) is DRIVER code per language; only block-local
+# sequences ride here.
+#
+# THIS BLOCK HAS A PRECONDITION THAT IS INVISIBLE IN SOURCE AND FATAL AT RUN TIME. The manual is
+# blunt about it: it is forbidden to access the flash bank area before the peripheral has been
+# configured and enabled. An access the controller cannot serve is not a wrong value -- it is a
+# bus error, which the core takes as a bus fault, or as a hard fault where bus fault is disabled.
+# That covers an access while the controller is disabled, an access while memory-mapped mode is
+# not selected, and an access past the size the device half was given. A pointer into the window
+# is an ordinary pointer and reads like one, so nothing in a program says which side of the
+# bring-up it is on. That is why an ORDER rides in this table beside the register map: it is a
+# fact about the block, stated once, rather than a rule each driver is trusted to remember.
+#
+# THE WINDOW ONLY READS. The manual allows read operations alone in memory-mapped mode, so a
+# program or an erase is an INDIRECT-WRITE command. And after the first access through the window
+# the controller stays busy -- until an abort, or a timeout where CR.TCEN is set -- while its
+# prescaler, its mode bits and every device and command field may change only when it is not
+# busy. A route that writes the device therefore begins by aborting, and waits on BUSY before
+# every reconfiguration after that.
+#
+# THE ORDER IS CHIP TRUTH AND THE DEVICE IS NOT. Everything below is true of every board that
+# fits a quad-SPI flash to this part. WHICH flash is fitted, what its commands are, and how many
+# dummy cycles one of them needs are properties of that board's device -- they ride a board's own
+# memory region, and one of them is not a constant at all.
+#
+# READ IN RM0410, NOT CARRIED ACROSS FROM THE STM32F7 TABLE. The two parts' manuals agree about
+# this block register for register and bit for bit, and each table was read from its own manual:
+# a value taken from a sibling family is right until the day it is not, and nothing marks the day.
+
+[table]
+kind = "block"
+family = "stm32f769"
+block = "quadspi"
+sources = [
+    "STM32F76xxx/STM32F77xxx reference manual RM0410 Rev 5: QUADSPI register descriptions, sections 14.5.1 to 14.5.13, and Table 94 'QUADSPI register map and reset values' (pages 425-437) -- CR 0x00, DCR 0x04, SR 0x08, FCR 0x0C, DLR 0x10, CCR 0x14, AR 0x18, ABR 0x1C, DR 0x20, PSMKR 0x24, PSMAR 0x28, PIR 0x2C, LPTR 0x30",
+    "RM0410 Rev 5, the per-bit descriptions of sections 14.5.1 to 14.5.13: CR EN 0, ABORT 1, DMAEN 2, TCEN 3, SSHIFT 4, DFM 6, FSEL 7, FTHRES 12:8, TEIE 16, TCIE 17, FTIE 18, SMIE 19, TOIE 20, APMS 22, PMM 23, PRESCALER 31:24; DCR CKMODE 0, CSHT 10:8, FSIZE 20:16; SR TEF 0, TCF 1, FTF 2, SMF 3, TOF 4, BUSY 5, FLEVEL 13:8; FCR CTEF 0, CTCF 1, CSMF 3, CTOF 4; CCR INSTRUCTION 7:0, IMODE 9:8, ADMODE 11:10, ADSIZE 13:12, ABMODE 15:14, ABSIZE 17:16, DCYC 22:18, DMODE 25:24, FMODE 27:26, SIOO 28, DHHC 30, DDRM 31; DLR DL, AR ADDRESS, ABR ALTERNATE, DR DATA, PSMKR MASK and PSMAR MATCH 31:0; PIR INTERVAL and LPTR TIMEOUT 15:0",
+    "RM0410 Rev 5 section 14.3.3 (the five command phases, and at least one dummy cycle whenever data is received on two or four lines), 14.3.5 (indirect mode: which register write starts a command, and the 32-byte FIFO), 14.3.6 (automatic status-polling mode), 14.3.10 (configuration: the peripheral through CR, then the flash memory through DCR), 14.3.11 (the operating mode is selected by CCR's FMODE, and memory-mapped mode allows only read operations), 14.3.14 (BUSY, and ABORT, which ends any operation and flushes the FIFO) and 14.3.15 (an operation whose FIFO stays full on a read or empty on a write stalls with the clock held low)",
+    "RM0410 Rev 5 section 14.3.7: 'It is forbidden to access the quad-SPI flash bank area before having properly configured and enabled the QUADSPI peripheral'; no more than 256 Mbytes can be addressed; an access outside the range FSIZE defines raises a bus error, which the core takes as a bus fault (a hard fault where bus fault is disabled). Section 14.3.13: an access while the controller is disabled, or while memory-mapped mode is not selected, raises the same bus error",
+    "RM0410 Rev 5 section 2.2.2 Figure 2 (memory map, page 77: block 4, 0x80000000 to 0x9FFFFFFF, is the quad-SPI and FMC bank 3) read with section 13.5 Figure 34 (FMC memory banks, page 338: the FMC's own bank 4, 0x90000000 to 0x9FFFFFFF, is not used), which leaves 0x90000000 as the quad-SPI memory-mapped bank and its 256 Mbytes as the span section 14.3.7 allows. The vendor's quad-SPI application note AN4760 Rev 5, which applies to the STM32F7 series, states it outright in section 3.3.3: up to 256 Mbytes from 0x90000000 to 0x9FFFFFFF in memory-mapped mode",
+]
+notes = [
+    "The peripheral is configured in two halves and the manual separates them: CR describes the CONTROLLER (its clock prescaler, its sampling and its FIFO), DCR describes the DEVICE (how large it is, how long chip select must stay high, and what the clock does between commands). The split is the same one the strata make -- which is why the DCR values are the ones a board's memory region supplies.",
+    "FSIZE is not a size, it is an exponent: the number of bytes is 2 to the (FSIZE + 1), so FSIZE + 1 is exactly the number of address bits the device needs. A 64-Mbyte device is FSIZE 25 and needs 26 address bits -- more than a 24-bit address phase carries, so reaching all of one takes the 32-bit address size or an addressing mode of the device's own. The generator derives FSIZE from the fitted size rather than taking it, so a size and an FSIZE cannot disagree.",
+    "The interface clock is the AHB clock divided by (PRESCALER + 1); PRESCALER 0 is the AHB clock itself. So it is a divisor, and it is derived from a plan rate and a target rate rather than written down. An odd division factor gives a clock that stays low one cycle longer than it stays high, and DDR mode needs a factor of at least two.",
+    "A command is described entirely by CCR: the instruction, how many lines each phase uses, the address size, and the number of dummy cycles. IMODE/ADMODE/ABMODE/DMODE share one encoding (0 none, 1 single line, 2 two lines, 3 four lines), so a quad read is the same word with different numbers in it -- there is no separate quad mode to enter on this side.",
+    "DCYC is five bits, so the block can express 0 to 31 dummy cycles, and 0 skips the dummy phase. The manual sets one floor: data received on two or four lines needs at least one dummy cycle, the turn-around from output to input. WHICH count is right above that is not a property of this block: it covers the device's internal latency in TIME, so it falls as the interface clock falls. The block states the range; the count is asked of the part.",
+    "WHICH WRITE STARTS AN INDIRECT COMMAND depends on what the command still needs, and the manual names three cases: a command with no address phase and no data to supply starts on the write to CCR; one with an address phase and no data to supply starts on the write to AR; one with data to supply -- indirect write with a data phase -- starts on the first write to DR. ABR never starts a command, so alternate bytes are written before whichever write does. A command with no data phase at all is issued in indirect-write mode, the only mode the manual allows one in.",
+    "In memory-mapped mode the controller prefetches and holds chip select low indefinitely by default. A flash draws more current with chip select low, so a design that cares can set CR.TCEN and give LPTR a period, after which the controller raises chip select; nothing here needs it, and it is stated so the default is a choice rather than an oversight.",
+    "The alternate-byte, status-polling and low-power-timeout registers are stated beside the read path's because a route that programs the device reaches past the read path: status polling lets a program wait on a bit of the device's status register without a loop of indirect reads, alternate bytes carry the mode bits some devices take after the address, and the timeout is the one way BUSY falls in memory-mapped mode short of an abort or disabling the controller.",
+    "Some sentences of the manual's chapter disagree with its own register descriptions, and the descriptions are what this table records: section 14.3.6 attributes the polling MASK to QUADSPI_PSMAR (MASK is PSMKR at 0x24, MATCH is PSMAR at 0x28); 14.3.11 names a QUADSPI_PISR for the polling interval (it is PIR, at 0x2C) and says the match and stop modes are valid when FMODE = 11 (status polling is FMODE 10); 14.5.5 gives memory-mapped mode as FMODE = 10 (it is 11); and 14.3.3 says the data phase's line count is set by ABMODE (it is DMODE, CCR bits 25:24).",
+]
+
+[registers.CR]
+offset = 0x0
+width = 32
+fields = { EN = [0, 1], ABORT = [1, 1], DMAEN = [2, 1], TCEN = [3, 1], SSHIFT = [4, 1], DFM = [6, 1], FSEL = [7, 1], FTHRES = [8, 5], TEIE = [16, 1], TCIE = [17, 1], FTIE = [18, 1], SMIE = [19, 1], TOIE = [20, 1], APMS = [22, 1], PMM = [23, 1], PRESCALER = [24, 8] }
+notes = "The controller half. EN enables the peripheral; PRESCALER divides the AHB clock by (value + 1); SSHIFT samples the returned data half a cycle later, to allow for external signal delays, and must be clear in DDR mode. PRESCALER, PMM, APMS, FSEL, DFM, SSHIFT and TCEN may only be changed while SR.BUSY is 0. ABORT is how a busy controller is stopped: it ends whatever is running, and once the abort completes the controller clears ABORT and BUSY itself and flushes the FIFO. The manual warns that some flash memories misbehave if a write to a status register is aborted."
+
+[registers.DCR]
+offset = 0x4
+width = 32
+fields = { CKMODE = [0, 1], CSHT = [8, 3], FSIZE = [16, 5] }
+notes = "The device half. FSIZE is an exponent (bytes = 2^(FSIZE+1)); CSHT is the minimum number of clock cycles chip select stays high between commands, minus one; CKMODE is the level the clock rests at while chip select is high -- 0 leaves it low (mode 0), 1 leaves it high (mode 3). All three may only be changed while SR.BUSY is 0."
+
+[registers.SR]
+offset = 0x8
+width = 32
+fields = { TEF = [0, 1], TCF = [1, 1], FTF = [2, 1], SMF = [3, 1], TOF = [4, 1], BUSY = [5, 1], FLEVEL = [8, 6] }
+notes = "Status. BUSY is set while an operation runs and is the flag every reconfiguration waits on; in indirect mode it clears only once the command has finished AND the FIFO is empty, so a read that leaves bytes behind keeps it set. FTF means, in an indirect read, that there are bytes to take, and in an indirect write that there is room for more. FLEVEL counts the bytes in the 32-byte FIFO and reads 0 in memory-mapped and status-polling modes. In memory-mapped mode BUSY goes high on the first access and, because of the prefetch, does not fall until a timeout (where CR.TCEN is set), an abort, or the controller is disabled."
+
+[registers.FCR]
+offset = 0xC
+width = 32
+fields = { CTEF = [0, 1], CTCF = [1, 1], CSMF = [3, 1], CTOF = [4, 1] }
+notes = "Write-1-to-clear for the matching SR flag. FTF has no clear bit: it follows the FIFO."
+
+[registers.DLR]
+offset = 0x10
+width = 32
+fields = { DL = [0, 32] }
+notes = "Indirect-mode transfer length MINUS ONE; writing the length itself transfers one byte too many. All ones states no length at all: the transfer runs to the end of the size DCR states. In status-polling mode the value is at most 3, four status bytes. It has no meaning in memory-mapped mode, and may only be written while SR.BUSY is 0."
+
+[registers.CCR]
+offset = 0x14
+width = 32
+fields = { INSTRUCTION = [0, 8], IMODE = [8, 2], ADMODE = [10, 2], ADSIZE = [12, 2], ABMODE = [14, 2], ABSIZE = [16, 2], DCYC = [18, 5], DMODE = [24, 2], FMODE = [26, 2], SIOO = [28, 1], DHHC = [30, 1], DDRM = [31, 1] }
+notes = "The command. Writing this register STARTS an indirect command that needs neither an address nor data from the program, so it is written after DLR and ABR and before AR and DR; the other two starting writes are in the notes above. In memory-mapped mode (FMODE 3) it is a standing description of the read the controller issues on every access, and the address comes from the bus rather than from AR. Every field may only be written while SR.BUSY is 0."
+
+[registers.AR]
+offset = 0x18
+width = 32
+fields = { ADDRESS = [0, 32] }
+notes = "The address phase's value in indirect and status-polling modes. Writing it is what starts a command that HAS an address phase and no data to supply. Writes are IGNORED while SR.BUSY is 1 and in memory-mapped mode, so an address written at the wrong moment is lost rather than refused. An address beyond the size DCR states, or one whose transfer would run past it, sets SR.TEF."
+
+[registers.ABR]
+offset = 0x1C
+width = 32
+fields = { ALTERNATE = [0, 32] }
+notes = "The alternate-byte phase's value: optional bytes sent right after the address, generally to set a device's mode of operation. CCR.ABMODE says how many lines carry them and CCR.ABSIZE how many are sent (8, 16, 24 or 32 bits, in the same encoding as ADSIZE). A write here never starts a command, so it is written before the write that does, and may only be made while SR.BUSY is 0."
+
+[registers.DR]
+offset = 0x20
+width = 32
+fields = { DATA = [0, 32] }
+notes = "The indirect-mode data FIFO, 32 bytes deep. Byte, halfword and word accesses each move that many bytes, and a narrower access must be to the low byte or halfword of the register -- so a byte-wide read is a byte-wide access to this address and not a word read of which three bytes are discarded. A write waits while the FIFO is too full to take it; a read waits while the FIFO holds fewer bytes than asked for and the transfer is still running. An indirect write whose FIFO runs dry does not end: the transfer stalls with the clock held low until more data arrives, and bytes written past the length in DLR are flushed when it completes. In status-polling mode it holds the last status read, unmasked; in memory-mapped mode every access to it returns zero."
+
+[registers.PSMKR]
+offset = 0x24
+width = 32
+fields = { MASK = [0, 32] }
+notes = "Status-polling mask: bit n set means bit n of the status the device returns takes part in the match; clear means it is ignored. It may only be written while SR.BUSY is 0, so it is written before the CCR or AR write that starts the polling."
+
+[registers.PSMAR]
+offset = 0x28
+width = 32
+fields = { MATCH = [0, 32] }
+notes = "Status-polling match value, compared with the masked status. CR.PMM chooses how: 0 sets SR.SMF only when every unmasked bit matches (AND), 1 when any one does (OR). With CR.APMS set the polling stops at the first match and BUSY falls; otherwise it continues until an abort or until the controller is disabled. It may only be written while SR.BUSY is 0."
+
+[registers.PIR]
+offset = 0x2C
+width = 32
+fields = { INTERVAL = [0, 16] }
+notes = "Status-polling interval: the number of interface-clock cycles between two status reads. It may only be written while SR.BUSY is 0."
+
+[registers.LPTR]
+offset = 0x30
+width = 32
+fields = { TIMEOUT = [0, 16] }
+notes = "Memory-mapped low-power timeout: the number of interface-clock cycles the controller waits, once the prefetch has filled the FIFO and no access has followed, before it raises chip select. It counts only while CR.TCEN is set, and a timeout is what lets BUSY fall in memory-mapped mode without an abort. It may only be written while SR.BUSY is 0."
+
+[constants]
+# The phase-mode encoding, shared by every phase of a command. One name, because IMODE, ADMODE,
+# ABMODE and DMODE are the same two bits with the same meaning in four places.
+CCR_MODE_NONE = 0
+CCR_MODE_SINGLE = 1
+CCR_MODE_DUAL = 2
+CCR_MODE_QUAD = 3
+# The functional mode: what the controller does with the command described by CCR.
+CCR_FMODE_INDIRECT_WRITE = 0
+CCR_FMODE_INDIRECT_READ = 1
+CCR_FMODE_STATUS_POLL = 2
+CCR_FMODE_MEMORY_MAPPED = 3
+# Address size, in the same field order the manual states. ABSIZE, the alternate-byte size, uses
+# the same four values for the same four widths.
+CCR_ADSIZE_8 = 0
+CCR_ADSIZE_16 = 1
+CCR_ADSIZE_24 = 2
+CCR_ADSIZE_32 = 3
+# Clock mode: the level the clock idles at while chip select is high.
+DCR_CKMODE_LOW = 0
+DCR_CKMODE_HIGH = 1
+# The dummy-phase field's range. A count is chosen from this range by ASKING THE PART, never by
+# stating an answer -- see the note above and a board's own device record.
+CCR_DCYC_MIN = 0
+CCR_DCYC_MAX = 31
+# THE MEMORY-MAPPED WINDOW. This is the second statement of a number a board that fits a flash
+# here also has to know, and the two are held equal at generation time rather than trusted to
+# agree: a board states where its region appears, this states where the block puts it.
+MEMORY_MAPPED_BASE = 0x90000000
+
+[parameters]
+controller = "the composed CR word with EN clear: PRESCALER in bits 31:24, the interface-clock divisor minus one, derived from the AHB rate and the rate the device is qualified at; and SSHIFT where external signal delays call for sampling later."
+controller_enabled = "the same CR word with EN (bit 0) set as well."
+device = "the composed DCR word: the fitted device's size exponent, its chip-select high time, and its clock mode."
+command = "the composed CCR word for one command: the instruction, the line count of each phase, the address size, the dummy count the part answered to, and the functional mode the step names."
+length = "an indirect transfer's byte count MINUS ONE."
+address = "the device address an indirect command reads from."
+
+# ---- THE BRING-UP ORDER ----------------------------------------------------------------------
+#
+# Four steps, and every one of them has to happen before the window is touched at all. The manual
+# splits the configuration in two (the controller, then the flash) and this is that split written
+# down: CR carries what the CONTROLLER does, DCR what the DEVICE is, and the prescaler, the mode
+# bits and every device field may change only while the peripheral is not busy -- which after the
+# first memory-mapped access it stays, until an abort or a timeout.
+#
+# `map` is the step that makes the window exist. Before it, an access to the bank area faults.
+
+[[sequences.enable]]
+op = "poll"
+reg = "SR"
+mask = 0x20
+want = 0
+note = "BUSY clear. The prescaler, the sampling shift and every device field may only be changed while the controller is idle"
+
+[[sequences.enable]]
+op = "write"
+reg = "CR"
+value = "$controller"
+note = "the controller half: the clock divisor and the sampling choice, with EN still clear"
+
+[[sequences.enable]]
+op = "write"
+reg = "DCR"
+value = "$device"
+note = "the flash half: size, chip-select high time, clock mode"
+
+[[sequences.enable]]
+op = "write"
+reg = "CR"
+value = "$controller_enabled"
+note = "the same controller word with EN set, written last so the controller never runs with a device half it has not been given. A store of the enable bit alone would also write PRESCALER back to 0 and run the interface at the full AHB rate"
+
+# Memory-mapped mode: ONE more write, and it is the one that turns the bank area from a fault
+# into memory. There is no address and no length -- the bus supplies the address on every access
+# and the controller never finishes, which is why SR.BUSY stays set from the first access until
+# an abort, or a timeout where CR.TCEN is set.
+
+[[sequences.map]]
+op = "poll"
+reg = "SR"
+mask = 0x20
+want = 0
+note = "BUSY clear: every CCR field may only be written while the controller is idle"
+
+[[sequences.map]]
+op = "write"
+reg = "CCR"
+value = "$command"
+note = "FMODE = memory-mapped, plus the read command's phases and its dummy count. The window serves reads after this write, faults before it, and takes no writes at all"
+
+# One indirect read, which is how a device is identified before it is mapped -- and how a dummy
+# count is checked against a payload the caller already knows.
+
+[[sequences.read_indirect]]
+op = "poll"
+reg = "SR"
+mask = 0x20
+want = 0
+note = "BUSY clear"
+
+[[sequences.read_indirect]]
+op = "write"
+reg = "DLR"
+value = "$length"
+note = "the byte count MINUS ONE"
+
+[[sequences.read_indirect]]
+op = "write"
+reg = "CCR"
+value = "$command"
+note = "FMODE = indirect read. A command with no address phase STARTS on this write"
+
+[[sequences.read_indirect]]
+op = "write"
+reg = "AR"
+value = "$address"
+note = "a command WITH an address phase starts on this write instead. A command without one skips this step: it is already running, and the controller ignores AR while it is busy"
+
+[[sequences.read_indirect]]
+op = "poll"
+reg = "SR"
+mask = 0x4
+note = "FTF: the FIFO holds data to take"
+
+[[sequences.read_indirect]]
+op = "read"
+reg = "DR"
+
+[[sequences.read_indirect]]
+op = "poll"
+reg = "SR"
+mask = 0x2
+note = "TCF: the programmed count has transferred"
+
+[[sequences.read_indirect]]
+op = "write"
+reg = "FCR"
+value = 0x2
+note = "clear TCF, or the next command's completion is indistinguishable from this one's"

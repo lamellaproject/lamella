@@ -31,6 +31,8 @@ FACTS = {
         "irq": 13,
         "apbc_mask": 0x40,
         "gclk_core_id": 24,
+        "gclk_clkctrl_value": 0x4018,
+        "core_clock_hz": 8000000,
         "pmux_mosi_reg": 0x410044B5,
         "pmux_mosi_shift": 0,
         "pincfg_mosi_reg": 0x410044CA,

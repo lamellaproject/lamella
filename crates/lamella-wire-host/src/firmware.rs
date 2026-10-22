@@ -1,7 +1,7 @@
 //! The host half of the DEVICE / FIRMWARE block (`0x90`-`0x9F`): update the thing that serves this
 //! protocol, over the protocol.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use lamella_wire::{Frame, error, msg};
 
@@ -399,22 +399,19 @@ fn await_reply(
     asked: u8,
     timeout: Duration,
 ) -> Result<Vec<u8>, FirmwareError> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        while let Some(Frame { msg_type, seq: reply_seq, payload }) = transport.poll()? {
-            if reply_seq != seq {
-                continue;
-            }
-            if msg_type == expect {
-                return Ok(payload);
-            }
-            if msg_type == msg::ERROR {
-                return Err(refusal(&payload, asked));
-            }
+    let answered = crate::await_answer(transport, timeout, |_| Ok(()), |_, Frame { msg_type, seq: reply_seq, payload }| {
+        if reply_seq != seq {
+            return Ok(None);
         }
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    Err(FirmwareError::Transport(TransportError::Closed))
+        if msg_type == expect {
+            return Ok(Some(Ok(payload)));
+        }
+        if msg_type == msg::ERROR {
+            return Ok(Some(Err(refusal(&payload, asked))));
+        }
+        Ok(None)
+    })?;
+    answered.unwrap_or(Err(FirmwareError::Transport(TransportError::Closed)))
 }
 
 /// Watches only for a refusal of `asked`, for ops whose success is silence.
@@ -424,25 +421,40 @@ fn await_refusal(
     asked: u8,
     timeout: Duration,
 ) -> Option<FirmwareError> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        match transport.poll() {
-            Ok(Some(Frame { msg_type, seq: reply_seq, payload })) => {
-                if reply_seq == seq && msg_type == msg::ERROR {
-                    return Some(refusal(&payload, asked));
-                }
-            }
-            Ok(None) => std::thread::sleep(Duration::from_millis(2)),
-            Err(inner) => return Some(FirmwareError::Transport(inner)),
-        }
-    }
-    None
+    let refused = crate::await_answer(transport, timeout, |_| Ok(()), |_, Frame { msg_type, seq: reply_seq, payload }| {
+        Ok((reply_seq == seq && msg_type == msg::ERROR).then(|| refusal(&payload, asked)))
+    });
+    refused.unwrap_or_else(|inner| Some(FirmwareError::Transport(inner)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use lamella_wire::MemTransport;
+    use std::time::Instant;
+
+    /// **A WAIT FOR AN ANSWER ENDS AT ITS DEADLINE WHILE THE TARGET GOES ON TALKING**, as every wait
+    /// in the crate does: frames for another request, arriving without pause, do not hold it.
+    #[test]
+    fn a_firmware_question_ends_at_its_deadline_while_the_target_goes_on_talking() {
+        struct Chatty {
+            until: Instant,
+        }
+        impl Transport for Chatty {
+            fn send(&mut self, _: u8, _: u16, _: &[u8]) -> Result<(), TransportError> {
+                Ok(())
+            }
+            fn poll(&mut self) -> Result<Option<Frame>, TransportError> {
+                Ok((Instant::now() < self.until)
+                    .then(|| Frame { msg_type: msg::FW_STATUS_RESULT, seq: 0x7777, payload: Vec::new() }))
+            }
+        }
+        let mut target = Chatty { until: Instant::now() + Duration::from_secs(3) };
+        let started = Instant::now();
+        let answer = fw_status(&mut target, 1, Duration::from_millis(300));
+        assert!(matches!(answer, Err(FirmwareError::Transport(TransportError::Closed))), "got {answer:?}");
+        assert!(started.elapsed() < Duration::from_secs(1), "took {:?}", started.elapsed());
+    }
 
     /// A transport already holding `reply` as though the target had sent it.
     fn answered(msg_type: u8, seq: u16, payload: &[u8]) -> MemTransport {

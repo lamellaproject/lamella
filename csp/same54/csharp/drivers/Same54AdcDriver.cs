@@ -3,7 +3,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Same54AdcDriver : AdcDriver
+internal sealed class Same54AdcDriver : AdcDriver
 {
     const int WaitBound = 100000;
 

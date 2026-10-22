@@ -9,7 +9,7 @@ exclude = ["crates/lamella-wifi-cyw4343x", "crates/lamella-psram-qspi"]
 # Shared package metadata. Member crates inherit these with `field.workspace = true`
 # so versioning and licensing stay in one place.
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.91"
 license = "MIT OR Apache-2.0"

@@ -4,7 +4,7 @@
 //! [`crate::run_program`] runner is a complete target.
 
 use crate::{ArtifactLoad, RunCollector, RunResult, send_program};
-use lamella_wire::{MemTransport, TransportError};
+use lamella_wire::{Frame, MemTransport, Transport, TransportError};
 
 #[cfg(feature = "serial")]
 use crate::{SerialTransport, eval_blocking};
@@ -56,6 +56,8 @@ pub struct LoopbackLink {
     driver: MemTransport,
     runner: MemTransport,
     configure: fn(&mut lamella_cil_runtime::Vm),
+    /// The arguments every program this link runs starts with ([`LoopbackLink::with_program_args`]).
+    program_args: Vec<String>,
 }
 
 impl LoopbackLink {
@@ -68,7 +70,22 @@ impl LoopbackLink {
     /// reading one there panics.
     #[must_use]
     pub fn new(corlib: Vec<u8>, configure: fn(&mut lamella_cil_runtime::Vm)) -> Self {
-        Self { corlib, driver: MemTransport::new(), runner: MemTransport::new(), configure }
+        Self {
+            corlib,
+            driver: MemTransport::new(),
+            runner: MemTransport::new(),
+            configure,
+            program_args: Vec::new(),
+        }
+    }
+
+    /// This link, whose programs start with `args` as their own arguments: what a
+    /// `Main(string[] args)` receives ([`lamella_cil_runtime::Vm::set_program_args`]). Without it a
+    /// program starts with none.
+    #[must_use]
+    pub fn with_program_args(mut self, args: Vec<String>) -> Self {
+        self.program_args = args;
+        self
     }
 }
 
@@ -84,14 +101,49 @@ impl LoopbackLink {
         send_program(&mut self.driver, seq, program)?;
         self.runner.feed(&self.driver.take_sent());
         let mut arena = ArtifactLoad::new();
-        let mut configure = self.configure;
+        let installed = self.configure;
+        let program_args = &self.program_args;
+        let mut configure = |vm: &mut lamella_cil_runtime::Vm| {
+            installed(vm);
+            vm.set_program_args(program_args.clone());
+        };
         while crate::serve_one_with(&mut self.runner, &self.corlib, &mut configure, &mut arena)? {}
         self.driver.feed(&self.runner.take_sent());
-        let mut run = RunCollector::new(seq);
-        if !run.poll(&mut self.driver)? {
+        collect(&mut self.driver, seq)
+    }
+}
+
+/// The run at `seq`, read out of a driver that already holds every frame the runner sent.
+///
+/// A poll folds at most [`RunCollector::FRAMES_PER_POLL`] frames, so a program that printed more
+/// than that is read over several polls, until its stop or until the driver has nothing left.
+fn collect(driver: &mut MemTransport, seq: u16) -> Result<RunCollector, TransportError> {
+    let mut driver = UntilDry { driver, dry: false };
+    let mut run = RunCollector::new(seq);
+    while !run.poll(&mut driver)? {
+        if driver.dry {
             return Err(TransportError::Closed);
         }
-        Ok(run)
+    }
+    Ok(run)
+}
+
+/// A driver that remembers whether its last poll found nothing, which for a loopback is the end of
+/// what the runner sent.
+struct UntilDry<'a> {
+    driver: &'a mut MemTransport,
+    dry: bool,
+}
+
+impl Transport for UntilDry<'_> {
+    fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
+        self.driver.send(msg_type, seq, payload)
+    }
+
+    fn poll(&mut self) -> Result<Option<Frame>, TransportError> {
+        let frame = self.driver.poll()?;
+        self.dry = frame.is_none();
+        Ok(frame)
     }
 }
 
@@ -490,7 +542,8 @@ impl LcscCompiler {
     /// 3. a `corlib.dll` beside the executable, and the libraries beside it;
     /// 4. a `corlib.dll` in the working directory, and the libraries beside it;
     /// 5. `managed/` in the source tree this tool was built from, which is where
-    ///    `build-managed.ps1` and `build-managed.sh` write the class library.
+    ///    `csharp/build-managed.ps1` and `csharp/build-managed.sh` write the class library. A packaged build (the
+    ///    `packaged` feature) has no source tree, and stops at 4.
     ///
     /// `Err` when none of them holds one, naming the build step that writes it. This is the one
     /// search: the `lamella` command, `lamella-repl`, `lamella-mcp` and `lamella-dap` each take their
@@ -541,7 +594,7 @@ impl LcscCompiler {
     /// assemblies of the same names, and the names of the ones it replaced.
     ///
     /// A family's builds sit in `families/<family>/` beside the reference set, where
-    /// `build-managed.ps1` and `build-managed.sh` write them: `System.Device.Gpio` built with the
+    /// `csharp/build-managed.ps1` and `csharp/build-managed.sh` write them: `System.Device.Gpio` built with the
     /// family's bus drivers. Each has the public surface of the shared build it stands in for, so a
     /// program binds to it exactly as to the shared one, and a build for one of the family's boards
     /// compiles, bakes and links against it.
@@ -602,9 +655,17 @@ impl LcscCompiler {
     /// It is the path the compiler was given, so a tree moved after it was built, or a binary
     /// copied out of it, no longer reaches it. That is the same limit as the `libs/` lookup in
     /// [`Self::with_libraries_beside`], and the search then falls through to its refusal.
-    fn source_tree() -> &'static std::path::Path {
+    #[cfg(not(feature = "packaged"))]
+    fn source_tree() -> Option<&'static std::path::Path> {
         let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-        manifest.parent().and_then(std::path::Path::parent).unwrap_or(manifest)
+        Some(manifest.parent().and_then(std::path::Path::parent).unwrap_or(manifest))
+    }
+
+    /// None in a packaged build, which looks only where a package puts the class library and
+    /// carries no path of the machine it was built on.
+    #[cfg(feature = "packaged")]
+    fn source_tree() -> Option<&'static std::path::Path> {
+        None
     }
 
     /// Each `corlib.dll` [`Self::discover`] tries when no variable names one, in the order it tries
@@ -612,7 +673,7 @@ impl LcscCompiler {
     fn implicit_places(test_build: bool) -> Vec<std::path::PathBuf> {
         let tree = Self::source_tree();
         let mut places = Vec::new();
-        if test_build {
+        if test_build && let Some(tree) = tree {
             places.push(
                 ["crates", "lamella-load", "tests", "fixtures", "corlib.dll"]
                     .iter()
@@ -625,7 +686,9 @@ impl LcscCompiler {
             places.push(dir.join("corlib.dll"));
         }
         places.push(std::path::PathBuf::from("corlib.dll"));
-        places.push(tree.join("managed").join("corlib.dll"));
+        if let Some(tree) = tree {
+            places.push(tree.join("managed").join("corlib.dll"));
+        }
         places
     }
 
@@ -652,10 +715,15 @@ impl LcscCompiler {
                 return Ok((Self::with_libraries_beside(place, bytes), Self::folder_of(place)));
             }
         }
-        let tree = Self::source_tree();
+        let Some(tree) = Self::source_tree() else {
+            return Err("no class library to compile against: set LAMELLA_REF_DIR to a folder \
+                        holding corlib.dll and the libraries, which a project built with the Lamella \
+                        SDK names for you"
+                .to_owned());
+        };
         Err(format!(
-            "no class library to compile against: build it with `pwsh -File build-managed.ps1` \
-             (Windows) or `./build-managed.sh` (Linux, macOS) in {}, which writes it to {}; or set \
+            "no class library to compile against: build it with `pwsh -File csharp/build-managed.ps1` \
+             (Windows) or `./csharp/build-managed.sh` (Linux, macOS) in {}, which writes it to {}; or set \
              LAMELLA_REF_DIR to a folder holding corlib.dll and the libraries",
             tree.display(),
             tree.join("managed").display()
@@ -724,8 +792,8 @@ impl LcscCompiler {
         let Some(dir) = corlib.parent() else {
             return references;
         };
-        let libs = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../libs");
-        let mut names: Vec<std::ffi::OsString> = if let Ok(entries) = std::fs::read_dir(&libs) {
+        let libs = Self::source_tree().map(|tree| tree.join("libs"));
+        let mut names: Vec<std::ffi::OsString> = if let Some(Ok(entries)) = libs.map(std::fs::read_dir) {
             entries
                 .flatten()
                 .filter(|entry| entry.path().is_dir())
@@ -1200,6 +1268,52 @@ mod tests {
         assert_eq!(result.stdout, "hi\n");
     }
 
+    /// A driver holding what `frames` sent, as the loopback's driver holds what its runner sent.
+    fn received(frames: impl FnOnce(&mut MemTransport)) -> MemTransport {
+        let mut target = MemTransport::new();
+        frames(&mut target);
+        let mut driver = MemTransport::new();
+        driver.feed(&target.take_sent());
+        driver
+    }
+
+    /// `count` lines on standard output, one frame each, numbered from 0.
+    fn print_lines(target: &mut MemTransport, count: usize) {
+        for line in 0..count {
+            let mut payload = vec![crate::debug::output::STDOUT, 0];
+            payload.extend_from_slice(format!("{line}\n").as_bytes());
+            target.send(crate::debug::EVT_OUTPUT, 0, &payload).unwrap();
+        }
+    }
+
+    /// **A LOOPBACK RUN THAT PRINTS MORE THAN ONE POLL TAKES IS READ TO ITS STOP.** The link polled
+    /// once, which read everything only while a poll read until the carrier fell silent: one bounded
+    /// poll stops short of the stop, and the run read as a closed link.
+    #[test]
+    fn a_loopback_run_that_prints_more_than_one_poll_takes_is_read_to_its_stop() {
+        let lines = RunCollector::FRAMES_PER_POLL * 2 + 1;
+        let mut driver = received(|target| {
+            print_lines(target, lines);
+            let mut stop = vec![crate::debug::reason::DONE];
+            stop.extend_from_slice(&[0; 8]);
+            stop.extend_from_slice(&5i32.to_le_bytes());
+            stop.push(0);
+            target.send(crate::debug::EVT_STOPPED, 3, &stop).unwrap();
+        });
+        let run = collect(&mut driver, 3).expect("the stop is behind the output");
+        let every_line: String = (0..lines).map(|line| format!("{line}\n")).collect();
+        assert_eq!(run.stdout, every_line, "every line, in order");
+        assert_eq!(run.exit_value(), Some(5));
+    }
+
+    /// A loopback run the runner left without a stop is a closed link once its output is read,
+    /// however much of it there was.
+    #[test]
+    fn a_loopback_run_left_without_a_stop_is_a_closed_link_once_its_output_is_read() {
+        let mut driver = received(|target| print_lines(target, RunCollector::FRAMES_PER_POLL * 2));
+        assert!(matches!(collect(&mut driver, 3), Err(TransportError::Closed)));
+    }
+
     #[test]
     fn a_loopback_link_runs_every_program_through_the_hook_its_embedder_gave_it() {
         let (Some(program), Some(corlib)) = (datetime_now(), corlib()) else {
@@ -1336,11 +1450,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// **THE CLASS LIBRARY `build-managed.ps1` WRITES IS FOUND WITH NOTHING SET**, so a clone that
+    /// **THE CLASS LIBRARY `csharp/build-managed.ps1` WRITES IS FOUND WITH NOTHING SET**, so a clone that
     /// has followed the README's two build steps runs a program with no variable to set.
     #[test]
     fn a_build_for_use_ends_its_search_at_the_class_library_of_its_own_source_tree() {
-        let tree = LcscCompiler::source_tree();
+        let tree = LcscCompiler::source_tree().expect("a test build is a build from a source tree");
         assert!(
             tree.join("crates").join("lamella-wire-host").join("Cargo.toml").exists(),
             "the source tree is the folder holding crates/: {}",
@@ -1355,7 +1469,11 @@ mod tests {
     /// while the tool says nothing.
     #[test]
     fn a_build_for_use_never_looks_at_the_test_corlib() {
-        let tests = LcscCompiler::source_tree().join("crates").join("lamella-load").join("tests");
+        let tests = LcscCompiler::source_tree()
+            .expect("a test build is a build from a source tree")
+            .join("crates")
+            .join("lamella-load")
+            .join("tests");
         for place in LcscCompiler::implicit_places(false) {
             assert!(!place.starts_with(&tests), "{} is the test corlib", place.display());
         }
@@ -1367,7 +1485,10 @@ mod tests {
     fn a_test_build_looks_at_the_test_corlib_before_any_other_place() {
         let fixture = ["crates", "lamella-load", "tests", "fixtures", "corlib.dll"]
             .iter()
-            .fold(LcscCompiler::source_tree().to_path_buf(), |path, part| path.join(part));
+            .fold(
+                LcscCompiler::source_tree().expect("a test build is a build from a source tree").to_path_buf(),
+                |path, part| path.join(part),
+            );
         let places = LcscCompiler::implicit_places(true);
         assert_eq!(places.first(), Some(&fixture));
         assert_eq!(&places[1..], &LcscCompiler::implicit_places(false)[..], "and then the same places");
@@ -1465,13 +1586,13 @@ mod tests {
 
     /// **WITH NOTHING FOUND, THE REFUSAL NAMES THE BUILD STEP THAT WRITES THE CLASS LIBRARY**, and
     /// where it writes it. A bare `lcsc` line cannot build it: the corlib needs the capability
-    /// symbols `build-managed.ps1` passes.
+    /// symbols `csharp/build-managed.ps1` passes.
     #[test]
     fn with_nothing_found_the_refusal_names_the_build_step_and_where_it_writes() {
         let error = LcscCompiler::search(None, None, &[]).expect_err("there is nothing to find");
-        let managed = LcscCompiler::source_tree().join("managed");
-        assert!(error.contains("pwsh -File build-managed.ps1"), "{error}");
-        assert!(error.contains("./build-managed.sh"), "{error}");
+        let managed = LcscCompiler::source_tree().expect("a test build is a build from a source tree").join("managed");
+        assert!(error.contains("pwsh -File csharp/build-managed.ps1"), "{error}");
+        assert!(error.contains("./csharp/build-managed.sh"), "{error}");
         assert!(error.contains(&managed.display().to_string()), "where it writes: {error}");
         assert!(error.contains("LAMELLA_REF_DIR"), "and the variable that names another: {error}");
         assert!(!error.contains("lcsc"), "{error}");

@@ -8,6 +8,7 @@ BOARD_VENDOR = "Adafruit"
 # Role handles: the ONLY peripheral names an app sees. The value of a
 # role handle is its role-id string; the runtime resolves role -> facts through FACTS
 # below, never through a surface-private enum.
+HEADER_I2C = "header-i2c"
 
 CARRIER = {
     "kind": "native-usb",
@@ -22,6 +23,20 @@ CARRIER = {
 # it, as <chip family>-<block>. One SERCOM block serves uart, spi and i2c, so the block does not
 # name a driver; a uart is a different register map on every family, so the kind does not either.
 FACTS = {
+    "header-i2c": {
+        "kind": "i2c",
+        "driver_family": "samd21-sercom",
+        "instance": "sercom3",
+        "sercom_base": 0x42001400,
+        "irq": 12,
+        "gclk_clkctrl_value": 0x4017,
+        "apbc_mask": 0x20,
+        "pmux_reg": 0x4100443B,
+        "pmux_pair": 0x22,
+        "pincfg_sda_reg": 0x41004456,
+        "pincfg_scl_reg": 0x41004457,
+        "core_clock_hz": 8000000,
+    },
 }
 
 # The chip's instance map: every block this family places, with its base address and

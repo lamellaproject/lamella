@@ -161,10 +161,50 @@ pub fn fit(board: &BoardTable, part: &PartRow, image_bytes: i64) -> FitVerdict {
     }
 }
 
+/// Whether a half of an image the board keeps in its external flash fits there: `image_bytes`
+/// against the board's flash region that a controller brings up, or `None` when the board states
+/// no such region.
+///
+/// **THE OTHER HALF OF A TWO-REGION IMAGE, JUDGED SEPARATELY.** [`fit`] judges the part of an
+/// image the part boots from, against the flash the part maps at reset; a region behind a
+/// controller is never that budget. A program laid out across both is two questions, and a single
+/// total would answer neither.
+#[must_use]
+pub fn fit_external(board: &BoardTable, image_bytes: i64) -> Option<(Budget, Fit)> {
+    let region = board
+        .memory
+        .iter()
+        .find(|region| region.kind == "flash" && !region.controller.is_empty())?;
+    let budget = Budget {
+        bytes: region.size,
+        source: BudgetSource::Board { region: region.name.clone() },
+    };
+    let verdict = Fit::of(
+        image_bytes,
+        budget.bytes,
+        &format!("board '{}' region '{}' states no size", board.board, region.name),
+    );
+    Some((budget, verdict))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::strata::MemoryRegion;
+
+    /// The external half is judged against the region behind the controller, and a board with
+    /// no such region has no answer rather than a zero.
+    #[test]
+    fn an_external_half_is_judged_against_the_controllers_region() {
+        let mut qspi = region("qspi", "flash", 0x0400_0000);
+        qspi.controller = String::from("quadspi");
+        let board = board_with(vec![qspi]);
+        let (budget, verdict) = fit_external(&board, 0x0058_0000).expect("a region");
+        assert_eq!(budget.source, BudgetSource::Board { region: String::from("qspi") });
+        assert_eq!(verdict, Fit::Fits { headroom: 0x0400_0000 - 0x0058_0000 });
+        assert_eq!(fit_external(&board, 0x0400_0001).map(|(_, verdict)| verdict), Some(Fit::Exceeds { over: 1 }));
+        assert!(fit_external(&board_with(vec![region("flash", "flash", 0x0020_0000)]), 1).is_none());
+    }
 
     fn region(name: &str, kind: &str, size: i64) -> MemoryRegion {
         MemoryRegion {

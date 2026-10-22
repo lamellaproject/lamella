@@ -2954,7 +2954,7 @@ fn emit_literal(
                 TypeSymbol::Special(SpecialType::Single) => {
                     out.push(Instruction::new(
                         Opcode::LdcR4,
-                        Operand::Float32(value as f32),
+                        Operand::Float32(lamella_binder::single_constant(*bits)),
                     ));
                 }
                 TypeSymbol::Special(SpecialType::Double) => {

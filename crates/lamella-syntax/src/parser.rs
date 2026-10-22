@@ -19,6 +19,7 @@ use crate::ast::{
     TypeNamePart, TypeParameterConstraintClause, TypeRef, TypeRefKind,
     TypeTestOperation,
     UnaryOperator, UsingDirective, UsingKind, UsingResource, VariableDeclarator,
+    TOP_LEVEL_ASYNC_ENTRY_POINT, TOP_LEVEL_ENTRY_POINT, TOP_LEVEL_PROGRAM,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
 use crate::lexer::{LexOptions, Tokenized, tokenize, tokenize_with};
@@ -275,6 +276,30 @@ struct Parser {
     in_unsafe_block: bool,
     /// The ranges of the `unsafe` blocks parsed so far, for the unit's `unsafe_blocks`.
     unsafe_blocks: Vec<Span>,
+    /// What the compilation unit's TOP-LEVEL STATEMENTS have shown so far, while they are being
+    /// parsed; `None` everywhere else. See [`TopLevelFacts`].
+    top_level: Option<TopLevelFacts>,
+}
+
+/// The two facts about a compilation unit's top-level statements that decide the signature of the
+/// entry point they become (C# 9): whether they `await`, and whether they `return` a value.
+///
+/// | awaits | returns a value | entry point                                  |
+/// |--------|-----------------|----------------------------------------------|
+/// | no     | no              | `static void <Main>$(string[] args)`         |
+/// | no     | yes             | `static int <Main>$(string[] args)`          |
+/// | yes    | no              | `static async Task <Main>$(string[] args)`   |
+/// | yes    | yes             | `static async Task<int> <Main>$(string[] args)` |
+///
+/// **ONLY THE STATEMENTS THEMSELVES COUNT, NEVER A FUNCTION WRITTEN AMONG THEM.** A lambda's
+/// `return 1;` returns from the lambda and its `await` belongs to the lambda, so neither changes
+/// the entry point; [`Parser::finish_lambda`] sets these aside while it parses a body.
+#[derive(Debug, Clone, Copy, Default)]
+struct TopLevelFacts {
+    /// An `await` expression appears in the statements.
+    awaits: bool,
+    /// A `return` statement with a value appears in the statements.
+    returns_value: bool,
 }
 
 /// Which token, after the closing bracket, settles a bracketed list as a deconstruction: `=` in
@@ -320,6 +345,7 @@ impl Parser {
             in_ref_returning_member: false,
             in_unsafe_block: false,
             unsafe_blocks: Vec::new(),
+            top_level: None,
         }
     }
 
@@ -630,7 +656,7 @@ impl Parser {
             && !matches!(self.current().kind, TokenKind::EndOfFile)
         {
             if self.using_declaration_here() {
-                statements.push(self.parse_using_declaration());
+                statements.push(self.parse_using_declaration(Self::parse_block_statements));
                 break;
             }
             let before = self.position;
@@ -666,14 +692,17 @@ impl Parser {
     ///
     /// So nothing after the parser learns a new shape, exactly as an expression body works.
     ///
-    fn parse_using_declaration(&mut self) -> Stmt {
+    ///
+    /// `rest` reads the statements the declaration's scope covers: the rest of the block, or the
+    /// rest of the top-level statements when it is one of those.
+    fn parse_using_declaration(&mut self, rest: fn(&mut Parser) -> Vec<Stmt>) -> Stmt {
         let start = self.current().span.start;
         self.bump();
         self.gate_feature(Feature::UsingDeclaration, Span::empty_at(start));
         let resource = self.parse_using_resource();
         self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
         let body_start = self.current().span.start;
-        let statements = self.parse_block_statements();
+        let statements = rest(self);
         let body_end = statements.last().map_or(body_start, |last| last.span.end);
         let body = Stmt::new(
             StmtKind::Block(statements),
@@ -683,6 +712,7 @@ impl Parser {
             StmtKind::Using {
                 resource,
                 body: Box::new(body),
+                declaration: true,
             },
             Span::new(start, body_end),
         )
@@ -712,6 +742,11 @@ impl Parser {
         } else {
             Some(self.parse_expression())
         };
+        if value.is_some() {
+            if let Some(facts) = self.top_level.as_mut() {
+                facts.returns_value = true;
+            }
+        }
         let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
         Stmt::new(StmtKind::Return(value), Span::new(start, end))
     }
@@ -846,6 +881,7 @@ impl Parser {
             self.skip_balanced(Punctuator::OpenParen, Punctuator::CloseParen);
         }
         let _ = self.parse_type_parameter_constraint_clauses();
+        let enclosing_top_level = self.top_level.take();
         let end = match self.current_punctuator() {
             Some(Punctuator::OpenBrace) => {
                 self.skip_balanced(Punctuator::OpenBrace, Punctuator::CloseBrace)
@@ -857,6 +893,7 @@ impl Parser {
             }
             _ => self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected),
         };
+        self.top_level = enclosing_top_level;
         Some(Stmt::new(StmtKind::Empty, Span::new(start, end)))
     }
 
@@ -1588,6 +1625,7 @@ impl Parser {
                 StmtKind::Using {
                     resource,
                     body: Box::new(body),
+                    declaration: true,
                 },
                 Span::new(start, end),
             );
@@ -1601,7 +1639,14 @@ impl Parser {
         self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
         let body = Box::new(self.parse_statement());
         let end = body.span.end;
-        Stmt::new(StmtKind::Using { resource, body }, Span::new(start, end))
+        Stmt::new(
+            StmtKind::Using {
+                resource,
+                body,
+                declaration: false,
+            },
+            Span::new(start, end),
+        )
     }
 
     /// Parses a `using` resource (15.13): a local declaration or an expression,
@@ -1835,29 +1880,53 @@ impl Parser {
         Stmt::new(StmtKind::Goto(target), Span::new(start, end))
     }
 
-    /// Parses a whole compilation unit (16.1): using directives then top-level
-    /// namespace and type declarations, to end of file.
+    /// Parses a whole compilation unit (16.1): using directives, global attributes, the top-level
+    /// statements (C# 9), then namespace and type declarations, to end of file.
+    ///
+    /// **THE TOP-LEVEL STATEMENTS ARE A PROGRAM, AND THEY LEAVE THIS FUNCTION AS ONE.** They become
+    /// the body of a method of `partial class Program` (see [`top_level_program`]), which is placed
+    /// first among the unit's members because the statements precede every declaration -- so the
+    /// binder, the flow analysis and the emitter see a class they already handle.
     fn parse_compilation_unit(&mut self) -> CompilationUnit {
         let start = self.current().span.start;
-        let usings = self.parse_using_directives();
+        let mut usings = Vec::new();
+        while self.current_keyword() == Some(Keyword::Using) && !self.using_statement_here() {
+            usings.push(self.parse_using_directive());
+        }
         let mut members = Vec::new();
         let mut global_attributes = Vec::new();
+        let mut statements = Vec::new();
+        let mut facts = TopLevelFacts::default();
         let mut top_level_gated = false;
         let mut top_level_misplaced = false;
         while !matches!(self.current().kind, TokenKind::EndOfFile) {
             let before = self.position;
             if self.top_level_statement_here() {
                 let at = Span::empty_at(self.current().span.start);
-                if !members.is_empty() {
+                if members.is_empty() {
+                    if !top_level_gated {
+                        self.gate_feature(Feature::TopLevelStatements, at);
+                        top_level_gated = true;
+                    }
+                    let run = self.parse_top_level_statements(&mut facts);
+                    statements.extend(run);
+                } else {
                     if !top_level_misplaced {
                         self.report(DiagnosticKind::TopLevelStatementsMustPrecedeMembers, at);
                         top_level_misplaced = true;
                     }
-                } else if !top_level_gated {
-                    self.gate_feature(Feature::TopLevelStatements, at);
-                    top_level_gated = true;
+                    let was_async = core::mem::replace(&mut self.in_async_method, true);
+                    let _ = self.parse_statement();
+                    self.in_async_method = was_async;
                 }
-                let _ = self.parse_statement();
+                if self.position == before {
+                    self.bump();
+                }
+                continue;
+            }
+            if self.current_keyword() == Some(Keyword::Using) {
+                self.report(DiagnosticKind::UsingMustPrecedeMembers, self.current().span);
+                let _ = self.parse_using_directive();
                 if self.position == before {
                     self.bump();
                 }
@@ -1866,7 +1935,7 @@ impl Parser {
             if self.current_punctuator() == Some(Punctuator::OpenBracket)
                 && self.is_global_attribute_target()
             {
-                if !members.is_empty() {
+                if !members.is_empty() || !statements.is_empty() {
                     let target = self.tokens.get(self.position + 1).map(|token| token.span);
                     let span = target.unwrap_or_else(|| self.current().span);
                     self.report(DiagnosticKind::GlobalAttributeMustPrecedeMembers, span);
@@ -1875,11 +1944,14 @@ impl Parser {
                 continue;
             }
             members.push(self.parse_namespace_member(NamespaceContainer::CompilationUnit {
-                members_precede: !members.is_empty(),
+                members_precede: !members.is_empty() || !statements.is_empty(),
             }));
             if self.position == before {
                 self.bump();
             }
+        }
+        if !statements.is_empty() {
+            members.insert(0, NamespaceMember::Type(top_level_program(statements, facts)));
         }
         let end = self.current().span.start;
         CompilationUnit {
@@ -1893,22 +1965,89 @@ impl Parser {
         }
     }
 
+    /// Parses a run of top-level statements, to the first token that does not begin one, adding
+    /// what they show to `facts`.
+    ///
+    /// The statements are parsed as an async method's body is: `await` is reserved in them (csc
+    /// answers `CS4003` for a local named `await` among top-level statements, and `await e` is
+    /// the operator whether or not the program awaits anywhere else).
+    fn parse_top_level_statements(&mut self, facts: &mut TopLevelFacts) -> Vec<Stmt> {
+        let was_async = core::mem::replace(&mut self.in_async_method, true);
+        self.top_level = Some(*facts);
+        let statements = self.parse_top_level_statement_list();
+        *facts = self.top_level.take().unwrap_or_default();
+        self.in_async_method = was_async;
+        statements
+    }
+
+    /// The statements of a run of top-level statements. A USING DECLARATION takes the rest of the
+    /// run as its body, as one in a block takes the rest of the block (see
+    /// [`Parser::parse_block_statements`]).
+    fn parse_top_level_statement_list(&mut self) -> Vec<Stmt> {
+        let mut statements = Vec::new();
+        while self.top_level_statement_here() {
+            if self.current_keyword() == Some(Keyword::Using) && self.using_declaration_here() {
+                statements.push(self.parse_using_declaration(Self::parse_top_level_statement_list));
+                break;
+            }
+            let before = self.position;
+            statements.push(self.parse_statement());
+            if self.position == before {
+                self.bump();
+            }
+        }
+        statements
+    }
+
+    /// Whether the `using` at the current position begins a STATEMENT rather than a directive: a
+    /// `using (resource)` statement, or a using declaration (`using var r = ...;`, `using T r =
+    /// ...;`).
+    ///
+    /// A directive names a namespace or a type and then ends, or names an alias and then `=`; a
+    /// declaration names a TYPE and then the variable it declares. So a type followed by an
+    /// identifier is the declaration, and anything else is left to the directive's own parse and
+    /// its own diagnostics.
+    fn using_statement_here(&mut self) -> bool {
+        if self.current_keyword() != Some(Keyword::Using) {
+            return false;
+        }
+        if self.next_is(Punctuator::OpenParen) {
+            return true;
+        }
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
+        self.bump();
+        let declares = self.current_keyword() != Some(Keyword::Static)
+            && !matches!(self.parse_type().kind, TypeRefKind::Error)
+            && matches!(self.current().kind, TokenKind::Identifier(_));
+        self.position = saved_position;
+        self.diagnostics.truncate(saved_diagnostics);
+        declares
+    }
+
     /// Whether a TOP-LEVEL STATEMENT begins here, in a compilation unit's member list.
     ///
     /// **CONSERVATIVE BY CONSTRUCTION: A TOKEN THAT CAN BEGIN A DECLARATION IS NEVER TAKEN.** A
     /// declaration -- a namespace, attributes, a type behind its modifiers, a record -- keeps its
     /// own path and its own diagnostics, and so does anything led by an access or type modifier,
     /// which cannot begin a statement. What remains is a name, a statement keyword, a predefined
-    /// type (a local declaration or a local function), or a bracket or operator that begins an
-    /// expression statement.
+    /// type (a local declaration or a local function), a literal, or a bracket or operator that
+    /// begins an expression statement.
     fn top_level_statement_here(&mut self) -> bool {
         if self.at_namespace_member() || self.record_declaration_here() {
             return false;
         }
         match &self.current().kind {
-            TokenKind::Identifier(_) => !matches!(
-                self.current_contextual_keyword(),
-                Some("global" | "partial" | "file" | "record")
+            TokenKind::Identifier(_) => match self.current_contextual_keyword() {
+                Some("global") => self.next_is(Punctuator::ColonColon),
+                Some("partial" | "file" | "record") => false,
+                _ => true,
+            },
+            TokenKind::Keyword(Keyword::Using) => self.using_statement_here(),
+            TokenKind::Keyword(Keyword::Unsafe) => true,
+            TokenKind::Keyword(Keyword::Extern) => !matches!(
+                self.tokens.get(self.position + 1).map(|token| &token.kind),
+                Some(TokenKind::Identifier(name)) if &**name == "alias"
             ),
             TokenKind::Keyword(keyword) => {
                 predefined_type(&self.current().kind).is_some()
@@ -1924,6 +2063,7 @@ impl Parser {
                             | Keyword::Return
                             | Keyword::Throw
                             | Keyword::Lock
+                            | Keyword::Fixed
                             | Keyword::Goto
                             | Keyword::Break
                             | Keyword::Continue
@@ -1932,13 +2072,34 @@ impl Parser {
                             | Keyword::Const
                             | Keyword::Static
                             | Keyword::New
+                            | Keyword::This
+                            | Keyword::Base
+                            | Keyword::Typeof
+                            | Keyword::Sizeof
+                            | Keyword::Default
+                            | Keyword::True
+                            | Keyword::False
+                            | Keyword::Null
                     )
             }
+            TokenKind::IntegerLiteral { .. }
+            | TokenKind::RealLiteral { .. }
+            | TokenKind::DecimalLiteral { .. }
+            | TokenKind::CharacterLiteral(_)
+            | TokenKind::StringLiteral(_)
+            | TokenKind::InterpolatedString(_) => true,
             TokenKind::Punctuator(
                 Punctuator::OpenBrace
                 | Punctuator::OpenParen
+                | Punctuator::Semicolon
                 | Punctuator::PlusPlus
-                | Punctuator::MinusMinus,
+                | Punctuator::MinusMinus
+                | Punctuator::Plus
+                | Punctuator::Minus
+                | Punctuator::Exclamation
+                | Punctuator::Tilde
+                | Punctuator::Asterisk
+                | Punctuator::Ampersand,
             ) => true,
             _ => false,
         }
@@ -2577,6 +2738,7 @@ impl Parser {
                 keyword_form,
                 keyword_span,
             }),
+            from_top_level_statements: false,
             span: Span::new(start, end),
         }
     }
@@ -4028,11 +4190,13 @@ impl Parser {
             Punctuator::EqualsGreaterThan,
             DiagnosticKind::TokenExpected { expected: "=>" },
         );
+        let enclosing_top_level = self.top_level.take();
         let body = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
             LambdaBody::Block(self.parse_block())
         } else {
             LambdaBody::Expression(self.parse_expression())
         };
+        self.top_level = enclosing_top_level;
         let end = match &body {
             LambdaBody::Expression(expr) => expr.span.end,
             LambdaBody::Block(block) => block.span.end,
@@ -4508,6 +4672,9 @@ impl Parser {
             if self.in_async_method && self.in_unsafe_block {
                 self.report(DiagnosticKind::AwaitInUnsafe, await_span);
             }
+            if let Some(facts) = self.top_level.as_mut() {
+                facts.awaits = true;
+            }
             let operand = self.parse_unary();
             let span = Span::new(await_span.start, operand.span.end);
             return Expr::new(ExprKind::Await(Box::new(operand)), span);
@@ -4849,8 +5016,10 @@ impl Parser {
             in_ref_returning_member: self.in_ref_returning_member,
             in_unsafe_block: self.in_unsafe_block,
             unsafe_blocks: Vec::new(),
+            top_level: self.top_level,
         };
         let expression = inner.parse_expression();
+        self.top_level = inner.top_level;
         if !matches!(inner.current().kind, TokenKind::EndOfFile) {
             let at = inner.current().span;
             inner.diagnostics.push(Diagnostic::new(
@@ -6781,6 +6950,121 @@ fn record_state_members(parameters: &[Parameter], members: &[Member]) -> Vec<Rec
     state
 }
 
+/// The class a compilation unit's TOP-LEVEL STATEMENTS declare (C# 9), as ORDINARY SYNTAX:
+///
+/// ```text
+/// partial class Program
+/// {
+///     private static <form> <Main>$(string[] args) { <the statements> }
+///
+///     // only when the statements await:
+///     private static <void or int> <Main>(string[] args)
+///         { [return] <Main>$(args).GetAwaiter().GetResult(); }
+/// }
+/// ```
+///
+/// where `<form>` is `void`, `int`, `Task` or `Task<int>` by whether the statements `await` and
+/// whether they `return` a value (see [`TopLevelFacts`]).
+///
+/// **A DESUGAR, FOR THE REASON A RECORD IS ONE** (see [`synthesize_record_members`]): the binder,
+/// the flow analysis and the emitter see a partial class, a static method and its parameter, all
+/// of which they already handle, and a `Program` the source declares merges with this one as any
+/// two parts of a partial class do. The names no source can spell, `<Main>$` and `<Main>`, are
+/// ordinary identifiers in the tree.
+///
+/// **THE SECOND METHOD IS THE ENTRY POINT WHEN THERE IS ONE.** An entry point returns `void` or
+/// `int` (ECMA-334 7.1), so an awaiting program runs through a synchronous method that waits for
+/// the task its statements return -- the shape the standard gives an asynchronous `Main`, and the
+/// shape csc writes, measured: `<Main>` calls `<Main>$`, then `GetAwaiter().GetResult()`.
+///
+/// Every span is the statements' own: a diagnostic about the entry point or about `Program`
+/// itself is reported where the first statement begins, as csc's are.
+fn top_level_program(statements: Vec<Stmt>, facts: TopLevelFacts) -> TypeDecl {
+    let first = statements.first().map_or(0, |statement| statement.span.start);
+    let last = statements.last().map_or(first, |statement| statement.span.end);
+    let span = Span::new(first, last);
+    let at = Span::empty_at(first);
+    let arguments = || TypeRef {
+        kind: TypeRefKind::Array {
+            element: Box::new(synth_predefined(PredefinedType::String, at)),
+            rank: 1,
+        },
+        span: at,
+        verbatim_name: false,
+    };
+    let int = || synth_predefined(PredefinedType::Int, at);
+    let void = || synth_predefined(PredefinedType::Void, at);
+    let tasks = ["System", "Threading", "Tasks"];
+    let entry_return = match (facts.awaits, facts.returns_value) {
+        (false, false) => void(),
+        (false, true) => int(),
+        (true, false) => synth_type(&["System", "Threading", "Tasks", "Task"], at),
+        (true, true) => synth_generic(&tasks, "Task", int(), at),
+    };
+    let mut entry_modifiers = alloc::vec![Modifier::Private, Modifier::Static];
+    if facts.awaits {
+        entry_modifiers.push(Modifier::Async);
+    }
+    let method = |modifiers, return_type, name: &str, body: Stmt, span| Member::Method {
+        modifiers,
+        return_type,
+        name: Box::from(name),
+        name_span: at,
+        type_parameters: Vec::new(),
+        constraints: Vec::new(),
+        parameters: alloc::vec![synth_parameter(arguments(), "args", at)],
+        is_vararg: false,
+        body: Some(body),
+        explicit_interface: None,
+        attributes: Vec::new(),
+        span,
+    };
+    let mut members = alloc::vec![method(
+        entry_modifiers,
+        entry_return,
+        TOP_LEVEL_ENTRY_POINT,
+        synth_block(statements, span),
+        span,
+    )];
+    if facts.awaits {
+        let task = synth_call(
+            Expr::name(Box::from(TOP_LEVEL_ENTRY_POINT), at),
+            alloc::vec![Expr::name(Box::from("args"), at)],
+            at,
+        );
+        let awaiter = synth_call(synth_member(task, "GetAwaiter", at), Vec::new(), at);
+        let result = synth_call(synth_member(awaiter, "GetResult", at), Vec::new(), at);
+        let (return_type, body) = if facts.returns_value {
+            (int(), synth_return_body(result, at))
+        } else {
+            (
+                void(),
+                synth_block(alloc::vec![Stmt::new(StmtKind::Expression(result), at)], at),
+            )
+        };
+        members.push(method(
+            alloc::vec![Modifier::Private, Modifier::Static],
+            return_type,
+            TOP_LEVEL_ASYNC_ENTRY_POINT,
+            body,
+            at,
+        ));
+    }
+    TypeDecl {
+        attributes: Vec::new(),
+        modifiers: alloc::vec![Modifier::Partial],
+        kind: TypeKind::Class,
+        name: Box::from(TOP_LEVEL_PROGRAM),
+        type_parameters: Vec::new(),
+        bases: Vec::new(),
+        constraints: Vec::new(),
+        members,
+        record: None,
+        from_top_level_statements: true,
+        span,
+    }
+}
+
 /// Adds the members a `record` declaration generates, as ORDINARY SYNTAX.
 ///
 /// **A DESUGAR, FOR THE REASON `=>` IS ONE.** Every member csc synthesizes for a record is
@@ -8225,7 +8509,7 @@ mod tests {
                 dump(init),
                 dump_stmt(body)
             ),
-            StmtKind::Using { resource, body } => {
+            StmtKind::Using { resource, body, .. } => {
                 let res = match resource {
                     UsingResource::Declaration { ty, declarators } => {
                         let mut text = format!("(local {}", dump_type(ty));
@@ -11402,11 +11686,6 @@ mod tests {
                 "iterators",
             ),
             (
-                "System.Console.WriteLine(1);\nSystem.Console.WriteLine(2);\nclass C { }",
-                "System",
-                "top-level statements",
-            ),
-            (
                 "record R(int X); class P { void M(R r) { var s = r with { X = 2 }; } }",
                 "with",
                 "with expression",
@@ -11519,6 +11798,151 @@ mod tests {
                 "{source:?} at {version:?} is refused by the rung, not by the build: {diagnostics:?}"
             );
         }
+    }
+
+    /// TOP-LEVEL STATEMENTS ARE THE BODY OF A METHOD OF `partial class Program` (C# 9), and the
+    /// class is placed first among the unit's members, where the statements are. The method's
+    /// signature follows from what the statements do -- csc's four forms, one program each.
+    #[test]
+    fn top_level_statements_are_the_body_of_program_s_entry_point() {
+        let tree = |source: &str| unit_tree_at(source, LanguageVersion::CSharp11);
+        let print = "(expr (call (. (. System Console) WriteLine) 1))";
+        assert_eq!(
+            tree("System.Console.WriteLine(1);\nclass C { }"),
+            format!(
+                "(class partial Program (method private static void <Main>$ (string[] args) \
+                 (block {print}))) (class C)"
+            )
+        );
+        assert_eq!(
+            tree("System.Console.WriteLine(1);\nreturn 2;"),
+            format!(
+                "(class partial Program (method private static int <Main>$ (string[] args) \
+                 (block {print} (return 2))))"
+            )
+        );
+        let result = "(call (. (call (. (call <Main>$ args) GetAwaiter)) GetResult))";
+        assert_eq!(
+            tree("await T();"),
+            format!(
+                "(class partial Program (method private static async System.Threading.Tasks.Task \
+                 <Main>$ (string[] args) (block (expr (await (call T))))) (method private static \
+                 void <Main> (string[] args) (block (expr {result}))))"
+            )
+        );
+        assert_eq!(
+            tree("await T();\nreturn 3;"),
+            format!(
+                "(class partial Program (method private static async \
+                 System.Threading.Tasks.Task<int> <Main>$ (string[] args) (block (expr (await \
+                 (call T))) (return 3))) (method private static int <Main> (string[] args) \
+                 (block (return {result}))))"
+            )
+        );
+    }
+
+    /// A lambda's `return` and `await` are its own, so they choose nothing about the entry point
+    /// -- in csc a `return 1;` inside one leaves the program `void`, and an `await` inside an async
+    /// lambda leaves it synchronous (both measured). So does an expression-bodied lambda's value.
+    #[test]
+    fn a_lambda_among_top_level_statements_does_not_choose_the_entry_point() {
+        let tree = unit_tree_at(
+            "System.Func<int> f = () => { return 1; };\nSystem.Func<int> g = () => 2;",
+            LanguageVersion::CSharp11,
+        );
+        assert!(
+            tree.starts_with("(class partial Program (method private static void <Main>$ "),
+            "{tree}"
+        );
+        let hole = unit_tree_at("System.Console.WriteLine($\"{await T()}\");", LanguageVersion::CSharp11);
+        assert!(hole.contains("async System.Threading.Tasks.Task <Main>$"), "{hole}");
+    }
+
+    /// `await` is reserved among top-level statements, as in an async method's body: a local named
+    /// `await` is CS4003 whether or not the program awaits anywhere (measured).
+    #[test]
+    fn await_is_reserved_among_top_level_statements() {
+        let diagnostics = unit_diagnostics_at("int await = 1;", LanguageVersion::CSharp11);
+        assert!(
+            diagnostics.iter().any(|(code, offset, _)| code == "CS4003" && *offset == 4),
+            "{diagnostics:?}"
+        );
+    }
+
+    /// A `using` at the head of a file is a STATEMENT when it acquires a resource -- `using (r)` or
+    /// a using declaration -- and a directive otherwise; a declaration's scope is then the rest of
+    /// the statements (measured: `using var s = ...;` and `using T s = ...;` both compile as the
+    /// first statement, after a `using System;` or with none).
+    #[test]
+    fn a_using_statement_begins_the_top_level_statements() {
+        let declaration = unit_tree_at(
+            "using System;\nusing var s = M();\nConsole.WriteLine(s);\nclass C { }",
+            LanguageVersion::CSharp11,
+        );
+        assert!(declaration.starts_with("(using System) (class partial Program "), "{declaration}");
+        assert!(
+            declaration.contains(
+                "(using (local var s=(call M)) (block (expr (call (. Console WriteLine) s))))"
+            ),
+            "{declaration}"
+        );
+        let typed = unit_tree_at("using System.IO.Stream s = M();", LanguageVersion::CSharp11);
+        assert!(typed.starts_with("(class partial Program "), "{typed}");
+        let statement = unit_tree_at("using (M()) { }", LanguageVersion::CSharp11);
+        assert!(statement.starts_with("(class partial Program "), "{statement}");
+        for directive in ["using System;", "using static System.Math;", "using M = System.Math;"] {
+            let tree = unit_tree_at(directive, LanguageVersion::CSharp11);
+            assert!(
+                tree.starts_with("(using") && !tree.contains("Program"),
+                "{directive:?} is a directive: {tree}"
+            );
+        }
+    }
+
+    /// What may come after the top-level statements is what may come after a declaration, and the
+    /// three misplacements are csc's codes at csc's positions: a `using` directive is CS1529 at its
+    /// keyword, an `[assembly:]` section CS1730 at its target, and a file-scoped namespace CS8956
+    /// at its name (each measured).
+    #[test]
+    fn what_follows_top_level_statements_is_ordered_as_after_a_declaration() {
+        let rows: &[(&str, &str, &str)] = &[
+            ("System.Console.WriteLine(1);\nusing System;", "CS1529", "using System"),
+            (
+                "System.Console.WriteLine(1);\n[assembly: System.CLSCompliant(true)]",
+                "CS1730",
+                "assembly",
+            ),
+            ("System.Console.WriteLine(1);\nnamespace N;\nclass C { }", "CS8956", "N;"),
+            ("class C { }\nusing System;", "CS1529", "using System"),
+        ];
+        for (source, code, at) in rows {
+            let diagnostics = unit_diagnostics_at(source, LanguageVersion::CSharp11);
+            let offset = source.find(at).expect("the row names a position in its source");
+            assert_eq!(
+                diagnostics.iter().map(|(code, offset, _)| (code.as_str(), *offset)).collect::<Vec<_>>(),
+                alloc::vec![(*code, offset)],
+                "{source:?} drew {diagnostics:?}"
+            );
+        }
+        let twice = unit_diagnostics_at(
+            "System.Console.WriteLine(1);\nusing static System.Math;\nusing M = System.Math;",
+            LanguageVersion::CSharp11,
+        );
+        assert_eq!(twice.iter().filter(|(code, ..)| code == "CS1529").count(), 2, "{twice:?}");
+    }
+
+    /// A statement out of place is still read as a top-level statement, with `await` reserved: an
+    /// `await` there is CS8803 alone, and a local named `await` is CS8803 and CS4003 (measured).
+    #[test]
+    fn a_misplaced_top_level_statement_reserves_await() {
+        let codes = |source: &str| {
+            unit_diagnostics_at(source, LanguageVersion::CSharp11)
+                .into_iter()
+                .map(|(code, ..)| code)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(codes("class C { }\nawait System.Threading.Tasks.Task.Delay(1);"), ["CS8803"]);
+        assert_eq!(codes("class C { }\nint await = 1;"), ["CS8803", "CS4003"]);
     }
 
     /// A statement AFTER a declaration is wrong in its order at every rung, and csc says so with

@@ -184,7 +184,7 @@ impl Options {
 
     /// The port, opened.
     fn open(&self) -> Result<NativePort, PortError> {
-        NativePort::open(&self.port, self.baud)
+        NativePort::open(&self.port, &lamella_serial_port::Settings::new(self.baud))
     }
 
     /// The per-part protocol variations to speak.
@@ -340,7 +340,7 @@ enum ScriptStep {
 fn parse_script(text: &str) -> Result<Vec<ScriptStep>, String> {
     let mut steps = Vec::new();
     for token in text.split(',').map(str::trim).filter(|t| !t.is_empty()) {
-        let (kind, rest) = token.split_at(1);
+        let (kind, rest) = token.split_at(token.chars().next().map_or(0, char::len_utf8));
         let step = match (kind, rest) {
             ("D" | "d", "1") => ScriptStep::Dtr(true),
             ("D" | "d", "0") => ScriptStep::Dtr(false),
@@ -461,17 +461,13 @@ fn sync(options: &Options) -> Result<bool, PortError> {
                 }
                 reached.push(name_of(body[1]));
                 trace(&format!("  -> {} ({} bytes)", name_of(body[1]), bytes.len()));
-                if let Err(problem) = port.write(&bytes) {
-                    return Err(problem);
-                }
+                Port::write(&mut port, &bytes)?;
             }
             Step::Do(action) => {
-                if let Err(problem) = perform_bare(&action, &mut port) {
-                    return Err(problem);
-                }
+                perform_bare(&action, &mut port)?;
                 trace(&format!("  {action:?}"));
             }
-            Step::Await { timeout_ms } => match port.read(&mut buffer, timeout_ms)? {
+            Step::Await { timeout_ms } => match Port::read(&mut port, &mut buffer, timeout_ms)? {
                 0 => {
                     trace(&format!("  <- nothing within {timeout_ms} ms"));
                     session.timeout();
@@ -607,8 +603,12 @@ fn collect(port: &mut dyn Port, window_ms: u64) -> Result<Vec<u8>, PortError> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(window_ms);
     let mut buffer = [0u8; 4096];
     let mut got = Vec::new();
-    while std::time::Instant::now() < deadline {
-        let n = port.read(&mut buffer, 100)?;
+    loop {
+        let left = deadline.saturating_duration_since(std::time::Instant::now()).as_millis();
+        if left == 0 {
+            break;
+        }
+        let n = port.read(&mut buffer, u32::try_from(left.min(100)).unwrap_or(100))?;
         got.extend_from_slice(&buffer[..n]);
     }
     Ok(got)
@@ -677,5 +677,63 @@ fn report(outcome: &Outcome, options: &Options) {
         }
         Outcome::Refused(why) => println!("REFUSED -- {why:?}"),
         Outcome::Transport(problem) => println!("TRANSPORT FAILURE -- {problem}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A port that never answers: each read waits out its whole bound, which is recorded.
+    struct Silent {
+        bounds: Vec<u32>,
+    }
+
+    impl Port for Silent {
+        fn write(&mut self, _bytes: &[u8]) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn read(&mut self, _buffer: &mut [u8], timeout_ms: u32) -> Result<usize, PortError> {
+            self.bounds.push(timeout_ms);
+            std::thread::sleep(std::time::Duration::from_millis(u64::from(timeout_ms)));
+            Ok(0)
+        }
+        fn set_dtr(&mut self, _on: bool) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn set_rts(&mut self, _on: bool) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn reopen(&mut self, _baud: u32) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn discard_buffers(&mut self) -> Result<(), PortError> {
+            Ok(())
+        }
+        fn describe(&self) -> String {
+            String::from("a port that never answers")
+        }
+    }
+
+    /// **A capture's reads end with its window**: each is bounded by what is left of it, so their
+    /// bounds add up to no more than the window, where reads of a fixed 100 ms ran up to 100 ms
+    /// past it and kept what arrived there. Each read still waits at most 100 ms.
+    #[test]
+    fn a_capture_reads_no_further_than_its_window() {
+        let mut port = Silent { bounds: Vec::new() };
+        collect(&mut port, 250).expect("a silent port reads");
+        let total: u32 = port.bounds.iter().sum();
+        assert!(total <= 250, "the reads were bounded by {:?}, {total} ms in all", port.bounds);
+        assert!(port.bounds.iter().all(|&bound| bound <= 100), "{:?}", port.bounds);
+    }
+
+    /// **A step that starts with a character of more than one byte is refused like any other bad
+    /// step**, rather than panicking the tool on a typo, and the steps around it still parse.
+    #[test]
+    fn a_step_that_starts_with_a_character_of_more_than_one_byte_is_refused() {
+        assert!(parse_script("\u{e9}1").is_err(), "a two-byte character");
+        assert!(parse_script("D1,\u{3c9}0").is_err(), "a two-byte character after a good step");
+        assert!(parse_script("\u{1f600}").is_err(), "a four-byte character alone");
+        assert_eq!(parse_script("D1, W10 ,r0"), Ok(vec![ScriptStep::Dtr(true), ScriptStep::Wait(10), ScriptStep::Rts(false)]));
     }
 }

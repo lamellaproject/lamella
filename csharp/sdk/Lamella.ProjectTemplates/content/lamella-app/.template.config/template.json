@@ -1,0 +1,52 @@
+{
+  "$schema": "http://json.schemastore.org/template",
+  "author": "Lamella LLC",
+  "classifications": [ "Lamella", "IoT", "Embedded", "Console" ],
+  "identity": "Lamella.App.CSharp",
+  "name": "Lamella app",
+  "shortName": "lamella-app",
+  "description": "A C# program for Lamella. With a board named, it blinks the board's own LED through System.Device.Gpio, and dotnet run runs it on a connected board of that kind; with none, it runs on this computer. It builds with dotnet build and runs with dotnet run.",
+  "tags": {
+    "language": "C#",
+    "type": "project"
+  },
+  "sourceName": "App",
+  "preferNameDirectory": true,
+  "symbols": {
+    "board": {
+      "type": "parameter",
+      "datatype": "choice",
+      "displayName": "Board",
+      "description": "The board the program runs on, by its id. The program then blinks the board's own LED, and dotnet run sends it only to a board of that kind. With no board, the program runs on this computer.",
+      "choices": [
+        { "choice": "adafruit-feather-rp2040-adalogger", "description": "Adafruit Feather RP2040 Adalogger" },
+        { "choice": "pimoroni-pico-plus-2", "description": "Pimoroni Pico Plus 2" },
+        { "choice": "rpi-pico", "description": "Raspberry Pi Pico" },
+        { "choice": "rpi-pico2", "description": "Raspberry Pi Pico 2" }
+      ],
+      "replaces": "lamella-board-id"
+    },
+    "hasBoard": {
+      "type": "computed",
+      "value": "(board != \"\")"
+    },
+    "ledPin": {
+      "type": "generated",
+      "generator": "switch",
+      "replaces": "LAMELLA_LED_PIN",
+      "parameters": {
+        "evaluator": "C++",
+        "datatype": "string",
+        "cases": [
+          { "condition": "(board == 'adafruit-feather-rp2040-adalogger')", "value": "13" },
+          { "condition": "(board == 'pimoroni-pico-plus-2')", "value": "25" },
+          { "condition": "(board == 'rpi-pico')", "value": "25" },
+          { "condition": "(board == 'rpi-pico2')", "value": "25" }
+        ]
+      }
+    }
+  },
+  "primaryOutputs": [
+    { "path": "App.csproj" }
+  ]
+}

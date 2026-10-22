@@ -1,5 +1,5 @@
 //! The serial-port seam: a UART/COM byte pipe behind a trait the embedder supplies (host =
-//! the `serialport` crate over a real COM port; a device = a SERCOM/USART peripheral driver;
+//! the operating system's serial ports; a device = a SERCOM/USART peripheral driver;
 //! tests and a browser = an in-memory loopback). Like the file seam ([`crate::fs`]) and unlike
 //! the socket seam ([`crate::net`]) every operation is BLOCKING: a read waits up to the
 //! configured read timeout, a write drains up to the write timeout, both in bounded time -- so

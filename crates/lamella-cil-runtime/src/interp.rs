@@ -276,6 +276,10 @@ pub struct Vm {
     /// managed `DriveInfo.GetFileSystems`. The embedder that links a formatter declares them (e.g.
     /// `["FAT"]`); empty by default (no format capability).
     filesystems: alloc::vec::Vec<alloc::string::String>,
+    /// The program's own arguments ([`Vm::set_program_args`]), which [`entry_args`] gives a
+    /// `Main(string[] args)` as its array. Empty unless the embedder sets them, so such a `Main`
+    /// gets an empty array, as .NET gives a program started with no arguments.
+    program_args: alloc::vec::Vec<alloc::string::String>,
     /// The embedder's on-demand mount-backend provider ([`crate::mount::StorageProvider`]) -- the FAT
     /// / SD / RAM constructor the managed `Storage.Mount*` routes through. `None` until installed; the
     /// mount calls then report NotSupported.
@@ -722,10 +726,14 @@ impl Vm {
         self.now_millis_fn.map(|now| now())
     }
 
-    /// Blocks the OS thread for `millis` milliseconds (a no-op without a clock seam). A network
-    /// backend whose link needs the processor's time -- a radio it drives by polling -- spends the
-    /// wait servicing it instead ([`crate::net::NetBackend::idle`]).
-    fn sleep_millis(&mut self, millis: u64) {
+    /// Blocks the OS thread for `millis` milliseconds through the clock seam ([`Vm::set_clock`]); a
+    /// no-op without one. A network backend whose link needs the processor's time -- a radio it
+    /// drives by polling -- spends the wait servicing it instead ([`crate::net::NetBackend::idle`]).
+    ///
+    /// It can return early: a host whose thread may not block, such as a browser's main thread,
+    /// returns at once. So a caller waiting for a deadline asks [`Vm::now_millis`] again after each
+    /// call rather than taking one call to have lasted `millis`.
+    pub fn sleep_millis(&mut self, millis: u64) {
         if let Some(backend) = self.net_backend.as_deref_mut() {
             if backend.idle(millis) {
                 return;
@@ -838,6 +846,18 @@ impl Vm {
         &self.filesystems
     }
 
+    /// Sets the program's own arguments, which [`entry_args`] gives a `Main(string[] args)`: what
+    /// follows `--` on a `dotnet run` or `lamella run` command line.
+    pub fn set_program_args(&mut self, args: alloc::vec::Vec<alloc::string::String>) {
+        self.program_args = args;
+    }
+
+    /// The program's own arguments ([`Vm::set_program_args`]).
+    #[must_use]
+    pub fn program_args(&self) -> &[alloc::string::String] {
+        &self.program_args
+    }
+
     /// Installs the embedder's on-demand mount-backend provider (the FAT / SD / RAM constructor).
     /// Without one, every managed `Storage.Mount*` reports [`crate::fs::FsError::Unsupported`].
     pub fn set_storage_provider(
@@ -929,7 +949,7 @@ impl Vm {
     }
 
     /// Sets the serial-port seam ([`crate::serial::SerialBackend`]). The embedder provides it (the
-    /// host with the `serialport` crate over a real COM port; a device with a SERCOM/USART driver;
+    /// host with the operating system's serial ports; a device with a SERCOM/USART driver;
     /// tests with the in-memory loopback); without it, every managed serial operation throws a
     /// catchable `IOException`.
     pub fn set_serial_backend(
@@ -2633,6 +2653,27 @@ pub fn boot_baked(module: &Module, vm: &mut Vm, entry: MethodId) -> Result<Metho
     }
     arm_board(module, vm)?;
     Ok(entry)
+}
+
+/// The arguments the entry point `entry` starts with, as .NET passes them: a `Main(string[] args)`
+/// gets a `string[]` of the program's arguments ([`Vm::set_program_args`]), empty when there are
+/// none, and a `Main()` gets nothing. ECMA-335 II.15.4.1.2 allows an entry point exactly those two
+/// shapes.
+///
+/// A host that starts a program passes this to [`run`], [`run_interruptible`] or [`Session::new`].
+/// An empty list instead leaves a `Main(string[] args)` without its argument, so its first read of
+/// `args` traps.
+#[must_use]
+pub fn entry_args(module: &Module, vm: &mut Vm, entry: MethodId) -> Vec<Value> {
+    if module.method(entry).map_or(0, crate::module::Method::arg_count) == 0 {
+        return Vec::new();
+    }
+    let program_args = vm.program_args.clone();
+    let elements = program_args
+        .iter()
+        .map(|arg| Value::Object(vm.heap_mut().alloc_text(arg)))
+        .collect();
+    alloc::vec![Value::Object(vm.heap_mut().alloc_array(elements))]
 }
 
 /// Initializes the board class the [`Vm`] names, if the program carries it: its type initializer

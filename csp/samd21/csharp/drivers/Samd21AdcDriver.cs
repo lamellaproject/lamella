@@ -20,7 +20,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Samd21AdcDriver : AdcDriver
+internal sealed class Samd21AdcDriver : AdcDriver
 {
     // A bound on every hardware wait, so a converter that never answers is reported rather than
     // waited on forever.
@@ -92,6 +92,26 @@ public sealed class Samd21AdcDriver : AdcDriver
         // The AIN channels are the multiplexer's lowest codes, and the internal inputs sit above
         // them (33.8.8).
         return channel > Samd21AdcLayout.Channel_AIN19 || PadSlot(channel) >= 0;
+    }
+
+    /// <summary>The pin a wired pad's channel reads, numbered as this family's GPIO driver numbers its
+    /// pins (PA10 is 10, PB00 is 32); -1 for an internal input or a channel no wired pad is.</summary>
+    public override int PinOfChannel(int channel)
+    {
+        int slot = PadSlot(channel);
+        if (slot < 0)
+        {
+            return -1;
+        }
+        // A pad's PINCFG byte is its group's PINCFG array indexed by the pad, the address the GPIO
+        // driver composes for the same pin, so the pin is read back from it rather than restated.
+        uint pincfg = _binding.Pad(slot).PincfgReg;
+        uint groupB = Samd21Instances.PORTB_BASE + Samd21PortLayout.PINCFG0_OFF;
+        if (pincfg >= groupB)
+        {
+            return 32 + (int)(pincfg - groupB);
+        }
+        return (int)(pincfg - (Samd21Instances.PORTA_BASE + Samd21PortLayout.PINCFG0_OFF));
     }
 
     /// <summary>Twelve bits, the resolution this driver selects.</summary>

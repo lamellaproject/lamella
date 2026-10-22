@@ -29,6 +29,11 @@ serde_json = { version = "1", optional = true }
 # The AOT backend, for the in-page chip/wasm exporter (lamella_aot_build). Default features bring the
 # ARM32 backend (chip images); enable lamella-aot's `wasm` feature too for the C# -> .wasm widget path.
 lamella-aot = { path = "../lamella-aot", optional = true }
+# The board catalog, for the bus table a linked build for a board lays into its image
+# (lamella_aot_build_linked): the table the command line lays, from the same generated files.
+lamella-catalog = { path = "../lamella-catalog", optional = true }
+# The archive reader, so a linked build refuses a runtime-support archive that is not one by name.
+lamella-elf = { path = "../lamella-elf", optional = true }
 # The probe feature pulls in the CMSIS-DAP command layer, the shared MEM-AP / Cortex-M layer, and
 # the per-part flash routines, so a browser drives real silicon through the SAME code a native
 # deploy drives it through. `default-features = false` because the CMSIS-DAP crate defaults to its
@@ -46,6 +51,10 @@ lamella-py-runtime = { path = "../lamella-py-runtime", optional = true }
 # wasm-buildable, so take only the carrier-neutral core (--no-default-features); this crate supplies
 # the compiler (over `compile`) and uses the engine's in-process LoopbackLink for the run side.
 lamella-wire-host = { path = "../lamella-wire-host", optional = true, default-features = false }
+
+[dev-dependencies]
+# The debug agent's tests compile their programs, so a program's source sits beside what it checks.
+lamella-assemble = { path = "../lamella-assemble" }
 
 [features]
 # Adds the lamella_selftest export so a wasm host can validate the module end to end
@@ -66,8 +75,16 @@ compile = [
 # Adds the in-page AOT exporter (lamella_aot_build: CIL -> a flashable chip image, e.g. micro:bit, or
 # a .wasm widget) so Lamella Code compiles the user's C# all the way to a microcontroller image client-side.
 # serde_json carries the build's `{ error }` envelope, so a failed lowering reports WHY to the page
-# instead of collapsing into an empty buffer.
-aot = ["dep:lamella-aot", "dep:serde_json"]
+# instead of collapsing into an empty buffer. It also adds the class-library build
+# (lamella_aot_build_linked): the program linked with corlib, its libraries and a board's
+# runtime-support archive, with the board's bus table, as the command line builds it for a board.
+aot = [
+    "dep:lamella-aot",
+    "lamella-aot/linked",
+    "dep:lamella-catalog",
+    "dep:lamella-elf",
+    "dep:serde_json",
+]
 # Adds the in-page debug-probe agent (lamella_probe_create/request/flash/dispose): CMSIS-DAP over a
 # host-supplied packet transport, the ADIv5 MEM-AP and Cortex-M run control above it, and the
 # per-part flash routines -- so a page connects a real probe, programs a chip and debugs it. This is

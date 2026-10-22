@@ -5,7 +5,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Nrf51I2cDriver : I2cDriver
+internal sealed class Nrf51I2cDriver : I2cDriver
 {
     private readonly uint _tasksStartRx;
     private readonly uint _tasksStartTx;

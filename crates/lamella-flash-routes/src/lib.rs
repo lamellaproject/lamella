@@ -5,6 +5,7 @@ pub mod backends;
 pub mod bootsel;
 pub mod contracts;
 pub mod dfu;
+pub mod external;
 pub mod identity;
 pub mod manifest;
 pub mod placement;
@@ -1117,6 +1118,18 @@ pub struct Prepared {
     pub read: String,
     /// The line that reports a wrap into a UF2, when the route needed one.
     pub wrapped: Option<String>,
+    /// The image's second half, for the board's external flash, when it has one. The two are
+    /// written together by [`write_set`], never one without the other.
+    pub window: Option<WindowHalf>,
+}
+
+/// The half of a two-region image that belongs in a board's external flash.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowHalf {
+    /// Where it belongs: the base of the board's external flash window.
+    pub base: u32,
+    /// Its bytes, contiguous from `base`.
+    pub bytes: Vec<u8>,
 }
 
 /// Read the image file at `path` into the bytes a write through `route` puts on the board `row`
@@ -1145,12 +1158,23 @@ pub fn prepare_image(
             let bytes =
                 std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
             let read = format!("{} B of {}", bytes.len(), required.description());
-            return Ok(Prepared { bytes, read, wrapped: None });
+            return Ok(Prepared { bytes, read, wrapped: None, window: None });
         }
     }
-    let artifact = crate::artifact::read(path)?;
+    let external = external_flash_for(row, route);
+    let (artifact, window) = match external {
+        Some(flash) => crate::artifact::read_regions(
+            path,
+            flash.window..flash.window.saturating_add(flash.largest()),
+        )?,
+        None => (crate::artifact::read(path)?, None),
+    };
     check_base(&artifact, placement)?;
     check_rp2350_stamp(&artifact.bytes, row.aot_target)?;
+    let window = match (window, external) {
+        (Some(half), Some(flash)) => Some(window_half(row.board, half, flash)?),
+        _ => None,
+    };
     refuse_unless_it_fits(row.board, &artifact.bytes, placement).map_err(|mut message| {
         if extension.as_deref() == Some("elf") {
             message.push_str(
@@ -1161,11 +1185,56 @@ pub fn prepare_image(
         }
         message
     })?;
-    let read = format!("{} B of {}", artifact.bytes.len(), artifact.format);
+    let read = match &window {
+        Some(half) => format!(
+            "{} B of {} for the part's flash and {} B for its external flash",
+            artifact.bytes.len(),
+            artifact.format,
+            half.bytes.len()
+        ),
+        None => format!("{} B of {}", artifact.bytes.len(), artifact.format),
+    };
     Ok(match wrap_for_route(route, &artifact.bytes) {
-        Some((bytes, line)) => Prepared { bytes, read, wrapped: Some(line) },
-        None => Prepared { bytes: artifact.bytes, read, wrapped: None },
+        Some((bytes, line)) => Prepared { bytes, read, wrapped: Some(line), window },
+        None => Prepared { bytes: artifact.bytes, read, wrapped: None, window },
     })
+}
+
+/// The external flash `route` writes on `row`'s board, beside the part's own: the board's on-board
+/// ST-LINK route, on a board that carries one.
+#[must_use]
+pub fn external_flash_for(row: &Programming, route: Programmer) -> Option<&'static external::ExternalFlash> {
+    match route {
+        Programmer::StlinkOnboard { family: StFamily::F7, .. } => external::for_board(row.board),
+        _ => None,
+    }
+}
+
+/// The window's half of an image, checked against `flash`: it must start at the window's base and
+/// fit the smallest part the board allows.
+fn window_half(
+    board: &str,
+    half: crate::artifact::Artifact,
+    flash: &external::ExternalFlash,
+) -> Result<WindowHalf, String> {
+    let stated = half.base.unwrap_or(flash.window);
+    if stated != flash.window {
+        return Err(format!(
+            "the image's external flash half starts at {stated:#010x}, and {board}'s external flash is \
+             written from {:#010x}, where the window begins.",
+            flash.window
+        ));
+    }
+    let room = flash.parts.iter().map(|part| part.size).min().unwrap_or(0);
+    let length = u32::try_from(half.bytes.len()).unwrap_or(u32::MAX);
+    if length > room {
+        return Err(format!(
+            "the image's external flash half is {length} B, and {board}'s external flash holds {room} B \
+             -- {} B too many.",
+            length - room
+        ));
+    }
+    Ok(WindowHalf { base: flash.window, bytes: half.bytes })
 }
 
 /// `image` wrapped into a UF2 for `route`, with the line that reports the wrap -- or `None` when
@@ -1404,10 +1473,11 @@ fn write_with(
                 if let ExternalProbe::StLink { product_id } =
                     external_probe_for(serial, &attached_usb_devices())?
                 {
-                    let stlink = lamella_stlink::StLink::open(product_id, Some(serial))
-                        .map_err(describe_stlink_choice)?;
                     return write_through_stlink(
-                        stlink,
+                        || {
+                            lamella_stlink::StLink::open(product_id, Some(serial))
+                                .map_err(describe_stlink_choice)
+                        },
                         family,
                         &image,
                         allow,
@@ -1497,9 +1567,14 @@ fn write_with(
             .map_err(|why| why.to_string());
         }
         Programmer::StlinkOnboard { family, probe_id } => {
-            let stlink =
-                lamella_stlink::StLink::open(probe_id, probe).map_err(describe_stlink_choice)?;
-            return write_through_stlink(stlink, family, &image, allow, "the board's ST-LINK", say);
+            return write_through_stlink(
+                || lamella_stlink::StLink::open(probe_id, probe).map_err(describe_stlink_choice),
+                family,
+                &image,
+                allow,
+                "the board's ST-LINK",
+                say,
+            );
         }
     };
 
@@ -1553,33 +1628,71 @@ where
     lamella_stlink::attach_held_in_reset(held, low_power_debug)
 }
 
-/// Writes `image` through an opened ST-LINK on `family`'s plan: the family's attach, memory access,
+/// Write a two-region image as one matched set: `image` where the board's part boots from, at the
+/// address `placement` gives, and `window` in the board's external flash, permitting only the parts
+/// `allow` names.
+///
+/// **WHEREVER IT STOPS, IT LEAVES THE OLD SET UNTOUCHED, A PART THAT CANNOT START, OR THE WHOLE NEW
+/// SET**, in the order [`lamella_flash_backend::flash_set`] states, through one attach of the
+/// board's own ST-LINK: both parts identified before either is erased, the boot half erased first,
+/// the window's half written whole, then the boot half with its vector last, and both read back
+/// before the part is released. `say` is [`write`]'s.
+///
+/// # Errors
+/// A route or board with no external flash this build writes, or anything that stops the write,
+/// already worded for a reader.
+pub fn write_set(
+    programmer: Programmer,
+    board: &str,
+    placement: &placement::Placement,
+    image: &[u8],
+    window: &WindowHalf,
+    probe: Option<&str>,
+    allow: &lamella_flash_backend::Allow,
+    say: &mut dyn FnMut(&str),
+) -> Result<lamella_flash_backend::SetReport, String> {
+    let Programmer::StlinkOnboard { family, probe_id } = programmer else {
+        return Err(format!(
+            "{board}'s image has a half for its external flash, and {} does not write one -- only \
+             the board's own ST-LINK does. Nothing was written.",
+            programmer.description()
+        ));
+    };
+    let Some(flash) = external::for_board(board) else {
+        return Err(format!(
+            "the image has a half for an external flash at {:#010x}, and {board} has none this build \
+             writes. Nothing was written.",
+            window.base
+        ));
+    };
+    let stlink = attach_stlink(
+        || lamella_stlink::StLink::open(probe_id, probe).map_err(describe_stlink_choice),
+        family,
+        "the board's ST-LINK",
+    )?;
+    let mut backend = crate::backends::StProbe::new(stlink, family.plan()).with_window(flash).saying(say);
+    lamella_flash_backend::flash_set(
+        &mut backend,
+        &lamella_flash_backend::Image { bytes: image, base: placement.base() },
+        &lamella_flash_backend::Image { bytes: &window.bytes, base: window.base },
+        lamella_flash_backend::VerifyPolicy::ReadBack,
+        allow,
+    )
+    .map_err(|why| why.to_string())
+}
+
+/// Writes `image` through the ST-LINK `open` opens, on `family`'s plan: the family's attach, memory access,
 /// then the plan's erase, program and read-back, each said to `say` as it starts. `through` names
 /// the probe in a refusal.
 fn write_through_stlink(
-    mut stlink: lamella_stlink::StLink,
+    open: impl FnMut() -> Result<lamella_stlink::StLink, String>,
     family: StFamily,
     image: &lamella_flash_backend::Image<'_>,
     allow: &lamella_flash_backend::Allow,
     through: &str,
     say: &mut dyn FnMut(&str),
 ) -> Result<lamella_flash_backend::Report, String> {
-    use lamella_probe_core::TargetAccess as _;
-
-    if family.plan().attach_under_reset {
-        stlink
-            .attach_under_reset(family.plan().low_power_debug)
-            .map_err(|why| {
-                format!("attaching to the board under reset through {through}: {why}")
-            })?;
-    } else {
-        stlink
-            .connect()
-            .map_err(|why| format!("entering SWD through {through}: {why}"))?;
-    }
-    stlink
-        .init_mem()
-        .map_err(|why| format!("opening memory access through {through}: {why}"))?;
+    let stlink = attach_stlink(open, family, through)?;
     let mut backend = crate::backends::StProbe::new(stlink, family.plan()).saying(say);
     lamella_flash_backend::flash(
         &mut backend,
@@ -1588,6 +1701,78 @@ fn write_through_stlink(
         allow,
     )
     .map_err(|why| why.to_string())
+}
+
+/// Opens a probe with `open` and attaches with `attach`, and when the attach fails the way a probe
+/// left mid-command fails, opens it once more and attaches again.
+///
+/// **A WRITE STOPPED PARTWAY LEAVES THE PROBE HOLDING A REPLY NOBODY READ**, so the next tool to
+/// open it reads a timeout on its first command, while the one after that works -- what a person
+/// meets after pressing Ctrl+C during a deploy and running it again. Re-opening reads past it. One
+/// retry, never a loop: a probe that fails twice is not answering, and that is reported, with the
+/// remedy.
+///
+/// # Errors
+/// The open's own refusal; an attach that fails for any other reason; or one that fails twice.
+fn attach_with_one_retry<P>(
+    mut open: impl FnMut() -> Result<P, String>,
+    mut attach: impl FnMut(&mut P) -> Result<(), lamella_probe_core::ProbeError>,
+    through: &str,
+) -> Result<P, String> {
+    let mut probe = open()?;
+    let first = match attach(&mut probe) {
+        Ok(()) => return Ok(probe),
+        Err(error) => error,
+    };
+    if !left_mid_command(&first) {
+        return Err(format!("attaching to the board through {through}: {first}"));
+    }
+    drop(probe);
+    let mut probe = open()?;
+    match attach(&mut probe) {
+        Ok(()) => Ok(probe),
+        Err(second) => Err(format!(
+            "attaching to the board through {through}: {second} (and {first} the time before). \
+             Unplug the board's USB cable, plug it back in, and run the write again."
+        )),
+    }
+}
+
+/// Whether `error` is how a probe answers when an earlier session stopped partway through a
+/// command: a reply that never came, or a transport that dropped one.
+fn left_mid_command(error: &lamella_probe_core::ProbeError) -> bool {
+    use lamella_probe_core::ProbeError;
+    match error {
+        ProbeError::Timeout(_) | ProbeError::Transport(_) => true,
+        ProbeError::Device(what) => what.contains("timed out"),
+        _ => false,
+    }
+}
+
+/// Opens an ST-LINK with `open` and attaches it the way `family`'s plan says, retrying once on a
+/// fresh open when the probe was left mid-command (see [`attach_with_one_retry`]). `through` names
+/// the probe in a refusal.
+fn attach_stlink(
+    open: impl FnMut() -> Result<lamella_stlink::StLink, String>,
+    family: StFamily,
+    through: &str,
+) -> Result<lamella_stlink::StLink, String> {
+    attach_with_one_retry(open, |stlink| attach_plan(stlink, family), through)
+}
+
+/// Attaches an opened ST-LINK the way `family`'s plan says and opens memory access.
+fn attach_plan(
+    stlink: &mut lamella_stlink::StLink,
+    family: StFamily,
+) -> Result<(), lamella_probe_core::ProbeError> {
+    use lamella_probe_core::TargetAccess as _;
+
+    if family.plan().attach_under_reset {
+        stlink.attach_under_reset(family.plan().low_power_debug)?;
+    } else {
+        stlink.connect()?;
+    }
+    stlink.init_mem()
 }
 
 /// A USB device as an external-probe route sees it when a serial names the probe: its identity, and
@@ -1964,6 +2149,67 @@ pub fn cannot_write(board: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A write stopped partway leaves the probe holding a reply nobody read, and the next open's
+    /// first command times out while the one after that works -- measured on a 32F746GDISCOVERY's
+    /// ST-LINK after a killed external-flash write. The attach opens once more and goes on.
+    #[test]
+    fn an_attach_after_a_stopped_write_retries_once_on_a_fresh_open() {
+        let mut opens = 0;
+        let mut attaches = 0;
+        let attached = attach_with_one_retry(
+            || {
+                opens += 1;
+                Ok(opens)
+            },
+            |probe: &mut i32| {
+                attaches += 1;
+                if *probe == 1 {
+                    Err(lamella_probe_core::ProbeError::Device("ST-Link reply read failed or timed out"))
+                } else {
+                    Ok(())
+                }
+            },
+            "the board's ST-LINK",
+        );
+        assert_eq!(attached, Ok(2), "the second open is the one handed back");
+        assert_eq!((opens, attaches), (2, 2));
+    }
+
+    /// Once, never a loop: a probe that times out twice is reported, with what to do about it.
+    #[test]
+    fn an_attach_that_times_out_twice_says_what_to_do() {
+        let mut opens = 0;
+        let refusal = attach_with_one_retry(
+            || {
+                opens += 1;
+                Ok(())
+            },
+            |_: &mut ()| Err(lamella_probe_core::ProbeError::Timeout("the probe's reply")),
+            "the board's ST-LINK",
+        )
+        .expect_err("two timeouts");
+        assert_eq!(opens, 2);
+        assert!(refusal.contains("Unplug the board's USB cable"), "{refusal}");
+    }
+
+    /// An attach that fails for any other reason is not a probe left mid-command, and is not
+    /// retried: the second try would fail the same way and hide the first reading.
+    #[test]
+    fn an_attach_refused_for_another_reason_is_not_retried() {
+        let mut opens = 0;
+        let refusal = attach_with_one_retry(
+            || {
+                opens += 1;
+                Ok(())
+            },
+            |_: &mut ()| Err(lamella_probe_core::ProbeError::Device("the target refused the debug port")),
+            "the board's ST-LINK",
+        )
+        .expect_err("refused");
+        assert_eq!(opens, 1);
+        assert!(refusal.contains("the target refused the debug port"), "{refusal}");
+    }
 
     /// **NO ROUTE WRITES TO A STANDARD STREAM.** What a route says goes to the `say` its caller
     /// passes, because both streams are the caller's: standard output carries a program's own

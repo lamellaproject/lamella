@@ -1,9 +1,10 @@
 # Builds each board's C# support package into a REFERENCE ASSEMBLY: `Lamella.Boards.<Vendor>.<Board>.dll`.
 #
-#   pwsh -File build-boards.ps1 [-OutDir <dir>] [-Lcsc <path>] [-Define <symbols>] [-Board <name>]
-#   pwsh -File build-boards.ps1 -PrintBoards [-Family <family>]   # every board's directory, one per line
+#   pwsh -File csharp/build-boards.ps1 [-OutDir <dir>] [-Lcsc <path>] [-Define <symbols>] [-Board <name>]
+#   pwsh -File csharp/build-boards.ps1 -PrintBoards [-Family <family>]   # every board's directory, one per line
+#   pwsh -File csharp/build-boards.ps1 -WriteInternalsVisibleTo         # rewrites each libs/<library>/InternalsVisibleTo.g.cs
 #
-# -Define defaults to the surface `build-managed.ps1` compiles at, which `build-managed.ps1
+# -Define defaults to the surface `csharp/build-managed.ps1` compiles at, which `csharp/build-managed.ps1
 # -PrintSurface` names, so a board assembly built without it matches the libraries it references.
 #
 # Each board's package under `bsp/boards/<board>/csharp/` binds that board's buses to its chip's
@@ -20,7 +21,7 @@
 # whose assembly it was built against. Every other source in `bsp/common/csharp/` is compiled into
 # every board's assembly too.
 #
-# `build-managed.ps1` is the other half and runs FIRST: it builds corlib + libs/ into -OutDir, and
+# `csharp/build-managed.ps1` is the other half and runs FIRST: it builds corlib + libs/ into -OutDir, and
 # this reads them back as references. Run that, then this.
 #
 # One assembly per board, rather than one covering all of them. A board class reaches its chip's
@@ -33,11 +34,11 @@
 # layouts, binding descriptors and drivers they name come from `csp/<family>/csharp/`. Neither half
 # compiles alone.
 #
-# A family with a System.Device.Gpio of its own (`build-managed.ps1` builds one for each
+# A family with a System.Device.Gpio of its own (`csharp/build-managed.ps1` builds one for each
 # `libs/System.Device.Gpio/Families/<family>.cs`, at `families/<family>/`) carries some of those csp
 # sources in that build, which an image for the board links in place of the shared one. Its boards'
 # assemblies leave those sources out and are compiled against that build, so each csp type is in
-# exactly one assembly: the image does not link with a type defined in two, and `build-managed.ps1`
+# exactly one assembly: the image does not link with a type defined in two, and `csharp/build-managed.ps1`
 # says why.
 
 [CmdletBinding()]
@@ -47,11 +48,13 @@ param(
     [string[]]$Define,
     [string]$Board,
     [switch]$PrintBoards,
-    [string]$Family
+    [string]$Family,
+    [switch]$WriteInternalsVisibleTo
 )
 
 $ErrorActionPreference = 'Stop'
-$root = $PSScriptRoot
+# The repository root: this script is in its csharp/ folder, and every path it reads is the root's.
+$root = Split-Path $PSScriptRoot -Parent
 
 # Every board: each directory under `bsp/boards/` that holds a `board.toml`, sorted by name. This is
 # the one list of the boards, so a script that walks them reads it through -PrintBoards rather than
@@ -75,6 +78,87 @@ function Resolve-Family($boardDir) {
         throw "$($boardDir): module '$($Matches[1])' states no family"
     }
     throw "$($boardDir)/board.toml states neither family nor module"
+}
+
+# The assembly's board name: the GENERATED bindings name, less the maker it begins with. A board id is
+# `<maker>-<product>`, and the assembly's vendor segment already says who made the board, so keeping
+# the maker in the board part would say it twice -- `Lamella.Boards.RaspberryPi.RpiPico2` rather than
+# `Lamella.Boards.RaspberryPi.Pico2`. The name comes from the generated file rather than from the
+# directory, because the generator already decided how `adafruit-feather-m0-adalogger` becomes
+# `AdafruitFeatherM0Adalogger`, and a second copy of that casing rule here could disagree with the
+# first. Removing the maker takes only its LENGTH from the directory name, so no casing is re-applied.
+function Resolve-BoardName($csharpDir, $dirName) {
+    $bindings = @(Get-ChildItem $csharpDir -Filter '*Bindings.g.cs')
+    if ($bindings.Count -ne 1) {
+        throw "bsp/boards/$dirName/csharp: expected exactly one *Bindings.g.cs to name the board, found $($bindings.Count). Regenerate the family."
+    }
+    $name = $bindings[0].Name -replace 'Bindings\.g\.cs$', ''
+    $maker = ($dirName -split '-', 2)[0]
+    if ($name.Length -le $maker.Length -or -not $name.StartsWith($maker, [StringComparison]::OrdinalIgnoreCase)) {
+        throw "bsp/boards/$dirName/csharp/$($bindings[0].Name): the generated name does not begin with the maker '$maker' its directory names. Regenerate the family."
+    }
+    $name.Substring($maker.Length)
+}
+
+# The assembly's VENDOR segment, read from the same generated file for the same reason: the
+# generator already decided that `raspberry-pi` becomes `RaspberryPi`, and it emits the decided
+# value rather than the kebab one precisely so nothing downstream re-applies that rule.
+function Resolve-BoardVendor($csharpDir, $dirName) {
+    $bindings = @(Get-ChildItem $csharpDir -Filter '*Bindings.g.cs')
+    $text = Get-Content $bindings[0].FullName -Raw
+    if ($text -notmatch 'BOARD_VENDOR\s*=\s*"([^"]+)"') {
+        throw "bsp/boards/$dirName/csharp/$($bindings[0].Name): no BOARD_VENDOR. Regenerate the family."
+    }
+    $Matches[1]
+}
+
+# Every board's assembly name, `Lamella.Boards.<Vendor>.<Board>`, sorted, for each board this script
+# builds (a board directory with a `csharp` directory).
+function Get-BoardAssemblies {
+    $names = @(Get-BoardDirectories | Where-Object { Test-Path (Join-Path $_.FullName 'csharp') } | ForEach-Object {
+            $csharp = Join-Path $_.FullName 'csharp'
+            "Lamella.Boards.$(Resolve-BoardVendor $csharp $_.Name).$(Resolve-BoardName $csharp $_.Name)"
+        })
+    [Array]::Sort($names, [System.StringComparer]::Ordinal)
+    $names
+}
+
+# WHICH OTHER ASSEMBLIES MAY USE A LIBRARY's INTERNAL TYPES, and this is the one place those lists are
+# written. Lamella.Hardware's register access and converter seam (Mmio, AdcDriver, AdcControllers and
+# the rest) and System.Device.Gpio's bus seams (SpiDriver, I2cDriver, Buses and the rest) are internal,
+# and every board's assembly uses both: `bsp/common/csharp/TargetBoard.cs` hands out the board's
+# analog controller, a board class binds its buses, and a family's drivers derive from the seams and
+# reach their registers through Mmio. So each file names every board this script builds, and the few
+# libraries the table below adds, and a board build refuses to run while a committed file names a
+# different set, rather than failing on an inaccessible type in the first board added since.
+$InternalsVisibleTo = [ordered]@{
+    'Lamella.Hardware'   = @{ also = @('System.Device.Gpio'); why = 'System.Device.Gpio, whose build for a chip family carries drivers that use them' }
+    'System.Device.Gpio' = @{ also = @('Lamella.IO.Storage'); why = 'Lamella.IO.Storage, which asks which SPI bus a memory card is on' }
+}
+function Get-InternalsVisibleToPath([string]$library) { Join-Path $root "libs/$library/InternalsVisibleTo.g.cs" }
+function Get-InternalsVisibleToText([string]$library) {
+    $entry = $InternalsVisibleTo[$library]
+    $lines = @(
+        "// $library -- the other assemblies that may use this assembly's internal types and members.",
+        '// GENERATED by csharp/build-boards.ps1 -WriteInternalsVisibleTo from the boards under bsp/boards -- DO NOT EDIT.',
+        "// What $library declares internal is hidden from every assembly but the ones named here:",
+        "// each board's assembly, which builds its drivers and its board class on them, and",
+        "// $($entry.why)."
+    )
+    $names = @(@(Get-BoardAssemblies) + $entry.also)
+    [Array]::Sort($names, [System.StringComparer]::Ordinal)
+    foreach ($assembly in $names) {
+        $lines += "[assembly: System.Runtime.CompilerServices.InternalsVisibleTo(""$assembly"")]"
+    }
+    ($lines -join "`n") + "`n"
+}
+if ($WriteInternalsVisibleTo) {
+    foreach ($library in $InternalsVisibleTo.Keys) {
+        $path = Get-InternalsVisibleToPath $library
+        [IO.File]::WriteAllText($path, (Get-InternalsVisibleToText $library), [Text.UTF8Encoding]::new($false))
+        Write-Host "wrote $path"
+    }
+    exit 0
 }
 
 # -PrintBoards answers before anything is built: every board's directory, or with -Family only the
@@ -106,7 +190,7 @@ if (-not (Test-Path (Join-Path $CommonSources 'TargetBoard.cs'))) {
     throw "$CommonSources holds no TargetBoard.cs: every board assembly compiles it"
 }
 
-# --- Locate the compiler (same contract as build-managed.ps1) -----------------------------------
+# --- Locate the compiler (same contract as csharp/build-managed.ps1) -----------------------------------
 if (-not $Lcsc) {
     Write-Host 'Building lcsc (cargo build --release -p lcsc)...'
     & cargo build --release -p lcsc
@@ -121,22 +205,22 @@ if (-not (Test-Path $Lcsc)) {
 
 $out = if ([System.IO.Path]::IsPathRooted($OutDir)) { $OutDir } else { Join-Path $root $OutDir }
 if (-not (Test-Path $out)) {
-    throw "-OutDir '$out' does not exist. Run build-managed.ps1 -OutDir '$OutDir' first: this script references the assemblies it builds."
+    throw "-OutDir '$out' does not exist. Run csharp/build-managed.ps1 -OutDir '$OutDir' first: this script references the assemblies it builds."
 }
 foreach ($r in $BoardReferences) {
     if (-not (Test-Path (Join-Path $out "$r.dll"))) {
-        throw "'$r.dll' is not in '$out'. Run build-managed.ps1 -OutDir '$OutDir' first."
+        throw "'$r.dll' is not in '$out'. Run csharp/build-managed.ps1 -OutDir '$OutDir' first."
     }
 }
-# THE SURFACE DEFAULTS TO THE LIBRARIES', read from `build-managed.ps1` rather than repeated here so
+# THE SURFACE DEFAULTS TO THE LIBRARIES', read from `csharp/build-managed.ps1` rather than repeated here so
 # the two cannot drift. A board's sources gate members on the same symbols the libraries do -- the
 # SAM D21 PWM classes on LAMELLA_SURFACE_FLOAT, which `PwmChannel.DutyCycle` needs -- so a board
 # compiled with none of them against libraries compiled with all of them binds no PWM chip, while
 # `PwmChannel.Create` is there to ask for one. A reduced surface is passed as -Define to both scripts.
 if (-not $Define) {
-    $Define = @(& pwsh -NoProfile -File (Join-Path $root 'build-managed.ps1') -PrintSurface)
+    $Define = @(& pwsh -NoProfile -File (Join-Path $root 'csharp/build-managed.ps1') -PrintSurface)
     if ($LASTEXITCODE -ne 0 -or -not $Define.Count) {
-        throw 'build-managed.ps1 -PrintSurface named no symbols, so the default surface is unknown. Pass -Define.'
+        throw 'csharp/build-managed.ps1 -PrintSurface named no symbols, so the default surface is unknown. Pass -Define.'
     }
 }
 
@@ -147,7 +231,7 @@ if (-not $Define) {
 $defineArg = @(if ($Define) { "/define:$($Define -join ';')" })
 
 # Sorted by the path RELATIVE to $dir, separators normalized, ORDINAL -- so emitted metadata does
-# not depend on the filesystem's enumeration order or on the host's culture. `build-managed.ps1`
+# not depend on the filesystem's enumeration order or on the host's culture. `csharp/build-managed.ps1`
 # sorts identically: two scripts laying out metadata differently would produce assemblies that
 # differ byte-for-byte for no reason visible in the sources.
 # EVERY CALLER MUST WRAP THIS IN @(): PowerShell unrolls a single result to a bare string, which
@@ -217,39 +301,14 @@ function Resolve-ExtensionSources($root, $standards) {
     $out
 }
 
-# The assembly's board name: the GENERATED bindings name, less the maker it begins with. A board id is
-# `<maker>-<product>`, and the assembly's vendor segment already says who made the board, so keeping
-# the maker in the board part would say it twice -- `Lamella.Boards.RaspberryPi.RpiPico2` rather than
-# `Lamella.Boards.RaspberryPi.Pico2`. The name comes from the generated file rather than from the
-# directory, because the generator already decided how `adafruit-feather-m0-adalogger` becomes
-# `AdafruitFeatherM0Adalogger`, and a second copy of that casing rule here could disagree with the
-# first. Removing the maker takes only its LENGTH from the directory name, so no casing is re-applied.
-function Resolve-BoardName($csharpDir, $dirName) {
-    $bindings = @(Get-ChildItem $csharpDir -Filter '*Bindings.g.cs')
-    if ($bindings.Count -ne 1) {
-        throw "bsp/boards/$dirName/csharp: expected exactly one *Bindings.g.cs to name the board, found $($bindings.Count). Regenerate the family."
-    }
-    $name = $bindings[0].Name -replace 'Bindings\.g\.cs$', ''
-    $maker = ($dirName -split '-', 2)[0]
-    if ($name.Length -le $maker.Length -or -not $name.StartsWith($maker, [StringComparison]::OrdinalIgnoreCase)) {
-        throw "bsp/boards/$dirName/csharp/$($bindings[0].Name): the generated name does not begin with the maker '$maker' its directory names. Regenerate the family."
-    }
-    $name.Substring($maker.Length)
-}
-
-# The assembly's VENDOR segment, read from the same generated file for the same reason: the
-# generator already decided that `raspberry-pi` becomes `RaspberryPi`, and it emits the decided
-# value rather than the kebab one precisely so nothing downstream re-applies that rule.
-function Resolve-BoardVendor($csharpDir, $dirName) {
-    $bindings = @(Get-ChildItem $csharpDir -Filter '*Bindings.g.cs')
-    $text = Get-Content $bindings[0].FullName -Raw
-    if ($text -notmatch 'BOARD_VENDOR\s*=\s*"([^"]+)"') {
-        throw "bsp/boards/$dirName/csharp/$($bindings[0].Name): no BOARD_VENDOR. Regenerate the family."
-    }
-    $Matches[1]
-}
-
 # --- Build --------------------------------------------------------------------------------------
+foreach ($library in $InternalsVisibleTo.Keys) {
+    $path = Get-InternalsVisibleToPath $library
+    $committed = if (Test-Path -LiteralPath $path) { [IO.File]::ReadAllText($path).Replace("`r`n", "`n") } else { '' }
+    if ($committed -ne (Get-InternalsVisibleToText $library)) {
+        throw "libs/$library/InternalsVisibleTo.g.cs does not name exactly the boards this script builds and the libraries it adds, so a board's assembly would not reach $library's internal seams. Run csharp/build-boards.ps1 -WriteInternalsVisibleTo, then csharp/build-managed.ps1 again."
+    }
+}
 $boards = @(Get-BoardDirectories | Where-Object { Test-Path (Join-Path $_.FullName 'csharp') })
 if ($Board) {
     $boards = @($boards | Where-Object { $_.Name -eq $Board })
@@ -279,13 +338,13 @@ foreach ($boardDir in $boards) {
     $gpioDll = Join-Path $out 'System.Device.Gpio.dll'
     $cspNote = "csp/$family"
     # The family's own System.Device.Gpio carries some csp sources: they are left out here, and the
-    # assembly is compiled against that build. build-managed.ps1, which compiles them, says which they
+    # assembly is compiled against that build. csharp/build-managed.ps1, which compiles them, says which they
     # are, so one reader of the list serves both scripts.
     if (Test-Path (Join-Path $root "libs/System.Device.Gpio/Families/$family.cs")) {
         if (-not $FamilySources.ContainsKey($family)) {
-            $listed = @(& pwsh -NoProfile -File (Join-Path $root 'build-managed.ps1') -PrintFamilySources $family)
+            $listed = @(& pwsh -NoProfile -File (Join-Path $root 'csharp/build-managed.ps1') -PrintFamilySources $family)
             if ($LASTEXITCODE -ne 0 -or -not $listed.Count) {
-                throw "build-managed.ps1 -PrintFamilySources $family named no sources, so which csp/$family/csharp sources its System.Device.Gpio carries is unknown"
+                throw "csharp/build-managed.ps1 -PrintFamilySources $family named no sources, so which csp/$family/csharp sources its System.Device.Gpio carries is unknown"
             }
             $FamilySources[$family] = $listed
         }
@@ -293,7 +352,7 @@ foreach ($boardDir in $boards) {
         $cspSrc = @($cspSrc | Where-Object { $FamilySources[$family] -notcontains $_.Substring($prefix).Replace('\', '/') })
         $gpioDll = Join-Path $out "families/$family/System.Device.Gpio.dll"
         if (-not (Test-Path $gpioDll)) {
-            throw "'families/$family/System.Device.Gpio.dll' is not in '$out'. Run build-managed.ps1 -OutDir '$OutDir' first."
+            throw "'families/$family/System.Device.Gpio.dll' is not in '$out'. Run csharp/build-managed.ps1 -OutDir '$OutDir' first."
         }
         $cspNote = "csp/$family less its System.Device.Gpio's $($FamilySources[$family].Count)"
     }

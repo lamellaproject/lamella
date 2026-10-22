@@ -5,7 +5,9 @@
 use crate::interp_backend::InterpreterBackend;
 use crate::frame_eval;
 use crate::protocol::{Event, Message, Request, Response};
-use lamella_debug_backend::{ChildReference, DebugBackend, Scope, Stop, Variable};
+use lamella_debug_backend::{
+    ChildReference, DebugBackend, ExceptionFilter, ExceptionInfo, Scope, Stop, Variable,
+};
 #[cfg(feature = "interpreter")]
 use lamella_cil_runtime::Module;
 use serde_json::{Value as Json, json};
@@ -37,6 +39,15 @@ pub struct Debugger {
     /// wipe the source breakpoints.
     source_breakpoints: Vec<u64>,
     instruction_breakpoints: Vec<u64>,
+    /// Function breakpoints, by the addresses their names resolved to, kept apart from the source and
+    /// instruction breakpoints so that each kind's request replaces only that kind.
+    function_breakpoints: Vec<u64>,
+    /// The exception the target is stopped on, which `exceptionInfo` describes; cleared once the
+    /// target runs again.
+    stopped_exception: Option<ExceptionInfo>,
+    /// Whether the backend has ended the program ([`DebugBackend::terminate`]), so the session has
+    /// no hold left on the target to release.
+    terminated: bool,
     /// Per-source-breakpoint hit-count / logpoint behavior, by code address. Rebuilt on each
     /// `setBreakpoints`; an address with no entry is an ordinary breakpoint that always stops.
     breakpoint_meta: Vec<BreakpointMeta>,
@@ -137,6 +148,9 @@ impl Debugger {
             running: false,
             source_breakpoints: Vec::new(),
             instruction_breakpoints: Vec::new(),
+            function_breakpoints: Vec::new(),
+            stopped_exception: None,
+            terminated: false,
             breakpoint_meta: Vec::new(),
             last_inactive_note: 0,
             noted_absent_variables: false,
@@ -201,37 +215,109 @@ impl Debugger {
     /// way -- the client's stream closing, or a frame that cannot be read or written. See
     /// [`DebugBackend::release`].
     ///
+    /// A target the session terminated is not released: ending the program ended the session's hold
+    /// on it.
+    ///
     /// # Errors
     /// The backend's reason, when the target could not be released and may still be stopped.
     pub fn release_target(&mut self) -> Result<(), String> {
         self.running = false;
+        if self.terminated {
+            return Ok(());
+        }
         self.backend.release()
+    }
+
+    /// Ends the program through the backend, and with it the session's hold on the target.
+    fn end_program(&mut self) -> Result<(), String> {
+        self.running = false;
+        let ended = self.backend.terminate();
+        if ended.is_ok() {
+            self.terminated = true;
+            self.launched = false;
+            self.stopped_exception = None;
+        }
+        ended
     }
 
     /// Handles one DAP request, returning the response followed by any events.
     pub fn handle(&mut self, request: &Request) -> Vec<Message> {
         let mut events: Vec<(&str, Option<Json>)> = Vec::new();
         let (success, body) = match request.command.as_str() {
-            "initialize" => (true, Some(capabilities(self.backend.can_set_variables()))),
-            "launch" => {
+            "initialize" => (true, Some(capabilities(self.backend.as_ref()))),
+            "launch" | "attach" => {
                 if let Some(reason) = self.refusal.clone() {
                     return self.fail_for_user(request, ERROR_SESSION_REFUSED, &reason);
                 }
-                let launched = self.launch(request);
+                let attaching = request.command == "attach";
+                let started = self.start(request, attaching);
                 self.flush_output(&mut events);
-                if let Err(reason) = launched {
+                if let Err(reason) = started {
                     let mut out: Vec<Message> =
                         events.into_iter().map(|(event, body)| self.event(event, body)).collect();
-                    out.extend(self.fail_for_user(
-                        request,
-                        ERROR_LAUNCH_FAILED,
-                        &format!("The session could not start: {reason}"),
-                    ));
+                    let (id, failed) = if attaching {
+                        (ERROR_ATTACH_FAILED, "The session could not attach")
+                    } else {
+                        (ERROR_LAUNCH_FAILED, "The session could not start")
+                    };
+                    out.extend(self.fail_for_user(request, id, &format!("{failed}: {reason}")));
                     return out;
                 }
                 events.push(("initialized", None));
                 (true, None)
             }
+            "restart" => {
+                if !self.backend.can_restart() {
+                    return self.fail(
+                        request,
+                        "This target cannot restart its program within a session. End the session \
+                         and start a new one.",
+                    );
+                }
+                if let Err(reason) = self.backend.restart() {
+                    return self.fail_for_user(
+                        request,
+                        ERROR_RESTART_FAILED,
+                        &format!("The program could not be restarted: {reason}"),
+                    );
+                }
+                for meta in &mut self.breakpoint_meta {
+                    meta.hits = 0;
+                }
+                self.stopped_exception = None;
+                self.terminated = false;
+                self.launched = true;
+                if self.stop_on_entry {
+                    events.push(("stopped", Some(stopped("entry"))));
+                } else {
+                    self.run(Action::Resume, &mut events);
+                }
+                (true, None)
+            }
+            "terminate" => {
+                if !self.backend.can_terminate() {
+                    return self.fail(
+                        request,
+                        "This target cannot end its program from the debugger. Disconnecting \
+                         leaves the program running.",
+                    );
+                }
+                if let Err(reason) = self.end_program() {
+                    return self.fail_for_user(
+                        request,
+                        ERROR_TERMINATE_FAILED,
+                        &format!("The program could not be ended: {reason}"),
+                    );
+                }
+                events.push(("terminated", None));
+                (true, None)
+            }
+            "setExceptionBreakpoints" => (true, Some(self.set_exception_breakpoints(request))),
+            "exceptionInfo" => match &self.stopped_exception {
+                Some(info) => (true, Some(exception_info_body(info))),
+                None => return self.fail(request, "The program is not stopped on an exception."),
+            },
+            "setFunctionBreakpoints" => (true, Some(self.set_function_breakpoints(request))),
             "configurationDone" => {
                 if self.stop_on_entry {
                     events.push(("stopped", Some(stopped("entry"))));
@@ -287,19 +373,35 @@ impl Debugger {
             "setInstructionBreakpoints" => (true, Some(self.set_instruction_breakpoints(request))),
             "disassemble" => (true, Some(self.disassemble(request))),
             "evaluate" => return self.evaluate(request),
-            "disconnect" => match self.release_target() {
-                Ok(()) => (true, None),
-                Err(reason) => {
-                    return self.fail_for_user(
-                        request,
-                        ERROR_TARGET_NOT_RELEASED,
-                        &format!(
-                            "The session has ended, but the target could not be released and may \
-                             still be stopped: {reason}"
-                        ),
-                    );
+            "disconnect" => {
+                let terminate = arg_bool(request, "terminateDebuggee")
+                    && self.backend.can_terminate()
+                    && !self.terminated;
+                let ended = if terminate { self.end_program() } else { self.release_target() };
+                match ended {
+                    Ok(()) => (true, None),
+                    Err(reason) if terminate => {
+                        return self.fail_for_user(
+                            request,
+                            ERROR_TERMINATE_FAILED,
+                            &format!(
+                                "The session has ended, but the program could not be ended and \
+                                 may still be running or stopped: {reason}"
+                            ),
+                        );
+                    }
+                    Err(reason) => {
+                        return self.fail_for_user(
+                            request,
+                            ERROR_TARGET_NOT_RELEASED,
+                            &format!(
+                                "The session has ended, but the target could not be released and \
+                                 may still be stopped: {reason}"
+                            ),
+                        );
+                    }
                 }
-            },
+            }
             _ => (false, None),
         };
 
@@ -311,26 +413,124 @@ impl Debugger {
         out
     }
 
-    fn launch(&mut self, request: &Request) -> Result<(), String> {
-        self.stop_on_entry = request
-            .arguments
-            .as_ref()
-            .and_then(|arguments| arguments.get("stopOnEntry"))
-            .and_then(Json::as_bool)
-            .unwrap_or(false);
-        let launched = self.backend.launch();
-        self.launched = launched.is_ok();
-        launched
+    /// Starts the session's target, launched at its entry point or attached to where it already runs,
+    /// and records whether `launch` asked to stop at the entry.
+    fn start(&mut self, request: &Request, attaching: bool) -> Result<(), String> {
+        let started = if attaching {
+            self.stop_on_entry = false;
+            self.backend.attach()
+        } else {
+            self.stop_on_entry = arg_bool(request, "stopOnEntry");
+            self.backend.launch()
+        };
+        self.launched = started.is_ok();
+        started
     }
 
-    /// Programs the backend with the union of source and instruction breakpoints. They share
-    /// the backend's single comparator set, so both kinds must be re-applied together;
-    /// applying only one would erase the other (VS Code sends an empty
+    /// Programs the backend with the union of source, instruction and function breakpoints. They
+    /// share the backend's single comparator set, so every kind must be re-applied together;
+    /// applying only one would erase the others (VS Code sends an empty
     /// `setInstructionBreakpoints` right after `setBreakpoints`, which otherwise wipes them).
     fn apply_breakpoints(&mut self) -> Result<(), String> {
         let mut all = self.source_breakpoints.clone();
         all.extend_from_slice(&self.instruction_breakpoints);
+        all.extend_from_slice(&self.function_breakpoints);
         self.backend.set_breakpoints(&all)
+    }
+
+    /// Replaces the armed exception filters with the ones a `setExceptionBreakpoints` names, and
+    /// answers each with whether it is armed, in the order they were named, which is how DAP pairs
+    /// the answers with the request.
+    fn set_exception_breakpoints(&mut self, request: &Request) -> Json {
+        let named: Vec<String> = request
+            .arguments
+            .as_ref()
+            .and_then(|args| args.get("filters"))
+            .and_then(Json::as_array)
+            .map(|ids| ids.iter().filter_map(Json::as_str).map(String::from).collect())
+            .unwrap_or_default();
+        let offered = self.backend.exception_filters();
+        let mut armed: Vec<ExceptionFilter> = Vec::new();
+        let mut results = Vec::with_capacity(named.len());
+        for id in &named {
+            match filter_named(id).filter(|filter| offered.contains(filter)) {
+                Some(filter) => {
+                    if !armed.contains(&filter) {
+                        armed.push(filter);
+                    }
+                    results.push(json!({ "verified": true }));
+                }
+                None => results.push(unverified(
+                    REASON_FAILED,
+                    format!("This target offers no exception filter named {id}."),
+                )),
+            }
+        }
+        if let Err(reason) = self.backend.set_exception_filters(&armed) {
+            withdraw_verification(&mut results, &reason);
+        }
+        json!({ "breakpoints": results })
+    }
+
+    /// Replaces the function breakpoints. Each names a method, and the backend resolves the name to
+    /// the first instruction of every method it matches; a name that matches none is reported
+    /// unverified.
+    fn set_function_breakpoints(&mut self, request: &Request) -> Json {
+        let specs = request
+            .arguments
+            .as_ref()
+            .and_then(|args| args.get("breakpoints"))
+            .and_then(Json::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let cap = self.backend.max_breakpoints();
+        let ahead = self.source_breakpoints.len() + self.instruction_breakpoints.len();
+        let resolves = self.backend.can_break_on_functions();
+        let mut addresses: Vec<u64> = Vec::new();
+        let mut results = Vec::with_capacity(specs.len());
+        for spec in &specs {
+            if !resolves {
+                results.push(unverified(
+                    REASON_FAILED,
+                    String::from(
+                        "This target cannot set a breakpoint on a method by its name. Set one on a \
+                         line of the method instead.",
+                    ),
+                ));
+                continue;
+            }
+            let name = spec.get("name").and_then(Json::as_str).unwrap_or_default().trim();
+            let bound = if name.is_empty() {
+                Vec::new()
+            } else {
+                self.backend.resolve_function_breakpoint(name)
+            };
+            let Some(&first) = bound.first() else {
+                results.push(unverified(
+                    REASON_FAILED,
+                    format!("No method named {name} was found, so no breakpoint can be set on it."),
+                ));
+                continue;
+            };
+            let armed = cap.map_or(true, |max| ahead + addresses.len() + bound.len() <= max);
+            addresses.extend_from_slice(&bound);
+            let mut breakpoint =
+                json!({ "verified": armed, "instructionReference": first.to_string() });
+            if let Some(location) = self.backend.source_location(first) {
+                breakpoint["line"] = json!(location.line);
+                breakpoint["source"] = json!({ "path": location.file });
+            }
+            if !armed {
+                breakpoint["message"] = json!(over_capacity_message(cap));
+                breakpoint["reason"] = json!(REASON_PENDING);
+            }
+            results.push(breakpoint);
+        }
+        self.function_breakpoints = addresses;
+        if let Err(reason) = self.apply_breakpoints() {
+            withdraw_verification(&mut results, &reason);
+        }
+        json!({ "breakpoints": results })
     }
 
     /// Replaces the instruction breakpoints. Each is an opaque code address carried in
@@ -470,6 +670,7 @@ impl Debugger {
     /// Runs the target for one command and emits the resulting output + stop/terminate
     /// events.
     fn run(&mut self, action: Action, events: &mut Vec<(&'static str, Option<Json>)>) {
+        self.stopped_exception = None;
         if matches!(action, Action::Resume) {
             self.note_inactive_breakpoints(events);
         }
@@ -538,7 +739,9 @@ impl Debugger {
         let Some(max) = self.backend.max_breakpoints() else {
             return;
         };
-        let total = self.source_breakpoints.len() + self.instruction_breakpoints.len();
+        let total = self.source_breakpoints.len()
+            + self.instruction_breakpoints.len()
+            + self.function_breakpoints.len();
         let inactive = total.saturating_sub(max);
         if inactive == self.last_inactive_note {
             return;
@@ -573,12 +776,8 @@ impl Debugger {
         let mut budget = self.backend.step_budget().max(1);
         loop {
             match self.backend.step() {
-                Stop::Done => break Stop::Done,
-                Stop::Fault(message) => break Stop::Fault(message),
-                Stop::Running => break Stop::Running,
-                Stop::Breakpoint => break Stop::Breakpoint,
-                _ if reached(self.backend.depth(), start) => break Stop::Step,
-                _ => {
+                Stop::Step if reached(self.backend.depth(), start) => break Stop::Step,
+                Stop::Step => {
                     budget -= 1;
                     if budget == 0 {
                         break self.give_up_stepping(
@@ -587,6 +786,7 @@ impl Debugger {
                         );
                     }
                 }
+                other => break other,
             }
         }
     }
@@ -650,42 +850,35 @@ impl Debugger {
         let mut budget = self.backend.step_budget().max(1);
         loop {
             match self.backend.step() {
-                Stop::Done => break Stop::Done,
-                Stop::Fault(message) => break Stop::Fault(message),
-                Stop::Running => break Stop::Running,
-                Stop::Breakpoint => break Stop::Breakpoint,
-                _ => {
-                    if matches!(action, Action::StepOver | Action::StepOut)
-                        && self.backend.depth() > start
-                    {
-                        match self.backend.run_to_return() {
-                            Stop::Step => {}
-                            other => break other,
-                        }
-                    }
-                    if matches!(action, Action::StepIn)
-                        && self.backend.depth() > start
-                        && !self.innermost_frame_has_source()
-                    {
-                        match self.backend.run_to_return() {
-                            Stop::Step => {}
-                            other => break other,
-                        }
-                    }
-                    let reached = match action {
-                        Action::StepIn | Action::Resume => true,
-                        Action::StepOver => self.backend.depth() <= start,
-                        Action::StepOut => self.backend.depth() < start,
-                    };
-                    if reached && self.backend.at_source_boundary() {
-                        break Stop::Step;
-                    }
-                    budget -= 1;
-                    if budget == 0 {
-                        break self
-                            .give_up_stepping("no source statement was reached", events);
-                    }
+                Stop::Step => {}
+                other => break other,
+            }
+            if matches!(action, Action::StepOver | Action::StepOut) && self.backend.depth() > start {
+                match self.backend.run_to_return() {
+                    Stop::Step => {}
+                    other => break other,
                 }
+            }
+            if matches!(action, Action::StepIn)
+                && self.backend.depth() > start
+                && !self.innermost_frame_has_source()
+            {
+                match self.backend.run_to_return() {
+                    Stop::Step => {}
+                    other => break other,
+                }
+            }
+            let reached = match action {
+                Action::StepIn | Action::Resume => true,
+                Action::StepOver => self.backend.depth() <= start,
+                Action::StepOut => self.backend.depth() < start,
+            };
+            if reached && self.backend.at_source_boundary() {
+                break Stop::Step;
+            }
+            budget -= 1;
+            if budget == 0 {
+                break self.give_up_stepping("no source statement was reached", events);
             }
         }
     }
@@ -705,6 +898,10 @@ impl Debugger {
         match stop {
             Stop::Breakpoint => events.push(("stopped", Some(stopped("breakpoint")))),
             Stop::Step => events.push(("stopped", Some(stopped("step")))),
+            Stop::Exception(info) => {
+                events.push(("stopped", Some(stopped_on_exception(&info))));
+                self.stopped_exception = Some(info);
+            }
             Stop::Done => {
                 let exit_code = self.backend.exit_code();
                 events.push(("exited", Some(json!({ "exitCode": exit_code }))));
@@ -1085,6 +1282,72 @@ fn stopped(reason: &str) -> Json {
     json!({ "reason": reason, "threadId": 1, "allThreadsStopped": true })
 }
 
+/// The `stopped` event for an exception stop, with the exception's type as the text a client shows
+/// beside the stop.
+fn stopped_on_exception(info: &ExceptionInfo) -> Json {
+    let mut body = stopped("exception");
+    body["description"] = json!("Paused on exception");
+    body["text"] = json!(info.type_name);
+    body
+}
+
+/// The `exceptionInfo` answer for the exception the program is stopped on.
+///
+/// `breakMode` says why it stopped, in DAP's words: `always` for a stop the `all` filter made at a
+/// throw, and `unhandled` for a throw that nothing will catch.
+fn exception_info_body(info: &ExceptionInfo) -> Json {
+    let short_name = info.type_name.rsplit('.').next().unwrap_or(&info.type_name);
+    let break_mode = match info.filter {
+        ExceptionFilter::All => "always",
+        ExceptionFilter::Uncaught => "unhandled",
+    };
+    let mut body = json!({
+        "exceptionId": info.type_name,
+        "breakMode": break_mode,
+        "details": { "typeName": short_name, "fullTypeName": info.type_name },
+    });
+    if !info.message.is_empty() {
+        body["description"] = json!(info.message);
+        body["details"]["message"] = json!(info.message);
+    }
+    body
+}
+
+/// The DAP filter id of an exception filter, as `initialize` offers it and `setExceptionBreakpoints`
+/// names it.
+fn filter_id(filter: ExceptionFilter) -> &'static str {
+    match filter {
+        ExceptionFilter::All => "all",
+        ExceptionFilter::Uncaught => "uncaught",
+    }
+}
+
+/// The exception filter a DAP filter id names, the inverse of [`filter_id`].
+fn filter_named(id: &str) -> Option<ExceptionFilter> {
+    [ExceptionFilter::All, ExceptionFilter::Uncaught]
+        .into_iter()
+        .find(|filter| filter_id(*filter) == id)
+}
+
+/// How `initialize` offers an exception filter to the user. Uncaught exceptions are on by default,
+/// because a throw that nothing catches ends the run, and stopping where it happened is what a
+/// user debugging the program wants.
+fn filter_offer(filter: ExceptionFilter) -> Json {
+    let (label, description, default) = match filter {
+        ExceptionFilter::All => (
+            "All Exceptions",
+            "Stop wherever an exception is thrown, whether or not something catches it.",
+            false,
+        ),
+        ExceptionFilter::Uncaught => (
+            "Uncaught Exceptions",
+            "Stop where an exception is thrown that nothing will catch.",
+            true,
+        ),
+    };
+    json!({ "filter": filter_id(filter), "label": label, "description": description, "default": default })
+}
+
 /// Where the `variablesReference`s for a value's MEMBERS begin; a frame's scopes use the numbers
 /// below it (`frame * 3 + scope + 1`).
 ///
@@ -1119,6 +1382,18 @@ const ERROR_TARGET_NOT_RELEASED: u32 = 2;
 /// The identifier of the error shown when the backend could not start the target
 /// ([`DebugBackend::launch`]).
 const ERROR_LAUNCH_FAILED: u32 = 3;
+
+/// The identifier of the error shown when the backend could not attach to the target
+/// ([`DebugBackend::attach`]).
+const ERROR_ATTACH_FAILED: u32 = 4;
+
+/// The identifier of the error shown when the backend could not end the program
+/// ([`DebugBackend::terminate`]).
+const ERROR_TERMINATE_FAILED: u32 = 5;
+
+/// The identifier of the error shown when the backend could not restart the program
+/// ([`DebugBackend::restart`]).
+const ERROR_RESTART_FAILED: u32 = 6;
 
 /// The backend behind [`Debugger::refusing`]. There is no target: nothing starts, and every question
 /// about a program has an empty answer.
@@ -1165,25 +1440,36 @@ impl DebugBackend for Unstartable {
     }
 }
 
-/// What this adapter tells the client it can do, in the `initialize` response.
+/// What this adapter tells the client it can do, for the backend it drives, in the `initialize`
+/// response.
 ///
 /// A client asks for nothing it has not been told about, so a capability left out here is a
 /// feature that never gets exercised and leaves no trace of why: `supportsEvaluateForHovers` is
 /// what makes an editor send an `evaluate` when the pointer rests on a variable, and without it
 /// no hover request is made, no hover appears, and the server sees no request to explain it.
-/// What this adapter tells a client it can do, for the backend it drives.
 ///
-/// `set_variables` is the BACKEND's answer, because the adapter can offer an edit only where the
-/// target can make one: advertised to every backend, it put a "Set Value" in the editor that every
-/// device refused.
-fn capabilities(set_variables: bool) -> Json {
-    json!({
+/// Every answer read from `backend` is one the adapter can honor only where the target can carry it
+/// out: a "Set Value" offered to every backend is one every device refuses, and an exception filter
+/// offered by a target that cannot stop on an exception is a checkbox that does nothing.
+fn capabilities(backend: &dyn DebugBackend) -> Json {
+    let mut offered = json!({
         "supportsConfigurationDoneRequest": true,
         "supportsInstructionBreakpoints": true,
         "supportsDisassembleRequest": true,
-        "supportsSetVariable": set_variables,
+        "supportsSetVariable": backend.can_set_variables(),
         "supportsEvaluateForHovers": true,
-    })
+        "supportsTerminateRequest": backend.can_terminate(),
+        "supportTerminateDebuggee": backend.can_terminate(),
+        "supportsRestartRequest": backend.can_restart(),
+        "supportsFunctionBreakpoints": backend.can_break_on_functions(),
+    });
+    let filters = backend.exception_filters();
+    if !filters.is_empty() {
+        offered["exceptionBreakpointFilters"] =
+            json!(filters.iter().map(|&filter| filter_offer(filter)).collect::<Vec<_>>());
+        offered["supportsExceptionInfoRequest"] = json!(true);
+    }
+    offered
 }
 
 fn arg_u32(request: &Request, field: &str) -> u32 {
@@ -1209,6 +1495,16 @@ fn arg_str<'r>(request: &'r Request, field: &str) -> &'r str {
         .and_then(|args| args.get(field))
         .and_then(Json::as_str)
         .unwrap_or("")
+}
+
+/// A flag argument, false when the client left it out.
+fn arg_bool(request: &Request, field: &str) -> bool {
+    request
+        .arguments
+        .as_ref()
+        .and_then(|args| args.get(field))
+        .and_then(Json::as_bool)
+        .unwrap_or(false)
 }
 
 #[cfg(all(test, feature = "interpreter"))]

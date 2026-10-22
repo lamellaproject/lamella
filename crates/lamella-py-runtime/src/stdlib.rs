@@ -214,6 +214,18 @@ enum StdlibFn {
     HeapqPushPopMax,
     /// `_heapq.heapify_max(list)` -- rearranges `list` into a max-heap, in place.
     HeapqHeapifyMax,
+    /// `_bisect.bisect_left(a, x, lo=0, hi=None, *, key=None)` -- the index at which `x` goes into
+    /// the sorted `a`, before the entries equal to it.
+    BisectLeft,
+    /// `_bisect.bisect_right(a, x, lo=0, hi=None, *, key=None)` -- the index at which `x` goes into
+    /// the sorted `a`, after the entries equal to it.
+    BisectRight,
+    /// `_bisect.insort_left(a, x, lo=0, hi=None, *, key=None)` -- inserts `x` into the sorted `a`,
+    /// before the entries equal to it.
+    InsortLeft,
+    /// `_bisect.insort_right(a, x, lo=0, hi=None, *, key=None)` -- inserts `x` into the sorted `a`,
+    /// after the entries equal to it.
+    InsortRight,
     /// NOT A FUNCTION. One past the last real variant, so the coverage guard below can count them
     /// without naming which one is last.
     ///
@@ -332,6 +344,9 @@ impl StdlibFn {
             n if (HeapqPush as u32..HeapqPush as u32 + HEAPQ_FUNCTIONS.len() as u32).contains(&n) => {
                 HEAPQ_FUNCTIONS[(n - HeapqPush as u32) as usize]
             }
+            n if (BisectLeft as u32..BisectLeft as u32 + BISECT_FUNCTIONS.len() as u32).contains(&n) => {
+                BISECT_FUNCTIONS[(n - BisectLeft as u32) as usize]
+            }
             _ => return None,
         })
     }
@@ -439,6 +454,10 @@ impl StdlibFn {
             HeapqReplaceMax => "heapreplace_max",
             HeapqPushPopMax => "heappushpop_max",
             HeapqHeapifyMax => "heapify_max",
+            BisectLeft => "bisect_left",
+            BisectRight => "bisect_right",
+            InsortLeft => "insort_left",
+            InsortRight => "insort_right",
         }
     }
 
@@ -461,6 +480,18 @@ impl StdlibFn {
             _ => return None,
         })
     }
+
+    /// The `_bisect` function this is, or `None` for a function of another module.
+    fn bisect_function(self) -> Option<crate::bisect::Function> {
+        use crate::bisect::Function;
+        Some(match self {
+            StdlibFn::BisectLeft => Function::BisectLeft,
+            StdlibFn::BisectRight => Function::BisectRight,
+            StdlibFn::InsortLeft => Function::InsortLeft,
+            StdlibFn::InsortRight => Function::InsortRight,
+            _ => return None,
+        })
+    }
 }
 
 /// `_heapq`'s functions, in their declaration order: `from_id` indexes this by id.
@@ -477,9 +508,14 @@ const HEAPQ_FUNCTIONS: [StdlibFn; 10] = [
     StdlibFn::HeapqHeapifyMax,
 ];
 
-/// Dispatches a KEYWORD call of stdlib function `id`. The only stdlib keyword surface is
-/// `deque(iterable, maxlen=N)`; any other stdlib function with no keywords falls back to the
-/// positional dispatch (a `*`-unpacking call), and a genuine keyword elsewhere is a TypeError.
+/// `_bisect`'s functions, in their declaration order: `from_id` indexes this by id.
+const BISECT_FUNCTIONS: [StdlibFn; 4] =
+    [StdlibFn::BisectLeft, StdlibFn::BisectRight, StdlibFn::InsortLeft, StdlibFn::InsortRight];
+
+/// Dispatches a KEYWORD call of stdlib function `id`. The stdlib keyword surfaces are
+/// `deque(iterable, maxlen=N)` and `_bisect`'s functions, which bind their own arguments; any other
+/// stdlib function with no keywords falls back to the positional dispatch (a `*`-unpacking call),
+/// and a genuine keyword elsewhere is a TypeError.
 pub fn call_stdlib_kw(
     id: u32,
     posargs: &[Value],
@@ -508,6 +544,11 @@ pub fn call_stdlib_kw(
         }
         args.push(maxlen);
         return call_stdlib(id, &args, functions, model, depth);
+    }
+    if let Some(f) = StdlibFn::from_id(id)
+        && let Some(function) = f.bisect_function()
+    {
+        return crate::bisect::call(function, f.python_name(), posargs, kwargs, functions, model, depth);
     }
     if kwargs.is_empty() {
         return call_stdlib(id, posargs, functions, model, depth);
@@ -642,6 +683,7 @@ pub fn build_module(name: &str, model: &mut ObjectModel) -> Option<Result<Value,
         "_struct" => Some(build_struct_seam_module(model)),
         "weakref" => Some(build_weakref_module(model)),
         "_heapq" => Some(build_heapq_module(model)),
+        "_bisect" => Some(build_bisect_module(model)),
         "_reactor" => Some(build_reactor_module(model)),
         "_socket" => Some(build_socket_module(model)),
         "_sys" => Some(build_sys_seam_module(model)),
@@ -814,6 +856,18 @@ fn build_thread_module(model: &mut ObjectModel) -> Result<Value, Trap> {
 fn build_heapq_module(model: &mut ObjectModel) -> Result<Value, Trap> {
     let mut entries: Vec<(Value, Value)> = Vec::new();
     for f in HEAPQ_FUNCTIONS {
+        let key = model.new_str(f.python_name())?;
+        entries.push((key, Value::builtin_ref(f.id())));
+    }
+    let namespace = model.new_dict(entries)?;
+    model.new_module(namespace)
+}
+
+/// Builds `_bisect`: the two searches and the two insertions, which `bisect` imports and re-exports
+/// beside its aliases `bisect` and `insort`.
+fn build_bisect_module(model: &mut ObjectModel) -> Result<Value, Trap> {
+    let mut entries: Vec<(Value, Value)> = Vec::new();
+    for f in BISECT_FUNCTIONS {
         let key = model.new_str(f.python_name())?;
         entries.push((key, Value::builtin_ref(f.id())));
     }
@@ -1307,6 +1361,10 @@ pub fn call_stdlib(
             let (op, is_max) = f.heap_op().ok_or(Trap::Malformed)?;
             crate::heapq::call(op, is_max, f.python_name(), args, functions, model, depth)
         }
+        f @ (BisectLeft | BisectRight | InsortLeft | InsortRight) => {
+            let function = f.bisect_function().ok_or(Trap::Malformed)?;
+            crate::bisect::call(function, f.python_name(), args, &[], functions, model, depth)
+        }
         SocketTcpConnect => {
             let [addr, port] = args else { return Err(Trap::TypeError) };
             let (addr, port) = (addr_arg(model, *addr)?, port_arg(model, *port)?);
@@ -1703,7 +1761,7 @@ pub fn call_stdlib(
                     for item in items {
                         let mut found = false;
                         for entry in &mut counts {
-                            if crate::interp::elem_eq(item, entry.0, functions, model, depth)? {
+                            if crate::interp::elem_eq(entry.0, item, functions, model, depth)? {
                                 entry.1 += 1;
                                 found = true;
                                 break;

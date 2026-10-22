@@ -499,10 +499,7 @@ pub(crate) fn fold_const_unary(operator: UnaryOperator, operand: &Literal) -> Op
             negated_integer_min_literal(operand).map(|(literal, _)| literal)
         }
         UnaryOperator::Minus => match operand {
-            Literal::Real { bits, suffix } => Some(Literal::Real {
-                bits: (-f64::from_bits(*bits)).to_bits(),
-                suffix: *suffix,
-            }),
+            Literal::Real { bits, suffix } => Some(real_constant(-f64::from_bits(*bits), *suffix)),
             _ => Some(integer_literal(literal_int_value(operand)?.checked_neg()?)),
         },
         UnaryOperator::Complement => Some(integer_literal(!literal_int_value(operand)?)),
@@ -514,10 +511,6 @@ pub(crate) fn fold_const_unary(operator: UnaryOperator, operand: &Literal) -> Op
     }
 }
 
-/// Folds a binary operator applied to two already-folded constant operands (14.7-14.12). Integer
-/// arithmetic uses checked ops, so an overflow or a divide-by-zero declines to fold (it is not a
-/// constant value); string `+` concatenates. Operands are treated as `i64`, so a `const` whose type
-/// or value needs the operand's own width (e.g. a `uint` expression near `u32::MAX`) is not folded.
 /// The f64 value of a numeric constant literal -- a real's stored bits, or an integer widened to
 /// double -- for folding floating-point constant arithmetic.
 fn real_value(literal: &Literal) -> Option<f64> {
@@ -540,6 +533,58 @@ fn is_double_literal(literal: &Literal) -> bool {
     )
 }
 
+/// .NET's NaN: the bits csc writes for every `double` NaN constant. It is the NaN x86 makes for
+/// `0.0 / 0.0`, quiet, with no payload and the sign bit set. A `float` NaN is held at these bits
+/// too, since [`SINGLE_NAN_BITS`] widens to exactly them.
+const NAN_BITS: u64 = 0xFFF8_0000_0000_0000;
+
+/// .NET's NaN as a `float`: the bits csc writes for every `float` NaN constant.
+const SINGLE_NAN_BITS: u32 = 0xFFC0_0000;
+
+/// A `float` or `double` constant of `value`: rounded to single precision when `suffix` is
+/// [`RealSuffix::Float`], and held at [`NAN_BITS`] when it is a NaN, whichever NaN it is.
+///
+/// **THE BITS OF A NaN ARE THE ONE PART OF A FOLDED VALUE THE BUILD HOST CHOOSES.** IEEE 754 fixes
+/// every other result of `+`, `-`, `*`, `/` and a cast exactly, and `%` is exact too, but it leaves
+/// a NaN's sign and payload to the implementation: for `0.0 / 0.0` x86 makes the negative NaN
+/// above and AArch64 the positive `0x7FF8000000000000`, and the C library that computes `%` makes
+/// whichever its authors chose. A compiler that kept the host's NaN would build a different
+/// assembly on each kind of machine from one source. csc writes .NET's NaN for EVERY NaN constant:
+/// one made from operands that are not NaN, one that takes a NaN operand of either sign or with a
+/// payload, a negated NaN, a converted one, and a NaN read from a referenced assembly's constant.
+/// So every real constant the binder computes from another or reads from a reference is made
+/// here. One converted from an integer is never a NaN.
+pub(crate) fn real_constant(value: f64, suffix: RealSuffix) -> Literal {
+    let value = if suffix == RealSuffix::Float {
+        f64::from(value as f32)
+    } else {
+        value
+    };
+    Literal::Real {
+        bits: if value.is_nan() { NAN_BITS } else { value.to_bits() },
+        suffix,
+    }
+}
+
+/// The `float` a real constant of `bits` stands for, as csc writes it: the value narrowed to
+/// single precision, which is exact for a `float` constant the binder made, and .NET's NaN,
+/// `0xFFC00000`, for any NaN. That NaN is written here, not by the narrowing conversion, which
+/// leaves the sign and payload of a NaN it narrows unspecified.
+#[must_use]
+pub fn single_constant(bits: u64) -> f32 {
+    let value = f64::from_bits(bits);
+    if value.is_nan() {
+        f32::from_bits(SINGLE_NAN_BITS)
+    } else {
+        value as f32
+    }
+}
+
+/// Folds a binary operator applied to two already-folded constant operands (14.7-14.12). Integer
+/// arithmetic uses checked ops, so an overflow or a divide-by-zero declines to fold (it is not a
+/// constant value); string `+` concatenates. Operands are treated as `i64`, so a `const` whose type
+/// or value needs the operand's own width (e.g. a `uint` expression near `u32::MAX`) is not folded.
+/// A floating-point result is the constant [`real_constant`] makes of it.
 pub(crate) fn fold_const_binary(
     operator: BinaryOperator,
     left: &Literal,
@@ -575,15 +620,12 @@ pub(crate) fn fold_const_binary(
             Op::NotEqual => return Some(Literal::Boolean(lv != rv)),
             _ => return None,
         };
-        let (result, suffix) = if is_double_literal(left) || is_double_literal(right) {
-            (result, RealSuffix::Double)
+        let suffix = if is_double_literal(left) || is_double_literal(right) {
+            RealSuffix::Double
         } else {
-            (f64::from(result as f32), RealSuffix::Float)
+            RealSuffix::Float
         };
-        return Some(Literal::Real {
-            bits: result.to_bits(),
-            suffix,
-        });
+        return Some(real_constant(result, suffix));
     }
     let (left, right) = (literal_int_value(left)?, literal_int_value(right)?);
     let value = match operator {
@@ -2205,5 +2247,135 @@ mod tests {
         );
         let d = model.get("N", "D").expect("D");
         assert_eq!(default_values(d.methods_named("Invoke")), [[Some(2)]]);
+    }
+
+    /// The bits csc writes for every NaN constant, `double` or `float`, as a constant is held.
+    const DOTNET_NAN: u64 = 0xFFF8_0000_0000_0000;
+
+    /// **THE NaN STEP HOLDS EVERY NaN AT .NET's BITS**: the NaN each kind of processor makes, and
+    /// NaNs with a payload, either sign or the signaling bit, at every suffix; and a `float`
+    /// constant narrows each of them to .NET's `float` NaN.
+    ///
+    /// The first row is the NaN an AArch64 build host makes for `0.0 / 0.0`. It is fed in by its
+    /// bits, so a host whose processor never makes it still runs the path an AArch64 host takes.
+    #[test]
+    fn the_nan_step_holds_every_nan_at_dotnets_bits() {
+        let nans: [u64; 6] = [
+            0x7FF8_0000_0000_0000,
+            0xFFF8_0000_0000_0000,
+            0x7FF8_0000_0000_0123,
+            0xFFF8_0000_0000_0456,
+            0x7FF0_0000_0000_0001,
+            0xFFFF_FFFF_FFFF_FFFF,
+        ];
+        for bits in nans {
+            for suffix in [RealSuffix::None, RealSuffix::Double, RealSuffix::Float] {
+                assert_eq!(
+                    real_constant(f64::from_bits(bits), suffix),
+                    Literal::Real { bits: DOTNET_NAN, suffix },
+                    "{bits:#018X} at {suffix:?}"
+                );
+            }
+            assert_eq!(single_constant(bits).to_bits(), 0xFFC0_0000, "{bits:#018X} narrowed");
+        }
+        for single in [0x7FC0_0000u32, 0xFFC0_0000, 0x7FC0_0123, 0x7F80_0001] {
+            let held = f64::from(f32::from_bits(single)).to_bits();
+            assert_eq!(single_constant(held).to_bits(), 0xFFC0_0000, "{single:#010X}");
+        }
+        for value in [0.0, -0.0, 1.5, -2.25, f64::INFINITY, f64::NEG_INFINITY, f64::MAX, 5e-324] {
+            assert_eq!(
+                real_constant(value, RealSuffix::Double),
+                Literal::Real { bits: value.to_bits(), suffix: RealSuffix::Double },
+                "{value:e}"
+            );
+        }
+        assert_eq!(
+            real_constant(0.1, RealSuffix::Float),
+            Literal::Real { bits: f64::from(0.1f32).to_bits(), suffix: RealSuffix::Float }
+        );
+        assert_eq!(single_constant(f64::from(0.1f32).to_bits()), 0.1f32);
+        assert_eq!(single_constant((-0.0f64).to_bits()).to_bits(), (-0.0f32).to_bits());
+        assert_eq!(single_constant(f64::NEG_INFINITY.to_bits()), f32::NEG_INFINITY);
+    }
+
+    /// **EVERY FOLD THAT MAKES A NaN MAKES .NET's**, in `double`, in `float` and mixed: from
+    /// operands that are not NaN (`0 / 0`, `inf - inf`, `inf * 0`, `inf / inf`, `x % 0`, `inf % y`),
+    /// from a NaN operand of either sign or with a payload, by negating a NaN and by converting one.
+    /// Every expected value is the one csc writes for that constant expression, measured; csc writes
+    /// no other NaN.
+    #[test]
+    fn every_fold_that_makes_a_nan_makes_dotnets() {
+        use BinaryOperator as Op;
+        let double = |value: f64| Literal::Real { bits: value.to_bits(), suffix: RealSuffix::Double };
+        let single = |value: f32| Literal::Real {
+            bits: f64::from(value).to_bits(),
+            suffix: RealSuffix::Float,
+        };
+        let dotnet = |suffix| Some(Literal::Real { bits: DOTNET_NAN, suffix });
+        let positive = f64::from_bits(0x7FF8_0000_0000_0000);
+        let payload = f64::from_bits(0xFFF8_0000_0000_0456);
+        let inf = f64::INFINITY;
+        let rows = [
+            (Op::Divide, 0.0, 0.0),
+            (Op::Divide, -0.0, 0.0),
+            (Op::Divide, 0.0, -0.0),
+            (Op::Subtract, inf, inf),
+            (Op::Add, inf, -inf),
+            (Op::Add, -inf, inf),
+            (Op::Multiply, inf, 0.0),
+            (Op::Multiply, 0.0, -inf),
+            (Op::Divide, inf, inf),
+            (Op::Divide, -inf, inf),
+            (Op::Modulo, 1.0, 0.0),
+            (Op::Modulo, -1.0, 0.0),
+            (Op::Modulo, 0.0, 0.0),
+            (Op::Modulo, 1.0, -0.0),
+            (Op::Modulo, inf, 1.0),
+            (Op::Modulo, -inf, -2.5),
+            (Op::Modulo, inf, 0.0),
+            (Op::Modulo, inf, inf),
+            (Op::Add, positive, 1.0),
+            (Op::Subtract, 1.0, positive),
+            (Op::Multiply, positive, payload),
+            (Op::Divide, payload, positive),
+            (Op::Modulo, positive, 1.0),
+            (Op::Modulo, 1.0, positive),
+            (Op::Modulo, payload, 0.0),
+            (Op::Add, inf, positive),
+        ];
+        for (operator, left, right) in rows {
+            let row = alloc::format!("{left} {operator:?} {right}");
+            assert_eq!(
+                fold_const_binary(operator, &double(left), &double(right)),
+                dotnet(RealSuffix::Double),
+                "{row}"
+            );
+            assert_eq!(
+                fold_const_binary(operator, &single(left as f32), &single(right as f32)),
+                dotnet(RealSuffix::Float),
+                "{row}, float"
+            );
+            assert_eq!(
+                fold_const_binary(operator, &single(left as f32), &double(right)),
+                dotnet(RealSuffix::Double),
+                "{row}, float with double"
+            );
+        }
+        for bits in [0x7FF8_0000_0000_0000, DOTNET_NAN, 0x7FF8_0000_0000_0123] {
+            for suffix in [RealSuffix::Double, RealSuffix::Float] {
+                let nan = Literal::Real { bits, suffix };
+                let held = real_constant(f64::from_bits(bits), suffix);
+                assert_eq!(fold_const_unary(UnaryOperator::Minus, &nan), dotnet(suffix), "-{bits:#018X}");
+                assert_eq!(fold_const_unary(UnaryOperator::Plus, &held), dotnet(suffix), "+{bits:#018X}");
+                assert_eq!(cast_constant(&nan, SpecialType::Single), dotnet(RealSuffix::Float));
+                assert_eq!(cast_constant(&nan, SpecialType::Double), dotnet(RealSuffix::Double));
+            }
+        }
+        assert_eq!(fold_const_binary(Op::Divide, &double(1.0), &double(0.0)), Some(double(inf)));
+        assert_eq!(fold_const_binary(Op::Divide, &double(-1.0), &double(0.0)), Some(double(-inf)));
+        assert_eq!(fold_const_binary(Op::Modulo, &double(5.5), &double(2.0)), Some(double(1.5)));
+        assert_eq!(fold_const_binary(Op::Modulo, &double(-0.0), &double(inf)), Some(double(-0.0)));
+        assert_eq!(fold_const_binary(Op::Multiply, &single(-0.0), &single(1.0)), Some(single(-0.0)));
+        assert_eq!(fold_const_unary(UnaryOperator::Minus, &double(0.0)), Some(double(-0.0)));
     }
 }

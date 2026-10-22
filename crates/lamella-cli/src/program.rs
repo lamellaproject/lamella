@@ -6,7 +6,7 @@ use lamella_catalog::{self as catalog, BOARD_PYTHON};
 use lamella_bsp_gen::fit::fit;
 use lamella_wire_host::debug::reason;
 use lamella_wire_host::engine::{
-    CompileFailure, LcscCompiler, LoopbackLink, ReplCompiler, ReplError, install_host_clock,
+    LcscCompiler, LoopbackLink, ReplError, install_host_clock,
 };
 use lamella_js_frontend::interpreter::{Completion, Interpreter};
 use lamella_js_frontend::value::JsValue;
@@ -60,10 +60,15 @@ which is not what `run` means to a reader.
     --device <d>      run it ON the board at <d>, with its output here";
 
 pub(crate) const RUN_USAGE: &str = "\
-usage: lamella run <file.cs|file.csproj|file.py|file.js> [--device <d>]
+usage: lamella run <file.cs|file.csproj|file.py|file.js> [--device <d>] [-- <arguments>]
 
 Compiles and runs the program, and STAYS until it ends -- its output appears here as it is
 printed. A program written to loop forever runs until you stop this tool.
+
+Whatever follows -- is the program's own: a C# program's Main(string[] args) receives each
+argument whole and in the order given, as `dotnet run` passes them. A program on a board cannot
+take arguments yet, and neither can a Python or a JavaScript program, so a run given them is
+refused and nothing is sent or run.
 
 With neither option it runs on this machine, which needs no hardware and is the fastest way to
 find out whether a program compiles and does what you meant.
@@ -89,16 +94,48 @@ and putting it on a board while returning you to your shell is `deploy`.
 The run ends with the program's own exit code. When this tool cannot run it, or an exception
 nothing caught stops it, the run ends with 1 and says why on standard error.";
 
-/// `lamella run <file> [--device <d>]`: compile and run on this machine, or on a board.
+/// A `run` command line's own options, and the program's arguments: everything after the first
+/// `--`, which this tool hands to the program rather than reading.
+fn options_and_program_args(args: &[String]) -> (&[String], &[String]) {
+    let separator = args.iter().position(|argument| argument == "--").unwrap_or(args.len());
+    (&args[..separator], args.get(separator + 1..).unwrap_or_default())
+}
+
+/// Whether a run on a board was given arguments, which a program there cannot take yet. When it
+/// was, the refusal is said, and the caller ends the run before the board is opened.
+pub(crate) fn refuses_arguments_on_a_board(program_args: &[String]) -> bool {
+    if program_args.is_empty() {
+        return false;
+    }
+    let given: Vec<&String> = program_args.iter().collect();
+    crate::own_lines::say(&mut std::io::stderr(), &crate::image_run::arguments_refusal(&given));
+    true
+}
+
+/// The refusal for a Python or a JavaScript program given arguments, which neither takes yet.
+fn arguments_refused_here(language: Language, given: &[String]) -> String {
+    let name = if language == Language::Python { "Python" } else { "JavaScript" };
+    let listed: Vec<String> = given.iter().map(|argument| format!("{argument:?}")).collect();
+    format!(
+        "lamella run: a {name} program cannot take arguments yet, so nothing was run (given: {}).",
+        listed.join(", ")
+    )
+}
+
+/// `lamella run <file> [--device <d>] [-- <arguments>]`: compile and run on this machine, or on a
+/// board, with what follows the `--` as the program's own arguments.
 ///
 /// It ends as the program ended: [`Ended::finish`] turns the answer into this process's exit.
 pub fn run_command(args: &[String]) -> Ended {
-    let separator = args.iter().position(|argument| argument == "--").unwrap_or(args.len());
-    if args[..separator].iter().any(|argument| argument == crate::image_run::MANIFEST) {
-        return crate::image_run::run_manifest(&args[..separator], args.get(separator + 1..).unwrap_or_default());
+    let (options, program_args) = options_and_program_args(args);
+    if options.iter().any(|argument| argument == crate::image_run::MANIFEST) {
+        return crate::image_run::run_manifest(options, program_args);
+    }
+    if options.iter().any(|argument| argument == crate::msbuild::BUILT) {
+        return crate::msbuild::run_built(options, program_args);
     }
     let spec = Spec { verb: "run", usage: Some(RUN_USAGE), values: &["--board", "--device"], flags: &[] };
-    let parsed = match args::parse_or_halt(args, &spec) {
+    let parsed = match args::parse_or_halt(options, &spec) {
         Ok(parsed) => parsed,
         Err(args::Halt::Help) => return Ended::Program(0),
         Err(args::Halt::Bad) => return Ended::Failed,
@@ -115,10 +152,13 @@ pub fn run_command(args: &[String]) -> Ended {
         return Ended::Failed;
     }
     if let Some(target) = parsed.value("--device") {
+        if refuses_arguments_on_a_board(program_args) {
+            return Ended::Failed;
+        }
         return run_on_target(&path, target);
     }
     if crate::flash::is_project(&path) {
-        return run_project(&path);
+        return run_project(&path, program_args);
     }
 
     let (language, source) = match read(&path) {
@@ -128,8 +168,12 @@ pub fn run_command(args: &[String]) -> Ended {
             return Ended::Failed;
         }
     };
+    if language != Language::CSharp && !program_args.is_empty() {
+        eprintln!("{}", arguments_refused_here(language, program_args));
+        return Ended::Failed;
+    }
     match language {
-        Language::CSharp => run_csharp(&path, &source),
+        Language::CSharp => run_csharp(&path, &source, program_args),
         Language::Python => run_python(&path, &source, None),
         Language::JavaScript => run_javascript(&path, &source),
     }
@@ -235,6 +279,23 @@ fn run_on_target(path: &Path, target: &str) -> Ended {
     crate::attach::run_on_target(path, target)
 }
 
+/// As [`run_on_target`], for an assembly a build already made: baked for the board that answers,
+/// with the libraries it references from the class library and from beside it, and refused when
+/// that board is not the one `board` checks for.
+#[cfg(feature = "bake")]
+pub(crate) fn run_built_on_target(path: &Path, target: &str, board: Option<&crate::project::BoardCheck>) -> Ended {
+    crate::own_lines::say(&mut std::io::stderr(), &crate::attach::forever_warning());
+    crate::attach::run_image_on_target(path, target, board, |answered| {
+        crate::bake::image_of_built(path, "run", answered)
+    })
+}
+
+/// In a build that cannot bake, the sentence that names the missing feature.
+#[cfg(not(feature = "bake"))]
+pub(crate) fn run_built_on_target(path: &Path, target: &str, _board: Option<&crate::project::BoardCheck>) -> Ended {
+    run_on_target(path, target)
+}
+
 #[cfg(not(feature = "bake"))]
 fn run_on_target(_path: &Path, _target: &str) -> Ended {
     eprintln!(
@@ -246,7 +307,8 @@ fn run_on_target(_path: &Path, _target: &str) -> Ended {
     Ended::Failed
 }
 
-/// Compile a C# program and run it on the host interpreter.
+/// Compile a C# program and run it on the host interpreter, with `program_args` as its own
+/// arguments.
 ///
 /// **THERE IS NO `--unsafe` HERE AND THAT IS NOT AN OVERSIGHT.** This verb runs the program on THIS
 /// machine, where a raw pointer at a device register addresses host memory and means nothing --
@@ -254,32 +316,16 @@ fn run_on_target(_path: &Path, _target: &str) -> Ended {
 /// hardware belongs on `deploy`, which takes a source file and `--unsafe`, and the diagnostic below
 /// says so where it comes up. **Not `flash`**, which takes an image rather than a source file and
 /// declares no `--unsafe` at all.
-fn run_csharp(path: &Path, source: &str) -> Ended {
-    let compiler = match LcscCompiler::discover() {
-        Ok(compiler) => compiler.for_source_file(&path.display().to_string()),
-        Err(error) => {
-            eprintln!("lamella run: {error}");
-            return Ended::Failed;
-        }
-    };
-    let Some(corlib) = compiler.references().first().cloned() else {
-        eprintln!("lamella run: the compiler found no reference assemblies");
-        return Ended::Failed;
-    };
-    let assembly = match compiler.compile(source) {
-        Ok(assembly) => assembly,
-        Err(CompileFailure::Diagnostics(text)) => return refuse_diagnostics(&text),
-        Err(CompileFailure::Toolchain(detail)) => {
-            eprintln!("lamella run: {}", ReplError::Compile(detail));
-            return Ended::Failed;
-        }
-    };
-    report(run_here(corlib, &assembly))
+fn run_csharp(path: &Path, source: &str, program_args: &[String]) -> Ended {
+    match compile_csharp_assembly_with_corlib(path, source, false, &[], None, "run") {
+        Ok((assembly, corlib)) => report(run_here(corlib, &assembly, program_args)),
+        Err(text) => refuse_diagnostics(&text),
+    }
 }
 
 /// A program's run on this machine: what it wrote to each stream, and how it ended.
 #[derive(Debug)]
-struct HostRun {
+pub(crate) struct HostRun {
     /// What the program wrote to its standard output.
     stdout: String,
     /// What it wrote to its standard error, with the runner's report of how it failed, if it
@@ -289,7 +335,8 @@ struct HostRun {
     ended: Ended,
 }
 
-/// Runs a compiled program on this machine against `corlib`, the one it was bound against.
+/// Runs a compiled program on this machine against `corlib`, the one it was bound against, with
+/// `program_args` as the program's own arguments, which a `Main(string[] args)` receives.
 ///
 /// **THE STOP SAYS HOW IT ENDED, AND THE CODE ALONE CANNOT.** An exception nothing caught ends a
 /// run with the code a program could return itself, so the code is the program's only when the
@@ -297,8 +344,13 @@ struct HostRun {
 ///
 /// # Errors
 /// A link that failed, which is this tool's failure rather than the program's.
-fn run_here(corlib: Vec<u8>, assembly: &[u8]) -> Result<HostRun, ReplError> {
-    let mut link = LoopbackLink::new(corlib, install_host_clock);
+pub(crate) fn run_here(
+    corlib: Vec<u8>,
+    assembly: &[u8],
+    program_args: &[String],
+) -> Result<HostRun, ReplError> {
+    let mut link =
+        LoopbackLink::new(corlib, install_host_clock).with_program_args(program_args.to_vec());
     let run = link.run_collected(1, assembly).map_err(ReplError::Transport)?;
     let ended = match (run.stop_reason(), run.exit_value()) {
         (Some(reason::DONE), Some(code)) => Ended::Program(code),
@@ -324,7 +376,8 @@ fn refuse_diagnostics(text: &str) -> Ended {
     Ended::Failed
 }
 
-/// Compile a C# project and run it on the host interpreter, as a single source file is run.
+/// Compile a C# project and run it on the host interpreter, as a single source file is run, with
+/// `program_args` as its own arguments.
 ///
 /// **THE COMPILATION `build` MAKES OF IT** -- every `.cs` beside the project as one program, under
 /// the project's own settings -- so a project checked here is the project a board gets. Only where
@@ -333,8 +386,8 @@ fn refuse_diagnostics(text: &str) -> Ended {
 /// **A PROJECT THAT NAMES LIBRARIES IS REFUSED, NOT RUN.** This machine runs a program against the
 /// class library alone, so a name that resolves into a library of the project's own would load with
 /// nothing to resolve to -- a failure that would point at the program rather than at this verb.
-fn run_project(path: &Path) -> Ended {
-    match project_run(path) {
+fn run_project(path: &Path, program_args: &[String]) -> Ended {
+    match project_run(path, program_args) {
         Ok(run) => report(run),
         Err(refusal) => {
             eprintln!("{refusal}");
@@ -349,7 +402,7 @@ fn run_project(path: &Path) -> Ended {
 /// # Errors
 /// A project that cannot be read or compiled, a class library, or a project naming libraries of its
 /// own, each with the sentence that says so.
-fn project_run(path: &Path) -> Result<Result<HostRun, ReplError>, String> {
+fn project_run(path: &Path, program_args: &[String]) -> Result<Result<HostRun, ReplError>, String> {
     let project = program_project(
         path,
         "run",
@@ -357,7 +410,7 @@ fn project_run(path: &Path) -> Result<Result<HostRun, ReplError>, String> {
         &format!("lamella build {} --board <id> --format <f>", path.display()),
     )?;
     let (assembly, corlib) = compile_project_assembly(&project, &[], None, "run")?;
-    Ok(run_here(corlib, &assembly))
+    Ok(run_here(corlib, &assembly, program_args))
 }
 
 /// The C# project at `path`, read as a program, or why it is not one: a class library has no entry
@@ -417,7 +470,7 @@ pub(crate) fn program_project(
 ///
 /// **ONE REPORTER FOR BOTH ROUTES**, so a source file and a project that run the same program are
 /// reported the same way rather than by two copies that drift.
-fn report(run: Result<HostRun, ReplError>) -> Ended {
+pub(crate) fn report(run: Result<HostRun, ReplError>) -> Ended {
     match run {
         Ok(run) => print_host_run(&run, &mut std::io::stdout(), &mut std::io::stderr()),
         Err(error) => {
@@ -572,23 +625,57 @@ fn compile_python(
 /// than one that does not build, so a recognized-but-unhonored directive is refused with what it
 /// asks for, exactly as an unrecognized one is.
 ///
+/// **`#:package` IS HONORED FOR THE PACKAGES LAMELLA BUILDS**, with NuGet's version rule and codes
+/// ([`crate::packages`]); its warnings are printed here, once, and the builds it chose are returned.
+///
 /// # Errors
-/// Any `#:` directive at all, today: none is honored yet. The two shapes are told apart because
-/// they call for opposite next steps -- a misspelling is fixed by the author, an unhonored
-/// directive is not.
+/// Every other `#:` directive, and a `#:package` that gets no build. The two shapes of an unhonored
+/// directive are told apart because they call for opposite next steps -- a misspelling is fixed by
+/// the author, an unhonored directive is not.
 fn refuse_unhonored_directives(
+    file: &str,
     source: &str,
     options: lamella_syntax::lexer::LexOptions,
-) -> Result<(), String> {
+) -> Result<Vec<crate::packages::Selected>, String> {
     let tokenized = lamella_syntax::lexer::tokenize_with(source, options);
     if !tokenized.diagnostics.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    let Some(directive) = tokenized.file_directives.first() else {
-        return Ok(());
-    };
+    let (mut selected, mut errors) = (Vec::new(), Vec::new());
+    for directive in &tokenized.file_directives {
+        if &*directive.name == "package" {
+            let line = source
+                .get(..directive.position as usize)
+                .map_or(1, |before| before.matches('\n').count() + 1);
+            let reference = crate::packages::PackageReference::from_directive(
+                &directive.argument,
+                u32::try_from(line).unwrap_or(u32::MAX),
+            );
+            match crate::packages::select(&reference) {
+                Ok(one) => {
+                    if let Some(warning) = &one.warning {
+                        eprintln!("{}", warning.render(file));
+                    }
+                    selected.push(one);
+                }
+                Err(error) => errors.push(error.render(file)),
+            }
+            continue;
+        }
+        refuse_directive(directive)?;
+    }
+    if !errors.is_empty() {
+        return Err(errors.join("\n"));
+    }
+    Ok(selected)
+}
+
+/// The refusal for `directive`, a `#:` line this tool does not honor.
+///
+/// # Errors
+/// Always: the directive, named, with what it asks for.
+fn refuse_directive(directive: &lamella_syntax::lexer::FileDirective) -> Result<(), String> {
     let asks_for = match &*directive.name {
-        "package" => "a package by name, which needs a feed, version resolution and a restore step",
         "project" => "another project to reference, which needs a project system to resolve into",
         "include" => "another source file to compile with this one",
         "property" => "a build property",
@@ -677,6 +764,9 @@ pub fn board_module_run_command(args: &[String]) -> ExitCode {
 
 /// `lamella build <file> [--board <id>] [--out <path>]`: produce the artifact a device runs.
 pub fn build_command(args: &[String]) -> ExitCode {
+    if args.first().is_some_and(|first| first == crate::msbuild::REFERENCES || first == crate::msbuild::COMPILE) {
+        return crate::msbuild::build(args);
+    }
     let usage = usage();
     let spec = Spec {
         verb: "build",
@@ -1339,8 +1429,8 @@ fn compile_csharp_file(
         file_based: true,
         ..Default::default()
     };
-    refuse_unhonored_directives(source, options.clone())?;
     let typed = path.display().to_string();
+    let _packages = refuse_unhonored_directives(&typed, source, options.clone())?;
     let document = if debug {
         document_path(path).map_err(|error| {
             format!(
@@ -1456,7 +1546,35 @@ fn compile_project(
     verb: &str,
     debug: bool,
 ) -> Result<Compiled, String> {
+    for warning in &project.package_warnings {
+        eprintln!("{warning}");
+    }
     let set = lamella_wire_host::boards::ReferenceSet::discover(board)?;
+    compile_project_against(project, libraries, &set, verb, debug)
+}
+
+/// A project's program compiled against `set`, a set the caller chose: what `dotnet build` hands
+/// over binds against the corlib and the libraries the project references, and nothing else.
+///
+/// # Errors
+/// As [`compile_project_assembly`].
+pub(crate) fn compile_project_assembly_against(
+    project: &crate::project::Project,
+    libraries: &[crate::flash::Library],
+    set: &lamella_wire_host::boards::ReferenceSet,
+    verb: &str,
+) -> Result<Vec<u8>, String> {
+    compile_project_against(project, libraries, set, verb, false).map(|compiled| compiled.assembly)
+}
+
+/// The compile behind [`compile_project`], against the set it is handed.
+fn compile_project_against(
+    project: &crate::project::Project,
+    libraries: &[crate::flash::Library],
+    set: &lamella_wire_host::boards::ReferenceSet,
+    verb: &str,
+    debug: bool,
+) -> Result<Compiled, String> {
     let compiler = set.compiler();
     let mut references: Vec<lamella_metadata::Assembly> = compiler
         .references()
@@ -1506,6 +1624,7 @@ fn compile_project(
     let options = lamella_syntax::lexer::LexOptions {
         unsafe_code: project.allow_unsafe,
         file_based: false,
+        defines: project.defines.iter().map(|symbol| symbol.as_str().into()).collect(),
         ..Default::default()
     };
     let compiled = lamella_assemble::compile_sources_with(
@@ -1733,6 +1852,7 @@ fn host_sleep_ns(nanos: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lamella_wire_host::engine::ReplCompiler;
 
     /// **A trapped run's output is on screen before its trap report**, in the one screen both
     /// streams write to. Standard output is buffered by line and standard error is not, so output
@@ -1791,10 +1911,110 @@ mod tests {
     /// A program compiled from `source`, run on this machine, or `None` where this build has no
     /// reference assemblies to compile against.
     fn ran_here(source: &str) -> Option<HostRun> {
+        ran_here_with(source, &[])
+    }
+
+    /// [`ran_here`], with `args` as the program's own arguments.
+    fn ran_here_with(source: &str, args: &[&str]) -> Option<HostRun> {
         let compiler = LcscCompiler::discover().ok()?;
         let corlib = compiler.references().first().cloned().expect("a corlib");
         let assembly = compiler.compile(source).unwrap_or_else(|_| panic!("compiles: {source}"));
-        Some(run_here(corlib, &assembly).expect("runs"))
+        let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
+        Some(run_here(corlib, &assembly, &args).expect("runs"))
+    }
+
+    /// **WHAT FOLLOWS `--` IS THE PROGRAM'S**, each argument whole and in the order given, as
+    /// `dotnet run` passes it: a `Main(string[] args)` receives it, and an empty array when nothing
+    /// follows.
+    #[test]
+    fn the_arguments_after_the_double_dash_reach_the_program() {
+        let source = "class P { static int Main(string[] args) { System.Console.WriteLine(args.Length); \
+                      for (int i = 0; i < args.Length; i++) { System.Console.WriteLine(\"[\" + args[i] + \"]\"); } \
+                      return 42; } }";
+        let Some(given) = ran_here_with(source, &["one", "two words"]) else { return };
+        assert_eq!((given.ended, given.stdout.as_str()), (Ended::Program(42), "2\n[one]\n[two words]\n"));
+        let none = ran_here_with(source, &[]).expect("compiles");
+        assert_eq!((none.ended, none.stdout.as_str()), (Ended::Program(42), "0\n"));
+    }
+
+    /// A `run` command line's options end at its first `--`, and everything after it, a second `--`
+    /// included, is the program's.
+    #[test]
+    fn a_run_command_line_ends_its_options_at_the_first_double_dash() {
+        let line = |items: &[&str]| items.iter().map(|item| (*item).to_owned()).collect::<Vec<String>>();
+        let args = line(&["--built", "App.dll", "--device", "local", "--", "one", "--", "two words"]);
+        let (options, program) = options_and_program_args(&args);
+        assert_eq!(options, &line(&["--built", "App.dll", "--device", "local"])[..]);
+        assert_eq!(program, &line(&["one", "--", "two words"])[..]);
+        let bare = line(&["--built", "App.dll"]);
+        let none: &[String] = &[];
+        assert_eq!(options_and_program_args(&bare), (&bare[..], none));
+    }
+
+    /// The `Main` of [`a_source_file_and_a_project_hand_main_the_arguments_after_the_double_dash`]:
+    /// 42 when it was handed exactly what that test gives it, and 10 plus the count otherwise.
+    const TAKES_ARGUMENTS: &str = "class Program { static int Main(string[] args) { \
+        return args.Length == 3 && args[0] == \"one\" && args[1] == \"two words\" \
+        && args[2] == \"--help\" ? 42 : 10 + args.Length; } }";
+
+    /// **`lamella run <file> -- <arguments>` TAKES `dotnet run`'s GRAMMAR.** A source file and a
+    /// project alike hand what follows the `--` to `Main(string[] args)`, a `--help` among it
+    /// included, which is the program's and not a request for this verb's help.
+    #[test]
+    fn a_source_file_and_a_project_hand_main_the_arguments_after_the_double_dash() {
+        if LcscCompiler::discover().is_err() {
+            return;
+        }
+        let line = |items: &[&str]| items.iter().map(|item| (*item).to_owned()).collect::<Vec<String>>();
+        let project = project_at("arguments", "Exe", "", TAKES_ARGUMENTS);
+        let alone = std::env::temp_dir().join(format!("lamella-cli-{}-arguments-file", std::process::id()));
+        let _ = std::fs::remove_dir_all(&alone);
+        std::fs::create_dir_all(&alone).expect("a scratch directory");
+        let file = alone.join("Program.cs");
+        std::fs::write(&file, TAKES_ARGUMENTS).expect("write the program");
+        for path in [&project, &file] {
+            let path = path.to_string_lossy().into_owned();
+            let given = run_command(&line(&[&path, "--", "one", "two words", "--help"]));
+            assert_eq!(given, Ended::Program(42), "{path}: the arguments, whole and in order");
+            assert_eq!(run_command(&line(&[&path, "--"])), Ended::Program(10), "{path}: none");
+        }
+        let _ = std::fs::remove_dir_all(project.parent().expect("its directory"));
+        let _ = std::fs::remove_dir_all(&alone);
+    }
+
+    /// **A RUN THAT CANNOT GIVE A PROGRAM ITS ARGUMENTS IS REFUSED, NOT RUN WITHOUT THEM:** a run on
+    /// a board, from a source file as from `dotnet run`'s built assembly, before the board is
+    /// opened, and a Python or a JavaScript program, which neither takes them yet.
+    #[test]
+    fn a_run_that_cannot_give_the_program_its_arguments_is_refused() {
+        let line = |items: &[&str]| items.iter().map(|item| (*item).to_owned()).collect::<Vec<String>>();
+        let dir = std::env::temp_dir().join(format!("lamella-cli-{}-arguments-refused", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let source = dir.join("Program.cs");
+        std::fs::write(&source, TAKES_ARGUMENTS).expect("write the program");
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a port on this machine");
+        listener.set_nonblocking(true).expect("a listener that does not wait");
+        let board = format!("tcp:{}", listener.local_addr().expect("its address"));
+        let source = source.to_string_lossy().into_owned();
+        let board = board.as_str();
+        for options in [vec![source.as_str(), "--device", board], vec!["--built", "App.dll", "--device", board]] {
+            let given = [options.clone(), vec!["--", "one"]].concat();
+            assert_eq!(run_command(&line(&given)), Ended::Failed, "{given:?}");
+            let opened = listener.accept().map(|_| ()).map_err(|error| error.kind());
+            assert_eq!(opened, Err(std::io::ErrorKind::WouldBlock), "{given:?}: the board was opened");
+        }
+        for (name, program) in [("p.py", "print(\"ran\")\n"), ("p.js", "print(\"ran\");\n")] {
+            let path = dir.join(name);
+            std::fs::write(&path, program).expect("write the program");
+            let path = path.to_string_lossy().into_owned();
+            assert_eq!(run_command(&line(&[&path, "--", "one"])), Ended::Failed, "{name}");
+            assert_eq!(run_command(&line(&[&path, "--"])), Ended::Program(0), "{name}: none given");
+        }
+        let refusal = arguments_refused_here(Language::JavaScript, &line(&["one", "two words"]));
+        assert!(refusal.contains("a JavaScript program cannot take arguments yet"), "{refusal}");
+        assert!(refusal.contains("(given: \"one\", \"two words\")"), "{refusal}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **A C# PROGRAM'S CODE COMES BACK UNCHANGED, 70 INCLUDED, AND AN EXCEPTION NOTHING CAUGHT IS
@@ -1967,7 +2187,7 @@ mod tests {
         }
         let project = project_at("runs", "Exe", "", PRINTS);
         assert_eq!(run_command(&[project.to_string_lossy().into_owned()]), Ended::Program(0));
-        match project_run(&project) {
+        match project_run(&project, &[]) {
             Ok(Ok(run)) => {
                 assert_eq!(run.stdout, "from the project\n", "the program's own output");
                 assert_eq!(run.ended, Ended::Program(0));
@@ -1999,7 +2219,7 @@ mod tests {
             std::fs::write(&project, project_bytes).expect("write the project");
             let directory = project.parent().expect("its directory").to_path_buf();
             std::fs::write(directory.join("Program.cs"), source_bytes).expect("write the program");
-            match project_run(&project) {
+            match project_run(&project, &[]) {
                 Ok(Ok(run)) => {
                     assert_eq!(run.stdout, "from the project\n", "{what}: the program's own output");
                     assert_eq!(run.ended, Ended::Program(0), "{what}");
@@ -2034,7 +2254,7 @@ mod tests {
     #[test]
     fn a_library_project_and_one_naming_libraries_are_refused_by_run() {
         let library = project_at("library", "Library", "", PRINTS);
-        let refusal = project_run(&library).expect_err("a class library has no entry point");
+        let refusal = project_run(&library, &[]).expect_err("a class library has no entry point");
         assert!(
             refusal.contains("builds a class library") && refusal.contains("<Reference>"),
             "{refusal}"
@@ -2049,7 +2269,7 @@ mod tests {
             gpio.display()
         );
         let referencing = project_at("referencing", "Exe", &items, PRINTS);
-        let refusal = project_run(&referencing).expect_err("its libraries are not linked here");
+        let refusal = project_run(&referencing, &[]).expect_err("its libraries are not linked here");
         assert!(
             refusal.contains("references libraries of its own")
                 && refusal.contains("System.Device.Gpio.dll")
@@ -2351,9 +2571,11 @@ mod tests {
 
     fn directives(source: &str) -> Result<(), String> {
         refuse_unhonored_directives(
+            "Program.cs",
             source,
             lamella_syntax::lexer::LexOptions { file_based: true, ..Default::default() },
         )
+        .map(|_| ())
     }
 
     /// The compiler validates no directive name -- it hands `name` through untouched -- so this
@@ -2368,14 +2590,22 @@ mod tests {
         assert!(typo.contains("Unrecognized directive 'pacakge'"), "named back: {typo}");
         assert!(!typo.contains("CS"), "no CS code on an SDK-layer error: {typo}");
 
-        let known = directives("#:package Newtonsoft.Json\nclass P { static void Main() { } }")
+        let known = directives("#:property LangVersion=11\nclass P { static void Main() { } }")
             .expect_err("a recognized directive we do not honor is refused too");
-        assert!(known.contains("#:package"), "names the directive: {known}");
-        assert!(known.contains("feed"), "and what honoring it would take: {known}");
+        assert!(known.contains("#:property"), "names the directive: {known}");
         assert!(
             !known.contains("Unrecognized"),
             "a directive we know is not a misspelling, and the fixes differ: {known}"
         );
+
+        directives("#:package System.Device.Gpio@4.2.0\nclass P { static void Main() { } }")
+            .expect("a provided package is honored");
+        let foreign = directives("#:package System.Device.Gpio@4.2.0\n#:package Newtonsoft.Json@13.0.3\nclass P { }")
+            .expect_err("a package Lamella does not build is refused");
+        assert!(foreign.starts_with("Program.cs(2): error NU1101: "), "{foreign}");
+        let later = directives("#:package System.Device.Gpio@4.2.0\n#:sdk Other\nclass P { }")
+            .expect_err("every directive is read, not the first");
+        assert!(later.contains("#:sdk"), "{later}");
 
         let shouted = directives("#:PROPERTY Lang=x\nclass P { static void Main() { } }")
             .expect_err("case matters");

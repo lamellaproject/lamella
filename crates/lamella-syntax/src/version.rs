@@ -1166,10 +1166,10 @@ impl Feature {
             Feature::LambdaExpression => true,
             Feature::NamedArguments => true,
             Feature::NamespaceAlias => true,
+            Feature::TopLevelStatements => true,
             Feature::AnonymousMethods
             | Feature::AnonymousObjectCreation
             | Feature::SwitchOnBool
-            | Feature::TopLevelStatements
             | Feature::RecordStructs
             | Feature::RecordInheritance
             | Feature::DefaultInterfaceImplementation
@@ -1554,9 +1554,6 @@ impl Feature {
             Feature::Iterators => Some("Build and return a collection instead."),
             Feature::LocalFunctions | Feature::StaticLocalFunctions => {
                 Some("Declare it as a method of the enclosing type instead.")
-            }
-            Feature::TopLevelStatements => {
-                Some("Put the statements in a 'static void Main()' inside a class instead.")
             }
             Feature::PatternCaseLabel => {
                 Some("Use a switch expression, or an 'if' with an 'is' pattern, instead.")

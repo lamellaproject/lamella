@@ -116,6 +116,65 @@ pub fn read(path: &Path) -> Result<Artifact, String> {
     }
 }
 
+/// Read `path` as an image that may span a board's own flash and the external flash it maps at
+/// `window`: the half written where the part boots from, and the window's half when the image has
+/// one.
+///
+/// **AN IMAGE THAT NEVER TOUCHES THE WINDOW READS EXACTLY AS [`read`] READS IT**, byte for byte, so
+/// a board that gains an external flash writes every image it wrote before unchanged. Only a linked
+/// ELF can carry two halves, because only its segments say where each byte goes; every other format
+/// is read by [`read`].
+///
+/// # Errors
+/// What [`read`] refuses; a segment that starts on one side of the window's edge and ends on the
+/// other; and an image whose every segment is in the window, which has no half to boot from.
+pub fn read_regions(
+    path: &Path,
+    window: std::ops::Range<u32>,
+) -> Result<(Artifact, Option<Artifact>), String> {
+    if extension_of(path).as_deref() != Some("elf") {
+        return read(path).map(|artifact| (artifact, None));
+    }
+    let bytes = read_bytes(path)?;
+    let segments = lamella_elf::load_segments(&bytes)
+        .map_err(|_| format!("{}: it is not a linked ELF32 executable this can read.", path.display()))?;
+    let inside = |segment: &lamella_elf::LoadSegment<'_>| window.contains(&segment.address);
+    for segment in &segments {
+        let end = u64::from(segment.address) + segment.bytes.len() as u64;
+        let ends_inside = end > u64::from(window.start) && end <= u64::from(window.end);
+        if inside(segment) != ends_inside && !segment.bytes.is_empty() {
+            return Err(format!(
+                "{}: the segment at {:#010x} runs across the edge of the external flash window at \
+                 {:#010x}, so it belongs to neither half.",
+                path.display(),
+                segment.address,
+                if inside(segment) { window.end } else { window.start }
+            ));
+        }
+    }
+    let (in_window, own): (Vec<_>, Vec<_>) = segments.iter().copied().partition(inside);
+    if in_window.is_empty() {
+        return read(path).map(|artifact| (artifact, None));
+    }
+    if own.is_empty() {
+        return Err(format!(
+            "{}: every loadable byte is in the external flash window at {:#010x}, so the image has no \
+             half the part can boot from. A two-region image is written whole.",
+            path.display(),
+            window.start
+        ));
+    }
+    let flat = |group: &[lamella_elf::LoadSegment<'_>]| {
+        lamella_elf::flatten(group).map_err(|_| format!("{}: it declares no loadable bytes.", path.display()))
+    };
+    let own = flat(&own)?;
+    let in_window = flat(&in_window)?;
+    Ok((
+        Artifact { bytes: own.bytes, base: Some(own.base), format: "ELF" },
+        Some(Artifact { bytes: in_window.bytes, base: Some(in_window.base), format: "ELF" }),
+    ))
+}
+
 /// The file's bytes, or a message naming it.
 fn read_bytes(path: &Path) -> Result<Vec<u8>, String> {
     std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))

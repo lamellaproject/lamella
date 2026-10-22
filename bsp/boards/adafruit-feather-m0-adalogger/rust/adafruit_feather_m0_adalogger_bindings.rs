@@ -17,12 +17,14 @@ pub const BOARD_VENDOR: &str = "Adafruit";
 /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
 pub const SD_SPI_DRIVER_FAMILY: &str = "samd21-sercom";
 
-// -- SD_SPI: a sercom-spi binding descriptor (core-clock id UNSHIFTED: the
-// consumer composes ID | GEN | CLKEN per its runtime-selected plan) --
+// -- SD_SPI: a sercom-spi binding descriptor (ONE plan: the composed clock word
+// and the core-clock RATE, from which the driver derives BAUD) --
 pub const SD_SPI_SERCOM_BASE: u32 = 0x42001800;
 pub const SD_SPI_IRQ: u32 = 13;
 pub const SD_SPI_APBC_MASK: u32 = 0x40;
 pub const SD_SPI_GCLK_CORE_ID: u32 = 24;
+pub const SD_SPI_GCLK_CLKCTRL_VALUE: u32 = 0x4018;
+pub const SD_SPI_CORE_CLOCK_HZ: u32 = 8000000;
 pub const SD_SPI_PMUX_MOSI_REG: u32 = 0x410044B5;
 pub const SD_SPI_PMUX_MOSI_SHIFT: u32 = 0;
 pub const SD_SPI_PINCFG_MOSI_REG: u32 = 0x410044CA;

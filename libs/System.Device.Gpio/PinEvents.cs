@@ -5,7 +5,7 @@ using System.Device.Gpio;
 namespace Lamella.Hardware
 {
     /// <summary>Routes pin-change interrupts to the handlers registered for them.</summary>
-    public sealed class PinEvents
+    internal sealed class PinEvents
     {
         private PinEvents() { }
 

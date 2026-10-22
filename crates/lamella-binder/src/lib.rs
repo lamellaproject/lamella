@@ -22,6 +22,7 @@ pub mod special;
 pub mod statement;
 mod struct_layout;
 pub mod symbols;
+pub mod top_level;
 pub mod types;
 
 pub use bind::{bind_type, parameter_symbol};
@@ -41,6 +42,7 @@ pub use conversion::{has_implicit_conversion, nullable_underlying};
 pub use declaration::{
     collect_into, collect_model, collect_types, constraints_by_parameter, declared_full_name,
     declared_indexer_accessor_name, declared_member_name, fold_parameter_default, resolve_constants,
+    single_constant,
 };
 pub use diagnostic::{CodeNamespace, Diagnostic, DiagnosticKind};
 pub use flow::{always_exits, check_definite_assignment, is_const_true, switch_section_reachability};

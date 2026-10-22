@@ -118,6 +118,10 @@ pub struct Tokens {
     /// Async methods whose machines and stub bodies land after the source types; see
     /// `compile::emit_async_machine`.
     pub(crate) pending_async: Vec<crate::compile::PendingAsync>,
+    /// The entry point the program's TOP-LEVEL STATEMENTS make (C# 9), once its method is written:
+    /// `<Main>$`, or `<Main>` when they await. It is the program's entry point whatever `Main`
+    /// methods the source also declares, so it is held apart from the ordinary choice.
+    pub(crate) top_level_entry_point: Option<Token>,
     /// The `Param` and `Property` rows that a `ref readonly` member needs
     /// `[System.Runtime.CompilerServices.IsReadOnlyAttribute]` on, held until every type exists.
     ///

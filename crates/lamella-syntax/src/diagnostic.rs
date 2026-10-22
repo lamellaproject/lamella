@@ -287,6 +287,12 @@ pub enum DiagnosticKind {
     /// type OR a namespace -- which is exactly the condition the file-scoped-namespace work already
     /// tracks as `members_precede`. Reported at the TARGET keyword, not at the `[`.
     GlobalAttributeMustPrecedeMembers,
+    /// `CS1529`: a `using` directive appeared after a statement, a type or a namespace in the same
+    /// compilation unit (16.3).
+    ///
+    /// Reported at the `using` of each directive out of place, and the directive is then read and
+    /// set aside, so the declarations after it still parse.
+    UsingMustPrecedeMembers,
     /// `operator` was not followed by an overloadable operator (17.9).
     OverloadableOperatorExpected,
     /// A `foreach` header was missing the `in` keyword (15.8.4).
@@ -497,6 +503,7 @@ impl DiagnosticKind {
             DiagnosticKind::TypeDeclarationExpected => 1518,
             DiagnosticKind::NamespaceCannotHaveModifiersOrAttributes => 1671,
             DiagnosticKind::GlobalAttributeMustPrecedeMembers => 1730,
+            DiagnosticKind::UsingMustPrecedeMembers => 1529,
             DiagnosticKind::OverloadableOperatorExpected => 1037,
             DiagnosticKind::InExpected => 1515,
             DiagnosticKind::FeatureRequiresLaterVersion { current, .. } => current.feature_gate_code(),
@@ -672,6 +679,10 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::GlobalAttributeMustPrecedeMembers => f.write_str(
                 "Assembly and module attributes must precede all other elements defined in a \
                  file except using clauses and extern alias declarations",
+            ),
+            DiagnosticKind::UsingMustPrecedeMembers => f.write_str(
+                "A using clause must precede all other elements defined in the namespace except \
+                 extern alias declarations",
             ),
             DiagnosticKind::OverloadableOperatorExpected => {
                 f.write_str("Overloadable operator expected")

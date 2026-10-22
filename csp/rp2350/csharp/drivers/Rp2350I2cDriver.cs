@@ -5,7 +5,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Rp2350I2cDriver : I2cDriver
+internal sealed class Rp2350I2cDriver : I2cDriver
 {
     private readonly uint _con;
     private readonly uint _tar;

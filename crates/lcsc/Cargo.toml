@@ -19,7 +19,7 @@ lamella-metadata = { path = "../lamella-metadata" }
 # GetACP, for the host's default ANSI code page when decoding a non-Unicode source. windows-sys
 # (not the `windows` crate) per project convention; Windows-only.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Globalization"] }
+windows-sys = { version = "0.61", features = ["Win32_Globalization"] }
 
 [lints]
 workspace = true

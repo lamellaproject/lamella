@@ -743,7 +743,7 @@ impl Binder {
                 }),
             },
             StmtKind::Lock { expression, body } => self.bind_lock(expression, body),
-            StmtKind::Using { resource, body } => self.bind_using(stmt.span, resource, body),
+            StmtKind::Using { resource, body, .. } => self.bind_using(stmt.span, resource, body),
             StmtKind::Fixed {
                 ty,
                 name,

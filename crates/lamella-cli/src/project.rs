@@ -34,8 +34,14 @@ pub const FRAMEWORK_VERSION: &str = "v1.0";
 /// way to supply for a Lamella target either.
 pub const MONIKER: &str = "lamella1.0";
 
-/// The one SDK an SDK-style project may name here.
-pub const SDK: &str = "Microsoft.NET.Sdk";
+/// The SDK a Lamella project names, which `dotnet build` resolves from NuGet.
+///
+/// A project may pin its version as MSBuild spells it, `Lamella.Sdk/0.1.0`. The version is the
+/// MSBuild SDK's, which only `dotnet` resolves, so this reader takes the name and leaves the version.
+pub const SDK: &str = "Lamella.Sdk";
+
+/// The .NET SDK's own name, also read: a project written before `Lamella.Sdk` existed names it.
+pub const DOTNET_SDK: &str = "Microsoft.NET.Sdk";
 
 /// Whether an element this reader does not recognize stops the build.
 ///
@@ -75,6 +81,15 @@ pub struct Project {
     pub sources: Vec<PathBuf>,
     /// The board the project builds for, where `<LamellaTargetBoard>` names one.
     pub board: Option<NamedBoard>,
+    /// The packages the project names with `<PackageReference>`, each with the build it gets, in the
+    /// order the project declares them.
+    #[allow(dead_code)]
+    pub packages: Vec<crate::packages::Selected>,
+    /// The warnings choosing those builds raised (NuGet's NU1603), each rendered against its line.
+    pub package_warnings: Vec<String>,
+    /// The preprocessor symbols the compile defines. A project file read here defines none, as
+    /// `csc` defines none unasked; `dotnet build` hands over its `DefineConstants`.
+    pub defines: Vec<String>,
 }
 
 /// The board a project names with `<LamellaTargetBoard>`.
@@ -389,10 +404,11 @@ impl Project {
             ));
         }
         match document.attribute("Sdk") {
-            Some(sdk) if sdk.eq_ignore_ascii_case(SDK) => {}
+            Some(sdk) if names_a_read_sdk(sdk) => {}
             Some(sdk) => {
                 return Err(format!(
-                    "lamella {verb}: {} names the SDK {sdk:?}, and this build reads {SDK}.\n\n\
+                    "lamella {verb}: {} names the SDK {sdk:?}, and this build reads {SDK} \
+                     (or {DOTNET_SDK}).\n\n\
                      Nothing was built.",
                     path.display()
                 ));
@@ -400,7 +416,7 @@ impl Project {
             None => {
                 return Err(format!(
                     "lamella {verb}: {} has no Sdk attribute.\n\n\
-                     An SDK-style project opens `<Project Sdk=\"{SDK}\">`. The older \
+                     A Lamella project opens `<Project Sdk=\"{SDK}\">`. The older \
                      non-SDK\nproject format, which names its own imports and targets, is not read \
                      here.\n\nNothing was built.",
                     path.display()
@@ -418,6 +434,7 @@ impl Project {
         let mut allow_unsafe = false;
         let mut board = None;
         let mut references: Vec<(String, Option<String>, u32)> = Vec::new();
+        let mut packages = Vec::new();
         let mut included = Vec::new();
         let mut removed = Vec::new();
 
@@ -453,6 +470,15 @@ impl Project {
                             let hint = item.child("HintPath").map(|hint| hint.text.clone());
                             references.push((include, hint, item.line));
                         }
+                        "packagereference" => packages.push(crate::packages::PackageReference {
+                            id: item.attribute("Include").unwrap_or_default().to_owned(),
+                            version: item
+                                .attribute("Version")
+                                .map(str::to_owned)
+                                .or_else(|| item.child("Version").map(|version| version.text.clone()))
+                                .filter(|version| !version.is_empty()),
+                            line: item.line,
+                        }),
                         "compile" => {
                             if let Some(include) = item.attribute("Include") {
                                 included.push(include.to_owned());
@@ -515,6 +541,7 @@ impl Project {
         }
 
         let references = resolve_references(verb, path, directory, &references)?;
+        let (packages, package_warnings) = select_packages(verb, path, &packages)?;
 
         let assembly_name = assembly_name.filter(|name| !name.is_empty()).unwrap_or_else(|| {
             path.file_stem()
@@ -531,8 +558,45 @@ impl Project {
             references,
             sources,
             board,
+            packages,
+            package_warnings,
+            defines: Vec::new(),
         })
     }
+}
+
+/// Whether `sdk`, a project's `Sdk` attribute, names an SDK this reader reads: [`SDK`], with or
+/// without a version, or [`DOTNET_SDK`].
+fn names_a_read_sdk(sdk: &str) -> bool {
+    let name = sdk.split_once('/').map_or(sdk, |(name, _)| name).trim();
+    name.eq_ignore_ascii_case(SDK) || sdk.trim().eq_ignore_ascii_case(DOTNET_SDK)
+}
+
+/// The build each `<PackageReference>` gets, and the warnings choosing them raised; or every error at
+/// once, as NuGet reports each reference it cannot satisfy rather than the first.
+///
+/// # Errors
+/// Any reference that gets no build, each rendered against its line.
+fn select_packages(
+    verb: &str,
+    path: &Path,
+    declared: &[crate::packages::PackageReference],
+) -> Result<(Vec<crate::packages::Selected>, Vec<String>), String> {
+    let file = path.display().to_string();
+    let (mut selected, mut warnings, mut errors) = (Vec::new(), Vec::new(), Vec::new());
+    for reference in declared {
+        match crate::packages::select(reference) {
+            Ok(one) => {
+                warnings.extend(one.warning.as_ref().map(|warning| warning.render(&file)));
+                selected.push(one);
+            }
+            Err(error) => errors.push(error.render(&file)),
+        }
+    }
+    if !errors.is_empty() {
+        return Err(format!("{}\n\nlamella {verb}: nothing was built.", errors.join("\n")));
+    }
+    Ok((selected, warnings))
 }
 
 /// The board a build of `path` is for: the one `--board` names (`flag`), the one the project at
@@ -593,8 +657,9 @@ fn known_board(
 /// before anything is sent: that it is the board the project names.
 #[derive(Debug, Clone)]
 pub struct BoardCheck {
-    /// The project that names the board.
-    project: PathBuf,
+    /// The project file that names the board, when this tool read it; `None` for a project MSBuild
+    /// evaluated, whose property may come from any file the project imports.
+    project: Option<PathBuf>,
     /// The board it names.
     named: NamedBoard,
     /// The product model that board answers a HELLO with. Zero when its facts declare none.
@@ -615,33 +680,69 @@ impl BoardCheck {
             return Ok(None);
         };
         let product_model = u16::try_from(known_board(verb, path, &named)?.product_model).unwrap_or(0);
-        Ok(Some(Self { project: path.to_path_buf(), named, product_model }))
+        Ok(Some(Self { project: Some(path.to_path_buf()), named, product_model }))
     }
 
-    /// Whether the board that answered as `answered` (its HELLO's product model) may take the
-    /// program, and the refusal when it is another board.
+    /// The check for sending a program to a running board, for the board `id` that `Lamella.Sdk`
+    /// passes from the project MSBuild evaluated.
+    ///
+    /// # Errors
+    /// A board this build does not know.
+    pub fn for_board(verb: &str, id: &str) -> Result<Self, String> {
+        let row = lamella_catalog::load_board(id).ok_or_else(|| {
+            format!(
+                "lamella {verb}: the project names {id:?} with <LamellaTargetBoard>, which is no board \
+                 this build knows.\n\n\
+                 `lamella boards` lists the ones it does. Nothing was sent."
+            )
+        })?;
+        let product_model = u16::try_from(row.product_model).unwrap_or(0);
+        Ok(Self { project: None, named: NamedBoard { id: id.to_owned(), line: 0 }, product_model })
+    }
+
+    /// Whether the board that answered at `target` as `answered` (its HELLO's product model) may
+    /// take the program, and the refusal when it is another board.
     ///
     /// A board that answers with no product model, or a project board whose facts declare none,
     /// cannot be told apart from any other, so the program goes.
     ///
     /// # Errors
-    /// The board that answered being another board than the one the project names.
-    pub fn against(&self, verb: &str, answered: u16) -> Result<(), String> {
+    /// The board that answered being another board than the one the project names. The refusal
+    /// says that the two do not match and names both, each by its name and its id where this build
+    /// knows them; the route that asked ends as this tool's own failure, exit code 1.
+    pub fn against(&self, verb: &str, target: &str, answered: u16) -> Result<(), String> {
         let unknown = lamella_wire::product_model::UNKNOWN;
         if answered == unknown || self.product_model == unknown || answered == self.product_model {
             return Ok(());
         }
-        let answered_name = lamella_wire_host::on_device::the_board(lamella_wire_host::board_name(answered));
+        let wanted_name = lamella_wire_host::board_name(self.product_model).map(|name| format!("the {name}"));
+        let wanted = match &wanted_name {
+            Some(name) => format!("{name} ({})", self.named.id),
+            None => self.named.id.clone(),
+        };
+        let answering_id = lamella_wire_host::boards::board_answering(answered);
+        let answering = match (lamella_wire_host::board_name(answered), &answering_id) {
+            (Some(name), Some(id)) => format!("the {name} ({id})"),
+            (Some(name), None) => format!("the {name} (product model {answered})"),
+            (None, Some(id)) => format!("{id} (product model {answered})"),
+            (None, None) => format!("a board this build does not know (product model {answered})"),
+        };
+        let naming = match &self.project {
+            Some(project) => format!("{}, line {}, names", project.display(), self.named.line),
+            None => "The project names".to_owned(),
+        };
+        let change = match &answering_id {
+            Some(id) => format!("change the property to {id}"),
+            None => "change the property".to_owned(),
+        };
         Err(format!(
-            "lamella {verb}: {}, line {}, names {} with <LamellaTargetBoard>, and the board that \
-             answered is {answered_name} (product model {answered}).\n\n\
-             A program built for one board is not sent to another. Connect {}, or change the \
-             property.\n\n\
+            "lamella {verb}: the board on {target} is {answering}, which does not match the \
+             project's board, {wanted}.\n\n\
+             {naming} {} with <LamellaTargetBoard>, and a program built for one board is not sent \
+             to another. Connect {}, or {change}.\n\n\
              Nothing was sent.",
-            self.project.display(),
-            self.named.line,
             self.named.id,
-            self.named.id
+            wanted_name.as_deref().unwrap_or(&self.named.id),
         ))
     }
 }
@@ -1079,21 +1180,41 @@ mod tests {
 
     /// **A PROGRAM BUILT FOR ONE BOARD IS NOT SENT TO ANOTHER.** A `--device` route checks the
     /// board's HELLO against the project's board, and a board that answers with no product model
-    /// cannot be told apart from any other, so it passes.
+    /// cannot be told apart from any other, so it passes. The refusal says plainly that the board
+    /// does not match, and names both boards, each by its name and its id.
     #[test]
     fn a_device_route_refuses_a_board_the_project_does_not_name() {
         let named = project_with("device", "    <LamellaTargetBoard>rpi-pico2-w</LamellaTargetBoard>\n");
         let check = BoardCheck::for_file("run", &named)
             .expect("the project reads")
             .expect("it names a board");
-        assert_eq!(check.against("run", lamella_wire::product_model::PICO2_W), Ok(()));
-        assert_eq!(check.against("run", lamella_wire::product_model::UNKNOWN), Ok(()));
+        assert_eq!(check.against("run", "COM7", lamella_wire::product_model::PICO2_W), Ok(()));
+        assert_eq!(check.against("run", "COM7", lamella_wire::product_model::UNKNOWN), Ok(()));
         let error = check
-            .against("run", lamella_wire::product_model::PICO2)
+            .against("run", "COM7", lamella_wire::product_model::PICO2)
             .expect_err("a Pico 2 is not a Pico 2 W");
-        assert!(error.contains("names rpi-pico2-w with <LamellaTargetBoard>"), "{error}");
-        assert!(error.contains("the Raspberry Pi Pico 2 (product model 2)"), "{error}");
-        assert!(error.contains("Nothing was sent"), "{error}");
+        assert_eq!(
+            error,
+            format!(
+                "lamella run: the board on COM7 is the Raspberry Pi Pico 2 (rpi-pico2), which does not match \
+                 the project's board, the Raspberry Pi Pico 2 W (rpi-pico2-w).\n\n\
+                 {}, line 4, names rpi-pico2-w with <LamellaTargetBoard>, and a program built for one board is \
+                 not sent to another. Connect the Raspberry Pi Pico 2 W, or change the property to rpi-pico2.\n\n\
+                 Nothing was sent.",
+                named.display()
+            )
+        );
+        crate::rendered::assert_renders_cleanly(&error, crate::rendered::four_space_sample);
+
+        let error = check.against("deploy", "tcp:10.0.0.7:5000", 0xFFFE).expect_err("not a Pico 2 W");
+        assert!(
+            error.starts_with(
+                "lamella deploy: the board on tcp:10.0.0.7:5000 is a board this build does not know (product \
+                 model 65534), which does not match the project's board, the Raspberry Pi Pico 2 W (rpi-pico2-w)."
+            ),
+            "{error}"
+        );
+        assert!(error.contains("Connect the Raspberry Pi Pico 2 W, or change the property.\n\n"), "{error}");
         crate::rendered::assert_renders_cleanly(&error, crate::rendered::four_space_sample);
 
         let unnamed = project_with("device-none", "");
@@ -1102,6 +1223,31 @@ mod tests {
         for path in [named, unnamed] {
             let _ = std::fs::remove_dir_all(path.parent().expect("its directory"));
         }
+    }
+
+    /// **THE SAME CHECK HOLDS FOR A BOARD `Lamella.Sdk` PASSES**, from a project MSBuild evaluated:
+    /// its refusal names the project's board without a line, and a board this build does not know
+    /// is refused before anything is opened.
+    #[test]
+    fn a_board_the_sdk_passes_is_checked_against_the_board_that_answers() {
+        let check = BoardCheck::for_board("run", "rpi-pico2-w").expect("a board this build knows");
+        let device = "usb:39e9:0001:A0000000000000B1";
+        assert_eq!(check.against("run", device, lamella_wire::product_model::PICO2_W), Ok(()));
+        assert_eq!(check.against("run", device, lamella_wire::product_model::UNKNOWN), Ok(()));
+        let error = check.against("run", device, lamella_wire::product_model::PICO2).expect_err("a Pico 2 is not a Pico 2 W");
+        assert!(
+            error.starts_with(
+                "lamella run: the board on usb:39e9:0001:A0000000000000B1 is the Raspberry Pi Pico 2 (rpi-pico2), \
+                 which does not match the project's board, the Raspberry Pi Pico 2 W (rpi-pico2-w).\n\n\
+                 The project names rpi-pico2-w with <LamellaTargetBoard>, and"
+            ),
+            "{error}"
+        );
+        assert!(error.ends_with("\n\nNothing was sent."), "{error}");
+        crate::rendered::assert_renders_cleanly(&error, crate::rendered::four_space_sample);
+
+        let error = BoardCheck::for_board("run", "rpi-pico2w").expect_err("no such board");
+        assert!(error.contains("names \"rpi-pico2w\" with <LamellaTargetBoard>"), "{error}");
     }
 
     /// **A MONIKER THAT IS NOT OURS IS REFUSED BY NAME**, with both spellings that would work.
@@ -1181,7 +1327,7 @@ mod tests {
         let group = &document.children[0];
         assert_eq!(group.name, "ItemGroup");
         assert_eq!(group.children[0].attribute("Remove"), Some("Gen&Old.cs"));
-        assert_eq!(document.attribute("sdk"), Some(SDK), "attributes match case-insensitively");
+        assert_eq!(document.attribute("sdk"), Some(DOTNET_SDK), "attributes match case-insensitively");
     }
 
     /// **A MISMATCHED CLOSING TAG NAMES BOTH LINES.** A project file is hand-edited, so this is the

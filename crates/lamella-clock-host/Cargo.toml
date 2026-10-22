@@ -13,7 +13,7 @@ publish = false
 # GetTickCount64, for milliseconds since the system started. windows-sys (not the `windows` crate)
 # per project convention; Windows-only.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_System_SystemInformation"] }
+windows-sys = { version = "0.61", features = ["Win32_System_SystemInformation"] }
 
 [lints]
 workspace = true

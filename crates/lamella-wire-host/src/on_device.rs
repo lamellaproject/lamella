@@ -385,7 +385,8 @@ pub fn run_scheduled(
 /// **IT ASKS WHEN THE PROGRAM HAS BEEN QUIET A WHILE.** A board whose firmware reset under the
 /// program -- a fault, or running out of memory -- sends no stop, and over a serial line its carrier
 /// stays open. The question is asked at the run's own sequence number, and a board still running the
-/// program answers that it is and carries on.
+/// program answers that it is and carries on. A question the carrier cannot send ends the run as
+/// [`RunEnd::Dropped`].
 fn follow(transport: &mut impl Transport, seq: u16, out: &mut dyn Write, err: &mut dyn Write, watch: Watch) -> RunEnd {
     let mut run = RunCollector::new(seq);
     let mut terminal = TerminalOutput::new(out, err);
@@ -416,7 +417,11 @@ fn follow(transport: &mut impl Transport, seq: u16, out: &mut dyn Write, err: &m
                 }
                 let quiet_long = now.duration_since(heard) >= watch.quiet;
                 let asked_lately = asked.is_some_and(|at| now.duration_since(at) < watch.quiet);
-                if quiet_long && !asked_lately && transport.send(exec::EXEC_STATUS, seq, &[]).is_ok() {
+                if quiet_long && !asked_lately {
+                    if let Err(error) = transport.send(exec::EXEC_STATUS, seq, &[]) {
+                        let _ = terminal.end_open_line();
+                        return RunEnd::Dropped(error);
+                    }
                     asked = Some(now);
                 }
                 std::thread::sleep(Duration::from_millis(5));
@@ -675,6 +680,30 @@ mod tests {
         assert!(end.describe("usb").starts_with("the connection to usb dropped while the program was running (Closed)"));
     }
 
+    /// **A QUESTION THE CARRIER CANNOT SEND ENDS THE RUN AS DROPPED.** A line that has gone away can
+    /// read as silence, so the failed question is the one sign of it, and a follower that let it
+    /// pass would wait forever.
+    #[test]
+    fn a_run_whose_question_cannot_be_sent_ends_as_dropped() {
+        struct Mute {
+            sends: usize,
+        }
+        impl Transport for Mute {
+            fn send(&mut self, _: u8, _: u16, _: &[u8]) -> Result<(), TransportError> {
+                self.sends += 1;
+                Err(TransportError::Carrier)
+            }
+            fn poll(&mut self) -> Result<Option<lamella_wire::Frame>, TransportError> {
+                if self.sends > 3 { Err(TransportError::Closed) } else { Ok(None) }
+            }
+        }
+        let mut mute = Mute { sends: 0 };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let end = follow(&mut mute, RUN_SEQ, &mut out, &mut err, quiet(Duration::from_millis(20)));
+        assert_eq!(end, RunEnd::Dropped(TransportError::Carrier), "the failed question ended the run");
+        assert_eq!(mute.sends, 1, "at the first question");
+    }
+
     /// A [`Board`] that sends the run's ending stop once `at` has passed.
     struct Ending<'a> {
         board: &'a mut Board,
@@ -697,6 +726,38 @@ mod tests {
             }
             self.board.poll()
         }
+    }
+
+    /// A board whose program prints without pause until `until`, and is silent after it.
+    struct Printing {
+        until: Instant,
+    }
+
+    impl Transport for Printing {
+        fn send(&mut self, _msg_type: u8, _seq: u16, _payload: &[u8]) -> Result<(), TransportError> {
+            Ok(())
+        }
+
+        fn poll(&mut self) -> Result<Option<lamella_wire::Frame>, TransportError> {
+            Ok((Instant::now() < self.until).then(|| {
+                let (msg_type, seq, payload) = printed(".");
+                lamella_wire::Frame { msg_type, seq, payload }
+            }))
+        }
+    }
+
+    /// **A WATCH WITH A LIMIT ENDS THERE WHILE THE PROGRAM GOES ON PRINTING.** The collector it polls
+    /// read until the board fell silent, so a program printing without pause held the watch inside
+    /// one poll, past its limit, for as long as it printed.
+    #[test]
+    fn a_watch_with_a_limit_ends_there_while_the_program_goes_on_printing() {
+        let mut board = Printing { until: Instant::now() + Duration::from_secs(3) };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let limit = Duration::from_millis(600);
+        let began = Instant::now();
+        let end = follow(&mut board, RUN_SEQ, &mut out, &mut err, Watch::for_at_most(limit));
+        assert_eq!(end, RunEnd::StillRunning(limit));
+        assert!(began.elapsed() < Duration::from_secs(1), "took {:?}", began.elapsed());
     }
 
     /// The tests that need a board's own deploy serve, in this process.

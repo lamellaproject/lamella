@@ -6,7 +6,7 @@ namespace Lamella.Hardware
 {
     /// <summary>Creates a device or bus over a driver supplied directly, for the cases that do not
     /// go through the board's <see cref="Buses"/> table.</summary>
-    public sealed class BusFactory
+    internal sealed class BusFactory
     {
         private BusFactory() { }
 

@@ -8,6 +8,27 @@ public enum AdafruitFeatherM0ExpressBindings {
     // -- identity --
     public static let BOARD_MODEL: UInt16 = 16
     public static let BOARD_VENDOR: String = "Adafruit"
+
+    /// driver family: which REGISTER MAP is behind a role, as `<chip family>-<block>`. The
+    /// role's `KIND` says what the application asked for -- a uart, an spi -- and two
+    /// peripherals of the same kind can share no register at all, so a consumer that selects a
+    /// driver at run time needs both: KIND is what was asked for, this is what the silicon is.
+    /// Neither alone is enough. One SERCOM block serves uart, spi and i2c, so the block does not
+    /// name a driver; and a uart is a different register map on every family, so the kind does
+    /// not either. Derived from the bound instance's block, so it cannot be transcribed wrongly.
+    public static let HEADER_I2C_DRIVER_FAMILY: String = "samd21-sercom"
+
+    // -- HEADER_I2C: a sercom-i2c binding descriptor (the CORE-CLOCK RATE, not a
+    // divisor: an I2C bus speed is a runtime Configure choice) --
+    public static let HEADER_I2C_SERCOM_BASE: UInt32 = 0x42001400
+    public static let HEADER_I2C_IRQ: UInt32 = 12
+    public static let HEADER_I2C_GCLK_CLKCTRL_VALUE: UInt32 = 0x4017
+    public static let HEADER_I2C_APBC_MASK: UInt32 = 0x20
+    public static let HEADER_I2C_PMUX_REG: UInt32 = 0x4100443B
+    public static let HEADER_I2C_PMUX_PAIR: UInt32 = 0x22
+    public static let HEADER_I2C_PINCFG_SDA_REG: UInt32 = 0x41004456
+    public static let HEADER_I2C_PINCFG_SCL_REG: UInt32 = 0x41004457
+    public static let HEADER_I2C_CORE_CLOCK_HZ: UInt32 = 8000000
     public static let DEVICE_COUNT: UInt32 = 2
 
     // -- on-board devices: PORT group base + pin index + mask --

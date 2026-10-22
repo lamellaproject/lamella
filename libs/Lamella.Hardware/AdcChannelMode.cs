@@ -2,7 +2,7 @@
 namespace Lamella.Hardware
 {
     /// <summary>How an ADC driver interprets a channel's input.</summary>
-    public enum AdcChannelMode
+    internal enum AdcChannelMode
     {
         /// <summary>One input, measured against the converter's reference.</summary>
         SingleEnded = 0,

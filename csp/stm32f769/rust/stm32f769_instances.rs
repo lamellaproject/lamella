@@ -26,3 +26,7 @@ pub const SYSCFG_BASE: u32 = 0x40013800;
 pub const SYSCFG_RCC_EN_OFF: u32 = 68;
 pub const SYSCFG_RCC_EN_BIT: u32 = 14;
 pub const SYSCFG_RCC_EN_MASK: u32 = 0x4000;
+pub const QUADSPI_BASE: u32 = 0xA0001000;
+pub const QUADSPI_RCC_EN_OFF: u32 = 56;
+pub const QUADSPI_RCC_EN_BIT: u32 = 1;
+pub const QUADSPI_RCC_EN_MASK: u32 = 0x2;

@@ -4,7 +4,7 @@ namespace Lamella.Hardware
     /// <summary>Base class for I2C drivers: the chip-level bus primitives a board or chip
     /// implementation provides, and the seam <see cref="System.Device.I2c.I2cDevice"/> sits
     /// on.</summary>
-    public abstract class I2cDriver : System.IDisposable
+    internal abstract class I2cDriver : System.IDisposable
     {
         /// <summary>The transfer completed; every byte was acknowledged.</summary>
         public const int Ok = 0;

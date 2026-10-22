@@ -183,7 +183,7 @@ namespace Lamella.Boards.Microchip
         /// <see cref="ExtTwiBusId"/>, not yet configured.</summary>
         /// <remarks>THE SAME INSTANCE <c>I2cDevice.Create</c> uses for that bus, for the reason
         /// <see cref="Lamella.Hardware.Buses.ResolveSpi"/> gives.</remarks>
-        public I2cDriver CreateExtTwiDriver()
+        internal I2cDriver CreateExtTwiDriver()
         {
             return Buses.ResolveI2c(ExtTwiBusId);
         }
@@ -256,11 +256,10 @@ namespace Lamella.Boards.Microchip
                 });
         }
 
-        /// <summary>The on-chip converter as dotnet/iot's analog controller. Each pin number is a
-        /// converter channel: <see cref="AdcChannelExt1Pin3"/> to <see cref="AdcChannelExt3Pin4"/>
-        /// name the six header pads, and <see cref="AdcChannelBandgap"/>,
-        /// <see cref="AdcChannelScaledCoreSupply"/> and <see cref="AdcChannelScaledIoSupply"/> the
-        /// internal inputs.</summary>
+        /// <summary>The on-chip converter as dotnet/iot's analog controller. A pin is opened by its
+        /// number as the board's GPIO controller numbers it (PA02 is 2, PB00 is 32), and its six are
+        /// the extension headers' analog pads: PB00 and PB01 on EXT1, PA10 and PA11 on EXT2, PA02 and
+        /// PA03 on EXT3. The internal inputs read no pin, so they do not open here.</summary>
         /// <remarks>Creating it touches no hardware; the first pin opened brings the converter up.</remarks>
         /// <param name="chip">Must be 0: the board has one converter.</param>
         /// <exception cref="System.ArgumentOutOfRangeException"><paramref name="chip"/> is not 0.</exception>
@@ -314,7 +313,7 @@ namespace Lamella.Boards.Microchip
         /// <see cref="Ext1SpiBusId"/>, not yet configured.</summary>
         /// <remarks>THE SAME INSTANCE <c>SpiDevice.Create</c> uses for that bus, for the reason
         /// <see cref="Lamella.Hardware.Buses.ResolveSpi"/> gives.</remarks>
-        public SpiDriver CreateExt1SpiDriver()
+        internal SpiDriver CreateExt1SpiDriver()
         {
             return Buses.ResolveSpi(Ext1SpiBusId);
         }

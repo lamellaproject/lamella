@@ -1,19 +1,20 @@
 #!/usr/bin/env bash
 # Builds Lamella's managed (C#) sources into the assemblies the runtime loads.
 #
-#   ./build-managed.sh [--out-dir <dir>] [--lcsc <path>] [--define <sym,sym,...>]
+#   ./csharp/build-managed.sh [--out-dir <dir>] [--lcsc <path>] [--define <sym,sym,...>]
 #
 # The Rust side is `cargo build`; this is the other half. It compiles `corlib/` and every assembly
 # under `libs/` with `lcsc` (this repository's C# compiler, built from `crates/lcsc`), in dependency
 # order, and writes them to --out-dir (default `managed/`). Nothing else in the tree is read or
-# written. `build-managed.ps1` is the same build for Windows and produces the same bytes.
+# written. `csharp/build-managed.ps1` is the same build for Windows and produces the same bytes.
 #
 # The sources alone are not enough to reproduce these assemblies: the corlib needs an exact set of
 # capability symbols, and the libraries have a reference order that is not derivable from the files.
 # Both are encoded here.
 set -euo pipefail
 
-root="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The repository root: this script is in its csharp/ folder, and every path it reads is the root's.
+root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 out_dir="managed"
 lcsc=""
 
@@ -25,7 +26,7 @@ lcsc=""
 # LAMELLA_SURFACE_TUPLES is what brings `corlib/System/ValueTuple.cs` into the compile, and tuple
 # syntax names those types and nothing else -- without the symbol `(int, string)` resolves to no
 # type at all. It takes no langversion rung below: the eight structs are plain generics, so see
-# build-managed.ps1's note beside the ladder for why a 7.0 step would be the wrong lever.
+# csharp/build-managed.ps1's note beside the ladder for why a 7.0 step would be the wrong lever.
 # LAMELLA_SURFACE_SPAN is what brings `corlib/System/Span.cs` into the compile. `System.Device.Gpio`'s
 # I2C and SPI facades take `Span<byte>` and `ReadOnlySpan<byte>` -- Microsoft's signatures for those
 # members -- so without it those facades name a type that does not exist and that assembly cannot be
@@ -52,7 +53,7 @@ done
 # reference resolves it from whichever is found first.
 # `held` holds a row back and names the reason: a held row is reported on every run instead of built.
 assemblies=(
-    # Its own assembly rather than folded, unlike System.Device.Pwm below. See build-managed.ps1's
+    # Its own assembly rather than folded, unlike System.Device.Pwm below. See csharp/build-managed.ps1's
     # entry for the upstream measurement the distinction rests on. References only corlib.
     "System.Device.Analog|"
     # It references System.Device.Analog and not the other way round: the analog controller it offers
@@ -61,7 +62,7 @@ assemblies=(
     "System.Device.Gpio||System.Device.Pwm"
     "System.Device.Model|"
     "System.Net.NetworkInformation|"
-    # Bare, unprefixed: full .NET's own assembly name for full .NET's types. See build-managed.ps1's
+    # Bare, unprefixed: full .NET's own assembly name for full .NET's types. See csharp/build-managed.ps1's
     # entry for the three-way argument. References only corlib.
     "System.IO.Ports|"
     "Lamella.Net.Time|"
@@ -103,7 +104,7 @@ case "$out_dir" in /*) out="$out_dir" ;; *) out="$root/$out_dir" ;; esac
 mkdir -p "$out"
 
 # Sorted on the path RELATIVE to the directory, by byte order, so the emitted metadata does not
-# depend on the filesystem's enumeration order -- and matches build-managed.ps1, which sorts the
+# depend on the filesystem's enumeration order -- and matches csharp/build-managed.ps1, which sorts the
 # same normalized key ordinally rather than by culture.
 sources_of() {
     local dir="$1" depth="$2"
@@ -128,7 +129,7 @@ read_lines() {
 }
 
 # Every compile reads its sources from a response file, never from the command line itself:
-# build-managed.ps1 says why, and writes the file the same way, one path to a line, quoted, with a
+# csharp/build-managed.ps1 says why, and writes the file the same way, one path to a line, quoted, with a
 # backslash before a quote or at the end doubled. One file serves every compile here, and it is
 # removed however the script ends. Under Git Bash or Cygwin, lcsc is a native Windows program:
 # bash rewrites a POSIX path in an ARGUMENT for it, but a path written into a file reaches it as
@@ -149,7 +150,7 @@ write_sources() {
 }
 
 # The language version follows the capability surface -- the same rule, condition and rung as
-# build-managed.ps1, which compiles these same sources and states the reasoning in full.
+# csharp/build-managed.ps1, which compiles these same sources and states the reasoning in full.
 # `corlib/System/Collections/Generic/*.cs` is guarded by LAMELLA_SURFACE_NETFX_2_0, so that symbol is
 # what brings generic sources into the compile, and at C# 1.0 they are refused with CS8022 rather
 # than passing by unused.
@@ -221,8 +222,8 @@ done
 # --- System.Device.Gpio, once per family -------------------------------------------------------------
 # Each family with a libs/System.Device.Gpio/Families/<family>.cs gets a System.Device.Gpio of its own,
 # at families/<family>/System.Device.Gpio.dll, holding the drivers that file constructs from a board's
-# bus table and the csp/<family>/csharp sources Families/<family>.sources lists: build-managed.ps1 says
-# why, and why build-boards.ps1 leaves those sources out of a board's assembly. The listed sources are
+# bus table and the csp/<family>/csharp sources Families/<family>.sources lists: csharp/build-managed.ps1 says
+# why, and why csharp/build-boards.ps1 leaves those sources out of a board's assembly. The listed sources are
 # compiled from copies whose overrides of GpioDriver's `protected internal` members say so; the edit
 # is the .ps1's, made with sed, and the list is read and refused as the .ps1 reads and refuses it.
 gpio_folded=""

@@ -13,7 +13,10 @@ mod devices;
 mod ending;
 mod flash;
 mod image_run;
+mod msbuild;
 mod own_lines;
+mod packages;
+mod ports;
 mod program;
 mod project;
 // Test-only: the one place that says what a rendered message may and may not contain.
@@ -64,7 +67,7 @@ const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const USAGE: &str = "\
 usage:
-  lamella devices [--identify] [--all-devices]       what is attached, and how to name it
+  lamella devices [--identify <d>] [--all-devices]   what is attached, and how to name it
   lamella run <file> [--device <d>]                  run it here, or ON a board with output here
   lamella build <file> [--board <id>] [--format f]   make an artifact; nothing is written
   lamella deploy <file> --device <d> | --board <id>  compile it and put it on a board

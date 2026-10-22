@@ -42,6 +42,9 @@ lamella-wire-host = { path = "../lamella-wire-host", features = ["repl-host", "s
 # The wire protocol types: Capabilities / Negotiated / product_model, for what `devices --identify`
 # reports back off a board.
 lamella-wire = { path = "../lamella-wire" }
+# `--device` and `devices --identify` open the port the user names themselves, with DTR and RTS held
+# low, so asking what is behind it pulses no board's reset.
+lamella-serial-port = { path = "../lamella-serial-port" }
 # The C# front end, called DIRECTLY by `build` rather than through the REPL compile seam, so the
 # assembly carries the FILE's name and the FILE's source path. The seam names everything `__Repl`
 # against `Repl.cs`, which is right for a submission typed at a prompt and wrong for an artifact
@@ -124,7 +127,7 @@ lamella-debug-backend = { path = "../lamella-debug-backend", optional = true }
 # run lets go of the board before it ends the way a program stopped by Ctrl+C ends; and the code
 # Windows gives such a program.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_System_Console"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
 
 # The same on Linux and macOS, through SIGINT.
 [target.'cfg(unix)'.dependencies]
@@ -185,6 +188,12 @@ bake = [
     "lamella-wire-host/baked",
     "lamella-wire-host/debug-backend", "dep:lamella-debug-backend",
 ]
+# A build for a package (`Lamella.Tools.<rid>`): the tool looks only where a package puts what it
+# reads -- the folders the SDK names, and beside the executable -- and never into the source tree it
+# was compiled from, which a packaged tool does not have and whose path it must not carry. A build
+# from a checkout leaves it off, and finds the class library and the runtime support archives that
+# checkout builds.
+packaged = ["lamella-wire-host/packaged"]
 
 [[package.metadata.lamella.test-configuration]]
 name = "bake"

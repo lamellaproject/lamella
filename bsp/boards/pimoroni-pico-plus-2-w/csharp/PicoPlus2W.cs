@@ -130,12 +130,13 @@ namespace Lamella.Boards.Pimoroni
                     PimoroniPicoPlus2WBindings.ADC_CHANNEL2_TWIN_PADS, 0u, 0u, 0u, 0u, 0u });
         }
 
-        /// <summary>The on-chip converter as dotnet/iot's analog controller. Each pin is a converter
-        /// channel: <see cref="AdcChannelGp40"/> to <see cref="AdcChannelGp43"/> and
-        /// <see cref="TemperatureSensorChannel"/> name them.</summary>
+        /// <summary>The on-chip converter as dotnet/iot's analog controller. A pin is opened by its GPIO
+        /// number, GP40 to GP47: <c>OpenPin(40)</c> reads GP40, converter channel
+        /// <see cref="AdcChannelGp40"/>, which header position 26 reaches through 1k. The temperature
+        /// sensor's channel reads no pin, so it does not open here.</summary>
         /// <remarks>Creating it touches no hardware; the first pin opened brings the converter up.
         /// It reads through the converter driver the board binds.
-        /// Channels 5 and 7 read the button and the PSRAM chip select and refuse to open.</remarks>
+        /// GP45 and GP47 are the button and the PSRAM chip select and refuse to open.</remarks>
         /// <param name="chip">Must be 0: the board has one converter.</param>
         /// <exception cref="ArgumentOutOfRangeException"><paramref name="chip"/> is not 0.</exception>
         public AnalogController CreateAnalogController(int chip)

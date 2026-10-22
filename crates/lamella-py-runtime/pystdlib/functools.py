@@ -72,111 +72,97 @@ def lru_cache(maxsize=128):
     return decorator
 
 
-# total_ordering: fill in the missing rich-comparison methods from one the class defines plus __eq__.
-# Each helper computes its operator from the root via `type(self).__root__(self, other)`, propagating
-# NotImplemented so a foreign operand still defers to the reflected op (CPython's exact logic). Root
-# detection uses `op in cls.__dict__` -- the class's OWN namespace -- rather than CPython's
-# `getattr(cls, op) is not getattr(object, op)`; identical for the common case (the comparison is
-# defined on the decorated class), and the interpreter exposes no bare `object` to compare against.
+# total_ordering. Each method it adds calls the class's own ordering method, looked up on the type
+# rather than the instance, returns NotImplemented unchanged so that Python tries the reflected
+# operation, and otherwise combines the result with == or !=. The twelve are shared by every class
+# they are added to.
 def _gt_from_lt(self, other):
-    op_result = type(self).__lt__(self, other)
-    if op_result is NotImplemented:
-        return op_result
-    return not op_result and self != other
+    result = type(self).__lt__(self, other)
+    return result if result is NotImplemented else not result and self != other
 
 
 def _le_from_lt(self, other):
-    op_result = type(self).__lt__(self, other)
-    if op_result is NotImplemented:
-        return op_result
-    return op_result or self == other
+    result = type(self).__lt__(self, other)
+    return result if result is NotImplemented else result or self == other
 
 
 def _ge_from_lt(self, other):
-    op_result = type(self).__lt__(self, other)
-    if op_result is NotImplemented:
-        return op_result
-    return not op_result
+    result = type(self).__lt__(self, other)
+    return result if result is NotImplemented else not result
 
 
 def _ge_from_le(self, other):
-    op_result = type(self).__le__(self, other)
-    if op_result is NotImplemented:
-        return op_result
-    return not op_result or self == other
+    result = type(self).__le__(self, other)
+    return result if result is NotImplemented else not result or self == other
 
 
 def _lt_from_le(self, other):
-    op_result = type(self).__le__(self, other)
-    if op_result is NotImplemented:
-        return op_result
-    return op_result and self != other
+    result = type(self).__le__(self, other)
+    return result if result is NotImplemented else result and self != other
 
 
 def _gt_from_le(self, other):
-    op_result = type(self).__le__(self, other)
-    if op_result is NotImplemented:
-        return op_result
-    return not op_result
+    result = type(self).__le__(self, other)
+    return result if result is NotImplemented else not result
 
 
 def _lt_from_gt(self, other):
-    op_result = type(self).__gt__(self, other)
-    if op_result is NotImplemented:
-        return op_result
-    return not op_result and self != other
+    result = type(self).__gt__(self, other)
+    return result if result is NotImplemented else not result and self != other
 
 
 def _ge_from_gt(self, other):
-    op_result = type(self).__gt__(self, other)
-    if op_result is NotImplemented:
-        return op_result
-    return not op_result or self == other
+    result = type(self).__gt__(self, other)
+    return result if result is NotImplemented else result or self == other
 
 
 def _le_from_gt(self, other):
-    op_result = type(self).__gt__(self, other)
-    if op_result is NotImplemented:
-        return op_result
-    return not op_result
+    result = type(self).__gt__(self, other)
+    return result if result is NotImplemented else not result
 
 
 def _le_from_ge(self, other):
-    op_result = type(self).__ge__(self, other)
-    if op_result is NotImplemented:
-        return op_result
-    return not op_result or self == other
+    result = type(self).__ge__(self, other)
+    return result if result is NotImplemented else not result or self == other
 
 
 def _gt_from_ge(self, other):
-    op_result = type(self).__ge__(self, other)
-    if op_result is NotImplemented:
-        return op_result
-    return op_result and self != other
+    result = type(self).__ge__(self, other)
+    return result if result is NotImplemented else result and self != other
 
 
 def _lt_from_ge(self, other):
-    op_result = type(self).__ge__(self, other)
-    if op_result is NotImplemented:
-        return op_result
-    return not op_result
+    result = type(self).__ge__(self, other)
+    return result if result is NotImplemented else not result
 
 
-_convert = {
-    "__lt__": [("__gt__", _gt_from_lt), ("__le__", _le_from_lt), ("__ge__", _ge_from_lt)],
-    "__le__": [("__ge__", _ge_from_le), ("__lt__", _lt_from_le), ("__gt__", _gt_from_le)],
-    "__gt__": [("__lt__", _lt_from_gt), ("__ge__", _ge_from_gt), ("__le__", _le_from_gt)],
-    "__ge__": [("__le__", _le_from_ge), ("__gt__", _gt_from_ge), ("__lt__", _lt_from_ge)],
-}
+# The four ordering methods, most preferred first, each with the three built from it in the order
+# they are added.
+_ORDERINGS = (
+    ("__lt__", (("__gt__", _gt_from_lt), ("__le__", _le_from_lt), ("__ge__", _ge_from_lt))),
+    ("__le__", (("__ge__", _ge_from_le), ("__lt__", _lt_from_le), ("__gt__", _gt_from_le))),
+    ("__gt__", (("__lt__", _lt_from_gt), ("__ge__", _ge_from_gt), ("__le__", _le_from_gt))),
+    ("__ge__", (("__le__", _le_from_ge), ("__gt__", _gt_from_ge), ("__lt__", _lt_from_ge))),
+)
+
+# A default no class attribute holds, so that a method set to None still reads as defined.
+_UNSET = object()
 
 
 def total_ordering(cls):
-    roots = {op for op in _convert if op in cls.__dict__}
-    if not roots:
+    """Class decorator supplying the ordering methods a class leaves undefined."""
+    defined = []
+    for name, built in _ORDERINGS:
+        # Anything but object's own method counts, one inherited from a base class included.
+        if getattr(cls, name, _UNSET) is not getattr(object, name, _UNSET):
+            defined.append(name)
+    if not defined:
         raise ValueError("must define at least one ordering operation: < > <= >=")
-    root = max(roots)  # prefer __lt__ > __le__ > __gt__ > __ge__ (lexical max of the four names)
-    for opname, opfunc in _convert[root]:
-        if opname not in roots:
-            opfunc.__name__ = opname
-            setattr(cls, opname, opfunc)
+    for name, built in _ORDERINGS:
+        if name == defined[0]:
+            break
+    for missing, method in built:
+        if missing not in defined:
+            method.__name__ = missing
+            setattr(cls, missing, method)
     return cls

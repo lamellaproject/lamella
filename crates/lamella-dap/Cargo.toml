@@ -63,6 +63,9 @@ lamella-assemble = { path = "../lamella-assemble" }
 # The reference-assembly search as a TEST build makes it: it also looks at this source tree's test
 # corlib, first, so these tests bind that corlib wherever they run. Nothing built for use looks there.
 lamella-wire-host = { path = "../lamella-wire-host", default-features = false, features = ["fixture-corlib"] }
+# This computer's uptime, read the way the server's clock reads it, to check what a debugged program
+# is told.
+lamella-clock-host = { path = "../lamella-clock-host" }
 
 # No single configuration of this crate compiles all of its tests, so the crate names the set that
 # does. The CIL-level tests need the interpreter backend to debug something; the ones that cover the

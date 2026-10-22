@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RuntimeTier {
     /// Every surface the runtime implements (the runner's `profile-full`), paired with the
-    /// every-feature corlib that `build-managed.ps1` builds by default.
+    /// every-feature corlib that `csharp/build-managed.ps1` builds by default.
     Full,
     /// The floor (the runner's `profile-minimal`: the intrinsic BCL, exceptions and the collector),
     /// paired with the kernel-tier corlib, which is built with no surface symbols at all.
@@ -31,7 +31,7 @@ pub enum RuntimeTier {
 pub fn candidates(tier: RuntimeTier) -> &'static [&'static str] {
     match tier {
         // In a checkout that carries this repository's tests, the committed corlib they load.
-        // Otherwise, what `build-managed.ps1` writes by default: the first step of a build from
+        // Otherwise, what `csharp/build-managed.ps1` writes by default: the first step of a build from
         // these sources, and the corlib a program for the board is compiled against.
         RuntimeTier::Full => &[
             "../lamella-load/tests/fixtures/corlib.dll",

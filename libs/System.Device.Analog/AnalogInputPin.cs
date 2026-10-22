@@ -3,20 +3,24 @@ namespace System.Device.Analog
 {
     /// <summary>Driver for analog input pins.</summary>
     /// <remarks>
-    /// <para>A platform derives from this and supplies <see cref="ReadRaw"/> and
+    /// <para>A Lamella platform derives from this and supplies <see cref="ReadRaw"/> and
     /// <see cref="AdcResolutionBits"/>; a program obtains one from
     /// <see cref="AnalogController.OpenPin(int)"/> rather than constructing it.</para>
-    /// <para><b>This is a strict subset of upstream's surface, not a variation on it.</b> Everything
-    /// here matches dotnet/iot member for member, and what is absent is absent rather than
-    /// respelled -- so a program written against these members compiles and runs unchanged on
-    /// dotnet/iot.</para>
+    /// <para><b>A subset of dotnet/iot's <c>AnalogInputPin</c>.</b> Every member here has dotnet/iot's
+    /// signature, so a program that opens a pin with <see cref="AnalogController.OpenPin(int)"/> and
+    /// reads it compiles unchanged on dotnet/iot. Three things are absent: every member typed in
+    /// UnitsNet (<c>VoltageReference</c>, <c>MinVoltage</c>, <c>MaxVoltage</c>, <c>ReadVoltage</c> and
+    /// <c>ConvertToVoltage</c>); the <c>ValueChanged</c> event and the methods that enable, disable
+    /// and raise it, whose arguments carry a UnitsNet value; and a public constructor. dotnet/iot's
+    /// constructor takes a UnitsNet <c>ElectricPotential</c>, so code outside Lamella cannot subclass
+    /// this pin until that type is available.</para>
     /// </remarks>
     public abstract class AnalogInputPin : System.IDisposable
     {
 
-        /// <summary>Constructs an instance of an analog pin. Not usually called directly: use
-        /// <see cref="AnalogController.OpenPin(int)"/> instead.</summary>
-        public AnalogInputPin(AnalogController controller, int pinNumber)
+        /// <summary>Constructs an instance of an analog pin. A program does not call it: it opens a
+        /// pin with <see cref="AnalogController.OpenPin(int)"/>.</summary>
+        internal AnalogInputPin(AnalogController controller, int pinNumber)
         {
             _controller = controller;
             _pinNumber = pinNumber;

@@ -12,10 +12,13 @@ pub mod protocol;
 pub mod serve;
 
 pub use adapter::Debugger;
+#[cfg(all(feature = "interpreter", not(target_arch = "wasm32")))]
+pub use interp_backend::host_machine;
 #[cfg(feature = "interpreter")]
 pub use interp_backend::{InterpreterBackend, decode_address, encode_address};
 pub use lamella_debug_backend::{
-    ChildReference, DebugBackend, Disassembled, Frame, Register, Scope, SourceLocation, Stop, Variable,
+    ChildReference, DebugBackend, Disassembled, ExceptionFilter, ExceptionInfo, Frame, Register, Scope,
+    SourceLocation, Stop, Variable,
 };
 pub use protocol::{Event, Message, Request, Response, read_message, write_message};
 pub use serve::{serve, serve_polled};

@@ -15,7 +15,7 @@ namespace Lamella.Hardware
         {
             get
             {
-                if ((object)_driver == null)
+                if ((object)_driver == null && AdcControllers.IsBound())
                 {
                     _driver = AdcControllers.Resolve();
                 }
@@ -25,30 +25,88 @@ namespace Lamella.Hardware
 
         public override int PinCount
         {
-            get { return Driver.ChannelCount; }
+            get
+            {
+                AdcDriver driver = Driver;
+                if ((object)driver == null)
+                {
+                    return 0;
+                }
+                int span = 0;
+                int channels = driver.ChannelCount;
+                for (int channel = 0; channel < channels; channel++)
+                {
+                    if (!driver.IsChannelSupported(channel))
+                    {
+                        continue;
+                    }
+                    int pin = driver.PinOfChannel(channel);
+                    if (pin >= span)
+                    {
+                        span = pin + 1;
+                    }
+                }
+                return span;
+            }
         }
 
         public override bool SupportsAnalogInput(int pin)
         {
-            return Driver.IsChannelSupported(pin);
+            return ChannelOf(pin) >= 0;
+        }
+
+        public override int ConvertPinNumberToAnalogChannelNumber(int pinNumber)
+        {
+            return ChannelOf(pinNumber);
+        }
+
+        public override int ConvertAnalogChannelNumberToPinNumber(int analogChannelNumber)
+        {
+            AdcDriver driver = Driver;
+            if ((object)driver == null || !driver.IsChannelSupported(analogChannelNumber))
+            {
+                return -1;
+            }
+            return driver.PinOfChannel(analogChannelNumber);
         }
 
         protected override AnalogInputPin OpenPinCore(int pinNumber)
         {
             AdcDriver driver = Driver;
-            driver.OpenChannel(pinNumber);
-            return new AdcAnalogInputPin(this, pinNumber, driver);
+            int channel = ChannelOf(pinNumber);
+            driver.OpenChannel(channel);
+            return new AdcAnalogInputPin(this, pinNumber, channel, driver);
+        }
+
+        private int ChannelOf(int pin)
+        {
+            AdcDriver driver = Driver;
+            if ((object)driver == null || pin < 0)
+            {
+                return -1;
+            }
+            int channels = driver.ChannelCount;
+            for (int channel = 0; channel < channels; channel++)
+            {
+                if (driver.IsChannelSupported(channel) && driver.PinOfChannel(channel) == pin)
+                {
+                    return channel;
+                }
+            }
+            return -1;
         }
     }
 
     internal sealed class AdcAnalogInputPin : AnalogInputPin
     {
         private readonly AdcDriver _driver;
+        private readonly int _channel;
 
-        internal AdcAnalogInputPin(AnalogController controller, int pinNumber, AdcDriver driver)
+        internal AdcAnalogInputPin(AnalogController controller, int pinNumber, int channel, AdcDriver driver)
             : base(controller, pinNumber)
         {
             _driver = driver;
+            _channel = channel;
         }
 
         public override int AdcResolutionBits
@@ -58,7 +116,7 @@ namespace Lamella.Hardware
 
         public override uint ReadRaw()
         {
-            int count = _driver.ReadValue(PinNumber);
+            int count = _driver.ReadValue(_channel);
             if (count < 0)
             {
                 throw new System.IO.IOException("the analog-to-digital conversion failed (status " + (-count) + ")");
@@ -70,7 +128,7 @@ namespace Lamella.Hardware
         {
             if (disposing)
             {
-                _driver.CloseChannel(PinNumber);
+                _driver.CloseChannel(_channel);
             }
             base.Dispose(disposing);
         }

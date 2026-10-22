@@ -9,8 +9,15 @@
 # ON THIS PART THE AF7 COLUMN HEADER IS NOT THE SIBLING FAMILY'S. Here it reads
 # SPI2/I2S2/SPI3/I2S3/USART1/2/3/UART5/DFSDM1/SPDIF, where the STM32F7's reads
 # SPI2/3/USART1/2/3/UART5/SPDIFRX -- the same number carrying a different set. The two agree about
-# USART1, which is the only cell this map claims, and they were read separately rather than one
-# being taken as evidence for the other.
+# USART1, which is the only AF7 cell this map claims, and they were read separately rather than
+# one being taken as evidence for the other.
+#
+# SO DO AF9 AND AF10, AND THE QUAD-SPI INTERFACE SITS IN BOTH. Here AF9 reads
+# CAN1/2/TIM12/13/14/QUADSPI/FMC/LCD and AF10 reads SAI2/QUADSPI/SDMMC2/DFSDM1/OTG2_HS/OTG1_FS/LCD,
+# where the STM32F7's read CAN1/2/TIM12/13/14/QUADSPI/LCD and SAI2/QUADSPI/OTG2_HS/OTG1_FS. On
+# both parts the quad-SPI clock and data cells this map claims are AF9 and its chip select is
+# AF10 -- an agreement read off this part's own table, like USART1's, rather than taken from the
+# other's.
 
 [table]
 kind = "pins"
@@ -18,9 +25,11 @@ family = "stm32f769"
 sources = [
     "STM32F765xx/STM32F767xx/STM32F768Ax/STM32F769xx datasheet DS11532 Rev 9, Table 13 'alternate function mapping' (page 89), whose sixteen function columns are headed by AF number: the AF7 column is headed SPI2/I2S2/SPI3/I2S3/USART1/2/3/UART5/DFSDM1/SPDIF, and PA9's AF7 cell is USART1_TX while PA10's is USART1_RX",
     "STM32F765xx/STM32F767xx/STM32F768Ax/STM32F769xx datasheet DS11532 Rev 9, Table 13 'alternate function mapping': the AF10 column is headed SAI2/QUADSPI/SDMMC2/DFSDM1/OTG2_HS/OTG1_FS/LCD and carries SDMMC2_D2 and SDMMC2_D3; the AF11 column is headed I2C4/CAN3/SDMMC2/ETH and carries SDMMC2_CK, SDMMC2_CMD, SDMMC2_D0 and SDMMC2_D1",
+    "STM32F765xx/STM32F767xx/STM32F768Ax/STM32F769xx datasheet DS11532 Rev 9, Table 13 'alternate function mapping', read as rendered pages 90, 92 and 94: the AF9 column is headed CAN1/2/TIM12/13/14/QUADSPI/FMC/LCD and carries QUADSPI_CLK on PB2, QUADSPI_BK1_IO0 on PC9, QUADSPI_BK1_IO1 on PC10, QUADSPI_BK1_IO3 on PD13 and QUADSPI_BK1_IO2 on PE2; the AF10 column carries QUADSPI_BK1_NCS on PB6, whose AF9 cell is CAN2_TX",
+    "UM2033 Rev 5 Table 14 (32F769IDISCOVERY I/O assignment) names the same six pins from the board's side: PB2 QUADSPI_CLK, PB6 QUADSPI_BK1_NCS, PC9 QUADSPI_BK1_IO0, PC10 QUADSPI_BK1_IO1, PE2 QUADSPI_BK1_IO2 and PD13 QUADSPI_BK1_IO3",
 ]
 notes = [
-    "Two groups of cells are stated: the pair a virtual COM port claims, and the six an SD/MMC socket claims. A part's LEDs and buttons are plain GPIO rather than muxed functions, so they carry no row here -- a pin driven by the port itself has no alternate function to select, and a row asserting one would be a claim the part does not make.",
+    "Three groups of cells are stated: the pair a virtual COM port claims, the six an SD/MMC socket claims, and the six a quad-SPI flash claims. A part's LEDs and buttons are plain GPIO rather than muxed functions, so they carry no row here -- a pin driven by the port itself has no alternate function to select, and a row asserting one would be a claim the part does not make.",
     "WHICH pins a given socket or header actually reaches is a wiring fact and is not stated here. This table says only which controller a pin CAN be muxed to, and at which function number.",
 ]
 
@@ -94,3 +103,56 @@ function = "AF11"
 instance = "sdmmc2"
 signal = "d1"
 source = "DS11532 Rev 9 Table 13: PG10's AF11 cell is SDMMC2_D1. This row rests on a weaker reading of the mapping table than the other five: PG10's row wraps and its cells cannot be counted, so the AF number is corroborated instead by the datasheet's pin-description table, which lists PG10's functions in AF order as SAI2_SD_B then SDMMC2_D1 -- the same AF10-then-AF11 adjacency that PG9's countable row demonstrates -- and by PG11's countable row, which places a second SDMMC2_D2 in the AF10 column and so agrees that only D2 and D3 live there. Were it wrong, the symptom would be a four-line data fault with single-line transfers healthy."
+
+# --- QUADSPI: five signals at AF9 and ONE AT AF10 ---------------------------------------------
+#
+# THE SIX LINES DO NOT SHARE ONE ALTERNATE FUNCTION, the same trap as the SD/MMC lines above in a
+# different place. The clock and the four data lines are AF9; chip select alone is AF10. Muxing
+# all six at AF9 puts PB6 on its AF9 function, CAN2_TX, instead of chip select, and the flash is
+# never selected.
+#
+# THE SIX SPAN FOUR PORTS, and the data lines are not even in port order: the clock and chip
+# select are on port B, IO0 and IO1 on port C, IO2 on port E and IO3 on port D -- so muxing them
+# takes four port clocks, not one.
+
+[[pins]]
+pin = "PB2"
+function = "AF9"
+instance = "quadspi"
+signal = "clk"
+source = "DS11532 Rev 9 Table 13 page 90: PB2's AF9 cell is QUADSPI_CLK. UM2033 Rev 5 Table 14 gives PB2 the signal name QUADSPI_CLK."
+
+[[pins]]
+pin = "PB6"
+function = "AF10"
+instance = "quadspi"
+signal = "bk1_ncs"
+source = "DS11532 Rev 9 Table 13 page 90: PB6's AF10 cell is QUADSPI_BK1_NCS. THE ONLY AF10 OF THE SIX -- PB6's AF9 cell is CAN2_TX, so a uniform AF9 mux leaves chip select on a CAN transmitter and the flash is never addressed. UM2033 Rev 5 Table 14 gives PB6 the signal name QUADSPI_BK1_NCS."
+
+[[pins]]
+pin = "PC9"
+function = "AF9"
+instance = "quadspi"
+signal = "bk1_io0"
+source = "DS11532 Rev 9 Table 13 page 92: PC9's AF9 cell is QUADSPI_BK1_IO0; its AF10 cell is LCD_G3, so muxing the six at AF10 -- the column that carries chip select -- fails here instead. UM2033 Rev 5 Table 14 gives PC9 the signal name QUADSPI_BK1_IO0."
+
+[[pins]]
+pin = "PC10"
+function = "AF9"
+instance = "quadspi"
+signal = "bk1_io1"
+source = "DS11532 Rev 9 Table 13 page 92: PC10's AF9 cell is QUADSPI_BK1_IO1. UM2033 Rev 5 Table 14 gives PC10 the signal name QUADSPI_BK1_IO1."
+
+[[pins]]
+pin = "PE2"
+function = "AF9"
+instance = "quadspi"
+signal = "bk1_io2"
+source = "DS11532 Rev 9 Table 13 page 94: PE2's AF9 cell is QUADSPI_BK1_IO2. UM2033 Rev 5 Table 14 gives PE2 the signal name QUADSPI_BK1_IO2."
+
+[[pins]]
+pin = "PD13"
+function = "AF9"
+instance = "quadspi"
+signal = "bk1_io3"
+source = "DS11532 Rev 9 Table 13 page 94: PD13's AF9 cell is QUADSPI_BK1_IO3. UM2033 Rev 5 Table 14 gives PD13 the signal name QUADSPI_BK1_IO3."

@@ -68,7 +68,8 @@ fn run_in_proc(program_bytes: &[u8]) -> RunResult {
         Err(error) => return RunResult { exit: -1, stdout: format!("load failed: {error}") },
     };
     let mut vm = Vm::new();
-    let outcome = run(&program.module, &mut vm, program.entry, Vec::new());
+    let args = lamella_cil_runtime::entry_args(&program.module, &mut vm, program.entry);
+    let outcome = run(&program.module, &mut vm, program.entry, args);
     let exit = match outcome {
         Ok(Some(Value::Int32(code))) => code,
         Ok(_) => 0,

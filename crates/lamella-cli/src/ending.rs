@@ -123,8 +123,9 @@ fn flush_both() {
 #[allow(unsafe_code)]
 mod platform {
     use super::{INTERRUPTED, Ordering, PRESSED};
-    use windows_sys::Win32::Foundation::{BOOL, FALSE, TRUE};
+    use windows_sys::Win32::Foundation::{FALSE, TRUE};
     use windows_sys::Win32::System::Console::{CTRL_C_EVENT, SetConsoleCtrlHandler};
+    use windows_sys::core::BOOL;
 
     /// Called, on a thread of the system's, for each control event the console delivers.
     ///

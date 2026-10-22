@@ -4605,6 +4605,13 @@ struct FakeRp2350 {
     /// What the next staging write fails with, once: the image crossing the wire into RAM is where
     /// most of a write's transfers are, so it is where a fault in them lands.
     fail_staging: Option<ProbeError>,
+    /// The halt polls one erased sector costs the probe waiting on it, or 0 for an erase that returns
+    /// at once. The bootrom erases a sector at a time, so an erase's time grows with its bytes, and
+    /// a call whose sectors cost more polls than its frame allows is given up on before it returns.
+    erase_polls_per_sector: u32,
+    /// An address whose erase never returns: the call that covers it erases the sectors below it
+    /// and is given up on.
+    erase_hangs_at: Option<u32>,
 }
 
 /// Where the fake's ROM table starts, and the addresses its four functions answer at.
@@ -4618,6 +4625,11 @@ const RP2350_STUBS: u32 = 0x2000_8000;
 
 impl FakeRp2350 {
     fn new() -> Self {
+        FakeRp2350::with_flash(64 * 1024)
+    }
+
+    /// A board whose flash holds `bytes` bytes, all of them erased.
+    fn with_flash(bytes: usize) -> Self {
         let mut rom = vec![0u8; RP2350_TABLE as usize + 64];
         rom[0x10..0x14].copy_from_slice(&0x0002_754d_u32.to_le_bytes());
         rom[0x14..0x18].copy_from_slice(&RP2350_TABLE.to_le_bytes());
@@ -4635,11 +4647,13 @@ impl FakeRp2350 {
         }
         FakeRp2350 {
             log: Vec::new(),
-            flash: vec![0xFF; 64 * 1024],
+            flash: vec![0xFF; bytes],
             ram: std::collections::HashMap::new(),
             rom,
             xip_reads: Vec::new(),
             fail_staging: None,
+            erase_polls_per_sector: 0,
+            erase_hangs_at: None,
         }
     }
 
@@ -4722,7 +4736,7 @@ impl TargetAccess for FakeRp2350 {
         &mut self,
         address: u32,
         args: &[u32],
-        _frame: &lamella_probe_core::CallFrame,
+        frame: &lamella_probe_core::CallFrame,
     ) -> Result<u32, ProbeError> {
         let named = |function: u16| address == u32::from(function);
         if address == RP2350_STUBS
@@ -4741,7 +4755,21 @@ impl TargetAccess for FakeRp2350 {
             .ok_or(ProbeError::Device("a flash_op outside the modelled flash"))?;
         match operation {
             0 => {
-                self.flash[offset..offset + length].fill(0xFF);
+                let sectors = length / 4096;
+                let hang = self
+                    .erase_hangs_at
+                    .filter(|hangs| (at..at + length as u32).contains(hangs))
+                    .map(|hangs| (hangs - at) as usize / 4096);
+                let afforded = frame.poll_tries.checked_div(self.erase_polls_per_sector);
+                let erased = [hang, afforded.map(|n| n as usize)]
+                    .into_iter()
+                    .flatten()
+                    .fold(sectors, usize::min);
+                self.flash[offset..offset + erased * 4096].fill(0xFF);
+                if erased < sectors {
+                    self.log.push(format!("erase {length} given up after {}", erased * 4096));
+                    return Err(ProbeError::Timeout("call_target: the callee did not return"));
+                }
                 self.log.push(format!("erase {length}"));
             }
             1 => {
@@ -5003,6 +5031,305 @@ fn a_transfer_fault_at_the_fallback_clock_is_the_answer() {
     assert_eq!(clocks, vec![SWD_CLOCK_HZ, FALLBACK_SWD_CLOCK_HZ]);
     assert_eq!(lines.iter().filter(|line| !line.starts_with("  ")).count(), 1, "{lines:?}");
     assert_eq!(rp2350_steps(&board), ["erase 4096", "staging failed", "erase 4096", "staging failed"]);
+}
+
+/// **AN IMAGE OF SIX AND A HALF MEGABYTES IS ERASED IN CALLS ITS POLL BUDGET COVERS.** The bootrom
+/// erases a sector at a time, so an erase takes longer the more bytes it covers, while each call is
+/// polled for its return a fixed number of times. So the route erases in calls of one 64 KiB block
+/// each, and the image is erased, written and read back whole.
+#[test]
+fn an_image_of_six_and_a_half_megabytes_is_erased_in_calls_its_poll_budget_covers() {
+    let bytes = rp2350_image(6_503_752);
+    let mut board = FakeRp2350::with_flash(8 * 1024 * 1024);
+    board.erase_polls_per_sector = 130;
+    let mut backend = Rp2350Probe::new(board, 0x4c01_3477, "an RP2350");
+    let written = flash(
+        &mut backend,
+        &Image {
+            bytes: &bytes,
+            base: lamella_cmsis_dap_rp2350::XIP_BASE,
+        },
+        VerifyPolicy::ReadBack,
+        &Allow::Any,
+    );
+
+    let erases: Vec<&str> =
+        rp2350_steps(&backend.target).into_iter().filter(|step| step.starts_with("erase")).collect();
+    let report = written.unwrap_or_else(|why| panic!("{why}, after {erases:?}"));
+    assert_eq!(report.verification, Verification::ReadBack);
+    assert!(backend.target.flash[..bytes.len()] == bytes[..], "the image, whole");
+    assert_eq!(erases.len(), 100, "{erases:?}");
+    assert!(erases[..99].iter().all(|step| *step == "erase 65536"), "{erases:?}");
+    assert_eq!(erases[99], "erase 16384");
+}
+
+/// **AN ERASE CALL THAT DOES NOT RETURN IS NAMED, AND THE NEXT WRITE STARTS OVER WITHOUT THE PROGRAM
+/// IT DESTROYED.** The failure says which call and where, nothing is programmed after it, and the
+/// board it leaves -- erased up to the call that hung, its last program no longer whole -- takes the
+/// next write whole, because that write reads nothing of the program it replaces.
+#[test]
+fn an_erase_call_that_does_not_return_is_named_and_the_next_write_starts_over() {
+    let old = vec![0x5a; 512 * 1024];
+    let new = rp2350_image(500 * 1024);
+    let mut board = FakeRp2350::with_flash(1024 * 1024);
+    board.flash[..old.len()].copy_from_slice(&old);
+    board.erase_hangs_at = Some(lamella_cmsis_dap_rp2350::XIP_BASE + 0x3_1000);
+    let image = Image {
+        bytes: &new,
+        base: lamella_cmsis_dap_rp2350::XIP_BASE,
+    };
+
+    let lines = std::cell::RefCell::new(Vec::<String>::new());
+    let mut backend = Rp2350Probe::new(board, 0x4c01_3477, "an RP2350")
+        .saying(|line: &str| lines.borrow_mut().push(line.to_owned()));
+    let why = flash(&mut backend, &image, VerifyPolicy::ReadBack, &Allow::Any)
+        .expect_err("the fourth call never returns")
+        .to_string();
+    assert!(why.contains("the callee did not return"), "{why}");
+    let failed = "  flash_op ERASE call 4 of 8 (65536 bytes at 0x10030000) did not complete: timed out \
+                  waiting for call_target: the callee did not return";
+    assert!(lines.borrow().iter().any(|line| line == failed), "{:?}", lines.borrow());
+    let mut board = backend.target;
+    assert!(board.flash[..0x3_1000].iter().all(|byte| *byte == 0xFF), "erased up to the hang");
+    assert!(board.flash[0x3_1000..old.len()].iter().all(|byte| *byte == 0x5a), "the rest untouched");
+    let steps = rp2350_steps(&board);
+    assert!(!steps.iter().any(|step| step.starts_with("program")), "programmed after: {steps:?}");
+
+    board.erase_hangs_at = None;
+    board.log.clear();
+    let mut backend = Rp2350Probe::new(board, 0x4c01_3477, "an RP2350");
+    let report = flash(&mut backend, &image, VerifyPolicy::ReadBack, &Allow::Any)
+        .expect("the write after the failed one");
+    assert_eq!(report.verification, Verification::ReadBack);
+    assert!(backend.target.flash[..new.len()] == new[..], "the new image, whole");
+}
+
+/// An RP2040 as its bootrom flash API shows itself to a probe: the function table its part routine
+/// reads and checks, `_flash_range_erase` and `flash_range_program` working on a byte array by
+/// offset from the start of the flash device, and the execute-in-place window the routine reads the
+/// image back through.
+///
+/// **THE BOOTROM's NUMBERS ARE WRITTEN OUT HERE**, from RP2040 datasheet 2.8.3, as on the RP2350's
+/// fake: the magic `'M','u',0x01` at 0x10, the function table's address at 0x14, and the table's
+/// (code, address) entries, among them `_debug_trampoline` and its end, which points at a `BKPT #0`.
+struct FakeRp2040 {
+    log: Vec<String>,
+    /// The flash device, from its start.
+    flash: Vec<u8>,
+    /// Every word written outside the flash: the staged image, the debug and power registers.
+    ram: std::collections::HashMap<u32, u32>,
+    /// The ROM from address 0.
+    rom: Vec<u8>,
+    /// The halt polls one 64 KiB block erase costs the probe waiting on it, or 0 for an erase that
+    /// returns at once.
+    erase_polls_per_block: u32,
+}
+
+/// Where the fake's function table starts, and its entries: the six functions the routine calls, at
+/// odd addresses because the table holds Thumb function pointers, and the trampoline pair it checks.
+const RP2040_TABLE: usize = 0x3000;
+const RP2040_FUNCTIONS: [([u8; 2], u16); 8] = [
+    (*b"IF", 0x2001),
+    (*b"EX", 0x2003),
+    (*b"RE", 0x2005),
+    (*b"RP", 0x2007),
+    (*b"FC", 0x2009),
+    (*b"CX", 0x200b),
+    (*b"DT", 0x01a9),
+    (*b"DE", 0x01af),
+];
+
+impl FakeRp2040 {
+    /// A board whose flash holds `bytes` bytes, all of them erased.
+    fn with_flash(bytes: usize) -> Self {
+        let mut rom = vec![0u8; 0x4000];
+        rom[0x10..0x14].copy_from_slice(&0x0001_754d_u32.to_le_bytes());
+        rom[0x14..0x16].copy_from_slice(&(RP2040_TABLE as u16).to_le_bytes());
+        for (index, (code, address)) in RP2040_FUNCTIONS.iter().enumerate() {
+            let at = RP2040_TABLE + index * 4;
+            rom[at..at + 2].copy_from_slice(code);
+            rom[at + 2..at + 4].copy_from_slice(&address.to_le_bytes());
+        }
+        rom[0x01ae..0x01b0].copy_from_slice(&0xbe00_u16.to_le_bytes());
+        FakeRp2040 {
+            log: Vec::new(),
+            flash: vec![0xFF; bytes],
+            ram: std::collections::HashMap::new(),
+            rom,
+            erase_polls_per_block: 0,
+        }
+    }
+
+    /// The table's address for the function with `code`.
+    fn function(code: &[u8; 2]) -> u32 {
+        RP2040_FUNCTIONS
+            .iter()
+            .find(|(named, _)| named == code)
+            .map(|(_, address)| u32::from(*address))
+            .expect("a function the fake's table holds")
+    }
+}
+
+impl TargetAccess for FakeRp2040 {
+    fn connect(&mut self) -> Result<(), ProbeError> {
+        Ok(())
+    }
+    fn read_idcode(&mut self) -> Result<u32, ProbeError> {
+        Ok(0x0bc1_2477)
+    }
+    fn init_mem(&mut self) -> Result<(), ProbeError> {
+        Ok(())
+    }
+    fn read_word(&mut self, address: u32) -> Result<u32, ProbeError> {
+        let (bytes, at) = match address.checked_sub(lamella_cmsis_dap_rp2040::XIP_BASE) {
+            Some(offset) if (offset as usize) < self.flash.len() => (&self.flash, offset as usize),
+            _ if (address as usize) < self.rom.len() => (&self.rom, address as usize),
+            _ => return Ok(self.ram.get(&address).copied().unwrap_or(0)),
+        };
+        Ok(u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]))
+    }
+    fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+        self.ram.insert(address, value);
+        Ok(())
+    }
+    fn read_words_into(&mut self, address: u32, out: &mut [u32]) -> Result<(), ProbeError> {
+        for (index, slot) in out.iter_mut().enumerate() {
+            *slot = self.read_word(address + (index * 4) as u32)?;
+        }
+        Ok(())
+    }
+    fn write_words(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError> {
+        for (index, word) in words.iter().enumerate() {
+            self.write_word(address + (index * 4) as u32, *word)?;
+        }
+        Ok(())
+    }
+    fn is_halted(&mut self) -> Result<bool, ProbeError> {
+        Ok(true)
+    }
+    fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+        self.log.push("reset_and_run".to_owned());
+        Ok(())
+    }
+    fn set_breakpoints(&mut self, addresses: &[u32]) -> Result<(), ProbeError> {
+        assert!(addresses.is_empty(), "a flash arms no breakpoint: {addresses:?}");
+        Ok(())
+    }
+    fn call_target(
+        &mut self,
+        address: u32,
+        args: &[u32],
+        frame: &lamella_probe_core::CallFrame,
+    ) -> Result<u32, ProbeError> {
+        if address == FakeRp2040::function(b"RE") {
+            let (offset, count) = (args[0] as usize, args[1] as usize);
+            let blocks = count.div_ceil(64 * 1024);
+            let afforded =
+                frame.poll_tries.checked_div(self.erase_polls_per_block).map_or(blocks, |n| n as usize);
+            let erased = (afforded * 64 * 1024).min(count);
+            self.flash[offset..offset + erased].fill(0xFF);
+            if erased < count {
+                self.log.push(format!("erase {count} given up after {erased}"));
+                return Err(ProbeError::Timeout("call_target: the callee did not return"));
+            }
+            self.log.push(format!("erase {count}"));
+        } else if address == FakeRp2040::function(b"RP") {
+            let (offset, from, count) = (args[0] as usize, args[1], args[2] as usize);
+            for index in 0..count / 4 {
+                let word = self.ram.get(&(from + (index * 4) as u32)).copied().unwrap_or(0);
+                self.flash[offset + index * 4..offset + index * 4 + 4]
+                    .copy_from_slice(&word.to_le_bytes());
+            }
+            self.log.push(format!("program {count}"));
+        } else if ![b"IF", b"EX", b"FC", b"CX"].iter().any(|code| address == FakeRp2040::function(code))
+        {
+            return Err(ProbeError::Device("a call to an address this fake does not model"));
+        }
+        Ok(0)
+    }
+
+    fn read_byte(&mut self, _address: u32) -> Result<u8, ProbeError> {
+        unreachable!("byte access is not part of the flashing path")
+    }
+    fn write_byte(&mut self, _address: u32, _value: u8) -> Result<(), ProbeError> {
+        unreachable!("byte access is not part of the flashing path")
+    }
+    fn read_halfword(&mut self, _address: u32) -> Result<u16, ProbeError> {
+        unreachable!("halfword access is not part of the flashing path")
+    }
+    fn write_halfword(&mut self, _address: u32, _value: u16) -> Result<(), ProbeError> {
+        unreachable!("halfword access is not part of the flashing path")
+    }
+    fn halt(&mut self) -> Result<(), ProbeError> {
+        unreachable!("the routine halts by its reset catch, not by this seam")
+    }
+    fn resume(&mut self) -> Result<(), ProbeError> {
+        unreachable!("a flashing backend leaves the part through reset_and_run, not resume")
+    }
+    fn step(&mut self) -> Result<(), ProbeError> {
+        unreachable!("run control is not the flashing path")
+    }
+    fn wait_halted(&mut self) -> Result<(), ProbeError> {
+        unreachable!("run control is not the flashing path")
+    }
+    fn reset_and_halt(&mut self) -> Result<(), ProbeError> {
+        unreachable!("the routine resets by SYSRESETREQ, not by this seam")
+    }
+    fn set_reset(&mut self, _assert: bool) -> Result<u8, ProbeError> {
+        unreachable!("a flashing backend does not drive the reset line directly")
+    }
+    fn read_core_reg(&mut self, _selector: u8) -> Result<u32, ProbeError> {
+        unreachable!("core registers are the call seam's business, and it is modelled whole")
+    }
+    fn write_core_reg(&mut self, _selector: u8, _value: u32) -> Result<(), ProbeError> {
+        unreachable!("core registers are the call seam's business, and it is modelled whole")
+    }
+    fn arm_reset_catch(&mut self) -> Result<(), ProbeError> {
+        unreachable!("the routine catches the reset through DEMCR, written as memory")
+    }
+    fn disarm_reset_catch(&mut self) -> Result<(), ProbeError> {
+        unreachable!("the routine catches the reset through DEMCR, written as memory")
+    }
+    fn set_breakpoint(&mut self, _address: u32) -> Result<(), ProbeError> {
+        unreachable!("breakpoints are not the flashing path")
+    }
+    fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
+        unreachable!("breakpoints are not the flashing path")
+    }
+}
+
+/// **AN RP2040's EIGHT-MEGABYTE IMAGE IS ERASED IN CALLS ITS POLL BUDGET COVERS, EVEN AT THE SLOWEST
+/// BLOCK ERASE ITS FLASH IS SPECIFIED FOR.** The bootrom erases 64 KiB blocks here, faster than the
+/// RP2350's sectors, but each block may take up to two seconds; so this route too erases in calls of
+/// one block each, and the whole flash of the catalog's largest RP2040 board is written and read back.
+#[test]
+fn an_rp2040s_eight_megabyte_image_is_erased_in_calls_its_poll_budget_covers() {
+    let bytes = rp2350_image(8 * 1024 * 1024 - 1000);
+    let mut board = FakeRp2040::with_flash(8 * 1024 * 1024);
+    board.erase_polls_per_block = 5_000;
+    let mut backend = Rp2040Probe::new(board, 0x0bc1_2477, "an RP2040");
+    let written = flash(
+        &mut backend,
+        &Image {
+            bytes: &bytes,
+            base: lamella_cmsis_dap_rp2040::XIP_BASE,
+        },
+        VerifyPolicy::ReadBack,
+        &Allow::Any,
+    );
+
+    let erases: Vec<&str> = backend
+        .target
+        .log
+        .iter()
+        .map(String::as_str)
+        .filter(|step| step.starts_with("erase"))
+        .collect();
+    let report = written.unwrap_or_else(|why| panic!("{why}, after {erases:?}"));
+    assert_eq!(report.verification, Verification::ReadBack);
+    assert!(backend.target.flash[..bytes.len()] == bytes[..], "the image, whole");
+    assert_eq!(erases.len(), 128, "{erases:?}");
+    assert!(erases.iter().all(|step| *step == "erase 65536"), "{erases:?}");
 }
 
 /// **THE RP2040 ROUTE HANDS THE CONTRACT ITS ROUTINE's READ, NOT A SECOND ONE**: what `program` kept

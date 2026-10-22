@@ -106,7 +106,8 @@ fn run_static(assembly_bytes: &'static [u8], corlib_bytes: Option<&'static [u8]>
     let mut vm = Vm::new();
     clock::install(&program.module, &mut vm);
     console::install(&mut vm);
-    match run(&program.module, &mut vm, program.entry, Vec::new()) {
+    let args = lamella_cil_runtime::entry_args(&program.module, &mut vm, program.entry);
+    match run(&program.module, &mut vm, program.entry, args) {
         Ok(result) => RunResult {
             stdout: vm.output_string(),
             exit_code: match result {

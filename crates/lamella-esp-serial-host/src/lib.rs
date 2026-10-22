@@ -1,105 +1,19 @@
 //! The native driver for [`lamella_esp_serial`]: a real serial port, and the loop that performs what
 //! the protocol asks for.
 
-#![allow(unsafe_code)]
-
 use std::time::Duration;
 
 use lamella_esp_serial::{Action, Session, Step};
+use lamella_serial_port::{Buffer, Settings};
 
-#[cfg(unix)]
-pub mod posix;
-#[cfg(windows)]
-pub mod windows;
-
-#[cfg(unix)]
-pub use posix::PosixPort;
-#[cfg(windows)]
-pub use windows::WindowsPort;
-
-/// The [`Port`] implementation for the host this was built for.
+/// The operating system's serial port, which every host reaches a real port through.
 ///
-/// Every host reaches a real serial port through this name, so a tool that drives one is written
-/// once and compiled everywhere -- including on a host that has no implementation here, where the
-/// tool still compiles, is still type-checked, and refuses at the point it would have opened a port
-/// rather than being absent from the build.
-#[cfg(unix)]
-pub type NativePort = PosixPort;
-
-/// The [`Port`] implementation for the host this was built for.
-#[cfg(windows)]
-pub type NativePort = WindowsPort;
-
-/// The [`Port`] implementation for the host this was built for.
-#[cfg(not(any(unix, windows)))]
-pub type NativePort = UnsupportedPort;
+/// A tool that drives one is written once and compiled everywhere, including on a host that has no
+/// serial port implementation, where it refuses at the point it would have opened a port.
+pub type NativePort = lamella_serial_port::Port;
 
 /// What went wrong with the port itself, as distinct from anything the protocol reports.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PortError {
-    /// The port could not be opened.
-    Open {
-        /// The port name as given.
-        name: String,
-        /// The operating system's error code.
-        code: u32,
-    },
-    /// The port opened but could not be configured.
-    Configure {
-        /// Which setting.
-        what: &'static str,
-        /// The operating system's error code.
-        code: u32,
-    },
-    /// A control signal could not be changed.
-    Signal {
-        /// Which signal, and in which direction.
-        what: &'static str,
-        /// The operating system's error code.
-        code: u32,
-    },
-    /// A write failed.
-    Write {
-        /// The operating system's error code.
-        code: u32,
-    },
-    /// **A bounded write moved nothing**, which is a transmitter that never became ready. Distinct
-    /// from [`PortError::Write`] because the remedy differs: this is flow control or a dead cable, not
-    /// a bad handle.
-    WriteStalled {
-        /// How many bytes had gone out before it stalled.
-        after: usize,
-    },
-    /// A read failed.
-    Read {
-        /// The operating system's error code.
-        code: u32,
-    },
-    /// **This host has no serial port implementation here.** Reported at the point a port would have
-    /// been opened, which is the only place the answer differs -- everything above it in the tool is
-    /// host-neutral and is compiled and checked on every platform.
-    UnsupportedHost,
-}
-
-impl std::fmt::Display for PortError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            PortError::Open { name, code } => write!(f, "cannot open {name} (error {code})"),
-            PortError::Configure { what, code } => write!(f, "cannot set {what} (error {code})"),
-            PortError::Signal { what, code } => write!(f, "cannot {what} (error {code})"),
-            PortError::Write { code } => write!(f, "write failed (error {code})"),
-            PortError::WriteStalled { after } => {
-                write!(f, "write stalled after {after} bytes -- the transmitter never became ready")
-            }
-            PortError::Read { code } => write!(f, "read failed (error {code})"),
-            PortError::UnsupportedHost => {
-                write!(f, "serial ports are not implemented for this operating system")
-            }
-        }
-    }
-}
-
-impl std::error::Error for PortError {}
+pub type PortError = lamella_serial_port::Error;
 
 /// A serial port, as this driver needs it.
 ///
@@ -151,58 +65,35 @@ pub trait Port {
     fn describe(&self) -> String;
 }
 
-/// A [`Port`] for a host with no implementation here.
-///
-/// It exists so that a tool written against [`NativePort`] compiles and is type-checked on every
-/// platform, including the ones this crate cannot drive. **It has no constructor that succeeds**:
-/// [`UnsupportedPort::open`] is the only way to reach one and it always refuses, so the refusal
-/// lands where a port would have been opened rather than as a binary that was never built.
-///
-/// It is defined unconditionally, not only on the hosts that need it, so that a change to the
-/// [`Port`] trait breaks it on the platform doing the change rather than on a platform nobody here
-/// compiles for.
-#[derive(Debug)]
-pub struct UnsupportedPort {
-    _private: (),
-}
-
-impl UnsupportedPort {
-    /// Refuses, always.
-    ///
-    /// # Errors
-    /// Always [`PortError::UnsupportedHost`].
-    pub fn open(_name: &str, _baud: u32) -> Result<UnsupportedPort, PortError> {
-        Err(PortError::UnsupportedHost)
-    }
-}
-
-impl Port for UnsupportedPort {
-    fn write(&mut self, _bytes: &[u8]) -> Result<(), PortError> {
-        Err(PortError::UnsupportedHost)
+/// The operating system's port, at eight data bits, no parity, one stop bit and no flow control:
+/// the line the bootloader speaks.
+impl Port for NativePort {
+    fn write(&mut self, bytes: &[u8]) -> Result<(), PortError> {
+        self.write_all(bytes)
     }
 
-    fn read(&mut self, _buffer: &mut [u8], _timeout_ms: u32) -> Result<usize, PortError> {
-        Err(PortError::UnsupportedHost)
+    fn read(&mut self, buffer: &mut [u8], timeout_ms: u32) -> Result<usize, PortError> {
+        NativePort::read(self, buffer, Some(Duration::from_millis(u64::from(timeout_ms))))
     }
 
-    fn set_dtr(&mut self, _on: bool) -> Result<(), PortError> {
-        Err(PortError::UnsupportedHost)
+    fn set_dtr(&mut self, on: bool) -> Result<(), PortError> {
+        NativePort::set_dtr(self, on)
     }
 
-    fn set_rts(&mut self, _on: bool) -> Result<(), PortError> {
-        Err(PortError::UnsupportedHost)
+    fn set_rts(&mut self, on: bool) -> Result<(), PortError> {
+        NativePort::set_rts(self, on)
     }
 
-    fn reopen(&mut self, _baud: u32) -> Result<(), PortError> {
-        Err(PortError::UnsupportedHost)
+    fn reopen(&mut self, baud: u32) -> Result<(), PortError> {
+        NativePort::reopen(self, &Settings::new(baud))
     }
 
     fn discard_buffers(&mut self) -> Result<(), PortError> {
-        Err(PortError::UnsupportedHost)
+        self.discard(Buffer::Both)
     }
 
     fn describe(&self) -> String {
-        String::from("no serial port on this operating system")
+        format!("{} at {} baud", self.name(), self.settings().baud)
     }
 }
 

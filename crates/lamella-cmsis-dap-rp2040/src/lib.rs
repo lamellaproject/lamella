@@ -87,6 +87,28 @@ const PSM_PROC1: u32 = 1 << 16;
 const ERASE_BLOCK_SIZE: u32 = 1 << 16;
 const ERASE_BLOCK_CMD: u32 = 0xd8;
 
+/// The most bytes one `_flash_range_erase` call covers: one 64 KiB block.
+///
+/// **THE IMAGE IS ERASED IN CALLS OF THIS SIZE RATHER THAN IN ONE, BECAUSE AN ERASE TAKES LONGER
+/// THE MORE BYTES IT COVERS WHILE A CALL IS POLLED FOR ITS RETURN A FIXED NUMBER OF TIMES.** A
+/// block erase is specified at up to 2 s on these boards' JV-family flash (the W25Q128JV's tBE2:
+/// 150 ms typical), and the sector erases at the image's end at up to 400 ms each, so one call
+/// takes at most 6.4 s whatever the image's size, and [`FLASH_OP_POLLS`] covers that several times
+/// over. The RP2350 crate erases the same way, for the same reason.
+const ERASE_CALL_BYTES: usize = 64 * 1024;
+
+/// How many times an erase or program call is polled for its return before it is given up as
+/// hung.
+///
+/// A poll is one read through the probe, so the time this spans is the probe's: about 40 s
+/// through a Raspberry Pi Debug Probe. Every call is sized so that its slowest specified case is
+/// a small part of that: an erase by [`ERASE_CALL_BYTES`] (6.4 s) and a program by [`STAGE_MAX`]
+/// (768 pages at up to 3 ms, 2.3 s).
+const FLASH_OP_POLLS: u32 = 100_000;
+
+/// How often the erase says how far it has got, in bytes, so a long erase is not a silent one.
+const ERASE_PROGRESS_BYTES: usize = 1024 * 1024;
+
 /// Connect to the RP2040 over SWD and return core 0's `DPIDR`: wake the bus, give the probe a
 /// WAIT-retry budget, select the core-0 debug port out of the several on the bus, and open its
 /// MEM-AP.
@@ -399,18 +421,36 @@ fn program_and_verify<A: TargetAccess>(
     words.resize(image.len().div_ceil(PAGE_BYTES) * (PAGE_BYTES / 4), 0xFFFF_FFFF);
 
     let frame = CallFrame::new(CALL_SP, CALL_TRAP);
-    let slow = CallFrame { poll_tries: 100_000, ..frame };
+    let slow = CallFrame { poll_tries: FLASH_OP_POLLS, ..frame };
     log("connect_internal_flash + flash_exit_xip...");
     target.call_target(rom.connect_internal_flash, &[], &frame)?;
     target.call_target(rom.flash_exit_xip, &[], &frame)?;
 
     let erase_len = image.len().div_ceil(SECTOR_BYTES) * SECTOR_BYTES;
-    log(&format!("_flash_range_erase {erase_len} bytes at flash offset 0..."));
-    target.call_target(
-        rom.flash_range_erase,
-        &[0, erase_len as u32, ERASE_BLOCK_SIZE, ERASE_BLOCK_CMD],
-        &slow,
-    )?;
+    let calls = erase_calls(erase_len);
+    let count = calls.len();
+    log(&format!(
+        "_flash_range_erase {erase_len} bytes at flash offset 0, {ERASE_CALL_BYTES} bytes a call..."
+    ));
+    for (index, (offset, bytes)) in calls.enumerate() {
+        target
+            .call_target(
+                rom.flash_range_erase,
+                &[offset, bytes, ERASE_BLOCK_SIZE, ERASE_BLOCK_CMD],
+                &slow,
+            )
+            .inspect_err(|error| {
+                log(&format!(
+                    "_flash_range_erase call {} of {count} ({bytes} bytes at flash offset \
+                     {offset:#x}) did not complete: {error}",
+                    index + 1
+                ));
+            })?;
+        let erased = offset as usize + bytes as usize;
+        if erased.is_multiple_of(ERASE_PROGRESS_BYTES) && erased < erase_len {
+            log(&format!("erased {erased} of {erase_len} bytes..."));
+        }
+    }
 
     let stage_words = STAGE_MAX / 4;
     for (index, slice) in words.chunks(stage_words).enumerate() {
@@ -438,6 +478,16 @@ fn program_and_verify<A: TargetAccess>(
         return Err(ProbeError::Device("flash verify mismatch"));
     }
     Ok(readback)
+}
+
+/// The `_flash_range_erase` calls that erase the first `erase_len` bytes of flash, in order: each
+/// an offset from the start of the flash device on a 64 KiB boundary, and a byte count no larger
+/// than [`ERASE_CALL_BYTES`].
+fn erase_calls(erase_len: usize) -> impl ExactSizeIterator<Item = (u32, u32)> {
+    (0..erase_len.div_ceil(ERASE_CALL_BYTES)).map(move |index| {
+        let offset = index * ERASE_CALL_BYTES;
+        (offset as u32, (erase_len - offset).min(ERASE_CALL_BYTES) as u32)
+    })
 }
 
 /// Hold core 1 in reset, or release it.
@@ -511,5 +561,42 @@ mod tests {
         let table = RomFunctions { entries: vec![(0x4552, 0x1234)] };
         assert_eq!(table.lookup(b'R', b'E'), Some(0x1234));
         assert_eq!(table.lookup(b'E', b'R'), None);
+    }
+
+    /// The erase calls cover the image's sectors exactly, in order and without a gap: each a whole
+    /// number of sectors starting on a 64 KiB boundary, and none larger than one block.
+    #[test]
+    fn the_erase_calls_cover_the_image_a_block_at_a_time() {
+        for erase_len in [4096, 65536, 65536 + 4096, 2 * 1024 * 1024, XIP_ADDRESSABLE] {
+            let calls: Vec<(u32, u32)> = erase_calls(erase_len).collect();
+            assert_eq!(calls.len(), erase_len.div_ceil(ERASE_CALL_BYTES), "{erase_len}");
+            let mut next = 0;
+            for &(offset, bytes) in &calls {
+                assert_eq!(offset, next, "{erase_len}: in order, with no gap");
+                assert_eq!(offset as usize % ERASE_CALL_BYTES, 0, "{offset:#x}");
+                assert!(bytes > 0 && bytes as usize <= ERASE_CALL_BYTES, "{bytes} at {offset:#x}");
+                assert_eq!(bytes as usize % SECTOR_BYTES, 0, "{bytes} at {offset:#x}");
+                next += bytes;
+            }
+            assert_eq!(next as usize, erase_len, "the image's sectors and no more");
+        }
+    }
+
+    /// **NO CALL OUTGROWS ITS POLL BUDGET**: the slowest erase call and the slowest program call
+    /// the flash device is specified for each take a fifth or less of the time the budget spans
+    /// through the probe, so a probe that polls five times faster still waits them out.
+    #[test]
+    fn every_flash_call_fits_its_poll_budget_five_times_over() {
+        const SECTOR_ERASE_MAX_US: u64 = 400_000;
+        const BLOCK_ERASE_MAX_US: u64 = 2_000_000;
+        const PAGE_PROGRAM_MAX_US: u64 = 3_000;
+        const POLL_US: u64 = 400;
+
+        let budget_us = u64::from(FLASH_OP_POLLS) * POLL_US;
+        let erase_us =
+            BLOCK_ERASE_MAX_US.max((ERASE_CALL_BYTES / SECTOR_BYTES) as u64 * SECTOR_ERASE_MAX_US);
+        let program_us = (STAGE_MAX / PAGE_BYTES) as u64 * PAGE_PROGRAM_MAX_US;
+        assert!(erase_us * 5 <= budget_us, "an erase call: {erase_us} us of {budget_us}");
+        assert!(program_us * 5 <= budget_us, "a program call: {program_us} us of {budget_us}");
     }
 }

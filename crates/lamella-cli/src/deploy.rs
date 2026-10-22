@@ -418,7 +418,7 @@ pub(crate) fn connect(
 ) -> Option<(AnyTransport, lamella_wire::Negotiated)> {
     let mut transport = open(verb, target)?;
     match hello_on(&mut transport, 0, verb, target, caps) {
-        Ok(session) => match board.map(|board| board.against(verb, session.identity.product_model)) {
+        Ok(session) => match board.map(|board| board.against(verb, target, session.identity.product_model)) {
             Some(Err(refusal)) => {
                 eprintln!("{refusal}");
                 None
@@ -434,10 +434,10 @@ pub(crate) fn connect(
 
 /// Open `target`, or say why not and answer `None`.
 fn open(verb: &str, target: &str) -> Option<AnyTransport> {
-    match open_target(target, BAUD, TIMEOUT) {
+    match open_named(target, TIMEOUT) {
         Ok(transport) => Some(transport),
-        Err(error) => {
-            eprintln!("lamella {verb}: cannot open {target}: {error:?}");
+        Err(why) => {
+            eprintln!("lamella {verb}: {why}");
             eprintln!(
                 "\nthis build can open: {}.\n\
                  `lamella devices` lists what is attached and what to write here.",
@@ -446,6 +446,47 @@ fn open(verb: &str, target: &str) -> Option<AnyTransport> {
             None
         }
     }
+}
+
+/// Open the device `target` names, which the user named, or say why not. `timeout` applies to a
+/// network target alone.
+///
+/// **THE ONE PLACE A DEVICE IS OPENED TO BE WRITTEN TO, AND IT IS ONLY EVER ONE THE USER NAMED**:
+/// `--device` at deploy time, and `lamella devices --identify <device>`. A serial port is opened
+/// with DTR and RTS held low, so that no edge reaches a board's reset, except the bridges that pass
+/// nothing back without them ([`crate::devices::raises_lines`]); on Linux and macOS the operating
+/// system raises both as it opens the port, before they can be lowered. A port or device another
+/// program holds is not taken from it: the open fails, and this says so.
+///
+/// Every other target goes through `open_target`, the one place that knows the target syntax.
+pub(crate) fn open_named(target: &str, timeout: Duration) -> Result<AnyTransport, String> {
+    if lamella_wire_host::classify_target(target) != lamella_wire_host::TargetKind::Serial {
+        return open_target(target, BAUD, timeout).map_err(|error| {
+            format!("cannot open {target}: {error:?}. A device another program holds cannot be opened until it lets go.")
+        });
+    }
+    let ports = crate::ports::attached();
+    let port = crate::ports::resolve(target, &ports).map_err(|why| format!("cannot open {target}: {why}"))?;
+    let usb = ports
+        .iter()
+        .find(|listed| listed.port.eq_ignore_ascii_case(&port))
+        .and_then(|listed| listed.vid.zip(listed.pid));
+    open_quietly(&port, crate::devices::raises_lines(usb)).map_err(|error| {
+        format!(
+            "cannot open {target} ({port}): {error}. A port another program holds cannot be opened, \
+             and this tool does not take it from that program."
+        )
+    })
+}
+
+/// Opens the serial port `name`. With `raise` false, DTR and RTS are deasserted, so that no edge on
+/// either reaches a board's reset: on Windows they stay low from the open on, and on Linux and macOS
+/// the open itself raises them first. With `raise` true, both are asserted.
+fn open_quietly(name: &str, raise: bool) -> Result<AnyTransport, lamella_serial_port::Error> {
+    let mut port = lamella_serial_port::Port::open(name, &lamella_serial_port::Settings::new(BAUD))?;
+    port.set_dtr(raise).ok();
+    port.set_rts(raise).ok();
+    Ok(AnyTransport::Serial(lamella_wire_host::SerialTransport::from_port(Box::new(port))))
 }
 
 /// Complete a HELLO offering `caps` with the firmware at the other end of `transport`, or say why

@@ -9,7 +9,9 @@ use lamella_debug_backend::{
 };
 use lamella_metadata::PortablePdb;
 use lamella_token::Token;
-use lamella_cil_runtime::{MethodId, Module, Session, Status, Value, Vm};
+use lamella_cil_runtime::{
+    MethodId, Module, PendingOp, Session, Status, Value, Vm, take_pending_op,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The `MethodDef` metadata table tag, for rebuilding a method token to map a PDB
@@ -57,8 +59,65 @@ fn exit_code_of(returned: &Option<Value>) -> i32 {
     }
 }
 
+/// Runs one instruction of `session`, then the thread operation it raised, if any: the session's
+/// status after it, or why the run cannot go on -- the instruction trapped, or it raised an
+/// operation a debug session cannot perform ([`perform_thread_op`]).
+fn step_and_perform_thread_op(
+    session: &mut Session,
+    module: &Module,
+    vm: &mut Vm,
+) -> Result<Status, String> {
+    let status = session.step(module, vm).map_err(|trap| format!("{trap}"))?;
+    if !matches!(status, Status::Done(_)) {
+        perform_thread_op(vm)?;
+    }
+    Ok(status)
+}
+
+/// Performs the thread operation the instruction just run raised, where a debug session can.
+///
+/// A debug session runs the program's main thread alone, with no scheduler beside it. A sleep
+/// waits out its time on the machine's clock, and a yield carries on, there being no other thread
+/// to yield to. Everything else a scheduler does for a thread -- starting or joining one, waiting
+/// for a lock another thread holds, blocking on a socket, sleeping for good -- ends the run with
+/// the reason, because the program would otherwise carry on as though the operation had worked.
+fn perform_thread_op(vm: &mut Vm) -> Result<(), String> {
+    match take_pending_op(vm) {
+        PendingOp::None | PendingOp::Yield => Ok(()),
+        PendingOp::SleepUntil(u64::MAX) => Err(String::from(
+            "Thread.Sleep(Timeout.Infinite) never returns in a debug session: the debugger runs \
+             the program's main thread alone, so nothing can wake it. Run the program without the \
+             debugger, where its other threads run.",
+        )),
+        PendingOp::SleepUntil(deadline) => {
+            sleep_until(vm, deadline);
+            Ok(())
+        }
+        PendingOp::NeedsScheduler(what) => Err(format!(
+            "{what} needs the scheduler, which a debug session does not run: the debugger runs the \
+             program's main thread alone. Run the program without the debugger to use it."
+        )),
+    }
+}
+
+/// Holds the program until the machine's monotonic clock reaches `deadline`.
+///
+/// Through the machine's own sleep, never the standard library's: this backend also runs in a
+/// browser, where only the page knows whether its thread may block. A sleep that may not block
+/// returns early, so the clock is asked again after each one.
+fn sleep_until(vm: &mut Vm, deadline: u64) {
+    while let Some(now) = vm.now_millis() {
+        if now >= deadline {
+            return;
+        }
+        vm.sleep_millis(deadline - now);
+    }
+}
+
 impl InterpreterBackend {
     /// Creates a backend that owns `module`, entered at `entry`.
+    ///
+    /// Its program has no clock until [`InterpreterBackend::configure_machine`] gives it one.
     #[must_use]
     pub fn new(module: Module, entry: u32) -> InterpreterBackend {
         InterpreterBackend {
@@ -80,6 +139,8 @@ impl InterpreterBackend {
     /// Creates a backend with source mapping from a standalone Portable PDB
     /// (`pdb_bytes`), building the `MethodId` -> `method_rid` reverse map from the
     /// module's token binding so frames and breakpoints map to and from source.
+    ///
+    /// Its program has no clock until [`InterpreterBackend::configure_machine`] gives it one.
     #[must_use]
     pub fn with_pdb(module: Module, entry: u32, pdb_bytes: Vec<u8>) -> InterpreterBackend {
         let mut method_rid = BTreeMap::new();
@@ -115,6 +176,22 @@ impl InterpreterBackend {
             at_reported_breakpoint: false,
             exit_code: 0,
         }
+    }
+
+    /// This backend with its program's machine set up by `configure`, which is handed the module
+    /// and the machine before the program starts. It is where the program's clock comes from.
+    ///
+    /// The interpreter keeps no clock of its own, so a program given none reads the year 1 from
+    /// `DateTime.Now` and 0 from `Environment.TickCount`, and its `Thread.Sleep` returns at once.
+    /// On this computer, pass [`host_machine`]. A page passes its own clock instead, because
+    /// `wasm32-unknown-unknown` has no standard-library clock and reading one there panics.
+    #[must_use]
+    pub fn configure_machine(
+        mut self,
+        configure: impl FnOnce(&Module, &mut Vm),
+    ) -> InterpreterBackend {
+        configure(&self.module, &mut self.vm);
+        self
     }
 
     fn apply_breakpoints(&mut self) {
@@ -199,9 +276,22 @@ impl InterpreterBackend {
     }
 }
 
+/// This computer's clock, for a program debugged on it: the one `lamella run` gives a program, so
+/// `DateTime.Now` reads the date, `Environment.TickCount` the milliseconds since the computer
+/// started, and `Thread.Sleep` waits. Pass it to [`InterpreterBackend::configure_machine`].
+///
+/// Not built for `wasm32`, which has no standard-library clock.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn host_machine(module: &Module, vm: &mut Vm) {
+    lamella_wire_host::engine::install_host_clock(vm);
+    let ticks = vm.now_ticks();
+    lamella_cil_runtime::set_wall_clock(module, vm, ticks);
+}
+
 impl DebugBackend for InterpreterBackend {
     fn launch(&mut self) -> Result<(), String> {
-        match Session::new(&self.module, self.entry, Vec::new()) {
+        let args = lamella_cil_runtime::entry_args(&self.module, &mut self.vm, self.entry);
+        match Session::new(&self.module, self.entry, args) {
             Ok(session) => {
                 self.session = Some(session);
                 self.at_reported_breakpoint = false;
@@ -224,27 +314,22 @@ impl DebugBackend for InterpreterBackend {
         let Some(session) = session.as_mut() else {
             return Stop::Done;
         };
-        if *at_reported_breakpoint && session.is_at_breakpoint() {
-            *at_reported_breakpoint = false;
-            match session.step(module, vm) {
+        let mut stepping_off = *at_reported_breakpoint && session.is_at_breakpoint();
+        *at_reported_breakpoint = false;
+        loop {
+            if !stepping_off && session.is_at_breakpoint() {
+                *at_reported_breakpoint = true;
+                return Stop::Breakpoint;
+            }
+            stepping_off = false;
+            match step_and_perform_thread_op(session, module, vm) {
                 Ok(Status::Done(value)) => {
                     *exit_code = exit_code_of(&value);
                     return Stop::Done;
                 }
-                Ok(_) => {}
-                Err(trap) => return Stop::Fault(format!("{trap}")),
+                Ok(Status::Running | Status::Paused) => {}
+                Err(reason) => return Stop::Fault(reason),
             }
-        }
-        match session.resume(module, vm) {
-            Ok(Status::Paused | Status::Running) => {
-                *at_reported_breakpoint = true;
-                Stop::Breakpoint
-            }
-            Ok(Status::Done(value)) => {
-                *exit_code = exit_code_of(&value);
-                Stop::Done
-            }
-            Err(trap) => Stop::Fault(format!("{trap}")),
         }
     }
 
@@ -261,7 +346,7 @@ impl DebugBackend for InterpreterBackend {
             return Stop::Done;
         };
         *at_reported_breakpoint = false;
-        match session.step(module, vm) {
+        match step_and_perform_thread_op(session, module, vm) {
             Ok(Status::Done(value)) => {
                 *exit_code = exit_code_of(&value);
                 Stop::Done
@@ -271,7 +356,7 @@ impl DebugBackend for InterpreterBackend {
                 Stop::Breakpoint
             }
             Ok(Status::Running | Status::Paused) => Stop::Step,
-            Err(trap) => Stop::Fault(format!("{trap}")),
+            Err(reason) => Stop::Fault(reason),
         }
     }
 

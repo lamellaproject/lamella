@@ -2,7 +2,7 @@
 namespace Lamella.Hardware
 {
     /// <summary>Volatile access to memory-mapped hardware registers, for peripheral drivers.</summary>
-    public sealed class Mmio
+    internal sealed class Mmio
     {
         private Mmio() { }
 
