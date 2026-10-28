@@ -2,7 +2,7 @@
 # against the datasheet's pinout, not the whole package, so a consumer must not read one as the
 # package. A pin that is not listed is refused rather than assumed.
 #
-# WHY THIS IS A FAMILY OF ITS OWN AND NOT A ROW ON `stm32f7`, since the two are one letter apart in
+# Why this is a family of its own and not a row on `stm32f7`, since the two are one letter apart in
 # a marketing name. A family here owns ONE reference manual and one pin-function table, and these
 # two parts do not share either. RM0410's introduction says it "provides complete information on
 # how to use the STM32F76xxx and STM32F77xxx microcontroller memory and peripherals"; RM0385's says
@@ -11,8 +11,8 @@
 # its F429 sibling already had -- RM0090 names both lines by name -- and it is the same test giving
 # the opposite answer here.
 #
-# WHERE THIS FAMILY AND `stm32f7` AGREE ON A NUMBER, THAT IS TWO FACTS AGREEING RATHER THAN ONE
-# FACT COPIED. Both manuals place USART1 at 0x40011000, the GPIO ports from 0x40020000, and the RCC
+# Where this family and `stm32f7` agree on a number, that is two facts agreeing rather than one
+# fact copied. Both manuals place USART1 at 0x40011000, the GPIO ports from 0x40020000, and the RCC
 # at 0x40023800; each was read from RM0410 here and each was already read from RM0385 there. Had
 # the vendor moved a peripheral the two rows would legitimately differ and neither would be wrong.
 #

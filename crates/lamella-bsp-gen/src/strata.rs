@@ -62,7 +62,7 @@ pub struct BlockTable {
     /// needs to appear all-at-once inside one unit. It ranges from 2 bytes on an STM32F0 to 512 on
     /// a SAM4S, and 32 on an STM32H7 whose flash word additionally cannot be programmed twice.
     ///
-    /// WHAT IT IS FOR, since a number with no consumer becomes a ritual. A record whose presence
+    /// What it is for, since a number with no consumer becomes a ritual. A record whose presence
     /// must survive losing power mid-write is laid out across at least TWO of these, with the
     /// value that makes it valid alone in the last one and programmed last -- so a torn write
     /// leaves that value absent and the record reads as not there, rather than as half of a record
@@ -155,7 +155,7 @@ pub struct InstanceRow {
     /// The pin-name port group this instance IS, when the family states it (`"C"` on a row that
     /// backs pins named `PC<n>`); empty when it states nothing. See [`InstanceRow::port_char`].
     ///
-    /// STATED RATHER THAN GUESSED FROM THE INSTANCE NAME. A control pin resolves to a port
+    /// Stated rather than guessed from the instance name. A control pin resolves to a port
     /// group's base address, and vendors do not agree on what that group is called: `PORTA`,
     /// `PORT0`, `GPIOA`, `PIOA`, `SIO` and `IO_MUX` all name one, and one of those is numbered
     /// where the rest are lettered. A derivation that pattern-matches the name has to grow by one
@@ -209,13 +209,13 @@ pub const NO_CONTROLLER: &str = "none";
 
 /// One pin-function row: pin x function -> (instance, signal), or -> nothing.
 ///
-/// A row takes ONE OF TWO SHAPES and every field of the shape it takes is required:
+/// A row takes one of two shapes and every field of the shape it takes is required:
 /// - ROUTED: `instance` names an instance the family places, `signal` names the cell's signal.
 /// - UNROUTED: `instance = "none"` and there is no `signal`, because a cell that reaches no
 ///   controller has no signal to name.
 ///
-/// THE SECOND SHAPE EXISTS BECAUSE AN ABSENCE AND AN OMISSION ARE INDISTINGUISHABLE IN A TABLE
-/// THAT HAS ONLY ONE WAY TO SAY NEITHER. "No controller reaches this cell" is a fact somebody read
+/// The second shape exists because an absence and an omission are indistinguishable in a table
+/// that has only one way to say neither. "No controller reaches this cell" is a fact somebody read
 /// out of a pin table; a missing `instance` is a field somebody did not fill in. Rendered as the
 /// same empty string they cannot be told apart, and they want opposite responses -- the first
 /// wants to be believed, the second wants a datasheet opened. The costlier mistake is the silent
@@ -274,13 +274,13 @@ pub struct PartRow {
     /// The part's PROCESSOR SOCKETS, in boot order, each with the architecture(s) it can run.
     /// Empty on a single-core part, where the `isa*` fields describe the one core.
     ///
-    /// A SOCKET RATHER THAN A CORE, and the distinction is forced by silicon rather than invented:
+    /// A socket rather than a core, and the distinction is forced by silicon rather than invented:
     /// some silicon lets each socket be an Arm core OR a RISC-V core, selected by a
     /// register, so "which core is in socket 1" is not a fixed property of the part. Listing the
-    /// admissible architectures per socket states what the part offers; WHICH ONE AN IMAGE USES is
+    /// admissible architectures per socket states what the part offers; which one an image uses is
     /// a target's choice and is not a fact about the chip.
     ///
-    /// THIS DOES NOT REPLACE `isa`. That field is a RISC-V PROFILE whose consequences (register
+    /// This does not replace `isa`. That field is a RISC-V PROFILE whose consequences (register
     /// count, multiply path) are derived and checked from its letters. This is a core-architecture
     /// NAME, a coarser thing, and the two answer different questions -- so a part may state both,
     /// and a mistake in one is not caught by the other.
@@ -289,22 +289,22 @@ pub struct PartRow {
     /// `cores` is stated, because it is half of the combinability test and a default would decide
     /// it silently.
     ///
-    /// SHARED MEMORY IS NOT SUFFICIENT FOR THREADING ACROSS CORES, and the part that proves it
+    /// Shared memory is not sufficient for threading across cores, and the part that proves it
     /// is shipping silicon: sockets running DIFFERENT architectures can share memory and still need
     /// two separate program images. Same architecture AND shared memory is the condition; this
     /// field is only the second half.
     pub cores_share_memory: Option<bool>,
-    /// Pins the part carries that A PROGRAM MAY NOT USE, each with the peripheral that owns it.
+    /// Pins the part carries that a program may not use, each with the peripheral that owns it.
     ///
-    /// PRESENT AND UNAVAILABLE ARE DIFFERENT FACTS, and until this existed the model could only
-    /// say the first. The present-list says a part HAS a pin; the pin map's unrouted shape says no
-    /// controller reaches a (pin, FUNCTION) CELL. Neither says a pin is permanently owned by
-    /// something inside the package, which is what a system-in-package states about the pins its
-    /// integrated peripheral is wired through -- and those pins ARE present, so removing them from
-    /// the present-list would be a second lie rather than a fix.
+    /// Present and unavailable are different facts, and this field states the second. The
+    /// present-list says a part has a pin; the pin map's unrouted shape says no controller reaches
+    /// a (pin, function) cell. Neither says a pin is permanently owned by something inside the
+    /// package, which is what a system-in-package states about the pins its integrated peripheral
+    /// is wired through -- and those pins are present, so removing them from the present-list
+    /// would be a second lie rather than a fix.
     ///
-    /// THE GAP WAS SILENT AND THE HAZARD IS A BOARD FILE, NOT A DRIVER. A control line needs no
-    /// pin-map row, so the unrouted shape is never consulted for one; a board could bind an LED to
+    /// The hazard is a board file, not a driver. A control line needs no pin-map row, so the
+    /// unrouted shape is never consulted for one; without this field a board could bind an LED to
     /// a reserved pin, pass the present-list, pass the control-pin check, and emit a real port base
     /// and a real mask. The write lands on a pin the program does not own and the board does
     /// nothing -- the same silence as a board with no LED at all.
@@ -316,7 +316,7 @@ pub struct PartRow {
     /// The pads each separately supplied rail powers, by rail (`vddio2 = ["PG2-PG15"]`), where the
     /// part isolates them at reset until software validates the rail. Empty for a part with none.
     ///
-    /// A PAD ON SUCH A RAIL IS PRESENT AND ROUTED AND STILL DOES NOTHING. It passes the pin list,
+    /// A pad on such a rail is present and routed and still does nothing. It passes the pin list,
     /// its function cell and every mux check, and a write to it lands with no error, because the
     /// isolation sits between the pad and the rest of the chip. So the rail is a fact of its own,
     /// and a board whose pins touch one emits the rail's prerequisite.
@@ -337,7 +337,7 @@ pub struct PartRow {
     /// Zmmul extension, which is M's multiply half WITHOUT divide), or `soft` (runtime routines
     /// for both); empty when unstated. Derived-and-verified against `isa` rather than trusted.
     ///
-    /// THE MIDDLE VALUE IS NOT A REFINEMENT, IT IS A CASE THAT REALLY OCCURS: a core can have a
+    /// The middle value is not a refinement, it is a case that really occurs: a core can have a
     /// `mul` instruction and no `div`, so a two-value field would have to call such a part either
     /// hardware (and emit a division that traps) or soft (and give up a multiply it has).
     pub isa_muldiv: String,
@@ -345,7 +345,7 @@ pub struct PartRow {
     /// `single` (F alone), or `soft` (neither -- floating point is library routines); empty when
     /// unstated. Derived-and-verified against `isa` rather than trusted.
     ///
-    /// THIS RECORDS WHAT THE SILICON HAS, NOT WHAT A BUILD EMITS. A part with an FPU may still be
+    /// This records what the silicon has, not what a build emits. A part with an FPU may still be
     /// compiled soft-float deliberately -- for size, or to keep one image valid across a family
     /// whose members differ here -- so this field settles what is POSSIBLE and a profile knob
     /// settles what is CHOSEN. Reading it as permission to emit FP instructions would be a
@@ -354,7 +354,7 @@ pub struct PartRow {
     /// What the DEBUG PORT answers about ITSELF -- the SW-DP IDCODE / DPIDR -- or `None` where the
     /// part has no such port or nobody has read one.
     ///
-    /// IT NAMES A PORT DESIGN AND NOT A PART. `0x0bc11477` is Arm's M0-class SW-DP: an STM32L0, an
+    /// It names a port design and not a part. `0x0bc11477` is Arm's M0-class SW-DP: an STM32L0, an
     /// STM32C0 and a SAM D11 all answer it. `0x2ba01477` is answered by an nRF52833 and by every
     /// STM32 M3/M4. So this value narrows a search and NEVER concludes one, which is why it is a
     /// separate field from [`device_id`] rather than the two sharing a name.
@@ -367,7 +367,7 @@ pub struct PartRow {
     /// one is recorded: `None` alongside [`device_id`], [`device_id_mask`] and
     /// [`device_id_identifies`], or all four together.
     ///
-    /// THE ADDRESS IS PART OF THE FACT AND VARIES INSIDE ONE VENDOR. ST keeps `DBGMCU_IDCODE` at a
+    /// The address is part of the fact and varies inside one vendor. ST keeps `DBGMCU_IDCODE` at a
     /// peripheral address on an F0 or L0 (`0x40015800`) and at `0xE0042000` on an F4 or F7; Nordic
     /// answers in FICR, Microchip in the DSU's DID. A field holding only a value would push the
     /// address into a tool, where it becomes a per-vendor branch nobody can audit against the
@@ -383,7 +383,7 @@ pub struct PartRow {
     /// device id is stated, and it is the field that stops the second reading repeating the first
     /// one's mistake.
     ///
-    /// A SECOND READING IS NOT AUTOMATICALLY AN IDENTITY. RM0090 gives `DEV_ID` 0x419 to
+    /// A second reading is not automatically an identity. RM0090 gives `DEV_ID` 0x419 to
     /// STM32F42xxx and STM32F43xxx alike, and an STM32L0's `DEV_ID` names a product CATEGORY
     /// spanning two lines -- so on those parts even the vendor register cannot say which part is on
     /// the wire. Stating `class` is how a table says that outright instead of leaving a consumer to
@@ -413,7 +413,7 @@ impl PartRow {
     /// Refuses a half-stated identity: the four `device_id*` fields are one fact and travel
     /// together.
     ///
-    /// THREE OF THE FOUR IS WORSE THAN NONE, and each missing one fails differently. Without the
+    /// Three of the four is worse than none, and each missing one fails differently. Without the
     /// REGISTER a consumer has a number and nowhere to read it. Without the MASK it compares whole
     /// words and reports a die revision as a different part. Without `identifies` it treats a value
     /// that names a whole product category as though it named the part, which is the reading a
@@ -498,7 +498,7 @@ pub struct Binding {
     /// The OPAQUE token an interrupt binding hands the runtime (-1 = not stated), legal only on
     /// an `interrupt` binding.
     ///
-    /// MINTED BY THE BOARD AND NEVER DECODED BY THE RUNTIME. It travels from the BSP's ISR through
+    /// Minted by the board and never decoded by the runtime. It travels from the BSP's ISR through
     /// `lamella_isr_notify` to the managed side and back to the driver, which maps it to a pin.
     /// Keeping it opaque is what keeps the pad-to-line-to-vector mapping in the strata and the
     /// runtime free of any per-chip table. It is deliberately NOT the line number: two pads can
@@ -563,7 +563,7 @@ impl Default for ControlPin {
 /// The levels a pin-wired control line may declare. CLOSED: anything else is refused where it is
 /// written.
 ///
-/// FOUR WORDS AND NOT TWO, because a polarity has four states and only two of them are a level.
+/// Four words and not two, because a polarity has four states and only two of them are a level.
 /// `none` is a line whose nature has no asserted level -- a clock, a bidirectional data pin -- and
 /// `unknown` is a line whose level nobody has established yet. Collapsing those two loses the
 /// difference between a fact that does not exist and a fact nobody looked for, which is the same
@@ -572,13 +572,13 @@ pub const ACTIVE_LEVELS: &[&str] = &["low", "high", "none", "unknown"];
 
 /// Whether a control line asserts LOW, or `None` when it declares no level at all.
 ///
-/// THE WHOLE POINT IS THAT THIS IS ONE FUNCTION. Four emitters -- C#, Rust, Swift, Python -- each
+/// The whole point is that this is one function. Four emitters -- C#, Rust, Swift, Python -- each
 /// carried their own `active == "low"`, so absence and every typo rendered as a confident
 /// active-HIGH, byte-identical to a board that claimed it. Four independent spellings of one rule
 /// is four chances to fix three of them: the repair is the extraction, not a more careful
 /// comparison at the fourth site.
 ///
-/// `None` MEANS THE EMITTERS PRODUCE NOTHING for this line's polarity -- no constant in the three
+/// `None` means the emitters produce nothing for this line's polarity -- no constant in the three
 /// typed languages, no key in Python's dict. A consumer that needs the level then fails to COMPILE,
 /// or raises a `KeyError`, against a board that never stated one: the loud form of the same
 /// information. Emitting a placeholder value instead was tried and is what the defect WAS.
@@ -599,13 +599,13 @@ pub const PULL_STATES: &[&str] = &["up", "down", "none", "unknown"];
 
 /// A pin-wired line's pull as (up, down), or `None` where no pull has been established.
 ///
-/// `none` EMITS HERE, WHERE A POLARITY'S `none` DOES NOT, and the asymmetry is deliberate rather
+/// `none` emits here, where a polarity's `none` does not, and the asymmetry is deliberate rather
 /// than an oversight: "no asserted level" is something a line does not HAVE -- a clock has no
 /// polarity and there is nothing to tell a driver -- while "no pull" is something a driver DOES.
 /// A pad that a document says needs neither resistor is an instruction, so it is emitted as one
 /// (both flags zero) and a consumer can tell it apart from a pad nobody read.
 ///
-/// TWO FLAGS RATHER THAN ONE ENCODED VALUE. Any small integer chosen here would coincide with
+/// Two flags rather than one encoded value. Any small integer chosen here would coincide with
 /// some family's register field -- 0/1/2 happens to be the STM32 `PUPDR` encoding and is NOT
 /// nRF's `PIN_CNF.PULL` -- and a value that looks like a register field invites being written
 /// into one, which is right on one family and silently wrong on the next. Two booleans cannot
@@ -737,7 +737,7 @@ pub struct MemoryRegion {
 /// One read configuration of a fitted flash: the command, how many lines each phase uses, and
 /// the dummy-cycle count MEASURED at a stated interface clock.
 ///
-/// THE DUMMY COUNT IS THE ONE NUMBER IN THE STRATA THAT NOTHING CAN DERIVE. A dummy phase covers
+/// The dummy count is the one number in the strata that nothing can derive. A dummy phase covers
 /// the device's internal latency in TIME, so the number of CYCLES that covers it falls as the
 /// interface clock falls -- a part whose datasheet states eight at its own rating reads correctly
 /// with six at half that. Neither figure is wrong, and neither is a property of the part alone.
@@ -845,7 +845,7 @@ pub struct ConnectorBus {
 /// One line a connector brings out as a single pin, named by the standard's own name for that
 /// socket position.
 ///
-/// A socket position is a NAME IN THE STANDARD'S VOCABULARY and the pin behind it is this board's
+/// A socket position is a name in the standard's vocabulary and the pin behind it is this board's
 /// answer, which is the whole content of a connector: `a4` is a position every module built to
 /// that standard knows, and which pin it reaches differs on every board that offers one.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -859,18 +859,18 @@ pub struct ConnectorPin {
 /// A socket a removable module plugs into: which standard it follows, which buses it brings out
 /// whole, and which single lines it brings out by name.
 ///
-/// A CONNECTOR IS BOARD TRUTH AND WHAT IS PLUGGED INTO IT IS NOT. The socket is on the schematic,
+/// A connector is board truth and what is plugged into it is not. The socket is on the schematic,
 /// it is identical on every unit, and it does not change; the module on the other end is different
 /// on different desks and on different days, so it is supplied per invocation rather than stored
 /// here.
 ///
-/// TWO LISTS RATHER THAN ONE, BECAUSE THE TWO KINDS OF LINE ARE SHARED DIFFERENTLY. A board with
+/// Two lists rather than one, because the two kinds of line are shared differently. A board with
 /// two sockets of one standard serves both from ONE set of bus roles and gives each its OWN chip
 /// select, interrupt and reset. That asymmetry is what a bus role alone cannot describe: which
 /// protocol an attached module speaks is a property of the module, and the side-band lines it uses
 /// are per socket.
 ///
-/// A LINE IS STATED ONCE. A pin a named bus already brings out must not appear again as a pin row,
+/// A line is stated once. A pin a named bus already brings out must not appear again as a pin row,
 /// because the two spellings would be two statements of one wire and nothing would hold them equal.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Connector {
@@ -901,7 +901,7 @@ pub const DEBUG_SIGNALS: [&str; 3] = ["swd", "jtag", "swio"];
 /// a cable. A board at rung three can be reached by a probe with no tools at all, which is a
 /// different situation from the two below it and is why the distinction earns a field.
 ///
-/// ONE BOOLEAN IS OPERATIONALLY BACKWARDS ON A WHOLE CLASS OF HOBBY BOARD. Such a board carries
+/// One boolean is operationally backwards on a whole class of hobby board. Such a board carries
 /// its SWD signals to two or three pads on the underside, with no connector on them, and says so
 /// in its own documentation. A presence flag reads true for every one of them, while an owner
 /// without a fine-pitch soldering setup can debug none of them.
@@ -919,7 +919,7 @@ pub const DEBUG_EXPOSURES: [&str; 5] = ["none", "pads", "connectable", "header",
 /// unreachable as a bare board. Recording the PRESENCE would put such a board in the reachable
 /// column; recording the PROTOCOL is what makes the fact answer the question a host actually asks.
 ///
-/// `chip-usb-jtag` IS NOT A DEBUGGER ON THE BOARD AT ALL, and it is here because the alternative
+/// `chip-usb-jtag` is not a debugger on the board at all, and it is here because the alternative
 /// is worse. Some parts carry a USB-attached debug controller on the die, with the USB data lines
 /// wired to it by default, so a host reaches the debug interface over the product's own USB socket
 /// with no probe, no bridge chip and no debug pads in the path. Such a board has no on-board
@@ -936,7 +936,7 @@ pub const DEBUG_ONBOARD: [&str; 6] =
 /// survives only as long as nothing erases the region holding it. A deploy that can brick a board
 /// is a different risk on the two.
 ///
-/// `mask-rom` NAMES THE PROPERTY, NOT A VENDOR'S WORD: the recovery is resident in the part and
+/// `mask-rom` names the property, not a vendor's word: the recovery is resident in the part and
 /// cannot be removed by writing flash. A datasheet that says "fixed at the time the silicon is
 /// manufactured" states it outright; so does one whose boot-mode table selects a download mode by
 /// a strapping pin read before any flash contents execute. Both are the same guarantee to a
@@ -953,12 +953,12 @@ pub const DEBUG_FITTED: [&str; 3] = ["yes", "no", "unknown"];
 
 /// How a debugger reaches this board, and what still reaches it after a deploy.
 ///
-/// ABSENCE OF A PAD IS A POSITIVE FACT ABOUT A BOARD AND CANNOT BE DERIVED FROM THE PART. The part
+/// Absence of a pad is a positive fact about a board and cannot be derived from the part. The part
 /// brings SWD out of the die on every member of most families; whether the BOARD carries those
 /// signals anywhere a person can reach is a property of one product's copper, and a chip's own
 /// tables can never answer it.
 ///
-/// STATING NOTHING AND STATING "none" ARE DIFFERENT CLAIMS, which is why a board holds an
+/// Stating nothing and stating "none" are different claims, which is why a board holds an
 /// `Option` of this record rather than a defaulted one. A board that omits the section has not
 /// been read yet; a board that states `exposure = "none"` has been read and found to expose
 /// nothing. A verdict that read an omitted record as an explicit `none` would call a board
@@ -972,13 +972,13 @@ pub struct DebugAccess {
     /// Whether a connector is ON the board, as opposed to a footprint with nothing in it, from
     /// [`DEBUG_FITTED`].
     ///
-    /// A VENDOR'S NOUN IS NOT EVIDENCE HERE. A datasheet will call three empty through-holes a
+    /// A vendor's noun is not evidence here. A datasheet will call three empty through-holes a
     /// "debug header" and, pages away, say the product is designed to be used with pin-headers the
     /// owner solders on. Reading the noun would promote an empty footprint to a cable-ready
     /// connector, so this field takes the answer from what is fitted rather than from what the
     /// position is called.
     ///
-    /// NOT A BOOLEAN, BECAUSE THE DOCUMENTS ARE UNEVEN AND A BOOLEAN FORCES A GUESS. A kit guide
+    /// Not a boolean, because the documents are uneven and a boolean forces a guess. A kit guide
     /// will devote a numbered section and a full pin table to a debug connector while never saying
     /// whether one is soldered to the position -- and the same guide will mark its crystals
     /// "mounted" and "footprint (not mounted)" in its feature list, so the silence is not a
@@ -1008,11 +1008,11 @@ pub const BOOTLOADER_LAYOUTS: [&str; 2] = ["bare", "keep"];
 /// The bootloader a board's product ships in flash, and what an image kept behind it must leave
 /// alone.
 ///
-/// IT STATES THE PRODUCT, NOT ONE UNIT. A unit whose bootloader was overwritten is still this
+/// It states the product, not one unit. A unit whose bootloader was overwritten is still this
 /// board, so whether a given part holds the bootloader is read from the part when an image is
 /// written, never from this record.
 ///
-/// STATING NOTHING AND STATING NONE ARE DIFFERENT CLAIMS, as for [`DebugAccess`]: a board that
+/// Stating nothing and stating none are different claims, as for [`DebugAccess`]: a board that
 /// omits the section has not been read, and `reserved_ram = []` states that the bootloader keeps
 /// nothing in SRAM across a reset.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -1043,13 +1043,13 @@ pub struct BootloaderLayout {
 /// everything for size.
 pub const INTERPRETER_BUILDS: [&str; 2] = ["speed", "size"];
 
-/// How this board's C# interpreter firmware is built, and the measurement that chose it.
+/// How this board's C# interpreter firmware is built.
 ///
-/// A CHOICE, AND A PER-BOARD ONE. The speed build executes markedly fewer instructions for the same
+/// A choice, and a per-board one. The speed build executes markedly fewer instructions for the same
 /// program and costs a larger image. Whether that image fits the board's firmware region, and
 /// whether a larger image gives back some of the gain on a part that executes from cached flash,
-/// are facts about the board -- so each board that runs the interpreter states its own build, and a
-/// board added later is measured and chosen for rather than handed a default nobody tried on it.
+/// are facts about the board -- so each board that runs the interpreter states its own build
+/// rather than inheriting a default.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct InterpreterBuild {
     /// How the board's C# interpreter firmware is optimized: one of [`INTERPRETER_BUILDS`].
@@ -1207,7 +1207,7 @@ impl ExtensionSocket {
 
 /// An extension board: `ext/<extension>/extension.toml`.
 ///
-/// EVERY LINE IS A STANDARD POSITION AND NEVER A HOST PAD, which is what lets one of these bind to
+/// Every line is a standard position and never a host pad, which is what lets one of these bind to
 /// every host that offers a socket of the same standard.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ExtensionTable {
@@ -1232,7 +1232,7 @@ pub struct ExtensionTable {
 
 impl ExtensionTable {
     /// Every standard position this extension needs a host to wire, without duplicates, in the
-    /// order the file states them. THIS IS THE REQUIREMENT SET a socket is measured against.
+    /// order the file states them. This is the requirement set a socket is measured against.
     ///
     /// An adapter's sockets count: each line a socket carries lands on one of its host positions,
     /// under every revision.
@@ -1461,12 +1461,12 @@ pub struct DeviceIdentity {
     pub values: Vec<Int>,
     /// Why this part has NO identity register, when it has none. Empty for a part that does.
     ///
-    /// NOT EVERY PART CAN BE IDENTIFIED, and a model that assumed otherwise could not describe
+    /// Not every part can be identified, and a model that assumed otherwise could not describe
     /// parts that exist. A humidity sensor whose whole interface is a measurement request and a
     /// data fetch carries no readable id at all -- there is no register to read, so the question
     /// has no answer rather than an answer nobody has looked up.
     ///
-    /// STATED RATHER THAN OMITTED, exactly as a reserved pin names its owner. An absence expressed
+    /// Stated rather than omitted, exactly as a reserved pin names its owner. An absence expressed
     /// as a missing section is indistinguishable from an unfinished table, and the two call for
     /// opposite responses. A part with no identity says so, and says why, so that a reader can
     /// tell a fact from a gap.
@@ -1572,7 +1572,7 @@ pub const SOURCING_VALIDATION: [&str; 3] = ["none", "identified", "exercised"];
 
 /// Where a part's facts came from, and what a physical part has been made to do.
 ///
-/// TWO AXES RATHER THAN ONE LADDER, because they answer different questions and a part can be
+/// Two axes rather than one ladder, because they answer different questions and a part can be
 /// strong on one and absent on the other. Two members of one family can differ on where their
 /// facts came from while agreeing that neither has been made to answer, and no single rank could
 /// order that pair without calling one of the two shortfalls the smaller.
@@ -2631,7 +2631,7 @@ fn build_pins(
     Ok(table)
 }
 
-/// Hold a pin row to ONE OF THE TWO SHAPES, so that an absence and an omission stop looking alike.
+/// Hold a pin row to one of the two shapes, so that an absence and an omission stop looking alike.
 ///
 /// Every field a shape uses is required, which is not tidiness: an empty string is legal in
 /// neither field precisely so that it cannot stand in for a fact. An unrouted cell says what it is
@@ -2708,7 +2708,7 @@ const KNOWN_CORE_ARCHITECTURES: &[&str] = &[
 
 /// A part's processor sockets: how many, what each can run, and whether they share memory.
 ///
-/// WHAT THIS IS FOR, stated because the fields look redundant beside `isa` and are not. A target
+/// What this is for, stated because the fields look redundant beside `isa` and are not. A target
 /// is a selection an IMAGE makes over a part's cores, and one part admits several -- so the facts
 /// layer has to say what there is to select FROM. Two sockets of the same architecture sharing
 /// memory can be driven as one threaded system; two of different architectures need two images
@@ -2776,7 +2776,7 @@ impl PartRow {
     /// Whether the part's sockets can be driven as ONE threaded system, and why not when they
     /// cannot. `None` on a single-core part, which is not asked the question.
     ///
-    /// THE TEST IS TWO CONDITIONS, NOT ONE: the sockets must reach one
+    /// The test is two conditions, not one: the sockets must reach one
     /// address space AND run the same architecture. Shared memory alone is not enough -- a part in
     /// some silicon lets one socket run Arm while the other runs RISC-V over the same memory, with
     /// atomics interoperating across the two, and its own datasheet says that arrangement "requires
@@ -3548,7 +3548,7 @@ fn build_extension(
 
 /// An adapter's revisions and sockets, checked against each other.
 ///
-/// A LINE IS WIRED ONE WAY FOR EVERY UNIT, OR ONCE FOR EACH REVISION. A socket position with a row
+/// A line is wired one way for every unit, or once for each revision. A socket position with a row
 /// for some revisions and not others would resolve to nothing on a unit of a missing one, and one
 /// with a row for every unit beside a row for one revision would be two statements of one wire --
 /// so both are refused, and a position whose wiring depends on the revision names every revision.
@@ -4699,7 +4699,7 @@ fn validate_family(set: &FamilySet) -> Result<(), String> {
 
 /// Refuses two instance rows that share a generic clock channel but state different ceilings for it.
 ///
-/// THE CEILING IS THE CHANNEL'S, NOT THE INSTANCE'S. Where a family routes one channel to two
+/// The ceiling is the channel's, not the instance's. Where a family routes one channel to two
 /// instances -- the SAM D21's timers, in pairs -- the datasheet limits the channel, so both rows state
 /// the one fact, and an edit to one row alone would leave the pair disagreeing about one clock. A row
 /// that states no ceiling, beside one that does, disagrees with it too.
@@ -5158,7 +5158,7 @@ fn documents_something(rest: &[Row]) -> bool {
     rest.iter().any(|row| !matches!(row, Row::Blank | Row::Comment(_)))
 }
 
-/// Renders a section comment with ONE MARKER PER LINE, at a given indent.
+/// Renders a section comment with one marker per line, at a given indent.
 ///
 /// A doc marker, so a section's warning travels with the constants it qualifies rather than being
 /// separable from them -- a caution such as "this dummy-cycle count must be asked of the part, and a
@@ -5173,9 +5173,13 @@ fn push_section_comment(out: &mut String, indent: &str, marker: &str, comment: &
     }
 }
 
+/// Opens a generated C# facts class. It is `internal`: its constants are a chip's, a board's, an
+/// extension's or a part's own facts, read by the drivers and classes compiled into the same
+/// assembly, and a program reaches a board through `Lamella.Hardware.TargetBoard` and dotnet/iot's
+/// types alone.
 fn emit_header(out: &mut String, class: &str, what: &str, sources: &[String], regen: &str) {
     out.push_str(&format!(
-        "// GENERATED by lamella-bsp-gen from {list} -- DO NOT EDIT.\n// Regenerate: {regen}\n//\n// {what}\nnamespace Lamella.Generated\n{{\n    public sealed class {class}\n    {{\n        private {class}() {{ }}\n",
+        "// GENERATED by lamella-bsp-gen from {list} -- DO NOT EDIT.\n// Regenerate: {regen}\n//\n// {what}\nnamespace Lamella.Generated\n{{\n    internal sealed class {class}\n    {{\n        private {class}() {{ }}\n",
         list = sources.join(" + "),
     ));
 }
@@ -5186,7 +5190,7 @@ fn push_const(out: &mut String, kind: &str, name: &str, value: &str) {
 
 /// What `<ROLE>_DRIVER_FAMILY` means, rendered at a given indent.
 ///
-/// A DOC COMMENT RATHER THAN A SECTION COMMENT, because this one has to reach a reader of the
+/// A doc comment rather than a section comment, because this one has to reach a reader of the
 /// published source: only `///` and `//!` survive stripping in a `.rs` or `.cs`, and a plain `//`
 /// section header does not. This is a new public string, so the sentence that says how to read it
 /// has to travel with it.
@@ -5711,8 +5715,9 @@ pub fn bindings_class(board: &str) -> String {
 
 /// The name of the class a board's C# package declares by hand beside its generated bindings: the
 /// bindings name less the maker the board's id begins with, so `rpi-pico2-w` gives `Pico2W`. Its
-/// namespace is `Lamella.Boards.` and the board's [`vendor_segment`], and `csharp/build-boards.ps1` names the
-/// board's assembly by the same rule.
+/// namespace is `Lamella.Boards.` and the board's [`vendor_segment`]. `csharp/build-boards.ps1`
+/// compiles the package into the board's facts assembly, which is `Lamella.Hardware.Facts` for every
+/// board.
 #[must_use]
 pub fn board_class(board: &str) -> String {
     let name = pascal(board);
@@ -5727,11 +5732,14 @@ pub fn board_class(board: &str) -> String {
 /// `csharp` directory.
 pub const TARGET_BOARD_FACTS_FILE: &str = "TargetBoardFacts.g.cs";
 
-/// Emits the generated half of `Lamella.Hardware.TargetBoard` for one board: the board's id, which is
-/// the name a build selects the board by, and the call that arms the board.
+/// Emits what `Lamella.Hardware.TargetBoard` asks a board's facts for: the board's id, which is the
+/// name a build selects the board by, and the call that arms the board.
 ///
-/// The hand-written half is `bsp/common/csharp/TargetBoard.cs`, and `csharp/build-boards.ps1` compiles
-/// both into the board's assembly. `board_class` is the class the board's package declares by hand
+/// `TargetBoard` is compiled once, in `libs/Lamella.Hardware`, against the facts assembly's fixed name,
+/// `Lamella.Hardware.Facts`, and `csharp/build-boards.ps1` compiles this file into the board's own
+/// facts assembly of that name. So every member here is a method or a property, never a constant: a
+/// constant would be compiled into `Lamella.Hardware` from the boardless facts it is built against.
+/// `board_class` is the class the board's package declares by hand
 /// ([`board_class`]), when it declares one. Its type initializer binds the board's buses, so arming
 /// reads its `BoardModel`, which runs that initializer the first time and nothing after. A read
 /// rather than a construction, because a class's constructor may do more than bind: the Pico 2's
@@ -5772,7 +5780,7 @@ pub fn emit_target_board_facts_csharp(
          internal static class TargetBoardFacts\n    \
          {{\n        \
          /// <summary>The board's id, the name a build selects this board by.</summary>\n        \
-         internal const string Name = \"{id}\";\n\n\
+         internal static string Name\n        {{\n            get {{ return \"{id}\"; }}\n        }}\n\n\
          {arm}    \
          }}\n\
          }}\n",
@@ -6089,7 +6097,7 @@ fn resolve_uart(
 /// One resolved sercom-usart emission for the PCHCTRL clock architecture -- the SAM C21, L21,
 /// L22, R30, L10/L11 and D5x/E5x shape, as opposed to the SAM D20/D21/DA1/HA1/R21 one.
 ///
-/// THE PIN HALF IS IDENTICAL TO [`UartEmission`]'s AND THE CLOCK HALF IS NOT, which is the whole
+/// The pin half is identical to [`UartEmission`]'s and the clock half is not, which is the whole
 /// reason this is a separate arm rather than a flag on that one. Both architectures put the same
 /// PORT block under the same PMUX/PINCFG offsets, so muxing a pad is the same act. What differs:
 ///
@@ -6347,12 +6355,12 @@ fn resolve_i2c_samd21(
 /// itself does, and its opposite in how the peripheral is CLOCKED -- which is why it is a separate
 /// shape rather than a widened one:
 ///
-///   A CHANNEL ADDRESS, NOT A COMPOSED WORD. That family routes a core clock by composing one
+///   A channel address, not a composed word. That family routes a core clock by composing one
 ///   CLKCTRL value -- id, generator and enable together -- into a single shared register. This one
 ///   has a register PER CHANNEL, so the channel index resolves to an ADDRESS here and the stored
 ///   value carries only the generator and the enable bit.
 ///
-///   A MASK REGISTER, NOT JUST A MASK. That family gates every SERCOM from one APB mask. This one
+///   A mask register, not just a mask. That family gates every SERCOM from one APB mask. This one
 ///   spreads eight SERCOMs over THREE, so which register to write is a per-instance fact and a
 ///   descriptor carrying only a bit would name a register the driver had to guess.
 ///
@@ -6632,7 +6640,8 @@ struct SpiPl022Emission {
     instance: String,
     base: i64,
     reset_mask: i64,
-    /// Per signal, in (miso, cs, sck, mosi) order: (name, io_ctrl, pads).
+    /// Per signal, in (miso, cs, sck, mosi) order: (name, io_ctrl, pads). The chip select is here
+    /// only when the binding names one.
     signals: Vec<(String, i64, i64)>,
     funcsel: i64,
     sspclk_hz: i64,
@@ -6735,12 +6744,12 @@ fn resolve_spi_pl022(
 
     let mut signals = Vec::new();
     for (signal, cell_signal) in [("miso", "rx"), ("cs", "ss_n"), ("sck", "sclk"), ("mosi", "tx")] {
-        let pin = binding
-            .pins
-            .iter()
-            .find(|(s, _)| s == signal)
-            .map(|(_, p)| p)
-            .ok_or_else(|| format!("{board}: spi binding '{}' needs a {signal} pin", binding.role))?;
+        let Some(pin) = binding.pins.iter().find(|(s, _)| s == signal).map(|(_, p)| p) else {
+            if signal == "cs" {
+                continue;
+            }
+            return Err(format!("{board}: spi binding '{}' needs a {signal} pin", binding.role));
+        };
         if pin.soft {
             return Err(format!(
                 "{board}: spi binding '{}' marks {signal} soft -- the pl022 arm states every signal on a pin with the block's own function, the chip select included, and checks each against its cell",
@@ -6864,7 +6873,7 @@ fn resolve_i2c_dw(
 /// one binds a PAD, because here a channel and a pad are a pairing the chip states per pin, and the
 /// pad has to be handed to the analog function before the converter can see it.
 ///
-/// AND IT CARRIES A CALIBRATION ADDRESS, WHICH NO OTHER ADC ROLE IN THIS FILE DOES. This converter
+/// And it carries a calibration address, which no other ADC role in this file does. This converter
 /// does not work out of reset: three production values must be copied out of the NVM software
 /// calibration area into CALIB "to allow conversion", in the manual's own words. So the descriptor
 /// names WHERE to read them and WHERE that instance's three sit in the word -- the second is a
@@ -7026,7 +7035,7 @@ fn resolve_adc_same54(
 /// releases alone: its inputs are analog pads, with no IO-bank route), the board's reference rail
 /// in microvolts, and the channel map of the board's own part's package.
 ///
-/// THE MAP IS THE PACKAGE'S, SO IT RIDES THE BINDING. The adc block states one map per package and
+/// The map is the package's, so it rides the binding. The adc block states one map per package and
 /// the part row names its package, so each board emits the map its chip has, with the channels
 /// whose pad the board gives to something else marked as reserved. The calibration records stay
 /// chip truth in the adc block's layout, and the plan's clk_adc rate is verified against the rate
@@ -7128,12 +7137,12 @@ fn resolve_adc_rp(
 /// The channel map of `resolved`'s own part's package, from the adc block's `[[channels]]` rows,
 /// and the temperature sensor's channel in it.
 ///
-/// THE ROWS ARE THE PACKAGE'S, AND THEY MUST BE WHOLE. AINSEL selects channels 0 to count - 1, so the
+/// The rows are the package's, and they must be whole. AINSEL selects channels 0 to count - 1, so the
 /// package's rows are those indexes, each once, which is what lets a driver take the count as the
 /// range. Each source is a GPIO or the temperature sensor, which must be there, and a GPIO is a pad
 /// the part bonds.
 ///
-/// A CHANNEL WHOSE PAD THE BOARD GIVES TO SOMETHING ELSE IS RESERVED, and names what has it: a line
+/// A channel whose pad the board gives to something else is reserved, and names what has it: a line
 /// wired to the pad (`line 'cyw43439-clk'`), a binding that routes it (`binding 'uart1'`), or the
 /// part's own reservation. The one line that does not reserve its pad is the channel's own: a
 /// device row on the pad that names a twin: another pad, which the board ties to the same net. That
@@ -7658,7 +7667,7 @@ fn resolve_pwm_samd21(
 /// Refuses a board whose pwm bindings drive one counter twice, or whose bindings put one generic
 /// clock channel on two generators.
 ///
-/// BOTH ARE SILENT ON THE PART. Two bindings on one counter are two drivers over one register block,
+/// Both are silent on the part. Two bindings on one counter are two drivers over one register block,
 /// each re-timing the other's outputs. And a generic clock channel may serve two instances -- the SAM
 /// D21 routes its timers' clocks in pairs, TCC0 with TCC1, TCC2 with TC3, TC4 with TC5 and TC6 with
 /// TC7, one CLKCTRL.ID each (15.8.3) -- so a write routing the channel for one clocks both: the
@@ -7732,7 +7741,7 @@ struct Rp2350PwmOutput {
 /// Resolves an rp2350 `kind = "pwm"` binding: one slice, and the outputs the board routes, each named
 /// `a` or `b`.
 ///
-/// THE SLICE IS STATED AND VERIFIED. Each output of slices 0 to 7 appears on two GPIOs, and each of
+/// The slice is stated and verified. Each output of slices 0 to 7 appears on two GPIOs, and each of
 /// slices 8 to 11 on two more (datasheet 12.5.2, Table 1130), so a pad alone names a slice only through
 /// the pin map, whose F4 cell for the pad is the slice's output by name (`a_1` is Table 1130's channel 1A). The
 /// binding states its slice, and each pad's cell must be that slice's output of the same name: a
@@ -7839,7 +7848,7 @@ fn resolve_pwm_rp2350(
     })
 }
 
-/// Refuses a board whose pwm bindings drive one slice twice. That is SILENT ON THE PART: two drivers
+/// Refuses a board whose pwm bindings drive one slice twice. That is silent on the part: two drivers
 /// over one slice's registers, each re-timing the other's outputs.
 fn refuse_shared_slices(board: &str, pwms: &[Rp2350PwmEmission]) -> Result<(), String> {
     for (index, pwm) in pwms.iter().enumerate() {
@@ -8187,7 +8196,7 @@ fn resolve_uart_sam3x(
 /// The GPIO facts for ONE bound pin: which port gate to open, and the two read-modify-writes
 /// that put the pin in alternate-function mode on the right function number.
 ///
-/// PER PIN RATHER THAN PER BINDING, and that is the whole point of the shape. A uart's two pins
+/// Per pin rather than per binding, and that is the whole point of the shape. A uart's two pins
 /// need not share anything: the F746G-DISCO transmits on port A and receives on port B, so its
 /// two pins have different port gates, different MODER registers and different alternate-function
 /// registers. An earlier shape folded both pins into one mask per register -- one write covering
@@ -8215,12 +8224,12 @@ struct StUartPin {
 /// 4 MHz, 0x45 @ 8 MHz, 0x8B @ 16 MHz).
 /// One ST external-interrupt binding: what an ISR needs that is not a register.
 ///
-/// THE TOKEN IS OPAQUE AND THAT IS THE CONTRACT. The runtime never decodes it -- it carries the
+/// The token is opaque and that is the contract. The runtime never decodes it -- it carries the
 /// value from the BSP's ISR to the managed side and hands it back to the driver, which maps it to
 /// a pin. Keeping it opaque is what keeps the pad-to-line-to-vector mapping entirely in the strata
 /// and the runtime free of any per-chip table.
 ///
-/// THE VECTOR IS LOOKED UP, NOT COMPUTED. Three vectors cover sixteen lines on this vendor and a
+/// The vector is looked up, not computed. Three vectors cover sixteen lines on this vendor and a
 /// SAM D EIC delivers every line on one, so the grouping is per-family DATA in the block table.
 struct StInterruptEmission {
     prefix: String,
@@ -8234,7 +8243,7 @@ struct StInterruptEmission {
     line_mask: i64,
     nvic_position: i64,
     exti_base: i64,
-    /// The pending register, absolute. WRITE ONE TO CLEAR: an ISR that returns without writing
+    /// The pending register, absolute. Write one to clear: an ISR that returns without writing
     /// its line's bit here is re-entered immediately.
     pr_reg: i64,
     /// The interrupt-mask register, absolute. A line reaches the NVIC only with its bit set here.
@@ -8335,7 +8344,7 @@ fn st_mux_pin(
 
 /// Resolves an ST external-interrupt binding into the facts an ISR needs.
 ///
-/// EVERY VALUE COMES FROM A TABLE AND NONE IS COMPUTED FROM A VENDOR ASSUMPTION. The line is the
+/// Every value comes from a table and none is computed from a vendor assumption. The line is the
 /// pin row's stated signal, the vector is looked up per line in the block, and the EXTICR geometry
 /// is the block's own constants -- so a family whose controller groups lines differently, or
 /// selects a port differently, changes its DATA rather than this function.
@@ -8592,7 +8601,7 @@ struct StSoftCs {
 /// One resolved st-spi binding emission: the instance, its RCC enable, the three muxed data pins,
 /// and the soft chip select when the board states one.
 ///
-/// NO BAUD IS DERIVED HERE, DELIBERATELY, and that is the one design decision in this arm. A
+/// No BAUD is derived here, deliberately, and that is the one design decision in this arm. A
 /// USART binding derives its divisor because the wire rate is a carrier fact the board states. An
 /// SPI master's rate is a property of the ATTACHED DEVICE -- the part's own maximum clock -- and a
 /// binding names a bus, not a part. So this emits the APB rate feeding the instance and the block
@@ -8729,14 +8738,14 @@ fn resolve_spi_stm32(
 ///
 /// Two things here that a uart binding on the same part does not need:
 ///
-/// * BOTH PINS ARE OPEN DRAIN, and that is not a preference. A push-pull output cannot be pulled
+/// * Both pins are open drain, and that is not a preference. A push-pull output cannot be pulled
 ///   low by the device at the other end, so a target's acknowledge is fought instead of seen and
 ///   the controller reads a bus where nothing ever answers -- with the mux perfectly correct.
 /// * The rate is not a divisor and is not derived from one. This block's timing is five separate
 ///   counts, and the manual TABULATES the compliant sets per kernel-clock rate rather than giving
 ///   a formula that works without knowing the bus's rise time -- which is a board's electrical
 ///   property, not a chip fact. So generation composes the word for each point the block states
-///   AT THIS PLAN'S KERNEL RATE, the driver picks a speed, and no one writes a divisor down.
+///   at this plan's kernel rate, the driver picks a speed, and no one writes a divisor down.
 ///
 /// Whether an internal pull-up is wanted is deliberately NOT emitted: an open-drain bus needs a
 /// pull somewhere, and whether the board already has one is board wiring nothing here states.
@@ -8981,7 +8990,7 @@ fn resolve_nrf_pin(
 /// each pin's PIN_CNF register address -- the nrf-twi shape with three signals, resolved by the
 /// same routing helper.
 ///
-/// THE MASTER DRIVES NO CHIP SELECT: both manuals leave slave selection to a GPIO. So a binding's
+/// The master drives no chip select: both manuals leave slave selection to a GPIO. So a binding's
 /// `cs`, when the board names one, must be soft -- a plain output the driver drives for
 /// `SpiConnectionSettings.ChipSelectLine` 0 -- and it reaches the driver through the binding's select
 /// table, not through a register here. A muxed one is refused, because there is no select function
@@ -9062,12 +9071,12 @@ fn resolve_spi_nrf(
 /// PIN_CNF register address -- the nrf-twi shape, resolved by the same routing helper -- and one
 /// BAUDRATE word per carrier whose wire rides the binding.
 ///
-/// THE BAUDRATE WORD IS LOOKED UP, NEVER COMPUTED. The register is enumerated: the part's manual
+/// The BAUDRATE word is looked up, never computed. The register is enumerated: the part's manual
 /// documents one word per supported rate, which the block states as `BAUDRATE_<rate>`, and documents
 /// no rule for composing another. So a carrier rate with no word is refused rather than computed or
 /// rounded to a neighbour.
 ///
-/// THE WORD IS ONLY AS ACCURATE AS HFCLK, so a carrier's plan must run HFCLK from the crystal.
+/// The word is only as accurate as HFCLK, so a carrier's plan must run HFCLK from the crystal.
 /// After reset these parts run HFCLK from an internal oscillator whose stated tolerance reaches 5%
 /// on the nRF51 and 8% on the nRF52833, and the nRF52833's specification requires the crystal for
 /// stable communication. A plan whose `source` is not `xtal` emits no word; it is refused instead.
@@ -9316,7 +9325,7 @@ struct SupplyEmission {
 
 /// The rails this board's pads ride, one emission per rail touched.
 ///
-/// PER BOARD, NOT PER PIN, and only where a pad touches the rail. Validating a rail is one write
+/// Per board, not per pin, and only where a pad touches the rail. Validating a rail is one write
 /// for every pad on it, so a board states it once; and a board none of whose pins the rail powers
 /// emits nothing, so its output is exactly what it was before rails were stated.
 fn resolve_supplies(set: &FamilySet, resolved: &ResolvedBoard) -> Result<Vec<SupplyEmission>, String> {
@@ -9420,7 +9429,7 @@ struct BoardEmissions {
 
 /// The driver family a role's bound instance belongs to: `<family>-<block>`.
 ///
-/// A ROLE DESCRIPTOR ALREADY SAYS WHAT SURFACE IT IS, AND NOT WHAT SILICON IT IS. `kind` is what
+/// A role descriptor already says what surface it is, and not what silicon it is. `kind` is what
 /// the application asked for -- a uart, an spi -- and two peripherals with the same `kind` can
 /// share no register whatsoever. So a consumer that picks a driver at run time had only the board
 /// identity to key on, which is the same board-to-driver table one level away, or the shape of the
@@ -9431,7 +9440,7 @@ struct BoardEmissions {
 /// from facts that are already gated, so it can never be transcribed wrongly and can never drift
 /// from the descriptor beside it.
 ///
-/// **`kind` AND THIS TOGETHER NAME A DRIVER; NEITHER ALONE DOES.** The SAMD21 is why: its six
+/// **`kind` and this together name a driver; neither alone does.** The SAMD21 is why: its six
 /// SERCOM instances all name the block `sercom`, and a SERCOM is a uart, an spi or an i2c
 /// depending on how it is configured -- three drivers over one register map. So `samd21-sercom`
 /// does not say which driver, and `uart` does not say which silicon. The two fields divide the
@@ -9459,7 +9468,7 @@ fn driver_family(set: &FamilySet, binding: &Binding) -> Result<String, String> {
 /// The select table of one spi binding: the pins `SpiConnectionSettings.ChipSelectLine` indexes, in
 /// line order.
 ///
-/// A LINE IS AN INDEX, AS DOTNET/IOT MEANS IT ON LINUX, where line n opens `/dev/spidev<bus>.<n>`:
+/// A line is an index, as dotnet/iot means it on Linux, where line n opens `/dev/spidev<bus>.<n>`:
 /// line 0 is the bus's first chip select, -1 is none, and a program never names the pin. So each
 /// entry is the pin a driver drives for its line, numbered as the family's GPIO driver numbers its
 /// pins -- the number `GpioController` takes for the same pin -- so that one number means one pin
@@ -9486,7 +9495,7 @@ fn resolve_chip_selects(set: &FamilySet, resolved: &ResolvedBoard, binding: &Bin
 /// families, whose `P<port>.<index>` ports are 32 pins wide, and on the SAM D21, whose PORT groups
 /// are too; and port * 16 + index on the ST families, whose ports are 16 pins wide.
 ///
-/// THE FAMILY DECIDES, NEVER THE SPELLING ALONE. `split_pin` reads the RP2350's `GP7` and an ST
+/// The family decides, never the spelling alone. `split_pin` reads the RP2350's `GP7` and an ST
 /// part's `PG7` as the same port and index, and they are pins 7 and 103. A family with no arm here
 /// is refused rather than guessed, because a wrong number is a wrong pin.
 fn logical_pin(family: &str, board: &str, pin: &str) -> Result<i64, String> {
@@ -9670,18 +9679,18 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
 
 /// Refuses a board whose interrupt bindings collide on a LINE or on a TOKEN.
 ///
-/// BOTH COLLISIONS ARE SILENT IN EVERY DIRECTION THAT MATTERS, which is the whole reason this is a
+/// Both collisions are silent in every direction that matters, which is the whole reason this is a
 /// refusal rather than a note. Neither one produces a bad address, a failed build or a fault: each
 /// produces a board that runs and answers the wrong pad.
 ///
-/// A LINE COLLISION IS A PROPERTY OF THE VENDOR'S ENCODING. Here a line is the PIN INDEX and the
+/// A line collision is a property of the vendor's encoding. Here a line is the PIN INDEX and the
 /// port is a separate choice, so PA13 and PC13 raise the same line and only whichever one SYSCFG
 /// was programmed for last is live. The chip reports nothing -- the other pad simply never fires,
 /// which reads on a bench exactly like a broken solder joint. Downstream it is worse than dead: the
 /// generated handler body would carry an `if` per binding, both testing the same bit, and the second
 /// could never be reached.
 ///
-/// A TOKEN COLLISION IS A PROPERTY OF OURS. The token is opaque to the runtime and is what a driver
+/// A token collision is a property of ours. The token is opaque to the runtime and is what a driver
 /// maps back to a pin, so two pads minted with one token are two pads the managed side cannot tell
 /// apart -- and it would hand both edges to whichever pin registered first.
 ///
@@ -10142,7 +10151,7 @@ pub fn emit_board_csharp(
 
     for i2c in &st_i2cs {
         let p = &i2c.prefix;
-        out.push_str(&format!("\n        // -- {p}: an st-i2c binding descriptor. BOTH PINS ARE OPEN DRAIN --\n        // a push-pull output cannot be pulled low by the device at the other end, so an\n        // acknowledge is fought instead of seen and nothing ever answers, with the mux\n        // perfectly correct. The timing words are the manual's own compliant points at\n        // this plan's kernel rate, composed here: five counts, not a divisor --\n"));
+        out.push_str(&format!("\n        // -- {p}: an st-i2c binding descriptor. Both pins are open drain --\n        // a push-pull output cannot be pulled low by the device at the other end, so an\n        // acknowledge is fought instead of seen and nothing ever answers, with the mux\n        // perfectly correct. The timing words are the manual's own compliant points at\n        // this plan's kernel rate, composed here: five counts, not a divisor --\n"));
         push_const(&mut out, "uint", &format!("{p}_BASE"), &format!("0x{:X}", i2c.base));
         push_const(&mut out, "uint", &format!("{p}_RCC_EN_REG"), &format!("0x{:X}", i2c.rcc_en_reg));
         push_const(&mut out, "uint", &format!("{p}_RCC_EN_MASK"), &format!("0x{:X}", i2c.rcc_en_mask));
@@ -10328,24 +10337,24 @@ pub fn emit_board_csharp(
 /// A control pin's GPIO-group row base + pin index. The rp-family's bank-less GP pins are driven
 /// through the SIO block (the vendor's own instance name, base SIO 0xd0000000).
 ///
-/// EVERY OTHER FAMILY RESOLVES A LETTERED OR NUMBERED PORT BY NAME, AND THE NAME IS THE VENDOR'S.
+/// Every other family resolves a lettered or numbered port by name, and the name is the vendor's.
 /// Microchip and Nordic call a GPIO group a PORT (`porta`, `port0`); ST calls it a GPIO (`gpioa`).
 /// Both spellings mean the same thing, and an instance row keeps whichever name the part's own
 /// manual uses rather than taking one vendor's word across all of them, so both are accepted. The
 /// alternative is renaming a family's rows, which moves every emitted `PORTA_BASE` / `GPIOA_BASE`
 /// constant and every driver that reads one -- a spelling preference paid for in published names.
 ///
-/// NEITHER FIELD PREDICTS THE OTHER, so a row cannot be found from its block alone: Nordic's ports
+/// Neither field predicts the other, so a row cannot be found from its block alone: Nordic's ports
 /// place a block called `gpio` and are named `port0` and `port1`. A family that spells a group a
 /// third way is a row here, and the error below names both spellings it looked for.
 /// A GPIO row's BANK and the bit within it, from the pin index its group base is paired with.
 ///
-/// A MASK IS ONLY MEANINGFUL AGAINST THE REGISTER SET A CONSUMER WRITES, and a part whose pins
+/// A mask is only meaningful against the register set a consumer writes, and a part whose pins
 /// outrun one 32-bit register has more than one such set. On such a part `1 << 45` is not a mask at
 /// all: it is a number no register has a bit for. So the index splits, and the bank is emitted
 /// beside the mask so a consumer can tell which set the bits belong to.
 ///
-/// WHAT A BANK MEANS IS THE CHIP FAMILY'S TO SAY, and two families can answer differently. Where a
+/// What a bank means is the chip family's to say, and two families can answer differently. Where a
 /// port's base address already separates the banks -- one address for port A, another for port B --
 /// every row is bank 0 and the field carries no information. Where one peripheral block serves
 /// every pin and reaches the upper ones through a second set of registers, the bank is what selects
@@ -10357,7 +10366,7 @@ pub(crate) fn pin_bank(index: u32) -> (u32, u32) {
 /// The name a row's mask constant takes: `<NAME>_MASK` in bank 0, and `<NAME>_BANK<n>_MASK` in any
 /// other bank.
 ///
-/// THE ASYMMETRY IS DELIBERATE AND IS THE POINT. A consumer written for the ordinary case does
+/// The asymmetry is deliberate and is the point. A consumer written for the ordinary case does
 /// `write(PORT_BASE + OUTSET, MASK)`. If a row in a second bank also published `<NAME>_MASK`, that
 /// code would compile, run, and write the wrong register with a plausible-looking value. Under this
 /// rule it fails to COMPILE against such a row instead, which is the loud direction. The bank
@@ -10421,7 +10430,7 @@ fn board_fact_rows(set: &FamilySet, resolved: &ResolvedBoard) -> Result<Vec<Row>
 /// The sockets a removable module plugs into: which standard each follows, which buses it brings
 /// out whole, and which single lines it brings out by name.
 ///
-/// A BUS IS EMITTED AS ITS ROLE AND A LINE AS ITS PORT WIRING, because those are the two different
+/// A bus is emitted as its role and a line as its port wiring, because those are the two different
 /// things a program needs. Reaching a module across a bus means opening the role the socket names;
 /// driving a socket's chip select or reading its interrupt means writing one bit of one port, and
 /// the base, index and mask for that are derived here rather than hand-composed by a driver.
@@ -10546,12 +10555,12 @@ fn region_block<'a>(set: &'a FamilySet, region: &MemoryRegion) -> Option<&'a Blo
 /// One region's FITTED-DEVICE emission: the configuration words its controller has to be told,
 /// derived here rather than written down.
 ///
-/// THIS IS WHERE THE THIRD STRATUM SHOWS ITSELF. A bring-up has three kinds of fact in it and
+/// This is where the third stratum shows itself. A bring-up has three kinds of fact in it and
 /// only two of them have a home in the file that states them:
 ///
 /// * the ORDER is chip truth and rides the controller's block table;
 /// * the DEVICE SHAPE is board truth and rides the region below;
-/// * and SOME OF THE NUMBERS ARE NEITHER -- they are properties of a device AT A CLOCK, wrong at
+/// * and some of the numbers are neither -- they are properties of a device AT A CLOCK, wrong at
 ///   every other operating point, so neither may be a bare constant. A baud
 ///   divisor is derived from a (carrier, plan) pair and never stated; a refresh count is derived
 ///   from a (device, plan) pair for exactly the same reason.
@@ -10680,7 +10689,7 @@ fn quadspi_device_rows(
         return Ok(());
     }
     section(rows, format!(
-        "-- read configurations. Each word below is a COMPLETE command EXCEPT two fields, and\nwhich two is the point: the functional mode is the driver's choice (indirect or\nmemory-mapped, both in the block layout), and THE DUMMY COUNT IS THE PART'S ANSWER.\nA dummy phase covers the device's internal latency in TIME, so the cycles that cover it\nfall with the interface clock -- and a wrong count does not fail, it shifts every byte\nand returns plausible garbage. Walk the range and keep the first count that reads back a\npayload you already know; the anchors below say what this board answered, and at what --"
+        "-- read configurations. Each word below is a complete command except two fields, and\nwhich two is the point: the functional mode is the driver's choice (indirect or\nmemory-mapped, both in the block layout), and the dummy count is the part's answer.\nA dummy phase covers the device's internal latency in time, so the cycles that cover it\nfall with the interface clock -- and a wrong count does not fail, it shifts every byte\nand returns plausible garbage. Walk the range and keep the first count that reads back a\npayload you already know; the anchors below say what this board answered, and at what --"
     ));
     uint(rows, format!("{prefix}_READ_CONFIGURATIONS"), region.reads.len().to_string());
     uint(rows, format!("{prefix}_DUMMY_MIN"), block.constant("CCR_DCYC_MIN").unwrap_or(0).to_string());
@@ -10901,11 +10910,11 @@ fn push_rust_const(out: &mut String, kind: &str, name: &str, value: &str) {
 
 /// Emits the interrupt handler BODY for each NVIC vector this board binds a line on.
 ///
-/// RUST ONLY, AND THAT IS THE POINT OF THE SPLIT. The constants above go to every language,
+/// Rust only, and that is the point of the split. The constants above go to every language,
 /// because a host tool, a driver and a test all describe the same board; a handler runs on the
 /// part, in native code, so there is exactly one language it can be written in.
 ///
-/// ONE FUNCTION PER VECTOR RATHER THAN PER BINDING, because the vendor's grouping is data: three
+/// One function per vector rather than per binding, because the vendor's grouping is data: three
 /// vectors cover sixteen lines here, so a single entry can find several of this board's lines
 /// pending, and a per-binding function would leave the caller to rediscover which of them share an
 /// entry. Grouping here is a lookup over the emission list, not a rule about ranges.
@@ -10998,11 +11007,11 @@ fn finish_rust(out: &str) -> Result<(), String> {
 /// the channel map and the calibration records), so a Rust driver composes its words from exactly
 /// the constants a C# driver does. C# `uint` and `int` map to `u32` and `i32`.
 ///
-/// ONE FILE PER BLOCK, because in Rust the file IS the namespace. A family's blocks reuse register
+/// One file per block, because in Rust the file IS the namespace. A family's blocks reuse register
 /// names freely -- two of them having a `CR` is ordinary -- so one module per family would collide
 /// on names that are only unique within a block.
 ///
-/// A FLOAT FACT IS NOT EMITTED, and the header names the ones withheld. A facts table carries
+/// A float fact is not emitted, and the header names the ones withheld. A facts table carries
 /// integers and named dispatch; offering a `f64` to a tier with no floating point would be
 /// carrying that debt one language further rather than reporting it.
 pub fn emit_layout_rust(block: &BlockTable, source: &str, regen: &str) -> Result<String, String> {
@@ -11470,7 +11479,7 @@ pub fn emit_board_rust(
     for adc in &same54_adcs {
         let p = &adc.prefix;
         out.push_str(&format!("
-//  -- {p}: a same54 adc binding descriptor. A PRESCALER, a CALIBRATION ADDRESS and a PMUX MASK --
+//  -- {p}: a same54 adc binding descriptor. A prescaler, a calibration address and a PMUX mask --
 "));
         push_rust_const(&mut out, "u32", &format!("{p}_ADC_BASE"), &format!("0x{:X}", adc.adc_base));
         push_rust_const(&mut out, "u32", &format!("{p}_GCLK_PCHCTRL_REG"), &format!("0x{:X}", adc.gclk_pchctrl_reg));
@@ -11605,7 +11614,7 @@ pub fn emit_board_rust(
 
     for i2c in &st_i2cs {
         let p = &i2c.prefix;
-        out.push_str(&format!("\n// -- {p}: an st-i2c binding descriptor. BOTH PINS ARE OPEN DRAIN --\n// a push-pull output cannot be pulled low by the device at the other end, so an\n// acknowledge is fought instead of seen and nothing ever answers, with the mux\n// perfectly correct. The timing words are the manual's own compliant points at\n// this plan's kernel rate, composed here: five counts, not a divisor --\n"));
+        out.push_str(&format!("\n// -- {p}: an st-i2c binding descriptor. Both pins are open drain --\n// a push-pull output cannot be pulled low by the device at the other end, so an\n// acknowledge is fought instead of seen and nothing ever answers, with the mux\n// perfectly correct. The timing words are the manual's own compliant points at\n// this plan's kernel rate, composed here: five counts, not a divisor --\n"));
         push_rust_const(&mut out, "u32", &format!("{p}_BASE"), &format!("0x{:X}", i2c.base));
         push_rust_const(&mut out, "u32", &format!("{p}_RCC_EN_REG"), &format!("0x{:X}", i2c.rcc_en_reg));
         push_rust_const(&mut out, "u32", &format!("{p}_RCC_EN_MASK"), &format!("0x{:X}", i2c.rcc_en_mask));
@@ -12281,7 +12290,7 @@ pub fn emit_board_swift(
     for adc in &same54_adcs {
         let p = &adc.prefix;
         out.push_str(&format!("
-    // -- {p}: a same54 adc binding descriptor. A PRESCALER, a CALIBRATION ADDRESS and a PMUX MASK --
+    // -- {p}: a same54 adc binding descriptor. A prescaler, a calibration address and a PMUX mask --
 "));
         push_swift_const(&mut out, "UInt32", &format!("{p}_ADC_BASE"), &format!("0x{:X}", adc.adc_base));
         push_swift_const(&mut out, "UInt32", &format!("{p}_GCLK_PCHCTRL_REG"), &format!("0x{:X}", adc.gclk_pchctrl_reg));
@@ -12416,7 +12425,7 @@ pub fn emit_board_swift(
 
     for i2c in &st_i2cs {
         let p = &i2c.prefix;
-        out.push_str(&format!("\n    // -- {p}: an st-i2c binding descriptor. BOTH PINS ARE OPEN DRAIN --\n    // a push-pull output cannot be pulled low by the device at the other end, so an\n    // acknowledge is fought instead of seen and nothing ever answers, with the mux\n    // perfectly correct. The timing words are the manual's own compliant points at\n    // this plan's kernel rate, composed here: five counts, not a divisor --\n"));
+        out.push_str(&format!("\n    // -- {p}: an st-i2c binding descriptor. Both pins are open drain --\n    // a push-pull output cannot be pulled low by the device at the other end, so an\n    // acknowledge is fought instead of seen and nothing ever answers, with the mux\n    // perfectly correct. The timing words are the manual's own compliant points at\n    // this plan's kernel rate, composed here: five counts, not a divisor --\n"));
         push_swift_const(&mut out, "UInt32", &format!("{p}_BASE"), &format!("0x{:X}", i2c.base));
         push_swift_const(&mut out, "UInt32", &format!("{p}_RCC_EN_REG"), &format!("0x{:X}", i2c.rcc_en_reg));
         push_swift_const(&mut out, "UInt32", &format!("{p}_RCC_EN_MASK"), &format!("0x{:X}", i2c.rcc_en_mask));
@@ -13728,7 +13737,7 @@ fn device_rows(part: &DeviceTable) -> Result<Vec<Row>, String> {
     if !identity.absent.is_empty() {
         section(
             &mut rows,
-            "identity: THIS PART HAS NONE, and that is a fact about the part rather than a gap in \
+            "identity: this part has none, and that is a fact about the part rather than a gap in \
              this table. There is no register to read, so nothing can confirm which part answered \
              an address -- the `identified` validation rung is unreachable for it by construction, \
              and confidence has to be earned by exercising it instead."
@@ -14288,7 +14297,7 @@ pub fn load_extension(
 
 /// Every extension directory under `ext/`, sorted.
 ///
-/// A DIRECTORY QUALIFIES BY HOLDING AN `extension.toml`, NOT BY BEING A DIRECTORY. `ext/` also
+/// A directory qualifies by holding an `extension.toml`, not by being a directory. `ext/` also
 /// holds `standards/`, the connector vocabularies the boards join through, and it will hold
 /// whatever the next non-board thing under this tree turns out to be. A walk keyed on "is a
 /// directory" adopts each of those as an extension and fails on the file it then cannot open --
@@ -14307,7 +14316,7 @@ pub fn extensions(repo_root: &std::path::Path) -> Result<Vec<String>, String> {
 
 /// The positions an extension needs that a socket does NOT bring out, in the extension's order.
 ///
-/// EMPTY MEANS IT FITS. This is the whole verdict a host can give about a removable board without
+/// Empty means it fits. This is the whole verdict a host can give about a removable board without
 /// anyone declaring that one is plugged in: an extension states what it needs, a socket states what
 /// it offers, and the difference is computable. It answers about the WIRING only -- whether a
 /// driver exists for what is on the extension is a different question with a different answer.
@@ -14829,9 +14838,9 @@ reg = "CTRL"
 value = 0x2
 "#;
 
-    /// A board's hand-written class is its bindings name less its maker, as `csharp/build-boards.ps1` names
-    /// the board's assembly; and `TargetBoard`'s generated half arms through that class's static,
-    /// or reads the bindings' identity where the package declares no class.
+    /// A board's hand-written class is its bindings name less its maker; and `TargetBoard`'s generated
+    /// half answers the board's id through a property, never a constant, and arms through that class's
+    /// static, or reads the bindings' identity where the package declares no class.
     #[test]
     fn target_board_facts_name_the_board_and_arm_its_class() {
         assert_eq!(board_class("rpi-pico2-w"), "Pico2W");
@@ -14850,7 +14859,8 @@ value = 0x2
             resolve_board(&set, board).expect("resolves")
         };
         let armed = emit_target_board_facts_csharp(&board("rpi-pico2-w"), Some("Pico2W"), &[], "regen");
-        assert!(armed.contains("internal const string Name = \"rpi-pico2-w\";"), "{armed}");
+        assert!(armed.contains("internal static string Name\n        {\n            get { return \"rpi-pico2-w\"; }\n        }"), "{armed}");
+        assert!(!armed.contains("const"), "a constant would be compiled into Lamella.Hardware: {armed}");
         assert!(armed.contains("return global::Lamella.Boards.RaspberryPi.Pico2W.BoardModel;"), "{armed}");
         let bare = emit_target_board_facts_csharp(&board("rpi-pico2"), None, &[], "regen");
         assert!(bare.contains("return RpiPico2Bindings.BOARD_MODEL;"), "{bare}");
@@ -15361,6 +15371,32 @@ source = "s"
         assert!(board.memory[0].part.is_empty(), "a board that names no part states none");
     }
 
+    /// A board's `[table]` has no key that keeps the board out of a list: `advertised` is refused
+    /// as every key outside the closed set is, whatever its value.
+    #[test]
+    fn a_board_table_has_no_key_that_keeps_the_board_out_of_a_list() {
+        let source = r#"
+[table]
+kind = "board"
+board = "b"
+vendor = "vend"
+family = "fam"
+part = "p"
+product_model = 1
+
+[[plans]]
+name = "n"
+default = true
+source = "s"
+"#;
+        parse(source).expect("parses");
+        for value in ["false", "true", "\"no\""] {
+            let keyed = source.replace("product_model = 1\n", &format!("product_model = 1\nadvertised = {value}\n"));
+            let error = parse(&keyed).expect_err("advertised is not a key");
+            assert!(error.contains("unexpected [table] key 'advertised'"), "advertised = {value}: {error}");
+        }
+    }
+
     #[test]
     fn instance_rows_enforce_the_record_v6() {
         let bad = r#"
@@ -15478,17 +15514,13 @@ base = 0x1000
         assert!(error.contains("state its ceiling as 96000000 and -1"), "{error}");
     }
 
-    /// A board's WIRED CONTROL LINE naming a pin its part does not carry -- the third list stating
-    /// pins about a part, and the last one nothing checked.
+    /// A board's wired control line naming a pin its part does not carry: the third list stating
+    /// pins about a part, held to the present-list as a binding's pins and a pin-map row are.
     ///
-    /// THE DEFECT, AND ITS SHAPE IS THE SAME ONE TWICE ALREADY: a binding's pins were held to the
-    /// present-list from the start, a pin-map row's joined them later, and an LED or a button row
-    /// was neither. It is not a harmless omission, because a control line EMITS: an LED row naming
-    /// a pin the part does not have produces a real port base and a real mask, so the firmware
-    /// writes a live register belonging to some other cell and the board simply does nothing.
+    /// It is not a harmless omission, because a control line emits: an LED row naming a pin the
+    /// part does not have produces a real port base and a real mask, so the firmware writes a live
+    /// register belonging to some other cell and the board simply does nothing.
     ///
-    /// Measured when this check landed: eight control lines across three rp2040 boards named pins
-    /// that family's parts row did not carry, and every gate was green.
     #[test]
     fn a_board_control_line_outside_its_parts_present_list_is_refused() {
         let set = FamilySet {
@@ -15532,7 +15564,7 @@ base = 0x1000
 
     /// A board wiring a control line to a pin the PART RESERVES for something inside the package.
     ///
-    /// THE DEFECT IS THAT EVERY EXISTING CHECK PASSES IT. A reserved pin IS in the present-list
+    /// The hazard is that every other check passes it. A reserved pin is in the present-list
     /// -- the part carries it -- so the check above says yes. A control line needs no pin-map row,
     /// so the unrouted shape is never consulted. Generation then composes a real port base and a
     /// real mask, the firmware writes them, and the silicon ignores the write because the pin
@@ -15612,7 +15644,7 @@ base = 0x1000
     /// one part admits several -- each core can be an individual target, and two cores "of the same
     /// architecture sharing the same memory space" can also be driven as ONE threaded system.
     ///
-    /// SHARED MEMORY IS NOT SUFFICIENT, and the counter-example is real silicon rather than a
+    /// Shared memory is not sufficient, and the counter-example is real silicon rather than a
     /// hypothetical: one part here puts either an Arm or a RISC-V core in each of two sockets, over
     /// one address space, with atomics interoperating across the pair -- and its own manual says
     /// that arrangement "requires two separate program images". So the test is BOTH conditions, and
@@ -15852,7 +15884,7 @@ source = \"a datasheet\"
         let swift = emit_pins_swift(&map, "regen").expect("Swift emits");
 
         for line in [
-            "    public sealed class FamPins",
+            "    internal sealed class FamPins",
             "        public const int EXTINT_NONE = -1;",
             "        public const int EXTINT_NMI = -2;",
             "        public const uint EXTINT_FUNCTION = 0;",
@@ -16208,12 +16240,11 @@ resolution_bits = "16..20, depending only on the oversampling setting"
 
     /// A part that states it has NO identity register may still declare a register at 0x00.
     ///
-    /// REPORTED FROM OUTSIDE AND IT BLOCKED A REAL TABLE. `[identity] absent` leaves `reg` and
-    /// `width` at their defaults, 0 and 0, and the cross-check that guards against an identity
-    /// disagreeing with its own register-map entry then compared those defaults against whatever
-    /// register happened to sit at 0x00 -- which is most parts' first register. The refusal named
-    /// a fact the table never stated: "[identity] reads register 0x0 as 0 bits". Absence read as a
-    /// claim, which is the same shape as an omitted polarity emitting as active-high.
+    /// `[identity] absent` leaves `reg` and `width` at their defaults, 0 and 0, so a cross-check of
+    /// an identity against its own register-map entry would compare those defaults against
+    /// whatever register sits at 0x00 -- most parts' first register -- and refuse the table over a
+    /// fact it never states: "[identity] reads register 0x0 as 0 bits". An absence is not a claim,
+    /// just as an omitted polarity is not active-high.
     #[test]
     fn a_part_with_no_identity_may_declare_a_register_at_zero() {
         let base = DEVICE_BASE

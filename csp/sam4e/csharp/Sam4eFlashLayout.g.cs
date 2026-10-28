@@ -5,7 +5,7 @@
 // instance bases live in Sam4eInstances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Sam4eFlashLayout
+    internal sealed class Sam4eFlashLayout
     {
         private Sam4eFlashLayout() { }
 

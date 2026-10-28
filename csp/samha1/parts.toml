@@ -3,8 +3,8 @@
 # is what makes this a family of its own rather than a SAMD21 part row, and it costs the same
 # kind of thing the SAM R21's radio costs: a SERCOM, and pads that reach no package pin.
 #
-# WHICH SERCOM THE SBC TAKES IS NOT A FAMILY FACT. IT DIFFERS BY SERIES, AND THAT IS THE ONE
-# THING ABOUT THIS FAMILY MOST LIKELY TO BE GOT WRONG:
+# Which SERCOM the SBC takes is not a family fact. It differs by series, and that is the one
+# thing about this family most likely to be got wrong:
 #
 #     series   SBC TXD              SBC RXD              instance spent
 #     G (48)   PB30  SERCOM5/PAD[0] PB23  SERCOM5/PAD[3]  SERCOM5
@@ -14,7 +14,7 @@
 # pads is a package pin on the series that uses it, which is why they are absent from every pin
 # list below.
 #
-# THIS IS ALSO WHY THE CONFIGURATION SUMMARY SAYS FIVE SERCOMS AND TABLE 14-1 ROWS SIX. Six are
+# This is also why the configuration summary says five SERCOMs and table 14-1 rows six. Six are
 # placed silicon and one of them is spent inside the package, exactly as the SAM R21's summary
 # counts its SERCOMs "5+1". instances.toml rows all six because they are all real; a BOARD may
 # bind five, and which five depends on the series.

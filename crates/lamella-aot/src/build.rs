@@ -854,11 +854,17 @@ const NORDIC_FAULT_MAGIC: u32 = 0xFA17_1EDD;
 /// On exception entry the core stacks `{R0-R3, R12, LR, PC, xPSR}`, so the return address is at
 /// `SP+24` and the interrupted `LR` at `SP+20`; the handler runs on the same stack and pushes
 /// nothing before reading them.
+///
+/// **An image with a console ring also ends the ring** (`ring_end`): the exit code
+/// [`lamella_console_ring::abort::FAULT`], a barrier, then the aborted magic, so a reader following
+/// the ring sees the program aborted by a fault rather than a ring that stopped moving. Still with
+/// plain stores and no push, because the fault may be the stack's.
 #[cfg(feature = "arm32")]
 fn emit_fault_handler(
     enc: &mut lamella_asm_arm32::Encoder,
     record_word: lamella_asm_arm32::Label,
     magic_word: lamella_asm_arm32::Label,
+    ring_end: Option<&FaultRingEnd>,
 ) {
     use lamella_asm_arm32::Reg;
     enc.ldr_sp(Reg::R0, 24).unwrap();
@@ -868,9 +874,25 @@ fn emit_fault_handler(
     enc.str_imm(Reg::R0, Reg::R1, 4).unwrap();
     enc.ldr_literal(Reg::R0, magic_word).unwrap();
     enc.str_imm(Reg::R0, Reg::R1, 8).unwrap();
+    if let Some(end) = ring_end {
+        enc.ldr_literal(Reg::R1, end.ring_word).unwrap();
+        enc.movs_imm(Reg::R0, lamella_console_ring::abort::FAULT as u8).unwrap();
+        enc.str_imm(Reg::R0, Reg::R1, lamella_console_ring::EXIT_CODE_OFFSET as u16).unwrap();
+        enc.emit_thumb32(0xF3BF, 0x8F5F);
+        enc.ldr_literal(Reg::R0, end.aborted_word).unwrap();
+        enc.str_imm(Reg::R0, Reg::R1, lamella_console_ring::MAGIC_OFFSET as u16).unwrap();
+    }
     let park = enc.new_label();
     enc.bind_label(park);
     enc.b(park);
+}
+
+/// The two literals a fault handler loads to end the console ring ([`emit_fault_handler`]): the
+/// ring's address and the aborted magic, which the caller places in its pool.
+#[cfg(feature = "arm32")]
+struct FaultRingEnd {
+    ring_word: lamella_asm_arm32::Label,
+    aborted_word: lamella_asm_arm32::Label,
 }
 
 /// Clears the three words of [`NORDIC_FAULT_RECORD`] before managed code runs, so a record left by
@@ -952,7 +974,7 @@ fn nordic_flat_image(initial_sp: u32, code: &[u8], statics_words: u32) -> Vec<u8
     enc.ldr_literal(Reg::R0, entry_word).unwrap();
     enc.bx(Reg::R0);
     let fault_offset = enc.position();
-    emit_fault_handler(&mut enc, record_word, magic_word);
+    emit_fault_handler(&mut enc, record_word, magic_word, None);
     enc.align_to_word();
     enc.bind_label(zero_start_word);
     enc.emit_word(arm32::STATIC_FIELD_BASE);
@@ -1003,21 +1025,33 @@ const LINKED_ENTRY_SYMBOL: &str = "f0";
 /// image it built before.
 #[cfg(feature = "linked")]
 const BOARD_INIT_SYMBOL: &str = "lamella_board_init";
+/// The console ring's arm hook: the function a runtime archive built with a console ring
+/// (`console-memory`) defines to arm the ring for this boot. A linked startup calls it after the clear
+/// and before the board's hook, when the link kept one, so the ring reads as running before the
+/// program prints anything.
+#[cfg(feature = "linked")]
+const CONSOLE_ARM_SYMBOL: &str = "lamella_console_arm";
+/// The console ring's finish hook, which the same archive defines: a linked startup calls it once the
+/// entry point returns, with the entry's result and the in-flight exception word, when the link kept
+/// one, and the ring then says whether the program returned or was ended by an exception.
+#[cfg(feature = "linked")]
+const CONSOLE_FINISH_SYMBOL: &str = "lamella_console_finish";
 /// The bump allocator's cursor word: the fixed address the runtime-support archive reads, with its
 /// limit in the word directly above it.
 #[cfg(feature = "linked")]
 const NORDIC_HEAP_PTR: u32 = 0x2000_0100;
-/// The bump heap grows up from here.
+/// Where RAM starts on every Nordic part.
 #[cfg(feature = "linked")]
-const NORDIC_HEAP_BASE: u32 = 0x2000_0200;
-/// The statics window handed to the linker, and the heap's ceiling in the same number: a heap that
-/// grew past here would overwrite the statics it is about to read.
+const NORDIC_RAM_BASE: u32 = 0x2000_0000;
+/// The lowest address a linked Nordic image lays statics at: above the fault record at the base of
+/// RAM and the allocator's seed words at [`NORDIC_HEAP_PTR`].
 #[cfg(feature = "linked")]
-const NORDIC_STATICS_BASE: u32 = 0x2000_1000;
-/// How much of RAM the statics window spans -- the linker's own per-machine default for ARM, stated
-/// here because this path passes it explicitly rather than inheriting it.
+const NORDIC_LOW_STATICS_BASE: u32 = 0x2000_0200;
+/// The green threads' stacks, `[base, top)`: the runtime-support archive lays three 1 KiB stacks
+/// here, at fixed addresses, for every part it is built for (`worker_stack_top`). Every Nordic RAM
+/// plan keeps clear of them, and the main stack sits directly above them.
 #[cfg(feature = "linked")]
-const NORDIC_STATICS_BYTES: u32 = 0x1000;
+const NORDIC_WORKER_STACKS: (u32, u32) = (0x2000_2000, 0x2000_2C00);
 
 /// Compiles a CIL assembly to a flashable bare-metal image for a Nordic Cortex-M chip, LINKED
 /// against `corlib` and the target ISA's runtime-support archive -- **the tier that has the class
@@ -1101,7 +1135,51 @@ pub fn build_linked_cortex_m_with_board(
     target: &str,
     board_buses: Option<&[u32]>,
 ) -> Result<Vec<u8>, BuildError> {
-    let part = linked_part(target)?;
+    build_linked_part(linked_part(target)?, cil, corlib, libraries, archive, board_buses)
+}
+
+/// [`build_linked_cortex_m_with_libraries`] for an STM32 row whose image is MOVED: its vector table and
+/// text linked at `code_base` rather than at the part's flash, and its main stack started from
+/// `ram_top` rather than from the top of the part's band. The rest of the plan is every STM32 row's:
+/// the statics from above the archive's fixed bands, and the heap everything between their end and
+/// the stack's floor.
+///
+/// **FOR RUNNING A ROW WHERE THERE IS NO BOARD, NEVER AN IMAGE FOR ONE.** QEMU has no machine for these
+/// parts, but it has their cores, and a machine whose code memory starts at `code_base` and whose RAM
+/// runs from `0x2000_0000` to `ram_top` runs a row's startup and text as the part would.
+///
+/// A target with no STM32 row is [`BuildError::UnsupportedTarget`], and so is a `ram_top` that leaves
+/// the plan no room above the archive's bands.
+#[cfg(feature = "linked")]
+pub fn build_linked_cortex_m_moved(
+    cil: &[u8],
+    corlib: &[u8],
+    libraries: &[&[u8]],
+    archive: &[u8],
+    target: &str,
+    code_base: u32,
+    ram_top: u32,
+) -> Result<Vec<u8>, BuildError> {
+    if !matches!(linked_part(target)?, LinkedPart::Stm32(_)) {
+        return Err(BuildError::UnsupportedTarget);
+    }
+    let moved = Stm32Part { flash_base: code_base, ram_top };
+    if moved.statics_capacity().is_none() {
+        return Err(BuildError::UnsupportedTarget);
+    }
+    build_linked_part(LinkedPart::Stm32(moved), cil, corlib, libraries, archive, None)
+}
+
+/// The linked image of `cil` for `part`, as [`build_linked_cortex_m_with_board`] builds it.
+#[cfg(feature = "linked")]
+fn build_linked_part(
+    part: LinkedPart,
+    cil: &[u8],
+    corlib: &[u8],
+    libraries: &[&[u8]],
+    archive: &[u8],
+    board_buses: Option<&[u32]>,
+) -> Result<Vec<u8>, BuildError> {
     let libraries = referenced_libraries(cil, libraries)?;
     let (program_object, deferred) =
         build_linked_program_object(cil, corlib, &libraries, None, part.wide())?;
@@ -1113,6 +1191,7 @@ pub fn build_linked_cortex_m_with_board(
         &libraries,
         archive,
         board_buses,
+        program_entry_returns_void(cil),
     )
     .map(|(image, _)| image)
 }
@@ -1139,24 +1218,194 @@ fn referenced_libraries<'a>(
         .collect())
 }
 
-/// The linked tier's Nordic parts, each with the stack top its boot image starts from.
-///
-/// **A PART IS A ROW HERE, NOT A SECOND PIPELINE.** Everything after the stack top is the same
-/// for every row, so a Nordic part the linked tier gains is a row and the RAM plan behind it.
+/// A Nordic part's RAM on the linked tier: where its main stack starts and how far down it has room,
+/// where the link lays the statics, and where the heap ends. The heap starts where the link says the
+/// statics end, rounded up to 8, so it is every byte the statics leave between their base and its end.
 #[cfg(feature = "linked")]
-const NORDIC_LINKED_PARTS: &[(&str, u32)] = &[("nrf52833", 0x2002_0000), ("microbit", 0x2000_4000)];
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct NordicRam {
+    /// The main stack's top: the boot image's initial SP.
+    initial_sp: u32,
+    /// The lowest address the main stack has room for, so its reserve is `initial_sp - stack_floor`.
+    stack_floor: u32,
+    /// Where the link lays the statics window.
+    statics_base: u32,
+    /// One past the last byte the heap may hold, which is also where the statics window ends: the
+    /// link refuses statics that reach it.
+    heap_end: u32,
+}
+
+/// The micro:bit v2's nRF52833: 128 KiB of RAM from `0x2000_0000`.
+///
+/// **The main stack keeps 8 KiB directly above the worker stacks, and the statics and the heap take
+/// everything above it, to the end of RAM**: the heap spans 109 KiB less what the statics need.
+/// Below the worker stacks, `0x2000_0200` to `0x2000_2000` holds nothing.
+///
+/// 8 KiB is more than half again the 5 KiB the micro:bit v1 runs the same programs in, and more than
+/// twice what a program that collects dozens of times was measured to reach.
+///
+/// **What an overflow of the main stack runs into:** the worker stacks, which hold anything only in a
+/// program that started a thread; then the empty band; then the allocator's seed words, which nothing
+/// reads once the heap is adopted, and the fault record; then the end of RAM, below which the part
+/// maps nothing, so the next push faults and the core stops. The statics and the heap lie above the
+/// stack, where an overflow cannot reach them.
+#[cfg(feature = "linked")]
+const NRF52833_RAM: NordicRam = NordicRam {
+    initial_sp: NORDIC_WORKER_STACKS.1 + 0x2000,
+    stack_floor: NORDIC_WORKER_STACKS.1,
+    statics_base: NORDIC_WORKER_STACKS.1 + 0x2000,
+    heap_end: NORDIC_RAM_BASE + 0x2_0000,
+};
+
+/// The micro:bit v1's nRF51822: 16 KiB of RAM from `0x2000_0000`.
+///
+/// **The main stack keeps the 5 KiB above the worker stacks, to the end of RAM, and the statics and
+/// the heap take everything below the worker stacks**: the statics from `0x2000_0200`, the heap from
+/// their end to `0x2000_2000`, so 7.5 KiB less what the statics need.
+///
+/// **What an overflow of the main stack runs into:** the worker stacks, which hold anything only in a
+/// program that started a thread; then the heap's top, where the collector keeps its mark bitmap, then
+/// the heap's free space, then its newest objects.
+#[cfg(feature = "linked")]
+const NRF51822_RAM: NordicRam = NordicRam {
+    initial_sp: NORDIC_RAM_BASE + 0x4000,
+    stack_floor: NORDIC_WORKER_STACKS.1,
+    statics_base: NORDIC_LOW_STATICS_BASE,
+    heap_end: NORDIC_WORKER_STACKS.0,
+};
+
+/// The linked tier's Nordic parts, each with its RAM plan.
+///
+/// **A PART IS A ROW HERE, NOT A SECOND PIPELINE.** Everything after the plan is the same for every
+/// row, so a Nordic part the linked tier gains is a row and the RAM plan behind it.
+#[cfg(feature = "linked")]
+const NORDIC_LINKED_PARTS: &[(&str, NordicRam)] = &[("nrf52833", NRF52833_RAM), ("microbit", NRF51822_RAM)];
+
+/// An STM32 part on the linked tier: where its flash begins, and the top of the band of SRAM its RAM
+/// plan spans.
+///
+/// **NARROW, AS THE NORDIC ROWS ARE.** The objects are Thumb-1 and the runtime archive is the thumbv6m
+/// one the micro:bits link, whose code the M4, the M7 and the M33 all run unchanged.
+///
+/// **ONE RAM PLAN FOR EVERY ROW, WHOSE TOP IS THE PART's, AND THE HEAP HAS ALL THE REST.** Each row's
+/// band starts at `0x2000_0000`, where the archive keeps its fixed bands up to [`STM32_STATICS_BASE`].
+/// The statics are laid from there, the main stack descends from [`Self::ram_top`] with
+/// [`STM32_STACK_BYTES`] of room, and the heap is everything between the statics' end and the stack's
+/// floor.
+#[cfg(feature = "linked")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Stm32Part {
+    /// Where the image is loaded: its vector table, then the startup, then the text
+    /// [`STM32_TEXT_OFFSET`] bytes in.
+    flash_base: u32,
+    /// The main stack's top: one past the last byte of the band of SRAM, from `0x2000_0000`, that the
+    /// part has clocked from reset.
+    ram_top: u32,
+}
+
+#[cfg(feature = "linked")]
+impl Stm32Part {
+    /// Where the text is linked.
+    fn text_base(self) -> u32 {
+        self.flash_base + STM32_TEXT_OFFSET
+    }
+
+    /// The lowest address the main stack has room for, [`STM32_STACK_BYTES`] below its top: where the
+    /// heap ends.
+    fn stack_floor(self) -> u32 {
+        self.ram_top - STM32_STACK_BYTES
+    }
+
+    /// The statics window's capacity in bytes: from [`STM32_STATICS_BASE`] to the stack's floor, so the
+    /// heap laid after the statics always ends below the stack. `None` for a plan whose top leaves no
+    /// room above the statics' base.
+    fn statics_capacity(self) -> Option<u32> {
+        let room = self.ram_top.checked_sub(STM32_STACK_BYTES)?.checked_sub(STM32_STATICS_BASE)?;
+        (room >= 8).then_some(room & !7)
+    }
+
+    /// The heap an image whose statics end at `statics_end` hands its collector, `(base, end)`: from
+    /// there, rounded up to 8, to the stack's floor.
+    fn heap(self, statics_end: u32) -> (u32, u32) {
+        (statics_end.next_multiple_of(8), self.stack_floor())
+    }
+}
+
+/// Where every STM32 row's flash begins: the image is linked and written here, and these parts boot
+/// from this flash as they leave the factory. The STM32F769 reads its vector table through the flash's
+/// ITCM alias at `0x0020_0000`, and the addresses in it run the same bytes from here (RM0410 2.5).
+#[cfg(feature = "linked")]
+const STM32_FLASH_BASE: u32 = 0x0800_0000;
+/// Where an STM32 image's startup and fault handler begin, relative to the flash base: after the
+/// sixteen system entries of the vector table.
+#[cfg(feature = "linked")]
+const STM32_STUB_OFFSET: u32 = 0x40;
+/// Where an STM32 image's text begins, relative to the flash base.
+#[cfg(feature = "linked")]
+const STM32_TEXT_OFFSET: u32 = 0x100;
+/// Where an STM32 row lays its statics: just above the bands the runtime archive fixes at the base of
+/// SRAM, which are the fault record at `0x2000_0000`, the heap's seed words at `0x2000_0100` and the
+/// three worker stacks at `0x2000_2000..0x2000_2C00`.
+#[cfg(feature = "linked")]
+const STM32_STATICS_BASE: u32 = 0x2000_2C00;
+/// How much of an STM32 row's band the main stack keeps below its top: more than three times the
+/// 5 KiB a micro:bit v1 runs the same programs in.
+#[cfg(feature = "linked")]
+const STM32_STACK_BYTES: u32 = 16 * 1024;
+
+/// The STM32F769 (Cortex-M7): 512 KB of SRAM from `0x2000_0000`, the 128 KB DTCM followed by SRAM1 at
+/// `0x2002_0000` and SRAM2 at `0x2007_C000`, all of it clocked from reset (RM0410 2.3).
+#[cfg(feature = "linked")]
+const STM32F769: Stm32Part = Stm32Part {
+    flash_base: STM32_FLASH_BASE,
+    ram_top: 0x2008_0000,
+};
+/// The STM32U5A5 (Cortex-M33): SRAM1, SRAM2, SRAM3 and SRAM5 run on from `0x2000_0000` to
+/// `0x2027_0000`, 2,496 KB, and all four are clocked from reset (RM0456 2.3.2, 11.8.29 to 11.8.31).
+#[cfg(feature = "linked")]
+const STM32U5A5: Stm32Part = Stm32Part {
+    flash_base: STM32_FLASH_BASE,
+    ram_top: 0x2027_0000,
+};
+/// The STM32U585 (Cortex-M33): SRAM1, SRAM2 and SRAM3 run on from `0x2000_0000` to `0x200C_0000`,
+/// 768 KB, all three clocked from reset (RM0456 2.3.2, 11.8.29 and 11.8.30).
+#[cfg(feature = "linked")]
+const STM32U585: Stm32Part = Stm32Part {
+    flash_base: STM32_FLASH_BASE,
+    ram_top: 0x200C_0000,
+};
+/// The STM32H747's Cortex-M7: its band is the 128 KB DTCM at `0x2000_0000` (RM0399 2.4), and it boots
+/// from the flash's base, where BOOT_CM7_ADD0's factory value points (RM0399 4.4.4). The AXI SRAM at
+/// `0x2400_0000` and the D2 domain's SRAMs lie outside this band.
+#[cfg(feature = "linked")]
+const STM32H747_CM7: Stm32Part = Stm32Part {
+    flash_base: STM32_FLASH_BASE,
+    ram_top: 0x2002_0000,
+};
+
+/// The linked tier's STM32 parts, each with its row. A dual-core part names its core.
+#[cfg(feature = "linked")]
+const STM32_LINKED_PARTS: &[(&str, Stm32Part)] = &[
+    ("stm32f769", STM32F769),
+    ("stm32u5a5", STM32U5A5),
+    ("stm32u585", STM32U585),
+    ("stm32h747-cm7", STM32H747_CM7),
+];
 
 /// A part the linked tier builds for: which boot image wraps the link, where the text is linked,
 /// and how the objects are encoded.
 #[cfg(feature = "linked")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LinkedPart {
-    /// A Nordic part: the vector table at address 0, and the stack top its boot image starts from.
-    Nordic { initial_sp: u32 },
+    /// A Nordic part: the vector table at address 0, and the part's RAM plan.
+    Nordic(NordicRam),
     /// The RP2350 (Cortex-M33): XIP flash at `0x1000_0000`, and objects built WIDE, as Thumb-2 --
     /// the encoding the RP2350 harness proved on silicon, and the one a far branch or a long
     /// literal needs where Thumb-1 would refuse the method.
     Rp2350,
+    /// An STM32 part: the vector table at the part's flash, objects built narrow as on a Nordic
+    /// part, and the RAM plan its row states.
+    Stm32(Stm32Part),
 }
 
 #[cfg(feature = "linked")]
@@ -1170,16 +1419,18 @@ impl LinkedPart {
     /// relative to.
     fn text_base(self) -> u32 {
         match self {
-            LinkedPart::Nordic { .. } => NORDIC_TEXT_BASE,
+            LinkedPart::Nordic(_) => NORDIC_TEXT_BASE,
             LinkedPart::Rp2350 => RP2350_CODE_BASE,
+            LinkedPart::Stm32(part) => part.text_base(),
         }
     }
 
     /// Where the image is loaded: its first byte's address.
     fn image_base(self) -> u32 {
         match self {
-            LinkedPart::Nordic { .. } => NORDIC_IMAGE_BASE,
+            LinkedPart::Nordic(_) => NORDIC_IMAGE_BASE,
             LinkedPart::Rp2350 => RP2350_CODE_REGION,
+            LinkedPart::Stm32(part) => part.flash_base,
         }
     }
 
@@ -1188,11 +1439,12 @@ impl LinkedPart {
     /// clears and the heap is laid above.
     fn statics_window(self) -> (u32, u32) {
         match self {
-            LinkedPart::Nordic { .. } => (NORDIC_STATICS_BASE, NORDIC_STATICS_BYTES),
+            LinkedPart::Nordic(ram) => (ram.statics_base, ram.heap_end - ram.statics_base),
             LinkedPart::Rp2350 => (
                 RP2350_STATICS_BASE,
                 RP2350_STACK_FLOOR - RP2350_STATICS_BASE,
             ),
+            LinkedPart::Stm32(part) => (STM32_STATICS_BASE, part.statics_capacity().unwrap_or(0)),
         }
     }
 }
@@ -1207,10 +1459,13 @@ fn linked_part(target: &str) -> Result<LinkedPart, BuildError> {
     if target == "rp2350" {
         return Ok(LinkedPart::Rp2350);
     }
+    if let Some(&(_, part)) = STM32_LINKED_PARTS.iter().find(|(name, _)| *name == target) {
+        return Ok(LinkedPart::Stm32(part));
+    }
     NORDIC_LINKED_PARTS
         .iter()
         .find(|(part, _)| *part == target)
-        .map(|&(_, initial_sp)| LinkedPart::Nordic { initial_sp })
+        .map(|&(_, ram)| LinkedPart::Nordic(ram))
         .ok_or(BuildError::UnsupportedTarget)
 }
 
@@ -1269,7 +1524,10 @@ fn board_buses_object(words: &[u32]) -> Result<lamella_elf::Object, BuildError> 
 /// wants the link's debug sections takes them from the same link as the bytes.
 ///
 /// `board_buses` is the bus table of the board the build names, laid by [`board_buses_object`].
+/// `entry_void` is whether the program's entry point returns `void` ([`entry_returns_void`]), which
+/// the startup needs when it ends a console ring.
 #[cfg(feature = "linked")]
+#[allow(clippy::too_many_arguments)]
 fn link_linked_image(
     part: LinkedPart,
     program_object: &[u8],
@@ -1278,6 +1536,7 @@ fn link_linked_image(
     libraries: &[&[u8]],
     archive: &[u8],
     board_buses: Option<&[u32]>,
+    entry_void: bool,
 ) -> Result<(Vec<u8>, lamella_linker::LinkedImage), BuildError> {
     let mut trimmed = reachable_objects(program_object, deferred, corlib, libraries, part.wide())?;
     if let Some(words) = board_buses {
@@ -1289,13 +1548,15 @@ fn link_linked_image(
         .map_err(BuildError::Link)?;
     let statics_end = linked_statics_end(&linked, part.text_base());
     let board_init = linked_board_init(&linked, part.text_base());
+    let console = linked_console(&linked, part.text_base(), entry_void);
     let image = match part {
-        LinkedPart::Nordic { initial_sp } => nordic_linked_image(
-            initial_sp,
+        LinkedPart::Nordic(ram) => nordic_linked_image(
+            ram,
             linked.entry_offset,
             &linked.text,
-            statics_end.map_or(NORDIC_STATICS_BASE, |end| end.max(NORDIC_STATICS_BASE)),
+            statics_end,
             board_init,
+            console,
         ),
         LinkedPart::Rp2350 => rp2350_linked_image(
             linked.entry_offset,
@@ -1303,6 +1564,15 @@ fn link_linked_image(
             statics_end.unwrap_or(RP2350_STATICS_BASE),
             board_init,
             linked_data_run(&linked, part.text_base()),
+            console,
+        ),
+        LinkedPart::Stm32(stm32) => stm32_linked_image(
+            stm32,
+            linked.entry_offset,
+            &linked.text,
+            statics_end.map_or(STM32_STATICS_BASE, |end| end.max(STM32_STATICS_BASE)),
+            board_init,
+            console,
         ),
     };
     Ok((image, linked))
@@ -1386,11 +1656,117 @@ fn rp2350_data_copy_routine(run: DataRun) -> Vec<u8> {
 /// `text_base` is the part's, because the link records a function as its offset into the text.
 #[cfg(feature = "linked")]
 fn linked_board_init(linked: &lamella_linker::LinkedImage, text_base: u32) -> Option<u32> {
+    linked_function(linked, text_base, BOARD_INIT_SYMBOL)
+}
+
+/// The address of `name`, a function the link kept, with the Thumb bit set, or `None` for a link that
+/// kept none. `text_base` is the part's, because the link records a function as its offset into the
+/// text.
+#[cfg(feature = "linked")]
+fn linked_function(linked: &lamella_linker::LinkedImage, text_base: u32, name: &str) -> Option<u32> {
     linked
         .symbols
         .iter()
-        .find(|(name, _)| name == BOARD_INIT_SYMBOL)
+        .find(|(symbol, _)| symbol == name)
         .map(|&(_, offset)| (text_base + offset) | 1)
+}
+
+/// The address of `name`, an object the link laid in RAM, or `None` for a link that laid none. The link
+/// records a RAM object as its address less the text base, so the sum wraps back to the address.
+#[cfg(feature = "linked")]
+fn linked_data(linked: &lamella_linker::LinkedImage, text_base: u32, name: &str) -> Option<u32> {
+    linked
+        .symbols
+        .iter()
+        .find(|(symbol, _)| symbol == name)
+        .map(|&(_, offset)| text_base.wrapping_add(offset))
+}
+
+/// What a linked startup needs to arm and end the console ring, found in the link: present only when
+/// the link kept the ring and both of its hooks, which is a link whose runtime archive was built with
+/// `console-memory`. Without it the startup is byte for byte the one it always was.
+#[cfg(feature = "linked")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ConsoleHooks {
+    /// The arm hook ([`CONSOLE_ARM_SYMBOL`]), with the Thumb bit set.
+    arm: u32,
+    /// The finish hook ([`CONSOLE_FINISH_SYMBOL`]), with the Thumb bit set.
+    finish: u32,
+    /// The ring itself, which a fault ends with stores of its own ([`emit_fault_handler`]).
+    ring: u32,
+    /// The in-flight exception word ([`lamella_elf::EH_TAG_SYMBOL`]), whose value the finish hook is
+    /// given; `None` for a link that laid none, where no exception can be in flight.
+    exception_word: Option<u32>,
+    /// Whether the entry point returns `void`. Its return register then holds whatever ran last, so the
+    /// finish hook is given 0, the code .NET exits with when such an entry returns.
+    entry_void: bool,
+}
+
+/// The console ring's hooks in `linked` ([`ConsoleHooks`]), or `None` when the link kept no ring.
+#[cfg(feature = "linked")]
+fn linked_console(
+    linked: &lamella_linker::LinkedImage,
+    text_base: u32,
+    entry_void: bool,
+) -> Option<ConsoleHooks> {
+    Some(ConsoleHooks {
+        arm: linked_function(linked, text_base, CONSOLE_ARM_SYMBOL)?,
+        finish: linked_function(linked, text_base, CONSOLE_FINISH_SYMBOL)?,
+        ring: linked_data(linked, text_base, lamella_console_ring::SYMBOL)?,
+        exception_word: linked_data(linked, text_base, lamella_elf::EH_TAG_SYMBOL),
+        entry_void,
+    })
+}
+
+/// Emits the call to the console ring's arm hook, and returns the literal the call loads for the
+/// caller to place in its pool.
+///
+/// **THE CALLER PLACES IT AFTER THE CLEAR AND BEFORE THE BOARD's HOOK.** The ring is a zero-initialized
+/// static, so a clear after the call would unarm it; and arming before the board's hook means a hook
+/// that faults or never returns is still read as this run's.
+#[cfg(feature = "linked")]
+fn emit_console_arm_call(
+    enc: &mut lamella_asm_arm32::Encoder,
+    console: &ConsoleHooks,
+) -> (lamella_asm_arm32::Label, u32) {
+    use lamella_asm_arm32::Reg;
+    let arm_word = enc.new_label();
+    enc.ldr_literal(Reg::R0, arm_word).unwrap();
+    enc.blx(Reg::R0);
+    (arm_word, console.arm)
+}
+
+/// Emits the call to the console ring's finish hook once the entry point has returned with its result
+/// in R0, and returns the literals the call loads for the caller to place in its pool.
+///
+/// The hook takes the code in R0 -- the entry's result, or 0 for an entry that returns `void` -- and in
+/// R1 the in-flight exception word's value, 0 for a link that laid none. It leaves in R0 the code the
+/// ring recorded: the result, 0 for a `void` entry, or 134 for an exception nothing caught, so a startup
+/// that goes on to stamp a result stamps the same code the ring says.
+#[cfg(feature = "linked")]
+fn emit_console_finish_call(
+    enc: &mut lamella_asm_arm32::Encoder,
+    console: &ConsoleHooks,
+) -> Vec<(lamella_asm_arm32::Label, u32)> {
+    use lamella_asm_arm32::Reg;
+    let mut pool = Vec::new();
+    if console.entry_void {
+        enc.movs_imm(Reg::R0, 0).unwrap();
+    }
+    match console.exception_word {
+        Some(address) => {
+            let word = enc.new_label();
+            enc.ldr_literal(Reg::R1, word).unwrap();
+            enc.ldr_imm(Reg::R1, Reg::R1, 0).unwrap();
+            pool.push((word, address));
+        }
+        None => enc.movs_imm(Reg::R1, 0).unwrap(),
+    }
+    let finish_word = enc.new_label();
+    enc.ldr_literal(Reg::R2, finish_word).unwrap();
+    enc.blx(Reg::R2);
+    pool.push((finish_word, console.finish));
+    pool
 }
 
 /// Emits the call to the board's startup hook at `hook`, the address [`linked_board_init`] found,
@@ -1620,6 +1996,7 @@ pub fn build_linked_cortex_m_debug_with_board(
         &libraries,
         archive,
         board_buses,
+        program_entry_returns_void(cil),
     )?;
     let program = lamella_elf::read_object(&program_object)
         .map_err(|e| BuildError::ObjectRead(alloc::format!("{e:?}")))?;
@@ -1631,14 +2008,73 @@ pub fn build_linked_cortex_m_debug_with_board(
             Some((name.as_str(), bytes.get(..own.data.len())?))
         })
         .collect();
-    Ok(lamella_elf::write_debuggable_executable(
+    let objects = console_ring(&linked.symbols, archive, part.text_base())?;
+    Ok(debug_executable(part, &image, linked.entry_offset, &sections, &objects))
+}
+
+/// The debug ELF of a linked image of `part`: `image` loaded at the part's image base, its entry
+/// `entry_offset` bytes into the linked text, `sections` the program's debug information, and
+/// `objects` the data objects it names.
+#[cfg(feature = "linked")]
+fn debug_executable(
+    part: LinkedPart,
+    image: &[u8],
+    entry_offset: u32,
+    sections: &[(&str, &[u8])],
+    objects: &[lamella_elf::NamedObject<'_>],
+) -> Vec<u8> {
+    let entry_from_image = part.text_base() - part.image_base() + entry_offset;
+    lamella_elf::write_debuggable_executable_with_objects(
         lamella_elf::Machine::Arm,
-        &image,
-        part.text_base() + linked.entry_offset,
+        image,
+        entry_from_image,
         part.image_base(),
         true,
-        &sections,
-    ))
+        sections,
+        objects,
+    )
+}
+
+/// The symbol a Lamella image's console ring is linked under: the RAM a reader of the running image
+/// follows the program's console and its end in, without halting the board.
+#[cfg(feature = "linked")]
+const CONSOLE_RING_SYMBOL: &str = "__lamella_console_log";
+
+/// The section the debug ELF describes the console ring's memory with.
+#[cfg(feature = "linked")]
+const CONSOLE_RING_SECTION: &str = ".lamella_console_log";
+
+/// The console ring, named for the debug ELF, when the link defined one; none otherwise.
+///
+/// Its address is the link's: `symbols` holds every global the link defined as its address less
+/// `text_base`. Its size is the `st_size` the runtime support archive gives it, since the link keeps
+/// no sizes; a reader bounds the ring's own header by it.
+///
+/// # Errors
+/// An archive that does not read, which the link has already read once.
+#[cfg(feature = "linked")]
+fn console_ring(
+    symbols: &[(alloc::string::String, u32)],
+    archive: &[u8],
+    text_base: u32,
+) -> Result<Vec<lamella_elf::NamedObject<'static>>, BuildError> {
+    let Some(address) = linked_address(symbols, CONSOLE_RING_SYMBOL, text_base) else {
+        return Ok(Vec::new());
+    };
+    let support = lamella_elf::read_archive(archive).map_err(|e| BuildError::ObjectRead(alloc::format!("{e:?}")))?;
+    let size = support
+        .members
+        .iter()
+        .flat_map(|member| member.object.symbols.iter())
+        .find(|symbol| symbol.defined && symbol.name == CONSOLE_RING_SYMBOL)
+        .map_or(0, |symbol| symbol.size);
+    Ok(vec![lamella_elf::NamedObject { name: CONSOLE_RING_SYMBOL, section: CONSOLE_RING_SECTION, address, size }])
+}
+
+/// The address the link gave the global `name`, from its `symbols` and the `text_base` it linked at.
+#[cfg(feature = "linked")]
+fn linked_address(symbols: &[(alloc::string::String, u32)], name: &str, text_base: u32) -> Option<u32> {
+    symbols.iter().find(|(defined, _)| defined == name).map(|(_, recorded)| recorded.wrapping_add(text_base))
 }
 
 /// THE PRODUCT LINK, AND IT IS STATED HERE ONCE SO THAT NOTHING CAN STATE IT A SECOND TIME.
@@ -1660,10 +2096,11 @@ pub fn build_linked_cortex_m_debug_with_board(
 /// same second opinion one argument further in. A target the linked tier has no row for is
 /// [`BuildError::UnsupportedTarget`].
 ///
-/// **THE BOARD'S STARTUP HOOK IS A ROOT OF THIS LINK** ([`BOARD_INIT_SYMBOL`]). Only the startup
-/// calls it, and the startup is assembled around the link rather than linked, so nothing the link
-/// sees references it: without the root, a board build's archive would never be searched for it,
-/// and the dead-strip would drop it. An archive that defines no hook links exactly as it did.
+/// **THE BOARD'S STARTUP HOOK IS A ROOT OF THIS LINK** ([`BOARD_INIT_SYMBOL`]), and so are the
+/// console ring's two hooks ([`CONSOLE_ARM_SYMBOL`], [`CONSOLE_FINISH_SYMBOL`]). Only the startup
+/// calls them, and the startup is assembled around the link rather than linked, so nothing the link
+/// sees references them: without the roots, the archive would never be searched for them, and the
+/// dead-strip would drop them. An archive that defines none of them links exactly as it did.
 #[cfg(feature = "linked")]
 pub fn link_product_image(
     trimmed: &[lamella_elf::Object],
@@ -1677,8 +2114,9 @@ pub fn link_product_image(
 /// [`link_product_image`] for a part already resolved.
 ///
 /// **INITIALIZED RAM DATA LINKS ONLY FOR THE RP2350**, whose startup copies it down
-/// ([`rp2350_linked_image`]). A Nordic part's startup copies none, so its link refuses an object that
-/// carries any (`LinkError::InitializedDataNotCopied`) rather than run it as whatever RAM held.
+/// ([`rp2350_linked_image`]). A Nordic or an STM32 part's startup copies none, so its link refuses an
+/// object that carries any (`LinkError::InitializedDataNotCopied`) rather than run it as whatever RAM
+/// held.
 #[cfg(feature = "linked")]
 fn link_part_image(
     part: LinkedPart,
@@ -1688,13 +2126,13 @@ fn link_part_image(
 ) -> Result<lamella_linker::LinkedImage, lamella_linker::LinkError> {
     let link = match part {
         LinkedPart::Rp2350 => lamella_linker::link_gc_with_archives_ram_and_data,
-        LinkedPart::Nordic { .. } => lamella_linker::link_gc_with_archives_ram,
+        LinkedPart::Nordic(_) | LinkedPart::Stm32(_) => lamella_linker::link_gc_with_archives_ram,
     };
     link(
         trimmed,
         archives,
         entry,
-        &[BOARD_INIT_SYMBOL],
+        &[BOARD_INIT_SYMBOL, CONSOLE_ARM_SYMBOL, CONSOLE_FINISH_SYMBOL],
         Some(part.text_base()),
         part.statics_window(),
     )
@@ -1703,20 +2141,30 @@ fn link_part_image(
 /// Wraps LINKED text in a Nordic boot image: `[initial SP][reset -> the startup]`, the startup, then
 /// the text at [`NORDIC_TEXT_BASE`].
 ///
+/// **The RAM plan is the part's ([`NordicRam`]), and the heap takes what the link leaves of it.**
+/// `statics_end` is where the linker says the statics end, the runtime archive's own included, in
+/// the window that starts at the plan's statics base; `None` for a link that placed no statics. The
+/// heap runs from there, rounded up to 8, to the plan's heap end.
+///
 /// **The startup is the whole of this part's crt0, and it does three things in this order**, four
 /// in a board build. It
-/// CLEARS `[NORDIC_HEAP_PTR, zero_end)` -- the allocator's cursor words, the heap band, and the
-/// statics window up to the end the LINKER reported ([`linked_statics_end`]). That window holds the
+/// CLEARS `[NORDIC_HEAP_PTR, zero_end)`, where `zero_end` is where the statics end -- the allocator's
+/// cursor words and the statics the LINKER placed ([`linked_statics_end`]). Those hold the
 /// managed statics, whose word 0 is the VES-global exception tag every call site tests on return,
 /// and every zero-initialized static of the runtime archive -- its scheduler, whose `current` every
 /// allocation reads, among them. Then it seeds the cursor and its limit, which the archive stops on
 /// rather than bumping past. In a board build it then calls the board's startup hook
-/// ([`emit_board_init_call`]). Then it enters the entry.
+/// ([`emit_board_init_call`]). Then it enters the entry. The heap itself is not cleared here: the
+/// collector clears it when it adopts it, at the first allocation, before anything reads it.
 ///
 /// **The order is load-bearing: the clear covers the cursor words, so seeding first would zero the
 /// seed.** And the clear is not optional on a part -- SRAM powers up undefined, there is no crt0 on
 /// this route, and an uncleared window means the first call returns as though an exception were in
 /// flight and a static field reads garbage instead of the CIL default.
+///
+/// **The heap's base and end are the last two words before the text** ([`NORDIC_HEAP_SEEDS`]), at the
+/// same offset in every linked image, so the heap a build chose can be read from the image alone
+/// ([`linked_heap`]).
 ///
 /// A `Main` that returns lands in the park below the call rather than in whatever reset left in `LR`.
 /// The flat path enters its entry with a bare `BX` instead, because there the entry IS the reset
@@ -1725,15 +2173,23 @@ fn link_part_image(
 /// It shares the flat path's vector table and fault handler, so a fault on this tier is recorded
 /// rather than escalated -- which matters because the linked tier is no more immune to undefined RAM
 /// than the flat one, only better supplied.
+///
+/// **With a console ring** (`console`, [`ConsoleHooks`]) the startup arms the ring after the seed and
+/// before the board's hook ([`emit_console_arm_call`]), ends it once the entry returns
+/// ([`emit_console_finish_call`]) and then parks, and the fault handler ends it too. Without one the
+/// startup is byte for byte the one it always was.
 #[cfg(feature = "linked")]
 fn nordic_linked_image(
-    initial_sp: u32,
+    ram: NordicRam,
     entry_offset: u32,
     text: &[u8],
-    zero_end: u32,
+    statics_end: Option<u32>,
     board_init: Option<u32>,
+    console: Option<ConsoleHooks>,
 ) -> Vec<u8> {
     use lamella_asm_arm32::{Encoder, Reg};
+    let zero_end = statics_end.map_or(ram.statics_base, |end| end.max(ram.statics_base));
+    let heap = nordic_heap(ram, zero_end);
     let mut enc = Encoder::new();
     let zero_start_word = enc.new_label();
     let zero_end_word = enc.new_label();
@@ -1743,6 +2199,7 @@ fn nordic_linked_image(
     let record_word = enc.new_label();
     let magic_word = enc.new_label();
     let entry_word = enc.new_label();
+    let mut console_pool: Vec<(lamella_asm_arm32::Label, u32)> = Vec::new();
 
     emit_fault_record_clear(&mut enc, record_word);
     emit_zero_band(&mut enc, zero_start_word, zero_end_word);
@@ -1751,25 +2208,40 @@ fn nordic_linked_image(
     enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
     enc.ldr_literal(Reg::R0, heap_limit_word).unwrap();
     enc.str_imm(Reg::R0, Reg::R1, 4).unwrap();
+    if let Some(console) = &console {
+        console_pool.push(emit_console_arm_call(&mut enc, console));
+    }
     let board_init_word = emit_board_init_call(&mut enc, board_init);
     enc.ldr_literal(Reg::R0, entry_word).unwrap();
     enc.blx(Reg::R0);
+    if let Some(console) = &console {
+        console_pool.extend(emit_console_finish_call(&mut enc, console));
+    }
     let park = enc.new_label();
     enc.bind_label(park);
     enc.b(park);
     let fault_offset = enc.position();
-    emit_fault_handler(&mut enc, record_word, magic_word);
+    let ring_end = console.as_ref().map(|console| {
+        let end = FaultRingEnd {
+            ring_word: enc.new_label(),
+            aborted_word: enc.new_label(),
+        };
+        console_pool.push((end.ring_word, console.ring));
+        console_pool.push((end.aborted_word, lamella_console_ring::ABORTED));
+        end
+    });
+    emit_fault_handler(&mut enc, record_word, magic_word, ring_end.as_ref());
     enc.align_to_word();
+    for (label, word) in console_pool {
+        enc.bind_label(label);
+        enc.emit_word(word);
+    }
     enc.bind_label(zero_start_word);
     enc.emit_word(NORDIC_HEAP_PTR);
     enc.bind_label(zero_end_word);
     enc.emit_word(zero_end);
     enc.bind_label(heap_ptr_word);
     enc.emit_word(NORDIC_HEAP_PTR);
-    enc.bind_label(heap_base_word);
-    enc.emit_word(NORDIC_HEAP_BASE);
-    enc.bind_label(heap_limit_word);
-    enc.emit_word(NORDIC_STATICS_BASE);
     enc.bind_label(record_word);
     enc.emit_word(NORDIC_FAULT_RECORD);
     enc.bind_label(magic_word);
@@ -1780,12 +2252,204 @@ fn nordic_linked_image(
         enc.bind_label(label);
         enc.emit_word(hook);
     }
+    let seeds_at = NORDIC_HEAP_SEEDS - NORDIC_STUB_BASE;
+    assert!(enc.position() <= seeds_at, "the nordic linked startup must end below its heap seeds");
+    enc.emit_bytes(&alloc::vec![0u8; (seeds_at - enc.position()) as usize]);
+    enc.bind_label(heap_base_word);
+    enc.emit_word(heap.base);
+    enc.bind_label(heap_limit_word);
+    enc.emit_word(heap.end);
     let stub = enc
         .finish()
         .expect("the nordic linked startup assembles")
         .bytes;
 
-    nordic_image(initial_sp, fault_offset, &stub, text)
+    nordic_image(ram.initial_sp, fault_offset, &stub, text)
+}
+
+/// Where a linked Nordic image's startup keeps the heap's base and end, as an image offset: the last
+/// two words before the text, the same in every linked image.
+#[cfg(feature = "linked")]
+const NORDIC_HEAP_SEEDS: u32 = NORDIC_TEXT_BASE - 8;
+
+/// The managed heap a linked image hands its collector, `[base, end)`.
+///
+/// The collector keeps its mark bitmap at the heap's top, one bit per word -- about 3% -- so a
+/// program's objects have the rest.
+#[cfg(feature = "linked")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LinkedHeap {
+    /// The heap's first byte.
+    pub base: u32,
+    /// One past its last byte.
+    pub end: u32,
+}
+
+#[cfg(feature = "linked")]
+impl LinkedHeap {
+    /// How many bytes the heap spans.
+    #[must_use]
+    pub fn bytes(&self) -> u32 {
+        self.end - self.base
+    }
+}
+
+/// The heap `ram`'s plan gives an image whose statics end at `statics_end`: from there, rounded up
+/// to 8, to the plan's end.
+#[cfg(feature = "linked")]
+fn nordic_heap(ram: NordicRam, statics_end: u32) -> LinkedHeap {
+    let base = statics_end.next_multiple_of(8);
+    assert!(base <= ram.heap_end, "the nordic statics must end below the heap's end");
+    LinkedHeap { base, end: ram.heap_end }
+}
+
+/// The heap the linked image `image`, built for `target`, hands its collector, read back from the
+/// image itself: what the startup will seed, rather than what a builder meant to produce. `None` for
+/// a target the linked tier has no Nordic plan for, and for an image whose startup seeds no heap --
+/// a flat image's, for one.
+#[cfg(feature = "linked")]
+#[must_use]
+pub fn linked_heap(image: &[u8], target: &str) -> Option<LinkedHeap> {
+    let Ok(LinkedPart::Nordic(ram)) = linked_part(target) else {
+        return None;
+    };
+    let word = |at: u32| {
+        let at = at as usize;
+        image.get(at..at + 4).map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    };
+    let heap = LinkedHeap { base: word(NORDIC_HEAP_SEEDS)?, end: word(NORDIC_HEAP_SEEDS + 4)? };
+    let seeded = word(0)? == ram.initial_sp
+        && heap.end == ram.heap_end
+        && (ram.statics_base..=ram.heap_end).contains(&heap.base);
+    seeded.then_some(heap)
+}
+
+/// Wraps LINKED text in an STM32 boot image: `[initial SP][reset -> the startup]` and the fault vectors
+/// at the part's flash base, the startup [`STM32_STUB_OFFSET`] bytes in, then the text
+/// [`STM32_TEXT_OFFSET`] bytes in.
+///
+/// **The startup is the Nordic one's, step for step** ([`nordic_linked_image`]), at this part's flash
+/// base: it clears the fault record, then `[NORDIC_HEAP_PTR, zero_end)` -- the allocator's seed words,
+/// the archive's fixed bands and the statics up to the end the LINKER reported -- then seeds the heap,
+/// arms the console ring when the link kept one, calls the board's startup hook when the link kept one,
+/// and enters the entry. The heap is not cleared here: the collector clears it when it adopts it, at
+/// the first allocation, before anything reads it. A `Main` that returns lands in the park below the
+/// call, or in the ring's finish hook and then the park.
+///
+/// **The heap is everything between the statics' end and the stack's floor** ([`Stm32Part::heap`]):
+/// the startup seeds the cursor with the statics' end, rounded up to 8, and its limit with the floor.
+#[cfg(feature = "linked")]
+fn stm32_linked_image(
+    part: Stm32Part,
+    entry_offset: u32,
+    text: &[u8],
+    zero_end: u32,
+    board_init: Option<u32>,
+    console: Option<ConsoleHooks>,
+) -> Vec<u8> {
+    use lamella_asm_arm32::{Encoder, Reg};
+    let (heap_base, heap_end) = part.heap(zero_end);
+    let mut enc = Encoder::new();
+    let zero_start_word = enc.new_label();
+    let zero_end_word = enc.new_label();
+    let heap_ptr_word = enc.new_label();
+    let heap_base_word = enc.new_label();
+    let heap_limit_word = enc.new_label();
+    let record_word = enc.new_label();
+    let magic_word = enc.new_label();
+    let entry_word = enc.new_label();
+    let mut console_pool: Vec<(lamella_asm_arm32::Label, u32)> = Vec::new();
+
+    emit_fault_record_clear(&mut enc, record_word);
+    emit_zero_band(&mut enc, zero_start_word, zero_end_word);
+    enc.ldr_literal(Reg::R0, heap_base_word).unwrap();
+    enc.ldr_literal(Reg::R1, heap_ptr_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.ldr_literal(Reg::R0, heap_limit_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 4).unwrap();
+    if let Some(console) = &console {
+        console_pool.push(emit_console_arm_call(&mut enc, console));
+    }
+    let board_init_word = emit_board_init_call(&mut enc, board_init);
+    enc.ldr_literal(Reg::R0, entry_word).unwrap();
+    enc.blx(Reg::R0);
+    if let Some(console) = &console {
+        console_pool.extend(emit_console_finish_call(&mut enc, console));
+    }
+    let park = enc.new_label();
+    enc.bind_label(park);
+    enc.b(park);
+    let fault_offset = enc.position();
+    let ring_end = console.as_ref().map(|console| {
+        let end = FaultRingEnd {
+            ring_word: enc.new_label(),
+            aborted_word: enc.new_label(),
+        };
+        console_pool.push((end.ring_word, console.ring));
+        console_pool.push((end.aborted_word, lamella_console_ring::ABORTED));
+        end
+    });
+    emit_fault_handler(&mut enc, record_word, magic_word, ring_end.as_ref());
+    enc.align_to_word();
+    for (label, word) in console_pool {
+        enc.bind_label(label);
+        enc.emit_word(word);
+    }
+    enc.bind_label(zero_start_word);
+    enc.emit_word(NORDIC_HEAP_PTR);
+    enc.bind_label(zero_end_word);
+    enc.emit_word(zero_end);
+    enc.bind_label(heap_ptr_word);
+    enc.emit_word(NORDIC_HEAP_PTR);
+    enc.bind_label(heap_base_word);
+    enc.emit_word(heap_base);
+    enc.bind_label(heap_limit_word);
+    enc.emit_word(heap_end);
+    enc.bind_label(record_word);
+    enc.emit_word(NORDIC_FAULT_RECORD);
+    enc.bind_label(magic_word);
+    enc.emit_word(NORDIC_FAULT_MAGIC);
+    enc.bind_label(entry_word);
+    enc.emit_word((part.text_base() + entry_offset) | 1);
+    if let Some((label, hook)) = board_init_word {
+        enc.bind_label(label);
+        enc.emit_word(hook);
+    }
+    let stub = enc
+        .finish()
+        .expect("the STM32 linked startup assembles")
+        .bytes;
+
+    stm32_image(part, fault_offset, &stub, text)
+}
+
+/// Assembles an STM32 image: the sixteen-entry vector table at the part's flash base, the startup and
+/// fault handler [`STM32_STUB_OFFSET`] bytes in, and the text [`STM32_TEXT_OFFSET`] bytes in.
+///
+/// Sixteen entries, as on a Nordic part ([`nordic_image`]): the startup enables no interrupt, and a
+/// reset clears the NVIC's enables, so no external IRQ can fire.
+#[cfg(feature = "linked")]
+fn stm32_image(part: Stm32Part, fault_offset: u32, stub: &[u8], text: &[u8]) -> Vec<u8> {
+    use lamella_asm_arm32::Encoder;
+    assert!(
+        STM32_STUB_OFFSET as usize + stub.len() <= STM32_TEXT_OFFSET as usize,
+        "the STM32 startup and fault handler must fit between the vector table and the text"
+    );
+    let stub_base = part.flash_base + STM32_STUB_OFFSET;
+    let mut enc = Encoder::new();
+    enc.emit_word(part.ram_top);
+    enc.emit_word(stub_base | 1);
+    for _ in 2..16 {
+        enc.emit_word((stub_base + fault_offset) | 1);
+    }
+    let table = enc.finish().expect("the STM32 vector table assembles").bytes;
+    debug_assert_eq!(table.len(), STM32_STUB_OFFSET as usize);
+
+    let mut image = alloc::vec![0u8; STM32_TEXT_OFFSET as usize];
+    image[..table.len()].copy_from_slice(&table);
+    image[STM32_STUB_OFFSET as usize..STM32_STUB_OFFSET as usize + stub.len()].copy_from_slice(stub);
+    image.extend_from_slice(text);
+    image
 }
 
 /// Compiles an already-lowered PYTHON module to a flashable bare-metal image for a Cortex-M chip,
@@ -2098,6 +2762,14 @@ pub fn rp2350_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
 ///   text, and the heap starts above the run. A hook can run code the run holds, which is why the
 ///   PSRAM bring-up can: its nucleus runs from RAM. A link with no data run gets the startup it
 ///   always got, byte for byte.
+/// * **A console ring is armed and ended** when the link kept one (`console`, [`ConsoleHooks`]): the
+///   startup arms it after the boot magic and before the board's hook ([`emit_console_arm_call`]).
+///   Once the entry returns, the startup jumps to [`rp2350_console_tail`], laid on a word after the
+///   text and the copy routine, which ends the ring, stamps the mailbox as the startup does without a
+///   ring, and parks; and the fault vectors reach that routine's fault handler, which ends the ring as
+///   aborted. The two calls do not fit beside the rest in the startup's fixed space, which a board
+///   build nearly fills, and a jump to each does. A link with no ring gets the startup it always got,
+///   byte for byte.
 #[cfg(feature = "linked")]
 fn rp2350_linked_image(
     entry_offset: u32,
@@ -2105,14 +2777,19 @@ fn rp2350_linked_image(
     statics_end: u32,
     board_init: Option<u32>,
     data: Option<DataRun>,
+    console: Option<ConsoleHooks>,
 ) -> Vec<u8> {
     use lamella_asm_arm32::{Encoder, Reg};
     const STUB_OFF: u32 = 16 * 4 + 5 * 4;
     let ram_end = data.map_or(statics_end, |run| run.end.max(statics_end));
     let heap_base = ram_end.next_multiple_of(8).max(RP2350_STATICS_BASE);
-    let copy_routine = data.map(|run| {
-        let at = RP2350_CODE_BASE + (text.len() as u32).next_multiple_of(4);
-        (at, rp2350_data_copy_routine(run))
+    let after_text = RP2350_CODE_BASE + (text.len() as u32).next_multiple_of(4);
+    let copy_routine = data.map(|run| (after_text, rp2350_data_copy_routine(run)));
+    let console_tail = console.as_ref().map(|console| {
+        let at = copy_routine
+            .as_ref()
+            .map_or(after_text, |(at, routine)| (at + routine.len() as u32).next_multiple_of(4));
+        (at, rp2350_console_tail(console))
     });
     let heap_limit = RP2350_STACK_FLOOR;
     assert!(heap_base <= heap_limit, "the RP2350 statics must end below the stack's floor");
@@ -2122,16 +2799,13 @@ fn rp2350_linked_image(
     let vtor_word = enc.new_label();
     let region_word = enc.new_label();
     let record_word = enc.new_label();
-    let fault_magic_word = enc.new_label();
     let zero_start_word = enc.new_label();
     let zero_end_word = enc.new_label();
     let heap_ptr_word = enc.new_label();
     let heap_base_word = enc.new_label();
     let heap_limit_word = enc.new_label();
     let boot_magic_word = enc.new_label();
-    let done_magic_word = enc.new_label();
     let result_word = enc.new_label();
-    let result_hi_word = enc.new_label();
     let entry_word = enc.new_label();
     enc.ldr_literal(Reg::R0, region_word).unwrap();
     enc.ldr_literal(Reg::R1, vtor_word).unwrap();
@@ -2154,46 +2828,77 @@ fn rp2350_linked_image(
     enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
     enc.movs_imm(Reg::R0, 0).unwrap();
     enc.str_imm(Reg::R0, Reg::R1, 4).unwrap();
+    let arm_word = console.as_ref().map(|console| emit_console_arm_call(&mut enc, console));
     let board_init_word = emit_board_init_call(&mut enc, board_init);
     enc.ldr_literal(Reg::R0, entry_word).unwrap();
     enc.blx(Reg::R0);
-    enc.ldr_literal(Reg::R1, result_hi_word).unwrap();
-    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
-    enc.ldr_literal(Reg::R0, done_magic_word).unwrap();
-    enc.ldr_literal(Reg::R1, result_word).unwrap();
-    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
-    let park = enc.new_label();
-    enc.bind_label(park);
-    enc.b(park);
-    let fault_offset = enc.position();
-    emit_fault_handler(&mut enc, record_word, fault_magic_word);
+    let mut mailbox = None;
+    let mut jumps = Vec::new();
+    let fault_offset = match &console_tail {
+        Some((at, (_, fault_entry))) => {
+            let tail_word = enc.new_label();
+            enc.ldr_literal(Reg::R1, tail_word).unwrap();
+            enc.bx(Reg::R1);
+            let fault_offset = enc.position();
+            let fault_word = enc.new_label();
+            enc.ldr_literal(Reg::R0, fault_word).unwrap();
+            enc.bx(Reg::R0);
+            jumps.push((tail_word, at | 1));
+            jumps.push((fault_word, (at + fault_entry) | 1));
+            fault_offset
+        }
+        None => {
+            let fault_magic_word = enc.new_label();
+            let done_magic_word = enc.new_label();
+            let result_hi_word = enc.new_label();
+            enc.ldr_literal(Reg::R1, result_hi_word).unwrap();
+            enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+            enc.ldr_literal(Reg::R0, done_magic_word).unwrap();
+            enc.ldr_literal(Reg::R1, result_word).unwrap();
+            enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+            let park = enc.new_label();
+            enc.bind_label(park);
+            enc.b(park);
+            let fault_offset = enc.position();
+            emit_fault_handler(&mut enc, record_word, fault_magic_word, None);
+            mailbox = Some((fault_magic_word, done_magic_word, result_hi_word));
+            fault_offset
+        }
+    };
     enc.align_to_word();
-    for (label, word) in [
+    let mut pool = alloc::vec![
         (vtor_word, SCB_VTOR),
         (region_word, RP2350_CODE_REGION),
         (record_word, NORDIC_FAULT_RECORD),
-        (fault_magic_word, NORDIC_FAULT_MAGIC),
+    ];
+    if let Some((fault_magic_word, _, _)) = mailbox {
+        pool.push((fault_magic_word, NORDIC_FAULT_MAGIC));
+    }
+    pool.extend([
         (zero_start_word, RP2350_HEAP_PTR),
         (zero_end_word, heap_limit),
         (heap_ptr_word, RP2350_HEAP_PTR),
         (heap_base_word, heap_base),
         (heap_limit_word, heap_limit),
         (boot_magic_word, RP2350_BOOT_MAGIC),
-        (done_magic_word, RP2350_DONE_MAGIC),
-        (result_word, RP2350_RESULT_ADDR),
-        (result_hi_word, RP2350_RESULT_ADDR + 4),
-        (entry_word, (RP2350_CODE_BASE + entry_offset) | 1),
-    ] {
+    ]);
+    if let Some((_, done_magic_word, _)) = mailbox {
+        pool.push((done_magic_word, RP2350_DONE_MAGIC));
+    }
+    pool.push((result_word, RP2350_RESULT_ADDR));
+    if let Some((_, _, result_hi_word)) = mailbox {
+        pool.push((result_hi_word, RP2350_RESULT_ADDR + 4));
+    }
+    pool.push((entry_word, (RP2350_CODE_BASE + entry_offset) | 1));
+    pool.extend(jumps);
+    pool.extend(board_init_word);
+    if let (Some(label), Some((at, _))) = (copy_word, &copy_routine) {
+        pool.push((label, at | 1));
+    }
+    pool.extend(arm_word);
+    for (label, word) in pool {
         enc.bind_label(label);
         enc.emit_word(word);
-    }
-    if let Some((label, hook)) = board_init_word {
-        enc.bind_label(label);
-        enc.emit_word(hook);
-    }
-    if let (Some(label), Some((at, _))) = (copy_word, &copy_routine) {
-        enc.bind_label(label);
-        enc.emit_word(at | 1);
     }
     let stub = enc.finish().expect("the RP2350 startup assembles").bytes;
     assert!(
@@ -2220,7 +2925,65 @@ fn rp2350_linked_image(
         image.resize((at - RP2350_CODE_REGION) as usize, 0);
         image.extend_from_slice(&routine);
     }
+    if let Some((at, (routine, _))) = console_tail {
+        image.resize((at - RP2350_CODE_REGION) as usize, 0);
+        image.extend_from_slice(&routine);
+    }
     image
+}
+
+/// The routine an RP2350 startup with a console ring jumps to once the entry point has returned, and
+/// the fault handler its fault vectors reach, laid on a word after the text: returns the routine and
+/// the fault handler's offset in it.
+///
+/// The first part enters with the entry's result in R0. It ends the ring
+/// ([`emit_console_finish_call`]), then stamps the mailbox as a startup with no ring does -- the code
+/// the ring recorded at [`RP2350_RESULT_ADDR`]` + 4`, then [`RP2350_DONE_MAGIC`] -- and parks. So with
+/// a ring the mailbox reads 134 for an exception nothing caught and 0 for a `void` entry, where
+/// without one it reads the entry's return register. The fault handler
+/// records the fault as every linked image's does and ends the ring as aborted
+/// ([`emit_fault_handler`]). The routine keeps its addresses in a literal pool of its own, so it runs
+/// wherever it is laid on a word.
+#[cfg(feature = "linked")]
+fn rp2350_console_tail(console: &ConsoleHooks) -> (Vec<u8>, u32) {
+    use lamella_asm_arm32::{Encoder, Reg};
+    let mut enc = Encoder::new();
+    let result_word = enc.new_label();
+    let result_hi_word = enc.new_label();
+    let done_magic_word = enc.new_label();
+    let record_word = enc.new_label();
+    let fault_magic_word = enc.new_label();
+    let ring_end = FaultRingEnd {
+        ring_word: enc.new_label(),
+        aborted_word: enc.new_label(),
+    };
+    let mut pool = emit_console_finish_call(&mut enc, console);
+    enc.ldr_literal(Reg::R1, result_hi_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    enc.ldr_literal(Reg::R0, done_magic_word).unwrap();
+    enc.ldr_literal(Reg::R1, result_word).unwrap();
+    enc.str_imm(Reg::R0, Reg::R1, 0).unwrap();
+    let park = enc.new_label();
+    enc.bind_label(park);
+    enc.b(park);
+    let fault_entry = enc.position();
+    emit_fault_handler(&mut enc, record_word, fault_magic_word, Some(&ring_end));
+    enc.align_to_word();
+    pool.extend([
+        (result_word, RP2350_RESULT_ADDR),
+        (result_hi_word, RP2350_RESULT_ADDR + 4),
+        (done_magic_word, RP2350_DONE_MAGIC),
+        (record_word, NORDIC_FAULT_RECORD),
+        (fault_magic_word, NORDIC_FAULT_MAGIC),
+        (ring_end.ring_word, console.ring),
+        (ring_end.aborted_word, lamella_console_ring::ABORTED),
+    ]);
+    for (label, word) in pool {
+        enc.bind_label(label);
+        enc.emit_word(word);
+    }
+    let routine = enc.finish().expect("the RP2350 console tail assembles").bytes;
+    (routine, fault_entry)
 }
 
 /// RP2040 (Pico / Pico H) result mailbox -- the RP2350 mailbox's twin, one bank lower because this
@@ -5872,6 +6635,13 @@ fn find_main(assembly: &Assembly) -> Option<u32> {
         }
     }
     None
+}
+
+/// Whether the program `cil` has an entry point that returns `void` ([`entry_returns_void`]); `false`
+/// for bytes that do not parse, which the build that lowered them has already refused.
+#[cfg(feature = "linked")]
+fn program_entry_returns_void(cil: &[u8]) -> bool {
+    Assembly::read(cil).is_ok_and(|assembly| entry_returns_void(&assembly))
 }
 
 /// Whether the assembly's entry point returns `void` -- the entry point being the method a build runs,
@@ -11162,6 +11932,78 @@ pub fn runtime_seam_body(
 mod tests {
     use super::*;
 
+    /// `members` in a minimal GNU `ar` archive, as `lamella_elf::read_archive` takes one.
+    #[cfg(feature = "linked")]
+    fn test_archive(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut out = b"!<arch>\n".to_vec();
+        for (name, data) in members {
+            let mut header = [b' '; 60];
+            header[..name.len()].copy_from_slice(name.as_bytes());
+            header[name.len()] = b'/';
+            let size = data.len().to_string();
+            header[48..48 + size.len()].copy_from_slice(size.as_bytes());
+            header[58..60].copy_from_slice(&[0x60, 0x0a]);
+            out.extend_from_slice(&header);
+            out.extend_from_slice(data);
+            if data.len() % 2 == 1 {
+                out.push(b'\n');
+            }
+        }
+        out
+    }
+
+    /// **A DEBUG ELF's ENTRY IS THE IMAGE's ENTRY, ON EVERY PART**: the linked text's address plus the
+    /// entry's offset into it, with the Thumb bit, inside the one segment the ELF loads -- on the
+    /// RP2350, whose image is loaded in flash, as on a Nordic part, whose image starts at 0.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn a_debug_elfs_entry_is_the_images_entry_on_every_part() {
+        for target in ["rp2350", "microbit", "nrf52833", "stm32f769", "stm32u5a5", "stm32u585", "stm32h747-cm7"] {
+            let part = linked_part(target).expect("a linked part");
+            let entry_offset = 0x40;
+            let image = vec![0xBFu8; (part.text_base() - part.image_base()) as usize + 0x100];
+            let elf = debug_executable(part, &image, entry_offset, &[], &[]);
+            let e_entry = u32::from_le_bytes([elf[24], elf[25], elf[26], elf[27]]);
+            assert_eq!(e_entry, (part.text_base() + entry_offset) | 1, "{target}: e_entry {e_entry:#010x}");
+            let loaded = lamella_elf::flat_image(&elf).expect("one loaded segment");
+            let inside = loaded.base..loaded.base + loaded.bytes.len() as u32;
+            assert!(inside.contains(&(e_entry & !1)), "{target}: {e_entry:#010x} outside {inside:#x?}");
+        }
+    }
+
+    /// **THE CONSOLE RING IS NAMED WHERE THE LINK PUT IT, WITH THE SIZE ITS ARCHIVE GIVES IT.** The
+    /// link records a global outside the text as its address less the text base and keeps no size, so
+    /// the address comes back whole and the size is the defining member's `st_size`; a link that
+    /// defined no ring names none.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn the_console_ring_is_named_where_the_link_put_it_with_its_archives_size() {
+        let text_base = 0x1000_0100;
+        let symbols = vec![
+            (String::from("Main"), 0x40),
+            (String::from(CONSOLE_RING_SYMBOL), 0x2000_8000u32.wrapping_sub(text_base)),
+        ];
+        let ring = lamella_elf::Symbol {
+            name: CONSOLE_RING_SYMBOL,
+            value: 0,
+            size: 16 + 16384,
+            binding: lamella_elf::Binding::Global,
+            kind: lamella_elf::SymbolType::NoType,
+            section: lamella_elf::SymbolSection::Text,
+        };
+        let member = lamella_elf::write_relocatable_object(lamella_elf::Machine::Arm, &[0u8; 4], &[ring], &[]);
+        let archive = test_archive(&[("ring.o", &member)]);
+        let named = console_ring(&symbols, &archive, text_base).expect("the archive reads");
+        let expected = lamella_elf::NamedObject {
+            name: CONSOLE_RING_SYMBOL,
+            section: CONSOLE_RING_SECTION,
+            address: 0x2000_8000,
+            size: 16 + 16384,
+        };
+        assert_eq!(named, vec![expected]);
+        assert_eq!(console_ring(&symbols[..1], &archive, text_base).expect("reads"), Vec::new(), "no ring, none named");
+    }
+
     /// THE POISONING SHAPE, PINNED WHERE THE QEMU ROW CANNOT REACH. `static-init-throws` scores this
     /// on emulated ARM silicon and is the better evidence, but it scores ONE code model: the same
     /// `type_init_thunk_body` feeds the RISC-V object path and the flat/wasm path, and neither has a
@@ -12839,7 +13681,7 @@ mod tests {
         let word = |image: &[u8], at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
         let literals = |image: &[u8]| -> Vec<u32> { (0x54..0x100).step_by(4).map(|at| word(image, at)).collect() };
 
-        let image = rp2350_linked_image(4, &text, RP2350_STATICS_BASE, None, None);
+        let image = rp2350_linked_image(4, &text, RP2350_STATICS_BASE, None, None, None);
         assert_eq!(
             word(&image, 0),
             0x2007_F000,
@@ -12869,7 +13711,7 @@ mod tests {
         assert!(pool.contains(&0x1000_0105), "the entry is the text base plus its offset, in Thumb");
         assert!(pool.contains(&0x2000_0000), "a fault is recorded where a Nordic image records one");
 
-        let raised = literals(&rp2350_linked_image(4, &text, 0x2001_2345, None, None));
+        let raised = literals(&rp2350_linked_image(4, &text, 0x2001_2345, None, None, None));
         assert!(raised.contains(&0x2001_2348), "the heap starts above the statics' end");
         assert!(raised.contains(&0x2006_F000), "and still ends at the stack's floor");
     }
@@ -12895,14 +13737,66 @@ mod tests {
             capacity > 58_869,
             "a TLS build's 58,869 B of archive state fits, with room left"
         );
-        assert_eq!(
-            LinkedPart::Nordic {
-                initial_sp: 0x2000_4000
+    }
+
+    /// EACH NORDIC PART's RAM PLAN, PINNED AS NUMBERS. Spelled out rather than imported, so this is
+    /// an answer key: where each part's main stack starts and how far down it may grow, where the
+    /// link lays the statics and how far the window reaches, and the heap an image with
+    /// a kilobyte of statics gets. Every band keeps clear of the fault record, the allocator's seed
+    /// words and the archive's worker stacks at `0x2000_2000..0x2000_2C00`, and stays in the part's
+    /// RAM: 128 KiB on the nRF52833, 16 KiB on the nRF51822.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn each_nordic_part_lays_its_stack_statics_and_heap_in_its_own_ram() {
+        let rows = [
+            ("nrf52833", 0x2002_0000u32, 0x2000_4C00u32, 0x2000_2C00u32, (0x2000_4C00u32, 0x1_B400u32), (0x2000_50A0u32, 0x2002_0000u32)),
+            ("microbit", 0x2000_4000, 0x2000_4000, 0x2000_2C00, (0x2000_0200, 0x1E00), (0x2000_06A0, 0x2000_2000)),
+        ];
+        for (target, ram_end, sp, floor, window, heap) in rows {
+            let Ok(LinkedPart::Nordic(ram)) = linked_part(target) else {
+                panic!("{target} has a Nordic row")
+            };
+            assert_eq!((ram.initial_sp, ram.stack_floor), (sp, floor), "{target}: the main stack");
+            assert_eq!(LinkedPart::Nordic(ram).statics_window(), window, "{target}: the statics window");
+            let got = nordic_heap(ram, window.0 + 1_180);
+            assert_eq!((got.base, got.end), heap, "{target}: the heap above a kilobyte of statics");
+            assert!(sp <= ram_end && ram.heap_end <= ram_end, "{target}: inside its RAM");
+            let (workers_base, workers_top) = (0x2000_2000, 0x2000_2C00);
+            assert_eq!(floor, workers_top, "{target}: the main stack sits on the worker stacks");
+            let statics = window.0..window.0 + window.1;
+            for (name, band) in [("the stack", floor..sp), ("the worker stacks", workers_base..workers_top), ("the seed words", 0x2000_0000..0x2000_0200)] {
+                assert!(band.end <= statics.start || statics.end <= band.start, "{target}: the statics and the heap clear {name}");
             }
-            .statics_window(),
-            (NORDIC_STATICS_BASE, NORDIC_STATICS_BYTES),
-            "a Nordic part keeps its window"
-        );
+        }
+        assert!(nordic_heap(NRF52833_RAM, 0x2000_4C00 + 4_096).bytes() > 106_000);
+        assert!(nordic_heap(NRF51822_RAM, 0x2000_0200 + 1_180).bytes() > 6_400);
+    }
+
+    /// THE HEAP A LINKED NORDIC IMAGE CHOSE READS BACK FROM THE IMAGE, from the two words the startup
+    /// keeps before the text, and the startup seeds the collector's cursor words from exactly those
+    /// two -- so a host that prints the heap prints what the board will use. The longest startup, with
+    /// a board's hook and the console ring's calls, keeps them in the same place. A flat image seeds
+    /// no heap and reads back none, and so does an image read for the wrong part.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn a_linked_nordic_image_says_which_heap_its_startup_seeds() {
+        let text = [0xAAu8; 8];
+        for (target, ram) in [("nrf52833", NRF52833_RAM), ("microbit", NRF51822_RAM)] {
+            let statics_end = ram.statics_base + 1_180;
+            let ring = console_hooks(0x0000_1000, ram.statics_base, false);
+            for (case, board_init, console) in [("", None, None), (" with a hook and a ring", Some(0x0000_0201), Some(ring))] {
+                let image = nordic_linked_image(ram, 4, &text, Some(statics_end), board_init, console);
+                let heap = linked_heap(&image, target).expect("a linked image names its heap");
+                assert_eq!(heap, nordic_heap(ram, statics_end), "{target}{case}: the heap the plan gives");
+                let word = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+                assert_eq!((word(0xF8), word(0xFC)), (heap.base, heap.end), "{target}{case}: the two words before the text");
+                assert_eq!(&image[0x100..0x108], &text, "{target}{case}: and the text follows them");
+                let other = if target == "microbit" { "nrf52833" } else { "microbit" };
+                assert_eq!(linked_heap(&image, other), None, "{target}{case}: read as the other part, it names none");
+            }
+            let flat = cortex_m_boot_image(target, &text, 1).expect("the flat image builds");
+            assert_eq!(linked_heap(&flat, target), None, "{target}: a flat image seeds no heap");
+        }
     }
 
     /// A LINKED STARTUP CALLS THE BOARD'S STARTUP HOOK ONLY WHEN THE LINK KEPT ONE, AFTER THE CLEAR
@@ -12938,8 +13832,8 @@ mod tests {
         let targets = |calls: &[(usize, u32)]| calls.iter().map(|&(_, target)| target).collect::<Vec<_>>();
         let text = [0xAAu8; 8];
         const RP2350_STUB: usize = 16 * 4 + 5 * 4;
-        let rp2350 = |hook| rp2350_linked_image(4, &text, 0x2000_2468, hook, None);
-        let nordic = |hook| nordic_linked_image(0x2000_4000, 4, &text, 0x2000_1000, hook);
+        let rp2350 = |hook| rp2350_linked_image(4, &text, 0x2000_2468, hook, None, None);
+        let nordic = |hook| nordic_linked_image(NRF51822_RAM, 4, &text, Some(0x2000_1000), hook, None);
         for (part, plain, hooked, start, entry, hook) in [
             ("rp2350", rp2350(None), rp2350(Some(0x1000_0201)), RP2350_STUB, 0x1000_0105, 0x1000_0201),
             (
@@ -12965,6 +13859,316 @@ mod tests {
         assert!(stamp < calls[0].0, "the boot magic is stamped before the hook runs");
     }
 
+    /// One instruction of a startup, decoded for the console-ring tests: the forms those startups use.
+    #[cfg(feature = "linked")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum StartupOp {
+        /// `ldr rt, [pc, #imm]`, with the literal it loads.
+        Load { rt: u8, value: u32 },
+        /// `blx rm`, with the address the last literal load into `rm` gave it.
+        Call { target: u32 },
+        /// `bx rm`, with the address the last literal load into `rm` gave it; it ends the walk.
+        Jump { target: u32 },
+        /// `movs rd, #imm`.
+        MovImm { rd: u8, imm: u8 },
+        /// `ldr rt, [rn, #offset]`.
+        LoadWord { rt: u8, rn: u8, offset: u16 },
+        /// `str rt, [rn, #offset]`.
+        Store { rt: u8, rn: u8, offset: u16 },
+        /// `dmb sy`.
+        Barrier,
+        /// `b .`, which ends the walk.
+        Park,
+        /// Anything else.
+        Other(u16),
+    }
+
+    /// Decodes `image` from `at` to the first `b .` or `bx`, inclusive.
+    #[cfg(feature = "linked")]
+    fn decode_startup(image: &[u8], at: usize) -> Vec<StartupOp> {
+        let half = |at: usize| u16::from_le_bytes([image[at], image[at + 1]]);
+        let word = |at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+        let (mut ops, mut loaded, mut at) = (Vec::new(), [0u32; 16], at);
+        loop {
+            let op = half(at);
+            let decoded = if op & 0xF800 == 0x4800 {
+                let value = word(((at + 4) & !3) + usize::from(op & 0xFF) * 4);
+                let rt = ((op >> 8) & 7) as u8;
+                loaded[usize::from(rt)] = value;
+                StartupOp::Load { rt, value }
+            } else if op & 0xFF87 == 0x4780 {
+                StartupOp::Call { target: loaded[usize::from((op >> 3) & 0xF)] }
+            } else if op & 0xFF87 == 0x4700 {
+                StartupOp::Jump { target: loaded[usize::from((op >> 3) & 0xF)] }
+            } else if op & 0xF800 == 0x2000 {
+                StartupOp::MovImm { rd: ((op >> 8) & 7) as u8, imm: (op & 0xFF) as u8 }
+            } else if op & 0xF000 == 0x6000 {
+                let (rt, rn, offset) = ((op & 7) as u8, ((op >> 3) & 7) as u8, ((op >> 6) & 0x1F) * 4);
+                if op & 0x0800 == 0 {
+                    StartupOp::Store { rt, rn, offset }
+                } else {
+                    StartupOp::LoadWord { rt, rn, offset }
+                }
+            } else if op == 0xF3BF && half(at + 2) == 0x8F5F {
+                at += 2;
+                StartupOp::Barrier
+            } else if op == 0xE7FE {
+                StartupOp::Park
+            } else {
+                StartupOp::Other(op)
+            };
+            ops.push(decoded);
+            at += 2;
+            if matches!(decoded, StartupOp::Park | StartupOp::Jump { .. }) {
+                return ops;
+            }
+        }
+    }
+
+    /// The calls of a decoded startup, in order.
+    #[cfg(feature = "linked")]
+    fn startup_calls(ops: &[StartupOp]) -> Vec<u32> {
+        ops.iter()
+            .filter_map(|op| match op {
+                StartupOp::Call { target } => Some(*target),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The console hooks the console-ring tests link against: arm, finish, the ring and the in-flight
+    /// exception word at made-up addresses on `part`.
+    #[cfg(feature = "linked")]
+    fn console_hooks(code: u32, ram: u32, entry_void: bool) -> ConsoleHooks {
+        ConsoleHooks {
+            arm: code + 0x201,
+            finish: code + 0x301,
+            ring: ram + 0x800,
+            exception_word: Some(ram),
+            entry_void,
+        }
+    }
+
+    /// What a fault handler ends with when the image keeps a console ring: the exit code 2, a barrier,
+    /// then the aborted magic, stored into the ring at `ring`, and the park.
+    #[cfg(feature = "linked")]
+    fn fault_ring_end(ring: u32) -> [StartupOp; 7] {
+        [
+            StartupOp::Load { rt: 1, value: ring },
+            StartupOp::MovImm { rd: 0, imm: 2 },
+            StartupOp::Store { rt: 0, rn: 1, offset: 12 },
+            StartupOp::Barrier,
+            StartupOp::Load { rt: 0, value: lamella_console_ring::ABORTED },
+            StartupOp::Store { rt: 0, rn: 1, offset: 0 },
+            StartupOp::Park,
+        ]
+    }
+
+    /// A NORDIC STARTUP WITH A CONSOLE RING ARMS IT AFTER THE CLEAR AND BEFORE THE BOARD's HOOK, AND
+    /// ENDS IT ONCE THE ENTRY RETURNS: the finish hook takes the entry's result in R0 and the
+    /// in-flight exception word's value in R1, so an exception nothing caught reads as aborted. A
+    /// `void` entry hands it 0. And a fault ends the ring as aborted with code 2.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn a_nordic_startup_with_a_console_ring_arms_it_first_and_ends_it_after_the_entry() {
+        let text = [0xAAu8; 8];
+        let entry = (NORDIC_TEXT_BASE + 4) | 1;
+        let console = console_hooks(0x0000_1000, 0x2000_1000, false);
+        let image = nordic_linked_image(NRF51822_RAM, 4, &text, Some(0x2000_1900), Some(0x0000_0201), Some(console));
+        let ops = decode_startup(&image, NORDIC_STUB_BASE as usize);
+        assert_eq!(
+            startup_calls(&ops),
+            [console.arm, 0x0000_0201, entry, console.finish],
+            "the arm hook, the board's hook, the entry, then the finish hook"
+        );
+        let clear = ops
+            .iter()
+            .position(|op| *op == StartupOp::Other(0x4291))
+            .expect("the startup clears RAM");
+        let arm = ops.iter().position(|op| *op == StartupOp::Call { target: console.arm }).unwrap();
+        assert!(clear < arm, "the ring is armed after the clear, which would unarm it");
+        let after_entry = ops.iter().position(|op| *op == StartupOp::Call { target: entry }).unwrap() + 1;
+        assert_eq!(
+            ops[after_entry..],
+            [
+                StartupOp::Load { rt: 1, value: 0x2000_1000 },
+                StartupOp::LoadWord { rt: 1, rn: 1, offset: 0 },
+                StartupOp::Load { rt: 2, value: console.finish },
+                StartupOp::Call { target: console.finish },
+                StartupOp::Park,
+            ],
+            "R0 is the entry's result, R1 the in-flight exception word's value, then the park"
+        );
+        let fault = (u32::from_le_bytes(image[12..16].try_into().unwrap()) & !1) as usize;
+        let handler = decode_startup(&image, fault);
+        assert_eq!(handler[handler.len() - 7..], fault_ring_end(console.ring), "a fault ends the ring");
+
+        let void = ConsoleHooks { exception_word: None, ..console_hooks(0x0000_1000, 0x2000_1000, true) };
+        let image = nordic_linked_image(NRF51822_RAM, 4, &text, Some(0x2000_1900), None, Some(void));
+        let ops = decode_startup(&image, NORDIC_STUB_BASE as usize);
+        let after_entry = ops.iter().position(|op| *op == StartupOp::Call { target: entry }).unwrap() + 1;
+        assert_eq!(
+            ops[after_entry..after_entry + 2],
+            [StartupOp::MovImm { rd: 0, imm: 0 }, StartupOp::MovImm { rd: 1, imm: 0 }],
+            "a void entry hands the hook 0, and a link with no exception word hands it no exception"
+        );
+    }
+
+    /// AN RP2350 STARTUP WITH A CONSOLE RING ARMS IT BEFORE THE BOARD's HOOK AND HANDS ITS ENDING TO A
+    /// TAIL laid on the first word after the text and the copy routine: the tail ends the ring, stamps
+    /// the mailbox with the code the ring recorded, and parks, and the fault vectors reach the tail's
+    /// fault handler, which records the fault and ends the ring as aborted. The startup fits its
+    /// fixed space with a board's hook and a data run beside the ring.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn an_rp2350_startup_with_a_console_ring_hands_its_ending_to_a_tail_after_the_text() {
+        const RP2350_STUB: usize = 16 * 4 + 5 * 4;
+        let text = [0xAAu8; 10];
+        let run = DataRun {
+            load: RP2350_CODE_BASE + 4,
+            start: 0x2001_2340,
+            end: 0x2001_2354,
+        };
+        let console = console_hooks(RP2350_CODE_BASE, 0x2001_0000, false);
+        let image = rp2350_linked_image(4, &text, 0x2001_2340, Some(0x1000_0201), Some(run), Some(console));
+        let copy = RP2350_CODE_BASE + 12;
+        let tail = (copy + rp2350_data_copy_routine(run).len() as u32).next_multiple_of(4);
+        let entry = (RP2350_CODE_BASE + 4) | 1;
+        let ops = decode_startup(&image, RP2350_STUB);
+        assert_eq!(
+            startup_calls(&ops),
+            [copy | 1, console.arm, 0x1000_0201, entry],
+            "the copy, the arm hook, the board's hook, then the entry"
+        );
+        assert_eq!(ops.last(), Some(&StartupOp::Jump { target: tail | 1 }), "then the jump to the tail");
+
+        let at = |address: u32| (address - RP2350_CODE_REGION) as usize;
+        let ending = decode_startup(&image, at(tail));
+        assert_eq!(
+            ending,
+            [
+                StartupOp::Load { rt: 1, value: 0x2001_0000 },
+                StartupOp::LoadWord { rt: 1, rn: 1, offset: 0 },
+                StartupOp::Load { rt: 2, value: console.finish },
+                StartupOp::Call { target: console.finish },
+                StartupOp::Load { rt: 1, value: RP2350_RESULT_ADDR + 4 },
+                StartupOp::Store { rt: 0, rn: 1, offset: 0 },
+                StartupOp::Load { rt: 0, value: RP2350_DONE_MAGIC },
+                StartupOp::Load { rt: 1, value: RP2350_RESULT_ADDR },
+                StartupOp::Store { rt: 0, rn: 1, offset: 0 },
+                StartupOp::Park,
+            ],
+            "the tail ends the ring, then stamps the code it recorded and the done magic, then parks"
+        );
+
+        let fault_vector = u32::from_le_bytes(image[12..16].try_into().unwrap()) & !1;
+        let jump = decode_startup(&image, at(fault_vector));
+        let StartupOp::Jump { target: fault_tail } = jump[jump.len() - 1] else {
+            panic!("the startup's fault entry jumps to the tail's handler: {jump:?}")
+        };
+        assert_eq!(jump.len(), 2, "with nothing between the vector and the jump: {jump:?}");
+        assert!(fault_tail > tail, "the fault handler is in the tail");
+        let handler = decode_startup(&image, at(fault_tail & !1));
+        assert_eq!(
+            handler[..7],
+            [
+                StartupOp::Other(0x9806),
+                StartupOp::Load { rt: 1, value: NORDIC_FAULT_RECORD },
+                StartupOp::Store { rt: 0, rn: 1, offset: 0 },
+                StartupOp::Other(0x9805),
+                StartupOp::Store { rt: 0, rn: 1, offset: 4 },
+                StartupOp::Load { rt: 0, value: NORDIC_FAULT_MAGIC },
+                StartupOp::Store { rt: 0, rn: 1, offset: 8 },
+            ],
+            "the handler records the stacked PC and LR, then the magic, as every linked image's does"
+        );
+        assert_eq!(handler[7..], fault_ring_end(console.ring), "and then ends the ring");
+    }
+
+    /// A LINK THAT KEPT NO CONSOLE RING GETS THE STARTUP IT ALWAYS GOT, BYTE FOR BYTE, on every linked
+    /// part and on the flat Nordic path that shares the fault handler.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn without_a_console_ring_every_startup_is_the_bytes_it_always_was() {
+        let fnv1a64 = |bytes: &[u8]| {
+            bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, &byte| {
+                (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+            })
+        };
+        let text8 = [0xAAu8; 8];
+        let text10 = [0xAAu8; 10];
+        let run = DataRun {
+            load: RP2350_CODE_BASE + 4,
+            start: 0x2001_2340,
+            end: 0x2001_2354,
+        };
+        for (name, image, expected) in [
+            (
+                "rp2350, no board",
+                rp2350_linked_image(4, &text8, 0x2000_2468, None, None, None),
+                (264, 0xbe8b_e43e_2a56_6d8f),
+            ),
+            (
+                "rp2350, a board's hook and a data run",
+                rp2350_linked_image(4, &text10, 0x2001_2340, Some(0x1000_0201), Some(run), None),
+                (308, 0x0610_5b97_c3b9_763a),
+            ),
+            (
+                "nordic, no board",
+                nordic_linked_image(NRF51822_RAM, 4, &text8, Some(0x2000_1000), None, None),
+                (264, 0xfeb9_0918_a9ee_2b87),
+            ),
+            (
+                "nordic, a board's hook",
+                nordic_linked_image(NRF51822_RAM, 4, &text8, Some(0x2000_1000), Some(0x0000_0201), None),
+                (264, 0x69bc_dcc9_3b29_fe0d),
+            ),
+            ("nordic, flat", nordic_flat_image(0x2000_4000, &text8, 16), (264, 0x0e66_396f_920b_bf4c)),
+        ] {
+            assert_eq!((image.len(), fnv1a64(&image)), expected, "{name}");
+        }
+    }
+
+    /// The console ring's hooks are found in the link only when it kept all three, the ring at the
+    /// address the link laid it in RAM, and the in-flight exception word beside them when the link
+    /// laid one.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn a_links_console_hooks_are_found_only_when_it_kept_the_ring_and_both_hooks() {
+        let text_base = RP2350_CODE_BASE;
+        let ram = |address: u32| address.wrapping_sub(text_base);
+        let link = |symbols: &[(&str, u32)]| lamella_linker::LinkedImage {
+            text: Vec::new(),
+            entry_offset: 0,
+            symbols: symbols.iter().map(|&(name, offset)| (String::from(name), offset)).collect(),
+            debug_sections: Vec::new(),
+        };
+        let full = link(&[
+            (CONSOLE_ARM_SYMBOL, 0x40),
+            (CONSOLE_FINISH_SYMBOL, 0x80),
+            (lamella_console_ring::SYMBOL, ram(0x2001_5000)),
+            (lamella_elf::EH_TAG_SYMBOL, ram(0x2001_0000)),
+        ]);
+        assert_eq!(
+            linked_console(&full, text_base, true),
+            Some(ConsoleHooks {
+                arm: (text_base + 0x40) | 1,
+                finish: (text_base + 0x80) | 1,
+                ring: 0x2001_5000,
+                exception_word: Some(0x2001_0000),
+                entry_void: true,
+            })
+        );
+        let no_word = link(&[
+            (CONSOLE_ARM_SYMBOL, 0x40),
+            (CONSOLE_FINISH_SYMBOL, 0x80),
+            (lamella_console_ring::SYMBOL, ram(0x2001_5000)),
+        ]);
+        assert_eq!(linked_console(&no_word, text_base, false).map(|hooks| hooks.exception_word), Some(None));
+        let no_ring = link(&[(CONSOLE_ARM_SYMBOL, 0x40), (CONSOLE_FINISH_SYMBOL, 0x80)]);
+        assert_eq!(linked_console(&no_ring, text_base, false), None, "no ring, no console");
+    }
+
     /// The linked tier names its parts once: `rp2350` builds wide Thumb-2 at `0x1000_0100`, a Nordic
     /// part narrow at its own base, and a target with no row is refused before anything is built.
     #[cfg(feature = "linked")]
@@ -12975,8 +14179,112 @@ mod tests {
         assert_eq!((rp2350.text_base(), rp2350.image_base()), (0x1000_0100, 0x1000_0000));
         let microbit = linked_part("microbit").expect("the micro:bit has a row");
         assert!(!microbit.wide());
-        assert_eq!(microbit, LinkedPart::Nordic { initial_sp: 0x2000_4000 });
+        assert_eq!(microbit, LinkedPart::Nordic(NRF51822_RAM));
         assert!(matches!(linked_part("rp2040"), Err(BuildError::UnsupportedTarget)));
+    }
+
+    /// EACH STM32 ROW LAYS ITS STATICS, ITS HEAP AND ITS STACK IN ITS OWN BAND: the statics from above
+    /// the archive's fixed bands, the heap from their end to 16 KiB below the band's top, and the stack
+    /// from the top. Each row is narrow, and boots from its flash at `0x0800_0000`.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn each_stm32_row_lays_its_statics_heap_and_stack_in_its_own_band() {
+        let rows = [
+            ("stm32f769", 0x2008_0000u32),
+            ("stm32u5a5", 0x2027_0000),
+            ("stm32u585", 0x200C_0000),
+            ("stm32h747-cm7", 0x2002_0000),
+        ];
+        for (target, top) in rows {
+            let part = linked_part(target).expect("an STM32 row");
+            let LinkedPart::Stm32(row) = part else { panic!("{target} is an STM32 row") };
+            assert!(!part.wide(), "{target}: narrow");
+            assert_eq!((part.image_base(), part.text_base()), (0x0800_0000, 0x0800_0100), "{target}: the flash");
+            assert_eq!(row.ram_top, top, "{target}: the band's top");
+            let (base, capacity) = part.statics_window();
+            assert_eq!(base, 0x2000_2C00, "{target}: the statics start above the worker stacks");
+            assert_eq!(base + capacity, top - 0x4000, "{target}: and may reach the stack's floor");
+            let (heap_base, heap_end) = row.heap(base + 1_180);
+            assert_eq!(heap_base, (base + 1_180).next_multiple_of(8), "{target}: the heap starts where the statics end");
+            assert_eq!(heap_end, top - 0x4000, "{target}: and ends at the stack's floor");
+            assert!(heap_end - heap_base > 90_000, "{target}: the heap is the band's, not a fixed slice of it");
+        }
+    }
+
+    /// AN STM32 IMAGE BOOTS FROM ITS FLASH: the stack's top and the reset vector into the startup at
+    /// `0x0800_0040`, every fault vector into the handler, and the text at `0x0800_0100`. The startup
+    /// clears to the statics' end, seeds the heap from there to the stack's floor and calls the entry;
+    /// with a board's hook and a console ring it arms the ring, calls the hook, enters, and ends the
+    /// ring, and a fault ends the ring too.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn an_stm32_image_boots_from_its_flash_and_seeds_a_heap_to_the_stack_floor() {
+        let text = [0xAAu8; 8];
+        let word = |image: &[u8], at: usize| u32::from_le_bytes(image[at..at + 4].try_into().unwrap());
+        let entry = (0x0800_0100 + 4) | 1;
+        let image = stm32_linked_image(STM32F769, 4, &text, 0x2000_3000, None, None);
+        assert_eq!(word(&image, 0), 0x2008_0000, "the stack starts at the band's top");
+        assert_eq!(word(&image, 4), 0x0800_0041, "reset enters the startup, in Thumb");
+        let handler = word(&image, 8);
+        assert!((0x0800_0041..0x0800_0100).contains(&handler) && handler & 1 == 1, "a fault vector {handler:#x}");
+        for at in (8..0x40).step_by(4) {
+            assert_eq!(word(&image, at), handler, "every fault vector reaches the handler (word {})", at / 4);
+        }
+        assert_eq!(&image[0x100..0x108], &text, "the text follows at 0x100");
+        let ops = decode_startup(&image, 0x40);
+        assert_eq!(startup_calls(&ops), [entry], "with no hook and no ring the startup calls the entry alone");
+        let loads: Vec<u32> = ops
+            .iter()
+            .filter_map(|op| match op {
+                StartupOp::Load { value, .. } => Some(*value),
+                _ => None,
+            })
+            .collect();
+        for (value, what) in [
+            (NORDIC_FAULT_RECORD, "the fault record it clears"),
+            (NORDIC_HEAP_PTR, "the band it clears from, and the cursor"),
+            (0x2000_3000, "the statics' end it clears to, and the heap's base"),
+            (0x2007_C000, "the heap's end, the stack's floor"),
+        ] {
+            assert!(loads.contains(&value), "the startup loads {what}, {value:#x}: {loads:x?}");
+        }
+
+        let console = console_hooks(0x0800_1000, 0x2000_2C00, false);
+        let image = stm32_linked_image(STM32F769, 4, &text, 0x2000_3000, Some(0x0800_0201), Some(console));
+        let ops = decode_startup(&image, 0x40);
+        assert_eq!(
+            startup_calls(&ops),
+            [console.arm, 0x0800_0201, entry, console.finish],
+            "the arm hook, the board's hook, the entry, then the finish hook"
+        );
+        let fault = (word(&image, 12) & !1) as usize - 0x0800_0000;
+        let handler = decode_startup(&image, fault);
+        assert_eq!(handler[handler.len() - 7..], fault_ring_end(console.ring), "a fault ends the ring");
+    }
+
+    /// AN STM32 IMAGE MOVED FOR QEMU IS THE ROW's IMAGE BUT FOR WHAT THE MOVE NAMES: with only the
+    /// stack's top moved, it differs from the row's in the vector table's first word and the heap's
+    /// end, and in nothing else. A move the plan has no room for, and a target with no STM32 row, are
+    /// refused before anything is built.
+    #[cfg(feature = "linked")]
+    #[test]
+    fn an_stm32_image_moved_for_qemu_differs_only_in_what_the_move_names() {
+        let text = [0xAAu8; 8];
+        let row = stm32_linked_image(STM32F769, 4, &text, 0x2000_3000, None, None);
+        let moved_part = Stm32Part { flash_base: STM32_FLASH_BASE, ram_top: 0x2002_0000 };
+        let moved = stm32_linked_image(moved_part, 4, &text, 0x2000_3000, None, None);
+        assert_eq!(row.len(), moved.len());
+        let differing: Vec<usize> = (0..row.len()).step_by(4).filter(|&at| row[at..at + 4] != moved[at..at + 4]).collect();
+        assert_eq!(differing.len(), 2, "two words differ: {differing:x?}");
+        assert_eq!(differing[0], 0, "the stack's top");
+        assert_eq!(
+            u32::from_le_bytes(moved[differing[1]..differing[1] + 4].try_into().unwrap()),
+            0x2002_0000 - 0x4000,
+            "and the heap's end, at the moved stack's floor"
+        );
+        let refused = |target, top| build_linked_cortex_m_moved(&[], &[], &[], &[], target, 0, top);
+        assert!(matches!(refused("stm32f769", 0x2000_4000), Err(BuildError::UnsupportedTarget)), "no room above the bands");
+        assert!(matches!(refused("microbit", 0x2002_0000), Err(BuildError::UnsupportedTarget)), "not an STM32 row");
     }
 
     /// The Python front end and the CIL front end get the SAME boot image, because there is only one
@@ -13788,9 +15096,9 @@ mod tests {
 
     /// A LIBRARY LOWERS AGAINST THE LIBRARIES IT REFERENCES, WHATEVER ORDER THEY ARE GIVEN IN.
     ///
-    /// `libchainboard`'s type initializer binds a `libchainbase` delegate, and `chainprog` names only
-    /// the board half: a dotnet/iot program's shape, with its board's assembly and
-    /// `Lamella.Hardware`. Both orders link.
+    /// `libchainboard`'s type initializer binds a `libchainbase` delegate, as a board's class binds
+    /// `System.Device.Analog`'s converter factory, and `chainprog` names only the board half. Both
+    /// orders link.
     #[cfg(feature = "linked")]
     #[test]
     fn a_library_lowers_against_the_libraries_it_references_whatever_order_they_are_given_in() {
@@ -14201,7 +15509,7 @@ mod tests {
             start: 0x2001_2340,
             end: 0x2001_2354,
         };
-        let image = rp2350_linked_image(4, &text, 0x2001_2340, Some(0x1000_0201), Some(run));
+        let image = rp2350_linked_image(4, &text, 0x2001_2340, Some(0x1000_0201), Some(run), None);
         let routine = RP2350_CODE_BASE + 12;
         let (calls, clear) = calls_and_clear(&image);
         let targets: Vec<u32> = calls.iter().map(|&(_, target)| target).collect();
@@ -14225,7 +15533,7 @@ mod tests {
             pool.contains(&0x2001_2358),
             "the heap starts above the run, on 8 bytes"
         );
-        let plain = rp2350_linked_image(4, &text, 0x2001_2340, Some(0x1000_0201), None);
+        let plain = rp2350_linked_image(4, &text, 0x2001_2340, Some(0x1000_0201), None, None);
         let (calls, _) = calls_and_clear(&plain);
         assert_eq!(calls.len(), 2);
         assert_eq!(plain.len(), 0x100 + text.len());
@@ -14356,14 +15664,7 @@ mod tests {
         let run = linked_data_run(&rp2350, LinkedPart::Rp2350.text_base()).expect("and names it");
         assert_eq!(run.end - run.start, 4);
         assert_eq!(
-            link_part_image(
-                LinkedPart::Nordic {
-                    initial_sp: 0x2000_4000
-                },
-                &[object],
-                &[],
-                "f0"
-            )
+            link_part_image(LinkedPart::Nordic(NRF51822_RAM), &[object], &[], "f0")
             .unwrap_err(),
             lamella_linker::LinkError::InitializedDataNotCopied(String::from(".data.setting"))
         );

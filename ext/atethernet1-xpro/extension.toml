@@ -2,14 +2,14 @@
 # Xplained Pro extension board. Every line names a SIGNAL of the ../standards/xplained-pro.toml
 # standard and never a host pad; which pad a signal reaches is the HOST's fact.
 #
-# THE WHOLE MAC AND PHY ARE ON THIS BOARD, WHICH IS THE POINT OF IT. The KSZ8851SNL is a single
+# The whole MAC and PHY are on this board, which is the point of it. The KSZ8851SNL is a single
 # part carrying a 10/100 physical-layer transceiver, a MAC and an SPI slave, so a host reaches a
 # complete Ethernet interface over four SPI wires and needs no RMII pins, no PHY management and no
 # MAC of its own. That is what makes it usable beside a host that already has an Ethernet MAC:
 # the two interfaces share nothing but the CPU.
 #
 #
-# SEVEN SIGNALS, AND EVERY ONE OF THEM CARRIES A DOCUMENTED ACTIVE LEVEL. The guide states the
+# Seven signals, and every one of them carries a documented active level. The guide states the
 # polarity of the reset, the interrupt, the chip select and the power-management event in words, so
 # no level here is inferred from a name -- which matters most for PME and INTRN, two active-low
 # INPUTS whose names suggest nothing about which way a host should read them. The other eleven

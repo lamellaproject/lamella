@@ -3,7 +3,7 @@ using System.Device.Gpio;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Samc21GpioDriver : GpioDriver
+internal sealed class Samc21GpioDriver : GpioDriver
 {
     protected override int PinCount { get { return 96; } }
 
@@ -79,7 +79,7 @@ public sealed class Samc21GpioDriver : GpioDriver
 
     /// <summary>The logical pin number for a generated group base and pin index -- the form every
     /// board binding emits.</summary>
-    /// <remarks>ON THE DRIVER RATHER THAN ON EACH BOARD, because which group a BASE is happens to be
+    /// <remarks>On the driver rather than on each board, because which group a BASE is happens to be
     /// family truth: the bases come from this family's instance map and the pins-per-group is this
     /// family's, so each board class carrying its own switch would be one copy per board of one
     /// fact. What stays a BOARD fact is which base a device sits on, and that is what a board passes

@@ -3,8 +3,8 @@
 # Shares the whole L3G register address map with its sibling and differs from it in five places,
 # every one of which is stated below: the identity byte, the I2C slave address, the range each
 # full-scale code names, the rate each output-data-rate code selects, and the field layout of
-# CTRL_REG4. Everything else is inherited from the family base and FLATTENED INTO THE EMITTED
-# TABLE, so a reader of the emitted artifact never has to chase a base to see the whole truth.
+# CTRL_REG4. Everything else is inherited from the family base and flattened into the emitted
+# table, so a reader of the emitted artifact never has to chase a base to see the whole truth.
 
 [table]
 kind = "device"
@@ -26,7 +26,7 @@ notes = [
 # sibling has, which raises no rank here -- the two are different silicon, and the one fact a part
 # of this type would answer with is precisely the one byte that differs between them.
 #
-# THE PAIR IS WHY THE TWO AXES ARE TWO. Both members of this family are primary and only one is
+# The pair is why the two axes are two. Both members of this family are primary and only one is
 # validated, where the other family in this catalog has both members unvalidated and one of them
 # secondary. Each family varies on one axis and holds the other fixed, so neither could be ordered
 # on a single rank without calling one kind of shortfall the smaller.
@@ -37,7 +37,7 @@ validation = "none"
 
 # --- identity ------------------------------------------------------------------------------------
 #
-# ONE BIT APART FROM THE SIBLING'S, which is the whole reason an identity is checked as a SET rather
+# One bit apart from the sibling's, which is the whole reason an identity is checked as a SET rather
 # than compared to a constant a driver was written around: 0xD4 and 0xD3 differ in two bit
 # positions and neither is far from the other, so a driver that accepted "close enough" would accept
 # the wrong part.
@@ -75,7 +75,7 @@ high = 0x6B
 # bits one part has is a bit the other part reserves, and a driver that carried either across would
 # be writing a reserved bit rather than getting a no-op.
 #
-# BDU IS THE ONE OF THE TWO WITH REAL CONSEQUENCES FOR A READING, because it is what stops the
+# BDU is the one of the two with real consequences for a reading, because it is what stops the
 # output registers being updated between the high and low byte of one sample. A driver that reads
 # the three axes as one burst does not need it; a driver that reads bytes one at a time on this part
 # can set it, and on the sibling has nothing to set.
@@ -96,9 +96,9 @@ notes = "Bits 2:1 are reserved zeros that must not be changed, and bit 3 is unus
 "3" = 2000
 notes = "Degrees per second, as the magnitude of a symmetric range: code 0 is plus or minus 250. The sibling's code 0 is plus or minus 245 for the same 8.75 millidegrees per digit, so the two parts name different ranges over an identical LSB. Codes 2 and 3 both select 2000."
 
-# --- output data rate: DIFFERENT FROM THE SIBLING'S, and stated three times here --------------------
+# --- output data rate: different from the sibling's, and stated three times here --------------------
 #
-# WHERE THE SIBLING'S DOCUMENT CONTRADICTS ITSELF ABOUT THESE FOUR NUMBERS, THIS ONE DOES NOT. The
+# Where the sibling's document contradicts itself about these four numbers, this one does not. The
 # mechanical characteristics table 4, the DR/BW configuration table 21, and the four column headings
 # of the high-pass cutoff table 26 all give 95/190/380/760 Hz. That is the same three-place check
 # the sibling fails in one place, which is why its rates are recorded with a caveat and these are

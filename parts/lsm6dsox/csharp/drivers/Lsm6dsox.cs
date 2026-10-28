@@ -17,7 +17,7 @@ namespace Lamella.Devices
 
         /// <summary>The magnitude of the vector, in milli-g.</summary>
         /// <remarks>
-        /// THE ONE FIGURE THAT CHECKS ITSELF. A body at rest reads about 1000 here whatever its
+        /// The one figure that checks itself. A body at rest reads about 1000 here whatever its
         /// orientation, so a caller can tell a working sensor from a plausible-looking wrong one
         /// without a reference instrument and without knowing which way up the part is mounted --
         /// which matters, because a module on a cable has no defined orientation.
@@ -58,7 +58,7 @@ namespace Lamella.Devices
         /// <summary>Binds to the part at the address <paramref name="i2cDevice"/>'s connection
         /// settings name.</summary>
         /// <remarks>
-        /// THE ADDRESS IS THE CALLER's TO NAME, with <see cref="AddressSa0Low"/> or
+        /// The address is the caller's to name, with <see cref="AddressSa0Low"/> or
         /// <see cref="AddressSa0High"/>, RATHER THAN DEFAULTED. The part states two and a carrier
         /// picks one by where it tied a pin, so a default here would be this driver guessing at a
         /// fact only the board knows.
@@ -72,7 +72,7 @@ namespace Lamella.Devices
 
         /// <summary>Reads the identity register and reports whether it is one this part accepts.</summary>
         /// <remarks>
-        /// ON A MISMATCH THE VALUE READ IS RETURNED, not merely a false. A rejected part reads as
+        /// On a mismatch the value read is returned, not merely a false. A rejected part reads as
         /// no part at all, and the number is what tells a wrong part from an empty address.
         /// </remarks>
         public bool TryIdentify(out byte id)
@@ -86,7 +86,7 @@ namespace Lamella.Devices
 
         /// <summary>Brings the accelerometer out of power-down at 12.5 Hz, plus or minus 2 g.</summary>
         /// <remarks>
-        /// REQUIRED BEFORE ANY READING. The part powers up with its rate field zero, which is
+        /// Required before any reading. The part powers up with its rate field zero, which is
         /// power-down: without this the output registers hold zero and the part reports no error,
         /// so an unconfigured device looks like a stationary one in free fall.
         /// </remarks>
@@ -105,7 +105,7 @@ namespace Lamella.Devices
 
         /// <summary>Reads one acceleration sample.</summary>
         /// <remarks>
-        /// ONE BURST FROM THE ACCELERATION BLOCK, never six single reads: the axes must come from
+        /// One burst from the acceleration block, never six single reads: the axes must come from
         /// one conversion, and byte-at-a-time reads can straddle two. The burst also depends on the
         /// interface auto-increment bit, which this part sets at reset -- without it every axis
         /// comes back equal to X, which is a plausible frame rather than a failure.

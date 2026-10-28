@@ -4,18 +4,18 @@
 #
 # Two facts, and each `sources` entry names the one it backs.
 #
-# THE WRITE UNIT IS A SOFTWARE CHOICE ON THIS PART, AND THE VALUE HERE IS THE ONE A BOARD AT AN
-# ORDINARY SUPPLY CAN TAKE. The controller's PSIZE field selects x8, x16, x32 or x64 -- one, two,
+# The write unit is a software choice on this part, and the value here is the one a board at an
+# ordinary supply can take. The controller's PSIZE field selects x8, x16, x32 or x64 -- one, two,
 # four or eight bytes per program operation -- and RM0090 Table 13 caps it by SUPPLY VOLTAGE. x64 is
 # available only with an external VPP of 8 to 9 V applied to the VPP pad, which the manual itself
 # advises limiting to factory programming. At 2.7-3.6 V without it the cap is x32, so four bytes is
 # the largest unit this part can be programmed in on a board that does not supply VPP.
 #
-# WARNING: RM0090 TABLE 13 HAS FIVE VOLTAGE COLUMNS AND FOUR PARALLELISM VALUES, because the x16
+# Warning: RM0090 table 13 has five voltage columns and four parallelism values, because the x16
 # cell SPANS the 2.4-2.7 V and 2.1-2.4 V columns. A reader who pairs the columns off one by one
 # puts x8 against 2.1-2.4 V and leaves 1.8-2.1 V unanswered, which is wrong for two of the five.
 #
-# THE UNIT MAY BE PROGRAMMED AGAIN WITHOUT AN ERASE, WHICH IS NOT TRUE OF EVERY ST CONTROLLER.
+# The unit may be programmed again without an erase, which is not true of every ST controller.
 # RM0090 permits successive writes that only change bits from 1 to 0. That is a property of this
 # family: on an STM32H7 a second program of the same flash word produces an ECC error on every later
 # read. A consumer relying on it must take it from the family that states it.

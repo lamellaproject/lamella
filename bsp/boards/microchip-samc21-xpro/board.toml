@@ -1,8 +1,8 @@
 # The SAM C21 Xplained Pro (ATSAMC21-XPRO): board truth only -- what is wired to what. Chip truth
 # lives in csp/samc21/.
 #
-# THE VIRTUAL COM PORT'S FUNCTION COLUMN CAME FROM THE DATASHEET AND COULD NOT HAVE COME FROM THE
-# KIT. Atmel-42460 Table 4-15 names "SERCOM4 PAD[2]" on PB10 and "SERCOM4 PAD[3]" on PB11 and stops
+# The virtual COM port's function column came from the datasheet and could not have come from the
+# kit. Atmel-42460 Table 4-15 names "SERCOM4 PAD[2]" on PB10 and "SERCOM4 PAD[3]" on PB11 and stops
 # there; DS60001479M Table 6-2 places both in column D (SERCOM-ALT) and leaves column C empty on
 # each. So the instance the guide names is right and the letter it does not name is D.
 
@@ -30,7 +30,7 @@ notes = [
 
 [[carriers]]
 kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
-usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+usb_vid = 0x03EB            # Note: no usb_pid row, and its absence is a sourced position rather than
 role = "vcp"                # AN OMISSION. A product id is a property of the debugger's FIRMWARE:
 baud = 115200               # this kit's user guide never prints one, and the EDBG user guide
 plan = "osc48m-4mhz"        # Atmel-42096 describes the composite device without giving an id
@@ -47,7 +47,7 @@ gclk_gen = 0                # letter is not a choice between two instances -- bu
 tx = { pin = "PB10", pad = 2 }   # not state it, so it had to be read off Table 6-2.
 rx = { pin = "PB11", pad = 3 }
 
-# THE DEFAULT CLOCK PLAN, AND IT IS NOT THE SAM D21 LINE'S. Those boards run osc8m-8mhz; this
+# The default clock plan, and it is not the SAM D21 line's. Those boards run osc8m-8mhz; this
 # family comes out of reset on a different oscillator at a different rate, which DS60001479M states
 # in words: "After reset, OSC48M is enabled and serves as the default clock source at 4MHz." So the
 # plan is named for what this part actually does rather than copied from a sibling board, and the

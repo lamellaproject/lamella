@@ -1,27 +1,27 @@
 # BLOCK: the SAM D5x/E5x external interrupt controller.
 #
-# IT IS NOT THE SAM D21's EIC AND THE TWO MUST NOT SHARE A LAYOUT. They carry the same name, the
+# It is not the SAM D21's EIC and the two must not share a layout. They carry the same name, the
 # same sixteen EXTINT lines and the same SENSE encoding, and their register maps agree at almost no
 # offset. The dangerous one is 0x14: it is WAKEUP on the SAM D21 and INTFLAG here. INTFLAG is
 # write-one-to-clear, so a driver carried across writes wake-enable bits into a pending-flag
 # register and silently discards interrupts it believed it was arming. The base differs too --
 # 0x40001800 there against 0x42001800 here, a different APB bridge.
 #
-# ONE NVIC LINE PER EXTINT, WHICH IS THE OTHER STRUCTURAL DIFFERENCE. EXTINT n is delivered on NVIC
+# One NVIC line per EXTINT, which is the other structural difference. EXTINT n is delivered on NVIC
 # line 12 + n, so sixteen vectors serve sixteen lines and the vector alone identifies which pad
 # fired. The SAM D21 delivers all sixteen on ONE line, where a handler is entered knowing nothing
 # and must read INTFLAG to find out. A dispatch design that assumes either shape is wrong on the
 # other: one needs a scan and the other must not pay for one.
 #
-# A LINE IS NOT A PAD. EXTINT is a peripheral function selected in the pad's PMUX, several pads
+# A line is not a pad. EXTINT is a peripheral function selected in the pad's PMUX, several pads
 # share one line, and only one of them can be the live source. The pad-to-line map is per-pad data
 # and lives in pins.toml.
 #
-# SIXTEEN LINES AND THE REGISTERS ARE SIXTEEN BITS WIDE, unlike the SAM D21's, whose interrupt and
+# Sixteen lines and the registers are sixteen bits wide, unlike the SAM D21's, whose interrupt and
 # wake registers carry bits up to 17 with nothing behind them. A consumer that sized a line count
 # from register width would get the right answer here and the wrong one there.
 #
-# PINSTATE IS A FACILITY THE SAM D21 DOES NOT HAVE, and it matters to anything that reports WHICH
+# PINSTATE is a facility the SAM D21 does not have, and it matters to anything that reports WHICH
 # WAY a pin moved. It returns the state of each EXTINT pin, so a handler can read the level from
 # this block rather than from PORT -- which means it does not depend on the pad's PINCFG.INEN being
 # set, and on that other family a cleared INEN makes PORT's IN read zero for ever whatever the pad

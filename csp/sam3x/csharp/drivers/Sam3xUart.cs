@@ -3,7 +3,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Sam3xUart
+internal sealed class Sam3xUart
 {
     private readonly uint _cr;
     private readonly uint _mr;

@@ -1,21 +1,21 @@
 # PIN map for the CH32V003 family: pin x function -> (instance, signal), or -> nothing. It lists
 # only the cells a board uses, and a row naming a pin outside every part's `pins` list is refused.
 #
-# THE ROW BELOW IS THE UNROUTED SHAPE, AND THIS PART IS THE PLAIN CASE FOR IT. The only pin a
+# The row below is the unrouted shape, and this part is the plain case for it. The only pin a
 # carrier of this family places is PD6, and what it places there is a plain output -- because PD6's
 # main function after reset is already PD6. That is something Table 2-1 states, not something the
 # table is missing: the row names the cell that was read, states that no controller is behind it,
 # and cites the page. As prose the same sentence is checked against nothing, cannot be quoted by a
 # refusal, and is indistinguishable from a table nobody has filled in yet.
 #
-# WHAT THE ROW DOES NOT SAY IS THE HALF THAT MATTERS. PD6 is not an unused pin: Table 2-1 gives it
+# What the row does not say is the half that matters. PD6 is not an unused pin: Table 2-1 gives it
 # a default alternate function (URX/A6 -- USART_RX and ADC channel 6) and remapping functions
 # (T2CH3_3/UTX_2). Those are OTHER cells of the same pin, and a row states one cell. A reader who
 # took "no controller reaches PD6" from the row below would have the pin wrong; what it states is
-# that no controller is reached THROUGH THE RESET FUNCTION, which is exactly the fact a control
+# that no controller is reached through the reset function, which is exactly the fact a control
 # pin rides on.
 #
-# FUNCTION IDS HERE ARE TABLE 2-1's OWN COLUMN NAMES, because this part carries no per-pin function
+# Function ids here are table 2-1's own column names, because this part carries no per-pin function
 # NUMBER for a row to name. The table's three function columns are the main function after reset,
 # the default alternate function, and the remapping function; a pin reaches the second through
 # CFGLR's CNF field selecting an alternate push-pull or open-drain output, and the third through an

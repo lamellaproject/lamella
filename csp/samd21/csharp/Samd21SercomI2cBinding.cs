@@ -1,7 +1,7 @@
 // The descriptor a SAMD21 SERCOM-I2C-master driver consumes: one binding's resolved values,
 namespace Lamella.Boards
 {
-    public sealed class Samd21SercomI2cBinding
+    internal sealed class Samd21SercomI2cBinding
     {
         /// <summary>The bound SERCOM instance's base address.</summary>
         public readonly uint SercomBase;

@@ -193,7 +193,7 @@ fn check_inst(
                 expect(MirType::I32, r, errors);
             }
         }
-        Inst::VirtualFuncAddr { object, .. } => {
+        Inst::VirtualFuncAddr { object, .. } | Inst::InterfaceFuncAddr { object, .. } => {
             use_value(func, defined, *object, errors);
             if let Some(r) = result_ty {
                 expect(MirType::I32, r, errors);

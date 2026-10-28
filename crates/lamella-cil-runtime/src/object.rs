@@ -545,6 +545,10 @@ pub struct Heap {
     /// [`Heap::should_collect`]); adapts after each collection.
     #[cfg(feature = "gc")]
     gc_threshold: usize,
+    /// Whether what decides a collection may have changed since the interpreter last weighed it
+    /// at an instruction boundary; see [`Heap::collection_check_pending`].
+    #[cfg(feature = "gc")]
+    collection_check_pending: bool,
     /// The identity hash of each object that has been ASKED for one, as `(object index, hash)`
     /// sorted by index -- the storage behind `Object.GetHashCode`.
     ///
@@ -590,6 +594,7 @@ impl Default for Heap {
             identity_hashes: Vec::new(),
             next_identity_hash: 0,
             gc_threshold: INITIAL_GC_THRESHOLD,
+            collection_check_pending: true,
             object_budget: None,
             #[cfg(feature = "finalizers")]
             finalize_registered: Vec::new(),
@@ -638,6 +643,8 @@ impl Heap {
     /// Sets the HARD live-object budget (`None` = unbounded). See [`Heap::object_budget`].
     pub fn set_object_budget(&mut self, budget: Option<usize>) {
         self.object_budget = budget;
+        #[cfg(feature = "gc")]
+        self.note_collection_check();
     }
 
     /// Whether the live object count has reached the configured budget (always false when
@@ -658,6 +665,8 @@ impl Heap {
         self.objects.push(object);
         #[cfg(feature = "finalizers")]
         self.finalize_registered.push(false);
+        #[cfg(feature = "gc")]
+        self.note_collection_check();
         ObjectRef(index)
     }
 
@@ -1686,11 +1695,33 @@ impl Heap {
         self.objects.len()
     }
 
-    /// Whether the live arena has reached the collection threshold -- the trigger the
-    /// interpreter checks at each instruction boundary to decide whether to collect.
+    /// Whether the live arena has reached the collection threshold -- one of the triggers the
+    /// interpreter weighs at an instruction boundary to decide whether to collect.
     #[must_use]
     pub fn should_collect(&self) -> bool {
         self.objects.len() >= self.gc_threshold
+    }
+
+    /// Whether a collection may have become due since the interpreter last weighed the triggers at
+    /// an instruction boundary: the threshold ([`Heap::should_collect`]), the object budget
+    /// ([`Heap::at_budget`]) and a requested collection. Only an allocation, a collection, a budget
+    /// change, a request ([`Vm::request_collect`](crate::Vm::request_collect)) or the end of a
+    /// suspension ([`Vm::resume_collection`](crate::Vm::resume_collection)) can change them, and each
+    /// sets this; the interpreter clears it as it weighs them. So a boundary skipped while it is clear
+    /// is one at which weighing them would have found nothing to do.
+    #[must_use]
+    pub fn collection_check_pending(&self) -> bool {
+        self.collection_check_pending
+    }
+
+    /// Marks the collection triggers as changed, to be weighed at the next instruction boundary.
+    pub(crate) fn note_collection_check(&mut self) {
+        self.collection_check_pending = true;
+    }
+
+    /// Clears the mark, as the interpreter weighs the triggers.
+    pub(crate) fn clear_collection_check(&mut self) {
+        self.collection_check_pending = false;
     }
 
     /// Registers `reference` for finalization -- its type declares a `Finalize`, so the
@@ -1792,6 +1823,7 @@ impl Heap {
             .len()
             .saturating_mul(2)
             .max(INITIAL_GC_THRESHOLD);
+        self.note_collection_check();
 
         #[cfg(feature = "finalizers")]
         let result = finalizable

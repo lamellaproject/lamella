@@ -1,4 +1,4 @@
-// Lamella.Hardware -- Lamella.Hardware.Adc (the native ADC entry points).
+// Lamella.Hardware -- Lamella.Hardware.Adc (the native ADC entry points), in the System.Device.Analog assembly.
 namespace Lamella.Hardware
 {
     /// <summary>Reads the board's analog-to-digital converter.</summary>

@@ -2,7 +2,7 @@
 # paths touch (partial, append-only). Offsets are GCLK-base-relative; the base lives in
 # ../instances.toml. WHICH generator runs at WHAT rate is a PLAN fact (board.toml), never here.
 #
-# TWO ARRAYS, INDEXED BY DIFFERENT THINGS -- GENCTRL[n] by GENERATOR and PCHCTRL[m] by PERIPHERAL
+# Two arrays, indexed by different things -- GENCTRL[n] by GENERATOR and PCHCTRL[m] by PERIPHERAL
 # CHANNEL. A peripheral is clocked by writing ITS channel with the generator number it should
 # listen to, and both numbers are small integers in the same range. The SAM D21 line has neither
 # array: it has ONE CLKCTRL register whose ID field selects the channel, so there the channel id is

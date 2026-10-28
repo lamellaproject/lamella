@@ -3,7 +3,7 @@ using Lamella.Generated;
 
 namespace Lamella.Boards.St
 {
-    public sealed class NucleoL476rg
+    internal sealed class NucleoL476rg
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = StNucleoL476rgBindings.BOARD_MODEL;

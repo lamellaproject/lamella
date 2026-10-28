@@ -5,7 +5,7 @@
 // instance bases live in Samd20Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Samd20PmLayout
+    internal sealed class Samd20PmLayout
     {
         private Samd20PmLayout() { }
 

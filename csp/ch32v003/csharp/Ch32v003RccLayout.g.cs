@@ -5,7 +5,7 @@
 // instance bases live in Ch32v003Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Ch32v003RccLayout
+    internal sealed class Ch32v003RccLayout
     {
         private Ch32v003RccLayout() { }
 

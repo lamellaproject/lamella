@@ -1,7 +1,7 @@
 # The SAML21 Main Clock block: the peripheral-bus gate registers. Offsets are MCLK-base-relative;
 # the base lives in ../instances.toml.
 #
-# FIVE APB MASK REGISTERS ON THIS FAMILY, A THROUGH E. The sibling samc21 has four and the SAM D21
+# Five APB mask registers on this family, A through E. The sibling samc21 has four and the SAM D21
 # line has one that matters. Which register gates an instance is therefore a per-instance fact and
 # the instance rows carry `apb_mask_offset` for it -- on this part PORT is in APBA, SERCOM0..4 are
 # in APBC, and SERCOM5 is in APBD.

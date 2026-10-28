@@ -17,11 +17,11 @@ notes = [
 
 # ---- the SAM L10/L11 Xplained Pro virtual COM port ----------------------------------------------
 #
-# ONE TABLE FOR BOTH BOARDS. The kit user guide DS70005359C documents the SAM L10 Xplained Pro and
+# One table for both boards. The kit user guide DS70005359C documents the SAM L10 Xplained Pro and
 # the SAM L11 Xplained Pro together and its pin column is headed "SAML10/SAML11 pin", so the two
 # boards are wired identically and these rows serve both.
 #
-# THE GUIDE NAMES THE PADS AND NOT THE COLUMN. Table 4-14 gives SERCOM0/PAD[2] on PA24 and
+# The guide names the pads and not the column. Table 4-14 gives SERCOM0/PAD[2] on PA24 and
 # SERCOM0/PAD[3] on PA25. Table 4-1 places SERCOM0 in column C on both pads and SERCOM2 in column
 # D, so the guide's instance is right and the letter it omits is C.
 

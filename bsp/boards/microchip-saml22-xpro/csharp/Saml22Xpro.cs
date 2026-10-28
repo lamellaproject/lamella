@@ -5,14 +5,14 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Microchip
 {
-    public sealed class Saml22Xpro
+    internal sealed class Saml22Xpro
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = MicrochipSaml22XproBindings.BOARD_MODEL;
 
         /// <summary>The yellow user LED LED0 on PC27, ACTIVE LOW: it lights when driven
         /// <see cref="PinValue.Low"/>.</summary>
-        /// <remarks>SHARED WITH THE SEGMENT LCD, per the guide's own column.</remarks>
+        /// <remarks>Shared with the segment LCD, per the guide's own column.</remarks>
         public static readonly int LedPin =
             Saml22GpioDriver.LogicalPin(MicrochipSaml22XproBindings.LED0_PORT_BASE, MicrochipSaml22XproBindings.LED0_PIN);
 
@@ -24,7 +24,7 @@ namespace Lamella.Boards.Microchip
             Saml22GpioDriver.LogicalPin(MicrochipSaml22XproBindings.BUTTON0_PORT_BASE, MicrochipSaml22XproBindings.BUTTON0_PIN);
 
         /// <summary>The mode the user button wants.</summary>
-        /// <remarks>THIS KIT'S GUIDE DOES NOT SAY WHETHER AN EXTERNAL PULL-UP IS FITTED, where the
+        /// <remarks>This kit's guide does not say whether an external pull-up is fitted, where the
         /// Curiosity Nano guides state outright that none is. <see cref="PinMode.InputPullUp"/> is
         /// nevertheless the right answer under BOTH readings: if the board fits no pull-up the
         /// internal one is required, and if it fits one the internal resistor pulls the same way and
@@ -46,7 +46,7 @@ namespace Lamella.Boards.Microchip
         private static GpioDriver MakeGpio() { return new Saml22GpioDriver(); }
 
         /// <summary>The family PORT driver this board bound.</summary>
-        /// <remarks>THE DRIVER SPANS THREE PORT GROUPS AND THIS PACKAGE BONDS PADS IN ALL THREE.
+        /// <remarks>The driver spans three port groups and this package bonds pads in all three.
         /// This part also carries six SERCOM instances where the smaller packages of the same family
         /// carry four, so a binding written here does not transfer down to an L22G or L22J.</remarks>
         public GpioDriver CreateGpioDriver()

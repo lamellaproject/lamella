@@ -4,18 +4,18 @@
 # Cross-block bring-up (RCC enables, GPIO muxing) is DRIVER code per language; only block-local
 # sequences ride here.
 #
-# ST SHIPS TWO UNRELATED USART REGISTER LAYOUTS UNDER ONE PERIPHERAL NAME, and this part has the
+# ST ships two unrelated USART register layouts under one peripheral name, and this part has the
 # older one. The F0, L4 and F7 lines carry a peripheral whose control register is at offset 0 and
 # whose status is ISR at 0x1C, with a separate receive register, a separate transmit register and a
 # write-1-to-clear flag register. This one has STATUS at offset 0 and ONE data register at 0x04 that
 # is the transmit register when written and the receive register when read, and it has no flag-clear
 # register at all -- a flag is cleared by the access that services it.
 #
-# TWO WAYS THAT DIFFERENCE BITES A DRIVER WRITTEN FOR THE OTHER LAYOUT, and neither fails loudly:
+# Two ways that difference bites a driver written for the other layout, and neither fails loudly:
 #
-#   * THE ENABLE BIT MOVED. UE is bit 13 here and bit 0 there. Writing bit 0 sets the receiver
+#   * The enable bit moved. UE is bit 13 here and bit 0 there. Writing bit 0 sets the receiver
 #     enable instead, so the peripheral stays off while a plausible-looking value sits in CR1.
-#   * TXE IS BIT 7 IN BOTH -- IN DIFFERENT REGISTERS. Polling the right bit at the other design's
+#   * TXE is bit 7 in both -- in different registers. Polling the right bit at the other design's
 #     offset reads CR1 here, whose bit 7 is the transmit-empty INTERRUPT enable: it reads back
 #     whatever was written, so a poll on it either spins forever or never waits at all.
 #
@@ -85,7 +85,7 @@ notes = "Guard time and prescaler, for smartcard and IrDA use. Untouched by an a
 [parameters]
 divisor = "the composed BRR word: the kernel clock divided by the wanted rate, rounded, which the fixed-point encoding makes a plain 16-bit divisor at 16x oversampling."
 
-# ---- THE ORDER A BYTE GOES OUT AND COMES IN -------------------------------------------------
+# ---- The order a byte goes out and comes in -------------------------------------------------
 #
 # Both sequences END on the access that services the flag, because this design has no flag-clear
 # register: writing the data register is what clears TXE, and reading it is what clears RXNE. A

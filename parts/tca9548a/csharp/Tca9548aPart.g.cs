@@ -7,7 +7,7 @@
 // run time.
 namespace Lamella.Generated
 {
-    public sealed class Tca9548aPart
+    internal sealed class Tca9548aPart
     {
         private Tca9548aPart() { }
         public const string PART = "tca9548a";
@@ -18,7 +18,7 @@ namespace Lamella.Generated
         public const string SOURCING_VALIDATION = "exercised";
         public const string SOURCING_EVIDENCE = "A unit acknowledged 0x70 on a Raspberry Pi Pico 2 and was then made to demonstrate its whole control model, without reference to the datasheet: sweeping the control byte one bit at a time revealed a different set of devices behind each of the eight values, which is what establishes that the register is a MASK with one bit per channel rather than a channel number. With the control byte never written, the trunk showed the switch alone and nothing behind it, which is what establishes that the channels are closed after reset. Devices appeared and vanished from a channel as modules were plugged into and pulled out of the matching physical port across many passes, and one channel carried three devices at once. Every one of those behaviours is what SCPS207H states, arrived at from the bus rather than from the page.";
 
-        /// identity: THIS PART HAS NONE, and that is a fact about the part rather than a gap in this table. There is no register to read, so nothing can confirm which part answered an address -- the `identified` validation rung is unreachable for it by construction, and confidence has to be earned by exercising it instead.
+        /// identity: this part has none, and that is a fact about the part rather than a gap in this table. There is no register to read, so nothing can confirm which part answered an address -- the `identified` validation rung is unreachable for it by construction, and confidence has to be earned by exercising it instead.
         public const string IDENTITY_ABSENT = "SCPS207H describes no identity register: the part has one 8-bit control register, and what it reads back is the channel mask somebody last wrote rather than anything fixed. So a read cannot distinguish this part from any other device answering the same address, and cannot distinguish it from itself in a different state.";
 
         /// address: a base plus which pin contributes which bit. The part states the range; a carrier fixes the straps, so no strap is defaulted here.

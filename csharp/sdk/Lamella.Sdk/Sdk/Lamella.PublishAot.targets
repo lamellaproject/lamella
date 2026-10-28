@@ -1,0 +1,21 @@
+<!--
+  PublishAot in a lamella1.0 build. Lamella.TargetFramework.targets imports this file for lamella1.0 alone.
+
+  PublishAot keeps its meaning on Lamella: whether the program is compiled ahead of time to native code. Its value is
+  kept as LamellaPublishAot, true when nothing sets it, and the .NET SDK is given false, because its own ahead-of-time
+  support covers .NET's frameworks alone: it refuses every other framework with NETSDK1207 as soon as PublishAot is
+  true, on restore, build, run and publish alike.
+
+  A property given on the command line, as with dotnet build -p:PublishAot=true, normally cannot be set again by a
+  project file. TreatAsLocalProperty lets this file set PublishAot all the same, and since only a lamella1.0 build
+  imports the file, every other framework keeps the value it was given.
+-->
+<Project TreatAsLocalProperty="PublishAot">
+
+  <PropertyGroup>
+    <LamellaPublishAot>$(PublishAot)</LamellaPublishAot>
+    <LamellaPublishAot Condition="'$(LamellaPublishAot)' == ''">true</LamellaPublishAot>
+    <PublishAot>false</PublishAot>
+  </PropertyGroup>
+
+</Project>

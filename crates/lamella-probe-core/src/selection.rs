@@ -8,6 +8,33 @@
 /// [`Selector::from_environment`] then reaches that probe's board and no other.
 pub const PROBE_SERIAL_ENV: &str = "LAMELLA_PROBE_SERIAL";
 
+/// What a probe's id begins with where a device list names it: `probe:` and then its USB serial
+/// number, as `lamella devices` and `dotnet run --list-devices` show it.
+pub const PROBE_ID_PREFIX: &str = "probe:";
+
+/// The USB serial number a name for a probe means: the name itself, or the serial number in a
+/// probe's id, `probe:<serial>`, so an id copied from a device list names the probe it lists. The
+/// prefix is matched in either case, and whitespace around the name or the serial number is no part
+/// of it.
+///
+/// An id may also carry a board after the serial number, `probe:<serial>/<board>`, as a net11.0
+/// device list writes one row for each board a probe reaches. The board is dropped, from the id's
+/// last slash: the probe is the same whichever board is behind it, and a run takes the board from
+/// the image's manifest or its own board option. A bare serial number is never cut.
+///
+/// An empty answer names no probe, and a caller treats it as no name at all.
+#[must_use]
+pub fn serial_named(name: &str) -> &str {
+    let name = name.trim();
+    match name.get(..PROBE_ID_PREFIX.len()) {
+        Some(head) if head.eq_ignore_ascii_case(PROBE_ID_PREFIX) => {
+            let id = &name[PROBE_ID_PREFIX.len()..];
+            id.rsplit_once('/').map_or(id, |(serial, _board)| serial).trim()
+        }
+        _ => name,
+    }
+}
+
 /// What the ladder needs to know about one discovered device, and nothing more.
 ///
 /// Deliberately three fields. A probe family's own discovery type carries far more -- transport,
@@ -55,7 +82,7 @@ impl Selector {
     #[must_use]
     pub fn from_environment() -> Self {
         match std::env::var(PROBE_SERIAL_ENV) {
-            Ok(serial) if !serial.trim().is_empty() => Self::by_serial(serial.trim()),
+            Ok(serial) if !serial_named(&serial).is_empty() => Self::by_serial(serial),
             _ => Self::any(),
         }
     }
@@ -97,15 +124,16 @@ impl Selector {
     #[must_use]
     pub fn named_or(requested: Option<&str>, environment: Selector) -> Self {
         match requested {
-            Some(serial) if !serial.trim().is_empty() => Self::by_serial(serial.trim()),
+            Some(serial) if !serial_named(serial).is_empty() => Self::by_serial(serial),
             _ => environment,
         }
     }
 
-    /// Matches the probe with this serial number.
+    /// Matches the probe with this serial number, given as itself or as the probe's id,
+    /// `probe:<serial>` ([`serial_named`]).
     #[must_use]
     pub fn by_serial(serial: impl Into<String>) -> Self {
-        Self { serial: Some(serial.into()), ..Self::default() }
+        Self { serial: Some(serial_named(&serial.into()).to_owned()), ..Self::default() }
     }
 
     /// Matches probes with this vendor and product id.
@@ -114,10 +142,11 @@ impl Selector {
         Self { vendor_id: Some(vendor_id), product_id: Some(product_id), ..Self::default() }
     }
 
-    /// Adds a serial-number constraint (builder style).
+    /// Adds a serial-number constraint (builder style), given as the serial number or as the probe's
+    /// id ([`serial_named`]).
     #[must_use]
     pub fn with_serial(mut self, serial: impl Into<String>) -> Self {
-        self.serial = Some(serial.into());
+        self.serial = Some(serial_named(&serial.into()).to_owned());
         self
     }
 
@@ -298,6 +327,56 @@ mod tests {
             Selector::named_or(Some("  MC0201  "), from_env).serial.as_deref(),
             Some("MC0201")
         );
+    }
+
+    /// **A PROBE'S ID FROM A DEVICE LIST NAMES THE PROBE**, at every rung that takes a name: a list
+    /// shows `probe:<serial>`, and a person pastes what the list shows. The prefix is taken in
+    /// either case, and a prefix with no serial after it is no name, as a blank is not.
+    #[test]
+    fn a_probe_named_by_its_listed_id_is_named_by_its_serial() {
+        let attached = two_alike();
+        for named in ["probe:BBBB2222", "PROBE:BBBB2222", "  probe: BBBB2222 ", "BBBB2222"] {
+            assert_eq!(serial_named(named), "BBBB2222", "{named:?}");
+            let selector = Selector::named_or(Some(named), Selector::any());
+            assert_eq!(
+                choose(&attached, &selector),
+                Selection::Unique(Some(String::from("BBBB2222"))),
+                "{named:?} selects the probe it lists"
+            );
+            assert_eq!(Selector::by_serial(named).serial.as_deref(), Some("BBBB2222"), "{named:?}");
+            assert_eq!(Selector::any().with_serial(named).serial.as_deref(), Some("BBBB2222"), "{named:?}");
+        }
+        let from_env = Selector::by_serial("FROM-THE-ENVIRONMENT");
+        for blank in ["probe:", " probe:  ", "PROBE:"] {
+            assert_eq!(serial_named(blank), "", "{blank:?}");
+            assert_eq!(
+                Selector::named_or(Some(blank), from_env.clone()).serial.as_deref(),
+                Some("FROM-THE-ENVIRONMENT"),
+                "{blank:?} is no probe name"
+            );
+        }
+        assert_eq!(serial_named("XYprobe:1"), "XYprobe:1");
+        assert_eq!(serial_named("probe"), "probe");
+    }
+
+    /// **A PROBE'S ID WITH THE BOARD AFTER IT NAMES THE SAME PROBE**: a net11.0 device list shows
+    /// one row per board a probe reaches, `probe:<serial>/<board>`, and a person pastes what the
+    /// list shows. The board is dropped, at the id's last slash; a bare serial is never cut, and an
+    /// id whose serial is empty is no name.
+    #[test]
+    fn a_probe_named_by_its_id_with_a_board_is_named_by_its_serial() {
+        let attached = two_alike();
+        for named in ["probe:BBBB2222/rpi-pico2", "PROBE:BBBB2222/pimoroni-pico-plus-2", " probe: BBBB2222 /rpi-pico2 "] {
+            assert_eq!(serial_named(named), "BBBB2222", "{named:?}");
+            assert_eq!(
+                choose(&attached, &Selector::named_or(Some(named), Selector::any())),
+                Selection::Unique(Some(String::from("BBBB2222"))),
+                "{named:?} selects the probe it lists"
+            );
+        }
+        assert_eq!(serial_named("probe:/rpi-pico2"), "", "no serial before the board");
+        assert_eq!(serial_named("probe:AB/CD/rpi-pico2"), "AB/CD", "the board is after the last slash");
+        assert_eq!(serial_named("AB/CD"), "AB/CD", "a bare serial is the serial, whole");
     }
 
     /// The ladder must SURVIVE a family narrowing, because that is how it is actually called: a

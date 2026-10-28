@@ -1,9 +1,9 @@
 # The SAMDA1 parts table. The SAM DA1 is a SAM D21 relative aimed at automotive use, and its
-# per-instance numbers turn out to agree with the SAM D21's value for value. THAT IS A RESULT
-# AND NOT A REASON TO HAVE DERIVED IT: the sibling samd20 was read on the same day out of the
-# same lineage and DISAGREES with the D21 on the generic-clock ids and the NVIC lines of every
-# SERCOM. Two families, one ancestor, and nothing but reading tells them apart -- which is why
-# instances.toml states each value with its own source rather than inheriting one.
+# per-instance numbers agree with the SAM D21's value for value. That is no reason to derive
+# them: the samd20, of the same lineage, disagrees with the D21 on the generic-clock ids and the
+# NVIC lines of every SERCOM. Two families, one ancestor, and only their own documents tell them
+# apart -- which is why instances.toml states each value with its own source rather than
+# inheriting one.
 
 [table]
 kind = "parts"

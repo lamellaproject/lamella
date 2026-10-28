@@ -7,7 +7,10 @@ namespace Lamella.Generated
     internal static class TargetBoardFacts
     {
         /// <summary>The board's id, the name a build selects this board by.</summary>
-        internal const string Name = "muselab-nano-ch32v003";
+        internal static string Name
+        {
+            get { return "muselab-nano-ch32v003"; }
+        }
 
         /// <summary>Answers the board's wire identity, and binds nothing: this board's package
         /// declares no class that binds its buses.</summary>

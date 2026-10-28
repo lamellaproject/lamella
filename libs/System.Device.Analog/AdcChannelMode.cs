@@ -1,4 +1,4 @@
-// Lamella.Hardware -- Lamella.Hardware.AdcChannelMode (the driver seam's conversion mode).
+// Lamella.Hardware -- Lamella.Hardware.AdcChannelMode (the driver seam's conversion mode), in the System.Device.Analog assembly.
 namespace Lamella.Hardware
 {
     /// <summary>How an ADC driver interprets a channel's input.</summary>

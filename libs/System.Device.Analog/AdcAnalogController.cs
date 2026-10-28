@@ -1,4 +1,4 @@
-// Lamella.Hardware -- the System.Device.Analog controller over the board's bound ADC driver.
+// Lamella.Hardware -- the System.Device.Analog controller over the board's bound ADC driver, in the System.Device.Analog assembly.
 using System.Device.Analog;
 
 namespace Lamella.Hardware

@@ -5,7 +5,7 @@
 // instance bases live in Samr30Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Samr30MclkLayout
+    internal sealed class Samr30MclkLayout
     {
         private Samr30MclkLayout() { }
 

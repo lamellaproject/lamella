@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Espressif
 {
-    public sealed class Esp32c6Devkitc
+    internal sealed class Esp32c6Devkitc
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = EspEsp32c6DevkitcBindings.BOARD_MODEL;

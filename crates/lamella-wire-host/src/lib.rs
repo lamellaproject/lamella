@@ -106,7 +106,7 @@ fn trace_received(bytes: &[u8]) {
     eprint!("{rendered}");
 }
 
-/// Why a `serial:<id>` target could not be turned into a port name.
+/// Why a `usb-serial:<id>` target could not be turned into a port name.
 ///
 /// States with different remedies, so they are variants rather than one failure: "plug the board
 /// in / check the serial" against "say which of these you meant", and a machine whose ports could
@@ -146,7 +146,7 @@ impl core::fmt::Display for ResolveError {
     }
 }
 
-/// Turn a target string into a port name: `serial:<id>` resolves through the attached boards' USB
+/// Turn a target string into a port name: `usb-serial:<id>` resolves through the attached boards' USB
 /// serial numbers, anything else is already a port name and is returned unchanged.
 ///
 /// # Why a serial is the addressable form and a port name is not
@@ -171,7 +171,7 @@ impl core::fmt::Display for ResolveError {
 /// listed.
 #[cfg(feature = "serial")]
 pub fn resolve_target(target: &str) -> Result<String, ResolveError> {
-    let Some(wanted) = target.strip_prefix("serial:") else {
+    let Some(wanted) = target.strip_prefix("usb-serial:") else {
         return Ok(target.to_string());
     };
     let needle = wanted.to_ascii_lowercase();
@@ -196,7 +196,7 @@ pub fn resolve_target(target: &str) -> Result<String, ResolveError> {
 #[cfg(feature = "serial")]
 impl SerialTransport {
     /// Open the serial carrier at `path` -- either a port name (`"COM5"` / `"/dev/ttyACM0"`) or
-    /// `serial:<id>`, which selects the board by its USB serial number (see [`resolve_target`]).
+    /// `usb-serial:<id>`, which selects the board by its USB serial number (see [`resolve_target`]).
     /// The baud is moot for native USB-CDC but honored for a real UART.
     ///
     /// A board that resets on DTR or RTS -- an Espressif USB-Serial-JTAG, an Arduino Due's
@@ -205,7 +205,7 @@ impl SerialTransport {
     /// before they can be cleared, so there the open can reset such a board.
     ///
     /// # Errors
-    /// [`TransportError::Carrier`] if the port cannot be opened, if a `serial:` target names no
+    /// [`TransportError::Carrier`] if the port cannot be opened, if a `usb-serial:` target names no
     /// board or more than one, or if the attached ports cannot be listed, which the open needs to
     /// tell whether the board resets on DTR or RTS. Call [`resolve_target`] first when the caller
     /// wants to tell a user WHICH of those happened -- this signature is shared with the
@@ -803,7 +803,7 @@ pub enum TargetKind {
     Tcp,
     /// `usb`, `usb:<serial>`, or `usb:<vid>:<pid>[:<serial>]`.
     Usb,
-    /// A port name, or `serial:<usb-serial-substring>`.
+    /// A port name, or `usb-serial:<usb-serial-substring>`.
     Serial,
 }
 
@@ -812,7 +812,7 @@ pub enum TargetKind {
 /// A bare `host:port` reads as TCP, and that is the one rule a reader should check against their
 /// own habits: a Windows port name (`COM8`) carries no colon and an appended one is not a thing
 /// anybody writes, while `192.168.1.50:14825` is exactly what somebody types. A `/dev/...` path can
-/// contain a colon on no platform this runs on. Where the guess would be wrong, `serial:` says so
+/// contain a colon on no platform this runs on. Where the guess would be wrong, `usb-serial:` says so
 /// explicitly and always wins.
 #[must_use]
 pub fn classify_target(target: &str) -> TargetKind {
@@ -822,7 +822,7 @@ pub fn classify_target(target: &str) -> TargetKind {
     if target == "usb" || target.starts_with("usb:") {
         return TargetKind::Usb;
     }
-    if target.starts_with("serial:") {
+    if target.starts_with("usb-serial:") {
         return TargetKind::Serial;
     }
     let looks_like_address = target.starts_with('[')

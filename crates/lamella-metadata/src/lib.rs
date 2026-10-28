@@ -33,8 +33,8 @@ pub use pdb::{LocalVariable, PortablePdb, SequencePoint};
 pub use pe::{PeError, PeImage};
 pub use reader::{
     Assembly, AssemblyRef, AttrArg, AttrNamed, CharSet, CustomAttribute, DecodedAttribute, Event,
-    ExceptionClause, ExceptionHandlerKind, Field, MemberRef, Method, MethodKind, Param, Property,
-    ResolvedMethod, TypeDef, TypeName, TypeRef, decode_custom_attribute,
+    ExceptionClause, ExceptionHandlerKind, Field, MemberRef, Method, MethodKind, MethodOwners, Param,
+    Property, ResolvedMethod, TypeDef, TypeName, TypeRef, decode_custom_attribute,
     encode_exception_base_chain, exception_tag_for_name, fnv1a32,
 };
 pub use rows::{Col, Row, Tables, columns};

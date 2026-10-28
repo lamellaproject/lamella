@@ -1,17 +1,17 @@
 # PARTS table for the stm32l4r5 family: the STM32L4R5 in its 144-pin LQFP package.
 #
-# THIS IS ITS OWN FAMILY AND NOT A ROW IN csp/stm32l476, THOUGH BOTH ARE STM32L4 PARTS. A family here
+# This is its own family and not a row in csp/stm32l476, though both are STM32L4 parts. A family here
 # is one reference manual and one pin-function table. The STM32L476 is described by RM0351 and its
 # own datasheet; this part is described by RM0432, the STM32L4+ Series manual, and by DS12023. The
 # two lines agree on much of their register layout, but each fact below was read from this part's
 # documents.
 #
-# RAM IS ONE CONTIGUOUS 640-KBYTE SPAN. SRAM1 (192 Kbytes at 0x20000000), SRAM2 (64 Kbytes at
+# RAM is one contiguous 640-Kbyte span. SRAM1 (192 Kbytes at 0x20000000), SRAM2 (64 Kbytes at
 # 0x20030000) and SRAM3 (384 Kbytes at 0x20040000) sit back to back, so a linker can treat the whole
 # of it as one region. SRAM2 is also aliased at 0x10000000, which is the same memory seen twice, not
 # more of it.
 #
-# EACH `pins` LIST NAMES A PACKAGE's PADS. A pin that is not listed is refused rather than assumed.
+# Each `pins` list names a package's pads. A pin that is not listed is refused rather than assumed.
 
 [table]
 kind = "parts"

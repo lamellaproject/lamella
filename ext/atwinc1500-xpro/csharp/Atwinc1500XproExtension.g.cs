@@ -6,7 +6,7 @@
 // extension binds to any host that offers a socket of this standard.
 namespace Lamella.Generated
 {
-    public sealed class Atwinc1500XproExtension
+    internal sealed class Atwinc1500XproExtension
     {
         private Atwinc1500XproExtension() { }
         public const string EXTENSION = "atwinc1500-xpro";

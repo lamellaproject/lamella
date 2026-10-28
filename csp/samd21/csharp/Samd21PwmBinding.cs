@@ -4,7 +4,7 @@ namespace Lamella.Boards
 {
     /// <summary>One output a board wired to a counter: the compare channel that drives it, and
     /// where its pad's multiplexer nibble and pin configuration byte are.</summary>
-    public sealed class Samd21PwmOutput
+    internal sealed class Samd21PwmOutput
     {
         /// <summary>The compare channel that drives the output: n for the counter's waveform
         /// output WO[n].</summary>
@@ -25,7 +25,7 @@ namespace Lamella.Boards
         }
     }
 
-    public sealed class Samd21PwmBinding
+    internal sealed class Samd21PwmBinding
     {
         /// <summary>The counter's base address: a TC's or a TCC's.</summary>
         public readonly uint CounterBase;

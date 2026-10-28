@@ -1,0 +1,12 @@
+[package]
+name = "lamella-console-ring"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The console ring a Lamella image keeps in RAM for a debug probe to read while the program runs: its layout, the words that say how the program ended, and the writes that keep them. no_std and allocation-free, so the runtime-support archive writes it and the AOT build lays and ends it from one definition."
+publish = false
+
+[lints]
+workspace = true

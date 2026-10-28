@@ -5,6 +5,51 @@ use crate::placement::{BootloaderChoice, Placement, ShippedBootloader};
 use lamella_flash_backend::{Allow, Verification, VerifyPolicy, flash};
 use lamella_probe_core::ProbeError;
 
+/// The Debug Halting Control and Status Register, which a write's hand-back reads and writes.
+const DHCSR: u32 = 0xe000_edf0;
+
+/// Halting debug as a fake part's DHCSR reports it: whether halting debug is on, and whether the
+/// core is halted. Every fake carries one, because a write ends by handing the part back through
+/// `lamella_probe_core::hand_back`, which reads the halt state and writes DHCSR.
+#[derive(Default)]
+struct Dhcsr {
+    /// `C_DEBUGEN`: halting debug is on.
+    debugen: bool,
+    /// `S_HALT`: the core is halted.
+    halted: bool,
+}
+
+impl Dhcsr {
+    /// A write to DHCSR. One without the key in its top half is ignored, as the architecture
+    /// ignores it; with halting debug on, `C_HALT` halts the core and its absence lets it run.
+    fn write(&mut self, value: u32) {
+        if value >> 16 != 0xa05f {
+            return;
+        }
+        self.debugen = value & 1 != 0;
+        if self.debugen {
+            self.halted = value & 2 != 0;
+        }
+    }
+
+    /// `TargetAccess::halt`: halting debug on, the core halted.
+    fn halt(&mut self) {
+        self.debugen = true;
+        self.halted = true;
+    }
+
+    /// `TargetAccess::reset_and_run`: a system reset, then a resume that leaves halting debug on.
+    fn reset_and_run(&mut self) {
+        self.debugen = true;
+        self.halted = false;
+    }
+
+    /// Whether the part was left as a part nobody is debugging: running, with halting debug off.
+    fn handed_back(&self) -> bool {
+        !self.debugen && !self.halted
+    }
+}
+
 /// A target with a byte-addressable flash array and a log of what was asked of it.
 struct FakeTarget {
     log: Vec<&'static str>,
@@ -12,6 +57,7 @@ struct FakeTarget {
     flash: Vec<u8>,
     /// Set to corrupt the read-back, so a verify failure can be exercised without a broken board.
     corrupt_at: Option<usize>,
+    dhcsr: Dhcsr,
 }
 
 impl FakeTarget {
@@ -21,6 +67,7 @@ impl FakeTarget {
             idcode,
             flash: vec![0xFF; 256],
             corrupt_at: None,
+            dhcsr: Dhcsr::default(),
         }
     }
 }
@@ -52,6 +99,13 @@ impl TargetAccess for FakeTarget {
         Ok(u32::from_le_bytes(word))
     }
     fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+        if address == DHCSR {
+            self.dhcsr.write(value);
+            if !self.dhcsr.debugen {
+                self.log.push("halting_debug_off");
+            }
+            return Ok(());
+        }
         if address == NVMC_ERASEALL && value == 1 {
             self.log.push("erase_all");
             self.flash.iter_mut().for_each(|byte| *byte = 0xFF);
@@ -81,11 +135,17 @@ impl TargetAccess for FakeTarget {
     }
     fn halt(&mut self) -> Result<(), ProbeError> {
         self.log.push("halt");
+        self.dhcsr.halt();
         Ok(())
     }
     fn reset_and_run(&mut self) -> Result<(), ProbeError> {
         self.log.push("reset_and_run");
+        self.dhcsr.reset_and_run();
         Ok(())
+    }
+    /// The hand-back that ends a write reads the halt state, so the fake reports it.
+    fn is_halted(&mut self) -> Result<bool, ProbeError> {
+        Ok(self.dhcsr.halted)
     }
 
     /// **PROGRAMMING AN nRF *IS* A RAW MEMORY WRITE**, with the controller left in write-enable
@@ -114,9 +174,6 @@ impl TargetAccess for FakeTarget {
         unreachable!("a flashing backend leaves the part through reset_and_run, not resume")
     }
     fn step(&mut self) -> Result<(), ProbeError> {
-        unreachable!("run control is not the flashing path")
-    }
-    fn is_halted(&mut self) -> Result<bool, ProbeError> {
         unreachable!("run control is not the flashing path")
     }
     fn wait_halted(&mut self) -> Result<(), ProbeError> {
@@ -199,8 +256,11 @@ fn a_real_parts_primitives_compose_into_the_contracts_order() {
             "read_words_into",
             "clear_breakpoints",
             "reset_and_run",
+            "clear_breakpoints",
+            "halting_debug_off",
         ],
-        "identify reads before init_mem/halt, and the read-back precedes the reset"
+        "identify reads before init_mem/halt, the read-back precedes the reset, and the part is \
+         handed back after it"
     );
 }
 
@@ -309,11 +369,13 @@ struct FakeL0 {
     sr: u32,
     keys: Vec<u32>,
     corrupt_at: Option<usize>,
+    dhcsr: Dhcsr,
 }
 
 impl FakeL0 {
     fn new() -> Self {
         FakeL0 {
+            dhcsr: Dhcsr::default(),
             log: Vec::new(),
             dev_id: L0_CAT5,
             flash_kb: 192,
@@ -377,6 +439,13 @@ impl TargetAccess for FakeL0 {
     }
 
     fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+        if address == DHCSR {
+            self.dhcsr.write(value);
+            if !self.dhcsr.debugen {
+                self.log.push("halting_debug_off".into());
+            }
+            return Ok(());
+        }
         match address {
             L0_PEKEYR | L0_PRGKEYR => {
                 self.keys.push(value);
@@ -464,10 +533,12 @@ impl TargetAccess for FakeL0 {
     }
 
     fn halt(&mut self) -> Result<(), ProbeError> {
+        self.dhcsr.halt();
         self.log.push("halt");
         Ok(())
     }
     fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+        self.dhcsr.reset_and_run();
         self.log.push("reset_and_run");
         Ok(())
     }
@@ -490,8 +561,9 @@ impl TargetAccess for FakeL0 {
     fn step(&mut self) -> Result<(), ProbeError> {
         unreachable!("run control is not the flashing path")
     }
+    /// The hand-back that ends a write reads the halt state, so the fake reports it.
     fn is_halted(&mut self) -> Result<bool, ProbeError> {
-        unreachable!("run control is not the flashing path")
+        Ok(self.dhcsr.halted)
     }
     fn wait_halted(&mut self) -> Result<(), ProbeError> {
         unreachable!("run control is not the flashing path")
@@ -592,8 +664,14 @@ fn the_l0_primitives_compose_into_the_contracts_order() {
     );
     assert_eq!(
         &log[run - 1..],
-        ["clear_breakpoints", "reset_and_run"],
-        "no breakpoint a debug session left armed outlives the reset that starts the image"
+        [
+            "clear_breakpoints",
+            "reset_and_run",
+            "clear_breakpoints",
+            "halting_debug_off"
+        ],
+        "no breakpoint a debug session left armed outlives the reset that starts the image, and \
+         halting debug is off after it"
     );
     assert!(
         !log.contains(&"notzeroerr"),
@@ -1277,11 +1355,13 @@ struct FakeC0 {
     locked: bool,
     cr: u32,
     sr: u32,
+    dhcsr: Dhcsr,
 }
 
 impl FakeC0 {
     fn new() -> Self {
         FakeC0 {
+            dhcsr: Dhcsr::default(),
             log: Vec::new(),
             dev_id: C0_C071,
             flash_kb: 128,
@@ -1332,6 +1412,13 @@ impl TargetAccess for FakeC0 {
     }
 
     fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+        if address == DHCSR {
+            self.dhcsr.write(value);
+            if !self.dhcsr.debugen {
+                self.log.push("halting_debug_off".into());
+            }
+            return Ok(());
+        }
         match address {
             a if a == C0_REGS + 0x008 => {
                 if value == 0xCDEF_89AB {
@@ -1404,11 +1491,13 @@ impl TargetAccess for FakeC0 {
     }
 
     fn halt(&mut self) -> Result<(), ProbeError> {
+        self.dhcsr.halt();
         self.log.push("halt");
         Ok(())
     }
 
     fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+        self.dhcsr.reset_and_run();
         self.log.push("reset_and_run");
         Ok(())
     }
@@ -1440,8 +1529,9 @@ impl TargetAccess for FakeC0 {
     fn step(&mut self) -> Result<(), ProbeError> {
         unreachable!("run control is not the flashing path")
     }
+    /// The hand-back that ends a write reads the halt state, so the fake reports it.
     fn is_halted(&mut self) -> Result<bool, ProbeError> {
-        unreachable!("run control is not the flashing path")
+        Ok(self.dhcsr.halted)
     }
     fn wait_halted(&mut self) -> Result<(), ProbeError> {
         unreachable!("run control is not the flashing path")
@@ -1734,11 +1824,13 @@ struct FakeSam4l {
     /// What `CHIPID_EXID` answers. Settable because the two SAM4L pairs that matter here differ in
     /// this field alone: the fitted LC8C is not on the member table and an LS8 is.
     exid: u32,
+    dhcsr: Dhcsr,
 }
 
 impl FakeSam4l {
     fn new() -> Self {
         FakeSam4l {
+            dhcsr: Dhcsr::default(),
             log: Vec::new(),
             flash: vec![0xff; L4W_PAGE * L4W_PAGES],
             cache: vec![0xff; L4W_PAGE * L4W_PAGES],
@@ -1809,6 +1901,13 @@ impl TargetAccess for FakeSam4l {
     }
 
     fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+        if address == DHCSR {
+            self.dhcsr.write(value);
+            if !self.dhcsr.debugen {
+                self.log.push("halting_debug_off".into());
+            }
+            return Ok(());
+        }
         match address {
             L4W_MAINT0 => {
                 if value & 1 != 0 {
@@ -1894,10 +1993,12 @@ impl TargetAccess for FakeSam4l {
     }
 
     fn halt(&mut self) -> Result<(), ProbeError> {
+        self.dhcsr.halt();
         self.log.push("halt");
         Ok(())
     }
     fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+        self.dhcsr.reset_and_run();
         self.log.push("reset_and_run");
         Ok(())
     }
@@ -1920,8 +2021,9 @@ impl TargetAccess for FakeSam4l {
     fn step(&mut self) -> Result<(), ProbeError> {
         unreachable!("run control is not the flashing path")
     }
+    /// The hand-back that ends a write reads the halt state, so the fake reports it.
     fn is_halted(&mut self) -> Result<bool, ProbeError> {
-        unreachable!("run control is not the flashing path")
+        Ok(self.dhcsr.halted)
     }
     fn wait_halted(&mut self) -> Result<(), ProbeError> {
         unreachable!("run control is not the flashing path")
@@ -2007,6 +2109,8 @@ fn the_sam4l_primitives_compose_into_the_contracts_order() {
             "invalidate_cache",
             "clear_breakpoints",
             "reset_and_run",
+            "clear_breakpoints",
+            "halting_debug_off",
         ],
         "{:?}",
         backend.target.log
@@ -2332,11 +2436,13 @@ struct FakeSam3x {
     /// Latched `FCMDE` / `FLOCKE`, reported on the next `FSR` read.
     errors: u32,
     cidr: u32,
+    dhcsr: Dhcsr,
 }
 
 impl FakeSam3x {
     fn new() -> Self {
         FakeSam3x {
+            dhcsr: Dhcsr::default(),
             log: Vec::new(),
             flash: vec![0xff; SAM3X_PLANE_SIZE as usize * 2],
             latch: [vec![0xff; SAM3X_PAGE], vec![0xff; SAM3X_PAGE]],
@@ -2409,6 +2515,13 @@ impl TargetAccess for FakeSam3x {
     }
 
     fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+        if address == DHCSR {
+            self.dhcsr.write(value);
+            if !self.dhcsr.debugen {
+                self.log.push("halting_debug_off".into());
+            }
+            return Ok(());
+        }
         if let Some(unit) = FakeSam3x::controller(address & !0xf) {
             if address & 0xf != L3X_FCR {
                 return Err(ProbeError::Device("a write to an EEFC register this fake refuses"));
@@ -2490,10 +2603,12 @@ impl TargetAccess for FakeSam3x {
     }
 
     fn halt(&mut self) -> Result<(), ProbeError> {
+        self.dhcsr.halt();
         self.log.push(String::from("halt"));
         Ok(())
     }
     fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+        self.dhcsr.reset_and_run();
         self.log.push(String::from("reset_and_run"));
         Ok(())
     }
@@ -2516,8 +2631,9 @@ impl TargetAccess for FakeSam3x {
     fn step(&mut self) -> Result<(), ProbeError> {
         unreachable!("run control is not the flashing path")
     }
+    /// The hand-back that ends a write reads the halt state, so the fake reports it.
     fn is_halted(&mut self) -> Result<bool, ProbeError> {
-        unreachable!("run control is not the flashing path")
+        Ok(self.dhcsr.halted)
     }
     fn wait_halted(&mut self) -> Result<(), ProbeError> {
         unreachable!("run control is not the flashing path")
@@ -2592,6 +2708,8 @@ fn the_sam3x_erase_step_erases_nothing_and_the_write_does_it_per_page() {
             "ewp0:1",
             "clear_breakpoints",
             "reset_and_run",
+            "clear_breakpoints",
+            "halting_debug_off",
         ],
         "{:?}",
         backend.target.log
@@ -2849,11 +2967,13 @@ struct FakeSam4sDual {
     /// What each controller reports for `FL_NB_PLANE`.
     planes: u32,
     page_size: u32,
+    dhcsr: Dhcsr,
 }
 
 impl FakeSam4sDual {
     fn new(plane_size: u32) -> Self {
         FakeSam4sDual {
+            dhcsr: Dhcsr::default(),
             log: Vec::new(),
             flash: vec![0xff; plane_size as usize * 2],
             latch: [vec![0xff; SAM4S_PAGE], vec![0xff; SAM4S_PAGE]],
@@ -2924,6 +3044,13 @@ impl TargetAccess for FakeSam4sDual {
     }
 
     fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+        if address == DHCSR {
+            self.dhcsr.write(value);
+            if !self.dhcsr.debugen {
+                self.log.push("halting_debug_off".into());
+            }
+            return Ok(());
+        }
         if let Some(unit) = FakeSam4sDual::controller(address & !0xf) {
             if address & 0xf != L4S_FCR {
                 return Err(ProbeError::Device("a write to an EEFC register this fake refuses"));
@@ -3026,10 +3153,12 @@ impl TargetAccess for FakeSam4sDual {
     }
 
     fn halt(&mut self) -> Result<(), ProbeError> {
+        self.dhcsr.halt();
         self.log.push(String::from("halt"));
         Ok(())
     }
     fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+        self.dhcsr.reset_and_run();
         self.log.push(String::from("reset_and_run"));
         Ok(())
     }
@@ -3052,8 +3181,9 @@ impl TargetAccess for FakeSam4sDual {
     fn step(&mut self) -> Result<(), ProbeError> {
         unreachable!("run control is not the flashing path")
     }
+    /// The hand-back that ends a write reads the halt state, so the fake reports it.
     fn is_halted(&mut self) -> Result<bool, ProbeError> {
-        unreachable!("run control is not the flashing path")
+        Ok(self.dhcsr.halted)
     }
     fn wait_halted(&mut self) -> Result<(), ProbeError> {
         unreachable!("run control is not the flashing path")
@@ -3126,6 +3256,7 @@ fn the_dual_plane_sam4s_erases_in_blocks_then_writes_in_pages() {
             "halt", "epa0:0",
             "ggpb", "getd0", "glb0",
             "wp0:0", "wp0:1", "clear_breakpoints", "reset_and_run",
+            "clear_breakpoints", "halting_debug_off",
         ],
         "{:?}",
         backend.target.log
@@ -3378,7 +3509,7 @@ struct FakeF7 {
     protected: Option<u32>,
     /// `DBGMCU_APB1_FZ`, whose bit 12 is what stops the independent watchdog while halted.
     apb1_fz: u32,
-    halted: bool,
+    dhcsr: Dhcsr,
     /// Whether the firmware the part was running had started its independent watchdog.
     iwdg_started: bool,
     /// The length in words of each block read of the array, in order: how many times a write read
@@ -3403,7 +3534,7 @@ impl FakeF7 {
             erased: Vec::new(),
             protected: None,
             apb1_fz: 0,
-            halted: false,
+            dhcsr: Dhcsr::default(),
             iwdg_started: false,
             array_reads: Vec::new(),
         }
@@ -3412,7 +3543,7 @@ impl FakeF7 {
     /// Whether a watchdog the firmware started has reset the part: it counts through a halt unless
     /// `DBG_IWDG_STOP` is set.
     fn watchdog_fired(&mut self) -> bool {
-        let fired = self.iwdg_started && self.halted && self.apb1_fz & (1 << 12) == 0;
+        let fired = self.iwdg_started && self.dhcsr.halted && self.apb1_fz & (1 << 12) == 0;
         if fired {
             self.log.push("watchdog reset".to_owned());
         }
@@ -3500,6 +3631,13 @@ impl TargetAccess for FakeF7 {
     }
 
     fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+        if address == DHCSR {
+            self.dhcsr.write(value);
+            if !self.dhcsr.debugen {
+                self.log.push("halting_debug_off".into());
+            }
+            return Ok(());
+        }
         match address {
             STM32F7_DBGMCU_APB1_FZ => {
                 self.apb1_fz = value;
@@ -3607,12 +3745,12 @@ impl TargetAccess for FakeF7 {
     }
 
     fn halt(&mut self) -> Result<(), ProbeError> {
-        self.halted = true;
+        self.dhcsr.halt();
         self.log.push("halt".to_owned());
         Ok(())
     }
     fn reset_and_run(&mut self) -> Result<(), ProbeError> {
-        self.halted = false;
+        self.dhcsr.reset_and_run();
         self.log.push("reset_and_run".to_owned());
         Ok(())
     }
@@ -3635,8 +3773,9 @@ impl TargetAccess for FakeF7 {
     fn step(&mut self) -> Result<(), ProbeError> {
         unreachable!("run control is not the flashing path")
     }
+    /// The hand-back that ends a write reads the halt state, so the fake reports it.
     fn is_halted(&mut self) -> Result<bool, ProbeError> {
-        unreachable!("run control is not the flashing path")
+        Ok(self.dhcsr.halted)
     }
     fn wait_halted(&mut self) -> Result<(), ProbeError> {
         unreachable!("run control is not the flashing path")
@@ -3850,7 +3989,7 @@ fn an_f7_write_stops_the_watchdogs_before_it_halts_and_puts_the_register_back() 
 
     let mut control = FakeF7::f769();
     control.iwdg_started = true;
-    control.halted = true;
+    control.dhcsr.halted = true;
     control.locked = false;
     assert!(control.write_word(F7_CR, F7_CR_SER | F7_CR_STRT).is_err());
     assert!(control.log.iter().any(|entry| entry == "watchdog reset"));
@@ -4044,7 +4183,7 @@ struct FakeSamd21 {
     status: u32,
     /// NVMCTRL.LOCK as it stands: bit n is region n, and 0 locks it.
     lock: u16,
-    halted: bool,
+    dhcsr: Dhcsr,
     /// Every command, halt and reset, in order, with the address each command acted on.
     log: Vec<String>,
 }
@@ -4070,7 +4209,7 @@ impl FakeSamd21 {
             ctrlb: 0,
             status: 0,
             lock: 0xffff,
-            halted: false,
+            dhcsr: Dhcsr::default(),
             log: Vec::new(),
         }
     }
@@ -4178,6 +4317,13 @@ impl TargetAccess for FakeSamd21 {
         }
     }
     fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+        if address == DHCSR {
+            self.dhcsr.write(value);
+            if !self.dhcsr.debugen {
+                self.log.push("halting_debug_off".into());
+            }
+            return Ok(());
+        }
         let at = address as usize;
         match address {
             D21_CTRLA => self.command(value)?,
@@ -4220,12 +4366,12 @@ impl TargetAccess for FakeSamd21 {
         Err(ProbeError::Device("not modelled"))
     }
     fn halt(&mut self) -> Result<(), ProbeError> {
-        self.halted = true;
+        self.dhcsr.halt();
         self.log.push("halt".to_owned());
         Ok(())
     }
     fn resume(&mut self) -> Result<(), ProbeError> {
-        self.halted = false;
+        self.dhcsr.halted = false;
         self.log.push("resume".to_owned());
         Ok(())
     }
@@ -4233,13 +4379,13 @@ impl TargetAccess for FakeSamd21 {
         Err(ProbeError::Device("not modelled"))
     }
     fn is_halted(&mut self) -> Result<bool, ProbeError> {
-        Ok(self.halted)
+        Ok(self.dhcsr.halted)
     }
     fn wait_halted(&mut self) -> Result<(), ProbeError> {
         Ok(())
     }
     fn reset_and_run(&mut self) -> Result<(), ProbeError> {
-        self.halted = false;
+        self.dhcsr.reset_and_run();
         self.log.push("reset_and_run".to_owned());
         Ok(())
     }
@@ -4323,7 +4469,8 @@ fn behind_a_kept_bootloader_the_image_is_written_and_the_bootloader_is_untouched
         .collect();
     assert_eq!(erased, ["ER 0x2000", "ER 0x2100", "ER 0x2200", "ER 0x2300"], "{:?}", part.log);
     assert_eq!(part.log.first().map(String::as_str), Some("halt"), "{:?}", part.log);
-    assert_eq!(part.log.last().map(String::as_str), Some("reset_and_run"), "{:?}", part.log);
+    let tail: Vec<&str> = part.log.iter().rev().take(3).rev().map(String::as_str).collect();
+    assert_eq!(tail, ["reset_and_run", "clear_breakpoints", "halting_debug_off"], "{:?}", part.log);
 }
 
 /// A write that keeps a bootloader the part does not hold is refused before anything is halted or
@@ -4612,6 +4759,7 @@ struct FakeRp2350 {
     /// An address whose erase never returns: the call that covers it erases the sectors below it
     /// and is given up on.
     erase_hangs_at: Option<u32>,
+    dhcsr: Dhcsr,
 }
 
 /// Where the fake's ROM table starts, and the addresses its four functions answer at.
@@ -4646,6 +4794,7 @@ impl FakeRp2350 {
             at += 6;
         }
         FakeRp2350 {
+            dhcsr: Dhcsr::default(),
             log: Vec::new(),
             flash: vec![0xFF; bytes],
             ram: std::collections::HashMap::new(),
@@ -4692,6 +4841,16 @@ impl TargetAccess for FakeRp2350 {
         })
     }
     fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+        if address == DHCSR {
+            self.dhcsr.write(value);
+            if !self.dhcsr.debugen {
+                self.log.push("halting_debug_off".into());
+            }
+            return Ok(());
+        }
+        if address == 0xe000_ed0c {
+            self.dhcsr.halted = true;
+        }
         if self.in_flash(address).is_some() {
             return Err(ProbeError::Device("flash is written through flash_op, not by a store"));
         }
@@ -4718,13 +4877,16 @@ impl TargetAccess for FakeRp2350 {
         Ok(())
     }
     fn halt(&mut self) -> Result<(), ProbeError> {
+        self.dhcsr.halt();
         self.log.push("halt".to_owned());
         Ok(())
     }
+    /// The hand-back that ends a write reads the halt state, so the fake reports it.
     fn is_halted(&mut self) -> Result<bool, ProbeError> {
-        Ok(true)
+        Ok(self.dhcsr.halted)
     }
     fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+        self.dhcsr.reset_and_run();
         self.log.push("reset_and_run".to_owned());
         Ok(())
     }
@@ -4934,6 +5096,30 @@ fn rp2350_steps(board: &FakeRp2350) -> Vec<&str> {
         .collect()
 }
 
+/// **A PROBE THAT CANNOT BE OPENED IS REFUSED SAYING THAT NOTHING WAS WRITTEN, BEFORE THE FIRST
+/// WRITE ONLY.** The attempt at the faster clock opens the probe before anything else, so one it
+/// cannot open has written nothing; the attempt at the fallback clock follows one that erased the
+/// flash and began the write, so its refusal claims nothing of the kind.
+#[test]
+fn a_probe_that_cannot_be_opened_says_nothing_was_written_before_the_first_write_only() {
+    let missing = "no probe is attached, or the one that is reports no serial number and so cannot be named.";
+    let first = write_rp2350(|_, _| Err(Rp2350Failure::Unopened(missing.to_owned())), &mut |_| {});
+    assert_eq!(first.err().as_deref(), Some(format!("{missing}\n\nNothing was written.").as_str()));
+    let mut attempts = 0;
+    let retried = write_rp2350(
+        |_, _| {
+            attempts += 1;
+            Err(if attempts == 1 {
+                Rp2350Failure::AtSpeed("the part answered FAULT".to_owned())
+            } else {
+                Rp2350Failure::Unopened(missing.to_owned())
+            })
+        },
+        &mut |_| {},
+    );
+    assert_eq!(retried.err().as_deref(), Some(missing), "the first attempt had begun the write");
+}
+
 /// **A TRANSFER FAULT AT THE FASTER CLOCK MAKES THE WHOLE WRITE AGAIN AT THE FALLBACK CLOCK**: one
 /// line says so, and the second write erases, programs and reads back the whole image from the
 /// start, on the board the first left erased and half-written.
@@ -5123,6 +5309,7 @@ struct FakeRp2040 {
     /// The halt polls one 64 KiB block erase costs the probe waiting on it, or 0 for an erase that
     /// returns at once.
     erase_polls_per_block: u32,
+    dhcsr: Dhcsr,
 }
 
 /// Where the fake's function table starts, and its entries: the six functions the routine calls, at
@@ -5152,6 +5339,7 @@ impl FakeRp2040 {
         }
         rom[0x01ae..0x01b0].copy_from_slice(&0xbe00_u16.to_le_bytes());
         FakeRp2040 {
+            dhcsr: Dhcsr::default(),
             log: Vec::new(),
             flash: vec![0xFF; bytes],
             ram: std::collections::HashMap::new(),
@@ -5189,6 +5377,16 @@ impl TargetAccess for FakeRp2040 {
         Ok(u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]))
     }
     fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+        if address == DHCSR {
+            self.dhcsr.write(value);
+            if !self.dhcsr.debugen {
+                self.log.push("halting_debug_off".into());
+            }
+            return Ok(());
+        }
+        if address == 0xe000_ed0c {
+            self.dhcsr.halted = true;
+        }
         self.ram.insert(address, value);
         Ok(())
     }
@@ -5204,10 +5402,12 @@ impl TargetAccess for FakeRp2040 {
         }
         Ok(())
     }
+    /// The hand-back that ends a write reads the halt state, so the fake reports it.
     fn is_halted(&mut self) -> Result<bool, ProbeError> {
-        Ok(true)
+        Ok(self.dhcsr.halted)
     }
     fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+        self.dhcsr.reset_and_run();
         self.log.push("reset_and_run".to_owned());
         Ok(())
     }
@@ -5261,6 +5461,7 @@ impl TargetAccess for FakeRp2040 {
         unreachable!("halfword access is not part of the flashing path")
     }
     fn halt(&mut self) -> Result<(), ProbeError> {
+        self.dhcsr.halt();
         unreachable!("the routine halts by its reset catch, not by this seam")
     }
     fn resume(&mut self) -> Result<(), ProbeError> {
@@ -5387,4 +5588,109 @@ fn the_st_route_says_its_three_steps_and_reads_the_image_back_once() {
     );
     let reads = &backend.target.array_reads;
     assert_eq!(*reads, vec![bytes.len().div_ceil(4)], "{:?}", backend.target.log);
+}
+
+/// **EVERY PROBE ROUTE HANDS THE PART BACK AFTER ITS WRITE**: the core running the new image, with
+/// halting debug off. The reset that starts the image leaves `DHCSR.C_DEBUGEN` set, and with it set
+/// a `BKPT` the program meets later -- a semihosting call among them -- halts the core and waits
+/// for a debugger that is not there.
+#[test]
+fn every_probe_route_hands_the_part_back_running_with_halting_debug_off() {
+    let check = |route: &str, dhcsr: &Dhcsr| {
+        assert!(
+            dhcsr.handed_back(),
+            "{route}: C_DEBUGEN {} and S_HALT {} after the write",
+            dhcsr.debugen,
+            dhcsr.halted
+        );
+    };
+    fn write(backend: &mut impl FlashBackend, bytes: &[u8], base: u32) -> Result<(), String> {
+        flash(
+            backend,
+            &Image { bytes, base },
+            VerifyPolicy::ReadBack,
+            &Allow::Any,
+        )
+        .map(|_| ())
+        .map_err(|why| why.to_string())
+    }
+
+    let mut microbit = MicrobitDaplink::new(FakeTarget::new(NRF51), NRF51, "the part family");
+    write(&mut microbit, &PROGRAM, 0).expect("the micro:bit");
+    check("the micro:bit", &microbit.target.dhcsr);
+
+    let mut l0 = StProbe::new(FakeL0::new(), crate::StFamily::L0.plan());
+    write(&mut l0, &L0_PROGRAM, L0_FLASH).expect("the STM32L0");
+    check("the STM32L0", &l0.target.dhcsr);
+
+    let c0_bytes: Vec<u8> = (0..20u8).map(|i| i.wrapping_mul(7)).collect();
+    let mut c0 = StProbe::new(FakeC0::new(), crate::StFamily::C0.plan());
+    write(&mut c0, &c0_bytes, C0_FLASH).expect("the STM32C0");
+    check("the STM32C0", &c0.target.dhcsr);
+
+    let mut f7 = StProbe::new(FakeF7::f769(), crate::StFamily::F7.plan());
+    f7_flash(&mut f7, &f7_pattern(32 * 1024 + 1)).expect("the STM32F769");
+    check("the STM32F769", &f7.target.dhcsr);
+
+    let mut sam4l = SamProbe::new(
+        FakeSam4l::new(),
+        crate::SamFamily::Sam4l,
+        SAM_TEST_MECHANISM,
+    );
+    write(&mut sam4l, &sam4l_image(), 0).expect("the SAM4L");
+    check("the SAM4L", &sam4l.target.dhcsr);
+
+    let mut sam3x = sam3x_backend();
+    write(&mut sam3x, &vec![0x5au8; SAM3X_PAGE * 2], SAM3X_FLASH0_BASE).expect("the SAM3X");
+    check("the SAM3X", &sam3x.target.dhcsr);
+
+    let mut sam4s = sam4s_dual_backend(L4S_PLANE);
+    write(&mut sam4s, &vec![0x5au8; SAM4S_PAGE * 2], SAM4S_FLASH0_BASE).expect("the SAM4S");
+    check("the SAM4S", &sam4s.target.dhcsr);
+
+    let placement = zero_placement(BootloaderChoice::Keep);
+    let part = FakeSamd21::zero(Some(D21_BOOTLOADER_TABLE), 7);
+    let mut samd21 = samd21_backend(part, &placement);
+    write(&mut samd21, &d21_image(1000), placement.base()).expect("the SAM D21");
+    check("the SAM D21", &samd21.target.dhcsr);
+
+    let rp_bytes = rp2350_image(1000);
+    let mut rp2350 = Rp2350Probe::new(FakeRp2350::new(), 0x4c01_3477, "an RP2350");
+    write(&mut rp2350, &rp_bytes, lamella_cmsis_dap_rp2350::XIP_BASE).expect("the RP2350");
+    check("the RP2350", &rp2350.target.dhcsr);
+
+    let board = FakeRp2040::with_flash(1024 * 1024);
+    let mut rp2040 = Rp2040Probe::new(board, 0x0bc1_2477, "an RP2040");
+    write(&mut rp2040, &rp_bytes, lamella_cmsis_dap_rp2040::XIP_BASE).expect("the RP2040");
+    check("the RP2040", &rp2040.target.dhcsr);
+}
+
+/// **A DRIVE `--volume` NAMES MUST BE A UF2 BOOTLOADER's**, by the `INFO_UF2.TXT` a bootloader puts
+/// on its drive, the file [`crate::bootsel::waiting`] finds one by. A folder that is not one, and a
+/// drive that is not mounted, are refused by the name given, saying that nothing was written: a
+/// folder would take the file, and the write would be reported as a board running the program. A
+/// drive that is one is the one settled.
+#[test]
+fn a_named_volume_that_is_no_bootloaders_drive_is_refused_by_its_name() {
+    let folder = std::env::temp_dir().join(format!("lamella-named-volume-{}", std::process::id()));
+    let not_a_drive = folder.join("not-a-drive");
+    let a_drive = folder.join("a-drive");
+    std::fs::create_dir_all(&not_a_drive).expect("a scratch folder");
+    std::fs::create_dir_all(&a_drive).expect("a scratch folder");
+    std::fs::write(a_drive.join("INFO_UF2.TXT"), "UF2 Bootloader v1.0\nModel: Raspberry Pi RP2350\n")
+        .expect("the file a bootloader puts there");
+    for refused in [not_a_drive.clone(), folder.join("not-mounted")] {
+        let named = refused.to_str().expect("a scratch path in UTF-8");
+        let mut volume = Uf2Volume::new(Some(named), crate::RP2_XIP_BASE, crate::RP2350_UF2_FAMILY);
+        let Err(FlashError::Refused(why)) = volume.identify() else {
+            panic!("{named} is no bootloader's drive, and was settled");
+        };
+        assert!(why.starts_with(&format!("{named} is not a board's bootloader drive")), "{why}");
+        assert!(why.ends_with("Nothing was written."), "{why}");
+    }
+    let named = a_drive.to_str().expect("a scratch path in UTF-8");
+    Uf2Volume::new(Some(named), crate::RP2_XIP_BASE, crate::RP2350_UF2_FAMILY)
+        .identify()
+        .expect("a bootloader's drive is settled");
+    let _ = std::fs::remove_dir_all(&folder);
 }

@@ -1,7 +1,7 @@
 // The descriptor an RP2350 PL011-UART driver consumes: one binding's resolved values, exactly
 namespace Lamella.Boards
 {
-    public sealed class Rp2350UartBinding
+    internal sealed class Rp2350UartBinding
     {
         /// <summary>The bound PL011 instance's base address.</summary>
         public readonly uint UartBase;

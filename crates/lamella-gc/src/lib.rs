@@ -11,10 +11,10 @@ pub mod heap;
 pub mod device;
 #[allow(unsafe_code)]
 pub mod device_heap;
-#[cfg(all(feature = "gc-collect", any(test, feature = "second-segment")))]
+#[cfg(feature = "gc-collect")]
 mod segments;
 
-pub use device::{lamella_gc_alloc_impl, lamella_gc_init_device_heap};
+pub use device::{lamella_gc_alloc_impl, lamella_gc_device_free_bytes, lamella_gc_init_device_heap};
 #[cfg(feature = "second-segment")]
 pub use device::lamella_gc_init_device_second_segment;
 #[cfg(feature = "gc-collect")]
@@ -31,9 +31,9 @@ pub use device::{
 #[cfg(all(feature = "gc-collect", feature = "host-heap"))]
 pub use device::{lamella_gc_collect, lamella_gc_collect_device};
 pub use device_heap::{DeviceHeap, DeviceTypeDesc};
-#[cfg(all(feature = "gc-collect", feature = "second-segment"))]
+#[cfg(feature = "gc-collect")]
 pub use device_heap::SegmentScratch;
-#[cfg(all(feature = "gc-collect", feature = "second-segment"))]
+#[cfg(feature = "gc-collect")]
 pub use segments::forwarding_index_words_for;
 pub use heap::Ref;
 #[cfg(feature = "host-heap")]

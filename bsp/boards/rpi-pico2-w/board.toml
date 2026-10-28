@@ -168,7 +168,7 @@ active = "none"
 reserved = true
 source = "Pico 2 W datasheet p.9 + schematic: gSPI CLK = GPIO29"
 
-# --- THE USER LED IS NOT ON THIS CHIP, AND THAT IS WHY THERE IS NO ROW FOR IT ------------------
+# --- The user LED is not on this chip, and that is why there is no row for it ------------------
 #
 # On the Pico 2 the green user LED is on GP25 and a program drives it directly. On this board GP25
 # is the CYW43439's chip select above, and the LED is on WL_GPIO0 -- a GPIO of the wireless chip --

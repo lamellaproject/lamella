@@ -8,7 +8,7 @@ use crate::ast::{
     DeconstructionTarget, LambdaBody,
     LambdaParameter,
     ConversionDirection, DelegateDecl, EnumDecl, EnumMember, Expr, ExprKind, ForInitializer,
-    GotoTarget, Initializer, InterpolationPart, Literal, Member, MemberInitializer,
+    GotoTarget, Initializer, InterpolationPart, Literal, LocalFunction, Member, MemberInitializer,
     MemberInitializerValue, Modifier,
     NamespaceDecl, NamespaceMember, OverloadableOperator,
     CollectionElement, Parameter, ParameterModifier, PostfixOperator, PredefinedType,
@@ -262,12 +262,6 @@ struct Parser {
     /// Whether the member whose body is being parsed returns BY REFERENCE, so `return ref e;`
     /// inside it does not gate the feature a second time.
     ///
-    /// **csc REPORTS THE RUNG ONCE PER MEMBER, AT THE DECLARATION, AND THIS FLAG IS THE ONLY
-    /// REASON WE DO TOO.** Measured at `/langversion:6`: `ref int M() { return ref a[0]; }` draws
-    /// ONE CS8059, at the declaration's `ref` -- the body's `ref` draws nothing, because the
-    /// declaration gate already fired for that member. The same body in a BY-VALUE method draws
-    /// the gate at the body's `ref` instead, since nothing gated ahead of it. Without this,
-    /// the first program reports twice and diverges from csc on a count.
     in_ref_returning_member: bool,
     /// Whether the parser is inside an `unsafe { ... }` block, which the parser LOWERS to a
     /// plain block (pointer use is permitted regardless) -- so the one rule that needs the
@@ -310,6 +304,18 @@ enum DeconstructionTerminator {
     Assign,
     /// `foreach ((a, b) in e)`
     In,
+}
+
+/// What precedes a local function's name, as [`Parser::parse_local_function_head`] reads it.
+struct LocalFunctionHead {
+    /// Where its first attribute section opens, when it has any.
+    attributes_at: Option<u32>,
+    /// The `static` modifier's span, when it is written.
+    static_at: Option<Span>,
+    /// Every modifier, in source order.
+    modifiers: Vec<Modifier>,
+    /// The return type.
+    return_type: TypeRef,
 }
 
 /// An explicit interface member's qualified name, as [`Parser::parse_explicit_member_name`]
@@ -404,12 +410,6 @@ impl Parser {
     /// The current token's identifier text WHEN IT MAY BE READ AS A CONTEXTUAL KEYWORD -- `None`
     /// for a verbatim identifier, which 9.4.2 forces back to an ordinary name.
     ///
-    /// **ONE FUNCTION BECAUSE THE RULE HAS ONE STATEMENT AND SEVEN SITES.** `@get` is a method
-    /// named `get`, `@where` is a type named `where`, `@required` is a type named `required`, and
-    /// each is a program csc REJECTS -- so a site that compares the text alone accepts something
-    /// invalid, quietly, and every new contextual keyword adds another such site. Measured before
-    /// the fix: `class Box<T> @where T : class` compiled here and is CS1514 in csc, and
-    /// `@required int n;` was read as the modifier where csc reads a type name (CS1519).
     fn current_contextual_keyword(&self) -> Option<&str> {
         if self.current().verbatim {
             return None;
@@ -474,6 +474,23 @@ impl Parser {
             self.report(missing, Span::empty_at(at));
             at
         }
+    }
+
+    /// Requires the `)` that closes a tuple of `elements` elements, returning the byte offset just past
+    /// it. Fewer than two elements is CS8124, which csc puts on the `)`, or, when the `)` is missing,
+    /// where its absence is reported (and before that report) -- never one byte back into the token
+    /// before it, which may be a multi-byte character.
+    fn expect_tuple_close(&mut self, elements: usize) -> u32 {
+        let at = self.current().span.start;
+        let present = self.current_punctuator() == Some(Punctuator::CloseParen);
+        if elements < 2 && !present {
+            self.report(DiagnosticKind::TupleTooFewElements, Span::empty_at(at));
+        }
+        let end = self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
+        if elements < 2 && present {
+            self.report(DiagnosticKind::TupleTooFewElements, Span::empty_at(at));
+        }
+        end
     }
 
     fn report(&mut self, kind: DiagnosticKind, span: Span) {
@@ -681,13 +698,6 @@ impl Parser {
     /// Parses `using T x = e;` and REWRITES IT INTO THE `using` STATEMENT IT MEANS, taking the rest
     /// of the enclosing block as its body (C# 8.0).
     ///
-    /// **THE DESUGAR IS MEASURED AGAINST csc, NOT REASONED FROM THE SPEC TEXT.** Eight pairs, each
-    /// the declaration form beside the hand-written `using (T x = e) { rest }`, compiled by csc and
-    /// compared as IL: under `/optimize+` seven are BYTE-IDENTICAL and the eighth differs only in
-    /// which local SLOT NUMBER the variable takes -- the declaration form declares it in the
-    /// enclosing block's scope, the statement form opens a new one, so a variable declared before
-    /// it is numbered differently. The `try`/`finally`, the null test, the `Dispose` call and the
-    /// `leave` are the same instructions in the same order.
     ///
     ///
     /// So nothing after the parser learns a new shape, exactly as an expression body works.
@@ -805,6 +815,9 @@ impl Parser {
             return self.parse_local_declaration(start, ty, true);
         }
         if self.current_keyword() == Some(Keyword::Ref) {
+            if let Some(statement) = self.try_parse_local_function(start) {
+                return statement;
+            }
             let ty = self.parse_ref_local_type();
             return self.parse_local_declaration(start, ty, false);
         }
@@ -827,39 +840,89 @@ impl Parser {
         self.parse_expression_statement(start)
     }
 
-    /// A LOCAL FUNCTION (C# 7.0) -- `[modifiers] Type Name(parameters) body` inside a block --
-    /// refused by name and consumed whole, or `None`, with nothing consumed, when none begins here.
+    /// A LOCAL FUNCTION (C# 7.0, ECMA-334 7th ed 13.6.4) -- `[modifiers] Type Name(parameters)
+    /// body` inside a block -- or `None`, with nothing consumed, when none begins here.
     ///
     /// **A TYPE, A NAME AND THEN `(` OR `<` IS A LOCAL FUNCTION AND NOTHING ELSE.** A local
     /// declaration's name is followed by `=`, `,` or `;`, and no expression continues with a bare
     /// name after a type.
     ///
-    /// The gate is csc's: `local functions` at the NAME, or `static local functions` at the
-    /// `static` when the modifier is there -- one rung later, and one refusal rather than two for
-    /// one declaration.
+    ///
+    /// The rest is a method declaration's grammar (15.6.1), read in the context of a block: type
+    /// parameters, parameters, `where` clauses, then a block, an expression body or a bare `;`.
+    ///
     fn try_parse_local_function(&mut self, start: u32) -> Option<Stmt> {
+        let LocalFunctionHead {
+            attributes_at,
+            static_at,
+            modifiers,
+            return_type: ty,
+        } = self.parse_local_function_head()?;
+        if let Some(at) = attributes_at {
+            self.gate_feature(Feature::LocalFunctionAttributes, Span::empty_at(at));
+        }
+        match static_at {
+            Some(at) => self.gate_feature(Feature::StaticLocalFunctions, Span::empty_at(at.start)),
+            None => self.gate_feature_here(Feature::LocalFunctions),
+        }
+        self.finish_local_function(start, modifiers, ty)
+    }
+
+    /// Whether a local function begins here, with nothing consumed: what a compilation unit asks
+    /// of attribute sections that may lead one rather than a type.
+    fn local_function_here(&mut self) -> bool {
         let saved_position = self.position;
         let saved_diagnostics = self.diagnostics.len();
+        let found = self.parse_local_function_head().is_some();
+        self.position = saved_position;
+        self.diagnostics.truncate(saved_diagnostics);
+        found
+    }
+
+    /// A local function's attribute sections, modifiers and return type, read up to its name --
+    /// or `None`, with nothing consumed, when what follows them is not a name and then `(` or `<`.
+    fn parse_local_function_head(&mut self) -> Option<LocalFunctionHead> {
+        let saved_position = self.position;
+        let saved_diagnostics = self.diagnostics.len();
+        let attributes_at = (self.current_punctuator() == Some(Punctuator::OpenBracket))
+            .then(|| self.current().span.start);
+        if attributes_at.is_some() {
+            self.parse_attribute_sections();
+        }
         let mut static_at = None;
+        let mut modifiers = Vec::new();
         loop {
             match self.current_keyword() {
                 Some(Keyword::Static) => {
                     static_at = Some(self.current().span);
+                    modifiers.push(Modifier::Static);
                     self.bump();
                 }
-                Some(Keyword::Unsafe | Keyword::Extern) => self.bump(),
+                Some(Keyword::Unsafe) => {
+                    modifiers.push(Modifier::Unsafe);
+                    self.bump();
+                }
+                Some(Keyword::Extern) => {
+                    modifiers.push(Modifier::Extern);
+                    self.bump();
+                }
                 _ if self.current_contextual_keyword() == Some("async")
                     && matches!(
                         self.tokens.get(self.position + 1).map(|token| &token.kind),
                         Some(TokenKind::Identifier(_) | TokenKind::Keyword(_))
                     ) =>
                 {
+                    modifiers.push(Modifier::Async);
                     self.bump();
                 }
                 _ => break,
             }
         }
-        let ty = self.parse_type();
+        let ty = if self.current_keyword() == Some(Keyword::Ref) {
+            self.parse_by_ref_type()
+        } else {
+            self.parse_type()
+        };
         let is_local_function = !matches!(ty.kind, TypeRefKind::Error)
             && matches!(self.current().kind, TokenKind::Identifier(_))
             && matches!(
@@ -871,30 +934,59 @@ impl Parser {
             self.diagnostics.truncate(saved_diagnostics);
             return None;
         }
-        match static_at {
-            Some(at) => self.gate_feature(Feature::StaticLocalFunctions, Span::empty_at(at.start)),
-            None => self.gate_feature_here(Feature::LocalFunctions),
-        }
-        self.bump();
-        let _ = self.parse_type_parameter_list();
-        if self.current_punctuator() == Some(Punctuator::OpenParen) {
-            self.skip_balanced(Punctuator::OpenParen, Punctuator::CloseParen);
-        }
-        let _ = self.parse_type_parameter_constraint_clauses();
+        Some(LocalFunctionHead {
+            attributes_at,
+            static_at,
+            modifiers,
+            return_type: ty,
+        })
+    }
+
+    /// The rest of a local function after its head: the name, type parameters, parameters,
+    /// `where` clauses and the body.
+    fn finish_local_function(&mut self, start: u32, modifiers: Vec<Modifier>, ty: TypeRef) -> Option<Stmt> {
+        let name_span = self.current().span;
+        let (name, _) = self.expect_identifier();
         let enclosing_top_level = self.top_level.take();
-        let end = match self.current_punctuator() {
+        let was_async = self.in_async_method;
+        self.in_async_method = modifiers.contains(&Modifier::Async);
+        let type_parameters = self.parse_type_parameter_list(Feature::LocalFunctionAttributes);
+        let (parameters, _) = self.parse_parameter_list();
+        for section in parameters.iter().flat_map(|parameter| &parameter.attributes) {
+            self.gate_feature(Feature::LocalFunctionAttributes, Span::empty_at(section.span.start));
+        }
+        let constraints = self.parse_type_parameter_constraint_clauses();
+        let (body, end) = match self.current_punctuator() {
             Some(Punctuator::OpenBrace) => {
-                self.skip_balanced(Punctuator::OpenBrace, Punctuator::CloseBrace)
+                let block = self.parse_block();
+                let end = block.span.end;
+                (Some(block), end)
             }
             Some(Punctuator::EqualsGreaterThan) => {
-                self.bump();
-                let _ = self.parse_expression();
-                self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected)
+                let (block, end) = self
+                    .parse_expression_body(Feature::ExpressionBodiedMethod, !Self::type_is_void(&ty));
+                (Some(block), end)
             }
-            _ => self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected),
+            _ => {
+                let end = self.expect(Punctuator::Semicolon, DiagnosticKind::SemicolonExpected);
+                (None, end)
+            }
         };
+        self.in_async_method = was_async;
         self.top_level = enclosing_top_level;
-        Some(Stmt::new(StmtKind::Empty, Span::new(start, end)))
+        Some(Stmt::new(
+            StmtKind::LocalFunction(Box::new(LocalFunction {
+                modifiers,
+                return_type: ty,
+                name,
+                name_span,
+                type_parameters,
+                constraints,
+                parameters,
+                body,
+            })),
+            Span::new(start, end),
+        ))
     }
 
     /// An OUT VARIABLE DECLARATION, `out int a` / `out var a` (C# 7.0), or `None` when the `out`
@@ -1043,15 +1135,7 @@ impl Parser {
     /// A bracketed DECONSTRUCTION TARGET LIST, with the scanner on the `(`; the targets and the
     /// offset just past the closing bracket, or `None` if this is not one.
     ///
-    /// `designated` is the `var (...)` form, in which every leaf is a DECLARATION with no written
-    /// type. That is not a shorthand this collapses for convenience -- it is what csc means by it:
-    /// `int a = 0; var (b, a) = (2, 40);` is `CS0128`, a duplicate local, and not an assignment to
-    /// the `a` already in scope (measured). So `var` distributes to every leaf, at every depth,
-    /// and recording a declaration at each one loses nothing.
     ///
-    /// **AT LEAST TWO TARGETS, MATCHING THE TUPLE RULE ABOVE IT.** `(int a) = t` is `CS1073` from
-    /// csc rather than a one-element deconstruction, so a one-element list is not this production
-    /// and the caller rewinds to find whatever it really is.
     fn try_parse_deconstruction_targets(
         &mut self,
         designated: bool,
@@ -1170,13 +1254,6 @@ impl Parser {
 
     /// Whether the current token begins an `await` OPERATOR in expression position.
     ///
-    /// Inside an async method: every non-verbatim `await` (the word is reserved there,
-    /// 12.8.8.1). Outside one, only the shapes csc reads as the operator, each measured
-    /// one compilation apiece: a following identifier (`x = await T()` is CS4033), a literal, or a
-    /// token that begins a primary expression and cannot continue `await`-as-identifier
-    /// (`new`, `this`, `base`, `typeof`, `true`/`false`/`null`, a predefined type). NOT `(`
-    /// (`await(1)` stays a call of a method named `await` -- compiles in csc), NOT an
-    /// operator (`await + 1` stays identifier-plus-plus -- compiles), NOT `[`, `.`, `;`.
     fn await_operator_here(&self) -> bool {
         if !matches!(self.current_contextual_keyword(), Some("await")) {
             return false;
@@ -1213,8 +1290,6 @@ impl Parser {
     /// identifier with an optional `= expression` initializer. Array initializers
     /// are not yet parsed. Does not consume a terminator.
     ///
-    /// `refs` says what a `ref` in front of an initializer means at this position; see
-    /// [`InitializerRefs`], whose three cases are three different csc answers.
     fn parse_variable_declarators(&mut self, refs: InitializerRefs) -> Vec<VariableDeclarator> {
         let mut declarators = Vec::new();
         loop {
@@ -1890,8 +1965,18 @@ impl Parser {
     fn parse_compilation_unit(&mut self) -> CompilationUnit {
         let start = self.current().span.start;
         let mut usings = Vec::new();
-        while self.current_keyword() == Some(Keyword::Using) && !self.using_statement_here() {
-            usings.push(self.parse_using_directive());
+        let mut global_usings = Vec::new();
+        loop {
+            if self.global_using_here() {
+                if !usings.is_empty() {
+                    self.report(DiagnosticKind::GlobalUsingMustPrecedeUsings, self.current().span);
+                }
+                global_usings.push(self.parse_global_using_directive());
+            } else if self.current_keyword() == Some(Keyword::Using) && !self.using_statement_here() {
+                usings.push(self.parse_using_directive());
+            } else {
+                break;
+            }
         }
         let mut members = Vec::new();
         let mut global_attributes = Vec::new();
@@ -1922,6 +2007,11 @@ impl Parser {
                 if self.position == before {
                     self.bump();
                 }
+                continue;
+            }
+            if self.global_using_here() {
+                self.report(DiagnosticKind::UsingMustPrecedeMembers, self.current().span);
+                let _ = self.parse_global_using_directive();
                 continue;
             }
             if self.current_keyword() == Some(Keyword::Using) {
@@ -1955,6 +2045,7 @@ impl Parser {
         }
         let end = self.current().span.start;
         CompilationUnit {
+            global_usings,
             usings,
             members,
             global_attributes,
@@ -1968,9 +2059,6 @@ impl Parser {
     /// Parses a run of top-level statements, to the first token that does not begin one, adding
     /// what they show to `facts`.
     ///
-    /// The statements are parsed as an async method's body is: `await` is reserved in them (csc
-    /// answers `CS4003` for a local named `await` among top-level statements, and `await e` is
-    /// the operator whether or not the program awaits anywhere else).
     fn parse_top_level_statements(&mut self, facts: &mut TopLevelFacts) -> Vec<Stmt> {
         let was_async = core::mem::replace(&mut self.in_async_method, true);
         self.top_level = Some(*facts);
@@ -2049,6 +2137,7 @@ impl Parser {
                 self.tokens.get(self.position + 1).map(|token| &token.kind),
                 Some(TokenKind::Identifier(name)) if &**name == "alias"
             ),
+            TokenKind::Keyword(Keyword::Ref) => self.local_function_here(),
             TokenKind::Keyword(keyword) => {
                 predefined_type(&self.current().kind).is_some()
                     || matches!(
@@ -2101,6 +2190,9 @@ impl Parser {
                 | Punctuator::Asterisk
                 | Punctuator::Ampersand,
             ) => true,
+            TokenKind::Punctuator(Punctuator::OpenBracket) => {
+                !self.is_global_attribute_target() && self.local_function_here()
+            }
             _ => false,
         }
     }
@@ -2125,13 +2217,46 @@ impl Parser {
             )
     }
 
-    /// Parses a run of leading `using` directives (16.3).
+    /// Parses a NAMESPACE BODY's run of leading `using` directives (16.3).
+    ///
+    /// A `global using` here is `CS8914`, at its `global`, and is kept as this body's own
+    /// directive: the namespace the program put it in is the one scope it can be read as
+    /// belonging to without a second mistake.
     fn parse_using_directives(&mut self) -> Vec<UsingDirective> {
         let mut directives = Vec::new();
-        while self.current_keyword() == Some(Keyword::Using) {
-            directives.push(self.parse_using_directive());
+        loop {
+            if self.global_using_here() {
+                self.report(DiagnosticKind::GlobalUsingInNamespace, self.current().span);
+                directives.push(self.parse_global_using_directive());
+            } else if self.current_keyword() == Some(Keyword::Using) {
+                directives.push(self.parse_using_directive());
+            } else {
+                break;
+            }
         }
         directives
+    }
+
+    /// Whether the current token begins a `global using` directive (C# 10): the contextual
+    /// `global`, written plainly, before `using`. `global::` begins a name and `@global` is an
+    /// identifier, so neither begins one.
+    fn global_using_here(&self) -> bool {
+        self.current_contextual_keyword() == Some("global")
+            && matches!(
+                self.tokens.get(self.position + 1).map(|token| &token.kind),
+                Some(TokenKind::Keyword(Keyword::Using))
+            )
+    }
+
+    /// Parses a `global using` directive (C# 10), positioned on its `global`. The directive's span
+    /// starts at the `global`, where csc reports every rule about where one may stand.
+    fn parse_global_using_directive(&mut self) -> UsingDirective {
+        let start = self.current().span.start;
+        self.gate_feature_here(Feature::GlobalUsingDirective);
+        self.bump();
+        let mut directive = self.parse_using_directive();
+        directive.span = Span::new(start, directive.span.end);
+        directive
     }
 
     /// Parses one `using` directive (16.3): a namespace import, a static-type import, or an alias.
@@ -2148,11 +2273,13 @@ impl Parser {
         } else if matches!(self.current().kind, TokenKind::Identifier(_))
             && self.next_is(Punctuator::Equals)
         {
-            let (name, _) = self.expect_identifier();
+            let name_start = self.current().span.start;
+            let (name, name_end) = self.expect_identifier();
             self.bump();
             UsingKind::Alias {
                 name,
                 target: self.parse_aliased_qualified_name(),
+                name_span: Span::new(name_start, name_end),
             }
         } else {
             UsingKind::Namespace(self.parse_aliased_qualified_name())
@@ -2172,11 +2299,13 @@ impl Parser {
         if matches!(self.current().kind, TokenKind::Identifier(_))
             && self.next_is(Punctuator::ColonColon)
         {
+            let alias_span = self.current().span;
             let (alias, _) = self.expect_identifier();
             self.bump();
             let mut name = self.parse_qualified_name();
             name.parts
                 .insert(0, crate::ast::alias_qualifier_part(&alias));
+            name.part_spans.insert(0, alias_span);
             name.span = Span::new(start, name.span.end);
             return name;
         }
@@ -2187,20 +2316,25 @@ impl Parser {
     fn parse_qualified_name(&mut self) -> QualifiedName {
         let start = self.current().span.start;
         let mut parts = Vec::new();
+        let mut part_spans = Vec::new();
         let mut last_verbatim = self.current().verbatim;
         let (first, mut end) = self.expect_identifier();
         parts.push(first);
+        part_spans.push(Span::new(start, end));
         while self.current_punctuator() == Some(Punctuator::Dot) {
             self.bump();
             last_verbatim = self.current().verbatim;
+            let part_start = self.current().span.start;
             let (part, part_end) = self.expect_identifier();
             end = part_end;
             parts.push(part);
+            part_spans.push(Span::new(part_start, part_end));
         }
         QualifiedName {
             parts,
             last_verbatim,
             span: Span::new(start, end),
+            part_spans,
         }
     }
 
@@ -2485,7 +2619,7 @@ impl Parser {
         self.bump();
         let return_type = self.parse_type();
         let (name, _) = self.expect_identifier();
-        let type_parameters = self.parse_type_parameter_list();
+        let type_parameters = self.parse_type_parameter_list(Feature::TypeParameterAttributes);
         let (parameters, arglist) = self.parse_parameter_list();
         if let Some(span) = arglist {
             self.report(DiagnosticKind::ArglistNotValidInThisContext, span);
@@ -2562,8 +2696,6 @@ impl Parser {
     /// MISPLACED file-scoped namespace (one written inside `namespace M { ... }`) from swallowing
     /// the enclosing declaration's brace and turning one reportable mistake into a parse cascade.
     ///
-    /// The three placement rules are csc's, MEASURED one compilation each, and every
-    /// one of them turns on the immediate CONTAINER rather than on anything file-wide:
     ///
     /// | container | diagnostic |
     /// |---|---|
@@ -2576,8 +2708,6 @@ impl Parser {
     /// file-scoped body runs to end of file, a second file-scoped declaration is never a sibling of
     /// the first -- it is always nested inside it, which is why the container answers this too.
     ///
-    /// The version gate is reported separately and does not replace any of the three: csc emits
-    /// both, at every dialect, and so do we.
     fn parse_file_scoped_namespace_body(
         &mut self,
         container: NamespaceContainer,
@@ -2673,8 +2803,10 @@ impl Parser {
                 TypeKind::Class
             }
         };
-        let (name, _) = self.expect_identifier();
-        let type_parameters = self.parse_type_parameter_list();
+        let name_start = self.current().span.start;
+        let (name, name_end) = self.expect_identifier();
+        let name_span = Span::new(name_start, name_end.max(name_start));
+        let type_parameters = self.parse_type_parameter_list(Feature::TypeParameterAttributes);
         let parameters = if record_keyword.is_some()
             && self.current_punctuator() == Some(Punctuator::OpenParen)
         {
@@ -2728,6 +2860,7 @@ impl Parser {
             modifiers,
             kind,
             name,
+            name_span,
             type_parameters,
             bases,
             constraints,
@@ -2746,8 +2879,6 @@ impl Parser {
     /// Whether the identifier `required` at the current position is the C# 11 MODIFIER rather than
     /// an ordinary identifier naming the member's own type.
     ///
-    /// **MEASURED against csc, and the rule is version-dependent in a way no amount of reading the
-    /// grammar would suggest:**
     ///
     /// | source | below C# 11 | C# 11 and up |
     /// |---|---|---|
@@ -2755,10 +2886,6 @@ impl Parser {
     /// | `required Foo f;` | modifier (and gated) | modifier |
     /// | `required f;` | **a field `f` of type `required`** | modifier, then `CS1519` |
     ///
-    /// **csc does this lookahead only BELOW C# 11, to keep source that names a type `required`
-    /// compiling; at C# 11 it stops and the identifier becomes a real modifier unconditionally.**
-    /// That is a deliberate source-compatibility break in csc -- `class required { }` used as a
-    /// field type compiles at C# 10 and does not at C# 11 -- and matching it means accepting it.
     ///
     /// Recognizing it below C# 11 is what buys the clean `Feature 'required members' ... please use
     /// language version 11.0` diagnostic instead of a parse cascade, which is the whole point of
@@ -2784,14 +2911,6 @@ impl Parser {
     /// Whether the current `async` identifier is the C# 5 MODIFIER rather than a type or an
     /// ordinary name (ECMA-334 5th ed, 15.15). All rows measured against csc, one compilation each:
     ///
-    /// | source | csc reads it as |
-    /// |---|---|
-    /// | `async Task M() { }` | modifier |
-    /// | `async async async() { }` | modifier, then type `async`, then name |
-    /// | `async async() { ... }` | **a method named `async` returning type `async`** |
-    /// | `async f;` | **a field `f` of type `async`** |
-    /// | `async C() { }` | **type `async`, method `C`** (CS0246 + CS0542, not a ctor) |
-    /// | `async int f;` | modifier, then CS0106 from the binder |
     ///
     /// So it is a modifier exactly when what follows can only be read as the REST of a member
     /// header: another modifier, a predefined type (including `void`), or a scannable type
@@ -2809,34 +2928,15 @@ impl Parser {
     /// [`Parser::async_is_a_modifier_here`]'s speculative type scan, there is nothing to
     /// disambiguate: what follows is `class`, `struct` or `interface`, or this is not a modifier.
     ///
-    /// Measured against csc, and both rows matter: `public class partial { }` declares a TYPE
-    /// named `partial`, and `class C { partial x; }` declares a FIELD of that type. Neither
-    /// compiles if the identifier is claimed unconditionally.
     ///
     /// `@partial` is never a modifier: the verbatim prefix forces the ordinary identifier (9.4.2),
     /// which [`Parser::current_contextual_keyword`] already enforces for every contextual keyword.
     /// Whether a RECORD declaration begins at the current position (C# 9): the contextual keyword
     /// `record`, then an identifier or the `class`/`struct` keyword.
     ///
-    /// **THE TEST IS UNCONDITIONAL, AND THAT IS MEASURED RATHER THAN ASSUMED -- IT IS NOT HOW THE
-    /// OTHER CONTEXTUAL KEYWORDS IN THIS FILE BEHAVE.** `partial`, `async` and `required` each
-    /// need a lookahead because the identifier may be naming a type; `record` does not, because
-    /// csc takes the declaration whatever else is in scope. Three rows measured, one compilation
-    /// each, with a `class record { }` declared beside them:
     ///
-    /// | source | csc |
-    /// |---|---|
-    /// | `class C { record x; }` | a nested private RECORD named `x`, plus `CS8860` on the class |
-    /// | `class C { record x = null; }` | `CS1514 { expected` -- a record, then a stray `=` |
-    /// | `class C { record M() { return null; } }` | `CS1519` -- a POSITIONAL record `M`, then `return` |
     ///
-    /// The second and third rows are the ones that settle it: both are unambiguous field and
-    /// method shapes, both are stolen by the record grammar anyway. A parser that disambiguated
-    /// against a field would accept two programs csc rejects.
     ///
-    /// `@record` is never this: [`Parser::current_contextual_keyword`] answers `None` for a
-    /// verbatim identifier, and csc agrees -- `public @record R(int X);` is `CS0106`, a METHOD `R`
-    /// returning a type called `record`.
     fn record_declaration_here(&self) -> bool {
         matches!(self.current_contextual_keyword(), Some("record"))
             && matches!(
@@ -2849,9 +2949,6 @@ impl Parser {
     /// Whether the `ref` at the current position is a STRUCT MODIFIER (C# 7.2) rather than the
     /// `ref` of a ref-returning member, a ref local, or a `ref` parameter.
     ///
-    /// **ONLY `ref struct` AND `ref partial struct`**, measured against csc: `ref class` and
-    /// `ref interface` are CS1031 there, so csc does not take `ref` as a modifier before them
-    /// either, and `partial ref struct` is CS1585 -- the order is fixed and `ref` comes first.
     ///
     /// The lookahead may not be widened to "a modifier run ending in `struct`" the way
     /// [`Parser::partial_is_misplaced_here`] scans: `ref readonly int M()` starts with exactly
@@ -2891,9 +2988,6 @@ impl Parser {
     /// [`a rule with several implementations`] takes -- three qualifiers, none of which gained the
     /// new case.
     ///
-    /// The two gates fire at their OWN tokens, four columns apart, because that is where csc puts
-    /// them: measured at `/langversion:6`, `ref readonly int M()` draws CS8059 twice, *byref locals
-    /// and returns* at the `ref` and *readonly references* at the `readonly`.
     ///
     /// [`a rule with several implementations`]: Parser::parse_member_type
     fn parse_by_ref_type(&mut self) -> TypeRef {
@@ -2932,10 +3026,6 @@ impl Parser {
     /// is CS8172 at the SECOND declarator -- the `ref` distributes to all of them, and the one
     /// without a `ref` initializer is the error, rather than the declaration being half by value.
     ///
-    /// **THE GATE FIRES HERE AND NOT AT THE INITIALIZER'S `ref`, ONCE PER DECLARATION.** csc gates
-    /// this feature once per declaration however many `ref`s it contains: at `/langversion:6`,
-    /// `ref int r = ref a[0], s = ref a[1];` draws ONE CS8059, at the leading `ref`.
-    /// [`Parser::in_ref_local_declaration`] is what suppresses the initializers'.
     fn parse_ref_local_type(&mut self) -> TypeRef {
         self.parse_by_ref_type()
     }
@@ -2969,11 +3059,6 @@ impl Parser {
     /// standing before other modifiers rather than immediately before the declaration's keyword,
     /// which is csc's CS0267.
     ///
-    /// **THE LOOKAHEAD HAS TO REACH PAST THE MODIFIERS, AND STOPPING SHORT IS NOT A LOOSER RULE
-    /// BUT A WRONG ONE.** `partial x;` is a FIELD of type `partial` and must stay one, so the
-    /// identifier alone cannot decide; only a `class`/`struct`/`interface` after the run of
-    /// modifier keywords says a type declaration was meant. Without the scan this shape drew a
-    /// parse cascade where csc draws one CS0267.
     fn partial_is_misplaced_here(&self) -> bool {
         if !matches!(self.current_contextual_keyword(), Some("partial")) {
             return false;
@@ -3167,7 +3252,7 @@ impl Parser {
             let (name, _) = self.expect_identifier();
             let was_async = self.in_async_method;
             self.in_async_method = modifiers.contains(&Modifier::Async);
-            let type_parameters = self.parse_type_parameter_list();
+            let type_parameters = self.parse_type_parameter_list(Feature::TypeParameterAttributes);
             let (parameters, arglist) = self.parse_parameter_list();
             let constraints = self.parse_type_parameter_constraint_clauses();
             let (body, end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
@@ -3222,7 +3307,7 @@ impl Parser {
             }
             let was_async = self.in_async_method;
             self.in_async_method = modifiers.contains(&Modifier::Async);
-            let type_parameters = self.parse_type_parameter_list();
+            let type_parameters = self.parse_type_parameter_list(Feature::TypeParameterAttributes);
             let (parameters, arglist) = self.parse_parameter_list();
             let constraints = self.parse_type_parameter_constraint_clauses();
             let (body, end) = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
@@ -3324,8 +3409,6 @@ impl Parser {
     /// statement. Getting that backwards is not cosmetic -- `return e;` in a void method is
     /// `CS0127`, and a bare `e;` in a value-returning one is `CS0161`.
     ///
-    /// `feature` names the member kind, because csc's message does: *'expression-bodied method'*
-    /// and *'expression-bodied property'* are different search keys at the same version.
     fn parse_expression_body(&mut self, feature: Feature, returns_value: bool) -> (Stmt, u32) {
         let arrow = self.current().span;
         self.gate_feature(feature, arrow);
@@ -3394,8 +3477,6 @@ impl Parser {
 
     /// [`Self::gate_feature`] at the current token's start, as an empty span.
     ///
-    /// The position most gate sites want: csc reports a feature gate at the construct's first
-    /// character rather than over its extent.
     fn gate_feature_here(&mut self, feature: Feature) {
         let at = Span::empty_at(self.current().span.start);
         self.gate_feature(feature, at);
@@ -4386,18 +4467,7 @@ impl Parser {
     /// a token that cannot begin a TYPE settles every other literal without speculation. Only a
     /// NAME is genuinely ambiguous, and the two positions answer that ambiguity differently.
     ///
-    /// **THE POSITION IS A PARAMETER RATHER THAN A SECOND FUNCTION, BECAUSE THE TWO READINGS
-    /// DIFFER IN EXACTLY TWO PLACES AND SHARE EVERYTHING ELSE** -- a bare `_`, and a name with no
-    /// designator. After `is` both are C# 1.0 TYPES (measured: `o is _` is `CS0246` under csc at
-    /// every version); in a switch arm the first is a discard and the second a CONSTANT, which is
-    /// what an enum-member arm is. Two spellings of the shared part is the shape where one of them
-    /// gains a case and the other does not.
     ///
-    /// **THE FEATURE GATE IS REPORTED AT THE INTRODUCING TOKEN, NOT AT THE PATTERN, AND THAT IS
-    /// MEASURED.** csc's `CS8059` for `o is string s` at `/langversion:6` points at the `is`
-    /// keyword, and so does the one for `x is 3` -- one position for every pattern form.
-    /// Reporting at the construct that DREW the gate reads as the natural choice and puts the
-    /// caret ten columns late on a declaration pattern.
     fn parse_pattern(&mut self, operator: Span, position: PatternPosition) -> Pattern {
         if matches!(self.current().kind, TokenKind::Keyword(Keyword::Null)) {
             let at = self.current().span;
@@ -4442,9 +4512,6 @@ impl Parser {
     /// Parses a SWITCH EXPRESSION's `switch { arm, ... }`, with `governing` already built and the
     /// cursor on the `switch`.
     ///
-    /// **A TRAILING COMMA IS LEGAL AND AN EMPTY ARM LIST IS TOO** -- both measured: `x switch { }`
-    /// compiles under csc with `CS8509`, so an empty list is an exhaustiveness question rather
-    /// than a syntax error, and refusing it here would report the wrong thing.
     fn parse_switch_expression(&mut self, governing: Expr) -> Expr {
         let operator = self.current().span;
         self.bump();
@@ -4569,9 +4636,6 @@ impl Parser {
     /// x is int? n          a NULLABLE pattern type, which is CS8116
     /// ```
     ///
-    /// Both are `?` IDENT. What differs is the `:` that a conditional must have, so the test is
-    /// three tokens deep. Taking the nullable reading is what lets the BINDER give csc's message
-    /// instead of the two parse errors the conditional reading collapses into.
     fn parse_is_target_type(&mut self) -> TypeRef {
         let ty = self.parse_type_inner(false);
         if self.current_punctuator() == Some(Punctuator::Question) && self.at_nullable_pattern_type()
@@ -4583,11 +4647,6 @@ impl Parser {
 
     /// The type on the right of an `as`: [`Self::parse_is_target_type`]'s reading, and one more.
     ///
-    /// **A `?` FOLLOWED BY A TOKEN THAT CANNOT BEGIN AN EXPRESSION IS THE TYPE'S OWN**, because the
-    /// conditional operator it would otherwise be needs an operand there. That is Roslyn's rule for
-    /// this position, and without it `o as int?;` (C# 2.0) and `o as string?;` (C# 8.0) read the
-    /// `?` as a conditional and failed at the `;`, on programs csc compiles (the first) or reports
-    /// by name (the second, CS8651). `x as T ? a : b` keeps its conditional: `a` begins one.
     fn parse_as_target_type(&mut self) -> TypeRef {
         let ty = self.parse_is_target_type();
         if self.current_punctuator() == Some(Punctuator::Question)
@@ -4778,16 +4837,6 @@ impl Parser {
 
     /// The postfix chain applied to an already-parsed operand.
     ///
-    /// **SPLIT FROM [`parse_postfix`](Self::parse_postfix) SO A `?.` CAN TAKE THE REST OF THE CHAIN
-    /// AS A SUBTREE.** `a?.B.C` skips `B` AND `C` when `a` is null, so the null-conditional node
-    /// has to CONTAIN the trailing accesses rather than be contained by them -- and "the trailing
-    /// accesses" is exactly what one more turn of this loop parses. Recursing on a placeholder is
-    /// what makes the two readings the same code.
-    /// `dependent_only` stops the chain before a postfix `++`/`--`, which is what a null-conditional
-    /// access's chain admits: the grammar lets `?.` be followed by `.name`, `(args)` and `[args]`
-    /// and NOTHING else. **`b?.N++` is `(b?.N)++`, not `b?.(N++)`** -- measured, csc reports
-    /// `CS1059` because the operand is then an `int?` VALUE rather than a variable. Letting the
-    /// chain swallow the `++` accepted that program instead.
     fn parse_postfix_from(&mut self, operand: Expr, dependent_only: bool) -> Expr {
         let mut expr = operand;
         loop {
@@ -4991,9 +5040,6 @@ impl Parser {
     /// raised in here points at the source the reader wrote. An `EndOfFile` is appended because
     /// every path in this parser expects one and none of them may run off the end.
     ///
-    /// An empty hole parses to nothing rather than to `CS1525`: the scanner already reported
-    /// `CS1733` for it, and a second complaint about the same absence is a cascade csc does not
-    /// emit.
     fn parse_interpolation_operand(&mut self, tokens: &[Token], hole: Span) -> Expr {
         if !tokens.iter().any(|token| !token.is_trivia()) {
             return Expr::new(ExprKind::Error, hole);
@@ -5280,13 +5326,7 @@ impl Parser {
                     let value = self.parse_expression();
                     elements.push(TupleElementExpr { name, value });
                 }
-                let end = self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
-                if elements.len() < 2 {
-                    self.report(
-                        DiagnosticKind::TupleTooFewElements,
-                        Span::empty_at(end.saturating_sub(1)),
-                    );
-                }
+                let end = self.expect_tuple_close(elements.len());
                 Expr::new(ExprKind::Tuple { elements }, Span::new(span.start, end))
             }
             TokenKind::Keyword(keyword)
@@ -5348,11 +5388,6 @@ impl Parser {
     /// The size list of an array creation `new int[e, ...]` (17.6), which is punctuated like an
     /// argument list and is not one.
     ///
-    /// **A NAME IS NOT PART OF THIS GRAMMAR AT ANY VERSION, SO THIS LIST DOES NOT LOOK FOR ONE.**
-    /// Because it does not, `new int[n: 3]` stops at the `:` with the missing-separator
-    /// diagnostic, which is what csc reports there and at the same column (measured: CS1003, at
-    /// the colon). Recognizing the name here and rejecting it afterwards would mean inventing a
-    /// diagnostic csc has no equivalent of.
     fn parse_sizes(&mut self, close: Punctuator, missing: DiagnosticKind) -> (Vec<Expr>, u32) {
         let (sizes, end) = self.parse_argument_list(close, missing, false);
         (sizes.into_iter().map(|size| size.value).collect(), end)
@@ -5516,9 +5551,6 @@ impl Parser {
     /// speculation while the EXPRESSION side does: nothing else in the grammar of a type opens
     /// with a bracket, so a `(` here can only start a tuple.
     ///
-    /// A one-element list is not a tuple and never becomes one -- see [`TypeRefKind::Tuple`] --
-    /// and csc refuses it (CS8124, measured), so the arity is checked here rather than left for a
-    /// later pass to discover.
     fn parse_tuple_type(&mut self) -> TypeRef {
         let start = self.current().span.start;
         self.gate_feature(Feature::Tuples, Span::empty_at(start));
@@ -5543,13 +5575,7 @@ impl Parser {
             }
             break;
         }
-        let end = self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
-        if elements.len() < 2 {
-            self.report(
-                DiagnosticKind::TupleTooFewElements,
-                Span::empty_at(end.saturating_sub(1)),
-            );
-        }
+        let end = self.expect_tuple_close(elements.len());
         TypeRef::new(TypeRefKind::Tuple(elements), Span::new(start, end))
     }
 
@@ -5603,10 +5629,6 @@ impl Parser {
     /// to predefined keywords would leave `TimeSpan?` and `GpioController?` unwritable, which is
     /// most of what real source spells.
     ///
-    /// BELOW C# 2 ONLY A PREDEFINED VALUE-TYPE KEYWORD IS TAKEN, and it is refused: `int ?` is
-    /// never a valid C# 1.0 conditional (a keyword is not an expression), whereas a user type
-    /// `Foo ?` IS one. CS8022 is the code csc uses, and the `?` is dropped to recover to the
-    /// underlying type.
     ///
     /// Separate from the suffix loop so ARRAY CREATION can take it too: `new int?[2]` parses its
     /// element type with [`parse_non_array_type`](Self::parse_non_array_type) and dispatches on the
@@ -5767,10 +5789,6 @@ impl Parser {
     /// Reports the C# 3.0 initializer gate at the current `{` when the dialect does not permit one.
     ///
     ///
-    /// **The two forms are the SAME version and DIFFERENT nouns**, so which one the message names
-    /// is decided here rather than by the feature table: csc reports `'object initializer'` for
-    /// `new C { F = 1 }` and `'collection initializer'` for `new ArrayList { 1, 2 }`. Both
-    /// measured, as is the tie-break -- **an EMPTY `new C { }` is an object initializer**.
     fn gate_initializer_if_unsupported(&mut self) {
         let feature = if self.initializer_assigns_a_member() {
             Feature::ObjectInitializer
@@ -5782,12 +5800,6 @@ impl Parser {
 
     /// Parses an object or collection initializer `{ ... }`, positioned on the `{` (C# 3.0).
     ///
-    /// **Which kind it is is decided by the first element and nothing else** -- `identifier =` opens
-    /// an object initializer, anything else a collection one, and an EMPTY `{ }` is an object
-    /// initializer because that is what csc calls it. Both spellings are the same version, so the
-    /// distinction exists for the MESSAGE and for what the binder must then check: a collection
-    /// initializer needs `IEnumerable` and an `Add` (csc CS1922 / CS1061), an object initializer
-    /// needs the named members to exist and be settable (CS0117 / CS0191 / CS0200 / CS1914).
     ///
     /// A TRAILING COMMA is legal in both, measured.
     fn parse_initializer(&mut self) -> (Initializer, u32) {
@@ -5828,10 +5840,6 @@ impl Parser {
     /// One element of a collection initializer: an expression, or `{ a, b }` -- a BRACED ARGUMENT
     /// LIST handed to a single `Add` call.
     ///
-    /// **THE BRACED FORM IS NOT A NESTED INITIALIZER.** `new D { { 1, "a" } }` is `D.Add(1, "a")`,
-    /// which is the whole of how a dictionary initializer works: there is no dictionary construct
-    /// in the language, only an element with two arguments. Measured against csc, which takes one,
-    /// two or three, and mixes braced and bare elements in one initializer.
     ///
     /// Arity is not checked here. A braced element of two against a one-argument `Add` is
     /// `CS1501`, which is ordinary overload resolution and so the binder's.
@@ -5889,9 +5897,6 @@ impl Parser {
     /// opposed to listing elements. csc's own discriminator, and it needs only the two tokens after
     /// the brace: an object initializer's first element is always `identifier =`.
     ///
-    /// An empty `{ }` answers `true`, because that is what csc calls it. `{ F = { G = 1 } }` also
-    /// answers `true` from the outer brace and again from the inner one, matching csc's two
-    /// diagnostics for that program.
     fn initializer_assigns_a_member(&self) -> bool {
         if matches!(
             self.tokens.get(self.position + 1).map(|token| &token.kind),
@@ -5921,7 +5926,7 @@ impl Parser {
                 Punctuator::CloseBracket,
                 DiagnosticKind::TokenExpected { expected: "]" },
             );
-            let rank = (sizes.len() as u8).max(1);
+            let rank = (sizes.len() as u32).max(1);
             (sizes, rank, end)
         };
         let mut extra_ranks = Vec::new();
@@ -6015,10 +6020,6 @@ impl Parser {
     /// type parse -- one feature diagnostic (CS8022) at the `<`, the same one `typeof(List<int>)`
     /// draws, from the same line of code.
     ///
-    /// A specifier on a NON-FINAL part -- `typeof(List<>.Enumerator)` -- is not accepted, though
-    /// the grammar allows one after every part and csc compiles it. [`TypeRefKind::Unbound`]
-    /// carries ONE arity for a whole dotted name, so there is nowhere to record which part the
-    /// specifier sat on. This answers `None` for it and the ordinary type parse refuses.
     fn parse_unbound_type_name(&mut self) -> Option<TypeRef> {
         if !self.version.supports(Feature::Generics) {
             return None;
@@ -6160,15 +6161,6 @@ impl Parser {
     /// So the `>>` is consumed WHOLE by the inner list, which hands its second half outward as a
     /// credit. Nothing in the token stream is mutated, and rollback stays position-only.
     ///
-    /// **ONLY A `nested` LIST MAY CONSUME A `>>`, AND THAT IS C#'s RULE RATHER THAN AN
-    /// IMPLEMENTATION CONVENIENCE.** The grammar splits `>>` into two `>` for a type-argument list
-    /// and nowhere else, so an OUTERMOST list has nothing to give the second half to. Letting it
-    /// close on one anyway reads `a<b>>c;` as a local declaration `a<b> c;` where the language --
-    /// and csc -- read the shift expression `a < b >> c`. Refusing to close leaves the `>>` in
-    /// place, the speculative type parse fails, and the statement falls through to the expression
-    /// reading it should have had.
-    /// Whether the `<` at the cursor opens a generic method call's type-argument list rather than a
-    /// less-than operator -- decided by SPECULATION, because the two are identical up to the `>`.
     ///
     /// `a < b > (c)` is two comparisons and `M<int>(x)` is one call, and no amount of looking at the
     /// `<` itself separates them. So this parses a candidate type-argument list and asks what
@@ -6299,13 +6291,6 @@ impl Parser {
     /// reports the feature diagnostic once and skips the balanced `<...>` so the rest of the
     /// declaration still parses. Returns the declared parameters, empty in both other cases.
     ///
-    /// **THE USE SITE HAD THE GATE AND THE DECLARATION SITES DID NOT, AND THE DIFFERENCE WAS
-    /// VISIBLE IN THE DIAGNOSTICS.** Measured against csc at `/langversion:ISO-1`, which answers all
-    /// three of `class C<T> { }`, `T M<T>(T x)` and `List<int>` with ONE feature diagnostic. lcsc
-    /// answered the use site the same way and the two declaration sites with a parse CASCADE --
-    /// `class C<T> { }` drew CS1031 + CS1514 + CS1519 and a generic method drew six codes, none of
-    /// which csc emits there. Codes csc does not emit are the false-positive column, so this was
-    /// not merely untidy.
     ///
     /// **PARSING IS NOT ACCEPTING, AND THE DIFFERENCE LIVES IN THE BINDER.**
     /// [`crate::version::Feature::Generics`] is in the NOT-IMPLEMENTED set, so above C# 2 the
@@ -6315,7 +6300,10 @@ impl Parser {
     /// name the construct at all; a half-implemented feature that reaches EMIT is the silent
     /// miscompile this pair of bits exists to prevent, and is how the automatically-implemented
     /// -property hole got in.
-    fn parse_type_parameter_list(&mut self) -> Vec<TypeParameter> {
+    ///
+    /// A type parameter's attribute sections are read and refused by name as `attributes`, at
+    /// each section's `[`: the feature its declaration gates them under.
+    fn parse_type_parameter_list(&mut self, attributes: Feature) -> Vec<TypeParameter> {
         if self.current_punctuator() != Some(Punctuator::LessThan) {
             return Vec::new();
         }
@@ -6328,6 +6316,9 @@ impl Parser {
         self.bump();
         let mut parameters = Vec::new();
         loop {
+            for section in self.parse_attribute_sections() {
+                self.gate_feature(attributes, Span::empty_at(section.span.start));
+            }
             let span = self.current().span;
             let (name, end) = self.expect_identifier();
             parameters.push(TypeParameter {
@@ -6353,12 +6344,6 @@ impl Parser {
     /// consumed its `:` by the time this runs, so a bare `where` in that position is a type name and
     /// is left alone.
     ///
-    /// **Parsed at every language version, INCLUDING below C# 2 where generics are gated.** The
-    /// gate fires once, in [`Parser::parse_type_parameter_list`]; if the clauses were then left
-    /// unparsed, `class C<T> where T : class { }` would report the honest CS8022 and follow it with
-    /// a cascade at `where` from the brace expectation -- codes csc does not emit here, which is the
-    /// false-positive column this parser measures itself against. Producing the tree is not
-    /// accepting it; the binder is what refuses.
     fn parse_type_parameter_constraint_clauses(&mut self) -> Vec<TypeParameterConstraintClause> {
         let mut clauses = Vec::new();
         while self.current_is_constraint_clause_start() {
@@ -6500,12 +6485,12 @@ impl Parser {
     /// Consumes an array rank-specifier `[` `,`* `]` if one begins here, returning
     /// its rank and the offset past the `]`. A `[` that is not a rank-specifier
     /// (it holds an index expression) is left untouched for element access.
-    fn try_rank_specifier(&mut self) -> Option<(u8, u32)> {
+    fn try_rank_specifier(&mut self) -> Option<(u32, u32)> {
         if self.current_punctuator() != Some(Punctuator::OpenBracket) {
             return None;
         }
         let mut index = self.position + 1;
-        let mut commas: u8 = 0;
+        let mut commas: u32 = 0;
         while matches!(
             self.tokens.get(index).map(|token| &token.kind),
             Some(TokenKind::Punctuator(Punctuator::Comma))
@@ -6631,9 +6616,6 @@ const SHIFT_PRECEDENCE: u8 = 8;
 /// The precedence of a SWITCH EXPRESSION's `switch`: one level TIGHTER than multiplicative, the
 /// highest entry in [`binary_operator`]'s table, and looser than unary.
 ///
-/// Measured rather than read off the grammar, in both directions: `2 * x switch { _ => "s" }` is
-/// `CS0019` for `int * string` under csc, so the switch took `x` and not `2 * x`; and
-/// `-x switch { _ => "s" }` compiles, so it took `-x` and not `x`.
 const SWITCH_PRECEDENCE: u8 = 11;
 
 /// Which position a pattern is being parsed in, for the two decisions that differ between them.
@@ -6868,16 +6850,7 @@ struct RecordStateMember {
 /// The MEMBERS a record's generated methods range over, in declaration order: its positional
 /// parameters, then the instance fields and properties its body declares.
 ///
-/// **csc RANGES OVER THE STATE, NOT OVER THE POSITIONAL LIST**, which is why the body form gets a
-/// full equality group too -- `record R { public int X; }` compares and prints `X`. A `static` or
-/// `const` member is not state and is skipped.
 ///
-/// **TWO SETS, NOT ONE, BECAUSE csc USES TWO.** Value equality, the hash and the copy constructor
-/// range over the record's instance FIELDS, whatever their accessibility -- a private field is
-/// compared and copied, and a computed property, which has no field, is neither. `PrintMembers`
-/// ranges over the PUBLIC fields and readable properties, computed ones included. Measured on
-/// .NET: `record R { private int _s; ... }` answers `new R(1) == new R(2)` with `False`, and
-/// `record R(int X) { public int Twice => X * 2; }` compiles and prints `Twice = 6`.
 ///
 fn record_state_members(parameters: &[Parameter], members: &[Member]) -> Vec<RecordStateMember> {
     let mut state: Vec<RecordStateMember> = parameters
@@ -6972,13 +6945,7 @@ fn record_state_members(parameters: &[Parameter], members: &[Member]) -> Vec<Rec
 /// two parts of a partial class do. The names no source can spell, `<Main>$` and `<Main>`, are
 /// ordinary identifiers in the tree.
 ///
-/// **THE SECOND METHOD IS THE ENTRY POINT WHEN THERE IS ONE.** An entry point returns `void` or
-/// `int` (ECMA-334 7.1), so an awaiting program runs through a synchronous method that waits for
-/// the task its statements return -- the shape the standard gives an asynchronous `Main`, and the
-/// shape csc writes, measured: `<Main>` calls `<Main>$`, then `GetAwaiter().GetResult()`.
 ///
-/// Every span is the statements' own: a diagnostic about the entry point or about `Program`
-/// itself is reported where the first statement begins, as csc's are.
 fn top_level_program(statements: Vec<Stmt>, facts: TopLevelFacts) -> TypeDecl {
     let first = statements.first().map_or(0, |statement| statement.span.start);
     let last = statements.last().map_or(first, |statement| statement.span.end);
@@ -7055,6 +7022,7 @@ fn top_level_program(statements: Vec<Stmt>, facts: TopLevelFacts) -> TypeDecl {
         modifiers: alloc::vec![Modifier::Partial],
         kind: TypeKind::Class,
         name: Box::from(TOP_LEVEL_PROGRAM),
+        name_span: Span::empty_at(span.start),
         type_parameters: Vec::new(),
         bases: Vec::new(),
         constraints: Vec::new(),
@@ -7067,18 +7035,7 @@ fn top_level_program(statements: Vec<Stmt>, facts: TopLevelFacts) -> TypeDecl {
 
 /// Adds the members a `record` declaration generates, as ORDINARY SYNTAX.
 ///
-/// **A DESUGAR, FOR THE REASON `=>` IS ONE.** Every member csc synthesizes for a record is
-/// expressible in the language it is a record of -- a property, a constructor, a method -- so
-/// producing them here means the binder, the flow analysis and the emitter see shapes they already
-/// handle, and none of them learns what a record is. The one name that cannot be TYPED,
-/// `<Clone>$`, is still an ordinary identifier in the tree.
 ///
-/// **EVERY FORM GETS THE WHOLE GROUP, AND NONE OF IT IS OPTIONAL.** A record missing `Equals(R)`
-/// or `op_Equality` is an assembly whose members a csc-built consumer calls and does not find, so
-/// the positional list decides only the properties, the constructor and `Deconstruct` -- value
-/// equality, the hash, `ToString`/`PrintMembers`, `<Clone>$` and the copy constructor are
-/// generated for the body form too. Measured over three record forms against csc's own inventory
-/// (`tools/record-split.ps1 -Members`).
 ///
 /// **A RECORD THAT INHERITS IS REFUSED RATHER THAN GENERATED**, because the shape differs in ways
 /// only the binder can see: a derived record OVERRIDES `EqualityContract`, `ToString`,
@@ -7188,12 +7145,6 @@ fn synthesize_record_members(declaration: &mut TypeDecl) {
 /// The value-equality group, `ToString`/`PrintMembers`, `<Clone>$`, the copy constructor and
 /// `Deconstruct` -- every member csc generates for a record beyond its positional properties.
 ///
-/// **THE SHAPE IS csc'S, MEASURED RATHER THAN RECALLED** (`tools/record-split.ps1 -Members`, and
-/// the IL of each body read once). `EqualityContract` is `protected virtual`, `Equals(R)` is
-/// `public virtual` and NEW, `Equals(object)` and `ToString` and `GetHashCode` are OVERRIDES,
-/// `PrintMembers` is `protected virtual`, `<Clone>$` is `public virtual`, and the copy constructor
-/// is `protected`. Those modifiers are the whole difference between an assembly a csc-built
-/// consumer can call and one it cannot.
 fn synthesize_record_equality(
     declaration: &TypeDecl,
     parameters: &[Parameter],
@@ -8579,6 +8530,21 @@ mod tests {
                 GotoTarget::Case(value) => format!("(goto-case {})", dump(value)),
                 GotoTarget::Default => String::from("(goto-default)"),
             },
+            StmtKind::LocalFunction(function) => {
+                let mut text = format!(
+                    "(local-function {} {}",
+                    dump_type(&function.return_type),
+                    function.name
+                );
+                for parameter in &function.parameters {
+                    text.push_str(&format!(" ({} {})", dump_type(&parameter.ty), parameter.name));
+                }
+                match &function.body {
+                    Some(body) => text.push_str(&format!(" {})", dump_stmt(body))),
+                    None => text.push_str(" ;)"),
+                }
+                text
+            }
             StmtKind::Error => String::from("<error-stmt>"),
         }
     }
@@ -8599,6 +8565,32 @@ mod tests {
             .iter()
             .map(Diagnostic::code)
             .collect()
+    }
+
+    /// A local function is the declaration it reads as: return type, name, parameters and a body,
+    /// an expression body desugared to the block it means, and a bare `;` kept as no body at all
+    /// (13.6.4). Its body is parsed, so an error inside it is reported where it stands.
+    #[test]
+    fn a_local_function_parses_to_its_declaration() {
+        let tree = |source: &str| dump_stmt(&parse_statement(source).statement);
+        assert_eq!(
+            tree("{ int Sq(int v) => v * v; }"),
+            "(block (local-function int Sq (int v) (block (return (* v v)))))"
+        );
+        assert_eq!(
+            tree("{ void Say(string s) { } }"),
+            "(block (local-function void Say (string s) (block)))"
+        );
+        assert_eq!(
+            tree("{ static extern int F(); }"),
+            "(block (local-function int F ;))"
+        );
+        let parsed = parse_statement("{ int F() { return 1 + ; } }");
+        assert!(
+            parsed.diagnostics.iter().any(|d| d.code() == 1525),
+            "the body's own syntax error is reported: {:?}",
+            parsed.diagnostics
+        );
     }
 
     #[test]
@@ -9319,7 +9311,7 @@ mod tests {
         match &directive.kind {
             UsingKind::Namespace(name) => format!("(using {})", dump_qname(name)),
             UsingKind::Static(name) => format!("(using-static {})", dump_qname(name)),
-            UsingKind::Alias { name, target } => {
+            UsingKind::Alias { name, target, .. } => {
                 format!("(using-alias {name} {})", dump_qname(target))
             }
         }
@@ -9840,6 +9832,13 @@ mod tests {
     fn dump_unit(unit: &CompilationUnit) -> String {
         let mut parts = String::new();
         let mut first = true;
+        for using in &unit.global_usings {
+            if !first {
+                parts.push(' ');
+            }
+            first = false;
+            parts.push_str(&format!("(global {})", dump_using(using)));
+        }
         for using in &unit.usings {
             if !first {
                 parts.push(' ');
@@ -9912,9 +9911,6 @@ mod tests {
     /// accessor. All five parse; the two GROUPS sit at different rungs, which is the part a single
     /// feature would have flattened.
     ///
-    /// csc counts an expression-bodied OPERATOR as `expression-bodied method` and admits it at 6.0,
-    /// while a constructor, static constructor and destructor are `expression body constructor and
-    /// destructor` at 7.0. Measured, both directions.
     #[test]
     fn an_expression_body_is_accepted_on_every_member_that_takes_one() {
         assert!(unit_codes("public class P { public static P operator +(P a, P b) => a; }").is_empty());
@@ -10069,13 +10065,7 @@ mod tests {
     /// x => x                     'lambda expression'                    C# 3.0
     /// ```
     ///
-    /// The accessor's name is not spelled like the other three, and the indexer does not call
-    /// itself a property. Both are csc's, copied rather than derived, because the text is a search
-    /// key.
     ///
-    /// The gate lives at these five parser sites rather than in the lexer, which cannot tell them
-    /// apart: it named the lambda for all of them, and returned `Unknown`, so three of the five
-    /// forms drew cascade diagnostics csc does not emit.
     #[test]
     fn an_expression_body_is_gated_at_its_own_member_kind() {
         let at = |version: LanguageVersion, source: &str| {
@@ -10185,12 +10175,6 @@ mod tests {
     /// The dump with a record's VALUE-EQUALITY GROUP elided, so a test about the DECLARATION reads
     /// as one.
     ///
-    /// **THE GROUP IS PROVEN ELSEWHERE AND BY A BETTER ORACLE.** `tools/record-members.ps1`
-    /// compares what lcsc and csc each WROTE, member by member and flag by flag, and
-    /// `tools/record-runtime.ps1` compares what they DO against .NET. Pasting the group's tree into
-    /// nine assertions here would add two thousand characters that say only "the synthesis did what
-    /// this file's synthesis does" -- a test mirroring its implementation -- while making the
-    /// positional list, the base list and the user-declared-member rule unreadable.
     ///
     /// The elision is ANCHORED on the group's first member, so a synthesis that stopped emitting it
     /// fails these tests rather than quietly leaving them green.
@@ -11087,10 +11071,6 @@ mod tests {
     /// reads one has to ask the same question -- which is why they all ask
     /// [`Parser::current_contextual_keyword`] rather than comparing the text.
     ///
-    /// **THE PAIRS ARE THE POINT.** Each plain spelling must keep working, or a guard that refuses
-    /// everything would pass the verbatim half on its own. Both halves were scored against csc
-    /// before this was written: `class Box<T> @where T : class` is CS1514 there and USED TO COMPILE
-    /// here, and `@required int n;` is CS1519 there while this compiler read the modifier.
     #[test]
     fn a_verbatim_contextual_keyword_is_never_read_as_one() {
         assert_eq!(unit_codes_at("class Box<T> where T : class { }", LanguageVersion::CSharp2), vec![]);
@@ -11627,6 +11607,38 @@ mod tests {
         );
     }
 
+    /// A one-element tuple type missing its `)` is CS8124 where the missing `)` is reported, and
+    /// before that report, as csc orders them -- never one byte back into the element's name, which
+    /// here is a two-byte character no column could be mapped from.
+    #[test]
+    fn a_short_tuple_missing_its_bracket_reports_where_the_bracket_is_missing() {
+        let source = "class C { (int \u{e9}; }";
+        let at = source.find(';').unwrap() as u32;
+        let found: Vec<(u16, u32)> = parse_compilation_unit(source)
+            .diagnostics
+            .iter()
+            .map(|diagnostic| (diagnostic.code(), diagnostic.span.start))
+            .collect();
+        assert_eq!(found[..2], [(8124, at), (1026, at)], "{found:?}");
+    }
+
+    /// A rank-specifier's rank is one more than its commas at any count: 255 commas are rank 256,
+    /// past what one byte holds, as csc writes it.
+    #[test]
+    fn a_rank_past_255_is_kept_whole() {
+        for commas in [255, 256] {
+            let source = format!("class C {{ int[{}] a; }}", ",".repeat(commas));
+            let parsed = parse_compilation_unit(&source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let text = format!("{:?}", parsed.unit);
+            assert!(
+                text.contains(&format!("rank: {}", commas + 1)),
+                "{commas} commas must be rank {}",
+                commas + 1
+            );
+        }
+    }
+
     /// Every diagnostic of a compilation unit parsed at `version`, as `(code, offset, message)`
     /// with the code carrying its namespace -- the whole of what a reader is shown.
     fn unit_diagnostics_at(source: &str, version: LanguageVersion) -> Vec<(String, usize, String)> {
@@ -11663,17 +11675,6 @@ mod tests {
                 "static class E { public static int Twice(this int v) { return v * 2; } }",
                 "this",
                 "extension method",
-            ),
-            (
-                "class P { void M() { int Sq(int a) { return a * a; } } }",
-                "Sq",
-                "local functions",
-            ),
-            ("class P { void M() { T Id<T>(T x) => x; } }", "Id", "local functions"),
-            (
-                "class P { void M() { static int Sq(int a) { return a * a; } } }",
-                "static int",
-                "static local functions",
             ),
             (
                 "using System.Collections; class P { IEnumerable M() { yield return 1; } }",
@@ -11929,6 +11930,145 @@ mod tests {
             LanguageVersion::CSharp11,
         );
         assert_eq!(twice.iter().filter(|(code, ..)| code == "CS1529").count(), 2, "{twice:?}");
+    }
+
+    /// A `global using` directive of each kind is the unit's own list, ahead of its ordinary
+    /// directives, and each one's span starts at its `global`.
+    #[test]
+    fn global_using_directives_are_the_units_own_list() {
+        let source = "global using System;\nglobal using static System.Math;\n\
+                      global using SB = System.Text.StringBuilder;\nusing System.IO;\nclass C { }";
+        let tree = unit_tree_at(source, LanguageVersion::CSharp10);
+        assert!(
+            tree.starts_with(
+                "(global (using System)) (global (using-static System.Math)) \
+                 (global (using-alias SB System.Text.StringBuilder)) (using System.IO) (class C"
+            ),
+            "{tree}"
+        );
+        let unit = parse_compilation_unit(source).unit;
+        assert_eq!((unit.global_usings.len(), unit.usings.len()), (3, 1));
+        let starts: Vec<usize> =
+            unit.global_usings.iter().map(|using| using.span.start as usize).collect();
+        let globals: Vec<usize> = source.match_indices("global").map(|(at, _)| at).collect();
+        assert_eq!(starts, globals);
+    }
+
+    /// The directives a .NET project's generated `GlobalUsings.g.cs` holds -- `global using
+    /// global::System;` and its kind -- are global directives naming the root namespace.
+    #[test]
+    fn the_generated_global_usings_file_parses() {
+        let source = "// <auto-generated/>\nglobal using global::System;\n\
+                      global using global::System.Collections.Generic;\n";
+        let tree = unit_tree_at(source, LanguageVersion::CSharp10);
+        assert_eq!(
+            tree,
+            "(global (using global::.System)) (global (using global::.System.Collections.Generic))"
+        );
+    }
+
+    /// Where a `global using` may stand, csc's codes at csc's positions, each at the `global`
+    /// (measured): after an ordinary directive CS8915, in a namespace of either form CS8914, and
+    /// after a statement, a type or an `[assembly:]` section CS1529, the misplaced-directive rule.
+    #[test]
+    fn where_a_global_using_may_stand_is_csc_s() {
+        let rows: &[(&str, &str)] = &[
+            ("using System;\nglobal using System.Text;", "CS8915"),
+            ("namespace N { global using System; }", "CS8914"),
+            ("namespace N;\nglobal using System;", "CS8914"),
+            ("class C { }\nglobal using System;", "CS1529"),
+            ("System.Console.WriteLine(1);\nglobal using System;", "CS1529"),
+            ("[assembly: System.CLSCompliant(true)]\nglobal using System;", "CS1529"),
+        ];
+        for (source, code) in rows {
+            let diagnostics = unit_diagnostics_at(source, LanguageVersion::CSharp10);
+            let offset = source.find("global").expect("the row writes a global using");
+            assert_eq!(
+                diagnostics.iter().map(|(code, offset, _)| (code.as_str(), *offset)).collect::<Vec<_>>(),
+                alloc::vec![(*code, offset)],
+                "{source:?} drew {diagnostics:?}"
+            );
+        }
+        let unit = parse_compilation_unit("using System;\nglobal using System.Text;").unit;
+        assert_eq!((unit.global_usings.len(), unit.usings.len()), (1, 1));
+        let unit = parse_compilation_unit("namespace N { global using System; }").unit;
+        assert!(unit.global_usings.is_empty());
+        match &unit.members[..] {
+            [NamespaceMember::Namespace(namespace)] => assert_eq!(namespace.usings.len(), 1),
+            other => panic!("one namespace: {other:?}"),
+        }
+    }
+
+    /// Below C# 10 a `global using` is the feature gate at its `global`, in every place it may
+    /// be written and beside whatever else that place draws (each measured: CS8773 at C# 9, CS8026
+    /// at C# 5, where `using static` is gated too).
+    #[test]
+    fn a_global_using_below_csharp_10_is_gated_at_its_global() {
+        let at = |source: &str, version| {
+            let mut found: Vec<(String, usize)> = unit_diagnostics_at(source, version)
+                .into_iter()
+                .map(|(code, offset, _)| (code, offset))
+                .collect();
+            found.sort();
+            found
+        };
+        assert_eq!(
+            at("global using System;\nclass C { }", LanguageVersion::CSharp9),
+            [("CS8773".to_string(), 0)]
+        );
+        assert_eq!(
+            at("global using static System.Math;", LanguageVersion::CSharp5),
+            [("CS8026".to_string(), 0), ("CS8026".to_string(), 13)]
+        );
+        assert_eq!(
+            at("namespace N { global using System; }", LanguageVersion::CSharp9),
+            [("CS8773".to_string(), 14), ("CS8914".to_string(), 14)]
+        );
+        assert!(at("global using System;", LanguageVersion::CSharp10).is_empty());
+    }
+
+    /// `global` begins a directive only before `using`: `global::` begins a name, so a top-level
+    /// statement written with one is still a statement.
+    #[test]
+    fn global_begins_a_directive_only_before_using() {
+        let source = "global::System.Console.WriteLine(1);";
+        let unit = parse_compilation_unit(source).unit;
+        assert!(unit.global_usings.is_empty());
+        assert!(unit_tree_at(source, LanguageVersion::CSharp10).contains("Program"));
+    }
+
+    /// A dotted name carries each part's span, and an alias directive its alias's: what a
+    /// diagnostic about one part, or about a repeated alias, points at.
+    #[test]
+    fn a_dotted_name_and_an_alias_carry_their_parts_spans() {
+        let source = "using System.Text;\nusing global::System;\nusing A = System.Text.StringBuilder;";
+        let unit = parse_compilation_unit(source).unit;
+        let spans = |name: &QualifiedName| {
+            name.part_spans
+                .iter()
+                .map(|span| &source[span.start as usize..span.end as usize])
+                .collect::<Vec<_>>()
+        };
+        match &unit.usings[..] {
+            [first, second, third] => {
+                match &first.kind {
+                    UsingKind::Namespace(name) => assert_eq!(spans(name), ["System", "Text"]),
+                    other => panic!("a namespace directive: {other:?}"),
+                }
+                match &second.kind {
+                    UsingKind::Namespace(name) => assert_eq!(spans(name), ["global", "System"]),
+                    other => panic!("a namespace directive: {other:?}"),
+                }
+                match &third.kind {
+                    UsingKind::Alias { name_span, target, .. } => {
+                        assert_eq!(&source[name_span.start as usize..name_span.end as usize], "A");
+                        assert_eq!(spans(target), ["System", "Text", "StringBuilder"]);
+                    }
+                    other => panic!("an alias directive: {other:?}"),
+                }
+            }
+            other => panic!("three directives: {other:?}"),
+        }
     }
 
     /// A statement out of place is still read as a top-level statement, with `await` reserved: an

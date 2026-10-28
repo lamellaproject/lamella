@@ -1,4 +1,4 @@
-// Lamella.Hardware -- Lamella.Hardware.Mmio (the volatile register seam).
+// Lamella.Hardware -- Lamella.Hardware.Mmio (the volatile register seam), in the System.Device.Gpio assembly.
 namespace Lamella.Hardware
 {
     /// <summary>Volatile access to memory-mapped hardware registers, for peripheral drivers.</summary>

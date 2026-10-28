@@ -50,7 +50,7 @@ pin = "PA21"                # driver can tell "no card" from "a card that will n
 active = "low"
 source = "Adafruit Feather M0 Adalogger guide ('#7 - used as the MicroSD card CD (card detect) pin') + variant.cpp (Arduino D7 = PORTA 21); active-low because the switch grounds the line when a card is inserted"
 
-# THIS BOARD HAS TWO INDICATORS, not one, and the second is not decoration: the vendor put it
+# This board has two indicators, not one, and the second is not decoration: the vendor put it
 # beside the card slot and suggests exactly the use a storage stack wants.
 [[devices]]                 # the red LED beside the USB jack -- this board's general-purpose
 name = "led"                # blink target.

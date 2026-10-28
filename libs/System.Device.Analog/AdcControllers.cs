@@ -1,4 +1,4 @@
-// Lamella.Hardware -- the board-populated ADC driver binding.
+// Lamella.Hardware -- the board-populated ADC driver binding, in the System.Device.Analog assembly.
 namespace Lamella.Hardware
 {
     /// <summary>Creates the ADC driver, on first use.</summary>

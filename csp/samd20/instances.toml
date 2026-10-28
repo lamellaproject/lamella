@@ -2,7 +2,7 @@
 # lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
 # uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
-# EVERY VALUE BELOW WAS READ OFF THE SAM D20'S OWN TABLE 11-1. That matters more on this family
+# Every value below was read off the SAM D20's own table 11-1. That matters more on this family
 # than on most, because the SAM D21 resemblance is close enough to invite a copy and the copy
 # would be wrong in exactly the two columns that are hardest to notice:
 #

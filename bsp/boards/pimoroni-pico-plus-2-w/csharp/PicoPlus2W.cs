@@ -11,7 +11,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Pimoroni
 {
-    public sealed class PicoPlus2W
+    internal sealed class PicoPlus2W
     {
         /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
         public static readonly int BoardModel = PimoroniPicoPlus2WBindings.BOARD_MODEL;

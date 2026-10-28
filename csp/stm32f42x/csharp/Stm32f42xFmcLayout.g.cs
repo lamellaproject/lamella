@@ -5,7 +5,7 @@
 // instance bases live in Stm32f42xInstances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Stm32f42xFmcLayout
+    internal sealed class Stm32f42xFmcLayout
     {
         private Stm32f42xFmcLayout() { }
 

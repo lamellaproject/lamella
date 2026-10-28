@@ -2,13 +2,12 @@
 # lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
 # uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
-# EVERY VALUE BELOW WAS READ OFF THE SAM R21'S OWN TABLE 10-1. The SERCOM rows then agree with
-# the SAMD21's, value for value -- which is a RESULT here rather than an assumption, and the
-# distinction is the whole reason this file exists separately from that family's. A part that
+# Every value below comes from the SAM R21's own table 10-1. The SERCOM rows agree with the
+# SAMD21's, value for value, and this file still stands apart from that family's: a part that
 # shares an ancestor shares some addresses and not others, and which is which is not derivable
 # from the resemblance.
 #
-# TWO STATEMENTS OF THE BASES AGREE AND BOTH WERE CHECKED: Figure 7-1 (Product Mapping) gives
+# Two statements of the bases agree: Figure 7-1 (Product Mapping) gives
 # SYSCTRL 0x40000800 and GCLK 0x40000C00, and Table 10-1 gives the same two independently.
 
 

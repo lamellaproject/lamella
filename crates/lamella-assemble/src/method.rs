@@ -313,10 +313,6 @@ pub struct ConstructorPrologue {
     /// and the prologue becomes `ldarg.0; initobj S` instead of a call. `None` for every ordinary
     /// chain, which is every class and every `: this(args)`.
     ///
-    /// **A VALUE TYPE HAS NO IL DEFAULT CONSTRUCTOR TO CALL.** The initializer means "every field
-    /// starts at its zero" (17.4.4), and csc lowers it exactly this way -- measured. Calling
-    /// `object::.ctor()` on the `this` byref instead produces IL that RUNS and that `ilverify`
-    /// refuses, which is why this is a field rather than a fallback.
     pub zero_initialize: Option<Token>,
 }
 
@@ -742,7 +738,7 @@ fn emit_statement(
             body,
         } => {
             frame.rebind_decl(stmt.span, name);
-            if matches!(&init.ty, TypeSymbol::Pointer(_)) {
+            let (pinned, pinned_by_ref) = if matches!(&init.ty, TypeSymbol::Pointer(_)) {
                 let slot =
                     frame.reserve_pinned_local(&TypeSymbol::ByRef(Box::new(element.clone())));
                 emit_expression(init, frame, tokens, out)?;
@@ -750,6 +746,7 @@ fn emit_statement(
                 out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
                 out.push(Instruction::simple(Opcode::ConvU));
                 store_to(frame, name, out)?;
+                (slot, true)
             } else if matches!(&init.ty, TypeSymbol::Special(SpecialType::String)) {
                 let slot = frame.reserve_pinned_local(&init.ty);
                 emit_expression(init, frame, tokens, out)?;
@@ -772,15 +769,39 @@ fn emit_statement(
                 out.push(Instruction::simple(Opcode::Add));
                 out[to_done].operand = Operand::Target(out.len() as u32);
                 store_to(frame, name, out)?;
+                (slot, false)
             } else {
                 let array_slot = frame.reserve_pinned_local(&init.ty);
                 emit_expression(init, frame, tokens, out)?;
+                out.push(Instruction::simple(Opcode::Dup));
                 out.push(Instruction::new(Opcode::Stloc, Operand::Variable(array_slot)));
+                let to_null = out.len();
+                out.push(Instruction::new(Opcode::Brfalse, Operand::Target(0)));
                 out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array_slot)));
                 let rank = match &init.ty {
                     TypeSymbol::Array { rank, .. } => *rank,
                     _ => 1,
                 };
+                if rank <= 1 {
+                    out.push(Instruction::simple(Opcode::Ldlen));
+                    out.push(Instruction::simple(Opcode::ConvI4));
+                } else {
+                    let reference = crate::compile::array_length_reference();
+                    let length = tokens
+                        .method(&reference.declaring_type, &reference.name, &reference.parameters)
+                        .ok_or(EmitError::Unsupported("Array.get_Length was not minted"))?;
+                    out.push(Instruction::new(Opcode::Callvirt, Operand::Token(length)));
+                }
+                let to_element = out.len();
+                out.push(Instruction::new(Opcode::Brtrue, Operand::Target(0)));
+                out[to_null].operand = Operand::Target(out.len() as u32);
+                out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(0)));
+                out.push(Instruction::simple(Opcode::ConvU));
+                store_to(frame, name, out)?;
+                let to_body = out.len();
+                out.push(Instruction::new(Opcode::Br, Operand::Target(0)));
+                out[to_element].operand = Operand::Target(out.len() as u32);
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(array_slot)));
                 if rank <= 1 {
                     out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(0)));
                     let element_token = tokens
@@ -796,9 +817,21 @@ fn emit_statement(
                         .ok_or(EmitError::Unsupported("fixed rectangular-array Address method"))?;
                     out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
                 }
+                out.push(Instruction::simple(Opcode::ConvU));
                 store_to(frame, name, out)?;
-            }
+                out[to_body].operand = Operand::Target(out.len() as u32);
+                (array_slot, false)
+            };
             emit_statement(body, frame, tokens, labels, out)?;
+            if completes_normally(body) {
+                if pinned_by_ref {
+                    out.push(Instruction::new(Opcode::LdcI4, Operand::Int32(0)));
+                    out.push(Instruction::simple(Opcode::ConvU));
+                } else {
+                    out.push(Instruction::simple(Opcode::Ldnull));
+                }
+                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(pinned)));
+            }
         }
         BoundStmtKind::Throw(value) => match value {
             Some(expr) => {
@@ -1327,16 +1360,7 @@ fn emit_for(
 
 /// Emits a loop's test -- `condition`, then `branch` to `target` -- and says whether it wrote one.
 ///
-/// **A CONDITION THAT IS THE CONSTANT `true` IS NOT TESTED.** Nothing can leave the loop through it,
-/// and an exit edge that is never taken is still an edge the CLI checks: ending a value-returning
-/// method, it reaches a `ret` with nothing to return, and ending a protected region, it makes the
-/// region need a `leave` that nothing can use. csc writes no test either, and [`is_const_true`] is
-/// the predicate the flow analysis uses to call such a loop endless, so the two agree on which loops
-/// have a way out.
 ///
-/// A debug build writes a `nop` where the test would have stood, so a step point on the condition
-/// keeps an instruction of its own: csc's debug build keeps one too, on an evaluation it stores and
-/// never reads.
 #[allow(clippy::too_many_arguments)]
 fn emit_loop_test(
     condition: &BoundExpr,
@@ -1490,9 +1514,6 @@ fn emit_statement_expression(
             let user_step = user_step_method(operand, increment, tokens);
             return emit_compound(operand, step_operator(increment), None, user_step, None, *checked, frame, tokens, out, Leave::Discard);
         }
-        // A sequence in statement position evaluates its spilled operands, then its value AS A
-        // STATEMENT: a compound assignment whose target spilled a receiver stores without keeping
-        // the value it assigned, as `B[0] += 5` does in csc's build.
         BoundExprKind::Sequence { spilled, value } => {
             crate::expr::open_sequence(spilled, frame, tokens, out)?;
             let result = emit_statement_expression(value, frame, tokens, out);

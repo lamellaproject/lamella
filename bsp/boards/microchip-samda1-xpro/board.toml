@@ -1,13 +1,13 @@
 # The SAMDA1 Xplained Pro (ATSAMDA1-XPRO): board truth only -- what is wired to what. Chip
 # truth lives in csp/samda1/.
 #
-# THE VIRTUAL COM PORT'S TWO PADS WERE CHECKED AGAINST THE PART DATASHEET AND THE TWO DOCUMENTS
-# AGREE. Atmel-9400B Table 4-9 gives SERCOM3 PAD[0] on PA22 and SERCOM3 PAD[1] on PA23, and
-# 40001895A Table 7-1 gives both pads in column C against SERCOM3. The check is run on every kit
-# because the SAM R21 Xplained Pro's guide FAILED it -- it puts one UART's two pads on two
-# different SERCOM instances.
+# The kit guide and the part datasheet agree about the virtual COM port's two pads. Atmel-9400B
+# Table 4-9 gives SERCOM3 PAD[0] on PA22 and SERCOM3 PAD[1] on PA23, and 40001895A Table 7-1
+# gives both pads in column C against SERCOM3. A kit guide does not always agree with its
+# datasheet: the SAM R21 Xplained Pro's guide puts one UART's two pads on two different SERCOM
+# instances.
 #
-# THIS GUIDE HAS A DEFECT OF ITS OWN, IN A CAPTION RATHER THAN IN A FACT. Its Table 4-7 is titled
+# This guide has a defect of its own, in a caption rather than in a fact. Its Table 4-7 is titled
 # "External 32.768kHz Crystals" and its contents are the LED connection: one row, PB30, Yellow
 # LED0. The caption is a copy of the crystal table's. The FACT is corroborated independently by
 # the EXT1 header table, which also names PB30 as the onboard LED0, so the binding below is safe
@@ -34,7 +34,7 @@ notes = [
 
 [[carriers]]
 kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
-usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+usb_vid = 0x03EB            # Note: no usb_pid row, and its absence is a sourced position rather than
 role = "vcp"                # AN OMISSION. A product id is a property of the debugger's FIRMWARE:
 baud = 115200               # this kit's user guide never prints one, and the EDBG user guide
 plan = "osc8m-8mhz"         # Atmel-42096 describes the composite device without giving an id

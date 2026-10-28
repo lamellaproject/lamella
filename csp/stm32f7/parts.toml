@@ -22,12 +22,10 @@ package = "216-pin TFBGA"
 flash = 0x100000
 ram = 0x3C000
 source = "DS10916 Rev 5 ordering information (N = 216 pins, G = 1024 Kbytes flash, H = TFBGA) + RM0385 Rev 9 memory map (SRAM1 240 KB). The pin list is PARTIAL rather than the package's full set."
-# Every pin the family's map now names, stated as same-port ranges where the run is contiguous.
-# The high ports are the interesting claim -- F, G, H and I exist only on the larger packages -- and
-# the evidence is not a table reading: an external memory was brought up on this exact part with
-# signals in all of them, which cannot happen through pins the package does not bring out.
+# Every pin the family's map names, stated as same-port ranges where the run is contiguous. The
+# high ports are the interesting claim -- F, G, H and I exist only on the larger packages.
 #
-# TWENTY-TWO OF THESE ARE CARRIED BY A SECOND KIND OF EVIDENCE, AND IT IS INDEPENDENT OF THE FIRST.
+# Twenty-two of these are carried by the board's own documents.
 # UM1907 Table 6 assigns each of them to a numbered position of a board header, which is a claim
 # only a package that brings the pin out can support: a board cannot route a pad the part does not
 # have to a hole a shield plugs into. That is what carries port I, which no binding here reaches

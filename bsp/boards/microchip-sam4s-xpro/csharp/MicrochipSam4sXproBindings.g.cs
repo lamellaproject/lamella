@@ -6,7 +6,7 @@
 // lines, and the carrier identity. The board's facts are stated in board.toml.
 namespace Lamella.Generated
 {
-    public sealed class MicrochipSam4sXproBindings
+    internal sealed class MicrochipSam4sXproBindings
     {
         private MicrochipSam4sXproBindings() { }
 

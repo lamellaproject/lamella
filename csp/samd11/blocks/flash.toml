@@ -4,12 +4,12 @@
 #
 # Two facts, and each `sources` entry names the one it backs.
 #
-# THE WRITE UNIT IS A PAGE, AND THE ERASE UNIT IS FOUR OF THEM. The datasheet separates the two in
+# The write unit is a page, and the erase unit is four of them. The datasheet separates the two in
 # one sentence: `The NVM has a row-erase granularity, while the write granularity is by page.` The
 # page is 64 bytes on this family's single flash density, so the write unit is 64 and the row is
 # 256.
 #
-# READ IN THE SAM D11 DATASHEET RATHER THAN CARRIED ACROSS FROM THE D10 OR THE D21. The three agree,
+# Read in the SAM D11 datasheet rather than carried across from the D10 or the D21. The three agree,
 # and the agreement was checked in three documents instead of assumed from one. The D11 is not the
 # D10 with more flash -- it carries a USB device the D10 does not have at all -- so a family
 # resemblance is not an argument about any particular register.

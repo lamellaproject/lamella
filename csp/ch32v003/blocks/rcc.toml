@@ -1,15 +1,15 @@
 # BLOCK layout: the CH32V003 reset and clock control block. Transcribed from the CH32V003
 # Reference Manual V1.9 (WCH), sections 3.4.1 through 3.4.8, with the document open.
 #
-# THE CLOCK-ENABLE REGISTERS AND THE RESET CLOCK STATE. A GPIO port does nothing until its clock is
+# The clock-enable registers and the reset clock state. A GPIO port does nothing until its clock is
 # enabled, so the enable registers are what a board's first control line needs. Beyond that, any
 # program that times anything -- a delay, a pulse, a baud rate -- needs to know what the core is
 # actually running at before a clock plan has run, and that is what the oscillator and prescaler
 # registers below state. The PLL's own configuration and the reset/interrupt registers join when a
 # clock plan or a driver needs them.
 #
-# THE ONE FACT TO CARRY AWAY: HCLK AT RESET IS 8 MHz, NOT 24 MHz. The core comes up on the internal
-# 24 MHz oscillator with the bus prescaler ALREADY DIVIDING BY THREE, because HPRE's reset value is
+# The one fact to carry away: HCLK at reset is 8 MHz, not 24 MHz. The core comes up on the internal
+# 24 MHz oscillator with the bus prescaler already dividing by three, because HPRE's reset value is
 # 0010b rather than zero. A cycle count scaled for 24 MHz runs three times slow, and nothing about
 # it looks wrong -- the program works, at the wrong speed.
 
@@ -63,7 +63,7 @@ APB2PCENR_IOPD = 0x20
 APB2PCENR_IOPC = 0x10
 APB2PCENR_IOPA = 0x4
 
-# THE RESET CLOCK, STATED AS ITS THREE PARTS AND THE RATE THEY PRODUCE, so the composition is
+# The reset clock, stated as its three parts and the rate they produce, so the composition is
 # checkable rather than a single number nobody can re-derive: the oscillator's frequency, the
 # divisor its prescaler reset value selects, and the bus clock that leaves. A program timing
 # anything before it has configured a clock is running at HCLK_RESET_HZ.

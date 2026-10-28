@@ -15,6 +15,7 @@ pub mod diagnostic;
 pub mod flow;
 mod infer;
 mod integral_constant;
+pub mod local_function;
 pub mod program;
 pub mod reference;
 pub mod resolve;
@@ -36,7 +37,7 @@ pub use bound::{
     BoundMemberInitializer, BoundMemberInitializerValue, Capture, ConversionKind, DeclaredField,
     FieldInstantiation, FieldReference, ConvertingStep, MethodInstantiation, MethodReference,
     ScopeId, SubmissionBinding, TypeInstantiation, bind_expression, constant_literal_value,
-    literal_int_value,
+    literal_int_value, task_result_type,
 };
 pub use conversion::{has_implicit_conversion, nullable_underlying};
 pub use declaration::{

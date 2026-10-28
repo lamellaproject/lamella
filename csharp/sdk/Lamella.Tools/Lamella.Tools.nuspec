@@ -4,6 +4,7 @@
     <id>Lamella.Tools.$rid$</id>
     <version>$version$</version>
     <!-- Packing writes here what every package carries: authors, license, licenseUrl, projectUrl, copyright and repository. -->
-    <description>The lamella tool for $rid$. Lamella.Sdk runs it to build a lamella1.0 project, to list the boards dotnet run offers, and to run a program; restore downloads the one for the machine the .NET SDK runs on, at the SDK's own version.</description>
+    <description>The Lamella command-line tool for $rid$. Lamella.Sdk restores and runs it for dotnet build, dotnet publish, and dotnet run. Do not reference this package directly.</description>
+    <readme>README.md</readme>
   </metadata>
 </package>

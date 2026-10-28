@@ -69,6 +69,9 @@ impl CodedIndex {
                 table::FILE,
                 table::EXPORTED_TYPE,
                 table::MANIFEST_RESOURCE,
+                table::GENERIC_PARAM,
+                table::GENERIC_PARAM_CONSTRAINT,
+                table::METHOD_SPEC,
             ],
             CodedIndex::HasCustomDebugInformation => &[
                 table::METHOD_DEF,

@@ -878,9 +878,17 @@ impl Func {
     pub fn i32_trunc_sat_f32_s(&mut self) {
         self.sat(0x00);
     }
+    /// `i32.trunc_sat_f32_u` -- truncate an f32 to an unsigned i32, saturating.
+    pub fn i32_trunc_sat_f32_u(&mut self) {
+        self.sat(0x01);
+    }
     /// `i32.trunc_sat_f64_s` -- truncate an f64 to a signed i32, saturating.
     pub fn i32_trunc_sat_f64_s(&mut self) {
         self.sat(0x02);
+    }
+    /// `i32.trunc_sat_f64_u` -- truncate an f64 to an unsigned i32, saturating.
+    pub fn i32_trunc_sat_f64_u(&mut self) {
+        self.sat(0x03);
     }
     /// `i64.trunc_sat_f32_s` -- truncate an f32 to a signed i64, saturating.
     pub fn i64_trunc_sat_f32_s(&mut self) {
@@ -1326,7 +1334,9 @@ mod tests {
     fn the_saturating_truncations_encode_as_the_fc_prefix_and_their_spec_index() {
         let mut body = Func::new(0);
         body.i32_trunc_sat_f32_s();
+        body.i32_trunc_sat_f32_u();
         body.i32_trunc_sat_f64_s();
+        body.i32_trunc_sat_f64_u();
         body.i64_trunc_sat_f32_s();
         body.i64_trunc_sat_f32_u();
         body.i64_trunc_sat_f64_s();
@@ -1334,7 +1344,8 @@ mod tests {
         assert_eq!(
             body.code,
             [
-                0xFC, 0x00, 0xFC, 0x02, 0xFC, 0x04, 0xFC, 0x05, 0xFC, 0x06, 0xFC, 0x07
+                0xFC, 0x00, 0xFC, 0x01, 0xFC, 0x02, 0xFC, 0x03, 0xFC, 0x04, 0xFC, 0x05, 0xFC, 0x06,
+                0xFC, 0x07
             ]
         );
     }

@@ -2,7 +2,7 @@
 # Arduino MKR form factor. Board truth ONLY: on-board devices, the carrier, and the clock plan.
 # Chip truth lives in csp/samd21/.
 #
-# WHAT MAKES THIS BOARD UNUSUAL IS WHAT IT DOES NOT HAVE ROWS FOR, and no other SAMD21 product
+# What makes this board unusual is what it does not have rows for, and no other SAMD21 product
 # shares the shape. Its real outputs are not on this part at all: up to fifteen P1000 I/O modules
 # clip onto a backplane to the right of the CPU and are reached over a SPI link to a separate base
 # controller, which is a co-processor with its own reset and its own readiness signal. So a

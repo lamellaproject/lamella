@@ -145,6 +145,32 @@ impl TableStream {
         self.sort_by_coded_column(table, 0);
     }
 
+    /// [`TableStream::sort_by_coded_parent`], with the rows of one parent ordered by `places`:
+    /// `places[i]` is the place of the row added `i`-th (a row past its end is at `u8::MAX`), and
+    /// rows of one parent and one place keep the order they were added in.
+    pub fn sort_by_coded_parent_then_place(&mut self, table: u8, places: &[u8]) {
+        if let Some(rows) = self.rows.get_mut(&table) {
+            let mut order: Vec<(u32, u8, usize)> = rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    let key = match row.first() {
+                        Some(Column::Coded(kind, token)) => kind.encode(*token),
+                        _ => 0,
+                    };
+                    (key, places.get(index).copied().unwrap_or(u8::MAX), index)
+                })
+                .collect();
+            order.sort_unstable();
+            let mut taken: Vec<Vec<Column>> = core::mem::take(rows);
+            *rows = order
+                .iter()
+                .map(|&(_, _, index)| core::mem::take(&mut taken[index]))
+                .collect();
+        }
+        self.sorted |= 1u64 << table;
+    }
+
     /// Sorts `table`'s rows by the encoded value of the coded index in `column` and marks
     /// the table sorted -- for a required-sorted table whose key is not its first column
     /// (`MethodSemantics` sorts by `Association`, its third). The sort is stable, so
@@ -210,15 +236,26 @@ impl TableStream {
             };
             for row in dependent_rows.iter_mut() {
                 for cell in row.iter_mut() {
-                    if let Column::Index(indexed_table, row_index) = cell
-                        && *indexed_table == table
-                    {
-                        let old = *row_index as usize;
-                        if let Some(&new) = moved_to.get(old)
-                            && new != 0
-                        {
-                            *row_index = new;
+                    // A row is named by an `Index` column or by a coded one: a `CustomAttribute`
+                    // on a generic parameter names it through its `HasCustomAttribute` parent.
+                    match cell {
+                        Column::Index(indexed_table, row_index) if *indexed_table == table => {
+                            let old = *row_index as usize;
+                            if let Some(&new) = moved_to.get(old)
+                                && new != 0
+                            {
+                                *row_index = new;
+                            }
                         }
+                        Column::Coded(_, token) if token.table() == table => {
+                            let old = token.row() as usize;
+                            if let Some(&new) = moved_to.get(old)
+                                && new != 0
+                            {
+                                *token = Token::new(table, new);
+                            }
+                        }
+                        _ => {}
                     }
                 }
             }

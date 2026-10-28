@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Arduino
 {
-    public sealed class Mkr1000
+    internal sealed class Mkr1000
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = ArduinoMkr1000Bindings.BOARD_MODEL;

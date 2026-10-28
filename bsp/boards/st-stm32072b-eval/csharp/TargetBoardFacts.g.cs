@@ -7,7 +7,10 @@ namespace Lamella.Generated
     internal static class TargetBoardFacts
     {
         /// <summary>The board's id, the name a build selects this board by.</summary>
-        internal const string Name = "st-stm32072b-eval";
+        internal static string Name
+        {
+            get { return "st-stm32072b-eval"; }
+        }
 
         /// <summary>Answers the board's wire identity, and binds nothing: this board's package
         /// declares no class that binds its buses.</summary>

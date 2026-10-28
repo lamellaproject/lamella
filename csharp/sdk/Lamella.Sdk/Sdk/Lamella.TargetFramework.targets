@@ -1,13 +1,54 @@
 <!--
-  Maps the target framework lamella1.0 to the framework Lamella,Version=v1.0. The .NET SDK imports
-  this file through BeforeTargetFrameworkInferenceTargets, which Sdk.props sets, just before it infers
-  a framework from the target framework's name.
+  What a lamella1.0 build is. The .NET SDK imports this file through BeforeTargetFrameworkInferenceTargets, which
+  Sdk.props sets, just before it infers a framework from the target framework's name. That is after the project file,
+  so the target framework is known here: in a project that targets one framework, and in each inner build of a
+  project that targets several. Everything below applies to lamella1.0 alone; a build for any other target framework
+  is left exactly as Microsoft.NET.Sdk makes it.
 -->
 <Project>
 
   <PropertyGroup Condition="'$(TargetFramework)' == 'lamella1.0'">
+    <!-- The target framework lamella1.0 is Lamella,Version=v1.0, and its reference assemblies are the
+         class library Sdk.props names, found through RedistList/FrameworkList.xml beside it. -->
     <TargetFrameworkIdentifier>Lamella</TargetFrameworkIdentifier>
     <TargetFrameworkVersion>v1.0</TargetFrameworkVersion>
+    <TargetFrameworkRootPath>$([MSBuild]::NormalizeDirectory('$(LamellaSdkRoot)', 'ref'))</TargetFrameworkRootPath>
+
+    <!-- A reference resolves only from what the project names. The framework folder holds the core
+         library and also every library a project reaches through a PackageReference, so a bare
+         assembly name is never looked up there. The search path list was made before the project
+         file was read, so the framework folder is taken out of it here. A property function escapes
+         what it returns, so the list is unescaped again, or it would read as one folder. -->
+    <AssemblySearchPath_UseTargetFrameworkDirectory>false</AssemblySearchPath_UseTargetFrameworkDirectory>
+    <AssemblySearchPaths>$([MSBuild]::Unescape($(AssemblySearchPaths.Replace('{TargetFrameworkDirectory}', ''))))</AssemblySearchPaths>
+
+    <!-- No .NET framework is referenced: the core library is Lamella's own. -->
+    <NoStdLib>true</NoStdLib>
+    <DisableImplicitFrameworkReferences>true</DisableImplicitFrameworkReferences>
+
+    <!-- The attributes these generators write are types Lamella's core library does not define. -->
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
+
+    <!-- The build writes the program's assembly alone, with no reference assembly beside it. -->
+    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
+
+    <!-- A program builds to a .dll, as on .NET. The C# version defaults to 11, the newest that
+         Lamella's compiler accepts, so an editor flags what the build would refuse. -->
+    <TargetExt>.dll</TargetExt>
+    <LangVersion Condition="'$(LangVersion)' == ''">11</LangVersion>
+
+    <!-- dotnet publish builds Release, as it does for .NET 8 and later, unless the project says
+         otherwise; the dotnet command reads this before it builds. -->
+    <PublishRelease Condition="'$(PublishRelease)' == ''">true</PublishRelease>
+
+    <!-- dotnet pack places a build in a lib folder only for a framework NuGet knows, so a lamella1.0
+         build never goes there: Lamella.Pack.targets places it. Whether the project packs its build
+         at all is still the project's IncludeBuildOutput. -->
+    <_LamellaIncludeBuildOutput>$(IncludeBuildOutput)</_LamellaIncludeBuildOutput>
+    <IncludeBuildOutput>false</IncludeBuildOutput>
   </PropertyGroup>
+
+  <Import Project="$(MSBuildThisFileDirectory)Lamella.PublishAot.targets" Condition="'$(TargetFramework)' == 'lamella1.0'" />
 
 </Project>

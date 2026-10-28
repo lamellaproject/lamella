@@ -11,8 +11,8 @@ sources = [
     "SAM E54 Xplained Pro user guide DS70005321A Table 5-1, which names the peripheral behind each extension-header position -- used as corroboration for the rows below, never as their source",
 ]
 
-# THE FUNCTION LETTER IS A COLUMN OF Table 6-1 AND THE COLUMNS ARE NOT INTERCHANGEABLE. Column C
-# and column D both carry a SERCOM for these two pads, and the PAD NUMBERS SWAP BETWEEN THEM: on
+# The function letter is a column of Table 6-1 and the columns are not interchangeable. Column C
+# and column D both carry a SERCOM for these two pads, and the pad numbers swap between them: on
 # column C the lower-numbered pin is pad 0, and on column D it is pad 1. So a row moved from one
 # column to the other does not merely select a different SERCOM -- it exchanges the two signals of
 # whatever bus is on it, which for I2C means exchanging data and clock. Both alternatives are
@@ -46,7 +46,7 @@ instance = "sercom5"
 signal = "pad0"
 source = "DS60001507F Table 6-1, the PA23 row: column D is SERCOM5/PAD[0]. The pad numbers of PA22 and PA23 are reversed between columns C and D, so the pair is ordered one way on SERCOM3 and the other way on SERCOM5."
 
-# THE ANALOG FUNCTION IS COLUMN B, AND IT IS ONE COLUMN COVERING SIX PERIPHERALS. Table 6-1 puts
+# The analog function is column B, and it is one column covering six peripherals. Table 6-1 puts
 # ANAREF, ADC0, ADC1, AC, DAC and PTC all under the single function letter B, so selecting B on a
 # pad does not say WHICH analog peripheral reaches it -- the cell does, and that is what this row
 # records. The channel number is part of the signal name for the same reason: a converter reaches a
@@ -61,12 +61,12 @@ source = "DS60001507F Table 6-1 (Multiplexed Peripheral Signals), the PB04 row: 
 
 # ---- SERCOM5 IOSET 1: the pads the SAM E51 Curiosity Nano wires its debugger UART to -------------
 #
-# THE SAME INSTANCE THIS TABLE ALREADY REACHES BY ANOTHER ROUTE. SERCOM5 is already here on PA22 and
+# The same instance this table already reaches by another route. SERCOM5 is already here on PA22 and
 # PA23 in column D, which is Table 6-15's IOSET 2. These two rows are IOSET 1 of the same instance,
 # in column C -- so the letter and the pad pair move together and a row that took one from each set
 # would name a pin the instance does not drive.
 #
-# ONE NUMBER TELLS THE TWO SETS APART AND IT IS NOT THE PAD: the IOSET is which PINS carry the pads,
+# One number tells the two sets apart and it is not the pad: the IOSET is which PINS carry the pads,
 # and Table 6-15 lists six of them for SERCOM5. What a binding names is a pin and a function letter,
 # so the IOSET is implied by the pins rather than stated -- which is why both rows below record
 # which IOSET they came from.
@@ -87,22 +87,22 @@ source = "DS60001507F Table 6-1: the PB17 row carries SERCOM5/PAD[1] in column C
 
 # --- EIC: the COMPLETE pad-to-EXTINT map for this die ------------------------------------------
 #
-# EVERY PAD ON THE DIE IS HERE. Which EXTINT a pad can raise is a property of the silicon, so it
+# Every pad on the die is here. Which EXTINT a pad can raise is a property of the silicon, so it
 # does not depend on any board and must not be limited to the pads some particular board wires. An
 # engineer who prototypes on an evaluation kit and then lays out their own hardware needs every pad.
 #
-# FUNCTION A IS THE EIC COLUMN, so a pad raises its EXTINT only with PINCFG.PMUXEN set and PMUX
+# Function A is the EIC column, so a pad raises its EXTINT only with PINCFG.PMUXEN set and PMUX
 # selecting A.
 #
-# 99 PADS, 16 LINES, SO PADS SHARE AND ONLY ONE OF A LINE'S PADS CAN BE THE LIVE SOURCE. Six pads
+# 99 pads, 16 lines, so pads share and only one of a line's pads can be the live source. Six pads
 # compete for most lines here against three or four on the smaller family, and nothing in the chip
 # reports the competition.
 #
-# PA08 IS NMI AND NOT AN EXTINT, alone on this die as on the SAM D21 -- the one pad whose function A
+# PA08 is NMI and not an EXTINT, alone on this die as on the SAM D21 -- the one pad whose function A
 # reaches the non-maskable interrupt, which cannot be masked, does not appear in INTFLAG, and is not
 # serviced by any of the sixteen EXTINT vectors.
 #
-# THE LINE IS NOT THE PAD AND A DERIVATION IS WRONG ON TWELVE PADS. For 86 of the 98 EXTINT pads the
+# The line is not the pad and a derivation is wrong on twelve pads. For 86 of the 98 EXTINT pads the
 # line is the pad index modulo sixteen, which is more than enough to make the rule look right under
 # any spot check. It fails on PB26, PB27, PB28 and PB29, which raise 12 through 15 rather than 10
 # through 13; on PC07, which raises 9 rather than 7; on PD08 through PD12, which raise 3 through 7

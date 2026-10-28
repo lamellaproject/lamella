@@ -4,8 +4,8 @@
 # alias of `resets` (base + 0x3000); the SET view rides the resets block's RESET_SET offset.
 # `sio` is the single-cycle IO block (the CPU-direct GPIO drive; processor-attached, never
 # through RESETS). -1 = not applicable.
-# Rows are added evidence-first: spi1 (0x40088000) and i2c1 (0x40098000) join when a binding or a
-# pin-map cell first needs them, verified against the RP2350 datasheet, as uart1 did.
+# Rows are added evidence-first: spi1 (0x40088000) joins when a binding or a pin-map cell first
+# needs it, verified against the RP2350 datasheet, as uart1 and i2c1 did.
 
 [table]
 kind = "instances"
@@ -92,6 +92,14 @@ name = "i2c0"
 block = "i2c"
 base = 0x40090000
 reset_bit = 4
+
+# I2C1 carries a board's I2C bus on GP2 and GP3 (function F3). RP2350 datasheet 2.2 address map:
+# I2C1_BASE 0x40098000; 7.5 Table 535 (RESETS: RESET): bit 5 I2C1.
+[[instances]]
+name = "i2c1"
+block = "i2c"
+base = 0x40098000
+reset_bit = 5
 
 [[instances]]
 name = "adc"

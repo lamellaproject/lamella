@@ -1,11 +1,11 @@
 # PART: Texas Instruments TCA9548A, an eight-channel I2C switch.
 #
-# THE FIRST PART HERE THAT IS NOT A LEAF. Everything else in this directory answers a question about
-# itself or about the world; this one decides WHICH OTHER PARTS ARE REACHABLE. A device behind a
+# The first part here that is not a leaf. Everything else in this directory answers a question about
+# itself or about the world; this one decides which other parts are reachable. A device behind a
 # closed channel is invisible to every scan and reads exactly like a device that is not there, so a
 # bus carrying one of these is a tree rather than a flat set of addresses.
 #
-# THAT MAKES IT A SHAPE THE CONSUMING MODELS DO NOT HAVE. A `[[devices]]` row on a board is either
+# That makes it a shape the consuming models do not have. A `[[devices]]` row on a board is either
 # pin-wired or bus-wired at an address, and both describe a leaf; neither can say that a device gates
 # the reachability of others. Reconciling anything behind a channel therefore takes a WRITE before
 # the read, where every other claim in that design is settled by reading alone.
@@ -42,7 +42,7 @@ absent = "SCPS207H describes no identity register: the part has one 8-bit contro
 
 # --- address -------------------------------------------------------------------------------------
 #
-# THREE STRAPS RATHER THAN ONE, which is what lets eight of these share a bus -- and is also why a
+# Three straps rather than one, which is what lets eight of these share a bus -- and is also why a
 # board carrying one has to say which it strapped rather than assuming the base.
 
 [address]

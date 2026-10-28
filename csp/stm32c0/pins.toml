@@ -2,22 +2,22 @@
 # peripheral is refused on this family.
 #
 # A pin map pairs a pad with an alternate-function number and the peripheral signal that function
-# routes to. NONE OF THAT IS IN A REFERENCE MANUAL. RM0490 describes the die -- its peripherals,
+# routes to. None of that is in a reference manual. RM0490 describes the die -- its peripherals,
 # their registers, their memory map -- and says nothing about which pads a package bonds out or
 # which AF number reaches them. The alternate-function tables in the part's DATASHEET are what
 # fill this file.
 #
-# AN EMPTY MAP IS NOT A PAD SPACE AND MUST NOT BE READ AS ONE. Zero rows does not mean the part has
+# An empty map is not a pad space and must not be read as one. Zero rows does not mean the part has
 # no pins, and it does not mean no controller reaches a given pad. A consumer that treats the
 # absence as a negative gets a confident, complete-looking wrong answer.
 #
-# A ROW NEEDS TWO DIFFERENT DOCUMENTS. It names an INSTANCE and a SIGNAL, which the datasheet's
+# A row needs two different documents. It names an INSTANCE and a SIGNAL, which the datasheet's
 # alternate-function tables give, and a PIN, which some part's `pins` list must carry. A `pins`
 # list says which pads a PACKAGE bonds out; the alternate-function tables say which signals a DIE
 # routes. Those are not the same statement, and on some parts they genuinely differ, so a pad is
 # never added to a `pins` list on the strength of appearing in an AF table.
 #
-# THE BINDING CHECKER REFUSES A BOARD THAT CLAIMS A PIN THIS FILE DOES NOT CARRY, and its refusal
+# The binding checker refuses a board that claims a pin this file does not carry, and its refusal
 # says to grow the map from the datasheet rather than from the binding. A row is read from the
 # datasheet's table, never written to satisfy a board.
 #

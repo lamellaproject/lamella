@@ -1,12 +1,5 @@
 //! Spilling for a `stackalloc` nested in an expression (C# 8.0) that is lowered to `localloc`.
 //!
-//! `localloc` requires an evaluation stack empty apart from its size (ECMA-335 III.3.47), and a
-//! nested `stackalloc` is reached with whatever the enclosing expression evaluated before it
-//! still pushed: `_device.Write(stackalloc byte[2])` has the receiver there. So, as csc does, a
-//! statement holding one is rewritten: each operand evaluated before the `stackalloc` is stored in
-//! a temporary first, the span is built into a temporary of its own, and the statement then reads
-//! both. An operand that is an address -- a value type's receiver variable, a `ref` argument --
-//! or `this`, a type or a constant is left in place, since reading it later reads the same thing.
 //!
 //! Only the `localloc` lowering needs this; the array one (a span type with no `(void*, int)`
 //! constructor) has no such constraint, and a body with no `localloc` is left untouched.

@@ -124,7 +124,7 @@ const HEAP_MIN_BYTES: usize = 12;
 #[no_mangle]
 extern "C" fn lamella_gc_alloc_impl(payload_size: u32, type_desc: *const u32) -> *mut u8 {
     unsafe {
-        collector::ensure_device_heap();
+        collector::ensure_device_heap(payload_size);
         let payload = lamella_gc::lamella_gc_alloc_impl(
             payload_size,
             type_desc as *const lamella_gc::DeviceTypeDesc,
@@ -132,14 +132,28 @@ extern "C" fn lamella_gc_alloc_impl(payload_size: u32, type_desc: *const u32) ->
             0,
         );
         if payload.is_null() {
-            lamella_heap_exhausted();
+            lamella_heap_exhausted(block_bytes(payload_size), lamella_gc::lamella_gc_device_free_bytes());
         }
         payload
     }
 }
 
-/// Ends the program because the heap cannot serve an allocation: prints `HEAPFULL` on the console
-/// sink and halts.
+/// The bytes the heap is asked for when an object's payload is `payload_size` bytes: its header word
+/// and its payload rounded up to a word, as the heap reserves them. A request too large to state in 32
+/// bits answers `u32::MAX`, more than any heap holds.
+fn block_bytes(payload_size: u32) -> u32 {
+    payload_size.checked_add(3).map_or(u32::MAX, |rounded| (rounded & !3).saturating_add(4))
+}
+
+/// Ends the program because the heap cannot serve an allocation: prints `HEAPFULL`, the bytes the
+/// allocation asked for and the bytes the heap had free, on the console sink, records a fatal stop
+/// in the console ring where the build keeps one, and halts.
+///
+/// The line reads `HEAPFULL: asked for 40 B, 28 B free`. Both figures count header words, as the
+/// heap reserves them, so they compare directly: the request did not fit in what was free. From
+/// [`lamella_gc_alloc_impl`] the free figure is the one after the collection that request ran, so
+/// it is what the program's live objects left. A request whose size does not fit 32 bits asks for
+/// `4294967295` bytes.
 ///
 /// A native seam cannot raise a managed exception, so this ends the way `DEADLOCK`, `LOCKFULL`,
 /// `MONITOR` and `NULLLOCK` do: a word on the console, visibly wrong next to a harness's one-byte
@@ -147,11 +161,43 @@ extern "C" fn lamella_gc_alloc_impl(payload_size: u32, type_desc: *const u32) ->
 /// [`lamella_gc_alloc_impl`] can end an exhausted heap the same way, and so a debugger halted in it
 /// names the cause.
 #[no_mangle]
-pub extern "C" fn lamella_heap_exhausted() -> ! {
-    for b in *b"HEAPFULL" {
-        console_put(b);
+pub extern "C" fn lamella_heap_exhausted(asked: u32, free: u32) -> ! {
+    write_ascii(b"HEAPFULL: asked for ");
+    write_figure(asked);
+    write_ascii(b" B, ");
+    write_figure(free);
+    write_ascii(b" B free\n");
+    fatal_end()
+}
+
+/// Writes `text` to the console sink, a byte at a time. One copy, shared by every piece of a report.
+#[inline(never)]
+fn write_ascii(text: &[u8]) {
+    for &byte in text {
+        console_put(byte);
     }
-    loop {}
+}
+
+/// The powers of ten a 32-bit figure is written with, most significant first.
+static POW10_U32: [u32; 10] = [1_000_000_000, 100_000_000, 10_000_000, 1_000_000, 100_000, 10_000, 1_000, 100, 10, 1];
+
+/// Writes a 32-bit figure in decimal, most significant digit first, by repeated SUBTRACTION of powers
+/// of ten -- division-free, as [`write_udec`] is, and in 32 bits, so a report of two byte counts does
+/// not carry that function's 64-bit walk. Leading zeros are suppressed; `0` prints `0`.
+#[inline(never)]
+fn write_figure(mut value: u32) {
+    let mut started = false;
+    for &power in POW10_U32.iter() {
+        let mut digit = 0u8;
+        while value >= power {
+            value -= power;
+            digit += 1;
+        }
+        started |= digit != 0 || power == 1;
+        if started {
+            console_put(b'0' + digit);
+        }
+    }
 }
 
 /// The magnitude of a double: clears the IEEE-754 sign bit. Branch-free and correct for the
@@ -347,6 +393,56 @@ unsafe extern "C" {
     fn lamella_board_console_putc(byte: u8);
 }
 
+/// The console ring's transcript size in bytes: 16 KiB on the RP2350, whose statics window is most
+/// of its RAM.
+#[cfg(all(feature = "console-memory", console_ring_16k))]
+const CONSOLE_RING_BYTES: usize = 16 * 1024;
+/// The console ring's transcript size in bytes on every other part. On a micro:bit the link lays the
+/// ring among the program's statics and this archive's own, and the heap takes the RAM they leave, so
+/// every byte the ring keeps is a byte the heap does not have.
+#[cfg(all(feature = "console-memory", not(console_ring_16k)))]
+const CONSOLE_RING_BYTES: usize = 256;
+
+/// The console ring this build keeps.
+#[cfg(feature = "console-memory")]
+type ConsoleRing = lamella_console_ring::Ring<CONSOLE_RING_BYTES>;
+
+/// The console ring a debug probe reads while the program runs: every console byte, and how the
+/// program ended. All zeros, so it lies in the RAM the image's startup zeroes, unarmed until
+/// [`lamella_console_arm`].
+#[cfg(feature = "console-memory")]
+#[no_mangle]
+#[allow(non_upper_case_globals)]
+pub static mut __lamella_console_log: ConsoleRing = ConsoleRing::new();
+
+/// [`__lamella_console_log`] as a raw pointer: a debug probe reads it while the program runs, so
+/// nothing here ever borrows it.
+#[cfg(feature = "console-memory")]
+#[inline(always)]
+fn console_ring() -> *mut ConsoleRing {
+    core::ptr::addr_of_mut!(__lamella_console_log)
+}
+
+/// Arms the console ring for this boot, so a reader sees the program as running before it prints
+/// anything. The image's startup calls this after it has zeroed RAM and before the program's entry
+/// point.
+#[cfg(feature = "console-memory")]
+#[no_mangle]
+pub extern "C" fn lamella_console_arm() {
+    unsafe { ConsoleRing::arm(console_ring()) }
+}
+
+/// Ends the console ring when the program's entry point has come back with `code`: returned with that
+/// code, or aborted with code 134 when an exception was still in flight as it came back
+/// (`exception_in_flight` is the image's in-flight exception word, nonzero while one is). Returns the
+/// code it recorded, which an image that also stamps a result stamps. The image's startup calls this
+/// once the entry point returns, and parks after it.
+#[cfg(feature = "console-memory")]
+#[no_mangle]
+pub extern "C" fn lamella_console_finish(code: i32, exception_in_flight: u32) -> i32 {
+    unsafe { ConsoleRing::finish(console_ring(), code, exception_in_flight) }
+}
+
 /// ONE console byte, to whichever sink this build selected.
 ///
 /// Every console entry point bottoms out here, and that is the point. A sink written
@@ -359,6 +455,10 @@ unsafe extern "C" {
 /// leaves undefined (it pulls the exported member, not each internal callee).
 #[inline(always)]
 fn console_put(byte: u8) {
+    #[cfg(feature = "console-memory")]
+    unsafe {
+        ConsoleRing::put(console_ring(), byte);
+    }
     #[cfg(feature = "console-semihosting")]
     semihost_writec(byte);
     #[cfg(feature = "console-board")]
@@ -367,6 +467,33 @@ fn console_put(byte: u8) {
     }
     #[cfg(not(any(feature = "console-semihosting", feature = "console-board")))]
     let _ = byte;
+}
+
+/// Ends the program because the runtime cannot go on: prints `word` on the console sink, then ends it
+/// as [`fatal_end`] does. A native seam cannot raise a managed exception, so the runtime's own
+/// failures end this way: a word that reads as wrong next to a harness's one-byte verdict, and a loop
+/// that never resumes.
+#[inline(always)]
+fn fatal_stop<const N: usize>(word: [u8; N]) -> ! {
+    for byte in word {
+        console_put(byte);
+    }
+    fatal_end()
+}
+
+/// Ends the program once the console sink holds the words of its stop: records the end in the console
+/// ring, where the build keeps one, as aborted with code 1, and halts.
+#[inline(always)]
+fn fatal_end() -> ! {
+    #[cfg(feature = "console-memory")]
+    unsafe {
+        ConsoleRing::end(
+            console_ring(),
+            lamella_console_ring::ABORTED,
+            lamella_console_ring::abort::FATAL_STOP,
+        );
+    }
+    loop {}
 }
 
 /// Emit one UTF-16 code unit UTF-8-encoded (BMP; a lone surrogate is emitted per-unit). The interpreter
@@ -569,7 +696,7 @@ fn alloc_string(units: u32) -> *mut u32 {
         return core::ptr::null_mut();
     }
     let Some(payload) = units.checked_mul(2).and_then(|n| n.checked_add(4)) else {
-        lamella_heap_exhausted();
+        lamella_heap_exhausted(u32::MAX, lamella_gc::lamella_gc_device_free_bytes());
     };
     let obj = lamella_gc_alloc_impl(payload, type_desc as *const u32) as *mut u32;
     unsafe { core::ptr::write(obj, units) };
@@ -1502,7 +1629,8 @@ const fn worker_stack_top(id: usize) -> u32 {
 /// Why a parked thread is waiting, for the reactor block point below. Mirrors
 /// `lamella_cil_runtime::reactor::WaitReason` (the interp's shipping set) plus a `NotParked` slot so the
 /// per-thread array needs no `Option`. A `Join`/`Monitor`-lock park is woken by hand-off, not the
-/// reactor, so it is simply `NotParked` here (the runnable bit stays clear until `wake`).
+/// reactor, so it is simply `NotParked` here (the runnable bit stays clear until `wake`). So is a
+/// thread asleep for good, which nothing wakes: it is marked in [`Scheduler::asleep_forever`] instead.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ParkReason {
     /// Runnable or lock/join-blocked -- not on the reactor's timer/socket set.
@@ -1545,6 +1673,11 @@ struct Scheduler {
     entry_args: [u32; MAX_THREADS],
     /// Bit `i` set = thread `i` has exited -- what `lamella_thread_join` waits on.
     done: u32,
+    /// Bit `i` set = thread `i` is asleep for good (`Thread.Sleep(Timeout.Infinite)`). It waits on
+    /// no timer or socket, so the reactor never sees it and nothing wakes it; while any bit is set, a
+    /// scheduler with nothing to run and nothing to wait for is a program still waiting, not a
+    /// deadlock ([`sched_idle`]).
+    asleep_forever: u32,
 }
 
 /// The one scheduler, zero-initialized so that it is `.bss`: the linker places it in the statics
@@ -1671,9 +1804,7 @@ unsafe fn sched_exit() -> ! {
             lamella_thread_switch(&mut dead, &s.contexts[next]);
             loop {}
         }
-        if !sched_block_point(s) {
-            sched_deadlock_trap();
-        }
+        sched_idle(s);
     }
 }
 
@@ -1960,15 +2091,33 @@ fn sched_any_parked(s: &Scheduler) -> bool {
     s.parks[..s.count as usize].iter().any(|p| *p != ParkReason::NotParked)
 }
 
-/// A parked/exiting/joining thread found NOTHING runnable and the block point NOTHING external to wait
-/// on: every live thread is blocked on a join/lock nobody can satisfy. Fail LOUD -- print a marker on
-/// the semihosting console (visibly wrong next to the harnesses' single-'0'/'1' protocol) and halt,
-/// rather than silently spinning a scheduler that can never make progress again.
+/// A parked/exiting/joining thread found NOTHING runnable, the block point NOTHING external to wait
+/// on, and no thread asleep for good: every live thread is blocked on a join/lock nobody can satisfy.
+/// Fail LOUD -- print a marker on the semihosting console (visibly wrong next to the harnesses'
+/// single-'0'/'1' protocol) and halt, rather than silently spinning a scheduler that can never make
+/// progress again.
 fn sched_deadlock_trap() -> ! {
-    for b in *b"DEADLOCK" {
-        console_put(b);
+    fatal_stop(*b"DEADLOCK")
+}
+
+/// How long the scheduler idles at a time while a thread sleeps forever and nothing can run or be
+/// waited on, before it looks again. One slice of the reactor's own sleep, which on a `net` build
+/// also services the network stack. The C# interpreter idles the same 16 ms in the same state.
+const FOREVER_IDLE_SLICE_MS: u64 = 16;
+
+/// What a thread does when nothing is runnable: wait once at the reactor block point. When that has
+/// nothing to wait on either, a thread asleep for good means the program is still waiting -- .NET
+/// keeps the process alive for it, and an event-driven `Main` parks exactly so -- so idle one slice
+/// and let the caller look again. Without one, the threads left are lock/join-deadlocked: fail loud.
+unsafe fn sched_idle(s: &mut Scheduler) {
+    if sched_block_point(s) {
+        return;
     }
-    loop {}
+    if s.asleep_forever != 0 {
+        reactor_env::sleep_millis(FOREVER_IDLE_SLICE_MS);
+        return;
+    }
+    sched_deadlock_trap();
 }
 
 /// Park the current thread on `reason`: clear its runnable bit, record the reason, and run others
@@ -1982,12 +2131,26 @@ unsafe fn sched_park(reason: ParkReason) {
     sched_block_current(s);
 }
 
-/// The blocked-thread re-entry loop shared by a reactor park ([`sched_park`]) and a Monitor block
-/// ([`sched_block_for_handoff`]). The caller has already cleared the current thread's runnable
-/// bit; run the next runnable thread until a wake sets the bit again (a self-wake with nothing
-/// else runnable is a plain return), and with NOTHING runnable drive the reactor block point --
-/// possibly on behalf of threads parked on timers/sockets while the current one awaits a hand-off.
-/// A false block point (nothing external to wait on) is the lock/join deadlock: fail loud.
+/// Park the current thread for good (`Thread.Sleep(Timeout.Infinite)`): clear its runnable bit and
+/// mark it asleep forever. It waits on no timer or socket, so nothing wakes it; the other threads run
+/// on, and once none can run the scheduler idles ([`sched_idle`]). Never returns: a wake that reached
+/// it anyway would only park it again.
+unsafe fn sched_park_forever() -> ! {
+    loop {
+        let s = &mut *sched();
+        let cur = s.current as usize;
+        s.asleep_forever |= 1u32 << cur;
+        s.runnable &= !(1u32 << cur);
+        sched_block_current(s);
+    }
+}
+
+/// The blocked-thread re-entry loop shared by a reactor park ([`sched_park`]), a park for good
+/// ([`sched_park_forever`]) and a Monitor block ([`sched_block_for_handoff`]). The caller has
+/// already cleared the current thread's runnable bit; run the next runnable thread until a wake
+/// sets the bit again (a self-wake with nothing else runnable is a plain return), and with NOTHING
+/// runnable drive the reactor block point -- possibly on behalf of threads parked on
+/// timers/sockets while the current one awaits a hand-off -- through [`sched_idle`].
 unsafe fn sched_block_current(s: &mut Scheduler) {
     let cur = s.current as usize;
     loop {
@@ -2000,9 +2163,7 @@ unsafe fn sched_block_current(s: &mut Scheduler) {
             lamella_thread_switch(&mut s.contexts[cur], &s.contexts[next]);
             return;
         }
-        if !sched_block_point(s) {
-            sched_deadlock_trap();
-        }
+        sched_idle(s);
     }
 }
 
@@ -2170,6 +2331,7 @@ unsafe fn sched_ensure_init() {
         s.current = 0;
         s.runnable = 1;
         s.done = 0;
+        s.asleep_forever = 0;
         for i in 0..MAX_THREADS {
             s.parks[i] = ParkReason::NotParked;
         }
@@ -2211,7 +2373,9 @@ extern "C" fn lamella_thread_yield_impl() {
 /// busy-join); with everything else PARKED it drives the reactor block point instead -- so joining a
 /// thread that is asleep or blocked on a socket waits in the ONE real wait rather than spinning a
 /// no-op yield forever. A false block point (nothing external left to wait on) means the joined
-/// thread can never finish: fail loud. An id no spawn returned returns at once rather than hanging.
+/// thread can never finish: fail loud -- unless a thread is asleep for good, and then the join waits
+/// for good as well, as .NET's does ([`sched_idle`]). An id no spawn returned returns at once rather
+/// than hanging.
 #[no_mangle]
 extern "C" fn lamella_thread_join_impl(id: i32) {
     unsafe {
@@ -2223,8 +2387,8 @@ extern "C" fn lamella_thread_join_impl(id: i32) {
             let cur = s.current as usize;
             if sched_next_runnable(s, cur) != cur {
                 sched_yield();
-            } else if !sched_block_point(s) {
-                sched_deadlock_trap();
+            } else {
+                sched_idle(s);
             }
         }
     }
@@ -2261,6 +2425,10 @@ pub extern "C" fn lamella_thread_finished(id: i32) -> i32 {
 /// monotonic source this build has -- degrading to one cooperative yield where there is no clock a
 /// deadline could be trusted to reach.
 ///
+/// `Timeout.Infinite` (-1) parks the thread for good on every build, clock or none: a wait that never
+/// ends needs no clock to measure it. The managed `Sleep` refuses anything below -1 before this seam
+/// is reached, with .NET's `ArgumentOutOfRangeException`.
+///
 /// # WITHOUT A CLOCK IT YIELDS, AND THAT IS THE HONEST ANSWER RATHER THAN A CHEAP ONE
 ///
 /// A build with no monotonic source cannot wait for a stated duration, so it performs one
@@ -2275,6 +2443,12 @@ pub extern "C" fn lamella_thread_finished(id: i32) -> i32 {
 /// than a wrong one anybody can see.**
 #[no_mangle]
 extern "C" fn lamella_thread_sleep_impl(milliseconds: i32) {
+    if milliseconds < 0 {
+        unsafe {
+            sched_ensure_init();
+            sched_park_forever()
+        }
+    }
     if milliseconds > 0 {
         if let Some(now) = monotonic_now_ms() {
             unsafe {
@@ -2429,10 +2603,7 @@ fn locks() -> *mut LockTable {
 /// and proceeding without a slot would drop mutual exclusion. Prints `LOCKFULL` over semihosting
 /// (visibly wrong next to the harnesses' single-'0'/'1' protocol) and halts.
 fn monitor_table_full_trap() -> ! {
-    for b in *b"LOCKFULL" {
-        console_put(b);
-    }
-    loop {}
+    fatal_stop(*b"LOCKFULL")
 }
 
 /// `Monitor.Wait`/`Pulse`/`PulseAll` by a thread that does not own the lock -- the interpreter's
@@ -2440,10 +2611,7 @@ fn monitor_table_full_trap() -> ! {
 /// LOUD (`MONITOR` + halt) rather than silently diverge from the interp on an erroneous program.
 /// (A non-owner `Exit` is different: the interp releases nothing and stays silent -- mirrored.)
 fn monitor_not_owner_trap() -> ! {
-    for b in *b"MONITOR" {
-        console_put(b);
-    }
-    loop {}
+    fatal_stop(*b"MONITOR")
 }
 
 /// `Monitor.Enter(null)`/`TryEnter(null)` -- the interpreter traps LOUD (`Trap::TypeMismatch` on a
@@ -2452,10 +2620,7 @@ fn monitor_not_owner_trap() -> ! {
 /// (`NULLLOCK` + halt; the RISC-V twin exits 5). Wait/Pulse on null fall into
 /// [`monitor_not_owner_trap`] already -- no 0-keyed entry can exist past this guard.
 fn monitor_null_trap() -> ! {
-    for b in *b"NULLLOCK" {
-        console_put(b);
-    }
-    loop {}
+    fatal_stop(*b"NULLLOCK")
 }
 
 /// The interp's `lock_try`: take a free slot or an unowned entry, or bump the owner's recursion;
@@ -2873,12 +3038,20 @@ mod collector {
     /// off before the heap is handed over.
     ///
     /// **It is carved rather than declared, because the cost has to scale with the heap.** One bit per
-    /// 4-byte word is about 3% of the region -- 112 bytes of a nordic 3,584-byte arena, 2 KB of an
-    /// RP2350 64 KB one -- so the board with a big heap pays for a big bitmap and the board with 16 KB
-    /// of RAM does not pay for a heap it has not got.
+    /// 4-byte word is about 3% of the region -- about 200 bytes of a micro:bit v1's 6.5 KB heap, and
+    /// 3.4 KB of a micro:bit v2's 110 KB one -- so the board with a big heap pays for a big bitmap and
+    /// the board with 16 KB of RAM does not pay for a heap it has not got.
     static mut MARK_BASE: *mut u32 = core::ptr::null_mut();
     /// How many `u32` words [`MARK_BASE`] addresses. Zero until the heap is adopted.
     static mut MARK_WORDS: usize = 0;
+
+    /// The heap band's FORWARDING INDEX, carved off the top of the band below its mark bitmap: what
+    /// lets a collection find where each survivor lands by replaying one 256-byte chunk of the heap
+    /// rather than the heap from its base, once per reference it rewrites. Two words per 256 bytes,
+    /// about 3% of the band, as the bitmap is.
+    static mut INDEX_BASE: *mut u32 = core::ptr::null_mut();
+    /// How many `u32` words [`INDEX_BASE`] addresses. Zero until the heap is adopted.
+    static mut INDEX_WORDS: usize = 0;
 
     /// The SECOND SEGMENT's mark bitmap: the top of the PSRAM window, carved off before the rest is
     /// handed to the heap, as [`MARK_BASE`] is carved off the band. Null until the PSRAM is adopted,
@@ -2896,14 +3069,6 @@ mod collector {
     /// How many `u32` words [`SECOND_INDEX_BASE`] addresses. Zero until the PSRAM is adopted.
     #[cfg(feature = "second-segment")]
     static mut SECOND_INDEX_WORDS: usize = 0;
-    /// The BAND's forwarding index, also carved off the PSRAM, below the second segment's: the band
-    /// keeps all of its SRAM for objects. Null while there is no PSRAM, and the band is then
-    /// collected without one, as on every other board.
-    #[cfg(feature = "second-segment")]
-    static mut FIRST_INDEX_BASE: *mut u32 = core::ptr::null_mut();
-    /// How many `u32` words [`FIRST_INDEX_BASE`] addresses. Zero until the PSRAM is adopted.
-    #[cfg(feature = "second-segment")]
-    static mut FIRST_INDEX_WORDS: usize = 0;
 
     /// The two words above `HEAP_END` that a test harness's startup seeds with a SECOND SEGMENT's base
     /// and end, as it seeds the first band's: RAM at a second address, for a harness that has no board
@@ -2990,50 +3155,14 @@ mod collector {
     /// would report everything past its end as unreachable. Both answer `false`, the allocation fails,
     /// and `lamella_heap_exhausted` says so loudly -- which is the honest outcome, because a collector
     /// that cannot prove an object dead must not reclaim it.
-    #[cfg(not(feature = "second-segment"))]
-    fn collect_device_heap(heap: &mut lamella_gc::DeviceHeap) -> bool {
-        unsafe {
-            PIN_COUNT = 0;
-            PIN_OVERFLOW = false;
-        }
-        lamella_gc_walk_roots_impl(Some(gather_pin));
-        if unsafe { PIN_OVERFLOW } {
-            return false;
-        }
-        let (pins, marks) = unsafe {
-            (
-                &*core::ptr::addr_of!(PINS),
-                core::slice::from_raw_parts_mut(MARK_BASE, MARK_WORDS),
-            )
-        };
-        if marks.is_empty() {
-            return false;
-        }
-        let pin_count = unsafe { PIN_COUNT };
-        heap.collect_no_alloc(
-            |visit: &mut dyn FnMut(&mut lamella_gc::Ref, lamella_gc::RootKind)| {
-                let mut parked: RootVisitor<'_> = visit;
-                unsafe {
-                    ACTIVE_VISITOR = core::ptr::addr_of_mut!(parked) as *mut core::ffi::c_void;
-                }
-                lamella_gc_walk_roots_impl(Some(report_root));
-                unsafe {
-                    ACTIVE_VISITOR = core::ptr::null_mut();
-                }
-            },
-            &pins[..pin_count],
-            marks,
-        )
-    }
-
-    /// [`collect_device_heap`] for a heap that can have a SECOND SEGMENT, the PSRAM: the same pins and
-    /// the same root walk, and one collection over both segments, each with its own bitmap.
     ///
-    /// `second` is `None` when the board's startup did not bring the PSRAM up, and then this collects
-    /// the band alone. Either way it refuses as the one-segment hook refuses: an overflowed pin list,
-    /// or a bitmap short of its segment, answers `false` having moved nothing.
-    #[cfg(feature = "second-segment")]
-    fn collect_device_heap(heap: &mut lamella_gc::DeviceHeap, second: Option<&mut lamella_gc::DeviceHeap>) -> bool {
+    /// In a build whose heap can have a SECOND SEGMENT, the PSRAM, it is handed that segment too:
+    /// `None` when the board's startup did not bring the PSRAM up, and it then collects the band
+    /// alone. One collection covers both, each with its own bitmap and forwarding index.
+    fn collect_device_heap(
+        heap: &mut lamella_gc::DeviceHeap,
+        #[cfg(feature = "second-segment")] second: Option<&mut lamella_gc::DeviceHeap>,
+    ) -> bool {
         unsafe {
             PIN_COUNT = 0;
             PIN_OVERFLOW = false;
@@ -3042,47 +3171,56 @@ mod collector {
         if unsafe { PIN_OVERFLOW } {
             return false;
         }
-        let (pins, marks) = unsafe {
+        let (pins, marks, index) = unsafe {
             (
                 &*core::ptr::addr_of!(PINS),
-                core::slice::from_raw_parts_mut(MARK_BASE, MARK_WORDS),
+                carved(MARK_BASE, MARK_WORDS),
+                carved(INDEX_BASE, INDEX_WORDS),
             )
         };
         if marks.is_empty() {
             return false;
         }
-        let (second_marks, first_index, second_index) = unsafe {
-            (
-                carved(SECOND_MARK_BASE, SECOND_MARK_WORDS),
-                carved(FIRST_INDEX_BASE, FIRST_INDEX_WORDS),
-                carved(SECOND_INDEX_BASE, SECOND_INDEX_WORDS),
-            )
-        };
         let pin_count = unsafe { PIN_COUNT };
-        heap.collect_no_alloc_spanning(
-            second,
-            |visit: &mut dyn FnMut(&mut lamella_gc::Ref, lamella_gc::RootKind)| {
-                let mut parked: RootVisitor<'_> = visit;
-                unsafe {
-                    ACTIVE_VISITOR = core::ptr::addr_of_mut!(parked) as *mut core::ffi::c_void;
-                }
-                lamella_gc_walk_roots_impl(Some(report_root));
-                unsafe {
-                    ACTIVE_VISITOR = core::ptr::null_mut();
-                }
-            },
-            &pins[..pin_count],
-            lamella_gc::SegmentScratch { marks, index: first_index },
-            lamella_gc::SegmentScratch { marks: second_marks, index: second_index },
-        )
+        let roots = |visit: &mut dyn FnMut(&mut lamella_gc::Ref, lamella_gc::RootKind)| {
+            let mut parked: RootVisitor<'_> = visit;
+            unsafe {
+                ACTIVE_VISITOR = core::ptr::addr_of_mut!(parked) as *mut core::ffi::c_void;
+            }
+            lamella_gc_walk_roots_impl(Some(report_root));
+            unsafe {
+                ACTIVE_VISITOR = core::ptr::null_mut();
+            }
+        };
+        let scratch = lamella_gc::SegmentScratch { marks, index };
+        #[cfg(not(feature = "second-segment"))]
+        {
+            heap.collect_no_alloc(roots, &pins[..pin_count], scratch)
+        }
+        #[cfg(feature = "second-segment")]
+        {
+            let (second_marks, second_index) = unsafe {
+                (
+                    carved(SECOND_MARK_BASE, SECOND_MARK_WORDS),
+                    carved(SECOND_INDEX_BASE, SECOND_INDEX_WORDS),
+                )
+            };
+            heap.collect_no_alloc_spanning(
+                second,
+                roots,
+                &pins[..pin_count],
+                scratch,
+                lamella_gc::SegmentScratch { marks: second_marks, index: second_index },
+            )
+        }
     }
 
-    /// The `words` words at `base` that [`adopt_second_segment`] carved, or the empty slice for none.
+    /// The `words` words at `base` that [`ensure_device_heap`] or [`adopt_second_segment`] carved, or
+    /// the empty slice for none.
     ///
     /// # Safety
-    /// Inside the allocator's critical section, with `base` and `words` as `adopt_second_segment` set
-    /// them: a band of the window nothing else addresses, or zero words.
-    #[cfg(feature = "second-segment")]
+    /// Inside the allocator's critical section, with `base` and `words` as the carving set them: a
+    /// band of the heap's region or of the window that nothing else addresses, or zero words.
     unsafe fn carved(base: *mut u32, words: usize) -> &'static mut [u32] {
         if words == 0 {
             return &mut [];
@@ -3092,8 +3230,8 @@ mod collector {
 
     /// Hands the heap its SECOND SEGMENT, beside the band [`ensure_device_heap`] has just adopted:
     /// the PSRAM the board's startup brought up, or the window a test harness seeded. Carved off the
-    /// top of the window, as the band's bitmap is carved off the band: the segment's mark bitmap, its
-    /// forwarding index, and the band's forwarding index, sized for `band_len` bytes of band.
+    /// top of the window, as the band's are carved off the band: the segment's forwarding index and
+    /// its mark bitmap.
     ///
     /// **No exclusive or atomic access may ever touch a word of this segment or its bitmap.** The
     /// RP2350 supports exclusive accesses only in SRAM: to any other memory a store-exclusive still
@@ -3110,23 +3248,19 @@ mod collector {
     /// must be one nothing else in the image uses: the PSRAM the board's startup brought up, or RAM
     /// the harness set aside.
     #[cfg(feature = "second-segment")]
-    unsafe fn adopt_second_segment(band_len: usize) {
+    unsafe fn adopt_second_segment() {
         let Some((base, size)) = second_segment_window() else {
             return;
         };
         let mark_bytes = lamella_gc::mark_words_for(size) * 4;
         let second_index_bytes = lamella_gc::forwarding_index_words_for(size) * 4;
-        let first_index_bytes = lamella_gc::forwarding_index_words_for(band_len) * 4;
-        let heap_len = size.saturating_sub(mark_bytes + second_index_bytes + first_index_bytes) & !3;
+        let heap_len = size.saturating_sub(mark_bytes + second_index_bytes) & !3;
         if heap_len <= super::HEAP_MIN_BYTES {
             return;
         }
-        let first_index = base + heap_len;
-        let second_index = first_index + first_index_bytes;
+        let second_index = base + heap_len;
         let marks = second_index + second_index_bytes;
         unsafe {
-            FIRST_INDEX_BASE = first_index as *mut u32;
-            FIRST_INDEX_WORDS = first_index_bytes / 4;
             SECOND_INDEX_BASE = second_index as *mut u32;
             SECOND_INDEX_WORDS = second_index_bytes / 4;
             SECOND_MARK_BASE = marks as *mut u32;
@@ -3168,10 +3302,13 @@ mod collector {
     /// would allocate onto an uninitialised heap -- a fault with no message, and one that every new
     /// board bring-up would get the chance to make. Here there is nothing to remember.
     ///
+    /// `payload_size` is the first allocation's, which a heap that cannot be adopted reports as the
+    /// bytes asked for when it stops.
+    ///
     /// # Safety
     /// The heap words must hold the base and end the reset stub seeded, and that band must be owned
     /// by the GC for the program's lifetime -- which is what the stub's cleared band is.
-    pub(super) unsafe fn ensure_device_heap() {
+    pub(super) unsafe fn ensure_device_heap(payload_size: u32) {
         unsafe {
             if HEAP_ADOPTED {
                 return;
@@ -3179,23 +3316,26 @@ mod collector {
             let base = core::ptr::read_volatile(super::HEAP_PTR);
             let end = core::ptr::read_volatile(super::HEAP_END);
             if end <= base {
-                super::lamella_heap_exhausted();
+                super::lamella_heap_exhausted(super::block_bytes(payload_size), 0);
             }
             HEAP_ADOPTED = true;
 
             let total = (end - base) as usize;
             let mark_bytes = lamella_gc::mark_words_for(total) * 4;
-            let heap_len = total.saturating_sub(mark_bytes) & !3;
+            let index_bytes = lamella_gc::forwarding_index_words_for(total) * 4;
+            let heap_len = total.saturating_sub(mark_bytes + index_bytes) & !3;
             if heap_len <= super::HEAP_MIN_BYTES {
-                super::lamella_heap_exhausted();
+                super::lamella_heap_exhausted(super::block_bytes(payload_size), 0);
             }
-            MARK_BASE = base.wrapping_add(heap_len as u32) as *mut u32;
-            MARK_WORDS = (total - heap_len) / 4;
+            INDEX_BASE = base.wrapping_add(heap_len as u32) as *mut u32;
+            INDEX_WORDS = index_bytes / 4;
+            MARK_BASE = base.wrapping_add((heap_len + index_bytes) as u32) as *mut u32;
+            MARK_WORDS = (total - heap_len - index_bytes) / 4;
 
             lamella_gc::lamella_gc_init_device_heap(base as *mut u8, heap_len);
             lamella_gc::set_device_collect_hook(collect_device_heap);
             #[cfg(feature = "second-segment")]
-            adopt_second_segment(heap_len);
+            adopt_second_segment();
         }
     }
 

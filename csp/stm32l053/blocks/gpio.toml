@@ -1,16 +1,16 @@
 # BLOCK layout: the STM32L0x3 GPIO port block. Offsets are instance-base-relative; the port
 # instance bases live in ../instances.toml.
 #
-# IT IS NOT csp/stm32l0's GPIO BLOCK, AND THE DIFFERENCE IS A WHOLE REGISTER. This line adds
+# It is not csp/stm32l0's GPIO block, and the difference is a whole register. This line adds
 # GPIOx_BRR at 0x28 -- a bit-reset register beside BSRR -- which RM0377 does not give the L0x1 at
 # all. Reading the L0x1's layout across would place the first ten registers correctly and then
 # simply lack the eleventh.
 #
-# THE RESET MODE IS ANALOG, NOT INPUT. 11 is the reset state, so an untouched pin has its input
+# The reset mode is analog, not input. 11 is the reset state, so an untouched pin has its input
 # buffer off and IDR reads zero forever. An alternate-function setup must CLEAR a pin's 2-bit field
 # before OR-ing its value in; an OR alone leaves the pin analog.
 #
-# AND GPIOA's MODER RESET IS NOT ALL-ANALOG, because PA13 and PA14 come out of reset as SWDIO and
+# And GPIOA's MODER reset is not all-analog, because PA13 and PA14 come out of reset as SWDIO and
 # SWCLK. Table 48 gives port A its own row for that reason. A driver assuming a uniform analog reset
 # across ports is wrong about exactly the two pins a debugger is holding.
 #

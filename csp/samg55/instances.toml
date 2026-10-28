@@ -1,22 +1,22 @@
 # The SAMG55 instance map: every placed block copy, its base, and its peripheral id. Layout truth
 # lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml.
 #
-# THE RECORD IS THE SAM3X's AND NOT THE SAM D/L ONE. On this architecture the peripheral id (Table 9-1)
+# The record is the SAM3X's and not the SAM D/L one. On this architecture the peripheral id (Table 9-1)
 # is BOTH the PMC clock-control bit (PMC_PCER0 bit `pid` for pid < 32) AND the NVIC interrupt line
 # -- one number, so one field. -1 marks a row with no id, or an id this document does not settle;
 # where it is the second, the row says so.
 #
-# THIS DATASHEET CONTRADICTS ITSELF ABOUT WHICH FLEXCOM CARRIES WHICH PERIPHERAL ID, AND THE
-# CONTRADICTION IS THE REASON EVERY USART ROW BELOW CARRIES pid = -1.
+# This datasheet contradicts itself about which FLEXCOM carries which peripheral id, and the
+# contradiction is the reason every USART row below carries pid = -1.
 #
 #     Table 9-1 (Peripheral Identifiers)   id 8 = USART0    id 21 = USART5    id 14 = USART2
 #     Figure 6-1 (Product Mapping)         id 8 = USART5    id 21 = USART2    id 14 = USART3
 #
-# Six of the eight disagree. EVERY NON-USART PERIPHERAL AGREES between the two -- PIOA 11, PIOB 12,
+# Six of the eight disagree. Every non-USART peripheral agrees between the two -- PIOA 11, PIOB 12,
 # PMC 5, EFC 6, every TC, every I2SC, the ADC -- so this is not a document that is unreliable
 # everywhere; it is wrong in one column, and neither source says which.
 #
-# WHAT IS SETTLED, AND BY A THIRD SOURCE STRONGER THAN EITHER: the instance NAMES and their
+# What is settled, and by a third source stronger than either: the instance NAMES and their
 # BASES. The FLEXCOM and USART register descriptions print their own instance-indexed address
 # lists, and both agree with Figure 6-1's names on all eight:
 #
@@ -25,7 +25,7 @@
 #     US_CR      (30.7.1)  the same eight bases PLUS 0x200
 #
 # So a driver can find any USART; what nothing here can tell it is which PMC bit to set to clock
-# it. A WRONG PMC BIT DOES NOT FAULT -- the peripheral simply never clocks while every register
+# it. A wrong PMC bit does not fault -- the peripheral simply never clocks while every register
 # reads back what was written -- so a guessed id is exactly the silent-wrong-answer shape, and no
 # board binds a USART on this family until somebody reads the id off silicon.
 
@@ -114,7 +114,7 @@ block = "flexcom"
 base = 0x40008000
 pid = -1
 
-# THE ONE THE SAM G55 XPLAINED PRO WIRES ITS VIRTUAL COM PORT TO, and the reason that board binds
+# The one the SAM G55 Xplained Pro wires its virtual COM port to, and the reason that board binds
 # no UART. Table 9-4 puts TXD6 on PB0 and RXD6 on PB1, both on Peripheral B, so the pads are not
 # in doubt; the id is.
 [[instances]]

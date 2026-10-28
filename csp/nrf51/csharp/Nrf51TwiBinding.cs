@@ -1,7 +1,7 @@
 // The descriptor an nRF51 TWI (polled I2C master) driver consumes: one binding's resolved
 namespace Lamella.Boards
 {
-    public sealed class Nrf51TwiBinding
+    internal sealed class Nrf51TwiBinding
     {
         /// <summary>The bound TWI instance's base address. It shares its peripheral ID -- and
         /// therefore this whole register block -- with the serial-peripheral personalities at

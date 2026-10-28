@@ -64,7 +64,7 @@ default = true
 source = "xtal"             # HFCLKSTAT.SRC's name for the crystal oscillator (HFXO)
 xtal_hz = 32000000          # crystal X1 across XC1 and XC2 (schematic page 3)
 
-# THE MOTION SENSOR PART IS NOT GUARANTEED BY THE BOARD REVISION, and the two rows below assert
+# The motion sensor part is not guaranteed by the board revision, and the two rows below assert
 # one. The vendor's own hardware documentation, https://tech.microbit.org/hardware/2-0-revision/ ,
 # states verbatim:
 #
@@ -84,21 +84,21 @@ xtal_hz = 32000000          # crystal X1 across XC1 and XC2 (schematic page 3)
 #               0x40 at register 0x4F (magnetometer, address 0x1E)
 #   FXOS8700CQ  0xC7 at register 0x0D (ONE device, and on THIS board at address 0x1F)
 #
-# THE TWO VARIANTS DO NOT COLLIDE ON THIS BOARD, and that is a property of the board rather than of
+# The two variants do not collide on this board, and that is a property of the board rather than of
 # the parts. The NXP part selects among four addresses with two pins, and its 0,0 corner is 0x1E --
 # which is the ST magnetometer's address. This board straps it to 0x1F instead, so the two layouts
 # occupy disjoint addresses and a walk can tell them apart before any register is read. Where those
 # pins are tied is carrier truth, and it is stated here because the board's own vendor states it.
 #
-# THE IDENTITY REGISTERS ARE STILL ORDINARY DATA ON EACH OTHER'S PART, which is why the rule is to
+# The identity registers are still ordinary data on each other's part, which is why the rule is to
 # read both and accept exactly one. Register 0x4F on the NXP part is its magnetometer Z-axis minimum
 # value -- MEASURED data that changes with the field the board is in -- so a probe that read 0x4F
 # and compared against 0x40 could match by chance if it ever reached that part. In the other
 # direction, 0x0D is in a range the ST magnetometer reserves and whose read value its datasheet does
 # not guarantee. Full facts in parts/lsm303agr and parts/fxos8700cq.
 #
-# They are kept because they are true of every unit measured here and a board must say what is on
-# its bus. For the sibling revision the same vendor page adds "To date, all V1.5 boards have been
+# They are kept because a board must say what is on its bus.
+# For the sibling revision the same vendor page adds "To date, all V1.5 boards have been
 # manufactured with the LSM303AGR", so the alternative footprint appears never to have been
 # exercised there; no equivalent statement is published for this revision.
 
@@ -116,9 +116,9 @@ role = "internal-i2c"       # sensor driver's. Present only if the ST part is pl
 address = 0x1E
 source = "micro:bit v2.0.0_S schematic (bus residents): the accelerometer answers at 0x19 (WHO_AM_I 0x33), the magnetometer at 0x1E (WHO_AM_I 0x40). PART NOT GUARANTEED BY REVISION -- tech.microbit.org/hardware/2-0-revision/ states the board has a shared footprint for the ST LSM303AGR and the NXP FXOS8700CQ, only one is ever placed, and the reference runtime detects which at run time"
 
-# THE INTERFACE CHIP IS ALSO A BUS RESIDENT, AND THE BOARD FILE DID NOT SAY SO UNTIL A WALK FOUND
-# IT. Two addresses answer on this bus besides the motion sensor, and both belong to the on-board
-# interface processor rather than to anything a program would call a sensor. They are stated for the
+# The interface chip is also a bus resident. Two addresses answer on this bus besides the motion
+# sensor, and both belong to the on-board interface processor rather than to anything a program
+# would call a sensor. They are stated for the
 # same reason the sensor rows are: what answers where is the board's to say, and a reader comparing
 # a reading against this file should not find two devices it does not mention.
 

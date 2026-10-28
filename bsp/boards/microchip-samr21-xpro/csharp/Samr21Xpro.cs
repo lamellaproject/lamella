@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Microchip
 {
-    public sealed class Samr21Xpro
+    internal sealed class Samr21Xpro
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = MicrochipSamr21XproBindings.BOARD_MODEL;
@@ -21,7 +21,7 @@ namespace Lamella.Boards.Microchip
             Samr21GpioDriver.LogicalPin(MicrochipSamr21XproBindings.BUTTON0_PORT_BASE, MicrochipSamr21XproBindings.BUTTON0_PIN);
 
         /// <summary>The mode the user button wants.</summary>
-        /// <remarks>THIS KIT'S GUIDE DOES NOT SAY WHETHER AN EXTERNAL PULL-UP IS FITTED, where the
+        /// <remarks>This kit's guide does not say whether an external pull-up is fitted, where the
         /// Curiosity Nano guides state outright that none is. <see cref="PinMode.InputPullUp"/> is
         /// nevertheless the right answer under BOTH readings, which is why it can be offered without
         /// settling the question: if the board fits no pull-up the internal one is required, and if
@@ -44,7 +44,7 @@ namespace Lamella.Boards.Microchip
         private static GpioDriver MakeGpio() { return new Samr21GpioDriver(); }
 
         /// <summary>The family PORT driver this board bound.</summary>
-        /// <remarks>THE DRIVER SPANS ALL THREE PORT GROUPS AND THIS PACKAGE BONDS PART OF TWO. A pin
+        /// <remarks>The driver spans all three port groups and this package bonds part of two. A pin
         /// number the package does not carry is addressable and connected to nothing, which is why
         /// the constants above name only pads this board's own guide names. Four of the part's pads
         /// -- PA10, PA11, PB16 and PB17 -- are wired to the transceiver's control inputs and cannot

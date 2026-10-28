@@ -6,7 +6,7 @@
 // lines, and the carrier identity. The board's facts are stated in board.toml.
 namespace Lamella.Generated
 {
-    public sealed class StNucleoL4r5ziBindings
+    internal sealed class StNucleoL4r5ziBindings
     {
         private StNucleoL4r5ziBindings() { }
 

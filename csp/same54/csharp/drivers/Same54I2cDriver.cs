@@ -32,6 +32,27 @@ internal sealed class Same54I2cDriver : I2cDriver
         _data = block + Same54SercomI2cMasterLayout.DATA_OFF;
     }
 
+    /// <summary>The standard-mode and fast-mode rates, 100000 and 400000, whose BAUD divisor fits the
+    /// register at the binding's core clock: f_SCL = f_GCLK / (10 + 2*BAUD), BAUD from 0 to 255.</summary>
+    public override int[] Rates
+    {
+        get
+        {
+            bool standard = Fits(100000);
+            bool fast = Fits(400000);
+            int[] rates = new int[(standard ? 1 : 0) + (fast ? 1 : 0)];
+            if (standard) rates[0] = 100000;
+            if (fast) rates[rates.Length - 1] = 400000;
+            return rates;
+        }
+    }
+
+    bool Fits(int busHz)
+    {
+        uint half = _binding.CoreClockHz / (uint)(busHz * 2);
+        return half >= 5 && half - 5 <= Same54SercomI2cMasterLayout.BAUD_BAUD;
+    }
+
     public override void Configure(int busHz)
     {
         Mmio.Write32(_binding.ApbMaskReg, Mmio.Read32(_binding.ApbMaskReg) | _binding.ApbMask);
@@ -196,7 +217,7 @@ internal sealed class Same54I2cDriver : I2cDriver
 
     /// <summary>Receives `count` bytes and closes the transaction. The first byte is already in
     /// hand when this is entered -- addressing a slave for a read clocks it in.</summary>
-    /// <remarks>DO NOT ADD LOGGING, TRACING OR ANY OTHER SLOW WORK INSIDE THIS LOOP. The master
+    /// <remarks>Do not add logging, tracing or any other slow work inside this loop. The master
     /// holds SCL low for as long as a flag is pending, so a pause here is not a delay -- it is a
     /// held bus, and a device with an SMBus timeout abandons the transfer and releases it. Every
     /// byte after that reads as 0xFF from a bus nothing is driving, which looks exactly like a

@@ -1,27 +1,27 @@
 # BLOCK layout: the STM32L0x3 GPIO port block, category 5. Offsets are instance-base-relative; the
 # port instance bases live in ../instances.toml.
 #
-# THIS IS A DELIBERATE TWIN OF csp/stm32l053's GPIO BLOCK AND THE TWINNING IS THE FACT. RM0367
+# This is a deliberate twin of csp/stm32l053's GPIO block and the twinning is the fact. RM0367
 # states this block's registers ONCE, without qualifying by category, so the two categories of the
 # L0x3 line have the same port hardware and a file each. Every offset here was re-read from that
 # book's own per-register sections rather than carried across, and they agree -- which is the
 # expected result of reading one manual twice, and a disagreement would have been the finding.
 #
-# WHAT DOES DIFFER BETWEEN THE TWO CATEGORIES IS NOT IN THIS FILE. It is which PORTS exist (the
+# What does differ between the two categories is not in this file. It is which PORTS exist (the
 # instance map), how many pads a package bonds (the parts row), the SYSCFG port codes an external
 # interrupt can name (the exti block), and the NVM (the flash block). A reader tidying this
 # directory should fold none of them on the strength of this one being a twin.
 #
-# IT IS NOT csp/stm32l0's GPIO BLOCK, AND THAT DIFFERENCE IS A WHOLE REGISTER. This line adds
+# It is not csp/stm32l0's GPIO block, and that difference is a whole register. This line adds
 # GPIOx_BRR at 0x28 -- a bit-reset register beside BSRR -- which RM0377 does not give the L0x1 at
 # all. Reading the L0x1's layout across would place the first ten registers correctly and then
 # simply lack the eleventh.
 #
-# THE RESET MODE IS ANALOG, NOT INPUT. 11 is the reset state, so an untouched pin has its input
+# The reset mode is analog, not input. 11 is the reset state, so an untouched pin has its input
 # buffer off and IDR reads zero forever. An alternate-function setup must CLEAR a pin's 2-bit field
 # before OR-ing its value in; an OR alone leaves the pin analog.
 #
-# AND GPIOA's MODER RESET IS NOT ALL-ANALOG, because PA13 and PA14 come out of reset as SWDIO and
+# And GPIOA's MODER reset is not all-analog, because PA13 and PA14 come out of reset as SWDIO and
 # SWCLK. Table 48 gives port A its own row for that reason. A driver assuming a uniform analog reset
 # across ports is wrong about exactly the two pins a debugger is holding.
 #

@@ -29,7 +29,7 @@ pub enum TypeSymbol {
         /// The element type.
         element: Box<TypeSymbol>,
         /// The number of dimensions (at least 1).
-        rank: u8,
+        rank: u32,
     },
     /// An unsafe pointer type `T*` (III.1.1.5): a raw managed pointer to `element`.
     Pointer(Box<TypeSymbol>),
@@ -53,7 +53,7 @@ impl TypeSymbol {
 
     /// An array of `self`.
     #[must_use]
-    pub fn into_array(self, rank: u8) -> TypeSymbol {
+    pub fn into_array(self, rank: u32) -> TypeSymbol {
         TypeSymbol::Array {
             element: Box::new(self),
             rank,
@@ -249,11 +249,6 @@ mod tests {
 impl TypeSymbol {
     /// The type's name WITHOUT its namespace, as csc renders it in a handful of messages.
     ///
-    /// **csc DOES NOT USE ONE RENDERING FOR ALL DIAGNOSTICS, AND THIS IS NOT A STYLE CHOICE WE
-    /// GET TO MAKE.** Measured on the same type in the same file: `CS0029` says
-    /// *'System.Func<int, int>'* and `CS1593` says *'Func<int, int>'*. Both are csc, one compilation
-    /// apart. The messages are search keys, so each one is copied as it is, and this exists for the
-    /// second group rather than as an opinion about which is better.
     ///
     /// Structural rather than string surgery: dropping everything before the last `.` would also
     /// cut into a type ARGUMENT (`Func<System.Guid, int>`), which is a different type's name.

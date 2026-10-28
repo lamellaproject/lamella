@@ -1,6 +1,6 @@
 # The SAMR30 parts table. The SAM R30 is a SAM L21 die and an AT86RF212B sub-1 GHz transceiver in
-# one package, and the classification is not a guess from the name: THE DOCUMENT'S OWN RUNNING
-# HEADER READS "SAM R30 -- Reference Guide - SAM L21" on all 1,163 pages. So the sibling by name is
+# one package, and the classification is not a guess from the name: the document's own running
+# header reads "SAM R30 -- Reference Guide - SAM L21" on all 1,163 pages. So the sibling by name is
 # the SAM R21 and the sibling by silicon is the SAM L21, and where the two disagree the L21 wins.
 #
 #     block       SAM R21       SAM R30
@@ -8,8 +8,8 @@
 #     SERCOM0     0x42000800    0x42000000     <- the L21's
 #     clock       SYSCTRL       MCLK/PCHCTRL   <- the L21's arm, not the R21's
 #
-# WHAT THE RADIO COSTS, STATED IN THE ONE FIGURE THAT CARRIES IT, AND IT IS THE SAME FIGURE IN BOTH
-# PACKAGES. Ch 2 of each family's own datasheet gives the general-purpose I/O count per pin count:
+# What the radio costs, stated in the one figure that carries it, and it is the same figure in both
+# packages. Ch 2 of each family's own datasheet gives the general-purpose I/O count per pin count:
 #
 #     package    SAM L21     SAM R30     spent on the transceiver
 #     48-pin       37          28                 9
@@ -20,14 +20,14 @@
 # 28 in a 48-pin package, which is a coincidence of two different subtractions rather than a shared
 # fact.
 #
-# THE RADIO SPENDS SERCOM4, AND THE REFUSAL HERE IS WEAKER THAN THE SAM R21'S BY A REAL AMOUNT.
+# The radio spends SERCOM4, and the refusal here is weaker than the SAM R21's by a real amount.
 # On the R21, SERCOM4's pads reach NO package pin at all -- the instance is unreachable from
 # outside the package and the refusal is absolute. On this part Table 7-1 ALSO places SERCOM4 on
 # four bonded pads, PA12..PA15 in column D, so the instance is CONTENDED rather than unreachable:
 # a program may have the radio or those four pads, never both. The two parts differ by a countable
 # amount: SERCOM4 appears ZERO times in the R21's Table 5-1 and FOUR times in this part's Table 7-1.
 #
-# THIS PART HAS TWO RAM REGIONS AND THE SCHEMA HAS ONE FIGURE, exactly as its SAM L21 host die
+# This part has two RAM regions and the schema has one figure, exactly as its SAM L21 host die
 # does. Ch 2 states System SRAM and Low Power SRAM as separate rows -- 32 KB and 8 KB -- at
 # different addresses in different power domains. The `ram` field below is the SYSTEM SRAM alone,
 # which is the contiguous span a linker can believe, and the low-power region is

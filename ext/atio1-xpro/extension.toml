@@ -2,22 +2,22 @@
 # SIGNAL of the ../standards/xplained-pro.toml standard and never a host pad; which pad a signal
 # reaches is the HOST's fact and lives in that host's `[[connectors]]` row.
 #
-# THIS BOARD USES EVERY SIGNAL THE STANDARD DEFINES, which is what its own guide claims -- it
+# This board uses every signal the standard defines, which is what its own guide claims -- it
 # "utilizes all functions on the standard Xplained Pro extension header" -- and the rows below bear
 # out: a light sensor on the ADC pair's positive line, a low-pass filter bridging a PWM pin to the
 # ADC pair's negative line, an LED on the other PWM pin, both general-purpose lines on a header, a
 # temperature sensor with EEPROM on I2C with its alarm on the interrupt line, a UART loopback, and a
 # microSD card on the SPI bus with its detect on the second slave select.
 #
-# SO IT EXERCISES SIX KINDS OF HOST DRIVER AT ONCE -- ADC, PWM, GPIO, I2C, UART and SPI -- which is
+# So it exercises six kinds of host driver at once -- ADC, PWM, GPIO, I2C, UART and SPI -- which is
 # what makes it worth more than any single-purpose extension and also what makes it cost more.
 #
-# TWO POLARITIES COME OUT THE OPPOSITE OF THE OBVIOUS WAY AND BOTH ARE STATED RATHER THAN INFERRED.
+# Two polarities come out the opposite of the obvious way and both are stated rather than inferred.
 # The LED lights when its line is driven to GROUND, so it is ACTIVE LOW on a pin the standard calls
-# PWM(+). And the card-detect line is shorted to ground BY THE PRESENCE OF A CARD, so it reads LOW
+# PWM(+). And the card-detect line is shorted to ground by the presence of a card, so it reads LOW
 # when a card is in and needs a pull-up on the host to read anything at all when one is not.
 #
-# THE LOW-PASS FILTER IS THE ONE FEATURE THAT IS NOT A CHIP. Two of the twenty pins are wired to
+# The low-pass filter is the one feature that is not a chip. Two of the twenty pins are wired to
 # each other through a resistor and a capacitor, so a host can drive a PWM signal out and sample the
 # smoothed result back on its own ADC without anything else attached. It is a self-test for two
 # drivers at once, and no `[[devices]]` row can express it -- it has no device.
@@ -151,7 +151,7 @@ source = "Atmel-42078B section 4.2.3 and Table 4-4: EXT pin 6 is routed through 
 
 # --- the two features that are not devices --------------------------------------------------------
 #
-# A LOW-PASS FILTER AND A UART LOOPBACK ARE BOTH WIRES BETWEEN TWO PINS OF THIS CONNECTOR. Neither
+# A low-pass filter and a UART loopback are both wires between two pins of this connector. Neither
 # has a part, an address or a bus, so neither can be a device row -- and both are the most useful
 # things on the board for proving a host driver works, because a host can drive one end and read
 # the other with nothing else attached.

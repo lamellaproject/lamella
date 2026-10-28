@@ -4,7 +4,8 @@
     <id>Lamella.Sdk</id>
     <version>$version$</version>
     <!-- Packing writes here what every package carries: authors, license, licenseUrl, projectUrl, copyright and repository. -->
-    <description>The MSBuild project SDK for C# programs that run on Lamella. A project that names it and targets lamella1.0 builds with dotnet build, and dotnet run runs it on this computer, under Lamella's interpreter, or on a connected board running Lamella's firmware.</description>
+    <description>The MSBuild project SDK for building, publishing and running C# programs on Lamella and Lamella RHU boards. lamella1.0 targets Lamella; net11.0 targets Lamella RHU.</description>
+    <readme>README.md</readme>
     <packageTypes>
       <packageType name="MSBuildSdk" />
     </packageTypes>

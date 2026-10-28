@@ -18,7 +18,8 @@ validation = "none"
 
 # --- a disagreement worth carrying ------------------------------------------------------------
 #
-# MEASURED AT AN ADDRESS NEITHER COLUMN LISTS: 0x39 measured, against 0x32 and 0x19 in the manual.
+# This node answers at an address neither column of the manual lists: 0x39, against 0x32 and 0x19
+# there.
 
 [address]
 bus = "i2c"

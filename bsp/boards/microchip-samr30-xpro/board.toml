@@ -1,16 +1,16 @@
 # The SAM R30 Xplained Pro (ATSAMR30-XPRO): board truth only -- what is wired to what. Chip
 # truth lives in csp/samr30/.
 #
-# THE PART IS A SAM L21 AND AN AT86RF212B IN ONE PACKAGE, and the kit exists to show the sub-1 GHz
+# The part is a SAM L21 and an AT86RF212B in one package, and the kit exists to show the sub-1 GHz
 # radio. What that costs a board is stated once, in csp/samr30/parts.toml: 28 general-purpose I/O
 # pins on a 48-pin part. Nothing here may reach SERCOM4 or PA10/PA11/PB16/PB17.
 #
-# THE NAME SAYS R21 AND THE SILICON SAYS L21, AND THE CLOCK PLAN IS WHERE THAT BITES. The sibling
+# The name says R21 and the silicon says L21, and the clock plan is where that bites. The sibling
 # microchip-samr21-xpro's plan is OSC8M at 8 MHz; this part starts on OSC16M at 4 MHz, like the SAM L21 and
 # SAM L22 and unlike every SAM D21-line board on this roster. A baud divisor carried across from
 # the kit that shares this one's name would be wrong by a factor of two.
 #
-# THIS KIT'S GUIDE DOES NOT REPEAT THE SIBLING'S TYPO, WHICH WAS CHECKED RATHER THAN ASSUMED. The
+# This kit's guide does not repeat the sibling's typo. The
 # SAM R21 Xplained Pro guide names SERCOM0 for its TX line and SERCOM1 for its RX line -- two
 # instances for one link -- and csp/samr21/pins.toml records taking the datasheet over it.
 # DS50002612A Table 4-12 names SERCOM0 on both rows and agrees with DS70005303C Table 7-1.
@@ -44,7 +44,7 @@ notes = [
 
 [[carriers]]
 kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
-usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+usb_vid = 0x03EB            # Note: no usb_pid row, and its absence is a sourced position rather than
 role = "vcp"                # AN OMISSION. A product id is a property of the debugger's FIRMWARE:
 baud = 115200               # this kit's user guide never prints one, and the EDBG user guide
 plan = "osc16m-4mhz"        # Atmel-42096 describes the composite device without giving an id
@@ -61,7 +61,7 @@ gclk_gen = 0                # column-C SERCOM at all, so the letter is not a cho
 tx = { pin = "PA04", pad = 0 }   # which is the sibling samr21's shape and NOT the saml21's, where
 rx = { pin = "PA05", pad = 1 }   # both columns are occupied and the letter picks the instance.
 
-# THE DEFAULT CLOCK PLAN, AND THE DATASHEET NAMES THE GENERATOR RATHER THAN LEAVING IT INFERRED:
+# The default clock plan, and the datasheet names the generator rather than leaving it inferred:
 # "Generator 0 is using OSC16M at 4 MHz as source and generates GCLK_MAIN". So GCLK0 is 4 MHz at
 # reset -- the SAM L21 and SAM L22 rate, reached by the same oscillator, and NOT the 8 MHz that the
 # SAM D21-line boards and the sibling microchip-samr21-xpro start at. Every baud divisor the generator

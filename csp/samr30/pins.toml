@@ -21,7 +21,7 @@ notes = [
 # a function column. Table 7-1 leaves column C empty on both pads and carries SERCOM0 in column D,
 # so the guide's instance is right and the letter it omits is D.
 #
-# THE SIBLING KIT GUIDE GETS THIS WRONG AND THIS ONE DOES NOT. The SAM R21 Xplained Pro guide's
+# The sibling kit guide gets this wrong and this one does not. The SAM R21 Xplained Pro guide's
 # same table names SERCOM0 for its TX line and SERCOM1 for its RX line -- two instances for one
 # link, which cannot be right, and csp/samr21/pins.toml records taking the datasheet over it. This
 # kit's guide names SERCOM0 on both rows and agrees with Table 7-1. Checked rather than assumed,

@@ -3,12 +3,12 @@
 # enable registers, so [base, rcc_en_off, rcc_en_bit] states each gate in full. `-1` = the row
 # gates nothing (the RCC itself).
 #
-# EVERY BASE HERE IS THE NONSECURE ALIAS, AND THAT IS A DECISION RATHER THAN A DEFAULT. This is
+# Every base here is the nonsecure alias, and that is a decision rather than a default. This is
 # an Armv8-M TrustZone part, so RM0456 Table 6 prints TWO address columns for every peripheral --
 # "Secure boundary address" and "Nonsecure boundary address" -- and an instance row has one `base`.
 # The rows below state the NONSECURE one.
 #
-# WHY ONE FIELD IS ENOUGH, AND WHY THE OBVIOUS SHORTCUT IS STILL REFUSED. The two aliases differ
+# Why one field is enough, and why the obvious shortcut is still refused. The two aliases differ
 # by a CONSTANT +0x10000000 across the table, so a second per-instance field would be filled by
 # formula on every row -- the dead-data shape csp/ra4m1 refused for the module-stop record and the
 # H7 pad hit before it. But the constant is NOT safe to encode as a derivation either: Table 6 has
@@ -18,14 +18,14 @@
 # manual, and exactly the kind of exception that makes a derivation rule worse than none. Every
 # instance below obeys the constant; the rule is recorded as an observation and nothing computes it.
 #
-# AND WHETHER THE SECURE ALIAS IS EVEN REACHABLE IS CHIP STATE, NOT BOARD TRUTH. TrustZone is
+# And whether the secure alias is even reachable is chip state, not board truth. TrustZone is
 # enabled by TZEN, bit 31 of FLASH_OPTR -- a user option byte, programmable, and not a property of
 # the part or of the board. Its value does not move any address below: with TZEN = 0 only the
 # nonsecure alias is meaningful, and with TZEN = 1 the secure alias exists IN ADDITION at the same
 # offset. So this table is correct either way, which is the whole reason the schema did not have to
 # change for a TrustZone part.
 #
-# THE BASES ARE NOT THE OTHER ST FAMILIES' BASES. This part puts its GPIO ports on AHB2 at
+# The bases are not the other ST families' bases. This part puts its GPIO ports on AHB2 at
 # 0x42020000 and above and its RCC at 0x46020C00, where the vendor's F0, F4 and F7 lines put them at
 # 0x40020000 and 0x40023800 and the H7 puts them at 0x58020000. A row copied across any of those
 # would be wrong on every peripheral here.
@@ -65,7 +65,7 @@ rcc_en_bit = 7      # GPIOHEN
 
 # --- the two links to a companion processor -------------------------------------------------
 #
-# THESE GATE THROUGH A DIFFERENT REGISTER FROM THE PORTS ABOVE: RCC_APB3ENR at 0x0A8, not
+# These gate through a different register from the ports above: RCC_APB3ENR at 0x0A8, not
 # RCC_AHB2ENR1 at 0x08C. See the note on that.
 
 [[instances]]

@@ -42,12 +42,6 @@ pub struct Tokenized {
 
 /// One `#:` file-based-app directive: its name and everything after it on the line.
 ///
-/// **THE LEXER DOES NOT INTERPRET EITHER PART, AND THAT IS csc's DIVISION RATHER THAN LAZINESS.**
-/// Measured against SDK 10.0.301: with file-based mode on, `#:nosuchthing Foo` and
-/// `#:property NoEqualsSign` both compile clean. The compiler owns the SYNTAX -- that a directive
-/// is here, what it is called, and where it may appear -- and the tooling that acts on directives
-/// owns which names exist and what their arguments must look like. Validating a name here would
-/// put the closed set in two places.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileDirective {
     /// The offset of the `#`.
@@ -167,11 +161,6 @@ impl NullableContext {
 
 /// Scans `source` into a complete [`Tokenized`] stream.
 ///
-/// How identifiers are compared (9.4.2). They differ only for a decomposed vs precomposed spelling
-/// of one identifier: `None` keeps the raw code points, which csc does (it does NOT normalize, so
-/// the two spellings are distinct -- this matches the differential oracle); `Nfc` folds to Unicode
-/// Normalization Form C, which the ECMA-334 standard requires (the two spellings are then one
-/// identifier). The compiler default is `None`; `Nfc` is the spec-strict knob.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Normalization {
     /// Raw code points -- the Roslyn/csc behaviour. The default.
@@ -187,11 +176,6 @@ pub enum Normalization {
 /// the front end threads one options value, so a driver switch becomes a field rather than a
 /// parameter on every `*_with` entry point.
 ///
-/// **[`OutputKind::Inferred`] IS THE DEFAULT AND IS NOT csc's.** csc defaults to `exe` and answers
-/// `CS5001` when no entry point is found. This compiler defaults to reading the SOURCES -- a static
-/// `Main` with an entry-point signature makes an executable, and its absence makes a library --
-/// because `lcsc` has no project system to carry the answer, and because the corlib build names no
-/// target at all on its command line. Adopting csc's default would refuse that build.
 ///
 /// The distinction only holds where the driver was TOLD: `Inferred` cannot demand an entry point,
 /// so `CS5001` is reported for an explicit executable target and never for an inferred one.
@@ -202,10 +186,6 @@ pub enum OutputKind {
     Inferred,
     /// `/target:exe`, and `/target:winexe`.
     ///
-    /// **THE TWO ARE ONE KIND HERE, AND THE PART THAT DIFFERS IS INERT FOR US.** csc separates them
-    /// only by the PE subsystem field -- Windows CUI against Windows GUI -- which the Windows
-    /// loader reads and nothing else does. A Lamella image is run by the Lamella runtime or compiled
-    /// ahead of time for a microcontroller, so no consumer of one has ever read that field.
     Executable,
     /// `/target:library`.
     Library,
@@ -214,10 +194,6 @@ pub enum OutputKind {
 /// The lexer-level dialect knobs, gathered so they thread through the front end as one
 /// value (and so a new knob is a field, not another parameter on every `*_with`).
 ///
-/// [`Default`] is strict-ISO-meets-csc: identifiers are not normalized (matching the
-/// Roslyn/csc oracle) and the csc typed-reference operators are off (they are not in
-/// ECMA-334). The two knobs move independently of the oracle -- `normalization` toward
-/// the spec, `typedref` toward csc -- because each closes a different gap.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LexOptions {
     /// Preprocessor symbols defined before scanning (9.5.3) -- csc's `/define:A;B`. `#if` sees
@@ -238,11 +214,6 @@ pub struct LexOptions {
     pub version: LanguageVersion,
     /// Whether this compilation is a FILE-BASED PROGRAM -- csc's `-features:FileBasedProgram`.
     ///
-    /// **`#:` AND `#!` ARE NOT PLAIN C# AND THIS IS THE SWITCH THAT ADMITS THEM.** Off by default,
-    /// as csc's is: a `#:` in an ordinary compilation is `CS9298` and a `#!` is `CS9314`, even
-    /// when well placed. The knob does not change what is LEXED -- both are recognized either way,
-    /// so the diagnostic can name the real problem instead of a syntax error -- only whether the
-    /// compilation may contain them.
     ///
     /// It follows the INPUT KIND rather than the file count: a single `.cs` run or built
     /// directly is a file-based program, and a project is not one however few files it lists.
@@ -263,12 +234,6 @@ pub struct LexOptions {
     /// native) scenarios. When off, `[DllImport]` is rejected rather than emitted as inert
     /// metadata.
     ///
-    /// **`[StructLayout]`, `[FieldOffset]` and `[MarshalAs]` ARE NOT BEHIND THIS KNOB.** What it
-    /// guards is an unmanaged CALL boundary, and none of those three is one: an explicit-layout
-    /// struct with overlapping fields is a managed union, a `Pack` is a managed layout request, and
-    /// a `[MarshalAs]` on a field is inert until something marshals it. csc emits all three at any
-    /// setting, so gating them would make this compiler's metadata differ from csc's for source
-    /// containing no native call at all.
     pub native_interop: bool,
     /// Whether the Portable PDB is EMBEDDED in the image (the `EmbeddedPortablePdb` debug directory
     /// entry, DEFLATE-compressed) rather than written beside it as a standalone `.pdb`. Purely an
@@ -605,10 +570,6 @@ impl<'a> Lexer<'a> {
 
     /// Scans a `#:` file-based-app directive: `#:` then a NAME then the rest of the line.
     ///
-    /// **THE COMPILER'S WHOLE SHARE OF THIS FEATURE IS HERE**, and it is three things: recognize
-    /// the directive, require the mode, and enforce placement. Measured against SDK 10.0.301 --
-    /// with the mode on, csc accepts an unknown NAME and a malformed ARGUMENT without complaint,
-    /// so neither is checked here. What the directives MEAN belongs to whatever acts on them.
     ///
     /// BOTH DIAGNOSTICS CAN FIRE ON ONE DIRECTIVE: a misplaced directive in a non-file-based
     /// compilation reports the mode error and then the placement error, in that order.
@@ -810,9 +771,6 @@ impl<'a> Lexer<'a> {
     /// Processes a `#pragma` (9.5.8), which in C# 2.0 means `warning disable|restore [codes]` and
     /// `checksum`.
     ///
-    /// **A PRAGMA IS ADVICE, SO AN UNKNOWN ONE IS A WARNING AND NOT AN ERROR** -- csc's `CS1633`,
-    /// measured. The alternative, refusing the file, would make this compiler reject source every
-    /// other one accepts over a directive whose whole purpose is to be ignorable.
     ///
     /// The suppression list is COLLECTED here and applied nowhere near here: the warnings it
     /// silences are the binder's, and they are silenced by POSITION, so the directives ride out on
@@ -861,10 +819,6 @@ impl<'a> Lexer<'a> {
     /// Processes a `#nullable` directive (C# 8.0): `enable`, `disable` or `restore`, then optionally
     /// `warnings` or `annotations` to set one of the two contexts rather than both.
     ///
-    /// The words are case-sensitive, as csc's are. A missing or unknown setting is CS8637 where the
-    /// setting should be; a word after it that is not a target is CS8668; anything after a valid
-    /// target is the ordinary CS1025. In a skipped `#if` region nothing is checked or recorded, and
-    /// under C# 7.3 or earlier the directive is gated at its name but still checked, as csc does.
     fn scan_nullable(&mut self, start: usize, name_start: usize, active: bool) {
         if !active {
             self.consume_to_line_end();
@@ -922,6 +876,7 @@ impl<'a> Lexer<'a> {
                 Some(',') => {
                     self.position += 1;
                 }
+                Some('/') if self.peek_second() == Some('/') => break,
                 Some(c) if c.is_ascii_digit() || c.is_ascii_alphabetic() => {
                     let text_start = self.position;
                     while self
@@ -936,7 +891,7 @@ impl<'a> Lexer<'a> {
                         codes.push(code);
                     }
                 }
-                Some(_) => self.position += 1,
+                Some(c) => self.position += c.len_utf8(),
             }
         }
         self.consume_to_line_end();
@@ -1554,10 +1509,6 @@ impl<'a> Lexer<'a> {
     /// cannot be mistaken for this hole's delimiters, because they never reach this loop as bare
     /// punctuators.
     ///
-    /// **A `:` AT NESTING DEPTH 0 ALWAYS ENDS THE EXPRESSION, EVEN WITH A `?` OPEN.** That is
-    /// csc's rule rather than a simplification of it: `$"{c ? a : b}"` is `CS8361` telling the
-    /// reader to parenthesize, and the reason parenthesizing works is exactly that `(` raises the
-    /// depth this test is about.
     fn scan_interpolation_hole(&mut self, verbatim: bool) -> ScannedHole {
         let hole_start = self.position;
         let mark = self.diagnostics.len();
@@ -1942,12 +1893,6 @@ impl<'a> Lexer<'a> {
     /// Reports whatever a digit run's separators require, MEASURED against csc rather than assumed
     /// -- the obvious guesses are wrong in three places.
     ///
-    /// * Separators between digits are C# 7.0.
-    /// * A separator immediately after a base prefix (`0x_FF`) is a SEPARATE feature at C# 7.2;
-    ///   csc rejects it at 7.0 by name, so accepting it there would be an accepts-invalid.
-    /// * A DOUBLED separator (`1__0`) is legal at every version that has separators at all.
-    /// * A TRAILING separator (`1_`) is not a feature gate: it is `CS1013 Invalid number`, at every
-    ///   version including the ones where separators are fully supported.
     fn gate_digit_run(&mut self, run: DigitRun, start: usize) {
         if run.trailing_separator {
             self.report(DiagnosticKind::MalformedNumericLiteral, start);
@@ -2306,8 +2251,6 @@ fn is_format_char(c: char) -> bool {
 /// The shape of a scanned digit run, so the caller can gate its separators once per literal rather
 /// than at each digit.
 ///
-/// `BitOrAssign` merges the runs of one literal -- integer part, fraction, exponent -- because csc
-/// reports a separator problem once for the literal, not once per run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct DigitRun {
     /// At least one actual digit was consumed.
@@ -2871,6 +2814,21 @@ mod tests {
         assert!(enabled(NullableOption::Enable, 5));
         assert!(enabled(NullableOption::Annotations, 45));
         assert!(!enabled(NullableOption::Warnings, 45));
+    }
+
+    /// A comment after the codes ends the list: what it says is prose, whatever characters it holds.
+    /// A multi-byte character on the line is stepped over whole, and a number in a comment disables
+    /// nothing, as csc reads the same lines.
+    #[test]
+    fn a_pragma_warning_comment_is_not_read_as_codes() {
+        let source = "#pragma warning disable 169 // field isn\u{2019}t used, see 414
+class C { }
+#pragma warning disable 649 \u{e9}
+";
+        let scanned = tokenize_with(source, LexOptions::default());
+        assert_eq!(scanned.pragma_warnings.len(), 2);
+        assert_eq!(scanned.pragma_warnings[0].codes, vec![169]);
+        assert_eq!(scanned.pragma_warnings[1].codes, vec![649]);
     }
 
     /// `#pragma warning` is COLLECTED rather than applied here: the warnings it silences are the
@@ -3932,9 +3890,6 @@ class C { }
 
     /// Scans `source` as a file-based program (or not), and returns the diagnostic codes.
     ///
-    /// Every expectation in the tests below was READ OFF SDK 10.0.301 and the csc it ships, not
-    /// off the documentation page -- which says only "place these at the top of the C# file" and
-    /// states no rule at all for a misplaced one.
     fn directive_codes(source: &str, file_based: bool) -> Vec<u16> {
         let options = LexOptions {
             file_based,

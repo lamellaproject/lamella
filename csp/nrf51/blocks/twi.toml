@@ -4,10 +4,9 @@
 # polled shape a table-driven driver wants.
 #
 # Transcribed from the nRF51 Series Reference Manual v3.0 (Nordic Semiconductor, 2014-10-20),
-# chapter 28, Tables 258/259/260/261/262/265/266/267/268/269/270/271/272, with the document
-# open.
+# chapter 28, Tables 258/259/260/261/262/265/266/267/268/269/270/271/272.
 #
-# EVERY OFFSET AND FIELD BELOW WAS READ FROM THIS PART'S OWN MANUAL. Other Nordic parts
+# Every offset and field below was read from this part's own manual. Other Nordic parts
 # document a TWI of the same name whose details differ, and four of the differences are noted
 # at their registers below. FREQUENCY K100 = 0x01980000 is the same word across them, which is
 # evidence the legacy design is shared -- but only evidence, and the differences below are what
@@ -93,7 +92,7 @@ width = 32
 fields = { EVENTS_ERROR = [0, 1] }
 notes = "1 = NACK or overrun -- the cause is in ERRORSRC."
 
-# DIFFERENCE 1 of 4 from the sibling family: there is NO SUSPENDED EVENT REGISTER on this part.
+# Difference 1 of 4 from the sibling family: there is no SUSPENDED event register on this part.
 # Figure 62 draws SUSPENDED as an output signal of the block and Figure 65 shows it on the
 # lifeline, but Table 260's register overview gives it no address and Tables 262-264 give it no
 # interrupt bit -- so it is not addressable here. Nothing is lost: SUSPEND is a task and the
@@ -123,7 +122,7 @@ width = 32
 fields = { OVERRUN = [0, 1], ANACK = [1, 1], DNACK = [2, 1] }
 notes = "Write 1 to clear each (Table 265). OVERRUN = a start condition arrived while previous data still lay in RXD, so that data is lost; ANACK = NACK received after sending the address, the scanner's absent-device answer; DNACK = NACK received after sending a data byte."
 
-# DIFFERENCE 2 of 4: ENABLE is a THREE-bit field here (Table 266 marks bits 2:0), where the
+# Difference 2 of 4: ENABLE is a THREE-bit field here (Table 266 marks bits 2:0), where the
 # sibling family's is four. The enabled value 5 is identical and fits either width, so this
 # costs nothing today -- it is stated as read rather than as assumed.
 [registers.ENABLE]
@@ -132,7 +131,7 @@ width = 32
 fields = { ENABLE = [0, 3] }
 notes = "0 = disabled, 5 = TWI enabled (Table 266). One register shared with the same-ID siblings, so this value is what selects the TWI personality -- and writing 0 here is what disables them."
 
-# DIFFERENCE 3 of 4: PSELSCL/PSELSDA are a plain 32-bit pin number, not a composed
+# Difference 3 of 4: PSELSCL/PSELSDA are a plain 32-bit pin number, not a composed
 # pin/port/connect word, and they are spelled without a separator in this manual. One GPIO port
 # means there is no port bit to place and no connect bit to clear.
 [registers.PSELSCL]
@@ -159,7 +158,7 @@ width = 32
 fields = { TXD = [0, 8] }
 notes = "The next byte to transmit. Single buffered: write the next only after TXDSENT."
 
-# DIFFERENCE 4 of 4: this register RESETS TO K250 (Table 271's reset row is 0x04000000), so an
+# Difference 4 of 4: this register RESETS TO K250 (Table 271's reset row is 0x04000000), so an
 # unwritten FREQUENCY leaves the master at 250 kbps rather than at the slowest rate.
 [registers.FREQUENCY]
 offset = 0x524

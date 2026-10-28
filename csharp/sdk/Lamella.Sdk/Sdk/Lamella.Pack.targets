@@ -1,0 +1,42 @@
+<!--
+  dotnet pack of a library that targets lamella1.0. NuGet places a build from a lib folder only for a framework it
+  knows, and it knows no Lamella framework, so the lamella1.0 build goes into the package at lamella/lib/lamella1.0/,
+  beside a targets file at buildTransitive/PackageId.targets. NuGet imports that file into every project that comes to
+  reference the package, directly or through another package, and for a Lamella project it references the build.
+
+  The targets file is Lamella.LibraryPackage.targets with this package's names written into it. It stays in the
+  package as written: it is the package's own, and a later SDK changes only what it writes into later packages.
+-->
+<Project>
+
+  <Target Name="_LamellaPackageContent"
+          DependsOnTargets="BuiltProjectOutputGroup"
+          Condition="'$(TargetFrameworkIdentifier)' == 'Lamella'">
+    <PropertyGroup>
+      <_LamellaPackageVersion>$([System.String]::Copy('$(TargetFrameworkVersion)').TrimStart('v'))</_LamellaPackageVersion>
+      <_LamellaPackageFolder>lamella$(_LamellaPackageVersion)</_LamellaPackageFolder>
+      <_LamellaPackageKey>$([System.Text.RegularExpressions.Regex]::Replace('$(PackageId)', '[^A-Za-z0-9_]', '_'))</_LamellaPackageKey>
+      <_LamellaPackageTargets>$(_LamellaIntermediateDir)$(PackageId).targets</_LamellaPackageTargets>
+      <_LamellaPackageTargetsText>$([System.IO.File]::ReadAllText('$(MSBuildThisFileDirectory)Lamella.LibraryPackage.targets').Replace('@PackageId@', '$(PackageId)').Replace('@Key@', '$(_LamellaPackageKey)').Replace('@Assembly@', '$(AssemblyName)').Replace('@Folder@', '$(_LamellaPackageFolder)').Replace('@Version@', '$(_LamellaPackageVersion)'))</_LamellaPackageTargetsText>
+    </PropertyGroup>
+    <MakeDir Directories="$(_LamellaIntermediateDir)" />
+    <WriteLinesToFile File="$(_LamellaPackageTargets)" Lines="$(_LamellaPackageTargetsText)" Overwrite="true" WriteOnlyWhenDifferent="true" />
+    <ItemGroup>
+      <TfmSpecificPackageFile Include="@(BuiltProjectOutputGroupOutput)"
+                              Condition="'$(_LamellaIncludeBuildOutput)' != 'false' and '%(BuiltProjectOutputGroupOutput.Extension)' == '.dll'"
+                              PackagePath="lamella/lib/$(_LamellaPackageFolder)/" />
+      <TfmSpecificPackageFile Include="$(_LamellaPackageTargets)" PackagePath="buildTransitive/$(PackageId).targets" />
+    </ItemGroup>
+  </Target>
+
+  <!-- NU5100 says an assembly outside lib/ will not be referenced, which the targets file above
+       makes untrue for the Lamella build. NuGet takes no warning code for one path, only for the
+       whole package, so NU5100 is quieted in the package of a project that packs a lamella1.0 build,
+       and in no other. -->
+  <Target Name="_LamellaPackageWarnings" BeforeTargets="GenerateNuspec" Condition="'$(_LamellaPacksLamellaBuild)' == 'true'">
+    <PropertyGroup>
+      <NoWarn>$(NoWarn);NU5100</NoWarn>
+    </PropertyGroup>
+  </Target>
+
+</Project>

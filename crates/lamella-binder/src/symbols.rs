@@ -6,7 +6,7 @@ use crate::types::TypeSymbol;
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use lamella_syntax::ast::Literal;
-use alloc::collections::BTreeMap;
+use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
 
@@ -64,10 +64,6 @@ pub struct FieldSymbol {
     pub ty: TypeSymbol,
     /// The TUPLE ELEMENT NAMES of the field's type, when it is a tuple that named any of them.
     ///
-    /// INVARIANT: EMPTY, or exactly as long as the tuple is wide -- the same shape and the same
-    /// meaning as [`MethodSymbol::parameter_info`], and empty means NOT A NAMED TUPLE rather than
-    /// "a tuple that named nothing". A single element may still be `None`: `(int a, int)` names
-    /// one and not the other, and csc accepts that.
     ///
     /// **NAMES ARE NOT PART OF THE TYPE, WHICH IS WHY THEY ARE HERE AND NOT ON `TypeSymbol`.**
     /// `(int a, int b)` and `(int c, int d)` are ONE type -- each converts to the other by the
@@ -106,10 +102,6 @@ pub struct PropertySymbol {
     pub ty: TypeSymbol,
     /// The TUPLE ELEMENT NAMES of the property's type, when it is a tuple that named any of them.
     ///
-    /// INVARIANT: EMPTY, or exactly as long as the tuple is wide -- the same shape and the same
-    /// meaning as [`MethodSymbol::parameter_info`], and empty means NOT A NAMED TUPLE rather than
-    /// "a tuple that named nothing". A single element may still be `None`: `(int a, int)` names
-    /// one and not the other, and csc accepts that.
     ///
     /// **NAMES ARE NOT PART OF THE TYPE, WHICH IS WHY THEY ARE HERE AND NOT ON `TypeSymbol`.**
     /// `(int a, int b)` and `(int c, int d)` are ONE type -- each converts to the other by the
@@ -124,13 +116,6 @@ pub struct PropertySymbol {
     /// The interface an EXPLICIT implementation names (`int I.P { get; }`), as written; `None`
     /// for an ordinary property.
     ///
-    /// **A RULE THAT NEEDS THE INTERFACE CANNOT RECOVER IT FROM THE NAME**: an explicit property is
-    /// stored under its PLAIN name, unlike a method's mangled `I.M`. Without this field, "is this
-    /// property explicitly implemented" can only be answered as "is there a non-public one of this
-    /// name", which cannot say WHICH interface -- and `ListEnumerator<T>` declares `public T
-    /// Current` for `IEnumerator<T>` beside `object IEnumerator.Current` for the non-generic
-    /// interface it also implements, so crediting the second against the first strips a slot csc
-    /// emits.
     pub explicit_interface: Option<TypeSymbol>,
     /// Whether the property is declared `virtual` -- its accessors are overridable slots.
     pub is_virtual: bool,
@@ -151,10 +136,6 @@ pub struct PropertySymbol {
     pub has_setter: bool,
     /// Whether that setter was spelled `init` rather than `set` (C# 9).
     ///
-    /// **IT IS A SETTER EITHER WAY**, which is why this is a flag beside `has_setter` and not a
-    /// third accessor: csc answers `int P { init { } set { } }` with CS1007, so the two spellings
-    /// name one slot. What changes is WHERE it may be called -- an object initializer, an instance
-    /// constructor on `this`/`base`, or another `init` accessor, and nowhere else (CS8852).
     ///
     /// For an IMPORTED property this is read from the `modreq(IsExternalInit)` on the `set_`
     /// accessor's return type, which is the only thing in metadata that distinguishes the two.
@@ -258,9 +239,6 @@ pub struct ParameterInfo {
     /// `Constant` row, and a source method's is folded by [`crate::declaration::resolve_constants`]
     /// -- so both reach a caller the same way and neither carries a syntax tree it could not have.
     ///
-    /// `Literal::Null` covers more shapes than its name suggests, and that is csc's doing rather
-    /// than a shortcut: measured, csc emits a `NullReference` constant for `= null` on a reference
-    /// type, for `default(string)`, for `int? x = null` AND for `default(S)` on a struct.
     pub default: Option<Literal>,
 }
 
@@ -312,10 +290,6 @@ pub struct MethodSymbol {
     pub parameter_info: Vec<ParameterInfo>,
     /// The TUPLE ELEMENT NAMES of the RETURN type, when it is a tuple that named any of them.
     ///
-    /// INVARIANT: EMPTY, or exactly as long as the tuple is wide -- the same shape and the same
-    /// meaning as [`MethodSymbol::parameter_info`], and empty means NOT A NAMED TUPLE rather than
-    /// "a tuple that named nothing". A single element may still be `None`: `(int a, int)` names
-    /// one and not the other, and csc accepts that.
     ///
     /// **NAMES ARE NOT PART OF THE TYPE, WHICH IS WHY THEY ARE HERE AND NOT ON `TypeSymbol`.**
     /// `(int a, int b)` and `(int c, int d)` are ONE type -- each converts to the other by the
@@ -446,9 +420,6 @@ impl MethodSymbol {
 
     /// How many arguments a call MUST supply: the parameters up to the first optional one.
     ///
-    /// Optional parameters are a TRAILING run by construction -- csc's CS1737 refuses a required
-    /// parameter after an optional one -- so the first parameter carrying a default fixes the
-    /// minimum, and `position` below relies on that.
     #[must_use]
     pub fn required_parameter_count(&self) -> usize {
         self.parameter_info
@@ -491,11 +462,6 @@ impl MethodSymbol {
     /// fixed parameter takes an argument or is optional, and the array takes the rest -- any
     /// number, zero included.
     ///
-    /// **OPTIONAL FIXED PARAMETERS MAY BE LEFT OUT, BUT ONLY WHEN THE ARRAY TAKES NOTHING**, since
-    /// arguments are positional: `S(1)` against `S(int a, int b = 10, params int[] r)` is `a = 1`,
-    /// `b = 10` and an empty array, which is csc's reading and returns 11. The words of 12.6.4.2
-    /// (*"if A has fewer arguments than the number of fixed parameters ... the expanded form ...
-    /// cannot be constructed"*) predate optional parameters; csc fills them, and so does this.
     #[must_use]
     pub fn accepts_expanded_count(&self, argc: usize) -> bool {
         let Some(fixed) = self.parameters.len().checked_sub(1) else {
@@ -529,14 +495,6 @@ impl MethodSymbol {
     /// refusal-never-partial-substitution rule [`TypeInfo::instantiate`] follows, and for the same
     /// reason: a signature left half-substituted reads as ordinary and means something else.
     ///
-    /// **THIS IS WHAT MAKES A GENERIC CALL TYPE-CHECK AT ALL, AND ITS ABSENCE IS SILENT.**
-    /// ECMA-334 14.5.5.1: *"the parameters of a generic method are considered AFTER substituting
-    /// the type arguments"*. Bind `Id<string>(1)` against the OPEN method and the argument is
-    /// checked against `T`, which accepts anything -- the call compiles, resolves to the open
-    /// method with `!!0` never substituted, and is wrong. Substituted, the same call is the CS1503
-    /// csc reports. **The difference between correct and catastrophically wrong here produces no
-    /// diagnostic on the failing side, so it can only be caught by a test that asserts the
-    /// REJECTION.**
     ///
     /// Substitution is BY NAME, the binder's model throughout -- see [`substitute`], whose doc
     /// explains why that is the same rule metadata's numbering expresses from the other side.
@@ -610,19 +568,10 @@ pub struct TypeInfo {
     /// empty [`Self::constructors`] means "declares constructors, none of them visible here"
     /// rather than "nothing recorded".
     ///
-    /// **THE TWO ARE DIFFERENT ANSWERS AND ONLY ONE OF THEM IS A DIAGNOSTIC.** A base class with no
-    /// visible constructor cannot be derived from, and csc says so; a `TypeInfo` that simply has no
-    /// constructors recorded (a hand-built model, a type whose `.ctor` signature did not decode) is
-    /// a gap, and refusing on it would refuse correct code. Nothing downstream can tell them apart
-    /// after the fact, so the filter records which one it produced.
     pub hidden_constructors: bool,
     /// For an external type, whether its assembly named THIS compilation a friend with
     /// `[assembly: InternalsVisibleTo]`, so its `internal` members are reachable from here.
     ///
-    /// **AN EXTERNAL TYPE'S `internal` MEMBERS ARE ONLY IN THE MODEL AT ALL WHEN THIS IS SET** --
-    /// `reference.rs` does not import them otherwise, matching csc. The flag is carried anyway
-    /// rather than inferred from their presence, so the accessibility rule states the fact it
-    /// depends on instead of relying on an invariant established in another file.
     pub internals_visible: bool,
     /// For an external type, the simple name of the assembly that defines it (so its `TypeRef`
     /// is scoped to the right `AssemblyRef`, not just mscorlib). `None` for a this-module type.
@@ -642,10 +591,6 @@ pub struct TypeInfo {
     /// The names of the type's declared type parameters, in declaration order -- `["T"]` for
     /// `Box<T>`. Empty for every non-generic type, which is every C# 1.0 type.
     ///
-    /// This is for DIAGNOSTICS, not for identity: arity is already part of the type's `name`
-    /// ([`metadata_type_name`]), so nothing resolves through this list. It exists because csc names
-    /// the candidate by its parameters -- *Using the generic type 'Box<T>' requires 1 type
-    /// arguments* -- and a message that printed the arity instead would be a different message.
     pub type_parameters: Vec<Box<str>>,
     /// Whether any declaration of this type carried the `partial` modifier (ECMA-334 4th ed
     /// 17.1.4), so a second declaration of the same name MERGES into this one instead of replacing
@@ -719,6 +664,15 @@ pub struct TypeParameterConstraints {
     /// source fact here and applying the implication at emission is what lets the check and the
     /// encoding disagree honestly rather than one of them being wrong.
     pub value_type: bool,
+    /// `where T : unmanaged` (C# 7.3) -- the argument must be a non-nullable value type holding no
+    /// reference at any depth of its fields (ECMA-334 7th ed, 15.2.5).
+    ///
+    /// **IT IS THE VALUE TYPE CONSTRAINT AS WELL, AND [`Self::value_type`] IS SET WITH IT.** Every
+    /// rule that asks for `struct` asks the same of `unmanaged` -- `T?` is `Nullable<T>`, `new T()`
+    /// is a value's default, the parameter satisfies another parameter's `struct`, and the flag
+    /// word is `0x0008|0x0010` -- so that flag answers them all, and this one only what is
+    /// `unmanaged`'s own: the use check, and the constraint row and attribute that record it.
+    pub unmanaged: bool,
     /// `where T : new()` -- the argument must have a public parameterless constructor. Metadata
     /// `0x0010`.
     pub default_constructor: bool,
@@ -734,6 +688,47 @@ pub struct TypeParameterConstraints {
 }
 
 impl TypeParameterConstraints {
+    /// These constraints as one USE of their declaration must meet them: each of `parameters`
+    /// replaced by the argument at its position. A constraint may name the declaration's own
+    /// parameters -- `where T : C<T>`, `where U : T` -- so `C<string>` asks whether `string`
+    /// converts to `C<string>`. A parameter with no argument at its position is left as written.
+    #[must_use]
+    pub fn substituted(
+        &self,
+        parameters: &[Box<str>],
+        arguments: &[TypeSymbol],
+    ) -> TypeParameterConstraints {
+        let bindings: BTreeMap<&str, &TypeSymbol> = parameters
+            .iter()
+            .map(|parameter| &**parameter)
+            .zip(arguments)
+            .collect();
+        TypeParameterConstraints {
+            types: self
+                .types
+                .iter()
+                .map(|ty| substitute(ty, &bindings))
+                .collect(),
+            ..self.clone()
+        }
+    }
+
+    /// Reads a bare `unmanaged` these constraints took as the `unmanaged` constraint as the class
+    /// type `named` instead, as it is where a type of that name is found from the clause
+    /// (ECMA-334 7th ed, 15.2.5). `struct_written` says whether the clause also wrote `struct`,
+    /// which `unmanaged` had set [`Self::value_type`] for already.
+    ///
+    /// The type goes first, where a class type stands in a clause, and where the bare name had to
+    /// be written for the constraint to be valid.
+    pub fn read_unmanaged_as_type(&mut self, named: TypeSymbol, struct_written: bool) {
+        if !self.unmanaged {
+            return;
+        }
+        self.unmanaged = false;
+        self.value_type = struct_written;
+        self.types.insert(0, named);
+    }
+
     /// Whether nothing was written -- the state of every parameter with no `where` clause, and of
     /// every type parameter in a C# 1.0 compilation.
     #[must_use]
@@ -1108,6 +1103,16 @@ impl TypeInfo {
             for parameter in &mut method.parameters {
                 *parameter = substitute(parameter, &bindings);
             }
+            let type_bindings: BTreeMap<&str, &TypeSymbol> = bindings
+                .iter()
+                .filter(|(name, _)| !method.type_parameters.iter().any(|own| &**own == **name))
+                .map(|(name, argument)| (*name, *argument))
+                .collect();
+            for constraints in &mut method.type_parameter_constraints {
+                for ty in &mut constraints.types {
+                    *ty = substitute(ty, &type_bindings);
+                }
+            }
         }
         for base in &mut closed.bases {
             *base = substitute(base, &bindings);
@@ -1224,6 +1229,11 @@ impl TypeInfo {
 #[derive(Debug, Default, Clone)]
 pub struct Model {
     types: BTreeMap<(String, String), TypeInfo>,
+    /// The compilation's `global using` directives, every unit's; see [`Model::global_usings`].
+    global_usings: Vec<lamella_syntax::ast::UsingKind>,
+    /// Every namespace the compilation's source declares, by its full name, whether or not a type
+    /// is declared in it: `namespace Empty { }` makes `Empty` a namespace, as a type in it would.
+    declared_namespaces: BTreeSet<String>,
 }
 
 /// The IMPLICIT parameterless constructor (17.10.4): public, no parameters.
@@ -1260,6 +1270,25 @@ impl Model {
     #[must_use]
     pub fn new() -> Model {
         Model::default()
+    }
+
+    /// Records `directives`, one unit's `global using` directives (C# 10), as the compilation's.
+    pub fn add_global_usings(&mut self, directives: &[lamella_syntax::ast::UsingDirective]) {
+        self.global_usings
+            .extend(directives.iter().map(|directive| directive.kind.clone()));
+    }
+
+    /// The compilation's `global using` directives (C# 10), in the order their units were
+    /// collected.
+    ///
+    /// **THEY TRAVEL WITH THE MODEL BECAUSE EVERY BINDER OF A COMPILATION IS BUILT FROM ONE** --
+    /// the bind's, the emitter's, each declaration walk's -- and
+    /// [`Binder::with_model`](crate::Binder::with_model) imports them beneath everything else. So
+    /// a walk that applies one file's directives has no case to add for them, and a binder built
+    /// from this model cannot be without them.
+    #[must_use]
+    pub fn global_usings(&self) -> &[lamella_syntax::ast::UsingKind] {
+        &self.global_usings
     }
 
     /// Adds a type, replacing any earlier one with the same namespace and name.
@@ -1317,10 +1346,6 @@ impl Model {
     /// from a reference assembly are excluded. Two or more is a CS0017 (multiple entry points);
     /// none, for an executable target, is a CS5001.
     ///
-    /// **GENERICS DISQUALIFY IT THREE WAYS AND csc ANSWERS CS5001 FOR ALL THREE**, measured: a
-    /// `Main` in a generic type, a `Main` in a type NESTED inside a generic one, and a generic
-    /// `Main<T>` itself. The type's own list already carries its enclosing type's parameters, so
-    /// the nested case needs no separate test.
     ///
     #[must_use]
     pub fn entry_point_count(&self) -> usize {
@@ -1372,6 +1397,16 @@ impl Model {
             | TypeSymbol::Pointer(_)
             | TypeSymbol::ByRef(_)
             | TypeSymbol::Error => None,
+        }
+    }
+
+    /// `ty`'s base-class chain, `ty` itself first -- see [`BaseClassChain`].
+    pub(crate) fn base_class_chain(&self, ty: &TypeSymbol) -> BaseClassChain<'_> {
+        BaseClassChain {
+            model: self,
+            next: Some(ty.clone()),
+            walked: Vec::new(),
+            repeated: None,
         }
     }
 
@@ -1512,6 +1547,21 @@ impl Model {
         })
     }
 
+    /// [`Model::open_member`] for an EVENT ACCESSOR, which a source-declared event does not put in
+    /// `methods` either: `add_E` and `remove_E` take the event's type BEFORE substitution and
+    /// return void. Returns the definition's type-parameter names beside that type, for an event
+    /// reached through an instantiated generic type (`IB<int>`).
+    #[must_use]
+    pub fn open_event_accessor(
+        &self,
+        declaring: &TypeSymbol,
+        event: &str,
+    ) -> Option<(Vec<Box<str>>, TypeSymbol)> {
+        let (open, type_parameters) = self.open_declaration(declaring)?;
+        let declared = open.find_event(event)?;
+        Some((type_parameters, declared.ty.clone()))
+    }
+
     /// [`Model::open_member`] for a FIELD: the definition's type-parameter names and the field's
     /// type BEFORE substitution, for a field reached through an instantiated generic type.
     ///
@@ -1632,15 +1682,24 @@ impl Model {
     }
 
     /// Whether `namespace` is a declared namespace -- some type lives in it or in a
-    /// namespace nested under it.
+    /// namespace nested under it, or the source declares it or one nested under it.
     #[must_use]
     pub fn is_namespace(&self, namespace: &str) -> bool {
-        self.types.keys().any(|(type_namespace, _)| {
-            type_namespace == namespace
-                || type_namespace
+        let within = |declared: &str| {
+            declared == namespace
+                || declared
                     .strip_prefix(namespace)
                     .is_some_and(|rest| rest.starts_with('.'))
-        })
+        };
+        self.types.keys().any(|(type_namespace, _)| within(type_namespace))
+            || self.declared_namespaces.iter().any(|declared| within(declared))
+    }
+
+    /// Records that the source declares the namespace `namespace`, named in full.
+    pub fn declare_namespace(&mut self, namespace: &str) {
+        if !self.declared_namespaces.contains(namespace) {
+            self.declared_namespaces.insert(String::from(namespace));
+        }
     }
 
     /// The existence-only [`TypeTable`] for plain type-name resolution.
@@ -1720,7 +1779,18 @@ impl Model {
             let start = info.type_parameters.len().saturating_sub(arity);
             info.type_parameters[start..].to_vec()
         }
-        let mut rebuilt: Vec<((String, String), Vec<Box<str>>)> = Vec::new();
+        fn own_constraints(info: &TypeInfo) -> Vec<TypeParameterConstraints> {
+            let arity = mangled_arity(&info.name);
+            let start = info.type_parameter_constraints.len().saturating_sub(arity);
+            let mut own = info.type_parameter_constraints[start..].to_vec();
+            own.resize(arity, TypeParameterConstraints::default());
+            own
+        }
+        let mut rebuilt: Vec<(
+            (String, String),
+            Vec<Box<str>>,
+            Vec<TypeParameterConstraints>,
+        )> = Vec::new();
         for (key, info) in &self.types {
             if info.is_external || info.enclosing.is_none() {
                 continue;
@@ -1748,15 +1818,25 @@ impl Model {
                 chain = outward;
                 enclosing = outer.enclosing.clone();
             }
+            let inherited = chain.len();
             let mut parameters = chain;
             parameters.extend(own(info));
-            if parameters != info.type_parameters {
-                rebuilt.push((key.clone(), parameters));
+            let current = &info.type_parameter_constraints;
+            let mut constraints: Vec<TypeParameterConstraints> =
+                if current.len() == inherited + mangled_arity(&info.name) {
+                    current[..inherited].to_vec()
+                } else {
+                    alloc::vec![TypeParameterConstraints::default(); inherited]
+                };
+            constraints.extend(own_constraints(info));
+            if parameters != info.type_parameters || constraints != info.type_parameter_constraints {
+                rebuilt.push((key.clone(), parameters, constraints));
             }
         }
-        for (key, parameters) in rebuilt {
+        for (key, parameters, constraints) in rebuilt {
             if let Some(info) = self.types.get_mut(&key) {
                 info.type_parameters = parameters;
+                info.type_parameter_constraints = constraints;
             }
         }
     }
@@ -1797,6 +1877,91 @@ impl Model {
             }
         }
         SignatureCanon { map }
+    }
+}
+
+/// A type's base-class chain, most derived first: the type itself, its direct base class, that
+/// class's base, and on to the root -- `class C : B { }` walks `C`, `B`, `System.Object`. Made by
+/// [`Model::base_class_chain`].
+///
+/// **EVERY WALK UP A CLASS CHAIN GOES THROUGH THIS ONE, BECAUSE A CHAIN CAN BE CIRCULAR.**
+/// `class A : B { }` beside `class B : A { }` is CS0146, but that diagnostic belongs to one pass,
+/// and every other pass looks members up against the same model whether or not it has fired. The
+/// walk ends at the first class it has already walked, so every caller terminates on every program;
+/// [`BaseClassChain::returned_to_start`] is how the CS0146 check asks whether the cycle runs through
+/// the class it began at.
+///
+///
+/// Each [`BaseClassLink`] names its class as the chain reaches it -- a constructed base stays
+/// constructed, its arguments substituted from the class below it (14.2.4.2) -- beside the class's
+/// model entry. A class the model does not hold is the chain's last link, with no entry: nothing
+/// records what it derives from.
+#[derive(Debug, Clone)]
+pub(crate) struct BaseClassChain<'model> {
+    /// The model the chain is read from.
+    model: &'model Model,
+    /// The class the next step reaches; `None` once the chain has ended.
+    next: Option<TypeSymbol>,
+    /// The model rows walked so far, as `(namespace, name)`. A constructed class answers with its
+    /// definition's row, whose name [`TypeInfo::instantiate`] leaves on the closed type.
+    walked: Vec<(Box<str>, Box<str>)>,
+    /// Where in `walked` the row the chain came back to sits, once it has come back to one.
+    repeated: Option<usize>,
+}
+
+/// One class on a [`BaseClassChain`].
+#[derive(Debug, Clone)]
+pub(crate) struct BaseClassLink<'model> {
+    /// The class as the chain reaches it.
+    pub(crate) ty: TypeSymbol,
+    /// The class's model entry, or `None` for a class the model does not hold, which ends the
+    /// chain.
+    pub(crate) info: Option<Cow<'model, TypeInfo>>,
+}
+
+impl<'model> BaseClassChain<'model> {
+    /// Whether the chain ended at a class it had already walked -- a circular base -- rather than
+    /// at the root or at a class the model does not hold. Meaningful once the walk has ended.
+    pub(crate) fn is_circular(&self) -> bool {
+        self.repeated.is_some()
+    }
+
+    /// Whether the chain came back to the class it started from, so that the class depends on
+    /// itself through its own base: the condition CS0146 reports. A class whose chain only runs
+    /// INTO a cycle further up is not part of that cycle, and csc does not report it. Meaningful
+    /// once the walk has ended.
+    pub(crate) fn returned_to_start(&self) -> bool {
+        self.repeated == Some(0)
+    }
+
+    /// The classes the model holds, each beside its entry, up to the first class it does not hold.
+    pub(crate) fn resolved(self) -> impl Iterator<Item = (TypeSymbol, Cow<'model, TypeInfo>)> {
+        self.map_while(|link| Some((link.ty, link.info?)))
+    }
+}
+
+impl<'model> Iterator for BaseClassChain<'model> {
+    type Item = BaseClassLink<'model>;
+
+    fn next(&mut self) -> Option<BaseClassLink<'model>> {
+        let ty = self.next.take()?;
+        let Some(info) = self.model.get_by_symbol(&ty) else {
+            return Some(BaseClassLink { ty, info: None });
+        };
+        let row = self
+            .walked
+            .iter()
+            .position(|(namespace, name)| *namespace == info.namespace && *name == info.name);
+        if let Some(position) = row {
+            self.repeated = Some(position);
+            return None;
+        }
+        self.walked.push((info.namespace.clone(), info.name.clone()));
+        self.next = info.base.clone();
+        Some(BaseClassLink {
+            ty,
+            info: Some(info),
+        })
     }
 }
 

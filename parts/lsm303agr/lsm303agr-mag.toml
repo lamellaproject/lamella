@@ -20,12 +20,10 @@ notes = [
 #
 # Primary: every fact below is read from this part's own datasheet.
 #
-# WHAT THIS TABLE DELIBERATELY DOES NOT STATE: the output data rates and their codes, the operating
+# What this table deliberately does not state: the output data rates and their codes, the operating
 # and power modes, the offset cancellation and low-pass filter settings, the interrupt block, the
 # self-test, and the sensitivity a raw count represents. All are in the datasheet, none transcribed.
 #
-# Identified, and no further: a physical part has answered the identity register below against a
-# negative control. No magnetic field has been measured through this table.
 
 [sourcing]
 facts = "primary"
@@ -34,7 +32,7 @@ evidence = "A physical part answered the identity register on a Raspberry Pi Pic
 
 # --- identity ------------------------------------------------------------------------------------
 #
-# A DIFFERENT REGISTER FROM THE OTHER HALF'S, not merely a different value in the same one -- which
+# A different register from the other half's, not merely a different value in the same one -- which
 # is what makes the two halves two parts rather than one part with two identities. Reading 0x0F on
 # this address reaches a reserved register, and reading 0x4F on the accelerometer's address reaches
 # a different reserved register.

@@ -2,24 +2,24 @@
 # lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
 # uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
-# THE RECORD IS THE PCHCTRL FAMILIES', because on this architecture which APB mask register gates
+# The record is the PCHCTRL families', because on this architecture which APB mask register gates
 # an instance is per-instance rather than always APBC. On this part it is three different registers
 # for the blocks below: PORT is gated from APBAMASK, SERCOM0..4 from APBCMASK, and SERCOM5 from
 # APBDMASK. A row therefore states `apb_mask_offset` -- WHICH register, as an offset from MCLK's
 # base -- alongside its bit.
 #
-# EVERY VALUE BELOW MATCHES THE SAM L21'S, AND THAT WAS THE OUTCOME OF THE CHECK RATHER THAN ITS
-# PREMISE. The sibling families on this arm share an architecture and NOT ONE ADDRESS -- the C21,
-# the L21 and the L22 put PORT at 0x41000000, 0x40002800 and 0x41006000 -- so "it is a PCHCTRL
-# part" predicts shape and never a number. This part is the exception, and it is an exception for
-# a documented reason: it IS an L21 die, and the datasheet's own running header says so.
+# Every value below matches the SAM L21's, which the architecture alone does not predict: the
+# sibling families on this arm share an architecture and not one address -- the C21, the L21 and
+# the L22 put PORT at 0x41000000, 0x40002800 and 0x41006000 -- so "it is a PCHCTRL part"
+# predicts shape and never a number. This part is the exception, and it is an exception for a
+# documented reason: it is an L21 die, and the datasheet's own running header says so.
 #
-# STATED EXACTLY, BECAUSE A READER WILL DIFF THE TWO FILES: the emitted constants here and in
+# Stated exactly, because a reader will diff the two files: the emitted constants here and in
 # csp/saml21 agree on every row the L21 has, and this family adds one the L21 does not -- the
 # porta/portb/portc set is three rows where the L21's is two. The radio is why: it puts CLKM, SCLK
 # and MISO in port group C. So "matches the L21" is a claim about VALUES, not about the row set.
 #
-# READ TWICE, FROM TWO TABLES THAT DO NOT SHARE A LAYOUT. Table 13-3 (Peripherals Configuration
+# Read twice, from two tables that do not share a layout. Table 13-3 (Peripherals Configuration
 # Summary, pages 74-76) gives base, IRQ, APB index and generic-clock index per peripheral; Table
 # 13-18 (PCHCTRLm Mapping, page 131) gives the generic-clock channel list independently, indexed by
 # channel rather than by peripheral. The two agree on every SERCOM id below, including the one a
@@ -96,7 +96,7 @@ apb_mask_offset = 0x1C
 apb_bit = 4
 irq = 12
 
-# THE ODD ONE OUT, ON THREE AXES AT ONCE: a different bridge (D, at 0x43000000), a different gate
+# The odd one out, on three axes at once: a different bridge (D, at 0x43000000), a different gate
 # register (APBDMASK), a different power domain (PD0), and a core clock id that skips the number a
 # stride would give it because its own slow clock takes that number.
 [[instances]]
@@ -126,7 +126,7 @@ apb_mask_offset = -1
 apb_bit = -1
 irq = -1
 
-# PORT SITS BEHIND BRIDGE A ON THIS FAMILY, which is why its gate is APBAMASK bit 10 and not an
+# Port sits behind bridge A on this family, which is why its gate is APBAMASK bit 10 and not an
 # APBC bit. Nothing consumes that gate today -- the GPIO driver assumes the reset state, where
 # Table 13-3 marks PORT's APB clock 'Enabled at Reset: Y' -- and the row states it so that a
 # consumer which ever needs to gate it has the register rather than a guess.
@@ -148,7 +148,7 @@ apb_mask_offset = 0x14
 apb_bit = 10
 irq = -1
 
-# GROUP 2, AND ITS EVIDENCE IS NOT THE SAM R21'S. The R21's PORT register descriptions print an
+# Group 2, and its evidence is not the SAM R21's. The R21's port register descriptions print an
 # offset formula, 0x00+x*0x80 [x=0..2], which states both the stride and the bound. THIS document
 # prints no such formula anywhere -- searched, zero hits -- and says only "Each PORT group has its
 # own set of PORT registers with offset 0x80. The available number of PORT groups may depend on

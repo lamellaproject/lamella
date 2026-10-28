@@ -1,7 +1,7 @@
 # INSTANCE map for the SAM E54 family. It places only the block copies a binding or a board uses,
 # so a block that is not listed is not described here, rather than absent from the part.
 #
-# THE RECORD SHAPE IS SETTLED HERE, alongside the family's first clocked peripheral, which is what
+# The record shape is settled here, alongside the family's first clocked peripheral, which is what
 # the bases-only version of this file said it was waiting for. Four fields beyond the base, and
 # each answers a question a driver cannot answer from the base alone:
 #
@@ -13,16 +13,16 @@
 #   nvm_calib_lsb     where this instance's production calibration values start in the NVM
 #                     software calibration word. -1 where the instance needs none.
 #
-# THE CALIBRATION POSITION IS ONE NUMBER FOR THREE VALUES. Each converter's three fields sit
+# The calibration position is one number for three values. Each converter's three fields sit
 # contiguously and three bits apart, so the position of the first locates all of them -- and the
 # two converters sit at DIFFERENT offsets in the same word, which is exactly why it cannot be a
 # block constant.
 #
-# THE APB BUS IS PER-INSTANCE AND NOT PER-BLOCK, which is why the offset is a row value rather than
+# The APB bus is per-instance and not per-block, which is why the offset is a row value rather than
 # a block constant: the eight SERCOMs sit on THREE DIFFERENT masks (APBA, APBB and APBD). A record
 # carrying one bus for the block would be right for two instances and wrong for six.
 #
-# THIS MAP IS ADDRESS SPACE AND NOT A PRESENCE LIST. The family map places eight SERCOM slots; how
+# This map is address space and not a presence list. The family map places eight SERCOM slots; how
 # many a given device bonds to pads is the package's business and lives in parts.toml. A row here
 # says where a block copy WOULD be reached, not that a particular part carries it out to a pin.
 
@@ -127,7 +127,7 @@ apb_mask_offset = 0x20
 apb_bit = 3
 nvm_calib_lsb = -1
 
-# THE TWO ANALOG-TO-DIGITAL CONVERTERS. Neither works out of reset: the block table's header
+# The two analog-to-digital converters. Neither works out of reset: the block table's header
 # states why, and the last value on each row is what a driver needs to fix it.
 
 [[instances]]
@@ -157,18 +157,18 @@ apb_mask_offset = 0x1C
 apb_bit = 2
 nvm_calib_lsb = -1
 
-# THE FOUR PORT GROUPS. One PORT peripheral, four register sets inside it, and the manual states
+# The four port groups. One port peripheral, four register sets inside it, and the manual states
 # the spacing rather than leaving it to be derived: "The I/O pins are assembled in pin groups with
 # up to 32 pins. Group 0 consists of the PA pins, and group 1 is for the PB pins, etc. Each pin
 # group has its own PORT registers, with a 0x80 address spacing." So group N sits at the PORT base
 # plus 0x80 * N, and each is placed as its own row because that is what a consumer names.
 #
-# FOUR ROWS, ONE CLOCK: all four groups are the same PORT peripheral, so they carry the same APB
+# Four rows, one clock: all four groups are the same PORT peripheral, so they carry the same APB
 # mask bit. Enabling a group is not a thing the hardware can do, and the repeated value says so.
 # That clock is enabled out of reset, which is why a GPIO driver on this family works having
 # touched no clock register at all.
 #
-# THE SAMD21 USES THE SAME 0x80 SPACING AT A DIFFERENT BASE, which is the hazardous kind of
+# The SAMD21 uses the same 0x80 spacing at a different base, which is the hazardous kind of
 # near-miss: 0x41004400 there against 0x41008000 here, with the stride identical. A row carried
 # across would have TWO of its three values right and the one that matters wrong, and every gate
 # would stay green. Every number below is from this family's own manual.
@@ -211,7 +211,7 @@ nvm_calib_lsb = -1
 
 # --- the external interrupt controller ------------------------------------------------------------
 #
-# THE RECORD CANNOT NAME THIS INSTANCE'S NVIC LINES AND NO SINGLE FIELD COULD. Every other
+# The record cannot name this instance's NVIC lines and no single field could. Every other
 # peripheral here is delivered on one vector; the EIC has SIXTEEN, one per EXTINT, on lines 12
 # through 27. The mapping is stated in blocks/eic.toml, which is where a consumer looking for a
 # vector will be reading anyway.

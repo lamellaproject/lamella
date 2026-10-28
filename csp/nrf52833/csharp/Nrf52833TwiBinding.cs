@@ -1,7 +1,7 @@
 // The descriptor an nRF52833 TWI (legacy polled I2C master) driver consumes: one binding's
 namespace Lamella.Boards
 {
-    public sealed class Nrf52833TwiBinding
+    internal sealed class Nrf52833TwiBinding
     {
         /// <summary>The bound TWI instance's base address (it shares peripheral ID 3 with
         /// the SPI/SPIM/SPIS/TWIM/TWIS personalities; ENABLE selects TWI).</summary>

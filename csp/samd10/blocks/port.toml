@@ -4,7 +4,7 @@
 #   PINCFG[p] = group_base + 0x40 + p        (p = the pin index within the group)
 # The generator owns those derivations; drivers receive resolved addresses through their bindings.
 #
-# THIS FAMILY HAS ONE PORT GROUP. Every register in 22.8 is stated as `<offset>+n*0x80 [n=0..0]`,
+# This family has one port group. Every register in 22.8 is stated as `<offset>+n*0x80 [n=0..0]`,
 # and n=0..0 is the datasheet saying group 0 is the only one -- consistent with table 1-1, which
 # caps I/O at 22 pads, all named PA. The 0x80 group stride is still in the register spelling, so a
 # reader who later meets a two-group part in this family has the arithmetic; there is no such part

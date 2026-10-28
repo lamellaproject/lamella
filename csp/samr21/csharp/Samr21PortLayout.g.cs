@@ -5,7 +5,7 @@
 // instance bases live in Samr21Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Samr21PortLayout
+    internal sealed class Samr21PortLayout
     {
         private Samr21PortLayout() { }
 

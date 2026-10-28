@@ -2,7 +2,7 @@
 # against the datasheet's pinout, not the whole package, so a consumer must not read one as the
 # package. A pin that is not listed is refused rather than assumed.
 #
-# WHAT ADMITS A PART TO THIS FAMILY, AND WHY THE TEST READS TWO DOCUMENTS RATHER THAN ONE. A family
+# What admits a part to this family, and why the test reads two documents rather than one. A family
 # here owns ONE hardware manual and one pin-function table. This vendor scopes a manual by the GROUP
 # named in its title rather than by an introduction enumerating part numbers: the RA4M1 Group User's
 # Manual: Hardware says of itself only that it "describes the product specification of the
@@ -13,8 +13,8 @@
 # an RA6-series group is a different manual and a different family whatever its part number
 # resembles.
 #
-# A PIN NAME IS REWRITTEN HERE AND THE REWRITE IS THE ONE THING A READER MUST KNOW BEFORE
-# GREPPING. The vendor writes a pin as Pmnn with NO separator -- P111, P012 -- and its own register
+# A pin name is rewritten here and the rewrite is the one thing a reader must know before
+# grepping. The vendor writes a pin as Pmnn with NO separator -- P111, P012 -- and its own register
 # section defines the fields as m = 0 to 9 and n = 00 to 15, one digit of port and two of pin. A pin
 # name in this model is a port and an index, and the undelimited form does not parse: P111 offers no
 # boundary between the port digit and the pin digits. Every pin below is therefore written with the
@@ -22,7 +22,7 @@
 # which is reversible and loses nothing, but means a search for the vendor's spelling finds nothing
 # here and a search for this spelling finds nothing in the vendor's documents.
 #
-# THE PART CARRIES THREE MEMORIES AND `flash` IS ONE OF THEM. Code flash is 256 KB, SRAM is 32 KB,
+# The part carries three memories and `flash` is one of them. Code flash is 256 KB, SRAM is 32 KB,
 # and there is a further 8 KB of DATA FLASH that the datasheet lists in its own column beside them.
 # Data flash is byte-rewritable non-volatile storage rather than a place to link a program, so it is
 # neither part of `flash` nor part of `ram`, and no field here holds it. A program budgeted against
@@ -50,7 +50,7 @@ pins = [
     "P0.12", "P0.13",
     "P1.11",
 ]
-# THE ORDER CODE DECODES FIELD BY FIELD AND TWO OF ITS FIELDS ARE THE ONES THAT MATTER HERE.
+# The order code decodes field by field and two of its fields are the ones that matter here.
 # R7FA4M1AB3CFM splits as R7 = the vendor's microcontroller prefix, F = flash memory, A = RA family,
 # 4 = RA4 series, M1 = the RA4M1 group, A = feature set, B = 256 KB of code flash, 3 = -40 C to
 # 105 C, C = quality grade, FM = LQFP 64 pins. The suffix after the # is packing, terminal material

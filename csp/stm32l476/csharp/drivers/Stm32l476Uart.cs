@@ -3,7 +3,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Stm32l476Uart
+internal sealed class Stm32l476Uart
 {
     private readonly uint _cr1;
     private readonly uint _brr;

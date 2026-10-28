@@ -3,12 +3,12 @@
 # share their whole register address map: every name, address, access type and reset default from
 # 0x00 to 0x38 is the same on both.
 #
-# A PART IS NOT A CHIP A PROGRAM RUNS ON, which is why this catalog is a sibling of the chip
+# A part is not a chip a program runs on, which is why this catalog is a sibling of the chip
 # packages rather than part of one: a board states which BUSES exist, a part states its own
 # IDENTITY, and a probe joins the two at run time. A carrier can be populated with either of these
 # two parts on the same pads, so which one is fitted is discovered rather than declared.
 #
-# WHAT IS SHARED IS THE MAP, NOT EVERY FIELD INSIDE IT, and that distinction is the useful content
+# What is shared is the map, not every field inside it, and that distinction is the useful content
 # of this file. Held identical across both members and therefore stated here: the register
 # addresses, the widths, the access types, the field layouts of CTRL_REG1/2/3/5 and STATUS_REG, the
 # rate output format, both bus framings, and the SENSITIVITY -- the microdegrees per second each
@@ -16,12 +16,12 @@
 # because the documents differ: the identity value, the I2C slave address, the full-scale RANGE each
 # code names, the output data rate each code selects, and the whole field layout of CTRL_REG4.
 #
-# THIS FILE IS AN AUTHORING CONVENIENCE ONLY. A member names it with `base` and states its own
+# This file is an authoring convenience only. A member names it with `base` and states its own
 # deltas; generation RESOLVES the base and emits a fully flattened table per part. Nothing
 # downstream ever reads an inherited value, because a value that is only ever inherited is pinned
 # in no emitted artifact and so cannot be checked for drift between languages.
 #
-# REGISTER KEYS ARE THE DOCUMENTS' OWN NAMES, INCLUDING WHERE THAT DOUBLES A WORD. ST spells four
+# Register keys are the documents' own names, including where that doubles a word. ST spells four
 # of these registers with REG already inside the name -- STATUS_REG, FIFO_CTRL_REG, FIFO_SRC_REG,
 # and the CTRL_REG1..5 set -- and the address constant an emitter derives appends `_REG` for "this
 # is the address". So `STATUS_REG_REG` is the address of the register the datasheet calls
@@ -76,7 +76,7 @@ notes = "Verified before any other access. It is what tells the two parts apart 
 
 # --- the framing bytes, as values rather than as prose ---------------------------------------------
 #
-# THE TWO BUSES DISAGREE ABOUT HOW WIDE A REGISTER ADDRESS IS, and that is the trap this section
+# The two buses disagree about how wide a register address is, and that is the trap this section
 # exists to remove. On I2C the subaddress is SEVEN bits of address with auto-increment in the top
 # bit. On SPI the first byte is read/write in bit 7, auto-increment in bit 6, and only SIX bits of
 # address below that. A driver that composed the SPI byte the I2C way -- mask to 0x7F, set the top
@@ -100,7 +100,7 @@ notes = "The MSb of the subaddress field enables auto-increment; the seven bits 
 # is load-bearing: a chip block uses `offset` for base-relative addressing, and a device register
 # composed as `base + offset` would compile, emit, and be silently wrong.
 #
-# CTRL_REG4 IS ABSENT FROM THIS FILE ON PURPOSE. Its address, width and access are the same on both
+# CTRL_REG4 is absent from this file on purpose. Its address, width and access are the same on both
 # members but its FIELDS are not, so each member states the whole register and the family invariant
 # is left to be computed rather than asserted. What the two share -- the address, BLE, the
 # full-scale selector and SIM -- survives into the shared class; what only one has does not.
@@ -250,13 +250,13 @@ notes = "Interrupt duration counter. Fields not transcribed. This is the last re
 
 # --- enumerations --------------------------------------------------------------------------------
 
-# THE SENSITIVITY IS SHARED WHERE THE RANGE IS NOT, WHICH IS THE SURPRISING HALF OF THIS FAMILY.
+# The sensitivity is shared where the range is not, which is the surprising half of this family.
 # The two members disagree about what to CALL the lowest full-scale setting -- one says 245 dps and
 # the other 250 -- and agree exactly on what one output digit is WORTH at that setting. The number
 # a driver multiplies by is the second one, so the disagreement costs a caller nothing and would
 # cost a reader who noticed only the range names a lot.
 #
-# MICRODEGREES PER SECOND, AS INTEGERS. The documents give 8.75, 17.50 and 70 millidegrees per
+# Microdegrees per second, as integers. The documents give 8.75, 17.50 and 70 millidegrees per
 # second per digit; a facts table that carried 17.50 as a float would force floating point into
 # every emitted language for the sake of three rows, on a catalog that has to work on a tier with
 # no floating point at all.

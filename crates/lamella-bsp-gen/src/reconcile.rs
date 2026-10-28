@@ -26,7 +26,7 @@ pub struct Observation {
 /// A module somebody says is attached: what they call it, where they say it sits, and the part
 /// table that describes what should be there.
 ///
-/// SUPPLIED PER INVOCATION RATHER THAN READ FROM A BOARD FILE, and that is the whole point. A
+/// Supplied per invocation rather than read from a board file, and that is the whole point. A
 /// module on a cable is not a property of the board -- the same board has different residents on
 /// different days, on different desks, in different orders -- so a board file cannot state one and
 /// a table of them would be wrong for every unit that had something else plugged in. It arrives
@@ -215,11 +215,11 @@ pub fn profile_of(board: &BoardTable, part: &PartRow) -> Vec<Claim> {
 
 /// Settles an attached-module claim against its part table's identity and the reading taken.
 ///
-/// THE DISCRIMINATOR IS THE PART'S OWN `[identity]` AND NEEDS NO AUTHORING -- a BME280 answers the
+/// The discriminator is the part's own `[identity]` and needs no authoring -- a BME280 answers the
 /// same value at the same register on every carrier that ever held one, so a board restating it
 /// would be a second copy of a chip fact. The reading is keyed by the caller's name for the module.
 ///
-/// A PART WITH NO IDENTITY REGISTER CANNOT BE SETTLED HERE AT ALL, and that is the case this arm
+/// A part with no identity register cannot be settled here at all, and that is the case this arm
 /// exists to report rather than paper over. Some parts carry no readable id -- a sensor whose whole
 /// interface is a measurement request and a fetch has nothing to answer -- so presence and type are
 /// not confirmable by reading, and only exercising the part can establish them.
@@ -460,7 +460,7 @@ mod tests {
         Observation { discriminator: String::from(name), reading }
     }
 
-    /// THE CASE THE CHECK EXISTS FOR, AND THE ONE AN IDENTITY-ONLY IMPLEMENTATION PASSES. The
+    /// The case the check exists for, and the one an identity-only implementation passes. The
     /// chip answers its identity correctly, because a bare board and a populated one carry the
     /// same part. The region claim must not be confirmed by that.
     #[test]
@@ -596,7 +596,7 @@ mod tests {
         }
     }
 
-    /// AN ATTACHED MODULE IS CONFIRMED BY ITS PART'S OWN IDENTITY, with nothing authored on the
+    /// An attached module is confirmed by its part's own identity, with nothing authored on the
     /// board. A chip answers the same value at the same register on every carrier that ever held
     /// one, so a board restating it would be a second copy of a chip fact.
     #[test]
@@ -638,9 +638,9 @@ mod tests {
         ));
     }
 
-    /// THE CASE THE PARTS SCHEMA HAD TO GROW A SPELLING FOR. A part with no identity register has
-    /// nothing to answer, so its presence and type cannot be confirmed by reading at all -- and the
-    /// verdict says which part and why, rather than reporting an ordinary missing reading.
+    /// The case the parts schema has a spelling for: a part with no identity register has nothing
+    /// to answer, so its presence and type cannot be confirmed by reading at all -- and the verdict
+    /// says which part and why, rather than reporting an ordinary missing reading.
     #[test]
     fn a_part_with_no_identity_register_cannot_be_confirmed_by_reading() {
         let table = part_table("hs3003", None, "the datasheet describes no identity register");

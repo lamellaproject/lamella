@@ -5,7 +5,7 @@
   "identity": "Lamella.App.CSharp",
   "name": "Lamella app",
   "shortName": "lamella-app",
-  "description": "A C# program for Lamella. With a board named, it blinks the board's own LED through System.Device.Gpio, and dotnet run runs it on a connected board of that kind; with none, it runs on this computer. It builds with dotnet build and runs with dotnet run.",
+  "description": "A C# program for Lamella (lamella1.0), for Lamella RHU (net11.0), or for both. Name a board, and dotnet run runs the program on a connected board of that kind; with no board, it runs on this computer. It builds with dotnet build and runs with dotnet run.",
   "tags": {
     "language": "C#",
     "type": "project"
@@ -17,33 +17,62 @@
       "type": "parameter",
       "datatype": "choice",
       "displayName": "Board",
-      "description": "The board the program runs on, by its id. The program then blinks the board's own LED, and dotnet run sends it only to a board of that kind. With no board, the program runs on this computer.",
+      "description": "The board the program runs on, by its id, which only the project file names: dotnet run sends the program only to a board of that kind. With no board, the program runs on this computer.",
       "choices": [
-        { "choice": "adafruit-feather-rp2040-adalogger", "description": "Adafruit Feather RP2040 Adalogger" },
         { "choice": "pimoroni-pico-plus-2", "description": "Pimoroni Pico Plus 2" },
-        { "choice": "rpi-pico", "description": "Raspberry Pi Pico" },
-        { "choice": "rpi-pico2", "description": "Raspberry Pi Pico 2" }
+        { "choice": "pimoroni-pico-plus-2-w", "description": "Pimoroni Pico Plus 2 W" },
+        { "choice": "rpi-pico2", "description": "Raspberry Pi Pico 2" },
+        { "choice": "rpi-pico2-w", "description": "Raspberry Pi Pico 2 W" }
       ],
       "replaces": "lamella-board-id"
+    },
+    "Framework": {
+      "type": "parameter",
+      "datatype": "choice",
+      "allowMultipleValues": true,
+      "enableQuotelessLiterals": true,
+      "displayName": "Framework",
+      "description": "The target framework, or both: lamella1.0 is Lamella, and net11.0 is Lamella RHU. Give the option twice for both. Without it, a board Lamella RHU supports gets net11.0, a board only Lamella supports gets lamella1.0, and a program with no board gets net11.0.",
+      "choices": [
+        { "choice": "lamella1.0", "description": "Lamella" },
+        { "choice": "net11.0", "description": "Lamella RHU" }
+      ]
     },
     "hasBoard": {
       "type": "computed",
       "value": "(board != \"\")"
     },
-    "ledPin": {
-      "type": "generated",
-      "generator": "switch",
-      "replaces": "LAMELLA_LED_PIN",
-      "parameters": {
-        "evaluator": "C++",
-        "datatype": "string",
-        "cases": [
-          { "condition": "(board == 'adafruit-feather-rp2040-adalogger')", "value": "13" },
-          { "condition": "(board == 'pimoroni-pico-plus-2')", "value": "25" },
-          { "condition": "(board == 'rpi-pico')", "value": "25" },
-          { "condition": "(board == 'rpi-pico2')", "value": "25" }
-        ]
-      }
+    "lamellaBoard": {
+      "type": "computed",
+      "value": "(board == \"pimoroni-pico-plus-2\" || board == \"pimoroni-pico-plus-2-w\" || board == \"rpi-pico2\" || board == \"rpi-pico2-w\")"
+    },
+    "rhuBoard": {
+      "type": "computed",
+      "value": "false"
+    },
+    "frameworkGiven": {
+      "type": "computed",
+      "value": "(Framework == lamella1.0 || Framework == net11.0)"
+    },
+    "wantsRhu": {
+      "type": "computed",
+      "value": "(Framework == net11.0 || (!frameworkGiven && (!hasBoard || rhuBoard)))"
+    },
+    "wantsLamella": {
+      "type": "computed",
+      "value": "(Framework == lamella1.0 || (!frameworkGiven && hasBoard && !rhuBoard))"
+    },
+    "bothFrameworks": {
+      "type": "computed",
+      "value": "(wantsRhu && wantsLamella)"
+    },
+    "rhuOnly": {
+      "type": "computed",
+      "value": "(wantsRhu && !wantsLamella)"
+    },
+    "lamellaToo": {
+      "type": "computed",
+      "value": "(rhuOnly && hasBoard && lamellaBoard)"
     }
   },
   "primaryOutputs": [

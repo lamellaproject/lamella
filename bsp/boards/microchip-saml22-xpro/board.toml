@@ -1,16 +1,16 @@
 # The SAM L22 Xplained Pro (ATSAML22-XPRO-B): board truth only -- what is wired to what. Chip
 # truth lives in csp/saml22/.
 #
-# EVERYTHING THIS BOARD BINDS IS IN PORT GROUP C. The LED, the button and both virtual-COM-port
+# Everything this board binds is in port group C. The LED, the button and both virtual-COM-port
 # pads are PC pads, which is new for this family line -- the SAM C21's third group exists only on
 # its 100-pin part and carries just an LED.
 #
-# THE VIRTUAL COM PORT'S FUNCTION COLUMN CAME FROM THE DATASHEET. Atmel-42474 Table 4-11 names
+# The virtual COM port's function column came from the datasheet. Atmel-42474 Table 4-11 names
 # SERCOM4 PAD[2] on PC24 and PAD[3] on PC25 and stops there; DS60001465D Table 6-1 puts SERCOM4 in
 # column D on both pads and SERCOM0 in column C, so the letter is a real choice and the guide does
 # not make it.
 #
-# AND THE PART DATASHEET MISPRINTS SERCOM2's BASE -- see csp/saml22/parts.toml. Nothing on this
+# And the part datasheet misprints SERCOM2's base -- see csp/saml22/parts.toml. Nothing on this
 # board binds SERCOM2, so no value here depends on it.
 
 [table]
@@ -36,7 +36,7 @@ notes = [
 
 [[carriers]]
 kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
-usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+usb_vid = 0x03EB            # Note: no usb_pid row, and its absence is a sourced position rather than
 role = "vcp"                # AN OMISSION. A product id is a property of the debugger's FIRMWARE:
 baud = 115200               # this kit's user guide never prints one, and the EDBG user guide
 plan = "osc16m-4mhz"        # Atmel-42096 describes the composite device without giving an id
@@ -53,7 +53,7 @@ gclk_gen = 0                # and the kit guide does not state it.
 tx = { pin = "PC24", pad = 2 }
 rx = { pin = "PC25", pad = 3 }
 
-# THE DEFAULT CLOCK PLAN. The same oscillator and rate as the SAM L21 reaches, stated here from
+# The default clock plan. The same oscillator and rate as the SAM L21 reaches, stated here from
 # this part's own datasheet rather than pointed at the sibling: "After reset, OSC16M is enabled and
 # serves as the default clock source at 4MHz." Every baud divisor the generator derives rides it.
 [[plans]]

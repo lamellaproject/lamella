@@ -2,7 +2,7 @@
 # form factor -- a microcontroller sharing one board with a Qualcomm Dragonwing QRB2210 application
 # processor that runs Debian Linux.
 #
-# THIS BOARD STATES NO CARRIER, AND THAT IS THE WHOLE FINDING RATHER THAN A GAP. A board reaches a
+# This board states no carrier, and that is the whole finding rather than a gap. A board reaches a
 # host through a wire this schema can name: an on-board debugger, a bare SWD header, or the
 # microcontroller's own USB. This one reaches a host through NONE of them.
 #   * The microcontroller's own USB does not reach the connector. The USB-C is the application
@@ -19,26 +19,26 @@
 # row would have to name a wire, and stating one here would invent the wire. Declining to invent a
 # wire that does not exist is the same refusal as declining to state a rate for a wire that has none.
 #
-# FOUR RGB LEDS ARE POPULATED AND ONLY TWO ARE THIS BOARD'S TO BIND, because the OTHER TWO
-# BELONG TO A DIFFERENT PROCESSOR. RGB LEDs 1 and 2 in the schematic's naming (D27301, D27302) are
+# Four RGB LEDs are populated and only two are this board's to bind, because the other two
+# belong to a different processor. RGB LEDs 1 and 2 in the schematic's naming (D27301, D27302) are
 # driven by the application processor and surface under Linux as /sys/class/leds/ entries -- red:user,
 # green:user, blue:user, red:panic, green:wlan, blue:bt, which the board confirms. Their identifiers
 # are gpiochip line numbers, a KERNEL-BUILD property rather than a board fact, so they are not ours
 # to state and no row below names them. What this file binds is the two the microcontroller drives.
 #
-# AND AN 8 x 13 MONOCHROME LED MATRIX IS MICROCONTROLLER-DRIVEN AND CANNOT BE MODELLED HERE.
+# And an 8 x 13 monochrome LED matrix is microcontroller-driven and cannot be modelled here.
 # `[[devices]]` has two shapes -- pin-wired, or bus-wired with a role and an address -- and this is
 # neither. The 104 pixels are CHARLIEPLEXED across ELEVEN pins: the schematic draws a triangular
 # diode array growing by two per row, the nets run LED_MATRIX_0 to LED_MATRIX_10 each through its
 # own 22 ohm resistor, and LED_MATRIX_11 is marked "not use". Eleven tri-stated pins give 11 x 10 =
 # 110 addressable LEDs, which is how 104 pixels are reached; row-and-column scanning across eleven
-# pins reaches at most 30. So a pixel here is an ORDERED PAIR OF PINS, not the intersection of a row
+# pins reaches at most 30. So a pixel here is an ordered pair of pins, not the intersection of a row
 # and a column: a display described by row and column rows would state a scan this board does not
 # perform. The sheet's own numbered 1..104 grid is the
 # LOGICAL 8 x 13 the manual describes; the triangular array is the ELECTRICAL truth, and they are
 # different things. This is the FOURTH KIND `[[devices]]` stops at, and it is stated rather than bent.
 #
-# NOT MODELLED, AND NAMED SO EACH OMISSION IS DELIBERATE: the LED matrix above; the two
+# Not modelled, and named so each omission is deliberate: the LED matrix above; the two
 # application-processor RGB LEDs above; the power LED D27201, which no pin drives and which sits on
 # PWR_3P3V through a 330 ohm resistor; the LPUART1 and SPI3 links to the application processor,
 # which have no instance rows yet because their clock gates have not been read; the 2 GB or 4 GB of
@@ -75,14 +75,14 @@ notes = [
 
 # --- the carrier ------------------------------------------------------------------------------
 #
-# THERE IS NONE, DELIBERATELY. See the paragraph at the top of this file: the microcontroller's own
+# There is none, deliberately. See the paragraph at the top of this file: the microcontroller's own
 # USB does not reach the connector, its LPUART1 lands on the application processor rather than on a
 # bridge, and there is no debug connector at all. No `[[carriers]]` row appears below because every
 # kind this schema can name would be a wire this board does not have.
 
 # --- control lines ----------------------------------------------------------------------------
 #
-# EACH ROW BELOW CARRIES ITS OWN BALL, AND THAT IS NOT CEREMONY. The schematic draws each ball
+# Each row below carries its own ball, and that is not ceremony. The schematic draws each ball
 # designator on the wire stub ABOVE its pin-name baseline, so a text conversion pairs every ball
 # with the PREVIOUS pin and a whole port block reads one row low -- which is how the port G block
 # was misread twice before the join caught it. Every pin below was resolved schematic net -> BALL ->

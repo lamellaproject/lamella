@@ -1,7 +1,7 @@
 // The descriptor an RP2350 PL022-SPI driver consumes: one spi
 namespace Lamella.Boards
 {
-    public sealed class Rp2350SpiBinding
+    internal sealed class Rp2350SpiBinding
     {
         /// <summary>The bound PL022 instance's base address.</summary>
         public readonly uint SspBase;

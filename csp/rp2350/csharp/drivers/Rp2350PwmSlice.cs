@@ -3,7 +3,7 @@
 // one slice per PWM chip, and each output it routed -- A as channel 0, B as channel 1 -- is one channel
 // of that chip, created by PwmChannel.Create.
 //
-// ONE RATE PER SLICE. The slice's period is the period of both its outputs, and each output owns only
+// One rate per slice. The slice's period is the period of both its outputs, and each output owns only
 // its half of the compare register, which sets its duty cycle. So a frequency asked of one output
 // re-times the slice and its other output if that is not started: it keeps its duty cycle, and its
 // Frequency then reads the new rate. A started output is never re-timed under its owner, so a
@@ -36,7 +36,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Rp2350PwmSlice
+internal sealed class Rp2350PwmSlice
 {
     /// <summary>A bound on every hardware wait, so a block that never answers is reported rather than
     /// waited on forever.</summary>

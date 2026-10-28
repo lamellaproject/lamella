@@ -4,7 +4,7 @@ namespace Lamella.Boards
 {
     /// <summary>One analog pad a board wired to the converter: the channel it is, and where its
     /// multiplexer nibble and pin configuration byte are.</summary>
-    public sealed class Samd21AdcPad
+    internal sealed class Samd21AdcPad
     {
         /// <summary>The converter channel this pad is: its AIN number, which is the multiplexer code
         /// that selects it.</summary>
@@ -25,7 +25,7 @@ namespace Lamella.Boards
         }
     }
 
-    public sealed class Samd21AdcBinding
+    internal sealed class Samd21AdcBinding
     {
         /// <summary>The converter's base address.</summary>
         public readonly uint AdcBase;

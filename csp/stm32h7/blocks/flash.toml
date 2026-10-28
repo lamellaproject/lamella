@@ -4,7 +4,7 @@
 #
 # Two facts, and each `sources` entry names the one it backs.
 #
-# THIS IS THE PART THE WRITE-UNIT FACT EXISTS FOR. Its flash word is 256 bits -- 32 bytes -- and a
+# This is the part the write-unit fact exists for. Its flash word is 256 bits -- 32 bytes -- and a
 # program command commits one whole flash word plus its 10 ECC bits. Software may hand the
 # controller as few as 8 bits, but the manual is explicit that only 256-bit writes are executed in
 # the non-volatile memory: the shortfall is filled by a force-write of the whole word. So a record
@@ -12,13 +12,13 @@
 # unit and program a magic value LAST has no "last" -- the single write covers the magic and the
 # record together, and losing power part way through leaves both in the same indeterminate state.
 #
-# AND THE SECOND HALF OF WHY THIS PART IS THE HARD ONE: A FLASH WORD MAY NOT BE REPROGRAMMED. The
+# And the second half of why this part is the hard one: a flash word may not be reprogrammed. The
 # manual advises against overwriting a word that is not virgin, because a second program computes a
 # new ECC over the merged content and the result is reported as an ECC error on every subsequent
 # read. So the escape of "write the record now and the magic into the same unit afterwards", which
 # an STM32F4 permits, is not available here.
 #
-# THE ERASE UNIT IS NOT THIS NUMBER AND IS NOT DECLARED HERE. Erase is by sector, and RM0399 gives
+# The erase unit is not this number and is not declared here. Erase is by sector, and RM0399 gives
 # these parts eight sectors of 128 Kbytes per bank -- 4,096 times the write unit. A consumer
 # choosing where to PUT a record needs the erase unit as well as the write unit, and this file
 # declares only the one it can state for the whole block. Nothing here should be read as an answer

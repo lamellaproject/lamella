@@ -2,7 +2,7 @@
 # field at a time. Offsets are instance-base-relative; the port instance bases live in
 # ../instances.toml.
 #
-# EVERY VALUE HERE WAS READ FROM THIS FAMILY'S OWN BOOK. Nothing was carried over from
+# Every value here was read from this family's own book. Nothing was carried over from
 # csp/stm32l476, and the reason is that a carry-over would have LOOKED right: that family's USART2
 # sits at the same address as this one's and its RCC block does too, while its GPIOA sits at
 # 0x48000000 where this family puts GPIOA at 0x50000000. Two of three values survive a copy and

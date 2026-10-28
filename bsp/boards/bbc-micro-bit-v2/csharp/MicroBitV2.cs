@@ -6,7 +6,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Bbc
 {
-    public sealed class MicroBitV2
+    internal sealed class MicroBitV2
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = BbcMicroBitV2Bindings.BOARD_MODEL;
@@ -18,16 +18,16 @@ namespace Lamella.Boards.Bbc
         public static readonly uint I2cFreqWord400k = Nrf52833TwiLayout.FREQUENCY_K400;
 
         /// <summary>The accelerometer's I2C address on the internal bus.</summary>
-        /// <remarks>THE SENSOR PART IS NOT GUARANTEED BY THE BOARD REVISION. The vendor's own
+        /// <remarks>The sensor part is not guaranteed by the board revision. The vendor's own
         /// hardware documentation, https://tech.microbit.org/hardware/2-0-revision/ , states:
         /// <para>"The micro:bit has a footprint for two different motion sensors: one made by ST
         /// (the LSM303AGR) and one by NXP (FXOS8700CQ). The micro:bit DAL supports both of these
         /// sensors, detecting them at runtime. Only one sensor will ever be placed."</para>
         /// The footprint is shared, so the placed part is a manufacturing fact rather than a
-        /// design guarantee -- which is why the reference runtime DETECTS it. The ST part answers
+        /// design guarantee -- which is why the reference runtime detects it. The ST part answers
         /// as two bus residents; the NXP part is a single combined device and does not answer at
         /// <see cref="MagnetometerAddress"/> at all. These constants therefore describe the ST
-        /// population, which is every unit measured here. Code that must be correct on ANY unit
+        /// population. Code that must be correct on any unit
         /// should probe WHO_AM_I (the LSM303AGR answers 0x33 at 0x0F and 0x40 at 0x4F) instead of
         /// trusting them.</remarks>
         public static readonly int AccelerometerAddress = (int)BbcMicroBitV2Bindings.LSM303AGR_ADDRESS;

@@ -3516,4 +3516,16 @@ mod tests {
 
         assert!(lamella_flash_routes::can_flash("rpi-pico2"), "a Pico 2 has a route");
     }
+
+    /// `lamella_boards` lists every board of the catalog, as `lamella boards` does, the Pico LiPo 2
+    /// XL W among them.
+    #[test]
+    fn the_board_listing_names_every_board_of_the_catalog() {
+        let listing = tool_boards();
+        let text = listing["content"][0]["text"].as_str().expect("the listing has text");
+        let items: Vec<Value> = serde_json::from_str(text).expect("the listing is a JSON array");
+        let boards: Vec<&str> = items.iter().filter_map(|item| item["board"].as_str()).collect();
+        assert!(boards.contains(&"pimoroni-pico-lipo-2-xl-w"), "{boards:?}");
+        assert_eq!(boards.len(), lamella_catalog::BOARDS.len(), "every board of the catalog is listed");
+    }
 }

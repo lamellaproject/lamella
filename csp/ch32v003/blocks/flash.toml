@@ -2,20 +2,20 @@
 # controller need. Its option bytes, its unlock key sequences and its read protection are not
 # described here.
 #
-# THIS PART HAS TWO PROGRAMMING MODES AND THEY DISAGREE ABOUT THE UNIT. The reference manual gives
+# This part has two programming modes and they disagree about the unit. The reference manual gives
 # both, one after the other:
 #
 #   standard  a single 2-byte program, and erase by 1 KB sector or whole chip. The default.
 #   fast      a single 64-byte page program AND a 64-byte page erase, after a second unlock.
 #             The manual marks this one "(recommended)".
 #
-# SIXTY-FOUR IS DECLARED, AND THE CHOICE IS NOT A PREFERENCE. The two failure modes are not
+# Sixty-four is declared, and the choice is not a preference. The two failure modes are not
 # symmetric. A consumer that sizes a region from 2 and then meets a driver programming 64 bytes at a
 # time has its neighbour overwritten; one that sizes from 64 and meets a 2-byte driver has merely
 # spent more space than it needed. So the LARGER unit is the safe declaration whichever mode a
 # driver later chooses -- and the manual recommends the mode that makes it 64 anyway.
 #
-# AND A WORKING PROGRAMMING FLOW LANDS ON THE SAME TWO NUMBERS. The WCH-LinkE fast-program flow uses
+# And a working programming flow lands on the same two numbers. The WCH-LinkE fast-program flow uses
 # a 64-byte USB data packet and a 1024-byte program pack -- exactly the fast mode's 64-byte page and
 # 1 KB sector erase. A value the manual states and an independent implementation arrives at is a
 # stronger fact than either on its own.

@@ -2,18 +2,18 @@
 //! is resolved through the adapter's wiring to the board's header, and so to the board's pads, with
 //! what serves each line and which of the board's own bindings it takes a pad from.
 //!
-//! THREE FILES, TWO JOINS, AND NONE OF THEM NAMES ANOTHER. A module names positions of its socket's
+//! Three files, two joins, and none of them names another. A module names positions of its socket's
 //! standard (`cs`); the adapter wires each socket position to a position of the header it plugs
 //! into (`gp13`); the board's row for that header names the pad (`GP13`). The adapter's revision
 //! is a fact about one physical unit, so it arrives with the build rather than from any file here.
 //!
-//! A LINE IS SHARED WHERE THE BOARD ALREADY BINDS WHAT IT NEEDS, AND DISPLACES WHAT IS THERE WHERE
-//! IT DOES NOT. A module's I2C on the pads the board binds as its I2C bus rides that binding, as a
+//! A line is shared where the board already binds what it needs, and displaces what is there where
+//! it does not. A module's I2C on the pads the board binds as its I2C bus rides that binding, as a
 //! second device on the bus would. A module's chip select on a pad the board gives to a PWM output
 //! takes the pad for the build, and the report names the PWM output it took the pad from -- a board
 //! default is a default, and fitting a module is how a user overrides one.
 //!
-//! WHAT IS REFUSED, AND WHY EACH REFUSAL NAMES BOTH SIDES. A pad two claimants want for different
+//! What is refused, and why each refusal names both sides. A pad two claimants want for different
 //! things cannot serve both, and a refusal that named only the second would leave the first to be
 //! found by hand: a line of the build's link carrier and a module's line on one pad; two modules'
 //! lines on one pad for different functions; a module's line on a pad the board's own device holds.

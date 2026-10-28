@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Microchip
 {
-    public sealed class Samg55Xpro
+    internal sealed class Samg55Xpro
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = MicrochipSamg55XproBindings.BOARD_MODEL;
@@ -23,7 +23,7 @@ namespace Lamella.Boards.Microchip
             Samg55GpioDriver.LogicalPin(MicrochipSamg55XproBindings.BUTTON0_PORT_BASE, MicrochipSamg55XproBindings.BUTTON0_PIN);
 
         /// <summary>The mode the user button wants.</summary>
-        /// <remarks>THIS KIT'S GUIDE DOES NOT SAY WHETHER AN EXTERNAL PULL-UP IS FITTED, where the
+        /// <remarks>This kit's guide does not say whether an external pull-up is fitted, where the
         /// Curiosity Nano guides state outright that none is. <see cref="PinMode.InputPullUp"/> is
         /// nevertheless the right answer under BOTH readings, which is why it can be offered without
         /// settling the question: if the board fits no pull-up the internal one is required, and if
@@ -46,7 +46,7 @@ namespace Lamella.Boards.Microchip
         private static GpioDriver MakeGpio() { return new Samg55GpioDriver(); }
 
         /// <summary>The family PIO driver this board bound.</summary>
-        /// <remarks>THE DRIVER SPANS 48 LINES AND THIS PACKAGE CARRIES ALL OF THEM -- PA0..PA31 on
+        /// <remarks>The driver spans 48 lines and this package carries all of them -- PA0..PA31 on
         /// PIOA and PB0..PB15 on PIOB, which Table 1-1's count of 48 confirms -- so no logical pin
         /// number this driver accepts is unbonded. Four of PIOB's
         /// lines are the JTAG and SWD pads and one is the ERASE pin, so "carried by the package" and

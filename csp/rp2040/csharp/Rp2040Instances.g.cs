@@ -5,7 +5,7 @@
 // Layout offsets live in the *Layout classes; wiring lives in the per-board *Bindings.
 namespace Lamella.Generated
 {
-    public sealed class Rp2040Instances
+    internal sealed class Rp2040Instances
     {
         private Rp2040Instances() { }
 

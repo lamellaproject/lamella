@@ -191,10 +191,6 @@ pub struct Vm {
     /// each event nests inside the one before it and the innermost finishes first. It also costs a
     /// call frame per event, so a full queue arrives as a stack as deep as its capacity.
     pin_events_draining: bool,
-    /// The full name of the board class this machine is ([`Vm::set_board_class`]), whose type
-    /// initializer [`boot_baked`] runs before the entry point when the program carries the class.
-    /// `None` = no board: every host run, and every firmware that names none.
-    board_class: Option<&'static str>,
     /// Native KEY material the managed tier references only by HANDLE (a TLS exporter output,
     /// an AEAD key): the bytes live here, runtime-side, and never appear in managed values.
     /// Append-only like the TLS handle tables; a released slot is ZEROIZED before it is
@@ -342,6 +338,7 @@ impl Vm {
     #[cfg(feature = "gc")]
     pub fn request_collect(&mut self) {
         self.force_collect = true;
+        self.heap.note_collection_check();
     }
 
     /// Takes and clears any pending forced-collection request.
@@ -363,6 +360,7 @@ impl Vm {
     #[cfg(feature = "gc")]
     pub fn resume_collection(&mut self) {
         self.collect_suspend = self.collect_suspend.saturating_sub(1);
+        self.heap.note_collection_check();
     }
 
     /// Whether collection is currently suspended (a non-zero suspension depth).
@@ -694,22 +692,6 @@ impl Vm {
     /// nothing wakes it, and the program keeps running its other threads, timers and pin events.
     pub fn request_sleep_forever(&mut self) {
         self.thread_op = Some(ThreadOp::SleepForever);
-    }
-
-    /// Names the board this machine is, by the full name of its board class
-    /// (`Lamella.Boards.RaspberryPi.Pico2`). [`boot_baked`] runs that class's type initializer
-    /// before the entry point when the program carries the class, so the buses it binds are bound
-    /// before `Main` -- as an operating system has its devices set up before a program starts -- and
-    /// code written against the standard factories (`I2cDevice.Create`, `new GpioController()`)
-    /// needs no line that touches the board first.
-    pub fn set_board_class(&mut self, full_name: &'static str) {
-        self.board_class = Some(full_name);
-    }
-
-    /// The board class [`Vm::set_board_class`] named, if any.
-    #[must_use]
-    pub fn board_class(&self) -> Option<&'static str> {
-        self.board_class
     }
 
     /// Sets the host clock seam: a monotonic-millisecond reader and an OS-thread sleep, used by the
@@ -1794,6 +1776,8 @@ type Multicast = (Vec<Invocation>, Vec<Value>);
 /// method invocation.
 struct Frame {
     method: MethodId,
+    /// What every step of `method` reads from the module, resolved once when the frame is set up.
+    context: MethodContext,
     ip: usize,
     stack: Vec<Value>,
     locals: Vec<Value>,
@@ -1838,6 +1822,36 @@ struct Frame {
     varargs: Option<VarargFrame>,
 }
 
+/// What a frame needs from its method on every step, resolved once per call rather than read from
+/// the module before each instruction: the assembly whose token space the method's CIL resolves
+/// against, and -- under `code-in-place`, when they outlive the module -- its instruction bytes.
+#[derive(Clone, Copy)]
+struct MethodContext {
+    asm: u8,
+    /// `None` for a body the module owns in RAM (a REPL delta), whose bytes `advance` reads from the
+    /// module on each step.
+    #[cfg(feature = "code-in-place")]
+    code: Option<&'static [u8]>,
+}
+
+impl MethodContext {
+    /// The context of a frame no module stands behind: [`run_method`]'s lone frame, which resolves
+    /// no tokens.
+    const NONE: MethodContext = MethodContext {
+        asm: 0,
+        #[cfg(feature = "code-in-place")]
+        code: None,
+    };
+
+    fn of(module: &Module, id: MethodId) -> MethodContext {
+        MethodContext {
+            asm: module.method_asm(id),
+            #[cfg(feature = "code-in-place")]
+            code: module.method_code_static(id),
+        }
+    }
+}
+
 /// Recycled [`Frame`] shells and `Vec<Value>` buffers, so the steady-state cost of a
 /// managed call is ZERO heap allocations: a returning frame's stack/locals/args buffers
 /// (cleared, capacities kept) serve the next call instead of being dropped -- which on a
@@ -1878,15 +1892,16 @@ impl FramePool {
 
     /// A frame for `method` taking ownership of `args` -- a revived shell when one is
     /// pooled (its displaced `args` buffer comes back to the pool), else a fresh frame.
-    fn revive(&mut self, method: MethodId, args: Vec<Value>) -> Frame {
+    fn revive(&mut self, method: MethodId, context: MethodContext, args: Vec<Value>) -> Frame {
         match self.shells.pop() {
             Some(mut frame) => {
                 frame.method = method;
+                frame.context = context;
                 frame.ip = 0;
                 self.give_values(core::mem::replace(&mut frame.args, args));
                 frame
             }
-            None => Frame::new(method, args),
+            None => Frame::new(method, context, args),
         }
     }
 
@@ -2182,7 +2197,7 @@ struct PendingFilter {
 /// out-of-range local, argument, or branch, or integer division by zero.
 pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Value>, Trap> {
     let mut vm = Vm::new();
-    let mut frame = Frame::new(0, args);
+    let mut frame = Frame::new(0, MethodContext::NONE, args);
     loop {
         let instruction = body.code.get(frame.ip).ok_or(Trap::FellThroughEnd)?;
         frame.ip += 1;
@@ -2629,21 +2644,19 @@ pub fn run(
 /// ([`Module::initializes_types_on_first_access`]) needs nothing here, and nothing runs: every
 /// loaded module, and every image baked since the trigger tables were added. A constructor then
 /// runs where ECMA-335 II.10.5.3 puts it, so its output follows `Main`'s and one that throws
-/// raises `TypeInitializationException` at the access, where the program can catch it.
+/// raises `TypeInitializationException` at the access, where the program can catch it. A board's
+/// class is no exception: its initializer binds the board's buses where the program first touches
+/// the class.
 ///
 /// An image baked before those tables has no trigger to fire, so its static constructors run
 /// here, in declaration order, before the entry point. Without that no static would ever
 /// initialize -- so [`run`] refuses such a module unless this has run.
 ///
-/// Then the board: when the [`Vm`] names a board class ([`Vm::set_board_class`]) and the program
-/// carries it, that class is initialized here, before the entry point, exactly as its first access
-/// would initialize it -- so it runs once, and touching the board later runs nothing more.
-///
 /// Configure the [`Vm`] FIRST -- board seams, console, heap. A static constructor observes
 /// the VM it runs on, so a seam installed afterwards is not there when it runs.
 ///
 /// # Errors
-/// Propagates a [`Trap`] from a static constructor run here, the board class's included.
+/// Propagates a [`Trap`] from a static constructor run here.
 pub fn boot_baked(module: &Module, vm: &mut Vm, entry: MethodId) -> Result<MethodId, Trap> {
     if !module.initializes_types_on_first_access() {
         vm.mark_all_cctors_run(module);
@@ -2651,7 +2664,6 @@ pub fn boot_baked(module: &Module, vm: &mut Vm, entry: MethodId) -> Result<Metho
             run(module, vm, cctor, Vec::new())?;
         }
     }
-    arm_board(module, vm)?;
     Ok(entry)
 }
 
@@ -2674,24 +2686,6 @@ pub fn entry_args(module: &Module, vm: &mut Vm, entry: MethodId) -> Vec<Value> {
         .map(|arg| Value::Object(vm.heap_mut().alloc_text(arg)))
         .collect();
     alloc::vec![Value::Object(vm.heap_mut().alloc_array(elements))]
-}
-
-/// Initializes the board class the [`Vm`] names, if the program carries it: its type initializer
-/// binds the board's buses, which the standard factories then resolve through.
-///
-/// A program without the class is not refused here. It has bound nothing, and the first factory
-/// it calls says so, naming what to add.
-fn arm_board(module: &Module, vm: &mut Vm) -> Result<(), Trap> {
-    let Some(type_id) = vm.board_class().and_then(|name| module.type_id_by_full_name(name)) else {
-        return Ok(());
-    };
-    if let Some(cctor) = vm
-        .take_pending_cctor(module, type_id)
-        .map_err(Trap::TypeInitializationFailed)?
-    {
-        run(module, vm, cctor, Vec::new())?;
-    }
-    Ok(())
 }
 
 /// [`run`] plus a `service` callback fired at EVERY scheduler quantum boundary (every
@@ -3527,24 +3521,34 @@ impl Session {
         is_expandable(vm, value)
     }
 
+    /// The GC safepoint at an instruction boundary, where every frame's state is consistent: collects
+    /// when a collection was requested, or the heap has reached its threshold or its object budget.
+    /// [`Session::advance`] calls it only while [`Heap::collection_check_pending`] is set, and it
+    /// clears that first; what it does here re-arms it where the triggers must be weighed again.
+    #[cfg(feature = "gc")]
+    fn gc_safepoint(&mut self, module: &Module, vm: &mut Vm) {
+        vm.heap_mut().clear_collection_check();
+        let forced = vm.take_force_collect();
+        if vm.collection_suspended() {
+            if forced {
+                vm.request_collect();
+            }
+        } else if forced || vm.heap().should_collect() || vm.heap().at_budget() {
+            if vm.live_thread_count() <= 1 {
+                self.collect_garbage(module, vm);
+            } else {
+                vm.request_collect();
+            }
+        }
+    }
+
     /// Executes one instruction of the top frame and applies its effect to the
     /// call stack: a return pops (handing the result back, or finishing); a call
     /// pushes a managed frame or invokes an intrinsic.
     fn advance(&mut self, module: &Module, vm: &mut Vm) -> Result<Status, Trap> {
         #[cfg(feature = "gc")]
-        {
-            let forced = vm.take_force_collect();
-            if vm.collection_suspended() {
-                if forced {
-                    vm.request_collect();
-                }
-            } else if forced || vm.heap().should_collect() || vm.heap().at_budget() {
-                if vm.live_thread_count() <= 1 {
-                    self.collect_garbage(module, vm);
-                } else {
-                    vm.request_collect();
-                }
-            }
+        if vm.heap().collection_check_pending() {
+            self.gc_safepoint(module, vm);
         }
         let Session { frames, result, .. } = self;
         let current = match frames.len() {
@@ -3552,7 +3556,13 @@ impl Session {
             len => len - 1,
         };
         let top = &mut frames[current];
-        let asm = module.method_asm(top.method);
+        let asm = top.context.asm;
+        #[cfg(feature = "code-in-place")]
+        let code = match top.context.code {
+            Some(code) => code,
+            None => method_code(module, top.method)?,
+        };
+        #[cfg(not(feature = "code-in-place"))]
         let code = method_code(module, top.method)?;
         let instruction_ip = top.ip;
         #[cfg(not(feature = "code-in-place"))]
@@ -4701,7 +4711,7 @@ fn run_pending_cctor_nested(module: &Module, vm: &mut Vm, method: MethodId) -> R
 fn new_frame(vm: &mut Vm, module: &Module, id: MethodId, args: Vec<Value>) -> Result<Frame, Trap> {
     match module.method_kind(id) {
         Some(MethodKind::Managed) => {
-            let mut frame = vm.frame_pool.revive(id, args);
+            let mut frame = vm.frame_pool.revive(id, MethodContext::of(module, id), args);
             frame.prepare_for_handlers(eh_clause_count(module, id));
             Ok(frame)
         }
@@ -4714,7 +4724,7 @@ fn new_frame(vm: &mut Vm, module: &Module, id: MethodId, args: Vec<Value>) -> Re
 fn new_frame_cold(module: &Module, id: MethodId, args: Vec<Value>) -> Result<Frame, Trap> {
     match module.method_kind(id) {
         Some(MethodKind::Managed) => {
-            let mut frame = Frame::new(id, args);
+            let mut frame = Frame::new(id, MethodContext::of(module, id), args);
             frame.prepare_for_handlers(eh_clause_count(module, id));
             Ok(frame)
         }
@@ -4735,8 +4745,9 @@ fn take_args_pooled(frame: &mut Frame, vm: &mut Vm, count: u16) -> Result<Vec<Va
     Ok(args)
 }
 
-/// The CIL of a managed method -- looked up per advance now that a frame no longer
-/// borrows it. Errors if `id` names an intrinsic or no method.
+/// The CIL of a managed method, read from the module: on each step for a body a frame cannot keep
+/// (decoded instructions, or code bytes the module owns in RAM), since a frame does not borrow the
+/// module. Errors if `id` names an intrinsic or no method.
 ///
 /// The view is the `code_loading` level's fetch source: decoded instructions (indexed by an
 /// instruction-count ip) by default, or -- under `code-in-place` -- the flash-resident code BYTES,
@@ -5091,7 +5102,7 @@ fn raise_from(
             EhKind::Catch(type_token) => {
                 if catch_matches(
                     module,
-                    module.method_asm(frame.method),
+                    frame.context.asm,
                     vm,
                     *type_token,
                     exception,
@@ -5397,7 +5408,7 @@ fn step(
     instruction: &Instruction,
 ) -> Result<Flow, Trap> {
     let opcode = instruction.opcode;
-    let asm = module.map_or(0, |module| module.method_asm(frame.method));
+    let asm = frame.context.asm;
     match opcode {
         Opcode::Nop => {}
         Opcode::Break => {}
@@ -6687,9 +6698,10 @@ impl Frame {
         }
     }
 
-    fn new(method: MethodId, args: Vec<Value>) -> Frame {
+    fn new(method: MethodId, context: MethodContext, args: Vec<Value>) -> Frame {
         Frame {
             method,
+            context,
             ip: 0,
             stack: Vec::new(),
             locals: Vec::new(),
@@ -7730,44 +7742,26 @@ fn convert(opcode: Opcode, value: Value) -> Result<Value, Trap> {
     })
 }
 
-/// A float narrowed to the signed intermediate a `conv.*` truncates from, answering what .NET
-/// answers when the value does not fit or is NaN.
+/// A float converted to the intermediate a `conv.*` truncates from, answering what .NET 9 and later
+/// answer when the value does not fit or is NaN: the conversion SATURATES at the target's range, and
+/// NaN converts to 0.
 ///
 /// ECMA-335 III.3.27 declines to choose here: "If overflow occurs converting a floating-point type
 /// to an integer, or if the floating-point value being converted to an integer is a NaN, the value
-/// returned is unspecified." So any answer conforms, including Rust's `as`, which saturates and
-/// sends NaN to zero. This one matches .NET instead, because that is what a program written here
-/// meets when it runs there.
+/// returned is unspecified." Where the standard leaves a value unspecified, Lamella answers as
+/// modern .NET does, and from .NET 9 these conversions saturate on every platform.
+///
+/// The narrow targets (`conv.i1`, `u1`, `i2`, `u2`) saturate at `int`'s range and are then truncated,
+/// as .NET 9 does it: `(byte)1e10` is 255 and `(short)1e10` is -1, the low bits of `int.MaxValue`,
+/// not the narrow type's own maximum.
 #[cfg(feature = "float")]
 fn float_to_intermediate(opcode: Opcode, float: f64) -> i64 {
-    if matches!(opcode, Opcode::ConvU8 | Opcode::ConvU) {
-        const BIAS: f64 = 9_223_372_036_854_775_808.0;
-        return if float < BIAS {
-            signed_64(float)
-        } else {
-            signed_64(float - BIAS).wrapping_add(i64::MIN)
-        };
+    match opcode {
+        Opcode::ConvU8 | Opcode::ConvU => float as u64 as i64,
+        Opcode::ConvI8 | Opcode::ConvI => float as i64,
+        Opcode::ConvU4 => i64::from(float as u32),
+        _ => i64::from(float as i32),
     }
-    if matches!(opcode, Opcode::ConvI8 | Opcode::ConvI | Opcode::ConvU4) {
-        return signed_64(float);
-    }
-    if float.is_nan() || !(-2_147_483_648.0..2_147_483_648.0).contains(&float) {
-        return i64::from(i32::MIN);
-    }
-    i64::from(float as i32)
-}
-
-/// A float truncated toward zero into 64 signed bits, answering `i64::MIN` -- x86's "integer
-/// indefinite" -- when it does not fit or is NaN, where Rust's `as` would saturate and send NaN to
-/// zero. The one place that difference is expressed, so the arms above cannot drift apart.
-#[cfg(feature = "float")]
-fn signed_64(float: f64) -> i64 {
-    if float.is_nan()
-        || !(-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&float)
-    {
-        return i64::MIN;
-    }
-    float as i64
 }
 
 /// The checked conversions `conv.ovf.*`: like [`convert`] but yielding [`Trap::Overflow`]
@@ -8332,7 +8326,10 @@ fn array_element_is(module: &Module, element: u64, asm: u8, token: Token) -> boo
 /// signed/unsigned INTEGER interchange (`int[]` casts to `uint[]`, but `bool`/`char`/floats
 /// match only themselves), enum/underlying interchange, and reference-element covariance.
 /// An interface target is tested against the interfaces `System.Array` DECLARES, so
-/// `(IEnumerable)array` succeeds and `(IComparable)array` throws, as on .NET.
+/// `(IEnumerable)array` succeeds and `(IComparable)array` throws, as on .NET. With no corlib
+/// loaded there is no `System.Array` to ask, and a named target is decided by the name the loader
+/// read: an array is an instance of `System.Array` and the interfaces it implements, and of no
+/// other named type.
 fn array_cast_matches(module: &Module, asm: u8, op_elem: u64, token: Token) -> bool {
     if module.is_object_type_token(asm, token) {
         return true;
@@ -8357,22 +8354,20 @@ fn array_cast_matches(module: &Module, asm: u8, op_elem: u64, token: Token) -> b
         }
         Some(CastElem::Object) => true,
         Some(CastElem::Prim(_) | CastElem::String | CastElem::GenericValueType) => false,
-        Some(CastElem::Named(_)) | Some(CastElem::Lenient) | None => {
+        target @ (Some(CastElem::Named(_)) | Some(CastElem::Lenient) | None) => {
             let target_id = module.type_id_of(asm, token);
-            match target_id
+            let reflect = target_id
                 .and_then(|id| module.type_handle_of(id))
-                .and_then(|handle| module.reflect_type(handle))
-            {
-                Some(reflect) if reflect.is_interface => {
-                    match (array_type_id(module), target_id) {
-                        (Some(array_id), Some(target)) => {
-                            module.implements_interface(array_id, target)
-                        }
-                        _ => true,
-                    }
+                .and_then(|handle| module.reflect_type(handle));
+            match (reflect, array_type_id(module), target_id) {
+                (Some(reflect), Some(array_id), Some(target)) if reflect.is_interface => {
+                    module.implements_interface(array_id, target)
                 }
-                Some(reflect) => reflect.full_name == "System.Array",
-                None => true,
+                (Some(reflect), _, _) if !reflect.is_interface => reflect.full_name == "System.Array",
+                _ => match target {
+                    Some(CastElem::Named(handle)) => module.cast_names_array_base(handle),
+                    _ => true,
+                },
             }
         }
     }
@@ -9552,7 +9547,7 @@ mod tests {
     #[test]
     fn string_ctor_materializes_from_stackalloc_and_pinned_string() {
         let mut vm = Vm::new();
-        let mut owner = Frame::new(0, Vec::new());
+        let mut owner = Frame::new(0, MethodContext::NONE, Vec::new());
         let pointer = owner.localloc(0, 6);
         owner.write_stack(0, 0, [b'4', 0, 0, 0, 0, 0, 0, 0], 2).unwrap();
         owner.write_stack(0, 2, [b'2', 0, 0, 0, 0, 0, 0, 0], 2).unwrap();
@@ -9746,10 +9741,10 @@ mod tests {
         let small = run_convert(Opcode::ConvU8, Operand::Float64(42.7), Opcode::LdcR8);
         assert_eq!(small, Ok(Some(Value::Int64(42))));
         let minus_one = run_convert(Opcode::ConvU8, Operand::Float64(-1.0), Opcode::LdcR8);
-        assert_eq!(minus_one, Ok(Some(Value::Int64(-1))));
+        assert_eq!(minus_one, Ok(Some(Value::Int64(0))));
         let minus_two_point_five =
             run_convert(Opcode::ConvU8, Operand::Float64(-2.5), Opcode::LdcR8);
-        assert_eq!(minus_two_point_five, Ok(Some(Value::Int64(-2))));
+        assert_eq!(minus_two_point_five, Ok(Some(Value::Int64(0))));
     }
 
     #[test]
@@ -10536,115 +10531,6 @@ mod tests {
         );
     }
 
-    /// dotnet/iot code on a board, reduced to its shape: `Test.Buses` holds a static the board
-    /// binds (slot 0), `Test.Board`'s type initializer ADDS 1 to it, so running it twice shows, and
-    /// the entry reads that static -- calling `Board.Touch` first only when `touch_board`, as a
-    /// program written to construct its board does.
-    fn board_program(touch_board: bool) -> (Module, MethodId) {
-        let bound = Token(0x0400_0021);
-        let touch_token = Token(0x0600_0041);
-        let mut module = Module::new();
-        let buses = module.add_type(Vec::new());
-        let board = module.add_type(Vec::new());
-        module.bind_type_full_name(buses, String::from("Test.Buses"));
-        module.bind_type_full_name(board, String::from("Test.Board"));
-        module.bind_static_field(0, bound, Value::Int32(0));
-        module.bind_static_slot_range(0, 1, buses);
-
-        let cctor = module.add_method_image(
-            0,
-            method(vec![
-                Instruction::new(Opcode::Ldsfld, Operand::Token(bound)),
-                Instruction::simple(Opcode::LdcI41),
-                Instruction::simple(Opcode::Add),
-                Instruction::new(Opcode::Stsfld, Operand::Token(bound)),
-                ret(),
-            ]),
-            0,
-        );
-        module.set_method_type(cctor, board);
-        module.add_static_ctor(cctor);
-        let touch = module.add_method_image(0, method(vec![ret()]), 0);
-        module.set_method_type(touch, board);
-        module.bind_token(0, touch_token, touch);
-
-        let mut body = Vec::new();
-        if touch_board {
-            body.push(Instruction::new(Opcode::Call, Operand::Token(touch_token)));
-        }
-        body.push(Instruction::new(Opcode::Ldsfld, Operand::Token(bound)));
-        body.push(ret());
-        let main = module.add_method_image(0, method(body), 0);
-        (module, main)
-    }
-
-    /// The board class the `Vm` names is initialized before the entry point, so a program that
-    /// never touches its board finds what the board's initializer bound -- the dotnet/iot shape,
-    /// where `I2cDevice.Create` opens a bus and no line names the board.
-    #[test]
-    fn the_named_board_class_is_initialized_before_the_entry_point() {
-        let (module, main) = board_program(false);
-        let mut vm = Vm::new();
-        let unarmed = super::boot_baked(&module, &mut vm, main).expect("nothing runs at boot");
-        assert_eq!(
-            super::run(&module, &mut vm, unarmed, Vec::new()),
-            Ok(Some(Value::Int32(0))),
-            "with no board named, nothing binds the buses"
-        );
-
-        let mut vm = Vm::new();
-        vm.set_board_class("Test.Board");
-        let armed = super::boot_baked(&module, &mut vm, main).expect("the board arms");
-        assert_eq!(
-            super::run(&module, &mut vm, armed, Vec::new()),
-            Ok(Some(Value::Int32(1))),
-            "the named board's initializer ran before the entry point"
-        );
-    }
-
-    /// Arming IS the type's first access, so touching the board afterwards runs nothing: a program
-    /// written to construct its board first must not bind the buses a second time, which the bus
-    /// table refuses.
-    #[test]
-    fn an_armed_board_is_not_initialized_again_when_the_program_touches_it() {
-        let (module, main) = board_program(true);
-        let mut vm = Vm::new();
-        vm.set_board_class("Test.Board");
-        let main = super::boot_baked(&module, &mut vm, main).expect("the board arms");
-        assert_eq!(
-            super::run(&module, &mut vm, main, Vec::new()),
-            Ok(Some(Value::Int32(1))),
-            "2 means touching the board ran its initializer a second time"
-        );
-    }
-
-    /// A program that does not carry the named class is not refused at boot. It has bound
-    /// nothing, and the first bus it opens says so.
-    #[test]
-    fn a_named_board_class_the_program_does_not_carry_arms_nothing() {
-        let (module, main) = board_program(false);
-        let mut vm = Vm::new();
-        vm.set_board_class("Test.SomeOtherBoard");
-        let main = super::boot_baked(&module, &mut vm, main).expect("nothing to arm");
-        assert_eq!(super::run(&module, &mut vm, main, Vec::new()), Ok(Some(Value::Int32(0))));
-    }
-
-    /// The same arming on a baked image, which finds the class by the type names every image
-    /// carries.
-    #[cfg(feature = "code-in-place")]
-    #[test]
-    fn a_baked_image_arms_the_named_board_class() {
-        let (mut module, main) = board_program(false);
-        let image = module.write_baked(Some(main)).expect("bake");
-        let image: &'static [u8] = Box::leak(image.into_boxed_slice());
-        let (baked, entry) = Module::from_baked(image).expect("boot");
-        let entry = entry.expect("the image records its entry point");
-        let mut vm = Vm::new();
-        vm.set_board_class("Test.Board");
-        let entry = super::boot_baked(&baked, &mut vm, entry).expect("the board arms");
-        assert_eq!(super::run(&baked, &mut vm, entry, Vec::new()), Ok(Some(Value::Int32(1))));
-    }
-
     /// A module holding `System.Nullable<T>` over one value type, wired exactly as the loader
     /// wires a real one: the instantiation is a two-field value type (`hasValue`, then `value`)
     /// and `bind_nullable_underlying` records `T`'s handle against its `TypeId`.
@@ -10840,6 +10726,217 @@ mod tests {
             super::run(&module, &mut Vm::new(), main, Vec::new()),
             Ok(Some(Value::Null))
         );
+    }
+
+    #[test]
+    fn each_frame_runs_its_own_method_and_resolves_tokens_in_its_own_assembly() {
+        let shared = Token::new(0x06, 1);
+        let into_other = Token::new(0x06, 2);
+        let mut module = Module::new();
+        let one = module.add_method_image(
+            0,
+            method(vec![Instruction::simple(Opcode::LdcI41), Instruction::simple(Opcode::Ret)]),
+            0,
+        );
+        let two = module.add_method_image(
+            1,
+            method(vec![Instruction::simple(Opcode::LdcI42), Instruction::simple(Opcode::Ret)]),
+            0,
+        );
+        let callee = module.add_method_image(
+            1,
+            method(vec![
+                Instruction::new(Opcode::Call, Operand::Token(shared)),
+                Instruction::simple(Opcode::Ret),
+            ]),
+            0,
+        );
+        let caller = module.add_method_image(
+            0,
+            method(vec![
+                Instruction::new(Opcode::Call, Operand::Token(shared)),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(10)),
+                Instruction::simple(Opcode::Mul),
+                Instruction::new(Opcode::Call, Operand::Token(into_other)),
+                Instruction::simple(Opcode::Add),
+                Instruction::new(Opcode::Call, Operand::Token(shared)),
+                Instruction::simple(Opcode::Add),
+                Instruction::simple(Opcode::Ret),
+            ]),
+            0,
+        );
+        module.bind_token(0, shared, one);
+        module.bind_token(1, shared, two);
+        module.bind_token(0, into_other, callee);
+        let mut vm = Vm::new();
+        let result = crate::interp::run(&module, &mut vm, caller, Vec::new()).expect("run");
+        assert_eq!(result, Some(Value::Int32(13)));
+
+        #[cfg(feature = "code-in-place")]
+        {
+            let image = module.write_baked(Some(caller)).expect("bake");
+            let (booted, _) = Module::from_baked(Box::leak(image.into_boxed_slice())).expect("boot");
+            let mut vm = Vm::new();
+            let result = crate::interp::run(&booted, &mut vm, caller, Vec::new()).expect("baked run");
+            assert_eq!(result, Some(Value::Int32(13)));
+        }
+    }
+
+    /// `L: nop; br L`: a loop that allocates nothing, calls nothing and never ends.
+    fn spin_loop(module: &mut Module) -> MethodId {
+        module.add_method_image(
+            0,
+            method(vec![
+                Instruction::simple(Opcode::Nop),
+                Instruction::new(Opcode::Br, Operand::Target(0)),
+            ]),
+            0,
+        )
+    }
+
+    #[cfg(feature = "gc")]
+    #[test]
+    fn a_collection_asked_for_inside_a_loop_that_allocates_nothing_runs_at_the_next_instruction() {
+        let mut module = Module::new();
+        let spin = spin_loop(&mut module);
+        let mut vm = Vm::new();
+        let mut session = Session::new(&module, spin, Vec::new()).expect("session");
+        for _ in 0..3 {
+            vm.heap_mut().alloc_string(&[0x61]).expect("string");
+        }
+        for _ in 0..1000 {
+            session.step(&module, &mut vm).expect("step");
+        }
+        assert_eq!(vm.heap().object_count(), 3, "nothing in the loop makes a collection due");
+        vm.request_collect();
+        session.step(&module, &mut vm).expect("step");
+        assert_eq!(vm.heap().object_count(), 0, "the next instruction's safepoint collected");
+    }
+
+    /// Allocates one string nothing roots.
+    #[cfg(feature = "gc")]
+    fn make_garbage(vm: &mut Vm, _module: &Module, _args: &[Value]) -> Result<Option<Value>, Trap> {
+        vm.heap_mut().alloc_string(&[0x61]).map_err(|_| Trap::OutOfMemory)?;
+        Ok(None)
+    }
+
+    #[cfg(feature = "gc")]
+    #[test]
+    fn a_loop_whose_only_allocation_is_inside_a_call_still_collects_at_the_threshold() {
+        let mut module = Module::new();
+        let garbage = module.add_intrinsic(
+            0,
+            make_garbage,
+            crate::intrinsic_registry::intrinsic_id("test_make_garbage"),
+            0,
+        );
+        module.bind_token(0, Token::new(0x0A, 1), garbage);
+        let churn = module.add_method_image(
+            0,
+            method(vec![
+                Instruction::new(Opcode::Call, Operand::Token(Token::new(0x0A, 1))),
+                Instruction::new(Opcode::Br, Operand::Target(0)),
+            ]),
+            0,
+        );
+        let mut vm = Vm::new();
+        let mut session = Session::new(&module, churn, Vec::new()).expect("session");
+        let mut most = 0;
+        for _ in 0..2000 {
+            session.step(&module, &mut vm).expect("step");
+            most = most.max(vm.heap().object_count());
+        }
+        assert!(most >= 32, "the loop allocated ({most} objects at most)");
+        assert!(most <= 100, "the heap stayed at its threshold, not {most} objects");
+    }
+
+    /// Set by the thread [`a_loop_that_allocates_and_calls_nothing_is_preempted_for_another_thread`]
+    /// starts, when it runs.
+    static OTHER_THREAD_RAN: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+    fn mark_other_thread_ran(_vm: &mut Vm, _module: &Module, _args: &[Value]) -> Result<Option<Value>, Trap> {
+        OTHER_THREAD_RAN.store(true, core::sync::atomic::Ordering::SeqCst);
+        Ok(None)
+    }
+
+    /// Starts a green thread running the static method whose id is the argument.
+    fn start_static_thread(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+        let Some(Value::Int32(method)) = args.first() else {
+            return Err(Trap::StackUnderflow);
+        };
+        let id = vm.alloc_thread_id();
+        vm.request_spawn(id, *method as MethodId, Value::Null, false);
+        Ok(None)
+    }
+
+    #[test]
+    fn a_loop_that_allocates_and_calls_nothing_is_preempted_for_another_thread() {
+        OTHER_THREAD_RAN.store(false, core::sync::atomic::Ordering::SeqCst);
+        let mut module = Module::new();
+        let mark = module.add_intrinsic(
+            0,
+            mark_other_thread_ran,
+            crate::intrinsic_registry::intrinsic_id("test_mark_other_thread_ran"),
+            0,
+        );
+        let start = module.add_intrinsic(
+            0,
+            start_static_thread,
+            crate::intrinsic_registry::intrinsic_id("test_start_static_thread"),
+            1,
+        );
+        module.bind_token(0, Token::new(0x0A, 1), mark);
+        module.bind_token(0, Token::new(0x0A, 2), start);
+        let other = module.add_method_image(
+            0,
+            method(vec![
+                Instruction::new(Opcode::Call, Operand::Token(Token::new(0x0A, 1))),
+                Instruction::simple(Opcode::Ret),
+            ]),
+            0,
+        );
+        let main = module.add_method_image(
+            0,
+            method(vec![
+                Instruction::new(Opcode::LdcI4, Operand::Int32(other as i32)),
+                Instruction::new(Opcode::Call, Operand::Token(Token::new(0x0A, 2))),
+                Instruction::simple(Opcode::Nop),
+                Instruction::new(Opcode::Br, Operand::Target(2)),
+            ]),
+            0,
+        );
+        let mut vm = Vm::new();
+        let mut quanta = 0u32;
+        let ran = run_interruptible(&module, &mut vm, main, Vec::new(), &mut |_vm| {
+            quanta += 1;
+            !OTHER_THREAD_RAN.load(core::sync::atomic::Ordering::SeqCst) && quanta < 16
+        })
+        .expect("run");
+        assert!(matches!(ran, Ran::Interrupted));
+        assert!(OTHER_THREAD_RAN.load(core::sync::atomic::Ordering::SeqCst), "the other thread ran");
+        assert!(quanta <= 2, "it ran within two quanta of the spin, not {quanta}");
+    }
+
+    #[test]
+    fn a_loop_that_allocates_nothing_stops_at_its_breakpoint_and_when_its_service_asks() {
+        let mut module = Module::new();
+        let spin = spin_loop(&mut module);
+        let mut vm = Vm::new();
+        let mut session = Session::new(&module, spin, Vec::new()).expect("session");
+        session.add_breakpoint(spin, 0);
+        for _ in 0..3 {
+            let stop = session.continue_(&module, &mut vm).expect("continue");
+            assert_eq!(stop.reason, StopReason::Breakpoint);
+            assert_eq!(stop.location, Some(CodeLocation { method: spin, instruction: 0 }));
+        }
+        let mut calls = 0u32;
+        let ran = run_interruptible(&module, &mut Vm::new(), spin, Vec::new(), &mut |_vm| {
+            calls += 1;
+            false
+        })
+        .expect("run");
+        assert!(matches!(ran, Ran::Interrupted));
+        assert_eq!(calls, 1, "the first quantum's service call stopped it");
     }
 
     #[test]

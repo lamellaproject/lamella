@@ -1,0 +1,49 @@
+<!--
+  What dotnet publish writes for a lamella1.0 program: the image a board takes, for the board the project names, with
+  nothing else in the publish folder. Sdk.targets imports this file for a lamella1.0 build alone.
+
+  With LamellaPublishAot true, as PublishAot is unless the project says otherwise, the image is the native one: the
+  program compiled ahead of time and linked for the board, as a linked ELF that also carries the program's debug
+  information, with its manifest beside it, AssemblyName.elf.manifest.json, which records the board, the execution
+  model and the image's SHA-256. With LamellaPublishAot false, the image is the one Lamella's firmware runs the
+  program from, AssemblyName.lmli, the same bytes dotnet run sends to a board running the firmware, with its manifest
+  beside it, whose model is the interpreter's.
+-->
+<Project>
+
+  <!-- The image, written under the intermediate output folder by the lamella tool and published in
+       place of the assembly and its libraries, which the image carries. The tool is given the
+       compile's inputs, the board, the assembly the build made and the format. -->
+  <Target Name="_LamellaPublishImage"
+          AfterTargets="ComputeResolvedFilesToPublishList"
+          DependsOnTargets="_LamellaPublishNeedsBoard;_LamellaCheckTool;_LamellaCompileInputs">
+    <PropertyGroup>
+      <_LamellaImageFormat>lmli</_LamellaImageFormat>
+      <_LamellaImageFormat Condition="'$(LamellaPublishAot)' == 'true'">elf</_LamellaImageFormat>
+      <_LamellaImageModel>the image Lamella's firmware runs</_LamellaImageModel>
+      <_LamellaImageModel Condition="'$(LamellaPublishAot)' == 'true'">a native image</_LamellaImageModel>
+      <_LamellaImageName>$(AssemblyName).$(_LamellaImageFormat)</_LamellaImageName>
+      <_LamellaImage>$(_LamellaIntermediateDir)$(_LamellaImageName)</_LamellaImage>
+      <_LamellaPublishInputsFile>$(_LamellaIntermediateDir)lamella.publish.txt</_LamellaPublishInputsFile>
+    </PropertyGroup>
+    <ItemGroup>
+      <_LamellaPublishInput Include="@(_LamellaCompileInput)" />
+      <_LamellaPublishInput Include="format=$(_LamellaImageFormat)" />
+      <_LamellaPublishInput Include="built=$([MSBuild]::Escape('$(TargetPath)'))" />
+      <_LamellaPublishInput Include="image=$([MSBuild]::Escape('$(_LamellaImage)'))" />
+    </ItemGroup>
+    <Message Importance="high" Text="$(MSBuildProjectName) publishes for $(LamellaTargetBoard) as $(_LamellaImageModel), $(_LamellaImageName)." />
+    <WriteLinesToFile File="$(_LamellaPublishInputsFile)" Lines="@(_LamellaPublishInput)" Overwrite="true" />
+    <Delete Files="$(_LamellaImage);$(_LamellaImage).manifest.json" />
+    <Exec Command="&quot;$(_LamellaTool)&quot; build --msbuild-publish &quot;$(_LamellaPublishInputsFile)&quot;"
+          EnvironmentVariables="LAMELLA_REF_DIR=$(LamellaRefDir);LAMELLA_RUNTIME_SUPPORT_DIR=$(LamellaRuntimeSupportDir)"
+          StandardOutputImportance="normal"
+          StandardErrorImportance="normal" />
+    <ItemGroup>
+      <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)" />
+      <ResolvedFileToPublish Include="$(_LamellaImage)" RelativePath="$(_LamellaImageName)" CopyToPublishDirectory="PreserveNewest" />
+      <ResolvedFileToPublish Include="$(_LamellaImage).manifest.json" RelativePath="$(_LamellaImageName).manifest.json" CopyToPublishDirectory="PreserveNewest" Condition="Exists('$(_LamellaImage).manifest.json')" />
+    </ItemGroup>
+  </Target>
+
+</Project>

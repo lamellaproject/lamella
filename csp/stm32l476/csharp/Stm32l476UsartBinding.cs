@@ -4,7 +4,7 @@ namespace Lamella.Boards
     /// <summary>The resolved mux facts for ONE bound pin: the port clock gate to open, and the
     /// two read-modify-writes that put the pin into alternate-function mode on its function
     /// number.</summary>
-    public sealed class Stm32l476UsartPinMux
+    internal sealed class Stm32l476UsartPinMux
     {
         /// <summary>The RCC register gating this pin's port clock.</summary>
         public readonly uint PortRccEnReg;
@@ -39,7 +39,7 @@ namespace Lamella.Boards
         }
     }
 
-    public sealed class Stm32l476UsartBinding
+    internal sealed class Stm32l476UsartBinding
     {
         /// <summary>The bound USART instance's base address.</summary>
         public readonly uint UsartBase;

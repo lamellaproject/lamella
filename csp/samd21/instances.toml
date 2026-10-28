@@ -143,7 +143,7 @@ gclk_max_hz = -1
 
 # --- the external interrupt controller ------------------------------------------------------------
 #
-# ON APB A RATHER THAN APB C, which is why `apbc_bit` is -1 on this row and not an omission: the
+# On APB a rather than APB C, which is why `apbc_bit` is -1 on this row and not an omission: the
 # gate exists and this record cannot name it. See the table note above and blocks/eic.toml.
 
 [[instances]]

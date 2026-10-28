@@ -3,7 +3,7 @@ using System.Device.Gpio;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Stm32h7GpioDriver : GpioDriver
+internal sealed class Stm32h7GpioDriver : GpioDriver
 {
     private const int PinsPerPort = 16;
     private const int PortCount = 11;
@@ -17,7 +17,7 @@ public sealed class Stm32h7GpioDriver : GpioDriver
     /// <summary>Reserves the pins whose bits are set, so <c>SetPinMode</c> refuses them. A board
     /// passes the lines it must keep -- its debug transport, a fixed peripheral's control pin --
     /// because only the board knows which those are.</summary>
-    /// <remarks>TWO MASKS RATHER THAN ONE, AND THEY COVER PA0 THROUGH PD15 ONLY. PA13 and PA14 are
+    /// <remarks>Two masks rather than one, and they cover PA0 through PD15 only. PA13 and PA14 are
     /// SWDIO and SWCLK and come out of reset in alternate function, so the pins a board most needs
     /// to protect are the low ones; a board wanting to reserve a pin above PD15 is asking for
     /// something this shape cannot express and should say so rather than be given a silent
@@ -53,7 +53,7 @@ public sealed class Stm32h7GpioDriver : GpioDriver
 
     /// <summary>The logical pin number for a generated port base and pin index -- the form every
     /// board binding emits.</summary>
-    /// <remarks>ON THE DRIVER RATHER THAN ON EACH BOARD, because which port a BASE is happens to be
+    /// <remarks>On the driver rather than on each board, because which port a BASE is happens to be
     /// family truth: the bases come from this family's instance map and the ports-per-word is this
     /// family's, so four board classes each carrying an eleven-way switch would be four copies of
     /// one fact. What stays a BOARD fact is which base a device sits on, and that is what a board

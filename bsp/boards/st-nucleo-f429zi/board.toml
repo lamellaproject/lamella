@@ -1,7 +1,7 @@
 # BOARD binding: the NUCLEO-F429ZI -- and its point is that it carries THE SAME PART as this
 # family's other board on a completely different carrier.
 #
-# THE PAIR IS A CONTROLLED TEST OF THE CHIP/BOARD SPLIT, which is why this board is worth having
+# The pair is a controlled test of the chip/board split, which is why this board is worth having
 # beyond a second F429. The Discovery board and this one are the same silicon: same part id, same
 # memory sizes, same peripheral set, same pin map -- so EVERYTHING that differs between the two
 # files is board truth by construction, and nothing in `csp/stm32f42x` needed to change to admit
@@ -38,9 +38,9 @@ default = true              # this board states no [[plans]] row, so the carrier
 
 # --- control lines ---------------------------------------------------------------------------
 #
-# ALL THREE LEDS ARE ACTIVE HIGH and UM1974 states it in words for all three at once: they are on
-# when the I/O is HIGH and off when it is LOW. THE SCHEMATIC SHOWS TWO DIFFERENT REASONS FOR THAT
-# ONE BEHAVIOR, on two different sheets. LD2 and LD3 are driven from their pins through a series
+# All three LEDs are active high and UM1974 states it in words for all three at once: they are on
+# when the I/O is HIGH and off when it is LOW. The schematic shows two different reasons for that
+# one behavior, on two different sheets. LD2 and LD3 are driven from their pins through a series
 # resistor into the LED's ANODE, with the cathode at ground. LD1 IS NOT: PB0 reaches a 10K series
 # resistor into a 200K to ground, feeding a unity-gain follower (U7, a TSV631AILT off +3V3_PER)
 # whose output drives R32 510R into the anode -- so the polarity is the same because a follower
@@ -49,7 +49,7 @@ default = true              # this board states no [[plans]] row, so the carrier
 # supply feeds the anode and the pin sinks -- so the same vendor's two board families disagree,
 # and the polarity has to be read per board rather than per vendor.
 #
-# THE USER BUTTON IS ACTIVE HIGH TOO, AND THAT IS THE MIRROR OF WHAT A READER ASSUMES. R58, a
+# The user button is active high too, and that is the mirror of what a reader assumes. R58, a
 # 220K, holds PC13 DOWN, and the switch ties it UP to VDD -- so the pin reads LOW at rest and HIGH
 # while pressed, and a driver that enables a pull-up and waits for a low edge waits forever. The
 # F429 Discovery board's own user button is wired the same way, which is worth knowing because it

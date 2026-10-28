@@ -128,6 +128,7 @@ impl Session {
         let mut diagnostics = parse_diagnostics;
         if !parsed.types.is_empty() {
             let types_unit = CompilationUnit {
+                global_usings: Vec::new(),
                 usings: Vec::new(),
                 members: parsed.types.clone(),
                 global_attributes: Vec::new(),
@@ -218,6 +219,7 @@ impl Session {
             let members: Vec<NamespaceMember> =
                 self.types.iter().chain(new_types.iter()).cloned().collect();
             let unit = CompilationUnit {
+                global_usings: Vec::new(),
                 usings: Vec::new(),
                 members,
                 global_attributes: Vec::new(),

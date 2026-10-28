@@ -596,6 +596,26 @@ impl<'a> Assembly<'a> {
             .find(|type_def| type_def.name() == Some(TypeName { namespace, name }))
     }
 
+    /// The type definition IDENTIFIED by `namespace` and `name`: the pair
+    /// [`Assembly::type_token_full_name`] answers for it, in which a NESTED type's enclosing chain
+    /// stands where its namespace would be -- `("Lamella.Checks.Widget", "Nested")`. A top-level type
+    /// is identified by its own pair, so for one this answers exactly what [`Assembly::find_type`]
+    /// does.
+    ///
+    /// **[`Assembly::find_type`] MATCHES A ROW's OWN NAME, AND A NESTED ROW's NAMESPACE IS EMPTY.**
+    /// So it never finds a nested type by the pair a reference to that type carries, and asked for
+    /// `("", "Nested")` it finds the FIRST nested type of that simple name, whichever type it is
+    /// nested in. This finds a nested type only by its enclosing chain, and so finds the one meant.
+    #[must_use]
+    pub fn find_type_identified(&self, namespace: &str, name: &str) -> Option<TypeDef<'a>> {
+        self.type_defs().find(|type_def| {
+            type_def.name().is_some_and(|own| own.name == name)
+                && self
+                    .type_token_full_name(type_def.token())
+                    .is_some_and(|(identified, _)| identified == namespace)
+        })
+    }
+
     /// The first of `references` declaring `namespace.name`, as `(ordinal, TypeDef)`.
     ///
     /// **REFERENCE ORDER IS THE TIE-BREAK, AND THAT IS THE WHOLE RULE**: a name declared by two
@@ -619,6 +639,31 @@ impl<'a> Assembly<'a> {
             .find_map(|(ordinal, reference)| {
                 reference
                     .find_type(namespace, name)
+                    .map(|type_def| (ordinal, type_def))
+            })
+    }
+
+    /// [`Assembly::find_in_references`] for the pair a type is IDENTIFIED by
+    /// ([`Assembly::find_type_identified`]): the first of `references` declaring it, as `(ordinal,
+    /// TypeDef)`, with the same reference-order tie-break.
+    ///
+    /// **THE PAIR IS THE ONE A `TypeRef` CARRIES**, from [`Assembly::type_token_full_name`]: a
+    /// reference to a nested type is scoped by its enclosing type's `TypeRef` (II.22.38) and has an
+    /// empty namespace of its own, so its own row's pair names every nested type of that simple name
+    /// alike. [`Assembly::find_in_references`] matches each definition's OWN pair, which a nested
+    /// definition never answers to; this matches the pair a reference carries.
+    #[must_use]
+    pub fn find_in_references_identified(
+        references: &[&Assembly<'a>],
+        namespace: &str,
+        name: &str,
+    ) -> Option<(usize, TypeDef<'a>)> {
+        references
+            .iter()
+            .enumerate()
+            .find_map(|(ordinal, reference)| {
+                reference
+                    .find_type_identified(namespace, name)
                     .map(|type_def| (ordinal, type_def))
             })
     }
@@ -985,6 +1030,18 @@ impl<'a> Assembly<'a> {
         parse_type(blob).ok()
     }
 
+    /// [`Assembly::type_spec_signature`], and the required custom modifiers the `TypeSpec`'s blob
+    /// applies ([`crate::signature::parse_type_with_modifiers`]).
+    #[must_use]
+    pub fn type_spec_signature_with_modifiers(&self, token: Token) -> Option<(SigType, Vec<Token>)> {
+        if token.table() != table::TYPE_SPEC {
+            return None;
+        }
+        let row = self.tables.row(table::TYPE_SPEC, token.row())?;
+        let blob = self.image.blob().get(row.raw(0)).ok()?;
+        crate::signature::parse_type_with_modifiers(blob).ok()
+    }
+
     /// The `MethodDef` at 1-based `index`, or `None` if out of range.
     #[must_use]
     pub fn method(&self, index: u32) -> Option<Method<'a>> {
@@ -1090,6 +1147,14 @@ impl<'a> Assembly<'a> {
     #[must_use]
     pub fn resolve_method(&self, token: Token) -> Option<ResolvedMethod<'a>> {
         self.resolve_method_owned_by(token, |method_index| self.method_owner(method_index))
+    }
+
+    /// The type owning every `MethodDef` row, read in one pass, for a caller that resolves many
+    /// method tokens of this assembly: [`Assembly::resolve_method`] finds a definition's owner by
+    /// walking the TypeDef table, and [`MethodOwners::resolve_method`] reads it from the index.
+    #[must_use]
+    pub fn method_owners(&self) -> MethodOwners<'a> {
+        MethodOwners::new(*self)
     }
 
     /// [`Assembly::resolve_method`], with the owning type of a `MethodDef` answered by `owner`.
@@ -1212,6 +1277,20 @@ impl<'a> Assembly<'a> {
                 index: type_index,
             })
         })
+    }
+
+    /// The `TypeDef` that declares the method definition `token` names, found by walking the TypeDef
+    /// table's method runs; `None` for a token that is not a `MethodDef`.
+    ///
+    /// [`MethodOwners::owner_of`] answers the same from an index built once, which is the form for a
+    /// caller asking about many tokens. Both read the owner from its ROW; that function says why a
+    /// name does not identify one.
+    #[must_use]
+    pub fn method_def_owner(&self, token: Token) -> Option<TypeDef<'a>> {
+        if token.table() != table::METHOD_DEF {
+            return None;
+        }
+        self.method_owner(token.row())
     }
 
     /// The type declaring the attribute constructor `constructor`, with a `MethodDef`'s owner read
@@ -1734,10 +1813,12 @@ impl<'a> Assembly<'a> {
     }
 }
 
-/// The `TypeDef` owning each `MethodDef` row, read in one pass over the TypeDef table's method
-/// runs (II.22.37): [`Assembly::method_owner`]'s answer for every row at once, so a pass over
-/// another table can ask it per row without walking the types each time.
-struct MethodOwners<'a> {
+/// The `TypeDef` owning each `MethodDef` row of an assembly, read in one pass over the TypeDef
+/// table's method runs (II.22.37), from [`Assembly::method_owners`]: the owner
+/// [`Assembly::resolve_method`] finds by walking the types, for every row at once, so a caller can
+/// resolve one method token after another without walking the types each time.
+#[derive(Debug, Clone)]
+pub struct MethodOwners<'a> {
     assembly: Assembly<'a>,
     /// The owning `TypeDef` row of each `MethodDef` row from 0 through the last readable one,
     /// indexed by the `MethodDef` row; 0 where no run contains the row.
@@ -1761,7 +1842,31 @@ impl<'a> MethodOwners<'a> {
         MethodOwners { assembly, owners }
     }
 
-    /// The `TypeDef` that owns the method at `method_index`, as [`Assembly::method_owner`] answers.
+    /// [`Assembly::resolve_method`], with a `MethodDef`'s owner read from this index: the same
+    /// answer for every token, malformed metadata included.
+    #[must_use]
+    pub fn resolve_method(&self, token: Token) -> Option<ResolvedMethod<'a>> {
+        self.assembly
+            .resolve_method_owned_by(token, |method_index| self.owner(method_index))
+    }
+
+    /// The `TypeDef` that declares the method definition `token` names, read from this index; `None`
+    /// for a token that is not a `MethodDef`.
+    ///
+    /// **A DEFINITION's OWNER IS A ROW, NEVER A NAME.** [`ResolvedMethod::declaring_type`] carries
+    /// only the owner's namespace and name, and a NESTED type's namespace is empty (II.22.32), so
+    /// `A.Node` and `B.Node` carry the same pair. Turning that pair back into a type with
+    /// [`Assembly::find_type`] answers whichever of the two comes first in the table.
+    #[must_use]
+    pub fn owner_of(&self, token: Token) -> Option<TypeDef<'a>> {
+        if token.table() != table::METHOD_DEF {
+            return None;
+        }
+        self.owner(token.row())
+    }
+
+    /// The `TypeDef` that owns the method at `method_index`, as the walk of
+    /// [`Assembly::resolve_method`] answers.
     fn owner(&self, method_index: u32) -> Option<TypeDef<'a>> {
         match self.owners.get(method_index as usize) {
             Some(0) => None,
@@ -2904,6 +3009,53 @@ mod tests {
     }
 
     #[test]
+    fn the_method_owner_index_resolves_every_method_token_as_the_assembly_does() {
+        let cases: [(&[u16], u32, u32); 5] = [
+            (&[1, 1, 3, 3, 6], 7, 7),
+            (&[1, 4, 2, 6], 7, 7),
+            (&[0, 9, 3], 5, 5),
+            (&[1, 3, 5], 10, 4),
+            (&[], 3, 3),
+        ];
+        for (method_lists, claimed, present) in cases {
+            let root = methods_owned_by(method_lists, claimed, present);
+            let assembly =
+                Assembly::from_image(MetadataImage::parse_metadata_root(&root).unwrap()).unwrap();
+            let owners = assembly.method_owners();
+            for row in 0..=claimed + 2 {
+                for token in [Token::new(table::METHOD_DEF, row), Token::new(table::MEMBER_REF, row)] {
+                    assert_eq!(
+                        owners.resolve_method(token),
+                        assembly.resolve_method(token),
+                        "lists {method_lists:?}, {claimed} rows claimed and {present} present: {token:?}"
+                    );
+                }
+            }
+        }
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures/corlib.dll");
+        let Ok(bytes) = std::fs::read(fixture) else {
+            return;
+        };
+        let assembly = Assembly::read(std::boxed::Box::leak(bytes.into_boxed_slice()))
+            .expect("the committed corlib fixture reads");
+        let owners = assembly.method_owners();
+        let mut resolved = 0;
+        for (table, rows) in [
+            (table::METHOD_DEF, assembly.tables.row_count(table::METHOD_DEF)),
+            (table::MEMBER_REF, assembly.tables.row_count(table::MEMBER_REF)),
+            (table::TYPE_DEF, 2),
+        ] {
+            for row in 0..=rows + 1 {
+                let token = Token::new(table, row);
+                let answer = owners.resolve_method(token);
+                assert_eq!(answer, assembly.resolve_method(token), "{token:?}");
+                resolved += usize::from(answer.is_some_and(|method| method.declaring_type.is_some()));
+            }
+        }
+        assert!(resolved > 1000, "the fixture's methods resolve with their types: {resolved}");
+    }
+
+    #[test]
     fn the_constant_index_answers_as_the_scan_for_every_parent() {
         let blobs = [0, 4, 42, 0, 0, 0, 4, 7, 0, 0, 0, 4, 0, 0, 0, 0, 1, 0xFF];
         let field = |row: u16| row << 2;
@@ -2989,5 +3141,62 @@ mod tests {
         }
         assert!(answered > 100, "the fixture's constants: {answered}");
         assert_eq!(constants.len(), answered);
+    }
+
+    #[test]
+    fn every_type_is_found_by_the_pair_that_identifies_it_and_a_nested_one_by_no_other() {
+        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures/corlib.dll");
+        let Ok(bytes) = std::fs::read(fixture) else {
+            return;
+        };
+        let assembly = Assembly::read(std::boxed::Box::leak(bytes.into_boxed_slice()))
+            .expect("the committed corlib fixture reads");
+        let owners = assembly.method_owners();
+        let mut nested = 0;
+        for type_def in assembly.type_defs() {
+            let (namespace, name) = assembly
+                .type_token_full_name(type_def.token())
+                .expect("every type of the fixture names itself");
+            assert_eq!(
+                assembly.find_type_identified(&namespace, &name).map(|found| found.token()),
+                Some(type_def.token()),
+                "{namespace} {name}"
+            );
+            assert_eq!(
+                Assembly::find_in_references_identified(&[&assembly], &namespace, &name)
+                    .map(|(ordinal, found)| (ordinal, found.token())),
+                Some((0, type_def.token())),
+                "{namespace} {name} among references"
+            );
+            if type_def.enclosing_type().is_some() {
+                nested += 1;
+                assert_ne!(
+                    assembly.find_type_identified("", &name).map(|found| found.token()),
+                    Some(type_def.token()),
+                    "{namespace} {name} by its row's own pair"
+                );
+            } else {
+                assert_eq!(
+                    assembly.find_type(&namespace, &name).map(|found| found.token()),
+                    Some(type_def.token()),
+                    "{namespace} {name} by its row's own pair"
+                );
+            }
+            for method in type_def.methods() {
+                assert_eq!(
+                    owners.owner_of(method.token()).map(|owner| owner.token()),
+                    Some(type_def.token()),
+                    "{namespace} {name}: a method's owner, from the index"
+                );
+                assert_eq!(
+                    assembly.method_def_owner(method.token()).map(|owner| owner.token()),
+                    Some(type_def.token()),
+                    "{namespace} {name}: a method's owner, from the walk"
+                );
+            }
+        }
+        assert!(nested >= 6, "the fixture's nested types: {nested}");
+        assert!(owners.owner_of(Token::new(table::MEMBER_REF, 1)).is_none());
+        assert!(assembly.method_def_owner(Token::new(table::TYPE_DEF, 1)).is_none());
     }
 }

@@ -6,7 +6,7 @@
 // every one of these facts.
 namespace Lamella.Generated
 {
-    public sealed class L3gCommon
+    internal sealed class L3gCommon
     {
         private L3gCommon() { }
         public const string FAMILY = "l3g";

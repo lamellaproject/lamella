@@ -293,6 +293,7 @@ fn lower_inst(
         Inst::PyIntrinsic { .. } => return Err(LowerError::CallUnsupported),
         Inst::FuncAddr { .. }
         | Inst::VirtualFuncAddr { .. }
+        | Inst::InterfaceFuncAddr { .. }
         | Inst::CallIndirect { .. }
         | Inst::CallNative { .. }
         | Inst::InvokeDelegate { .. }
@@ -356,6 +357,8 @@ fn lower_inst(
                 ConvKind::Float32ToInt
                     | ConvKind::IntToFloat32
                     | ConvKind::Float64ToInt
+                    | ConvKind::Float32ToUInt
+                    | ConvKind::Float64ToUInt
                     | ConvKind::Float32ToLong
                     | ConvKind::Float64ToLong
                     | ConvKind::Float32ToULong
@@ -474,6 +477,8 @@ fn extend_for(enc: &mut Encoder, rd: Reg, rm: Reg, kind: ConvKind) -> Result<(),
         ConvKind::Float32ToInt
         | ConvKind::IntToFloat32
         | ConvKind::Float64ToInt
+        | ConvKind::Float32ToUInt
+        | ConvKind::Float64ToUInt
         | ConvKind::Float32ToLong
         | ConvKind::Float64ToLong
         | ConvKind::Float32ToULong
@@ -890,6 +895,84 @@ fn emit_reference_null_test(
     Ok(())
 }
 
+/// Leaves in r0 the code pointer of `tag`'s implementation for the object in the frame slot
+/// `receiver` (the Thumb bit set): its descriptor's itable is searched for `tag`, and a missing entry
+/// traps. ONE lookup for both readers -- [`Inst::CallInterface`] calls the pointer and
+/// [`Inst::InterfaceFuncAddr`] hands it to a delegate -- so the two cannot disagree about which
+/// implementation a receiver has. Clobbers r1-r3.
+fn emit_interface_target(
+    enc: &mut Encoder,
+    pool: &mut Vec<(Label, u32)>,
+    receiver: u16,
+    tag: u32,
+) -> Result<(), LowerError> {
+    slot_load(enc, Reg::R0, receiver)?;
+    enc.subs_imm8(Reg::R0, 4)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.ldr_imm(Reg::R0, Reg::R0, 0)
+        .map_err(|_| LowerError::TooManyValues)?;
+    let array_form = enc.new_label();
+    let have_itable = enc.new_label();
+    enc.ldr_imm(Reg::R1, Reg::R0, 0)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.lsrs_imm(Reg::R1, Reg::R1, 24)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.cmp_imm(Reg::R1, (ARRAY_DESC_MARK >> 24) as u8)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.b_cond(Cond::Eq, array_form);
+    enc.ldr_imm(Reg::R1, Reg::R0, 4)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.lsls_imm(Reg::R1, Reg::R1, 2)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.adds_imm8(Reg::R1, 16)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.b(have_itable);
+    enc.bind_label(array_form);
+    fault_unless_vector(enc, Reg::R0, Reg::R1)?;
+    enc.movs_imm(Reg::R1, crate::resolver::ARRAY_ITABLE_OFFSET as u8)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.bind_label(have_itable);
+    enc.adds(Reg::R1, Reg::R0, Reg::R1)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.ldr_imm(Reg::R2, Reg::R1, 0)
+        .map_err(|_| LowerError::TooManyValues)?;
+    let missing = enc.new_label();
+    enc.cmp_imm(Reg::R2, 0)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.b_cond(Cond::Eq, missing);
+    enc.adds_imm8(Reg::R1, 4)
+        .map_err(|_| LowerError::TooManyValues)?;
+    load_const_word(enc, pool, Reg::R3, tag)?;
+    let search = enc.new_label();
+    let found = enc.new_label();
+    enc.bind_label(search);
+    enc.ldr_imm(Reg::R0, Reg::R1, 0)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.cmp_reg(Reg::R0, Reg::R3)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.b_cond(Cond::Eq, found);
+    enc.adds_imm8(Reg::R1, 8)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.subs_imm8(Reg::R2, 1)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.b_cond(Cond::Ne, search);
+    enc.bind_label(missing);
+    enc.udf(0);
+    enc.bind_label(found);
+    enc.ldr_imm(Reg::R0, Reg::R1, 4)
+        .map_err(|_| LowerError::TooManyValues)?;
+    slot_load(enc, Reg::R3, receiver)?;
+    enc.subs_imm8(Reg::R3, 4)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.ldr_imm(Reg::R3, Reg::R3, 0)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.adds(Reg::R0, Reg::R3, Reg::R0)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.adds_imm8(Reg::R0, 1)
+        .map_err(|_| LowerError::TooManyValues)?;
+    Ok(())
+}
+
 /// Faults unless the ARRAY descriptor in `descriptor` is a vector's, rank 1; `scratch` is clobbered.
 ///
 /// Only a vector's descriptor carries `System.Array`'s interface table. A rectangular array's lays
@@ -1124,6 +1207,9 @@ fn lower_spilled_inst(
             enc.adds_imm8(Reg::R0, 1)
                 .map_err(|_| LowerError::TooManyValues)?;
         }
+        Inst::InterfaceFuncAddr { object, tag } => {
+            emit_interface_target(enc, pool, slot(*object), *tag)?;
+        }
         Inst::TypeDescLiteral { handle, .. } => {
             let label = enc.new_label();
             sym_pool.push((label, DESC_SYMBOL_FLAG | *handle, 0));
@@ -1261,70 +1347,7 @@ fn lower_spilled_inst(
         }
         Inst::CallInterface { tag, args, .. } => {
             let receiver = *args.first().ok_or(LowerError::CallUnsupported)?;
-            slot_load(enc, Reg::R0, slot(receiver))?;
-            enc.subs_imm8(Reg::R0, 4)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_imm(Reg::R0, Reg::R0, 0)
-                .map_err(|_| LowerError::TooManyValues)?;
-            let array_form = enc.new_label();
-            let have_itable = enc.new_label();
-            enc.ldr_imm(Reg::R1, Reg::R0, 0)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.lsrs_imm(Reg::R1, Reg::R1, 24)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.cmp_imm(Reg::R1, (ARRAY_DESC_MARK >> 24) as u8)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.b_cond(Cond::Eq, array_form);
-            enc.ldr_imm(Reg::R1, Reg::R0, 4)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.lsls_imm(Reg::R1, Reg::R1, 2)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.adds_imm8(Reg::R1, 16)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.b(have_itable);
-            enc.bind_label(array_form);
-            fault_unless_vector(enc, Reg::R0, Reg::R1)?;
-            enc.movs_imm(Reg::R1, crate::resolver::ARRAY_ITABLE_OFFSET as u8)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.bind_label(have_itable);
-            enc.adds(Reg::R1, Reg::R0, Reg::R1)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_imm(Reg::R2, Reg::R1, 0)
-                .map_err(|_| LowerError::TooManyValues)?;
-            let missing = enc.new_label();
-            enc.cmp_imm(Reg::R2, 0)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.b_cond(Cond::Eq, missing);
-            enc.adds_imm8(Reg::R1, 4)
-                .map_err(|_| LowerError::TooManyValues)?;
-            load_const_word(enc, pool, Reg::R3, *tag)?;
-            let search = enc.new_label();
-            let found = enc.new_label();
-            enc.bind_label(search);
-            enc.ldr_imm(Reg::R0, Reg::R1, 0)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.cmp_reg(Reg::R0, Reg::R3)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.b_cond(Cond::Eq, found);
-            enc.adds_imm8(Reg::R1, 8)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.subs_imm8(Reg::R2, 1)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.b_cond(Cond::Ne, search);
-            enc.bind_label(missing);
-            enc.udf(0);
-            enc.bind_label(found);
-            enc.ldr_imm(Reg::R0, Reg::R1, 4)
-                .map_err(|_| LowerError::TooManyValues)?;
-            slot_load(enc, Reg::R3, slot(receiver))?;
-            enc.subs_imm8(Reg::R3, 4)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_imm(Reg::R3, Reg::R3, 0)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.adds(Reg::R0, Reg::R3, Reg::R0)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.adds_imm8(Reg::R0, 1)
-                .map_err(|_| LowerError::TooManyValues)?;
+            emit_interface_target(enc, pool, slot(receiver), *tag)?;
             enc.mov_reg(Reg::R12, Reg::R0);
             load_call_args(enc, value_types, slot, args, 0)?;
             enc.blx(Reg::R12);
@@ -2135,11 +2158,19 @@ fn emit_md_element_address(
 /// truncated toward zero as a signed int32 in r0. ARMv6-M has no FPU, so this is done by hand from
 /// the fields: `value = (-1)^sign * (1.mantissa) * 2^(exp-127)`, so the integer part is the 24-bit
 /// significand `(1<<23)|mantissa` shifted by `exp-150` (right when exp <= 150, left above), then
-/// negated for a set sign bit; an exponent below 127 (magnitude < 1) gives 0. (Overflow past 2^31
-/// is left undefined, like the hardware convert.) r1-r3 are scratch.
+/// negated for a set sign bit; an exponent below 127 (magnitude < 1) gives 0.
+///
+/// It saturates, as every conversion from a float to an integer does ([`ConvKind`]): an exponent of
+/// 158 or more (a magnitude of 2^31 or more, or an infinity) gives `int.MinValue` or `int.MaxValue`
+/// by its sign, and a NaN gives 0. r1-r3 are scratch.
+///
+/// The flat (linker-free) path only. The linked path calls the archive's `__aeabi_f2iz`
+/// ([`aeabi_convert_helper`]).
 fn emit_f2i(enc: &mut Encoder) -> Result<(), LowerError> {
     let oops = |_| LowerError::TooManyValues;
     let to_zero = enc.new_label();
+    let saturate = enc.new_label();
+    let clamp = enc.new_label();
     let shift_left = enc.new_label();
     let apply_sign = enc.new_label();
     let store = enc.new_label();
@@ -2149,6 +2180,8 @@ fn emit_f2i(enc: &mut Encoder) -> Result<(), LowerError> {
     enc.ands(Reg::R1, Reg::R2).map_err(oops)?;
     enc.cmp_imm(Reg::R1, 127).map_err(oops)?;
     enc.b_cond(Cond::LessThan, to_zero);
+    enc.cmp_imm(Reg::R1, 158).map_err(oops)?;
+    enc.b_cond(Cond::GreaterOrEqual, saturate);
     enc.lsls_imm(Reg::R2, Reg::R0, 9).map_err(oops)?;
     enc.lsrs_imm(Reg::R2, Reg::R2, 9).map_err(oops)?;
     enc.movs_imm(Reg::R3, 1).map_err(oops)?;
@@ -2170,6 +2203,18 @@ fn emit_f2i(enc: &mut Encoder) -> Result<(), LowerError> {
     enc.rsbs(Reg::R2, Reg::R2).map_err(oops)?;
     enc.bind_label(store);
     enc.mov_reg(Reg::R0, Reg::R2);
+    enc.b(end);
+    enc.bind_label(saturate);
+    enc.cmp_imm(Reg::R1, 255).map_err(oops)?;
+    enc.b_cond(Cond::Ne, clamp);
+    enc.lsls_imm(Reg::R2, Reg::R0, 9).map_err(oops)?;
+    enc.b_cond(Cond::Ne, to_zero);
+    enc.bind_label(clamp);
+    enc.lsrs_imm(Reg::R1, Reg::R0, 31).map_err(oops)?;
+    enc.movs_imm(Reg::R2, 1).map_err(oops)?;
+    enc.lsls_imm(Reg::R2, Reg::R2, 31).map_err(oops)?;
+    enc.subs_imm3(Reg::R2, Reg::R2, 1).map_err(oops)?;
+    enc.adds(Reg::R0, Reg::R2, Reg::R1).map_err(oops)?;
     enc.b(end);
     enc.bind_label(to_zero);
     enc.movs_imm(Reg::R0, 0).map_err(oops)?;
@@ -4069,6 +4114,7 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
                     | Inst::InvokeDelegate { .. }
                     | Inst::FuncAddr { .. }
                     | Inst::VirtualFuncAddr { .. }
+                    | Inst::InterfaceFuncAddr { .. }
                     | Inst::TypeDescLiteral { .. }
                     | Inst::CopyBlock { .. }
                     | Inst::FillBlock { .. }
@@ -5173,19 +5219,26 @@ fn aeabi_float_helper(op: BinOp, operand_ty: Option<MirType>) -> Option<&'static
     }
 }
 
-/// The `__aeabi_*` soft-float helper for a float CONVERSION the no-FPU target does not do inline;
-/// `None` for one lowered inline (`emit_f2i`) or an integer widen. A helper's single f64 argument
-/// arrives in `r0:r1`, which the C-ABI arg lowering already forms for a `CallNative`.
+/// The `__aeabi_*` soft-float helper for a float conversion on the linked path; `None` for an
+/// integer narrowing or widening, or a retype. A helper's single f64 argument arrives in `r0:r1`,
+/// which the C-ABI arg lowering already forms for a `CallNative`.
 ///
 /// `IntToFloat32` IS in this table even though [`emit_i2f`] can lower it inline, and that is the
 /// point: the inline loop is exact only below 2^24 and TRUNCATES above it, so `(float)int.MaxValue`
 /// came out 2147483520 where .NET rounds to nearest and answers 2147483648. The archive's
 /// `__aeabi_i2f` rounds correctly. The flat path tests this kind BEFORE consulting this table, so it
 /// keeps the inline form -- it has no linker and cannot call a helper at all.
+///
+/// `Float32ToInt` is here beside its inline form [`emit_f2i`] as well, so that on the linked path
+/// every conversion from a float to an integer calls one family of helpers, each saturating as
+/// [`ConvKind`] states.
 fn aeabi_convert_helper(kind: ConvKind) -> Option<&'static str> {
     match kind {
         ConvKind::IntToFloat32 => Some("__aeabi_i2f"),
+        ConvKind::Float32ToInt => Some("__aeabi_f2iz"),
         ConvKind::Float64ToInt => Some("__aeabi_d2iz"),
+        ConvKind::Float32ToUInt => Some("__aeabi_f2uiz"),
+        ConvKind::Float64ToUInt => Some("__aeabi_d2uiz"),
         ConvKind::Float32ToLong => Some("__aeabi_f2lz"),
         ConvKind::Float64ToLong => Some("__aeabi_d2lz"),
         ConvKind::Float32ToULong => Some("__aeabi_f2ulz"),
@@ -10520,8 +10573,8 @@ mod tests {
                 .any(|s| s.name == "__aeabi_fadd" && !s.defined)
         );
         let code = code_relocations(&obj);
-        assert_eq!(code.len(), 1);
-        assert_eq!(obj.symbols[code[0].symbol as usize].name, "__aeabi_fadd");
+        let names: Vec<&str> = code.iter().map(|r| obj.symbols[r.symbol as usize].name.as_str()).collect();
+        assert_eq!(names, ["__aeabi_fadd", "__aeabi_f2iz"]);
     }
 
     #[test]
@@ -11887,6 +11940,17 @@ mod tests {
         assert_eq!(aeabi_convert_helper(ConvKind::Float64ToLong), Some("__aeabi_d2lz"));
         assert_eq!(aeabi_convert_helper(ConvKind::Float32ToULong), Some("__aeabi_f2ulz"));
         assert_eq!(aeabi_convert_helper(ConvKind::Float64ToULong), Some("__aeabi_d2ulz"));
+    }
+
+    /// The four float-to-int32 helpers, named, for the same reason: the signed pair converts to
+    /// `int` and the unsigned pair to `uint`, each saturating (see [`ConvKind`]). `__aeabi_f2iz`
+    /// stands beside the inline [`emit_f2i`], which only the flat path keeps.
+    #[test]
+    fn the_float_to_int_helpers_pair_signed_with_signed_and_unsigned_with_unsigned() {
+        assert_eq!(aeabi_convert_helper(ConvKind::Float32ToInt), Some("__aeabi_f2iz"));
+        assert_eq!(aeabi_convert_helper(ConvKind::Float64ToInt), Some("__aeabi_d2iz"));
+        assert_eq!(aeabi_convert_helper(ConvKind::Float32ToUInt), Some("__aeabi_f2uiz"));
+        assert_eq!(aeabi_convert_helper(ConvKind::Float64ToUInt), Some("__aeabi_d2uiz"));
     }
 
     #[test]

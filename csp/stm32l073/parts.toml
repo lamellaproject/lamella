@@ -1,19 +1,19 @@
 # PARTS table for the STM32L0x3 family, category 5 (STM32L073x). Every row is an ORDERABLE variant.
 #
-# THIS IS A DIFFERENT FAMILY FROM csp/stm32l053 AND THEY SHARE A REFERENCE MANUAL, which is the
+# This is a different family from csp/stm32l053 and they share a reference manual, which is the
 # opposite of how the other splits in this directory arose. RM0367 covers the whole L0x3 line and
 # separates it into category 3 and category 5, and its own table 2 gives them different silicon:
 # GPIOD goes from [2] to full, GPIOE from ABSENT to full, GPIOH from [0:1] to [0:1][9:10], and the
 # NVM from "full-featured, single bank" to full-featured. So a family here is a CATEGORY, not a
 # manual.
 #
-# WHAT ACTUALLY SEPARATES THE TWO FAMILIES IN THIS DIRECTORY IS THE FLASH BLOCK AND THIS ROW.
+# What actually separates the two families in this directory is the flash block and this row.
 # The gpio and exti blocks are per-MANUAL and are the same registers for both categories -- they
 # are twins on purpose, and a twin of a block that varies by nothing is a file somebody can read
 # and confirm. The flash block is not: it carries exactly what varies per family, and folding the
 # two would state 2 Kbytes of single-bank data EEPROM about a part that has 6 in two banks.
 #
-# THE LQFP64 BONDS NO PORT E PAD AT ALL, and that is worth saying outright because the family split
+# The LQFP64 bonds no port E pad at all, and that is worth saying outright because the family split
 # turns on GPIOE existing. Figure 5 of the datasheet gives all 64 pins, and the GPIO pads among them
 # are PA0-PA15, PB0-PB15, PC0-PC15, PD2 and PH0-PH1 -- 51 pads, the same EXTENT as the category 3
 # part in the same package. So the die difference this family exists for is invisible on this

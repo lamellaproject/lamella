@@ -2,7 +2,7 @@
 // constants a board's generated Bindings class carries.
 namespace Lamella.Boards
 {
-    public sealed class Nrf51SpiBinding
+    internal sealed class Nrf51SpiBinding
     {
         /// <summary>The bound SPI instance's base address. It shares its peripheral ID -- and so
         /// this register block -- with the other serial personalities at the same base; ENABLE is

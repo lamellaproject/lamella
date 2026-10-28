@@ -56,10 +56,13 @@ assemblies=(
     # Its own assembly rather than folded, unlike System.Device.Pwm below. See csharp/build-managed.ps1's
     # entry for the upstream measurement the distinction rests on. References only corlib.
     "System.Device.Analog|"
-    # It references System.Device.Analog and not the other way round: the analog controller it offers
-    # over the ADC seam is a System.Device.Analog.AnalogController.
-    "Lamella.Hardware|System.Device.Analog"
     "System.Device.Gpio||System.Device.Pwm"
+    # The boardless facts: a build for a board takes the board's own facts assembly, of the same name,
+    # in their place. See csharp/build-managed.ps1's entry. References only corlib.
+    "Lamella.Hardware.Facts|"
+    # TargetBoard, compiled once against the facts' fixed name. It hands out the standard GPIO, I2C,
+    # SPI and analog classes, so it references both of their assemblies, and neither references it.
+    "Lamella.Hardware|System.Device.Gpio,System.Device.Analog,Lamella.Hardware.Facts"
     "System.Device.Model|"
     "System.Net.NetworkInformation|"
     # Bare, unprefixed: full .NET's own assembly name for full .NET's types. See csharp/build-managed.ps1's
@@ -294,7 +297,7 @@ for family_file in "${family_files[@]}"; do
     echo "System.Device.Gpio for $family ($(( ${#gpio_src[@]} + 1 + ${#copies[@]} )) sources) -> $dll"
     write_sources "${gpio_src[@]}" "$family_file" "${copies[@]}"
     "$lcsc" "$source_list_arg" "$langversion" "--define=$define;LAMELLA_FAMILY_DRIVERS" \
-        "--reference=$corlib_dll" "--reference=$out/Lamella.Hardware.dll" "--out=$dll" --no-debug
+        "--reference=$corlib_dll" "--out=$dll" --no-debug
     rm -rf "$work"
 done
 

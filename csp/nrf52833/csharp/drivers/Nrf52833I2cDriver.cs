@@ -71,6 +71,19 @@ internal sealed class Nrf52833I2cDriver : I2cDriver
         _errDnack = Nrf52833TwiLayout.ERRORSRC_DNACK;
     }
 
+    /// <summary>The rates the chip's FREQUENCY register names: 100000, 250000 and 400000.</summary>
+    public override int[] Rates
+    {
+        get
+        {
+            int[] rates = new int[3];
+            rates[0] = 100000;
+            rates[1] = 250000;
+            rates[2] = 400000;
+            return rates;
+        }
+    }
+
     /// <summary>Brings the bound TWI up as a polled master: pins per the datasheet's Table
     /// 51 (the layout's PIN_CNF_TWI value), PSEL routed while disabled, every relevant
     /// register written explicitly (the shared-peripheral-ID rule), ENABLE = TWI last. The

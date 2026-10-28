@@ -2,11 +2,11 @@
 # SERCOM-instance-relative; nothing in this file names an instance, a pin, a board, or a clock plan.
 # Instance bases/ids live in ../instances.toml; board wiring lives in bsp/boards/<board>/board.toml.
 #
-# THE I2C CHAPTER CARRIES TWO REGISTER MAPS AND THEY OVERLAP AT EVERY OFFSET. Table 27-3 is SLAVE
+# The I2C chapter carries two register maps and they overlap at every offset. Table 27-3 is SLAVE
 # mode (CTRLA.MODE = 100) and table 27-4 is MASTER (MODE = 101). Both define CTRLA at 0x00, CTRLB
 # at 0x04, STATUS at 0x1A and ADDR at 0x24, with different fields inside: the slave's CTRLB carries
 # AACKEN/GCMD/SMEN, the master's carries QCEN/SMEN and the CMD strobe, and the slave's STATUS
-# reports DIR/SR where the master's reports BUSSTATE and ARBLOST. THIS FILE IS THE MASTER MAP.
+# reports DIR/SR where the master's reports BUSSTATE and ARBLOST. This file is the master map.
 
 [table]
 kind = "block"

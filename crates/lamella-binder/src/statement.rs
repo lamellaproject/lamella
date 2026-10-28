@@ -71,7 +71,8 @@ impl BoundStmt {
                 .chain(catches.iter().map(|catch| &*catch.body))
                 .chain(finally.as_deref())
                 .collect(),
-            Kind::Empty
+            Kind::LocalFunction(_)
+            | Kind::Empty
             | Kind::Local { .. }
             | Kind::Expression(_)
             | Kind::Return(_)
@@ -90,6 +91,9 @@ impl BoundStmt {
 /// The kind of a [`BoundStmt`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BoundStmtKind {
+    /// A local function's declaration (C# 7.0, 13.6.4): it runs nothing where it stands, and the
+    /// lowering moves its body to the method it becomes, replacing this statement with nothing.
+    LocalFunction(Box<crate::local_function::BoundLocalFunction>),
     /// A block; its own scope has already been applied (15.2).
     Block(Vec<BoundStmt>),
     /// The empty statement (15.3).
@@ -362,6 +366,7 @@ impl Binder {
         let kind = match &stmt.kind {
             StmtKind::Block(statements) => {
                 self.enter_scope_at(stmt.span);
+                self.declare_local_functions(statements);
                 let contexts = self.take_body_statement_contexts();
                 let initializers = self.take_body_initializer_statements();
                 let bound = statements
@@ -743,7 +748,12 @@ impl Binder {
                 }),
             },
             StmtKind::Lock { expression, body } => self.bind_lock(expression, body),
-            StmtKind::Using { resource, body, .. } => self.bind_using(stmt.span, resource, body),
+            StmtKind::Using {
+                resource,
+                body,
+                declaration,
+            } => self.bind_using(stmt.span, resource, body, *declaration),
+            StmtKind::LocalFunction(function) => self.bind_local_function(function, stmt.span),
             StmtKind::Fixed {
                 ty,
                 name,
@@ -847,22 +857,21 @@ impl Binder {
     /// A chain that leaves this compilation answers false ("cannot prove"), so an unresolvable
     /// base never manufactures a diagnostic.
     pub(crate) fn is_provably_not_derived_from_system(&self, ty: &TypeSymbol, name: &str) -> bool {
-        let Some(mut current) = self.model().get_by_symbol(ty) else {
+        let Some(info) = self.model().get_by_symbol(ty) else {
             return false;
         };
-        if current.kind != crate::symbols::TypeKind::Class {
+        if info.kind != crate::symbols::TypeKind::Class {
             return true;
         }
-        for _ in 0..64 {
+        for link in self.model().base_class_chain(ty) {
+            let Some(current) = link.info else {
+                return false;
+            };
             if &*current.namespace == "System" && &*current.name == name {
                 return false;
             }
-            match &current.base {
-                None | Some(TypeSymbol::Special(_)) => return true,
-                Some(base) => match self.model().get_by_symbol(base) {
-                    Some(next) => current = next,
-                    None => return false,
-                },
+            if matches!(current.base, None | Some(TypeSymbol::Special(_))) {
+                return true;
             }
         }
         false
@@ -873,11 +882,6 @@ impl Binder {
     /// by the same rule and csc gives them the same diagnostic, measured on `new object()`, an
     /// `int` and a `string`.
     ///
-    /// **WHICH DIAGNOSTIC IS A PROPERTY OF THE RUNG, AND THE RUNG IS C# 8.0.** Below it the answer
-    /// is `CS0155`, the code a `catch` clause naming a non-exception type gets. From 8.0 on, `throw`
-    /// CONVERTS its operand to `System.Exception`, and a value that does not convert gets the
-    /// ordinary conversion diagnostic, exactly as an assignment would. Measured against csc at every
-    /// rung it accepts:
     ///
     /// ```text
     ///   operand                      ISO-1 .. 7.3       8.0 and later
@@ -962,22 +966,21 @@ impl Binder {
             TypeSymbol::Special(_) => return true,
             _ => {}
         }
-        let Some(mut current) = self.model().get_by_symbol(ty) else {
+        let Some(info) = self.model().get_by_symbol(ty) else {
             return false;
         };
-        if current.kind != crate::symbols::TypeKind::Class {
+        if info.kind != crate::symbols::TypeKind::Class {
             return true;
         }
-        for _ in 0..64 {
+        for link in self.model().base_class_chain(ty) {
+            let Some(current) = link.info else {
+                return false;
+            };
             if &*current.namespace == "System" && &*current.name == "Exception" {
                 return false;
             }
-            match &current.base {
-                None | Some(TypeSymbol::Special(_)) => return true,
-                Some(base) => match self.model().get_by_symbol(base) {
-                    Some(next) => current = next,
-                    None => return false,
-                },
+            if matches!(current.base, None | Some(TypeSymbol::Special(_))) {
+                return true;
             }
         }
         false
@@ -1346,8 +1349,19 @@ impl Binder {
         }
     }
 
-    fn bind_using(&mut self, span: Span, resource: &UsingResource, body: &Stmt) -> BoundStmtKind {
+    fn bind_using(
+        &mut self,
+        span: Span,
+        resource: &UsingResource,
+        body: &Stmt,
+        declaration: bool,
+    ) -> BoundStmtKind {
         self.enter_scope_at(span);
+        if declaration {
+            if let Some(scope) = self.innermost_scope_id() {
+                self.merge_scope_into_parent(scope);
+            }
+        }
         let mut resource_decls: alloc::vec::Vec<BoundStmt> = Vec::new();
         let mut resources: alloc::vec::Vec<(Box<str>, TypeSymbol)> = Vec::new();
         match resource {
@@ -1393,6 +1407,9 @@ impl Binder {
                 });
                 resources.push((temp, resource_ty));
             }
+        }
+        if declaration && matches!(body.kind, StmtKind::Block(_)) {
+            self.merge_next_scope_into_current();
         }
         let bound_body = self.bind_statement(body);
         for _ in 0..resources.len() {
@@ -1635,6 +1652,9 @@ impl Binder {
         if declared.is_void() {
             self.report(Diagnostic::new(DiagnosticKind::VoidLocal, ty.span));
         }
+        if crate::conversion::is_by_ref_like(self.model(), &declared) {
+            self.gate_async_ref_local(ty.span);
+        }
         let mut bound = Vec::with_capacity(declarators.len());
         for declarator in declarators {
             self.check_local_name_available(declarator);
@@ -1715,6 +1735,9 @@ impl Binder {
         let implicit = self.is_implicitly_typed(referent);
         if implicit {
             self.gate_feature(Feature::ImplicitlyTypedLocalVariable, referent.span);
+        }
+        if let Some(first) = declarators.first() {
+            self.gate_async_ref_local(first.span);
         }
         let declared = if implicit {
             let saved = self.diagnostic_count();
@@ -1802,31 +1825,12 @@ impl Binder {
     /// Whether `ty` is the contextual keyword `var` standing for an inferred type, rather than a
     /// type name (C# 3.0 spec, 8.5.1).
     ///
-    /// **THE TEST IS "DOES IT RESOLVE", NOT "IS IT SPELLED `var`", AND THE CLAUSE SAYS SO IN
-    /// TERMS**: a declaration is implicitly typed when the `local-variable-type` is `var` *"and no
-    /// type named var is in scope"*. A program that declares its own `class var` goes on meaning
-    /// that class at every `var x = ...` in it -- csc compiles such a program, measured -- so
-    /// keying on the spelling would silently change what an existing program means, which is the
-    /// one thing a contextual keyword exists to avoid.
     ///
-    /// **BARE ONLY.** `var[]`, `var*`, `var?`, `N.var` and `var<T>` are ordinary type references
-    /// that happen to name something called `var`; none of them IS a `local-variable-type` of
-    /// `var`. Measured against csc, which reports `CS0825` for `var[] a = ...` rather than any
-    /// inference failure -- so those spellings fall through to
-    /// [`Binder::resolve_named_type`](crate::bound::Binder::resolve_named_type) and are refused
-    /// there.
     ///
     /// The resolution is QUIET because this is a question and not the place an absence gets
     /// reported: the `var` that does not resolve is about to become an inferred type, and the one
     /// that does resolve is reported, if at all, by the ordinary path that follows.
     ///
-    /// **A VERBATIM `@var` IS NOT THIS KEYWORD AND NEVER WAS.** 6.4.4 lets a contextual keyword be
-    /// forced back to an ordinary identifier with `@`, so `@var x = 5;` names a type -- csc reports
-    /// CS0246, measured -- while `var x = 5;` infers. The lexer drops the `@` (9.4.2, correctly:
-    /// the identifier it denotes is `var`, and it has to bind to a type actually called that), so
-    /// the name alone cannot say which was written; `TypeRef::verbatim_name` is the parser
-    /// recording what only the parser can see. Without it, `@var x = 5;` is accepted -- a program
-    /// csc refuses.
     pub(crate) fn is_implicitly_typed(&mut self, ty: &TypeRef) -> bool {
         if ty.verbatim_name {
             return false;
@@ -1897,13 +1901,6 @@ impl Binder {
     /// same [`BoundStmtKind::Local`] an explicit type produces and no emitter can tell which
     /// spelling it came from. That is also why the feature needs no emit path of its own.
     ///
-    /// **THE FOUR RESTRICTIONS ARE 8.5.1's, IN ITS ORDER, AND THE FIFTH IS NOT ENFORCED HERE.**
-    /// 8.5.1 also says the initializer *"cannot refer to the declared variable itself"*, for which
-    /// csc reports `CS0841`. We refuse `var v = v;` too, but as `CS0103` -- the name is not in
-    /// scope yet, because a local is declared AFTER its initializer binds. That is a refusal with
-    /// the wrong code rather than an acceptance, and it is shared with the explicit path (`int x =
-    /// x;` is `CS0103` here and `CS0165` in csc), so it is a property of when locals enter scope
-    /// and not of this feature.
     ///
     /// **A SECOND PATH THROUGH A DECISION IS WHERE THE FIRST PATH'S REFUSALS GO MISSING**, so the
     /// explicit path's are enumerated here rather than left to be noticed: the name-availability
@@ -1933,6 +1930,9 @@ impl Binder {
                 declared = initializer
                     .as_ref()
                     .map_or(TypeSymbol::Error, |value| value.ty.clone());
+                if crate::conversion::is_by_ref_like(self.model(), &declared) {
+                    self.gate_async_ref_local(ty.span);
+                }
             }
             self.declare_local(&declarator.name, declared.clone());
             self.note_stack_bound_local(&declarator.name, initializer.as_ref());
@@ -1961,17 +1961,7 @@ impl Binder {
     /// Binds the initializer of an implicitly typed local, or reports why its type cannot be
     /// inferred (C# 3.0 spec, 8.5.1).
     ///
-    /// Every diagnostic here is at the DECLARATOR, which is csc's position for all three -- the
-    /// fault is that this variable has no type, and the initializer may be absent entirely.
     ///
-    /// **`None` MEANS "NO INITIALIZER WAS WRITTEN", NOT "THIS FAILED", AND THE DISTINCTION IS A
-    /// DIAGNOSTIC ONE.** A declarator with no initializer leaves the local unassigned, so a later
-    /// read of it is `CS0165`; a declarator WITH one that had no inferable type leaves the local
-    /// assigned to something unusable, and csc reports the inference failure alone. Returning
-    /// `None` for both made `var z = null;` report `CS0815` **and** a `CS0165` on the next line --
-    /// a second error, in another statement, blaming the variable for the first one. So a failed
-    /// inference still yields a value: [`BoundExprKind::Error`], the recovery expression, whose
-    /// type is `Error` and which no emitter sees because the program is already refused.
     fn bind_inferred_initializer(&mut self, declarator: &VariableDeclarator) -> Option<BoundExpr> {
         let unusable = || {
             Some(BoundExpr {
@@ -2119,9 +2109,6 @@ impl Binder {
     /// local that each label's test reads, as a switch expression's is, and each section is its
     /// own scope, where its labels' pattern variables live.
     ///
-    /// A constant label of such a switch is a constant pattern, so `case 1:` beside `case int n:`
-    /// is the test `subject is 1`. A label an earlier UNGUARDED one already covers is csc's
-    /// CS8120.
     fn bind_pattern_switch(
         &mut self,
         span: Span,

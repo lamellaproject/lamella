@@ -3,18 +3,18 @@
 # separate positions in the ordering code, and two parts sharing a marketing name can differ in
 # BOTH pad count and memory.
 #
-# THE ORDERING CODE IS DECODED FROM THE DATASHEET'S OWN SCHEME, NOT FROM ITS SHAPE. DS027973
+# The ordering code is decoded from the datasheet's own scheme, not from its shape. DS027973
 # section 8 prints the decode against the example STM32L011K4T6D: K = 32 pins, 4 = 16 Kbytes flash,
 # T = LQFP, 6 = industrial -40 to 85 C, D = the 1.65-3.6 V no-BOR option, and a trailing TR is
 # tape-and-reel packing that says nothing about the silicon.
 #
-# TWO PACKAGES SHARE THE PIN-COUNT LETTER AND THEY DO NOT HAVE THE SAME PADS. `K` is 32 pins, and
+# Two packages share the pin-count letter and they do not have the same pads. `K` is 32 pins, and
 # the 32-pin packages are LQFP32 (T) and UFQFPN32 (U). Table 2's own footnote states the split --
 # "the devices feature 26 and 28 GPIOs on LQFP32 and UFQFPN32, respectively" -- and table 13 says
 # which two: PB2 and PB8 have no LQFP32 pin number and do have a UFQFPN32 one. So the package
 # letter, not the pin-count letter, is what selects a pad set.
 #
-# PIN LISTS HERE ARE COMPLETE GPIO SETS for their package, taken from the per-package pin-number
+# Pin lists here are complete GPIO sets for their package, taken from the per-package pin-number
 # columns of table 13 and cross-checked against the GPIO counts in table 2. A consumer must still
 # not read one as a PAD SPACE: it omits VDD, VSS, VDDA and NRST, none of which is general-purpose
 # I/O.

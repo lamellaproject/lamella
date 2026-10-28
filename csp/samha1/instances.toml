@@ -2,14 +2,14 @@
 # lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
 # uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
-# ONE MAP SERVES BOTH SERIES, AND THAT IS A MEASUREMENT RATHER THAN AN ASSUMPTION. The E and G
-# are documented in two separate datasheets, and their Table 14-1 peripheral maps were compared
-# row by row: the bases, the IRQ lines, the generic-clock ids and the APB-C indices are identical
-# in every row this file carries. What differs between the series is the package, the pad set and
-# which SERCOM the SBC takes -- all three of which live in parts.toml, where the PART is named.
+# One map serves both series. The E and G are documented in two separate datasheets, and their
+# Table 14-1 peripheral maps agree row by row: the bases, the IRQ lines, the generic-clock ids
+# and the APB-C indices are identical in every row this file carries. What differs between the
+# series is the package, the pad set and which SERCOM the SBC takes -- all three of which live
+# in parts.toml, where the part is named.
 #
-# THE VALUES ALSO AGREE WITH THE SAM D21'S, as the sibling samda1's do and the sibling samd20's
-# do not. Read off this family's own tables; recorded as a result.
+# The values also agree with the SAM D21's, as the sibling samda1's do and the sibling samd20's
+# do not; each comes from this family's own tables.
 
 [table]
 kind = "instances"

@@ -4,14 +4,14 @@
 #
 # Two facts, and each `sources` entry names the one it backs.
 #
-# THE WRITE UNIT IS A 128-BIT QUAD-WORD AND IT IS NOT A CHOICE. The controller programs 137 bits at
+# The write unit is a 128-bit quad-word and it is not a choice. The controller programs 137 bits at
 # a time -- 128 of data and 9 of ECC -- and RM0456 refuses anything narrower: a byte or half-word
 # write sets SIZERR, and a quad-word at an address that is not quad-word aligned sets PGAERR. A unit
 # is also write-once between erases, and the controller enforces that rather than merely advising
 # against it.
 #
-# WHY THIS IS A SEPARATE FILE FROM THE STM32U585 BLOCK AND NOT A REFERENCE TO IT. RM0456 covers the
-# series but SPLITS BY SUB-GROUP wherever the sub-groups differ, and flash is one of the places it
+# Why this is a separate file from the STM32U585 block and not a reference to it. RM0456 covers the
+# series but splits by sub-group wherever the sub-groups differ, and flash is one of the places it
 # does: the module organization is two tables, one for STM32U575/585 and one for STM32U59x/5Ax --
 # the sub-group this part is in. This family's own parts table already carries that distinction for
 # SRAM and the memory map, for the same reason. What the manual does NOT split is the programming

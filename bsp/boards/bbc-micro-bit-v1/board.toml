@@ -44,8 +44,8 @@ xtal_hz = 16000000          # crystal Q2 across XC1 and XC2 (schematic sheet 5)
 # for one of its jobs. A scan on this board sees whatever is plugged in as well as what is
 # soldered down.
 #
-# THIS FILE STATES NO MOTION-SENSOR DEVICE ROW, AND THAT IS A FACT ABOUT THE FILE'S SCOPE RATHER
-# THAN AN UNFINISHED SECTION. One board id covers revisions that carry DIFFERENT SENSORS at
+# This file states no motion-sensor device row, and that is a fact about the file's scope rather
+# than an unfinished section. One board id covers revisions that carry DIFFERENT SENSORS at
 # DIFFERENT ADDRESSES, and no row is true of all of them:
 #
 #   v1.3 and v1.3B   MMA8653FC accelerometer at 0x1D, MAG3110 magnetometer at 0x0E -- two chips
@@ -56,9 +56,8 @@ xtal_hz = 16000000          # crystal Q2 across XC1 and XC2 (schematic sheet 5)
 # cannot support -- the same objection that keeps a plugged-in module out of a board file.
 #
 # The vendor's own hardware pages name the parts per revision, and every address above is the
-# part's own datasheet fact rather than this board's. Both pairs have been read on silicon through
-# this board's bus and each answered its identity register, so what is missing here is not the
-# knowledge -- it is a way for one board file to say "it depends which revision you are holding".
+# part's own datasheet fact rather than this board's. What is missing here is not the knowledge
+# -- it is a way for one board file to say "it depends which revision you are holding".
 # Splitting this into two board files would need a second product_model, which is a wire-protocol
 # constant and not this file's to mint.
 #
@@ -104,7 +103,7 @@ source = "micro:bit v1.5 schematic: sheet 5 wires the nRF51822's pins 42, 41 and
 # column lines SINK it (asserted low), the same electrical convention as the v2 -- and that is
 # where the resemblance ends.
 #
-# THIS DISPLAY IS NOT A SMALLER v2. The v2 is a plain 5x5: one pin per row, one per column, and
+# This display is not a smaller v2. The v2 is a plain 5x5: one pin per row, one per column, and
 # pixel (r,c) is lit by asserting row r and column c. This board drives the same 25 LEDs from a
 # 3x9 CHARLIEPLEXED grid, so a screen pixel does not correspond to a (row, column) pair by any
 # arithmetic -- the mapping is a 27-entry table (25 LEDs plus two unused grid positions) that can

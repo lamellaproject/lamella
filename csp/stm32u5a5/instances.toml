@@ -1,15 +1,15 @@
 # INSTANCE map for the STM32U5A5: where each block copy sits, plus its RCC clock-enable routing.
 # `-1` = the row gates nothing (the RCC itself).
 #
-# EVERY BASE HERE IS THE NONSECURE ALIAS, which is a decision rather than a default. This is an
+# Every base here is the nonsecure alias, which is a decision rather than a default. This is an
 # Armv8-M TrustZone part, so RM0456 Table 6 prints TWO address columns for every peripheral --
 # "Secure boundary address" and "Nonsecure boundary address" -- and an instance row has one `base`.
 # The rows below state the NONSECURE one, the same choice csp/stm32u585 made and for the same
 # reason: with TZEN = 0 only the nonsecure alias is meaningful, and with TZEN = 1 the secure alias
 # exists IN ADDITION at the same offset, so the table is correct either way.
 #
-# THE PORT SET IS COMPLETE FOR THIS SUB-GROUP AND IS READ FROM THE PRESENCE COLUMN, NOT FROM THE
-# ADDRESS COLUMN. Table 6 carries the memory map and a per-line presence matrix in ONE table --
+# The port set is complete for this sub-group and is read from the presence column, not from the
+# address column. Table 6 carries the memory map and a per-line presence matrix in ONE table --
 # four columns of X and '-' headed STM32U535/545, STM32U575/585, STM32U59x/5Ax and STM32U5Fx/5Gx.
 # An address in that table is a statement about the SERIES; the X in this part's column is the
 # statement about this die. GPIOJ is the row where they part company: it is marked present on
@@ -96,7 +96,7 @@ base = 0x42022000
 rcc_en_off = 0x8C
 rcc_en_bit = 8
 
-# GPIOJ IS THE ROW THAT DOES NOT EXIST ON A U575/585. See the header.
+# GPIOJ is the row that does not exist on a U575/585. See the header.
 [[instances]]
 name = "gpioj"
 block = "gpio"

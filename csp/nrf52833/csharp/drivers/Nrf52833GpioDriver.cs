@@ -2,7 +2,7 @@
 using System.Device.Gpio;
 using Lamella.Hardware;
 
-public sealed class Nrf52833GpioDriver : GpioDriver
+internal sealed class Nrf52833GpioDriver : GpioDriver
 {
     const uint P0_BASE = 0x50000000;
     const uint P1_BASE = 0x50000300;

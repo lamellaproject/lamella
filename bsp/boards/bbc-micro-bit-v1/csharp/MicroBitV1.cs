@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Bbc
 {
-    public sealed class MicroBitV1
+    internal sealed class MicroBitV1
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = BbcMicroBitV1Bindings.BOARD_MODEL;

@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Arduino
 {
-    public sealed class PortentaH7
+    internal sealed class PortentaH7
     {
         /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
         public static readonly int BoardModel = ArduinoPortentaH7Bindings.BOARD_MODEL;

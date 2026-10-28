@@ -6,7 +6,7 @@
 // lines, and the carrier identity. The board's facts are stated in board.toml.
 namespace Lamella.Generated
 {
-    public sealed class AdafruitFeatherRp2040AdaloggerBindings
+    internal sealed class AdafruitFeatherRp2040AdaloggerBindings
     {
         private AdafruitFeatherRp2040AdaloggerBindings() { }
 

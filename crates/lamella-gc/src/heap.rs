@@ -1407,302 +1407,6 @@ pub enum RootKind {
 #[cfg(feature = "gc-collect")]
 pub(crate) const MARK_STACK: usize = 64;
 
-/// [`mark_compact`]'s ALLOCATION-FREE twin: the same sliding mark-compact, with every piece of
-/// bookkeeping in storage the caller supplies.
-///
-/// # Why this exists beside `mark_compact` rather than replacing it
-///
-/// The shared engine keeps its worklist in a `Vec`, its live set in a `BTreeSet` and its forwarding
-/// table in a `BTreeMap`, so a collection allocates from the Rust global allocator -- measured at
-/// roughly 31 bytes per live object and about 2.5x the heap being compacted. That is affordable on a
-/// host and impossible on a device image, whose only allocator is the one that just failed: an AOT
-/// image installs no `#[global_allocator]` by design, because `lamella_gc_alloc` IS its allocator.
-/// The `collection-scratch-cost` example reports the figures and is re-runnable.
-///
-/// # What replaces each of the three
-///
-/// * the live set becomes [`MarkBits`] -- one bit per word of region, in caller storage;
-/// * the worklist becomes a fixed array that falls back to sweeping to a fixpoint on overflow;
-/// * the forwarding table becomes [`Self::forwarded`], recomputed by a linear scan per reference.
-///
-/// The cost is several passes over the heap instead of one, which is the trade a part with no spare
-/// RAM is asking for.
-///
-/// # The order of operations is load-bearing
-///
-/// **Every reference is rewritten BEFORE any object moves.** A destination address is a function of
-/// the marks and the object footprints, and a footprint depends on the header word and the leading
-/// payload words -- an array's dimensions, never a reference -- so rewriting reference slots cannot
-/// perturb the addresses still being computed. Moving first would destroy the layout that
-/// computation reads. `enumerate_roots` is called TWICE for the same reason: once to mark, once to
-/// rewrite.
-///
-/// # Interior roots
-///
-/// A root of kind [`RootKind::Interior`] addresses the inside of an object. It marks the object that
-/// contains it, and it is rewritten to the same offset inside that object's new place. The containing
-/// object is found by a walk over the old layout, which both passes still have intact.
-///
-/// # Pins
-///
-/// A pinned survivor stays where it is, and the dead bytes the survivors beneath it could not slide
-/// over become a FREE BLOCK ([`FREE_BLOCK`]), so the next collection can walk past them. The answer
-/// carries the new top and the chain of those blocks ([`FreeChain`]), which the allocator reuses.
-///
-/// # Refusal
-///
-/// Returns `None` when the bitmap is too small for the region, having touched NOTHING -- the caller
-/// still has its heap and its objects. A bitmap short of the region would answer "unmarked" for
-/// every address past its end, so live objects would be reclaimed; a collector that cannot prove an
-/// object dead must not reclaim it.
-#[cfg(feature = "gc-collect")]
-pub(crate) fn mark_compact_no_alloc<R>(
-    bytes: &mut [u8],
-    base: u32,
-    top: u32,
-    resolver: &dyn TypeResolver,
-    mut enumerate_roots: R,
-    pinned: &[u32],
-    marks: &mut MarkBits<'_>,
-) -> Option<Compacted>
-where
-    R: FnMut(&mut dyn FnMut(&mut Ref, RootKind)),
-{
-    let top = base + top;
-    if MarkBits::words_for(bytes.len()) > marks.capacity_words() {
-        return None;
-    }
-
-    let is_heap = |reference: Ref| reference.0 >= base + HEADER_SIZE && reference.0 < top;
-    let idx = |addr: u32| -> usize { (addr - base) as usize };
-    let read_word = |bytes: &[u8], addr: u32| -> u32 {
-        let at = idx(addr);
-        u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
-    };
-    let write_word = |bytes: &mut [u8], addr: u32, value: u32| {
-        let at = idx(addr);
-        bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
-    };
-    let read_leading =
-        |bytes: &[u8], payload: u32, want: u32, buf: &mut [u32; MAX_LEADING]| -> usize {
-            let available = ((top - payload) / 4) as usize;
-            let n = (want as usize).min(MAX_LEADING).min(available);
-            for (i, slot) in buf.iter_mut().enumerate().take(n) {
-                *slot = read_word(bytes, payload + (i as u32) * 4);
-            }
-            n
-        };
-    let footprint = |bytes: &[u8], payload: u32| -> u32 {
-        let header_word = read_word(bytes, Ref(payload).header_addr());
-        if let Some(length) = free_block_length(header_word) {
-            return length;
-        }
-        let mut leading = [0u32; MAX_LEADING];
-        let n = read_leading(bytes, payload, resolver.leading_words(header_word), &mut leading);
-        HEADER_SIZE + align_up(resolver.payload_size(header_word, &leading[..n]))
-    };
-    let owner_of = |bytes: &[u8], address: u32| -> Option<u32> {
-        let mut payload = base + ALIGN + HEADER_SIZE;
-        if address < payload || address > top {
-            return None;
-        }
-        while payload < top {
-            let step = footprint(bytes, payload);
-            if address < payload + step {
-                let header_word = read_word(bytes, Ref(payload).header_addr());
-                return free_block_length(header_word).is_none().then_some(payload);
-            }
-            payload += step;
-        }
-        None
-    };
-
-    // ---------------------------------------------------------------- MARK
-    let mut stack = [0u32; MARK_STACK];
-    let mut depth = 0usize;
-    let mut overflowed = false;
-
-    macro_rules! mark {
-        ($reference:expr, $marks:expr, $stack:expr, $depth:expr, $overflowed:expr) => {{
-            let reference: Ref = $reference;
-            if !reference.is_null()
-                && is_heap(reference)
-                && $marks.set(base, reference.0)
-            {
-                if $depth < MARK_STACK {
-                    $stack[$depth] = reference.0;
-                    $depth += 1;
-                } else {
-                    $overflowed = true;
-                }
-            }
-        }};
-    }
-
-    enumerate_roots(&mut |slot: &mut Ref, kind: RootKind| match kind {
-        RootKind::Object => mark!(*slot, marks, stack, depth, overflowed),
-        RootKind::Interior => {
-            if let Some(owner) = owner_of(bytes, slot.0) {
-                mark!(Ref(owner), marks, stack, depth, overflowed);
-            }
-        }
-    });
-
-    macro_rules! scan {
-        ($payload:expr, $bytes:expr, $marks:expr, $stack:expr, $depth:expr, $overflowed:expr) => {{
-            let payload: u32 = $payload;
-            let header_word = read_word($bytes, Ref(payload).header_addr());
-            let mut leading = [0u32; MAX_LEADING];
-            let n = read_leading($bytes, payload, resolver.leading_words(header_word), &mut leading);
-            resolver.for_each_ref_offset(header_word, &leading[..n], &mut |ref_offset| {
-                let child = Ref(read_word($bytes, payload + ref_offset));
-                mark!(child, $marks, $stack, $depth, $overflowed);
-            });
-            resolver.for_each_tagged_offset(header_word, &mut |tagged_offset| {
-                let word = read_word($bytes, payload + tagged_offset);
-                if word != 0 && word & 0b11 == 0 {
-                    mark!(Ref(word), $marks, $stack, $depth, $overflowed);
-                }
-            });
-        }};
-    }
-
-    while depth > 0 {
-        depth -= 1;
-        let payload = stack[depth];
-        scan!(payload, bytes, marks, stack, depth, overflowed);
-    }
-
-    while overflowed {
-        overflowed = false;
-        let mut added = false;
-        let mut payload = base + ALIGN + HEADER_SIZE;
-        while payload < top {
-            let step = footprint(bytes, payload);
-            if marks.test(base, payload) {
-                let before = depth;
-                scan!(payload, bytes, marks, stack, depth, overflowed);
-                if depth != before {
-                    added = true;
-                }
-                while depth > 0 {
-                    depth -= 1;
-                    let next = stack[depth];
-                    scan!(next, bytes, marks, stack, depth, overflowed);
-                    added = true;
-                }
-            }
-            payload += step;
-        }
-        if !added {
-            break;
-        }
-    }
-
-    // ------------------------------------------------------- FORWARDING
-    let is_pinned = |payload: u32, step: u32| pinned_within(pinned, payload, step);
-    let forwarded = |bytes: &[u8], want: u32| -> u32 {
-        let mut cursor = base + ALIGN;
-        let mut payload = base + ALIGN + HEADER_SIZE;
-        while payload < top {
-            let step = footprint(bytes, payload);
-            if marks.test(base, payload) {
-                if is_pinned(payload, step) {
-                    if payload == want {
-                        return payload;
-                    }
-                    cursor = payload - HEADER_SIZE + step;
-                } else {
-                    if payload == want {
-                        return cursor + HEADER_SIZE;
-                    }
-                    cursor += step;
-                }
-            }
-            payload += step;
-        }
-        0
-    };
-
-    // -------------------------------------------------------- REWRITE
-    enumerate_roots(&mut |slot: &mut Ref, kind: RootKind| match kind {
-        RootKind::Object => {
-            if !slot.is_null() && is_heap(*slot) {
-                slot.0 = forwarded(bytes, slot.0);
-            }
-        }
-        RootKind::Interior => {
-            if let Some(owner) = owner_of(bytes, slot.0) {
-                slot.0 = forwarded(bytes, owner) + (slot.0 - owner);
-            }
-        }
-    });
-
-    let mut payload = base + ALIGN + HEADER_SIZE;
-    while payload < top {
-        let step = footprint(bytes, payload);
-        if marks.test(base, payload) {
-            let header_word = read_word(bytes, Ref(payload).header_addr());
-            let mut leading = [0u32; MAX_LEADING];
-            let n = read_leading(bytes, payload, resolver.leading_words(header_word), &mut leading);
-            resolver.for_each_ref_offset(header_word, &leading[..n], &mut |ref_offset| {
-                let slot = payload + ref_offset;
-                let old = read_word(bytes, slot);
-                if old != 0 && is_heap(Ref(old)) {
-                    let new = forwarded(bytes, old);
-                    write_word(bytes, slot, new);
-                }
-            });
-            resolver.for_each_tagged_offset(header_word, &mut |tagged_offset| {
-                let slot = payload + tagged_offset;
-                let old = read_word(bytes, slot);
-                if old != 0 && old & 0b11 == 0 && is_heap(Ref(old)) {
-                    let new = forwarded(bytes, old);
-                    write_word(bytes, slot, new);
-                }
-            });
-            resolver.for_each_weak_offset(header_word, &mut |weak_offset| {
-                let slot = payload + weak_offset;
-                let old = read_word(bytes, slot);
-                if old != 0 && is_heap(Ref(old)) {
-                    let new = if marks.test(base, old) {
-                        forwarded(bytes, old)
-                    } else {
-                        0
-                    };
-                    write_word(bytes, slot, new);
-                }
-            });
-        }
-        payload += step;
-    }
-
-    // ----------------------------------------------------------- MOVE
-    let mut cursor = base + ALIGN;
-    let mut free = FreeChain::default();
-    let mut payload = base + ALIGN + HEADER_SIZE;
-    while payload < top {
-        let step = footprint(bytes, payload);
-        if marks.test(base, payload) {
-            let start = payload - HEADER_SIZE;
-            if is_pinned(payload, step) {
-                if cursor < start {
-                    free.add(bytes, idx(cursor), idx(start));
-                }
-                cursor = start + step;
-            } else {
-                if cursor != start {
-                    bytes.copy_within(idx(start)..idx(start) + step as usize, idx(cursor));
-                }
-                cursor += step;
-            }
-        }
-        payload += step;
-    }
-    bytes[idx(cursor)..idx(top)].fill(0);
-    Some(Compacted { top: cursor - base, free: free.head })
-}
-
 #[cfg(all(test, feature = "host-heap"))]
 mod tests {
     use super::*;
@@ -3109,7 +2813,7 @@ mod tests {
         assert_eq!(new_top, ALIGN + 2 * (HEADER_SIZE + 8), "the bump pointer must come back region-relative");
     }
 
-    /// THE ALLOCATION-FREE ENGINE, HELD TO THE ONE IT REPLACES.
+    /// THE ALLOCATION-FREE ENGINE, HELD TO THE ALLOCATING ONE.
     ///
     /// Every test here is DIFFERENTIAL rather than expectation-based, and that is the point: the
     /// device collection and the host rehearsal must not be able to walk differently, so the
@@ -3153,56 +2857,24 @@ mod tests {
         }
 
         /// [`no_alloc`] with each root's kind stated, for the interior roots the allocating engine
-        /// has no counterpart for.
+        /// has no counterpart for. It collects twice, with the forwarding index and without one, and
+        /// requires the same answer from both: the index changes where a lookup's replay starts and
+        /// nothing else, and a device heap collects with it.
         fn no_alloc_kinds(heap: &Heap, roots: &[(Ref, RootKind)], pinned: &[u32]) -> (u32, Vec<u8>, Vec<Ref>) {
-            let roots_with_kinds = roots;
-            let mut bytes = heap.bytes.clone();
-            let mut roots = roots.to_vec();
             let resolver = TableResolver {
                 type_descs: &heap.type_descs,
                 weak_offsets: &heap.weak_offsets,
             };
-            let mut storage = [0u32; 1024];
-            let mut marks = MarkBits::new(&mut storage);
-            let compacted = mark_compact_no_alloc(
-                &mut bytes,
-                Heap::BASE,
-                heap.top,
-                &resolver,
-                |visit: &mut dyn FnMut(&mut Ref, RootKind)| {
-                    for (root, kind) in &mut roots {
-                        visit(root, *kind);
-                    }
-                },
-                pinned,
-                &mut marks,
-            )
-            .expect("the bitmap is sized for this region");
-            let roots: Vec<Ref> = roots.into_iter().map(|(root, _)| root).collect();
-            for indexed in [false, true] {
-                let segmented = segmented(heap, &resolver, roots_with_kinds, pinned, indexed);
-                assert_eq!(
-                    segmented.0, compacted,
-                    "a one-segment collection through the segmented engine answers differently (indexed: {indexed})"
-                );
-                assert_eq!(
-                    segmented.2, roots,
-                    "the segmented engine relocated a root differently (indexed: {indexed})"
-                );
-                assert_eq!(
-                    segmented.1, bytes,
-                    "the segmented engine produced a different region (indexed: {indexed})"
-                );
-            }
-            (compacted.top, bytes, roots)
+            let (compacted, bytes, roots_after) = segmented(heap, &resolver, roots, pinned, true);
+            let replayed = segmented(heap, &resolver, roots, pinned, false);
+            assert_eq!(replayed.0, compacted, "the index changed the collection's answer");
+            assert_eq!(replayed.2, roots_after, "the index changed where a root was relocated");
+            assert_eq!(replayed.1, bytes, "the index changed the region the collection left");
+            (compacted.top, bytes, roots_after)
         }
 
-        /// The same collection as [`no_alloc_kinds`], through the SEGMENTED engine with ONE segment,
-        /// with its forwarding index or without.
-        ///
-        /// Every test that reaches `no_alloc_kinds` compares the two, so the second engine is held to
-        /// the first on every one-segment shape this module knows, and a fix that lands in only one
-        /// of them turns that test red.
+        /// One collection of `heap`, with `roots` and `pinned`, through the allocation-free engine
+        /// with ONE segment, with its forwarding index or without.
         fn segmented(
             heap: &Heap,
             resolver: &TableResolver<'_>,
@@ -3403,28 +3075,12 @@ mod tests {
             let pins = [first.0, second.0];
             agree(&heap, &roots, &pins);
 
-            let mut bytes = heap.bytes.clone();
             let resolver = TableResolver {
                 type_descs: &heap.type_descs,
                 weak_offsets: &heap.weak_offsets,
             };
-            let mut storage = [0u32; 1024];
-            let mut marks = MarkBits::new(&mut storage);
-            let mut rooted = roots;
-            let compacted = mark_compact_no_alloc(
-                &mut bytes,
-                Heap::BASE,
-                heap.top,
-                &resolver,
-                |visit: &mut dyn FnMut(&mut Ref, RootKind)| {
-                    for root in &mut rooted {
-                        visit(root, RootKind::Object);
-                    }
-                },
-                &pins,
-                &mut marks,
-            )
-            .expect("the bitmap is sized for this region");
+            let kinds = roots.map(|root| (root, RootKind::Object));
+            let (compacted, bytes, _) = segmented(&heap, &resolver, &kinds, &pins, true);
 
             let word = |at: u32| u32::from_le_bytes(bytes[at as usize..at as usize + 4].try_into().unwrap());
             let low_gap = ALIGN;
@@ -3597,11 +3253,17 @@ mod tests {
                 weak_offsets: &heap.weak_offsets,
             };
             let mut storage = [0u32; 1];
-            let mut marks = MarkBits::new(&mut storage);
-            let answer = mark_compact_no_alloc(
-                &mut bytes,
-                Heap::BASE,
-                heap.top,
+            let mut marks = [MarkBits::new(&mut storage)];
+            let mut answers = [Compacted { top: 0, free: 0 }];
+            let mut segments = [crate::segments::Segment {
+                bytes: &mut bytes,
+                base: Heap::BASE,
+                top: heap.top,
+                index: &mut [],
+            }];
+            let ran = crate::segments::mark_compact_segments(
+                &mut segments,
+                &mut marks,
                 &resolver,
                 |visit: &mut dyn FnMut(&mut Ref, RootKind)| {
                     for root in &mut roots {
@@ -3609,9 +3271,9 @@ mod tests {
                     }
                 },
                 &[],
-                &mut marks,
+                &mut answers,
             );
-            assert!(answer.is_none(), "a bitmap short of the region must refuse");
+            assert!(!ran, "a bitmap short of the region must refuse");
             assert_eq!(bytes, before, "a refusal must not have moved anything");
             assert_eq!(roots, vec![a], "a refusal must not have rewritten a root");
         }

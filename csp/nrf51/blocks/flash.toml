@@ -3,11 +3,11 @@
 #
 # Two facts, and each `sources` entry names the one it backs.
 #
-# THE WRITE UNIT IS A 32-BIT WORD AND THE PART FAULTS IF YOU DISAGREE. The reference manual is
+# The write unit is a 32-bit word and the part faults if you disagree. The reference manual is
 # unusually direct: `Only word aligned writes are allowed. Byte or half word aligned writes will
 # result in a hard fault.` So the unit is four bytes and the alignment is not advisory.
 #
-# THE ERASED VALUE IS STATED SIDEWAYS AND IS NONE THE WEAKER FOR IT. The manual says the NVMC `is
+# The erased value is stated sideways and is none the weaker for it. The manual says the NVMC `is
 # only able to write bits in the NVM that are erased, that is, set to 1`. It defines the erased
 # state as the one-state in the course of saying what the controller can do to it, which is the
 # same fact a sentence beginning `after an erase` would have carried.

@@ -2014,6 +2014,51 @@ mod tests {
     #[cfg(feature = "st")]
     const KB: usize = 1024;
 
+    /// The Debug Halting Control and Status Register, which a route's write reads and writes as it
+    /// hands the part back.
+    #[cfg(feature = "st")]
+    const DHCSR: u32 = 0xE000_EDF0;
+
+    /// Halting debug as a fake part's DHCSR reports it: whether halting debug is on, and whether
+    /// the core is halted. `FlashPart` and `H7Part` carry one, because an F7 or H7 deploy writes
+    /// through the route `lamella flash` takes, and the route's write ends by handing the part back
+    /// through `lamella_probe_core::hand_back`, which reads the halt state and writes DHCSR.
+    #[cfg(feature = "st")]
+    #[derive(Default)]
+    struct Dhcsr {
+        /// `C_DEBUGEN`: halting debug is on.
+        debugen: bool,
+        /// `S_HALT`: the core is halted.
+        halted: bool,
+    }
+
+    #[cfg(feature = "st")]
+    impl Dhcsr {
+        /// A write to DHCSR. One without the key in its top half is ignored, as the architecture
+        /// ignores it; with halting debug on, `C_HALT` halts the core and its absence lets it run.
+        fn write(&mut self, value: u32) {
+            if value >> 16 != 0xA05F {
+                return;
+            }
+            self.debugen = value & 1 != 0;
+            if self.debugen {
+                self.halted = value & 2 != 0;
+            }
+        }
+
+        /// `TargetAccess::halt`, and the hold ending a deploy: halting debug on, the core halted.
+        fn halt(&mut self) {
+            self.debugen = true;
+            self.halted = true;
+        }
+
+        /// `TargetAccess::reset_and_run`: a system reset, then a resume leaving halting debug on.
+        fn reset_and_run(&mut self) {
+            self.debugen = true;
+            self.halted = false;
+        }
+    }
+
     /// The flash register block the STM32F4 and F7 share, and the bits of it a write uses, as
     /// `lamella-cmsis-dap-stm32` drives them.
     #[cfg(feature = "st")]
@@ -2061,6 +2106,8 @@ mod tests {
         erases: Rc<Cell<u32>>,
         /// How the deploy LEFT the part, which is what a session about to be served sees.
         ending: Option<Ending>,
+        /// Halting debug, which the route's hand-back reads and turns off.
+        dhcsr: Dhcsr,
     }
 
     #[cfg(feature = "st")]
@@ -2126,6 +2173,7 @@ mod tests {
                 watchdogs: 0,
                 erases: Rc::new(Cell::new(0)),
                 ending: None,
+                dhcsr: Dhcsr::default(),
             }
         }
 
@@ -2179,6 +2227,10 @@ mod tests {
             })
         }
         fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+            if address == DHCSR {
+                self.dhcsr.write(value);
+                return Ok(());
+            }
             if let Some(at) = self.cells(address, 4) {
                 if self.control & f4_f7::CR_PG != 0 {
                     for (cell, byte) in self.flash[at..at + 4].iter_mut().zip(value.to_le_bytes()) {
@@ -2219,9 +2271,11 @@ mod tests {
             Ok(())
         }
         fn halt(&mut self) -> Result<(), ProbeError> {
+            self.dhcsr.halt();
             Ok(())
         }
         fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+            self.dhcsr.reset_and_run();
             self.ending = Some(Ending::Running);
             Ok(())
         }
@@ -2244,12 +2298,13 @@ mod tests {
             unreachable!("a deploy does not step")
         }
         fn is_halted(&mut self) -> Result<bool, ProbeError> {
-            unreachable!("a deploy does not read the run state")
+            Ok(self.dhcsr.halted)
         }
         fn wait_halted(&mut self) -> Result<(), ProbeError> {
             unreachable!("a deploy does not wait for a halt")
         }
         fn reset_and_halt(&mut self) -> Result<(), ProbeError> {
+            self.dhcsr.halt();
             self.ending = Some(Ending::HeldAtEntry);
             Ok(())
         }
@@ -2425,6 +2480,8 @@ mod tests {
         erases: Rc<Cell<u32>>,
         /// How the deploy LEFT the part, which is what a session about to be served sees.
         ending: Option<Ending>,
+        /// Halting debug, which the route's hand-back reads and turns off.
+        dhcsr: Dhcsr,
     }
 
     #[cfg(feature = "st")]
@@ -2439,6 +2496,7 @@ mod tests {
                 erase_does_not_take: None,
                 erases: Rc::new(Cell::new(0)),
                 ending: None,
+                dhcsr: Dhcsr::default(),
             }
         }
 
@@ -2491,6 +2549,10 @@ mod tests {
             })
         }
         fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+            if address == DHCSR {
+                self.dhcsr.write(value);
+                return Ok(());
+            }
             if let Some(at) = self.cells(address, 4) {
                 if self.control[at / h7::BANK] & h7::CR_PG != 0 {
                     for (cell, byte) in self.flash[at..at + 4].iter_mut().zip(value.to_le_bytes()) {
@@ -2530,9 +2592,11 @@ mod tests {
             Ok(())
         }
         fn halt(&mut self) -> Result<(), ProbeError> {
+            self.dhcsr.halt();
             Ok(())
         }
         fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+            self.dhcsr.reset_and_run();
             self.ending = Some(Ending::Running);
             Ok(())
         }
@@ -2555,12 +2619,13 @@ mod tests {
             unreachable!("a deploy does not step")
         }
         fn is_halted(&mut self) -> Result<bool, ProbeError> {
-            unreachable!("a deploy does not read the run state")
+            Ok(self.dhcsr.halted)
         }
         fn wait_halted(&mut self) -> Result<(), ProbeError> {
             unreachable!("a deploy does not wait for a halt")
         }
         fn reset_and_halt(&mut self) -> Result<(), ProbeError> {
+            self.dhcsr.halt();
             self.ending = Some(Ending::HeldAtEntry);
             Ok(())
         }

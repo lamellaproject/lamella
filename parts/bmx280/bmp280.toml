@@ -1,6 +1,6 @@
 # PART: Bosch BMP280 pressure and temperature sensor.
 #
-# The family base without humidity. THE POINT OF HOW SHORT THIS FILE IS: the base was drawn around
+# The family base without humidity. The point of how short this file is: the base was drawn around
 # what both members share rather than around the richer member, so the smaller part states only
 # what it genuinely differs by. Drawn the other way, this file would have had to switch features
 # back OFF -- which is the check a family of one member cannot run.
@@ -25,14 +25,14 @@ notes = [
 # from a third-party driver, and nothing the family base states about pressure or temperature is
 # contradicted by that section.
 #
-# WHAT THIS PART THEREFORE DOES NOT STATE, because the compatibility section does not cover it:
+# What this part therefore does not state, because the compatibility section does not cover it:
 # power figures, timing, and the measurement-duration table a non-blocking driver would need.
 # Treat those as absent rather than defaulted.
 #
 # Identified, and no further: a physical part has answered the identity register below against a
 # negative control, and nothing beneath it has been read from silicon.
 #
-# THE READING BEARS ON THE SOURCING AS WELL AS ON THE VALIDATION, which is unusual enough to say
+# The reading bears on the sourcing as well as on the validation, which is unusual enough to say
 # plainly. Both facts the check used -- the register and the set of values it accepts -- are
 # DERIVED ones, taken from a compatibility section rather than from this part's own datasheet, and
 # both held on a device. That is the first evidence this family's secondary derivation is sound. It

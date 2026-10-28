@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Microchip
 {
-    public sealed class Same51Cnano
+    internal sealed class Same51Cnano
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = MicrochipSame51CnanoBindings.BOARD_MODEL;
@@ -43,7 +43,7 @@ namespace Lamella.Boards.Microchip
         private static GpioDriver MakeGpio() { return new Same54GpioDriver(); }
 
         /// <summary>The family GPIO driver this board bound.</summary>
-        /// <remarks>THE DRIVER SPANS THE FAMILY'S FOUR PORT GROUPS AND THIS PACKAGE BONDS TWO.
+        /// <remarks>The driver spans the family's four port groups and this package bonds two.
         /// Ports C and D exist in the address map and reach no pin on a 64-pin part, so a pin
         /// number in them is addressable and connected to nothing. The constants above name only
         /// pads this package carries, which is the protection a program actually gets.</remarks>

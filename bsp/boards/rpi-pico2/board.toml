@@ -134,12 +134,12 @@ b = { pin = "GP15" }
 
 # --- the board's own control: one LED, and it is plain GPIO ------------------------------------
 #
-# NO ALTERNATE FUNCTION IS INVOLVED, so this row states a pin and a level and nothing else -- which
+# No alternate function is involved, so this row states a pin and a level and nothing else -- which
 # is why it needs no pin-map row, while the bindings above needed one per signal. The LED's cathode
 # is at ground through its own series resistor, so the pin drives it directly and driving it HIGH
 # lights it. The pin and the circuit are the plain Pico's unchanged, one chip generation on.
 #
-# THE WIRELESS SIBLING DOES NOT SHARE THIS FACT. On the Pico 2 W the same GP25 is the CYW43439's
+# The wireless sibling does not share this fact. On the Pico 2 W the same GP25 is the CYW43439's
 # chip select and the LED moves to the radio's own WL_GPIO0, so a blinky written against this row
 # lights nothing there and asserts the radio's chip select instead.
 

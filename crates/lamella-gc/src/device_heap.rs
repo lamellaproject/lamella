@@ -434,6 +434,26 @@ impl DeviceHeap {
         self.top
     }
 
+    /// How many bytes this heap can still hand out: those above the bump pointer, and the FREE
+    /// BLOCKS the last collection chained below it. Each counts its header word, as a request's
+    /// footprint does, so the figure compares directly with what an allocation needs.
+    #[must_use]
+    pub fn free_bytes(&self) -> u32 {
+        let mut free = self.region.len() as u32 - self.top;
+        #[cfg(feature = "gc-collect")]
+        {
+            let mut block = self.free as usize;
+            while block != 0 {
+                let Some(&[l0, l1, l2, l3, n0, n1, n2, n3]) = self.region.get(block..block.saturating_add(8)) else {
+                    break;
+                };
+                free += u32::from_le_bytes([l0, l1, l2, l3]) & !crate::heap::FREE_BLOCK;
+                block = u32::from_le_bytes([n0, n1, n2, n3]) as usize;
+            }
+        }
+        free
+    }
+
     /// Allocates an object of the type described by `type_desc`: writes the header word (the
     /// descriptor *address*), reserves a zeroed, 4-aligned payload, and returns the *payload* address
     /// as a [`Ref`]. The object goes in the first FREE BLOCK the last collection chained that holds
@@ -544,8 +564,17 @@ impl DeviceHeap {
         crate::heap::MarkBits::words_for(self.region.len())
     }
 
+    /// How many `u32` words of forwarding index [`Self::collect_no_alloc`] can use for this heap: two
+    /// for every 256 bytes of region, about 3% of it, as much as the mark bitmap. Sized from the
+    /// region for the reason [`Self::mark_words`] is.
+    #[cfg(feature = "gc-collect")]
+    #[must_use]
+    pub fn index_words(&self) -> usize {
+        crate::segments::forwarding_index_words_for(self.region.len())
+    }
+
     /// [`Self::collect_with_pins`] WITHOUT A HEAP ALLOCATOR: the same sliding mark-compact, with its
-    /// bookkeeping in `marks` instead of in a `Vec`, a `BTreeSet` and a `BTreeMap`.
+    /// bookkeeping in `scratch` instead of in a `Vec`, a `BTreeSet` and a `BTreeMap`.
     ///
     /// **This is the entry a device image collects through, and the reason it exists is arithmetic.**
     /// The shared engine's bookkeeping costs roughly 31 bytes per live object and about 2.5x the heap
@@ -554,11 +583,17 @@ impl DeviceHeap {
     /// 3.5 KB device heap that scratch would be about 9 KB, so the image would do better spending the
     /// RAM on the heap and never collecting. See the `collection-scratch-cost` example.
     ///
-    /// `marks` must hold at least [`Self::mark_words`] words; the caller owns it, so on a device it
-    /// is a static beside the heap and in a test it is a stack array. **Answers `false` when the
-    /// buffer is too small, having collected nothing and moved nothing** -- a bitmap short of the
-    /// region would report every address past its end as unreachable, so live objects would be
-    /// reclaimed. A collector that cannot prove an object dead must not reclaim it.
+    /// `scratch` is that bookkeeping's storage, which the caller owns, so on a device it is a band
+    /// beside the heap and in a test it is a stack array: the mark bitmap, at least
+    /// [`Self::mark_words`] words, and the forwarding index, [`Self::index_words`] words. **Answers
+    /// `false` when the bitmap is too small, having collected nothing and moved nothing** -- a bitmap
+    /// short of the region would report every address past its end as unreachable, so live objects
+    /// would be reclaimed. A collector that cannot prove an object dead must not reclaim it.
+    ///
+    /// **With the index a collection's time grows with the heap; without one, with its square.** Each
+    /// survivor's new place is found by replaying the compaction from the start of the index's chunk
+    /// the survivor lies in, rather than from the heap's base. A shorter index, the empty slice
+    /// included, collects exactly as a full one does and replays from the base.
     ///
     /// `enumerate_roots` is called TWICE, as it is for [`Self::collect_with_pins`]: once to mark and
     /// once to rewrite. It must report the same slots both times and must not allocate. Each slot is
@@ -570,29 +605,13 @@ impl DeviceHeap {
         &mut self,
         enumerate_roots: R,
         pinned: &[u32],
-        marks: &mut [u32],
+        scratch: SegmentScratch<'_>,
     ) -> bool
     where
         R: FnMut(&mut dyn FnMut(&mut Ref, crate::heap::RootKind)),
     {
-        let mut bits = crate::heap::MarkBits::new(marks);
-        let top = self.top;
-        match crate::heap::mark_compact_no_alloc(
-            self.region,
-            self.base,
-            top,
-            &PtrResolver,
-            enumerate_roots,
-            pinned,
-            &mut bits,
-        ) {
-            Some(compacted) => {
-                self.top = compacted.top;
-                self.free = compacted.free;
-                true
-            }
-            None => false,
-        }
+        let none = SegmentScratch { marks: &mut [], index: &mut [] };
+        self.collect_spanning_with(&PtrResolver, None, enumerate_roots, pinned, scratch, none)
     }
 
     /// [`Self::collect_no_alloc`] over this heap AND a SECOND SEGMENT: a region at an unrelated address
@@ -629,8 +648,9 @@ impl DeviceHeap {
     }
 
     /// [`Self::collect_no_alloc_spanning`] through any resolver, so a host test can collect a heap
-    /// whose headers are table indices rather than descriptor addresses.
-    #[cfg(all(feature = "gc-collect", any(test, feature = "second-segment")))]
+    /// whose headers are table indices rather than descriptor addresses. With `second` absent it is
+    /// [`Self::collect_no_alloc`], and `second_scratch` is unread.
+    #[cfg(feature = "gc-collect")]
     fn collect_spanning_with<R>(
         &mut self,
         resolver: &dyn TypeResolver,
@@ -830,9 +850,8 @@ impl DeviceHeap {
 }
 
 
-/// The storage one segment's collection works in, which the embedder owns and sizes, as it owns the
-/// one-segment collection's bitmap.
-#[cfg(all(feature = "gc-collect", any(test, feature = "second-segment")))]
+/// The storage one segment's collection works in, which the embedder owns and sizes.
+#[cfg(feature = "gc-collect")]
 pub struct SegmentScratch<'a> {
     /// The mark bitmap: at least [`DeviceHeap::mark_words`] words for the segment. A shorter one
     /// refuses the collection.
@@ -1163,7 +1182,11 @@ mod tests {
             heap.mark_words() > too_small.len(),
             "the buffer must actually be short, or this asserts nothing"
         );
-        let collected = heap.collect_no_alloc(|_visit| {}, &[], &mut too_small);
+        let collected = heap.collect_no_alloc(
+            |_visit| {},
+            &[],
+            SegmentScratch { marks: &mut too_small, index: &mut [] },
+        );
 
         assert!(!collected, "a bitmap short of the region must refuse to collect");
         assert_eq!(
@@ -1219,6 +1242,31 @@ mod tests {
         assert_eq!(offset(&heap, d), 56 + HEADER_SIZE);
         assert_eq!(heap.free, 0, "an exact fit must unlink the block");
         assert_eq!(word(&heap, 60), 0, "and clear the link its payload now covers");
+    }
+
+    /// THE FREE FIGURE IS EVERY BYTE AN ALLOCATION COULD STILL TAKE: what lies above the bump pointer,
+    /// and each free block in the chain, headers counted, as a request's footprint counts its own. A
+    /// header-only remainder is out of the chain, and so out of the figure, until a collection.
+    #[cfg(feature = "gc-collect")]
+    #[test]
+    fn the_free_figure_counts_the_tail_and_every_chained_block() {
+        use crate::heap::FREE_BLOCK;
+        let put = |heap: &mut DeviceHeap, at: usize, value: u32| {
+            heap.region[at..at + 4].copy_from_slice(&value.to_le_bytes());
+        };
+        let (base, len) = make_region(256);
+        let mut heap = unsafe { DeviceHeap::from_raw(base, len) };
+        assert_eq!(heap.free_bytes(), 256 - ALIGN, "a new heap: all but the reserved null word");
+        put(&mut heap, 16, FREE_BLOCK | 12);
+        put(&mut heap, 20, 48);
+        put(&mut heap, 48, FREE_BLOCK | 24);
+        heap.top = 128;
+        heap.free = 16;
+        assert_eq!(heap.free_bytes(), 128 + 12 + 24, "the tail and both blocks");
+        let _ = unsafe { heap.alloc(4, make_desc(4, &[])) }.unwrap();
+        assert_eq!(heap.free_bytes(), 128 + 24, "the remainder left the chain");
+        let _ = unsafe { heap.alloc(40, make_desc(40, &[])) }.unwrap();
+        assert_eq!(heap.free_bytes(), 128 - 44 + 24);
     }
 
     /// The bitmap size a caller must provide is derived from the REGION, not from what is in use --

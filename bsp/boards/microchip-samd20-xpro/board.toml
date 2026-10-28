@@ -1,11 +1,11 @@
 # The SAM D20 Xplained Pro (ATSAMD20-XPRO): board truth only -- what is wired to what. Chip
 # truth lives in csp/samd20/.
 #
-# THE VIRTUAL COM PORT'S TWO PADS WERE CHECKED AGAINST THE PART DATASHEET AND THE TWO DOCUMENTS
-# AGREE. Atmel-42102D Table 4-8 gives SERCOM3 PAD[2] on PA24 and SERCOM3 PAD[3] on PA25, and
-# DS60001504K Table 6-1 gives both pads in column C against SERCOM3. The check is run on every
-# kit because the SIBLING KIT FAILED IT -- the SAM R21 Xplained Pro's guide puts one UART's two
-# pads on two different SERCOM instances -- so agreement here is a result rather than a default.
+# The kit guide and the part datasheet agree about the virtual COM port's two pads. Atmel-42102D
+# Table 4-8 gives SERCOM3 PAD[2] on PA24 and SERCOM3 PAD[3] on PA25, and DS60001504K Table 6-1
+# gives both pads in column C against SERCOM3. A kit guide does not always agree with its
+# datasheet: the SAM R21 Xplained Pro's guide puts one UART's two pads on two different SERCOM
+# instances.
 
 [table]
 kind = "board"
@@ -29,7 +29,7 @@ notes = [
 
 [[carriers]]
 kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
-usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+usb_vid = 0x03EB            # Note: no usb_pid row, and its absence is a sourced position rather than
 role = "vcp"                # AN OMISSION. A product id is a property of the debugger's FIRMWARE:
 baud = 115200               # this kit's user guide never prints one, and the EDBG user guide
 plan = "osc8m-8mhz"         # Atmel-42096 describes the composite device without giving an id

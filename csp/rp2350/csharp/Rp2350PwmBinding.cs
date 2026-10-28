@@ -4,7 +4,7 @@ namespace Lamella.Boards
 {
     /// <summary>One output of a slice that a board routes to a pad: which of the slice's two outputs
     /// it is, and the pad's two registers.</summary>
-    public sealed class Rp2350PwmOutput
+    internal sealed class Rp2350PwmOutput
     {
         /// <summary>0 for the slice's output A and 1 for B: the half of the slice's CC register that
         /// sets its level, and the channel number <c>PwmChannel.Create</c> names it by.</summary>
@@ -22,7 +22,7 @@ namespace Lamella.Boards
         }
     }
 
-    public sealed class Rp2350PwmBinding
+    internal sealed class Rp2350PwmBinding
     {
         /// <summary>The PWM block's base address.</summary>
         public readonly uint PwmBase;

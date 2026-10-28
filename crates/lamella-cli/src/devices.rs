@@ -19,7 +19,7 @@ const IDENTIFY_TIMEOUT: Duration = Duration::from_millis(1500);
 ///
 /// It moves when a field is renamed, removed or given a new meaning. A field added beside the others
 /// leaves it where it is, so a reader written for this version ignores what it does not know.
-const SCHEMA: u32 = 1;
+const SCHEMA: u32 = 2;
 
 /// The `Type` every row carries: .NET's word for a physical device.
 ///
@@ -30,6 +30,25 @@ const DEVICE_TYPE: &str = "Device";
 
 /// The `Status` of a row nobody has asked: it is attached, which is all an unasked listing knows.
 const ATTACHED: &str = "Connected";
+
+/// The `Status` of a device that was asked and whose connection could not be opened.
+const CANNOT_OPEN: &str = "CannotOpen";
+
+/// The `Status` of a device that answered and refused.
+const BUSY: &str = "Busy";
+
+/// The family of a CMSIS-DAP debug probe, as the listing names it.
+pub(crate) const CMSIS_DAP: &str = "cmsis-dap";
+
+/// The family of an ST-LINK debug probe, as the listing names it.
+pub(crate) const ST_LINK: &str = "st-link";
+
+/// How a program sent to a device runs there, as the MSBuild form gives each row's `Model`: under
+/// Lamella's interpreter, on a board running Lamella's firmware.
+const INTERPRETER: &str = "interpreter";
+
+/// The `Model` of a row reached through a debug probe: the program is written as a native image.
+const NATIVE: &str = "native";
 
 /// What a row of the listing is, which decides the option that takes its id.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -55,8 +74,8 @@ impl Kind {
 
 /// One attached thing, as the listing sees it.
 struct Attached {
-    /// The word the option for its kind takes.
-    id: String,
+    /// The word the option for its kind takes, or `None` for a row nothing names uniquely.
+    id: Option<String>,
     /// Which option that is.
     kind: Kind,
     /// What it is, in whatever terms the operating system reported.
@@ -83,6 +102,10 @@ struct Facts {
     /// For a probe, the serial ports that share its USB serial number: its UART bridge or virtual
     /// COM port, which is where the console of a board wired to it can arrive.
     ports: Vec<String>,
+    /// For a serial port, the USB serial number of the probe whose UART bridge it is.
+    bridge_of: Option<String>,
+    /// Why the row is named as it is, when that is not the obvious way.
+    note: Option<String>,
 }
 
 /// A debug probe as the probe layer enumerated it.
@@ -134,34 +157,63 @@ enum Form<'a> {
 }
 
 const USAGE: &str = "\
-usage: lamella devices [--identify <device>] [--all-devices] [--json]
+Usage:
+  lamella devices [--identify <device>] [--all-devices] [--json]
 
-Lists what is attached, as .NET lists the devices a program can run on: each one's ID, which is
-the word --device takes, with its type, its status and what it is. Debug probes and bootloader
-drives follow, each under the word --probe or --volume takes when a board is written over one.
+List what is attached: the devices a program can run on, then debug probes and bootloader drives.
 
-The listing opens nothing: every row is the USB identity the operating system reports, so a board
-another program is using, or a probe in somebody's debug session, is listed undisturbed. A board
-wired to a debug probe is listed as the probe's UART bridge, and which board that is stays unknown
-until something asks it.
+Options:
+  --identify <device>  Ask the one device named what it is. The board it answers as becomes its
+                       description, and how it answered becomes its status.
+  --all-devices        Also list the vendor-class USB devices that were not taken for debug probes.
+  --json               Print the same rows as JSON, for a program to read.
 
-A board in its bootloader is listed here too. It is still attached, and it is the one somebody
-holding a new board is most likely to be looking for.
+What happens:
+  Each device is listed with its run target ID, type, status and description, and each probe and
+  drive under the name --probe or --volume takes. The listing opens nothing: each row is the USB
+  identity the operating system reports, so a board another program is using, or a probe in a
+  debug session, is listed undisturbed. Only --identify opens a device. The exit code is 0, and 1
+  when --identify names a device that is not attached.
 
---identify <device> asks the one device named what it is, over the wire: the board it answers as
-becomes its description, and how it answered its status. It is opened as --device opens a device:
-a serial port with DTR and RTS held low, except a Raspberry Pi Debug Probe's and an EDBG's, which
-pass nothing back without them. On Linux and macOS the operating system raises both lines as it
-opens the port, and a board that wires them to its reset restarts.
+Examples:
+  lamella devices
+  lamella devices --identify COM8
 
---all-devices also lists the vendor-class USB devices this build decided are not debug probes. Use
-it when a probe of yours is missing from the listing above: it is either not attached, or it is in
-that list and this build did not recognize it.
+Details:
+  The ID is the value to pass to --device. Copy it exactly.
 
---json prints the same rows as JSON for a program to read: a schema version, then each row's id,
-its kind (device, probe or drive: the option that takes the id), its type, status and description,
-and, where it has them, its USB ids, serial number, probe family and serial ports. The vendor-class
-devices passed over are listed under passed_over.";
+  In `usb-serial:<usb-serial-number>`, the ID uses the device's USB
+  serial number, so it stays the same if the operating system gives the
+  port a different name. The description shows the current port name.
+
+  In `probe:<probe-serial>/<board-id>`, the board is the one selected for
+  the run. The probe has not identified the board behind it.
+
+  Status:
+    Connected    The operating system can see it. Listing has not opened it.
+    Online       It was asked with --identify and answered.
+    Offline      It was asked with --identify and did not answer.
+    CannotOpen   It was asked with --identify, but its connection could not
+                 be opened.
+    Busy         It answered and refused. The description says why.
+    NeedsUpdate  It answered, but its Lamella Link protocol version does
+                 not overlap with this tool's.
+    Installed    The emulator program is installed on this computer.
+
+  A board wired to a debug probe is listed as the probe's UART bridge, and which board that is
+  stays unknown until something asks it. A board in its bootloader is listed too.
+
+  --identify opens the device as --device opens it: a serial port with DTR and RTS held low, except
+  a Raspberry Pi Debug Probe's and an EDBG's, which pass nothing back without them. On Linux and
+  macOS the operating system raises both lines as it opens the port, and a board that wires them
+  to its reset restarts.
+
+  Use --all-devices when a probe of yours is missing from the listing: it is either not attached,
+  or it is in that list and this build did not recognize it.
+
+  --json prints a schema version, then each row's id, its kind (device, probe or drive: the option
+  that takes the id), its type, status and description, and, where it has them, its USB IDs, serial
+  number, probe family and serial ports. The vendor-class devices passed over are under passed_over.";
 
 /// The option that writes the listing as an MSBuild project, for a device SDK's
 /// `ComputeAvailableDevices` target to read: the probes, each named by its USB serial number, with
@@ -182,7 +234,9 @@ fn spec(args: &[String]) -> Spec<'static> {
         verb: "devices",
         usage: Some(USAGE),
         values: if internal { &[IDENTIFY, MSBUILD] } else { &[IDENTIFY] },
+        repeats: &[],
         flags: &["--all-devices", "--json"],
+        positional: args::Positional::None,
     }
 }
 
@@ -207,7 +261,7 @@ pub fn devices_command(args: &[String]) -> ExitCode {
             description.push_str(&format!("  serial {serial}"));
         }
         attached.push(Attached {
-            id: waiting.volume.clone(),
+            id: Some(waiting.volume.clone()),
             kind: Kind::Drive,
             description,
             facts: Facts { serial: waiting.serial.clone(), ..Facts::default() },
@@ -216,6 +270,12 @@ pub fn devices_command(args: &[String]) -> ExitCode {
 
     let named = parsed.value(IDENTIFY);
     let answer = named.map(ask);
+    if let (Some(named), Some(answer)) = (named, answer.as_ref())
+        && let Some(refusal) = absent(&attached, named, answer)
+    {
+        eprintln!("{refusal}");
+        return ExitCode::FAILURE;
+    }
     let answers = answered_rows(&attached, named, answer.as_ref());
 
     match chosen {
@@ -270,7 +330,7 @@ pub fn devices_command(args: &[String]) -> ExitCode {
                 println!("  {line}");
             }
         }
-        _ => println!("`lamella devices --identify <ID>` asks one device what it is -- board, profile and chip id."),
+        _ => println!("`lamella devices --identify <device>` asks one device what it is -- board, profile and chip id."),
     }
     ExitCode::SUCCESS
 }
@@ -278,7 +338,24 @@ pub fn devices_command(args: &[String]) -> ExitCode {
 /// Each row's answer: the one `named` was given, for the row listed under that id, and none for the
 /// rest. A device named that is not listed has no row, and its answer is printed after the table.
 fn answered_rows<'a>(attached: &[Attached], named: Option<&str>, answer: Option<&'a Answer>) -> Vec<Option<&'a Answer>> {
-    attached.iter().map(|one| answer.filter(|_| named == Some(one.id.as_str()))).collect()
+    attached.iter().map(|one| answer.filter(|_| named.is_some() && one.id.as_deref() == named)).collect()
+}
+
+/// The refusal of `--identify` for the device `named`, when it is not attached: no row of the
+/// listing has it as its ID or its port's name, and asking it could not open it.
+fn absent(attached: &[Attached], named: &str, answer: &Answer) -> Option<String> {
+    let listed = attached.iter().any(|one| {
+        one.id.as_deref().is_some_and(|id| id.eq_ignore_ascii_case(named))
+            || one.facts.port.as_deref().is_some_and(|port| port.eq_ignore_ascii_case(named))
+    });
+    (!listed && answer.status == CANNOT_OPEN).then(|| {
+        let why = if answer.detail == format!("{named} is not attached.") {
+            String::new()
+        } else {
+            format!("\n{}", answer.detail)
+        };
+        format!("lamella devices: {named} is not attached, so nothing was identified.{why}\nTry: lamella devices")
+    })
 }
 
 /// The form `parsed` asks for, or why its options cannot go together.
@@ -288,30 +365,23 @@ fn answered_rows<'a>(attached: &[Attached], named: Option<&str>, answer: Option<
 fn form(parsed: &args::Options) -> Result<Form<'_>, String> {
     let json = parsed.flag("--json");
     let msbuild = parsed.value(MSBUILD);
+    let refused = |wrong: &str| Err(args::refusal("devices", wrong));
     if json && msbuild.is_some() {
-        return Err("lamella devices: --json prints the listing and --msbuild writes it to a file; \
-                    give one of them."
-            .to_owned());
+        return refused("--json prints the listing and --msbuild writes it to a file; give one of them");
     }
     if parsed.value(IDENTIFY).is_some_and(|device| device.starts_with("--")) {
-        return Err("lamella devices: --identify takes the device to ask, as --device takes it: \
-                    lamella devices --identify <ID>."
-            .to_owned());
+        return refused("--identify takes the device to ask, as --device takes it");
     }
     if msbuild.is_some() && parsed.value(IDENTIFY).is_some() {
-        return Err("lamella devices: the MSBuild form is a listing, and a listing asks no device; \
-                    leave --identify out."
-            .to_owned());
+        return refused("the MSBuild form is a listing, and a listing asks no device; leave --identify out");
     }
     if msbuild.is_some() && parsed.flag("--all-devices") {
-        return Err("lamella devices: --all-devices widens the table, and the MSBuild form lists what \
-                    an SDK can choose from; leave it out."
-            .to_owned());
+        return refused(
+            "--all-devices widens the table, and the MSBuild form lists what an SDK can choose from; leave it out",
+        );
     }
     if json && parsed.flag("--all-devices") {
-        return Err("lamella devices: --all-devices widens the table, and the JSON always lists the \
-                    devices passed over; leave it out."
-            .to_owned());
+        return refused("--all-devices widens the table, and the JSON always lists the devices passed over; leave it out");
     }
     Ok(match msbuild {
         Some(path) => Form::MsBuild(path),
@@ -403,11 +473,11 @@ fn assemble(
     for probe in probes {
         let st_link = lamella_stlink::is_st_link(probe.vendor_id, probe.product_id);
         attached.push(Attached {
-            id: probe_id(probe.serial.as_deref(), probe.vendor_id, probe.product_id),
+            id: probe_id(probe.serial.as_deref()),
             kind: Kind::Probe,
             description: probe.product.clone().unwrap_or_else(|| "debug probe".to_owned()),
             facts: Facts {
-                family: Some(if st_link { "st-link" } else { "cmsis-dap" }),
+                family: Some(if st_link { ST_LINK } else { CMSIS_DAP }),
                 wire: (!st_link).then_some(probe.wire),
                 usb: Some((probe.vendor_id, probe.product_id)),
                 serial: probe.serial,
@@ -425,11 +495,11 @@ fn assemble(
             .or_else(|| st_link.product.clone())
             .unwrap_or_else(|| "ST-Link".to_owned());
         attached.push(Attached {
-            id: probe_id(st_link.serial.as_deref(), st_link.vendor_id, st_link.product_id),
+            id: probe_id(st_link.serial.as_deref()),
             kind: Kind::Probe,
             description,
             facts: Facts {
-                family: Some("st-link"),
+                family: Some(ST_LINK),
                 usb: Some((st_link.vendor_id, st_link.product_id)),
                 serial: st_link.serial,
                 product: st_link.product,
@@ -444,7 +514,7 @@ fn assemble(
         };
         let description = board.product.clone().unwrap_or_else(|| "(no product string)".to_owned());
         attached.push(Attached {
-            id,
+            id: Some(id),
             kind: Kind::Device,
             description,
             facts: Facts {
@@ -462,26 +532,21 @@ fn assemble(
         .collect();
     let carrying_probe = |port: &lamella_wire_host::SerialPortDesc| {
         let serial = port.serial_number.as_deref()?;
-        probe_serials.iter().find(|probe| probe.eq_ignore_ascii_case(serial))
+        probe_serials.iter().find(|probe| probe.eq_ignore_ascii_case(serial)).cloned()
     };
     for port in ports {
         let (id, note) = serial_target(port, ports);
-        let mut description = describe(port);
-        if let Some(probe) = carrying_probe(port) {
-            description.push_str(&format!("  [the UART bridge of probe {probe}: target not identified]"));
-        }
-        if let Some(note) = note {
-            description.push_str(&format!("  {note}"));
-        }
         attached.push(Attached {
-            id,
+            id: Some(id),
             kind: Kind::Device,
-            description,
+            description: describe(port),
             facts: Facts {
                 usb: port.vid.zip(port.pid),
                 serial: port.serial_number.clone(),
                 product: port.product.clone(),
                 port: Some(port.port.clone()),
+                bridge_of: carrying_probe(port),
+                note,
                 ..Facts::default()
             },
         });
@@ -496,23 +561,38 @@ fn assemble(
             .map(|port| port.port.clone())
             .collect();
     }
+    unique_ids(&mut attached);
     (attached, passed_over)
 }
 
-/// The id a probe is listed under: its USB serial number, which `--probe` and
-/// `LAMELLA_PROBE_SERIAL` take. A probe the operating system reports no serial number for cannot be
-/// named, and its id says so.
-fn probe_id(serial: Option<&str>, vendor_id: u16, product_id: u16) -> String {
-    match serial {
-        Some(serial) => serial.to_owned(),
-        None => format!("? ({vendor_id:04x}:{product_id:04x}, no serial)"),
+/// The id a probe is listed under: `probe:` and its USB serial number, which `--probe` and
+/// `LAMELLA_PROBE_SERIAL` take as they take the serial number alone, so the id a device list shows
+/// names the probe wherever a probe is named. A probe the operating system reports no serial number
+/// for cannot be named, and has none.
+fn probe_id(serial: Option<&str>) -> Option<String> {
+    serial.map(|serial| format!("{}{serial}", lamella_probe_core::selection::PROBE_ID_PREFIX))
+}
+
+/// Leaves without an ID every row whose ID another row has too, in either case, so that no ID names
+/// two things: two boards that report no USB serial under one USB identity, or two probes that
+/// report one serial number.
+fn unique_ids(attached: &mut [Attached]) {
+    let ids: Vec<String> = attached.iter().filter_map(|one| one.id.clone()).collect();
+    for one in attached.iter_mut() {
+        let shared = one
+            .id
+            .as_deref()
+            .is_some_and(|id| ids.iter().filter(|other| other.eq_ignore_ascii_case(id)).count() > 1);
+        if shared {
+            one.id = None;
+        }
     }
 }
 
 /// The target to print for `port`, and a note when it is not the obvious one.
 ///
 /// **A USB serial number is not unique per port.** One MCU-Link presents TWO virtual COM ports
-/// under a single serial number, so `serial:<that number>` matches both -- and the resolver refuses
+/// under a single serial number, so `usb-serial:<that number>` matches both -- and the resolver refuses
 /// an ambiguous match rather than picking one, which is correct. A listing that printed that target
 /// anyway would be handing the reader a string that cannot be opened, which is worse than printing
 /// the unstable port name: the reader would blame the board.
@@ -532,7 +612,7 @@ fn serial_target(
         .filter(|other| other.serial_number.as_deref() == Some(serial.as_str()))
         .count();
     if sharing <= 1 {
-        return (format!("serial:{serial}"), None);
+        return (format!("usb-serial:{serial}"), None);
     }
     (
         port.port.clone(),
@@ -591,18 +671,24 @@ pub(crate) fn raises_lines(usb: Option<(u16, u16)>) -> bool {
 fn ask(target: &str) -> Answer {
     let mut transport = match crate::deploy::open_named(target, IDENTIFY_TIMEOUT) {
         Ok(transport) => transport,
-        Err(why) => return Answer { board: None, status: "CannotOpen", detail: why },
+        Err(why) => return Answer { board: None, status: CANNOT_OPEN, detail: why },
     };
     answer_of(hello_blocking(&mut transport, 1, host_caps(), IDENTIFY_TIMEOUT))
+}
+
+/// The board a device that answered a HELLO as product model `model` is, in the words `--identify`
+/// gives it: the name its firmware reports, or, for a model this build does not know, that and the
+/// number.
+pub(crate) fn answered_as(model: u16) -> String {
+    lamella_wire::product_model::name(model)
+        .map_or_else(|| format!("a board this build does not know (product model {model})"), str::to_owned)
 }
 
 /// What the outcome of a HELLO says about the device that was asked.
 fn answer_of(hello: Result<Negotiated, lamella_wire::TransportError>) -> Answer {
     match hello {
         Ok(negotiated) => {
-            let model = negotiated.identity.product_model;
-            let board = lamella_wire::product_model::name(model)
-                .map_or_else(|| format!("a board this build does not know (product model {model})"), str::to_owned);
+            let board = answered_as(negotiated.identity.product_model);
             Answer { board: Some(board), status: "Online", detail: render_identity(&negotiated) }
         }
         Err(lamella_wire::TransportError::VersionMismatch { target_min, target_max }) => Answer {
@@ -612,7 +698,7 @@ fn answer_of(hello: Result<Negotiated, lamella_wire::TransportError>) -> Answer 
         },
         Err(lamella_wire::TransportError::Refused { reason, .. }) => Answer {
             board: None,
-            status: "Busy",
+            status: BUSY,
             detail: format!(
                 "it answered and refused: {}",
                 lamella_wire_host::on_device::describe_refusal(reason)
@@ -627,12 +713,69 @@ fn answer_of(hello: Result<Negotiated, lamella_wire::TransportError>) -> Answer 
 }
 
 /// A row's status and description, as every form shows them: an `--identify` answer gives the
-/// status it answered with and, when it named one, the board as the description.
-fn presented<'a>(one: &'a Attached, answer: Option<&'a Answer>) -> (&'a str, &'a str) {
-    let status = answer.map_or(ATTACHED, |answer| answer.status);
-    let description =
-        answer.and_then(|answer| answer.board.as_deref()).unwrap_or(one.description.as_str());
-    (status, description)
+/// status it answered with, and [`described`] the words.
+fn presented<'a>(one: &'a Attached, answer: Option<&'a Answer>) -> (&'a str, String) {
+    (answer.map_or(ATTACHED, |answer| answer.status), described(one, answer))
+}
+
+/// A row's description.
+///
+/// - A probe: `Probe <serial>; board not identified`, since a listing does not ask which board is
+///   wired to it.
+/// - A device a program is sent to: `Interpreter on <board> at <endpoint>`. The board is the one it
+///   answered as, or for a probe's UART bridge the board behind that probe; the endpoint is the
+///   port's name, or the ID of a board on its own USB, which has no other name.
+/// - A board running Lamella firmware that was not asked: `Interpreter on <endpoint>`, since only its
+///   answer names the board.
+/// - A device that refused when it was asked: why.
+/// - Any other port, and a drive: what the operating system reports.
+///
+/// A row with no ID says it cannot be selected, and why.
+fn described(one: &Attached, answer: Option<&Answer>) -> String {
+    let unnamed = |what: &str| match one.facts.serial {
+        None => format!("{what}; no USB serial; cannot be selected uniquely"),
+        Some(_) => format!("{what}; its USB serial names another device too; cannot be selected uniquely"),
+    };
+    let firmware = names_lamella_firmware(one.facts.usb);
+    match one.kind {
+        Kind::Probe => match (&one.id, &one.facts.serial) {
+            (Some(_), Some(serial)) => format!("Probe {serial}; board not identified"),
+            (None, Some(serial)) => unnamed(&format!("Probe {serial}")),
+            (_, None) => "Probe with no USB serial; cannot be selected uniquely".to_owned(),
+        },
+        Kind::Drive => one.description.clone(),
+        Kind::Device if one.id.is_none() && firmware => unnamed("Interpreter on a board running Lamella firmware"),
+        Kind::Device if one.id.is_none() => unnamed(&one.description),
+        Kind::Device => {
+            if let Some(refused) = answer.filter(|answer| answer.status == BUSY) {
+                return refused.detail.clone();
+            }
+            let board = answer
+                .and_then(|answer| answer.board.clone())
+                .or_else(|| one.facts.bridge_of.as_ref().map(|probe| format!("the board behind probe {probe}")))
+                .or_else(|| is_probe_bridge(one.facts.usb).then(|| "the board behind this UART bridge".to_owned()));
+            let mut text = match board {
+                Some(board) => format!("Interpreter on {board} at {}", endpoint(one)),
+                None if firmware => format!("Interpreter on {}", endpoint(one)),
+                None => one.description.clone(),
+            };
+            if let Some(note) = &one.facts.note {
+                text.push_str("  ");
+                text.push_str(note);
+            }
+            text
+        }
+    }
+}
+
+/// Where a device row is reached: its port's name, or the ID of a board on its own USB.
+fn endpoint(one: &Attached) -> &str {
+    one.facts.port.as_deref().or(one.id.as_deref()).unwrap_or_default()
+}
+
+/// What the ID column shows for a row: its ID, or `-` for a row nothing names uniquely.
+fn id_cell(one: &Attached) -> String {
+    one.id.clone().unwrap_or_else(|| "-".to_owned())
 }
 
 /// The listing: the devices as .NET lists them -- an ID, a type, a status and a description, from
@@ -649,21 +792,13 @@ fn render(attached: &[Attached], answers: &[Option<&Answer>]) -> String {
     let devices: Vec<Vec<String>> = rows(Kind::Device)
         .map(|(one, answer)| {
             let (status, description) = presented(one, *answer);
-            vec![one.id.clone(), DEVICE_TYPE.to_owned(), status.to_owned(), description.to_owned()]
+            vec![id_cell(one), DEVICE_TYPE.to_owned(), status.to_owned(), description]
         })
         .collect();
     table(&mut text, &["ID", "TYPE", "STATUS", "DESCRIPTION"], &devices);
     for (kind, heading) in [(Kind::Probe, "PROBE"), (Kind::Drive, "DRIVE")] {
-        let listed: Vec<Vec<String>> = rows(kind)
-            .map(|(one, _)| {
-                let description = if kind == Kind::Probe {
-                    format!("{}  a board may be wired to this over SWD", one.description)
-                } else {
-                    one.description.clone()
-                };
-                vec![one.id.clone(), description]
-            })
-            .collect();
+        let listed: Vec<Vec<String>> =
+            rows(kind).map(|(one, answer)| vec![id_cell(one), presented(one, *answer).1]).collect();
         if !text.is_empty() && !listed.is_empty() {
             text.push('\n');
         }
@@ -731,13 +866,20 @@ fn render_json(
 /// `Description`, the metadata `dotnet run --list-devices` reads, and never `RuntimeIdentifier`,
 /// which `dotnet run` would apply to the whole build.
 ///
-/// `LamellaProbes` returns one item per probe, named by its USB serial number, with `Kind`, `Family`
-/// and `Usb`; a probe with no serial number is left out, because nothing could name it.
+/// `LamellaProbes` returns one item per probe, named by its id, `probe:` and its USB serial number,
+/// with `Kind`, `Family`, `Usb` and the serial number alone as `Serial`; a probe with no serial number
+/// is left out, because nothing could name it.
 ///
 /// `LamellaDevices` returns the devices a program can be sent to, each named by the id `--device`
 /// takes: a board whose USB identity is Lamella firmware's own, and a debug probe's UART bridge, which
-/// carries `Bridge="true"` because the board behind it is not identified. A port of any other
-/// identity is left out, as is everything a listing cannot name without opening it.
+/// carries `Bridge="true"` because the board behind it is not identified. Each carries its `Endpoint`,
+/// the port's name or the ID of a board on its own USB, which its description names it at. A port of
+/// any other identity is left out, as is everything a listing cannot name without opening it, or
+/// without naming something else too.
+///
+/// Every item's `Model` says how a program runs there: `interpreter` on a device, which takes a
+/// program to Lamella's firmware, and `native` through a probe, which writes the program as a native
+/// image.
 ///
 /// Every value is escaped by [`attribute`], so no device string can become a property, an item
 /// list, a wildcard or a separator in the reader's build.
@@ -751,14 +893,15 @@ fn render_msbuild(attached: &[Attached]) -> String {
     );
     text.push_str("  <Target Name=\"LamellaProbes\" Returns=\"@(LamellaProbe)\">\n    <ItemGroup>\n");
     for one in attached.iter().filter(|one| one.kind == Kind::Probe && one.facts.serial.is_some()) {
+        let Some(id) = &one.id else { continue };
         let (status, description) = presented(one, None);
         let _ = write!(
             text,
             "      <LamellaProbe Include=\"{}\" Type=\"{}\" Status=\"{}\" Description=\"{}\" Kind=\"{}\"",
-            attribute(&one.id),
+            attribute(id),
             attribute(DEVICE_TYPE),
             attribute(status),
-            attribute(description),
+            attribute(&description),
             attribute(one.kind.word()),
         );
         if let Some(family) = one.facts.family {
@@ -767,28 +910,32 @@ fn render_msbuild(attached: &[Attached]) -> String {
         if let Some((vendor_id, product_id)) = one.facts.usb {
             let _ = write!(text, " Usb=\"{vendor_id:04x}:{product_id:04x}\"");
         }
-        text.push_str(" />\n");
+        if let Some(serial) = &one.facts.serial {
+            let _ = write!(text, " Serial=\"{}\"", attribute(serial));
+        }
+        let _ = writeln!(text, " Model=\"{NATIVE}\" />");
     }
     text.push_str("    </ItemGroup>\n  </Target>\n");
     text.push_str("  <Target Name=\"LamellaDevices\" Returns=\"@(LamellaDevice)\">\n    <ItemGroup>\n");
     for one in attached.iter().filter(|one| one.kind == Kind::Device) {
         let bridge = is_probe_bridge(one.facts.usb);
-        if !bridge && !names_lamella_firmware(one.facts.usb) {
+        let Some(id) = one.id.as_ref().filter(|_| bridge || names_lamella_firmware(one.facts.usb)) else {
             continue;
-        }
+        };
         let (status, description) = presented(one, None);
         let _ = write!(
             text,
-            "      <LamellaDevice Include=\"{}\" Type=\"{}\" Status=\"{}\" Description=\"{}\"",
-            attribute(&one.id),
+            "      <LamellaDevice Include=\"{}\" Type=\"{}\" Status=\"{}\" Description=\"{}\" Endpoint=\"{}\"",
+            attribute(id),
             attribute(DEVICE_TYPE),
             attribute(status),
-            attribute(description),
+            attribute(&description),
+            attribute(endpoint(one)),
         );
         if bridge {
             text.push_str(" Bridge=\"true\"");
         }
-        text.push_str(" />\n");
+        let _ = writeln!(text, " Model=\"{INTERPRETER}\" />");
     }
     text.push_str("    </ItemGroup>\n  </Target>\n</Project>\n");
     text
@@ -951,7 +1098,7 @@ mod tests {
         use lamella_wire_host::{TargetKind, classify_target};
         assert_eq!(classify_target("usb:39e9:0001:ABC123"), TargetKind::Usb);
         assert_eq!(classify_target("usb:39e9:0001"), TargetKind::Usb);
-        assert_eq!(classify_target("serial:ABC123"), TargetKind::Serial);
+        assert_eq!(classify_target("usb-serial:ABC123"), TargetKind::Serial);
         assert_eq!(classify_target("COM8"), TargetKind::Serial);
         assert_eq!(classify_target("/dev/ttyACM0"), TargetKind::Serial);
     }
@@ -968,7 +1115,7 @@ mod tests {
 
     /// A row with no identifying details, as the table tests need.
     fn row(id: &str, kind: Kind, description: &str) -> Attached {
-        Attached { id: id.to_owned(), kind, description: description.to_owned(), facts: Facts::default() }
+        Attached { id: Some(id.to_owned()), kind, description: description.to_owned(), facts: Facts::default() }
     }
 
     /// **THE SDK IS OFFERED LAMELLA's OWN IDENTITY AND THE PROBES' UART BRIDGES.** A generic USB-UART
@@ -1011,7 +1158,7 @@ mod tests {
     #[test]
     fn only_the_device_named_is_answered() {
         let attached = [
-            row("serial:E6640000000000A1", Kind::Device, "COM75  Debugprobe on Pico (CMSIS-DAP)  (2e8a:000c)"),
+            row("usb-serial:E6640000000000A1", Kind::Device, "COM75  Debugprobe on Pico (CMSIS-DAP)  (2e8a:000c)"),
             row("COM5", Kind::Device, "COM5  USB Serial Port  (0403:6001)"),
         ];
         let answer = Answer { board: Some("Raspberry Pi Pico 2 W".to_owned()), status: "Online", detail: String::new() };
@@ -1044,7 +1191,7 @@ mod tests {
     }
 
     /// An MCU-Link presents two virtual COM ports under one USB serial number, so
-    /// `serial:<that number>` resolves to two ports and the resolver refuses it. Printing it
+    /// `usb-serial:<that number>` resolves to two ports and the resolver refuses it. Printing it
     /// anyway would give the reader a target that cannot be opened -- and they would go looking at
     /// the board.
     #[test]
@@ -1061,7 +1208,7 @@ mod tests {
         assert!(note.expect("it explains itself").contains("2 ports"), "and says how many");
 
         let (target, note) = serial_target(&all[2], &all);
-        assert_eq!(target, "serial:SERIAL0000000001", "a unique serial is the stable handle");
+        assert_eq!(target, "usb-serial:SERIAL0000000001", "a unique serial is the stable handle");
         assert!(note.is_none(), "and needs no explanation");
 
         let (target, note) = serial_target(&all[3], &all);
@@ -1097,10 +1244,12 @@ mod tests {
     /// the words their own options take.
     #[test]
     fn devices_are_listed_as_dotnet_lists_them_and_probes_and_drives_apart() {
+        let mut probe = row("probe:PROBE00001", Kind::Probe, "Debugprobe on Pico (CMSIS-DAP)");
+        probe.facts.serial = Some("PROBE00001".to_owned());
         let attached = [
             row("usb:39e9:0001:SERIAL0000000001", Kind::Device, "Lamella Link device"),
             row("COM8", Kind::Device, "COM8  USB Serial Device  (2e8a:000a)"),
-            row("PROBE00001", Kind::Probe, "Debugprobe on Pico (CMSIS-DAP)"),
+            probe,
             row("D:\\", Kind::Drive, "RP2350  HALTED in its bootloader, waiting for an image"),
         ];
         let online = Answer { board: Some("Raspberry Pi Pico 2 W".to_owned()), status: "Online", detail: String::new() };
@@ -1112,15 +1261,18 @@ mod tests {
         assert!(lines[0].starts_with("ID ") && lines[0].ends_with("STATUS   DESCRIPTION"), "{text}");
         let type_column = lines[0].find("TYPE").expect("a TYPE column");
         assert!(lines[1].starts_with("usb:39e9:0001:SERIAL0000000001  Device  Online"), "{text}");
-        assert!(lines[1].ends_with("Raspberry Pi Pico 2 W"), "the board it answered as: {text}");
+        assert!(
+            lines[1].ends_with("Interpreter on Raspberry Pi Pico 2 W at usb:39e9:0001:SERIAL0000000001"),
+            "the board it answered as, where it answered: {text}"
+        );
         assert!(lines[2].starts_with("COM8 ") && lines[2].contains("Device  Offline"), "{text}");
         assert!(lines[2].ends_with("COM8  USB Serial Device  (2e8a:000a)"), "the OS's words, unanswered: {text}");
         for device in &lines[1..3] {
             assert_eq!(device.find("Device"), Some(type_column), "the columns line up: {text}");
         }
         assert_eq!(lines[3], "", "a probe is no device: {text}");
-        assert!(lines[4].starts_with("PROBE ") && lines[5].starts_with("PROBE00001  Debugprobe"), "{text}");
-        assert!(lines[5].ends_with("(CMSIS-DAP)  a board may be wired to this over SWD"), "{text}");
+        assert!(lines[4].starts_with("PROBE ") && lines[5].starts_with("probe:PROBE00001  "), "{text}");
+        assert!(lines[5].ends_with("  Probe PROBE00001; board not identified"), "{text}");
         assert_eq!(lines[6], "", "{text}");
         assert!(lines[7].starts_with("DRIVE ") && lines[8].starts_with("D:\\ "), "{text}");
         assert!(text.contains("4 attached. --device takes an ID"), "{text}");
@@ -1132,6 +1284,123 @@ mod tests {
             !unasked.lines().any(|line| line.starts_with("PROBE") || line.starts_with("DRIVE")),
             "an empty table is not printed: {unasked}"
         );
+    }
+
+    /// **A DEVICE NAMED TO `--identify` THAT IS NOT ATTACHED IS REFUSED BY NAME**: no row has it as
+    /// its ID or as its port's name, and it could not be opened. One the listing names, and one that
+    /// opened, are answered as they answered.
+    #[test]
+    fn a_device_named_that_is_not_attached_is_refused_by_name() {
+        let mut bridge = row("usb-serial:E6640000000000A1", Kind::Device, "COM75  USB Serial Device (COM75)  (2e8a:000c)");
+        bridge.facts.port = Some("COM75".to_owned());
+        let attached = [bridge];
+        let missing = Answer { board: None, status: CANNOT_OPEN, detail: "COM999 is not attached.".to_owned() };
+        assert_eq!(
+            absent(&attached, "COM999", &missing).as_deref(),
+            Some("lamella devices: COM999 is not attached, so nothing was identified.\nTry: lamella devices")
+        );
+        let refused = Answer { board: None, status: CANNOT_OPEN, detail: "cannot open tcp:192.0.2.1:14825: Closed.".to_owned() };
+        assert_eq!(
+            absent(&[], "tcp:192.0.2.1:14825", &refused).as_deref(),
+            Some(
+                "lamella devices: tcp:192.0.2.1:14825 is not attached, so nothing was identified.\n\
+                 cannot open tcp:192.0.2.1:14825: Closed.\nTry: lamella devices"
+            ),
+            "and says why the open failed where that is not the reason"
+        );
+        assert!(absent(&[], "COM999", &missing).is_some(), "with nothing attached at all, too");
+        assert_eq!(absent(&attached, "com75", &missing), None, "a port the listing names is attached");
+        assert_eq!(absent(&attached, "usb-serial:e6640000000000a1", &missing), None, "and so is a row named by its ID");
+        let silent = Answer { board: None, status: "Offline", detail: String::new() };
+        assert_eq!(absent(&[], "tcp:192.0.2.1:14825", &silent), None, "a device that opened was there to ask");
+    }
+
+    /// **EVERY ID THE LISTING PRINTS NAMES ONE THING, IN CANONICAL SPELLING, AND PASTES BACK
+    /// UNCHANGED**: a device's ID is a target `--device` takes and reaches that row's device, and a
+    /// probe's is the name `--probe` takes for that probe. A row nothing names uniquely -- two boards
+    /// with no USB serial under one USB identity, a probe with no serial, two probes with one serial
+    /// -- is listed with no ID, in the table, the JSON and the MSBuild form alike.
+    #[test]
+    fn every_id_the_listing_prints_is_printed_once_and_pastes_back() {
+        use lamella_wire_host::{TargetKind, classify_target, parse_usb_target};
+        let serial_port = |name: &str, usb: (u16, u16), serial: Option<&str>| lamella_wire_host::SerialPortDesc {
+            port: name.to_owned(),
+            vid: Some(usb.0),
+            pid: Some(usb.1),
+            serial_number: serial.map(str::to_owned),
+            product: None,
+        };
+        let board = |serial: Option<&str>| BoardSeen {
+            vendor_id: lamella_wire::usb::VID,
+            product_id: lamella_wire::usb::PID,
+            serial: serial.map(str::to_owned),
+            product: Some("Lamella Link (RP2350)".to_owned()),
+        };
+        let ports = [
+            serial_port("COM75", (0x2e8a, 0x000c), Some("E6640000000000A1")),
+            serial_port("COM11", (0x1fc9, 0x0143), Some("PROBEALPHA001")),
+            serial_port("COM76", (0x1fc9, 0x0143), Some("PROBEALPHA001")),
+            serial_port("COM3", (0x0403, 0x6001), None),
+        ];
+        let probes =
+            vec![cmsis_dap(Some("E6640000000000A1")), cmsis_dap(None), cmsis_dap(Some("TWIN0001")), cmsis_dap(Some("twin0001"))];
+        let boards = vec![board(Some("A0000000000000B1")), board(None), board(None)];
+        let (attached, _) = assemble(probes, Vec::new(), boards, &ports);
+
+        let ids: Vec<&str> = attached.iter().filter_map(|one| one.id.as_deref()).collect();
+        for id in &ids {
+            assert_eq!(ids.iter().filter(|other| other.eq_ignore_ascii_case(id)).count(), 1, "{id} names one row: {ids:?}");
+        }
+        assert_eq!(
+            ids,
+            [
+                "probe:E6640000000000A1",
+                "usb:39e9:0001:A0000000000000B1",
+                "usb-serial:E6640000000000A1",
+                "COM11",
+                "COM76",
+                "COM3"
+            ],
+            "the two boards with no serial and the three probes nothing names uniquely have none"
+        );
+        for one in &attached {
+            let Some(id) = one.id.as_deref() else {
+                assert!(described(one, None).ends_with("cannot be selected uniquely"), "{}", described(one, None));
+                continue;
+            };
+            let scheme = id.split_once(':').map_or("", |(scheme, _)| scheme);
+            assert_eq!(scheme, scheme.to_ascii_lowercase(), "{id}: the scheme is lowercase");
+            match (one.kind, classify_target(id)) {
+                (Kind::Probe, _) => {
+                    assert_eq!(Some(lamella_probe_core::selection::serial_named(id)), one.facts.serial.as_deref(), "{id}");
+                }
+                (Kind::Device, TargetKind::Usb) => {
+                    let (vid, pid, serial) = parse_usb_target(id);
+                    assert_eq!((Some((vid, pid)), serial.as_deref()), (one.facts.usb, one.facts.serial.as_deref()), "{id}");
+                    assert!(id.starts_with(&format!("usb:{vid:04x}:{pid:04x}")), "{id}: the ids are four lowercase hex digits");
+                }
+                (Kind::Device, TargetKind::Serial) => {
+                    assert_eq!(crate::ports::resolve(id, &ports).as_deref(), Ok(one.facts.port.as_deref().unwrap_or_default()), "{id}");
+                }
+                (kind, target) => panic!("{id} is a {kind:?} row whose ID reads as {target:?}"),
+            }
+        }
+
+        let answers = vec![None; attached.len()];
+        let table = render(&attached, &answers);
+        let first_cells: Vec<&str> =
+            table.lines().filter_map(|line| line.split("  ").next()).filter(|cell| !cell.is_empty()).collect();
+        for id in &ids {
+            assert_eq!(first_cells.iter().filter(|cell| cell == &id).count(), 1, "{id} is in the table once:\n{table}");
+        }
+        let document: Value = serde_json::from_str(&render_json(&attached, &answers, &[])).expect("JSON");
+        let listed: Vec<Option<&str>> =
+            document["devices"].as_array().expect("rows").iter().map(|row| row["id"].as_str()).collect();
+        assert_eq!(listed, attached.iter().map(|one| one.id.as_deref()).collect::<Vec<_>>(), "the JSON's IDs are the rows'");
+        for item in render_msbuild(&attached).lines().filter_map(|line| line.split("Include=\"").nth(1)) {
+            let included = item.split('"').next().unwrap_or_default();
+            assert!(ids.contains(&included), "the MSBuild form offers {included}, which the listing does not name");
+        }
     }
 
     /// A carrier this build was compiled without must be reported as such rather than as a board
@@ -1161,27 +1430,27 @@ mod tests {
     #[test]
     fn the_usage_opens_with_the_verb_it_belongs_to() {
         assert!(
-            USAGE.starts_with("usage: lamella devices"),
+            USAGE.starts_with("Usage:\n  lamella devices "),
             "`devices` must open with the line a reader retypes: {}",
-            USAGE.lines().next().unwrap_or_default()
+            USAGE.lines().nth(1).unwrap_or_default()
         );
     }
 
     /// **AN ST-LINK IS LISTED AS THE PROBE IT IS.** The CMSIS-DAP filter declines it, and its
-    /// vendor and product id bring it back: named by its serial number, its family `st-link`, its
-    /// description the generation the id names -- and it no longer counts among the devices that
-    /// are not probes, while a device that really is not one still does.
+    /// vendor and product id bring it back: named by its id, `probe:` and its serial number, its
+    /// family `st-link`, its description the generation the id names -- and it no longer counts
+    /// among the devices that are not probes, while a device that really is not one still does.
     #[test]
     fn an_st_link_the_cmsis_dap_filter_passed_over_is_listed_as_a_probe() {
         let passed_over = vec![
-            declined(0x0483, 0x374b, "066DFF555051897267143327", "STM32 STLink"),
+            declined(0x0483, 0x374b, "066D000000000000000000C1", "STM32 STLink"),
             declined(0x1915, 0x520f, "NOTAPROBE01", "a radio dongle"),
         ];
         let (attached, still_passed_over) = assemble(Vec::new(), passed_over, Vec::new(), &[]);
 
         assert_eq!(attached.len(), 1, "the ST-Link alone becomes a row");
         let st_link = &attached[0];
-        assert_eq!(st_link.id, "066DFF555051897267143327");
+        assert_eq!(st_link.id.as_deref(), Some("probe:066D000000000000000000C1"));
         assert_eq!(st_link.kind, Kind::Probe);
         assert_eq!(st_link.description, "ST-LINK/V2-1");
         assert_eq!(st_link.facts.family, Some("st-link"));
@@ -1204,10 +1473,10 @@ mod tests {
             wire: "bulk-v2",
         };
         let (attached, _) =
-            assemble(vec![cmsis_dap(Some("E6614103E7176B2F")), unknown_st_link], Vec::new(), Vec::new(), &[]);
+            assemble(vec![cmsis_dap(Some("E6610000000000B2")), unknown_st_link], Vec::new(), Vec::new(), &[]);
         assert_eq!(attached[0].facts.family, Some("cmsis-dap"));
         assert_eq!(attached[0].facts.wire, Some("bulk-v2"));
-        assert_eq!(attached[0].id, "E6614103E7176B2F", "a probe is named by its serial number");
+        assert_eq!(attached[0].id.as_deref(), Some("probe:E6610000000000B2"), "a probe is named by its id, probe: and its serial number");
         assert_eq!(attached[1].facts.family, Some("st-link"));
         assert_eq!(attached[1].facts.wire, None);
     }
@@ -1218,24 +1487,22 @@ mod tests {
     #[test]
     fn a_probe_names_the_serial_ports_it_carries() {
         let ports = vec![
-            port("COM7", Some("066dff555051897267143327")),
+            port("COM7", Some("066d000000000000000000c1")),
             port("COM9", Some("SOMEBOARD0001")),
         ];
-        let passed_over = vec![declined(0x0483, 0x374b, "066DFF555051897267143327", "STM32 STLink")];
+        let passed_over = vec![declined(0x0483, 0x374b, "066D000000000000000000C1", "STM32 STLink")];
         let (attached, _) = assemble(vec![cmsis_dap(None)], passed_over, Vec::new(), &ports);
 
         let st_link = attached.iter().find(|one| one.facts.family == Some("st-link")).expect("the ST-Link");
         assert_eq!(st_link.facts.ports, ["COM7"]);
         let unnamed = attached.iter().find(|one| one.facts.family == Some("cmsis-dap")).expect("the probe");
-        assert_eq!(unnamed.id, "? (2e8a:000c, no serial)", "a probe with no serial says it cannot be named");
+        assert_eq!(unnamed.id, None, "a probe with no serial has no ID");
+        assert_eq!(described(unnamed, None), "Probe with no USB serial; cannot be selected uniquely");
         assert!(unnamed.facts.ports.is_empty(), "with no serial, no port is its");
 
         let com7 = attached.iter().find(|one| one.facts.port.as_deref() == Some("COM7")).expect("COM7");
-        assert!(
-            com7.description.contains("[the UART bridge of probe 066DFF555051897267143327: target not identified]"),
-            "{}",
-            com7.description
-        );
+        assert_eq!(com7.facts.bridge_of.as_deref(), Some("066D000000000000000000C1"));
+        assert_eq!(described(com7, None), "Interpreter on the board behind probe 066D000000000000000000C1 at COM7");
         let com9 = attached.iter().find(|one| one.facts.port.as_deref() == Some("COM9")).expect("COM9");
         assert!(!com9.description.contains("UART bridge"), "{}", com9.description);
         assert_eq!(com9.facts.usb, Some((0x1fc9, 0x0143)));
@@ -1246,16 +1513,16 @@ mod tests {
     /// serial ports it carries -- and nothing that is not a probe.
     #[test]
     fn a_run_is_offered_the_probes_the_listing_shows() {
-        let ports = vec![port("COM7", Some("066dff555051897267143327")), port("COM9", Some("SOMEBOARD0001"))];
-        let passed_over = vec![declined(0x0483, 0x374b, "066DFF555051897267143327", "STM32 STLink")];
-        let (attached, _) = assemble(vec![cmsis_dap(Some("E6614103E7176B2F"))], passed_over, Vec::new(), &ports);
+        let ports = vec![port("COM7", Some("066d000000000000000000c1")), port("COM9", Some("SOMEBOARD0001"))];
+        let passed_over = vec![declined(0x0483, 0x374b, "066D000000000000000000C1", "STM32 STLink")];
+        let (attached, _) = assemble(vec![cmsis_dap(Some("E6610000000000B2"))], passed_over, Vec::new(), &ports);
 
         let probes = probes_among(attached);
         assert_eq!(probes.len(), 2, "the two probes, and neither port: {probes:?}");
-        assert_eq!(probes[0].serial.as_deref(), Some("E6614103E7176B2F"));
+        assert_eq!(probes[0].serial.as_deref(), Some("E6610000000000B2"));
         assert_eq!(probes[0].usb, (0x2e8a, 0x000c));
         assert!(probes[0].ports.is_empty());
-        assert_eq!(probes[1].serial.as_deref(), Some("066DFF555051897267143327"));
+        assert_eq!(probes[1].serial.as_deref(), Some("066D000000000000000000C1"));
         assert_eq!(probes[1].description, "ST-LINK/V2-1");
         assert_eq!(probes[1].ports, ["COM7"]);
     }
@@ -1265,33 +1532,35 @@ mod tests {
     /// hex digits; a detail it does not have as `null`; and the devices passed over.
     #[test]
     fn the_json_carries_each_rows_words_and_ids() {
-        let mut probe = row("E6614103E7176B2F", Kind::Probe, "Debugprobe on Pico (CMSIS-DAP)");
+        let mut probe = row("probe:E6610000000000B2", Kind::Probe, "Debugprobe on Pico (CMSIS-DAP)");
         probe.facts = Facts {
             family: Some("cmsis-dap"),
             wire: Some("bulk-v2"),
             usb: Some((0x2e8a, 0x000c)),
-            serial: Some("E6614103E7176B2F".to_owned()),
+            serial: Some("E6610000000000B2".to_owned()),
             product: Some("Debugprobe on Pico (CMSIS-DAP)".to_owned()),
             port: None,
             ports: vec!["COM12".to_owned()],
+            ..Facts::default()
         };
         let attached = [probe, row("COM3", Kind::Device, "COM3  (not a USB port)")];
         let passed_over = [declined(0x1915, 0x520f, "NOTAPROBE01", "a radio dongle")];
 
         let text = render_json(&attached, &[None, None], &passed_over);
         let document: Value = serde_json::from_str(&text).expect("the JSON parses");
-        assert_eq!(document["schema"], 1);
+        assert_eq!(document["schema"], 2);
         let first = &document["devices"][0];
-        assert_eq!(first["id"], "E6614103E7176B2F");
+        assert_eq!(first["id"], "probe:E6610000000000B2");
         assert_eq!(first["kind"], "probe");
         assert_eq!(first["type"], "Device");
         assert_eq!(first["status"], "Connected");
-        assert_eq!(first["description"], "Debugprobe on Pico (CMSIS-DAP)");
+        assert_eq!(first["description"], "Probe E6610000000000B2; board not identified");
+        assert_eq!(first["product"], "Debugprobe on Pico (CMSIS-DAP)", "the probe's own name stays in the JSON");
         assert_eq!(first["family"], "cmsis-dap");
         assert_eq!(first["wire"], "bulk-v2");
         assert_eq!(first["vid"], "2e8a");
         assert_eq!(first["pid"], "000c");
-        assert_eq!(first["serial"], "E6614103E7176B2F");
+        assert_eq!(first["serial"], "E6610000000000B2");
         assert_eq!(first["ports"], json!(["COM12"]));
         let second = &document["devices"][1];
         assert_eq!(second["kind"], "device");
@@ -1312,13 +1581,59 @@ mod tests {
         let answers = [Some(&answer)];
         let table = render(&attached, &answers);
         let document: Value = serde_json::from_str(&render_json(&attached, &answers, &[])).expect("JSON");
-        assert!(table.contains("Online") && table.contains("Raspberry Pi Pico 2 W"), "{table}");
+        assert!(table.contains("Online") && table.contains("Interpreter on Raspberry Pi Pico 2 W at COM8"), "{table}");
         assert_eq!(document["devices"][0]["status"], "Online");
-        assert_eq!(document["devices"][0]["description"], "Raspberry Pi Pico 2 W");
+        assert_eq!(document["devices"][0]["description"], "Interpreter on Raspberry Pi Pico 2 W at COM8");
 
         let unasked: Value = serde_json::from_str(&render_json(&attached, &[None], &[])).expect("JSON");
         assert_eq!(unasked["devices"][0]["status"], ATTACHED);
         assert_eq!(unasked["devices"][0]["description"], "COM8  USB Serial Device  (2e8a:000a)");
+    }
+
+    /// **A BOARD RUNNING LAMELLA's FIRMWARE IS DESCRIBED BY WHERE IT IS UNTIL IT ANSWERS, NEVER BY
+    /// ITS USB PRODUCT STRING**, which names the chip's family rather than the board. Unasked, it is
+    /// the interpreter at its endpoint; asked, the interpreter on the board it answered as, there; a
+    /// board nothing names uniquely is described without the product string too. Every form agrees,
+    /// and the JSON keeps the product string as the operating system reported it.
+    #[test]
+    fn a_board_on_lamella_firmware_is_described_by_where_it_is_until_it_answers() {
+        let board = |serial: Option<&str>| BoardSeen {
+            vendor_id: lamella_wire::usb::VID,
+            product_id: lamella_wire::usb::PID,
+            serial: serial.map(str::to_owned),
+            product: Some("Lamella Link (RP2350)".to_owned()),
+        };
+        let on_a_port = lamella_wire_host::SerialPortDesc {
+            port: "COM8".to_owned(),
+            vid: Some(lamella_wire::usb::VID),
+            pid: Some(lamella_wire::usb::PID),
+            serial_number: None,
+            product: Some("Lamella Link (RP2350)".to_owned()),
+        };
+        let boards = vec![board(Some("E6610000000000B2")), board(None), board(None)];
+        let (attached, _) = assemble(Vec::new(), Vec::new(), boards, &[on_a_port]);
+        let unnamed = "Interpreter on a board running Lamella firmware; no USB serial; cannot be selected uniquely";
+        assert_eq!(
+            attached.iter().map(|one| described(one, None)).collect::<Vec<_>>(),
+            ["Interpreter on usb:39e9:0001:E6610000000000B2", unnamed, unnamed, "Interpreter on COM8"]
+        );
+        let answer = Answer { board: Some("Raspberry Pi Pico 2".to_owned()), status: "Online", detail: String::new() };
+        assert_eq!(
+            described(&attached[0], Some(&answer)),
+            "Interpreter on Raspberry Pi Pico 2 at usb:39e9:0001:E6610000000000B2",
+            "asked, the board it answered as"
+        );
+
+        let unasked = vec![None; attached.len()];
+        let table = render(&attached, &unasked);
+        assert!(!table.contains("Lamella Link (RP2350)"), "{table}");
+        let msbuild = render_msbuild(&attached);
+        assert!(!msbuild.contains("Lamella Link (RP2350)"), "{msbuild}");
+        let document: Value = serde_json::from_str(&render_json(&attached, &unasked, &[])).expect("JSON");
+        for row in document["devices"].as_array().expect("rows") {
+            assert!(!row["description"].as_str().unwrap_or_default().contains("Lamella Link (RP2350)"), "{row}");
+            assert_eq!(row["product"], "Lamella Link (RP2350)", "the operating system's words stay in the JSON");
+        }
     }
 
     /// **EVERY CHARACTER MSBUILD OR XML TREATS SPECIALLY IS ESCAPED**, and a control character
@@ -1335,31 +1650,31 @@ mod tests {
         assert_eq!(attribute("plain-ASCII_0123 (ok)"), "plain-ASCII_0123 (ok)", "the rest passes through");
     }
 
-    /// **THE MSBUILD FORM's PROBES ARE NAMED BY THEIR SERIAL NUMBERS.** One item per probe with a
-    /// serial number, under the target an SDK calls; the three metadata .NET reads beside the probe's
-    /// kind, family and USB ids; never `RuntimeIdentifier`; no drive and no probe that cannot be
-    /// named; a device of no identity the SDK is offered is left out of both targets; and a comment
-    /// XML can read.
+    /// **THE MSBUILD FORM's PROBES ARE NAMED BY THEIR IDS, `probe:` AND THE SERIAL NUMBER.** One item
+    /// per probe with a serial number, under the target an SDK calls; the three metadata .NET reads
+    /// beside the probe's kind, family, USB ids, serial number alone and model, `native`; never
+    /// `RuntimeIdentifier`; no drive and no probe that cannot be named; a device of no identity the
+    /// SDK is offered is left out of both targets; the schema, 2; and a comment XML can read.
     #[test]
     fn the_msbuild_form_lists_the_probes_named_by_their_serial_numbers() {
-        let mut probe = row("E6614103E7176B2F", Kind::Probe, "Debugprobe on Pico (CMSIS-DAP)");
+        let mut probe = row("probe:E6610000000000B2", Kind::Probe, "Debugprobe on Pico (CMSIS-DAP)");
         probe.facts = Facts {
             family: Some("cmsis-dap"),
             usb: Some((0x2e8a, 0x000c)),
-            serial: Some("E6614103E7176B2F".to_owned()),
+            serial: Some("E6610000000000B2".to_owned()),
             ..Facts::default()
         };
-        let mut st_link = row("066DFF555051897267143327", Kind::Probe, "ST-LINK/V2-1");
+        let mut st_link = row("probe:066D000000000000000000C1", Kind::Probe, "ST-LINK/V2-1");
         st_link.facts = Facts {
             family: Some("st-link"),
             usb: Some((0x0483, 0x374b)),
-            serial: Some("066DFF555051897267143327".to_owned()),
+            serial: Some("066D000000000000000000C1".to_owned()),
             ..Facts::default()
         };
         let attached = [
             probe,
             st_link,
-            row("? (2e8a:000c, no serial)", Kind::Probe, "Debugprobe on Pico (CMSIS-DAP)"),
+            Attached { id: None, ..row("-", Kind::Probe, "Debugprobe on Pico (CMSIS-DAP)") },
             row("COM8", Kind::Device, "COM8  USB Serial Device  (2e8a:000a)"),
             row("D:\\", Kind::Drive, "RP2350  HALTED in its bootloader, waiting for an image"),
         ];
@@ -1369,14 +1684,16 @@ mod tests {
             "<Project>\n\
              \x20 <!-- Written by the lamella devices command: what is attached to this computer. -->\n\
              \x20 <PropertyGroup>\n\
-             \x20   <LamellaDevicesSchema>1</LamellaDevicesSchema>\n\
+             \x20   <LamellaDevicesSchema>2</LamellaDevicesSchema>\n\
              \x20 </PropertyGroup>\n\
              \x20 <Target Name=\"LamellaProbes\" Returns=\"@(LamellaProbe)\">\n\
              \x20   <ItemGroup>\n\
-             \x20     <LamellaProbe Include=\"E6614103E7176B2F\" Type=\"Device\" Status=\"Connected\" \
-             Description=\"Debugprobe on Pico (CMSIS-DAP)\" Kind=\"probe\" Family=\"cmsis-dap\" Usb=\"2e8a:000c\" />\n\
-             \x20     <LamellaProbe Include=\"066DFF555051897267143327\" Type=\"Device\" Status=\"Connected\" \
-             Description=\"ST-LINK/V2-1\" Kind=\"probe\" Family=\"st-link\" Usb=\"0483:374b\" />\n\
+             \x20     <LamellaProbe Include=\"probe:E6610000000000B2\" Type=\"Device\" Status=\"Connected\" \
+             Description=\"Probe E6610000000000B2%3B board not identified\" Kind=\"probe\" Family=\"cmsis-dap\" Usb=\"2e8a:000c\" \
+             Serial=\"E6610000000000B2\" Model=\"native\" />\n\
+             \x20     <LamellaProbe Include=\"probe:066D000000000000000000C1\" Type=\"Device\" Status=\"Connected\" \
+             Description=\"Probe 066D000000000000000000C1%3B board not identified\" Kind=\"probe\" Family=\"st-link\" Usb=\"0483:374b\" \
+             Serial=\"066D000000000000000000C1\" Model=\"native\" />\n\
              \x20   </ItemGroup>\n\
              \x20 </Target>\n\
              \x20 <Target Name=\"LamellaDevices\" Returns=\"@(LamellaDevice)\">\n\
@@ -1392,9 +1709,9 @@ mod tests {
 
     /// **THE SDK IS OFFERED EACH DEVICE BY ITS USB IDENTITY, AND NOTHING IS ASKED.** On a bench of a
     /// board running Lamella firmware on its own USB and three probes, one of them an MCU-Link with
-    /// two ports under one serial number: the board by its own id and product string, each probe's
-    /// bridge by the id `--device` takes and marked as a bridge whose target is not identified, and
-    /// neither a generic USB-UART nor a port with no USB identity.
+    /// two ports under one serial number: the board by its own id, as the interpreter at that id,
+    /// each probe's bridge by the id `--device` takes and marked as a bridge whose target is not
+    /// identified, and neither a generic USB-UART nor a port with no USB identity.
     #[test]
     fn the_msbuild_form_offers_the_devices_by_their_usb_identity_alone() {
         let serial_port = |name: &str, usb: Option<(u16, u16)>, serial: Option<&str>, product: Option<&str>| {
@@ -1416,18 +1733,18 @@ mod tests {
         let board = BoardSeen {
             vendor_id: lamella_wire::usb::VID,
             product_id: lamella_wire::usb::PID,
-            serial: Some("E6614103E7176B2F".to_owned()),
+            serial: Some("E6610000000000B2".to_owned()),
             product: Some("Lamella Link (RP2350)".to_owned()),
         };
         let ports = [
             serial_port("COM75", Some((0x2e8a, 0x000c)), Some("E6640000000000A1"), Some("USB Serial Device (COM75)")),
-            serial_port("COM7", Some((0x0483, 0x374b)), Some("066DFF555051897267143327"), Some("STMicroelectronics STLink Virtual COM Port (COM7)")),
+            serial_port("COM7", Some((0x0483, 0x374b)), Some("066D000000000000000000C1"), Some("STMicroelectronics STLink Virtual COM Port (COM7)")),
             serial_port("COM11", Some((0x1fc9, 0x0143)), Some("PROBEALPHA001"), None),
             serial_port("COM76", Some((0x1fc9, 0x0143)), Some("PROBEALPHA001"), None),
             serial_port("COM5", Some((0x0403, 0x6001)), Some("A10KXYZ"), Some("USB Serial Port (COM5)")),
             serial_port("COM1", None, None, Some("Communications Port (COM1)")),
         ];
-        let passed_over = vec![declined(0x0483, 0x374b, "066DFF555051897267143327", "STM32 STLink")];
+        let passed_over = vec![declined(0x0483, 0x374b, "066D000000000000000000C1", "STM32 STLink")];
         let (attached, _) = assemble(vec![cmsis_dap(Some("E6640000000000A1")), mcu_link], passed_over, vec![board], &ports);
 
         let text = render_msbuild(&attached);
@@ -1436,20 +1753,21 @@ mod tests {
             devices,
             " Returns=\"@(LamellaDevice)\">\n\
              \x20   <ItemGroup>\n\
-             \x20     <LamellaDevice Include=\"usb:39e9:0001:E6614103E7176B2F\" Type=\"Device\" Status=\"Connected\" \
-             Description=\"Lamella Link (RP2350)\" />\n\
-             \x20     <LamellaDevice Include=\"serial:E6640000000000A1\" Type=\"Device\" Status=\"Connected\" \
-             Description=\"COM75  USB Serial Device (COM75)  (2e8a:000c)  [the UART bridge of probe E6640000000000A1: \
-             target not identified]\" Bridge=\"true\" />\n\
-             \x20     <LamellaDevice Include=\"serial:066DFF555051897267143327\" Type=\"Device\" Status=\"Connected\" \
-             Description=\"COM7  STMicroelectronics STLink Virtual COM Port (COM7)  (0483:374b)  [the UART bridge of \
-             probe 066DFF555051897267143327: target not identified]\" Bridge=\"true\" />\n\
-             \x20     <LamellaDevice Include=\"COM11\" Type=\"Device\" Status=\"Connected\" Description=\"COM11  (1fc9:0143)  \
-             [the UART bridge of probe PROBEALPHA001: target not identified]  [serial PROBEALPHA001 names 2 ports, so the \
-             port name addresses this one]\" Bridge=\"true\" />\n\
-             \x20     <LamellaDevice Include=\"COM76\" Type=\"Device\" Status=\"Connected\" Description=\"COM76  (1fc9:0143)  \
-             [the UART bridge of probe PROBEALPHA001: target not identified]  [serial PROBEALPHA001 names 2 ports, so the \
-             port name addresses this one]\" Bridge=\"true\" />\n\
+             \x20     <LamellaDevice Include=\"usb:39e9:0001:E6610000000000B2\" Type=\"Device\" Status=\"Connected\" \
+             Description=\"Interpreter on usb:39e9:0001:E6610000000000B2\" \
+             Endpoint=\"usb:39e9:0001:E6610000000000B2\" Model=\"interpreter\" />\n\
+             \x20     <LamellaDevice Include=\"usb-serial:E6640000000000A1\" Type=\"Device\" Status=\"Connected\" \
+             Description=\"Interpreter on the board behind probe E6640000000000A1 at COM75\" Endpoint=\"COM75\" \
+             Bridge=\"true\" Model=\"interpreter\" />\n\
+             \x20     <LamellaDevice Include=\"usb-serial:066D000000000000000000C1\" Type=\"Device\" Status=\"Connected\" \
+             Description=\"Interpreter on the board behind probe 066D000000000000000000C1 at COM7\" Endpoint=\"COM7\" \
+             Bridge=\"true\" Model=\"interpreter\" />\n\
+             \x20     <LamellaDevice Include=\"COM11\" Type=\"Device\" Status=\"Connected\" Description=\"Interpreter on the \
+             board behind probe PROBEALPHA001 at COM11  [serial PROBEALPHA001 names 2 ports, so the port name addresses \
+             this one]\" Endpoint=\"COM11\" Bridge=\"true\" Model=\"interpreter\" />\n\
+             \x20     <LamellaDevice Include=\"COM76\" Type=\"Device\" Status=\"Connected\" Description=\"Interpreter on the \
+             board behind probe PROBEALPHA001 at COM76  [serial PROBEALPHA001 names 2 ports, so the port name addresses \
+             this one]\" Endpoint=\"COM76\" Bridge=\"true\" Model=\"interpreter\" />\n\
              \x20   </ItemGroup>\n\
              \x20 </Target>\n\
              </Project>\n"
@@ -1484,7 +1802,7 @@ mod tests {
         assert_eq!(form(&parse(&[])), Ok(Form::Table));
         assert_eq!(form(&parse(&["--identify", "COM8", "--all-devices"])), Ok(Form::Table));
         assert_eq!(form(&parse(&["--json"])), Ok(Form::Json));
-        assert_eq!(form(&parse(&["--json", "--identify", "serial:E6640000000000A1"])), Ok(Form::Json));
+        assert_eq!(form(&parse(&["--json", "--identify", "usb-serial:E6640000000000A1"])), Ok(Form::Json));
         assert_eq!(form(&parse(&["--msbuild", "obj/devices.xml"])), Ok(Form::MsBuild("obj/devices.xml")));
         for refused in [
             &["--json", "--msbuild", "x.xml"][..],

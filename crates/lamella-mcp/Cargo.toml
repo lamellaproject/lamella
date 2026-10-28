@@ -69,5 +69,10 @@ bake = [
     "dep:lamella-token",
 ]
 
+[[package.metadata.lamella.test-configuration]]
+name = "bake"
+args = ["--features", "bake"]
+why = "the on-device path (size, bake, deploy, run on a board, source-level debug) and a .NET IoT program run on a board over stdio, which are off in a workspace build"
+
 [lints]
 workspace = true

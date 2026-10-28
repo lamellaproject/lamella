@@ -305,9 +305,9 @@ pub fn refuse_what_alone_cannot_run(program: &Assembly<'static>) -> Result<(), S
     };
     Err(format!(
         "{head}{}\n\n\
-         This tool bakes the program alone. `lamella run <file> --device <d>` builds its image with \
-         the corlib\nand the libraries the program was compiled against, for the board that \
-         answers, and runs it there.",
+         This tool bakes the program alone. `lamella run <file> --device <device>` builds its image \
+         with\nthe corlib and the libraries the program was compiled against, for the board that \
+         answers, and runs\nit there.",
         listed(&violations, &loaded.module, &assemblies, None)
     ))
 }

@@ -3,7 +3,7 @@ using System.Device.Gpio;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Samg55GpioDriver : GpioDriver
+internal sealed class Samg55GpioDriver : GpioDriver
 {
     protected override int PinCount { get { return 48; } }
 
@@ -89,7 +89,7 @@ public sealed class Samg55GpioDriver : GpioDriver
 
     /// <summary>The logical pin number for a generated controller base and line index -- the form
     /// every board binding emits.</summary>
-    /// <remarks>ON THE DRIVER RATHER THAN ON EACH BOARD, because which controller a BASE is happens
+    /// <remarks>On the driver rather than on each board, because which controller a BASE is happens
     /// to be family truth: the bases come from this family's instance map and the lines-per-
     /// controller is this family's, so each board class carrying its own switch would be one copy
     /// per board of one fact.</remarks>

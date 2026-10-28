@@ -5,16 +5,16 @@
 #   PINCFG[p] = group_base + 0x40 + p        (p = the pin index within the group)
 # The generator owns those derivations; drivers receive resolved addresses through their bindings.
 #
-# EVERY OFFSET HERE CAME OFF THE SAM D20'S OWN 21.9 REGISTER DESCRIPTIONS, WHICH STATE ONE
-# OFFSET EACH IN PROSE, AND NOT OFF THE 21.7 REGISTER-SUMMARY TABLE. In that table each register
+# Every offset here came off the SAM D20's own 21.9 register descriptions, which state one
+# offset each in prose, and not off the 21.7 register-summary table. In that table each register
 # occupies four rows, one per byte lane, and carries its name and its offset on only the first of
 # them -- so the Offset column and the Name column advance at different rates, and a reader
 # checking a value against it has to track which lane a row belongs to.
 #
-# THE GROUP COUNT COMES FROM THE PAD SET, AND ON THIS FAMILY IT HAS TO. The sibling samr21 block
+# The group count comes from the pad set, and on this family it has to. The sibling samr21 block
 # takes its count from the register descriptions themselves, which print each offset as
-# '0x..+x*0x80 [x=0..2]' and so state the stride and the bound in one expression. THIS DOCUMENT
-# DOES NOT WRITE THEM THAT WAY: 21.9's offsets carry no x term at all, and 21.8 states the stride
+# '0x..+x*0x80 [x=0..2]' and so state the stride and the bound in one expression. This document
+# does not write them that way: 21.9's offsets carry no x term at all, and 21.8 states the stride
 # in a Tip that ends 'group 1 is for the PB pins, etc.' -- an open-ended etc. with no bound. So
 # the bound is taken from the only statement that carries one: Table 6-1's pad set reaches PB and
 # stops, giving two groups. A recipe that names the offset expression as the source for the count
@@ -92,7 +92,7 @@ fields = { PMUXEN = [0, 1], INEN = [1, 1], PULLEN = [2, 1], DRVSTR = [6, 1] }
 notes = "Element 0 of the per-pin config array; see the block header for the element derivation."
 
 # Function-letter values for PMUX nibbles (family-wide; the pin-map rows name letters).
-# NOTE: THE LETTERS DO NOT SELECT WHAT THEY SELECT ON A SAMD21 -- the VALUES are the same 0..7,
+# Note: the letters do not select what they select on a SAMD21 -- the VALUES are the same 0..7,
 # but this part has no TCC at all, so Table 6-1 spends BOTH E and F on TC where the SAMD21 spends
 # F on TCC. A pin-map row carries the letter and this table turns it into a nibble; what the
 # letter SELECTS is Table 6-1's business.

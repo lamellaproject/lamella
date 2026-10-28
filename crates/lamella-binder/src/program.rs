@@ -221,9 +221,6 @@ pub fn bind_compilation_unit_with_model(
 /// be judged against it -- CS0101 for an ordinary duplicate, and CS0260 through CS0265 for the
 /// parts of a partial type (17.1.4).
 ///
-/// **THE PARTS ARE COMPARED AGAINST THE FIRST ONE RATHER THAN ALL-PAIRS**, which is csc's shape:
-/// each rule is reported once per type, and the fields a part omits are FILLED IN from it so a
-/// third part is judged against everything stated so far.
 struct DeclaredType {
     /// Whether the declaration carried `partial`.
     is_partial: bool,
@@ -289,11 +286,6 @@ type DeclaredTypes =
 /// file -- meets the one before it here. A duplicate NESTED type is CS0102 instead, reported
 /// elsewhere, so this walk does not descend into a type's members.
 ///
-/// **A PARTIAL PART IS NOT A DUPLICATE, AND A NON-PARTIAL ONE BESIDE IT IS NOT CS0101 EITHER.**
-/// Measured against csc: one part carrying `partial` makes every other declaration of that name a
-/// PART, so the one missing the modifier answers CS0260 rather than "already contains a
-/// definition". CS0101 survives for the case it was written for -- two declarations, neither
-/// partial -- and for a collision with an enum or delegate, which cannot be partial at all.
 fn report_duplicate_types(
     binder: &mut Binder,
     members: &[NamespaceMember],
@@ -403,9 +395,6 @@ fn report_duplicate_types(
 /// Judges one PART of a partial type against everything the earlier parts stated, reporting each
 /// rule at most once per type, and folds what this part adds into the record.
 ///
-/// **WHICH PART A RULE IS REPORTED AGAINST IS csc's, MEASURED RATHER THAN CHOSEN.** CS0260 lands on
-/// the declaration missing the modifier, whichever it is; CS0261 and CS0263 on the LATER part;
-/// CS0262, CS0264 and CS0265 on the FIRST. A single placement for all six would move four of them.
 fn report_partial_conflicts(binder: &mut Binder, earlier: &mut DeclaredType, part: DeclaredType) {
     let quoted = earlier.quoted.clone();
     if !earlier.reported.missing {
@@ -579,11 +568,6 @@ enum PartMember {
 /// The members one declaration contributes to its type's declaration space, for the CROSS-PART
 /// duplicate check.
 ///
-/// **THE WITHIN-ONE-DECLARATION CHECK ALREADY EXISTS AND IS NOT REPEATED HERE.** `validate_type`
-/// walks a declaration's own members for CS0102 and CS0111; what no per-declaration walk can see is
-/// a member declared in ANOTHER part -- possibly another file -- which csc reports just the same.
-/// An explicit interface implementation is exempt for the reason it is exempt there: 20.4.1 lets it
-/// repeat a simple name.
 fn part_members(binder: &mut Binder, declaration: &TypeDecl) -> Vec<PartMember> {
     let mut members = Vec::new();
     for member in &declaration.members {
@@ -942,8 +926,6 @@ fn declare_top_level_statements(binder: &mut Binder, units: &[CompilationUnit]) 
 /// `CS8802` and `CS8805` first, where csc lists them, and each `CS7022` after the unit's other
 /// diagnostics.
 ///
-/// After the declaration-error filter, which none of them may feed: csc reports a body's own
-/// errors beside a `CS8805` (measured), and a warning withholds nothing.
 fn attach_top_level_reports(per_unit: &mut [Vec<Diagnostic>], reports: Vec<(usize, Diagnostic)>) {
     for (index, diagnostic) in reports {
         let Some(unit) = per_unit.get_mut(index) else {
@@ -965,14 +947,6 @@ fn attach_top_level_reports(per_unit: &mut [Vec<Diagnostic>], reports: Vec<(usiz
 /// OWN DECLARATION'S SCOPE (10.8) -- the enclosing type, the current namespace, the global
 /// namespace, and the file's `using`s, through [`Binder::canonicalize`]'s scope walk.
 ///
-/// **THIS REPLACED the model-wide `canonicalize_signatures` WORLD-UNIQUENESS RULE, AND THE
-/// DIFFERENCE WAS #52.** That pass qualified a single-part signature name only when EXACTLY ONE
-/// type in the whole model (references included) carried the simple name -- so the moment a
-/// referenced assembly declared a same-named type in a namespace nobody imported, the signature
-/// stayed raw while expression positions resolved, and one file's `Marker` got two identities
-/// split by syntactic position (CS0029/CS0115 on programs csc compiles). Scope is per
-/// DECLARATION, so this pass is driven by the unit's AST -- the model alone no longer knows
-/// which file, and which `using`s, a type came from.
 ///
 /// Runs after [`collect_into`] and BEFORE [`Model::link_bases`], so the base chain links over
 /// qualified names. The walk mirrors [`bind_namespace_body`]'s scope entry (and the emitter's
@@ -1029,23 +1003,119 @@ fn qualify_delegate_declaration(
     namespace: &str,
     declaration: &DelegateDecl,
 ) {
-    let entered =
-        binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
-    qualify_model_info(
+    let name = crate::declaration::declared_delegate_name(declaration);
+    store_inherited_constraints(binder, namespace, &name);
+    let entered = binder.enter_declared_type_parameters(
+        &named_symbol(namespace, &name),
+        &declaration.type_parameters,
+        &declaration.constraints,
+    );
+    store_resolved_constraints(
         binder,
         namespace,
-        &crate::declaration::declared_delegate_name(declaration),
+        &name,
+        &declaration.type_parameters,
+        &declaration.constraints,
     );
+    qualify_model_info(binder, namespace, &name);
     binder.exit_type_parameters(entered);
+}
+
+/// Writes the constraint types one declaration's `where` clauses resolved to -- read back from the
+/// scope [`Binder::enter_declared_type_parameters`] has just entered for it -- into its model row,
+/// so a use of the type checks its arguments against the types the declaration meant, and the
+/// emitter writes those types.
+///
+/// Only the parameters THESE clauses name are written. A partial type may state its constraints on
+/// one part alone, and the model's row already holds them from that part; the part that states them
+/// is the one whose scope resolves them.
+/// Fills a NESTED declaration's inherited type parameters (ECMA-335 II.9.2) with the constraints
+/// their declaring types' clauses resolved to, so the nested type's row states them as its
+/// metadata does: a redeclared parameter carries its declaring type's flags and constraint rows.
+///
+/// Read from the scope, where every enclosing declaration's parameters are entered while its nested
+/// types are qualified -- and called BEFORE the nested declaration enters its own, which may
+/// redeclare an enclosing parameter's name (CS0693) and would hide the enclosing one.
+fn store_inherited_constraints(binder: &mut Binder, namespace: &str, name: &str) {
+    let Some(info) = binder.model().get(namespace, name) else {
+        return;
+    };
+    let inherited = info
+        .type_parameters
+        .len()
+        .saturating_sub(crate::symbols::mangled_arity(name));
+    let names: Vec<Box<str>> = info.type_parameters[..inherited].to_vec();
+    let resolved: Vec<Option<crate::symbols::TypeParameterConstraints>> = names
+        .iter()
+        .map(|parameter| binder.constraints_in_scope(parameter).cloned())
+        .collect();
+    let Some(info) = binder.model_mut().info_mut(namespace, name) else {
+        return;
+    };
+    for (slot, constraints) in resolved.into_iter().enumerate() {
+        if let (Some(constraints), Some(entry)) =
+            (constraints, info.type_parameter_constraints.get_mut(slot))
+        {
+            *entry = crate::symbols::TypeParameterConstraints {
+                known_non_nullable_reference: false,
+                ..constraints
+            };
+        }
+    }
+}
+
+fn store_resolved_constraints(
+    binder: &mut Binder,
+    namespace: &str,
+    name: &str,
+    parameters: &[TypeParameter],
+    clauses: &[TypeParameterConstraintClause],
+) {
+    let resolved: Vec<(usize, crate::symbols::TypeParameterConstraints)> = parameters
+        .iter()
+        .enumerate()
+        .filter(|(_, parameter)| clauses.iter().any(|clause| *clause.parameter == *parameter.name))
+        .filter_map(|(index, parameter)| {
+            binder
+                .constraints_in_scope(&parameter.name)
+                .map(|constraints| (index, constraints.clone()))
+        })
+        .collect();
+    let Some(info) = binder.model_mut().info_mut(namespace, name) else {
+        return;
+    };
+    let first = info.type_parameters.len().saturating_sub(parameters.len());
+    // The whole set and not only its types: whether a bare `unmanaged` is the constraint or a type
+    // is decided in the scope too (`Binder::unmanaged_names_a_type`).
+    for (index, constraints) in resolved {
+        if let Some(slot) = info.type_parameter_constraints.get_mut(first + index) {
+            *slot = crate::symbols::TypeParameterConstraints {
+                known_non_nullable_reference: false,
+                ..constraints
+            };
+        }
+    }
 }
 
 /// Qualifies one type declaration's model signatures under its scope, then recurses into its
 /// nested type declarations -- which are keyed under the enclosing type's FULL NAME standing in
 /// for the namespace, exactly as `collect_nested_types` registered them.
 fn qualify_type_declaration(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
-    let type_parameters =
-        binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
-    binder.enter_type(declared_symbol(namespace, declaration));
+    let declaring = declared_symbol(namespace, declaration);
+    store_inherited_constraints(binder, namespace, &declared_type_name(declaration));
+    let type_parameters = binder.enter_declared_type_parameters(
+        &declaring,
+        &declaration.type_parameters,
+        &declaration.constraints,
+    );
+    store_resolved_constraints(
+        binder,
+        namespace,
+        &declared_type_name(declaration),
+        &declaration.type_parameters,
+        &declaration.constraints,
+    );
+    binder.enter_type(declaring);
     qualify_model_info(binder, namespace, &declared_type_name(declaration));
     binder.exit_type();
     let enclosing_full = declared_full_name(namespace, declaration);
@@ -1059,6 +1129,7 @@ fn qualify_type_declaration(binder: &mut Binder, namespace: &str, declaration: &
                     qualify_delegate_declaration(binder, &enclosing_full, inner);
                 }
                 NamespaceMember::Enum(inner) => {
+                    store_inherited_constraints(binder, &enclosing_full, &inner.name);
                     qualify_model_info(binder, &enclosing_full, &inner.name);
                 }
                 NamespaceMember::Namespace(_) => {}
@@ -1088,6 +1159,29 @@ fn qualify_model_info(binder: &mut Binder, namespace: &str, name: &str) {
         event.ty = binder.canonicalize(&event.ty);
     }
     for method in &mut info.methods {
+        let constraint_scope = binder.enter_type_parameter_names_with(
+            &method.type_parameters,
+            &method.type_parameter_constraints,
+        );
+        for constraints in &mut method.type_parameter_constraints {
+            for ty in &mut constraints.types {
+                *ty = binder.canonicalize(ty);
+            }
+        }
+        // A bare `unmanaged` is a type where one of that name is found from the clause. The row
+        // keeps no syntax, but the flag says the name was written; with `struct` beside it the
+        // clause is CS0449 whichever way the name reads, so `struct` is taken as not written.
+        if method
+            .type_parameter_constraints
+            .iter()
+            .any(|constraints| constraints.unmanaged)
+            && let Some(named) = binder.unmanaged_names_a_type()
+        {
+            for constraints in &mut method.type_parameter_constraints {
+                constraints.read_unmanaged_as_type(named.clone(), false);
+            }
+        }
+        binder.exit_type_parameters(constraint_scope);
         let method_parameters = binder.enter_type_parameter_names_with(
             &method.type_parameters,
             &method.type_parameter_constraints,
@@ -1119,7 +1213,7 @@ fn qualify_model_info(binder: &mut Binder, namespace: &str, name: &str) {
 fn bind_unit_body(binder: &mut Binder, unit: &CompilationUnit) {
     binder.set_nullable_context(unit.nullable.clone());
     binder.set_unsafe_regions(unsafe_regions(unit));
-    bind_namespace_body(binder, &unit.usings, &unit.members, "");
+    bind_namespace_body(binder, Some(&unit.global_usings), &unit.usings, &unit.members, "");
 }
 
 /// The byte ranges of one unit that are unsafe contexts (18.1): each type and member declared
@@ -1171,57 +1265,49 @@ fn collect_unsafe_regions(member: &NamespaceMember, regions: &mut Vec<Span>) {
     }
 }
 
+/// Binds one namespace body: what its directives draw, then its members, under its scope.
+///
+/// `global_usings` is `Some` for a compilation unit -- the `global using` directives it wrote,
+/// possibly none -- and `None` for a namespace declaration, which holds none of its own.
 fn bind_namespace_body(
     binder: &mut Binder,
+    global_usings: Option<&[UsingDirective]>,
     usings: &[UsingDirective],
     members: &[NamespaceMember],
     namespace: &str,
 ) {
     let scope = binder.import_scope();
-    let mut aliases: alloc::collections::BTreeSet<&str> = alloc::collections::BTreeSet::new();
-    for using in usings {
-        match &using.kind {
-            // `using global::System;` (C# 2.0) is gated at the `global`, where csc reports it.
-            UsingKind::Namespace(name) => {
-                if name
-                    .parts
-                    .first()
-                    .is_some_and(|part| lamella_syntax::ast::alias_qualifier(part).is_some())
-                {
-                    binder.gate_feature(
-                        lamella_syntax::version::Feature::NamespaceAlias,
-                        Span::empty_at(name.span.start),
-                    );
-                }
-            }
-            UsingKind::Static(target) => {
-                let imported = TypeSymbol::Named(qualified_parts(target));
-                if binder.resolve_named_type_quietly(&imported, target.span).is_error()
-                    && binder.names_a_namespace(&dotted(target))
-                {
-                    binder.report(Diagnostic::new(
-                        DiagnosticKind::UsingStaticNamesANamespace {
-                            name: dotted(target).into(),
-                        },
-                        target.span,
-                    ));
-                } else {
-                    binder.resolve_named_type(&imported, target.span);
-                }
-            }
-            UsingKind::Alias { name, target } => {
-                if !aliases.insert(name) {
+    let mut list = DirectiveList::default();
+    if let Some(global_usings) = global_usings {
+        for using in global_usings {
+            let imported = check_using_directive(binder, using, namespace);
+            if let UsingKind::Alias { name, name_span, .. } = &using.kind {
+                if !binder.declare_global_alias(name) {
                     binder.report(Diagnostic::new(
                         DiagnosticKind::DuplicateUsingAlias { alias: name.clone() },
-                        using.span,
+                        *name_span,
                     ));
                 }
-                let named = TypeSymbol::Named(qualified_parts(target));
-                if binder.aliased_namespace(&named).is_none() {
-                    binder.resolve_named_type(&named, target.span);
-                }
+            }
+            list.note_import(binder, imported, using);
+        }
+        for kind in binder.model().global_usings() {
+            if let UsingKind::Alias { name, .. } = kind {
+                list.aliases.insert(name.clone());
             }
         }
+    }
+    for using in usings {
+        let imported = check_using_directive(binder, using, namespace);
+        if let UsingKind::Alias { name, name_span, .. } = &using.kind {
+            if !list.aliases.insert(name.clone()) {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::DuplicateUsingAlias { alias: name.clone() },
+                    *name_span,
+                ));
+            }
+        }
+        list.note_import(binder, imported, using);
         binder.import_using(&using.kind);
     }
     let mut prefix = String::new();
@@ -1236,7 +1322,13 @@ fn bind_namespace_body(
         match member {
             NamespaceMember::Namespace(declaration) => {
                 let inner = join_namespace(namespace, &declaration.name);
-                bind_namespace_body(binder, &declaration.usings, &declaration.members, &inner);
+                bind_namespace_body(
+                    binder,
+                    None,
+                    &declaration.usings,
+                    &declaration.members,
+                    &inner,
+                );
             }
             NamespaceMember::Type(_) | NamespaceMember::Delegate(_) | NamespaceMember::Enum(_) => {
                 bind_namespace_member(binder, namespace, member);
@@ -1246,14 +1338,229 @@ fn bind_namespace_body(
     binder.restore_import_scope(scope);
 }
 
+/// What a `using` directive imports when it names what it should, compared for `CS0105`.
+enum UsingImport {
+    /// A namespace, by its full name.
+    Namespace(String),
+    /// A type, and the name `CS0105` shows for it: the type as written after its namespace.
+    Type { ty: TypeSymbol, display: String },
+}
+
+/// One list of `using` directives as far as it has been read, for the two rules about a repeat.
+#[derive(Default)]
+struct DirectiveList {
+    /// The alias names it declares -- and at a file's level every global alias (`CS1537`).
+    aliases: alloc::collections::BTreeSet<Box<str>>,
+    /// The namespaces its namespace directives import (`CS0105`).
+    namespaces: alloc::collections::BTreeSet<String>,
+    /// The types its `using static` directives import (`CS0105`).
+    types: Vec<TypeSymbol>,
+}
+
+impl DirectiveList {
+    /// `CS0105`, at the directive's name, when what it imports an earlier directive of the list
+    /// already imports. A directive that named nothing it should is not compared: what it drew is
+    /// about its name, and a repeat of it is reported as itself again.
+    fn note_import(
+        &mut self,
+        binder: &mut Binder,
+        imported: Option<UsingImport>,
+        using: &UsingDirective,
+    ) {
+        let span = match &using.kind {
+            UsingKind::Namespace(name) | UsingKind::Static(name) => name.span,
+            UsingKind::Alias { .. } => return,
+        };
+        let repeated = match imported {
+            None => return,
+            Some(UsingImport::Namespace(namespace)) => {
+                if self.namespaces.insert(namespace.clone()) {
+                    return;
+                }
+                namespace
+            }
+            Some(UsingImport::Type { ty, display }) => {
+                if !self.types.contains(&ty) {
+                    self.types.push(ty);
+                    return;
+                }
+                display
+            }
+        };
+        binder.report(Diagnostic::new(
+            DiagnosticKind::RepeatedUsingDirective {
+                name: repeated.into(),
+            },
+            span,
+        ));
+    }
+}
+
+/// What one `using` directive draws wherever it is written, ordinary or `global`, and what it
+/// imports when it names what it should. An alias imports neither a namespace nor a type here: a
+/// second one is `CS1537`, the list's rule.
+///
+/// `namespace` is the body the directive is written in, `""` for a file: a namespace directive's
+/// first name is looked up there and outward (16.3.2).
+fn check_using_directive(
+    binder: &mut Binder,
+    using: &UsingDirective,
+    namespace: &str,
+) -> Option<UsingImport> {
+    match &using.kind {
+        UsingKind::Namespace(name) => {
+            if name
+                .parts
+                .first()
+                .is_some_and(|part| lamella_syntax::ast::alias_qualifier(part).is_some())
+            {
+                binder.gate_feature(Feature::NamespaceAlias, Span::empty_at(name.span.start));
+            }
+            namespace_using_target(binder, name, namespace).map(UsingImport::Namespace)
+        }
+        UsingKind::Static(target) => {
+            let imported = TypeSymbol::Named(qualified_parts(target));
+            if binder.resolve_named_type_quietly(&imported, target.span).is_error()
+                && binder.names_a_namespace(&dotted(target))
+            {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::UsingStaticNamesANamespace {
+                        name: dotted(target).into(),
+                    },
+                    target.span,
+                ));
+                return None;
+            }
+            let resolved = binder.resolve_named_type(&imported, target.span);
+            if resolved.is_error() {
+                return None;
+            }
+            Some(UsingImport::Type {
+                ty: resolved,
+                display: type_name_after_namespace(binder, target),
+            })
+        }
+        UsingKind::Alias { target, .. } => {
+            let named = TypeSymbol::Named(qualified_parts(target));
+            if binder.aliased_namespace(&named).is_none() {
+                binder.resolve_named_type(&named, target.span);
+            }
+            None
+        }
+    }
+}
+
+/// The namespace a namespace `using` directive names, by its full name -- or `None`, having
+/// reported what the name is instead: `CS0138` for a type, and for a part that names nothing,
+/// `CS0246` when it is the first, `CS0400` when it follows `global::`, `CS0234` when a namespace
+/// before it holds nothing by that name, at that part.
+///
+/// The first name is looked up in the namespace body `enclosing` and then outward to the global
+/// namespace (16.3.2), so `using B;` inside `namespace A` names `A.B` when there is one; after
+/// `global::`, in the global namespace alone.
+///
+/// **A TYPE IS ASKED FOR FIRST AT EVERY PART**, for the reason `using static` asks for one first:
+/// a type that declares a nested one is keyed the way a namespace is, so asking for a namespace
+/// first reads `using System.Environment;` as the import of a namespace.
+fn namespace_using_target(
+    binder: &mut Binder,
+    name: &QualifiedName,
+    enclosing: &str,
+) -> Option<String> {
+    let qualifier = name
+        .parts
+        .first()
+        .and_then(|part| lamella_syntax::ast::alias_qualifier(part));
+    let first = match qualifier {
+        None => 0,
+        Some("global") => 1,
+        Some(_) => return Some(dotted(name)),
+    };
+    let head = name.parts.get(first)?;
+    let part_span = |index: usize| name.part_spans.get(index).copied().unwrap_or(name.span);
+    let names_member = |binder: &Binder, namespace: &str, part: &str| {
+        binder.type_named_in(namespace, part)
+            || binder.names_a_namespace(&namespace_member_name(namespace, part))
+    };
+    let mut scope = if qualifier.is_some() { "" } else { enclosing };
+    while !scope.is_empty() && !names_member(binder, scope, head) {
+        scope = scope.rfind('.').map_or("", |dot| &scope[..dot]);
+    }
+    if !names_member(binder, scope, head) {
+        let kind = if qualifier.is_some() {
+            DiagnosticKind::GlobalNamespaceMemberNotFound { name: head.clone() }
+        } else {
+            DiagnosticKind::TypeNotFound { name: head.clone() }
+        };
+        binder.report(Diagnostic::new(kind, part_span(first)));
+        return None;
+    }
+    let mut namespace = String::from(scope);
+    for index in first..name.parts.len() {
+        let part = &name.parts[index];
+        if binder.type_named_in(&namespace, part) {
+            let mut parts: Vec<Box<str>> = namespace
+                .split('.')
+                .filter(|part| !part.is_empty())
+                .map(Box::from)
+                .collect();
+            parts.extend(name.parts[index..].iter().cloned());
+            let ty = TypeSymbol::Named(parts.into());
+            if binder.resolve_named_type_quietly(&ty, name.span).is_error() {
+                binder.resolve_named_type(&ty, name.span);
+            } else {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::UsingNamespaceNamesAType {
+                        name: name.parts[index..].join(".").into(),
+                    },
+                    name.span,
+                ));
+            }
+            return None;
+        }
+        let member = namespace_member_name(&namespace, part);
+        if !binder.names_a_namespace(&member) {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::NamespaceMemberNotFound {
+                    namespace: namespace.as_str().into(),
+                    name: part.clone(),
+                },
+                part_span(index),
+            ));
+            return None;
+        }
+        namespace = member;
+    }
+    Some(namespace)
+}
+
+/// `namespace.part`, or `part` in the global namespace.
+fn namespace_member_name(namespace: &str, part: &str) -> String {
+    if namespace.is_empty() {
+        String::from(part)
+    } else {
+        alloc::format!("{namespace}.{part}")
+    }
+}
+
+/// A `using static` directive's type as written after its namespace -- `Math` for
+/// `System.Math`, `Environment.SpecialFolder` for a nested type -- the name `CS0105` shows.
+fn type_name_after_namespace(binder: &Binder, target: &QualifiedName) -> String {
+    let parts = qualified_parts(target);
+    let mut namespace = String::new();
+    let mut index = 0;
+    while index + 1 < parts.len()
+        && !binder.type_named_in(&namespace, &parts[index])
+        && binder.names_a_namespace(&namespace_member_name(&namespace, &parts[index]))
+    {
+        namespace = namespace_member_name(&namespace, &parts[index]);
+        index += 1;
+    }
+    parts[index..].join(".")
+}
+
 /// The validations a namespace member receives, WHEREVER IT IS DECLARED.
 ///
-/// **A TYPE NESTED IN A TYPE IS THE SAME DECLARATION IN A DIFFERENT PLACE, AND THIS FUNCTION IS
-/// WHAT MAKES THAT TRUE.** The nested walk must reach every `NamespaceMember`, not only
-/// `::Type`: a walk that recurses into types alone leaves a nested DELEGATE and a nested ENUM with
-/// no validation. Measured against csc, `class C { public abstract delegate void D(); }` and
-/// `class C { public abstract enum E { A } }` are both CS0106, and the identical declarations one
-/// scope out are reported either way. A member's legality is not a property of where it sits.
 ///
 /// The `Namespace` arm is absent because a namespace cannot be declared inside a type; the
 /// namespace walk handles its own recursion, which is a different question (an import scope).
@@ -1266,8 +1573,11 @@ fn bind_namespace_member(binder: &mut Binder, namespace: &str, member: &Namespac
                 namespace,
                 &crate::declaration::declared_delegate_name(declaration),
             );
-            let scope = binder
-                .enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+            let scope = binder.enter_declared_type_parameters(
+                &enclosing,
+                &declaration.type_parameters,
+                &declaration.constraints,
+            );
             let outer = binder.replace_current_type(Some(enclosing.clone()));
             check_optional_parameters(binder, &enclosing, &declaration.parameters);
             binder.replace_current_type(outer);
@@ -1471,8 +1781,30 @@ fn check_delegate_accessibility(binder: &mut Binder, namespace: &str, declaratio
             parameter.ty.span,
         );
     }
-    let entered =
-        binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+    let delegate_symbol =
+        named_symbol(namespace, &crate::declaration::declared_delegate_name(declaration));
+    let entered = binder.enter_declared_type_parameters(
+        &delegate_symbol,
+        &declaration.type_parameters,
+        &declaration.constraints,
+    );
+    let quoted = quote_candidate(
+        &declaration.name,
+        declaration.type_parameters.len(),
+        &declaration
+            .type_parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect::<Vec<_>>(),
+    );
+    binder.in_type_header(&delegate_symbol, |binder| {
+        validate_constraint_clauses(
+            binder,
+            &quoted,
+            &declaration.type_parameters,
+            &declaration.constraints,
+        );
+    });
     binder.bind_annotated_type(&declaration.return_type, true);
     for parameter in &declaration.parameters {
         binder.bind_annotated_type(&parameter.ty, true);
@@ -1542,14 +1874,7 @@ fn check_delegate_accessibility(binder: &mut Binder, namespace: &str, declaratio
 /// is never rejected.
 /// Reports every way a `where` clause list can be ill-formed (25.7), for ONE declaration.
 ///
-/// **ONE IMPLEMENTATION, CALLED FOR A TYPE AND FOR EVERY GENERIC METHOD.** The rules are identical
-/// on both -- csc emits the same six codes for `class C<T> where Q : class` and
-/// `void M<T>() where Q : class` -- and writing them twice is the shape where the next case lands
-/// in one copy. `parameters` is whichever declaration's list is in view, and `quoted` is how csc
-/// names it in CS0699.
 ///
-/// **The checks are ordered as csc reports them**, and each is independent: a clause may be both
-/// duplicated and misordered, and csc says both.
 fn validate_constraint_clauses(
     binder: &mut Binder,
     quoted: &str,
@@ -1578,15 +1903,36 @@ fn validate_constraint_clauses(
             ));
         }
         seen.push(&clause.parameter);
-        validate_constraint_order(binder, clause);
+        let declared = parameters
+            .iter()
+            .find(|parameter| *parameter.name == *clause.parameter)
+            .map(|parameter| parameter.span);
+        validate_constraint_order(binder, clause, declared);
     }
 }
 
-/// The ORDER rules inside one clause (25.7): `class`/`struct` first and never both, `new()` last
-/// and never with `struct`.
-fn validate_constraint_order(binder: &mut Binder, clause: &TypeParameterConstraintClause) {
-    let mut has_class_or_struct = false;
-    let mut has_struct = false;
+/// The primary constraint a clause has written before the constraint being read (ECMA-334 7th ed,
+/// 15.2.5: `class`, `struct`, `unmanaged`, or a class type; at most one, and first).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrimaryConstraint {
+    Class,
+    Struct,
+    Unmanaged,
+}
+
+/// The ORDER rules inside one clause (25.7): `class`/`struct`/`unmanaged` first and never two of
+/// them, `new()` last and never with `struct` or `unmanaged`. `declared` is the span of the type
+/// parameter the clause constrains, `None` when the declaration has no such parameter.
+fn validate_constraint_order(
+    binder: &mut Binder,
+    clause: &TypeParameterConstraintClause,
+    declared: Option<Span>,
+) {
+    let mut primary: Option<PrimaryConstraint> = None;
+    let unmanaged_is_a_type = clause.constraints.iter().any(|constraint| {
+        matches!(constraint, SyntaxConstraint::Type(reference)
+            if crate::declaration::is_unmanaged_constraint(reference))
+    }) && binder.unmanaged_names_a_type().is_some();
     for (index, constraint) in clause.constraints.iter().enumerate() {
         match constraint {
             SyntaxConstraint::ReferenceType { span, .. } | SyntaxConstraint::ValueType(span) => {
@@ -1603,16 +1949,25 @@ fn validate_constraint_order(binder: &mut Binder, clause: &TypeParameterConstrai
                         *span,
                     ));
                 }
-                has_class_or_struct = true;
-                has_struct |= matches!(constraint, SyntaxConstraint::ValueType(_));
+                primary.get_or_insert(if matches!(constraint, SyntaxConstraint::ValueType(_)) {
+                    PrimaryConstraint::Struct
+                } else {
+                    PrimaryConstraint::Class
+                });
             }
             SyntaxConstraint::DefaultConstructor(span) => {
-                if has_struct {
-                    binder.report(Diagnostic::new(
+                match primary {
+                    Some(PrimaryConstraint::Struct) => binder.report(Diagnostic::new(
                         DiagnosticKind::NewConstraintWithStructConstraint,
                         *span,
-                    ));
-                } else if index + 1 != clause.constraints.len() {
+                    )),
+                    Some(PrimaryConstraint::Unmanaged) => binder.report(Diagnostic::new(
+                        DiagnosticKind::NewConstraintWithUnmanagedConstraint,
+                        *span,
+                    )),
+                    Some(PrimaryConstraint::Class) | None => {}
+                }
+                if index + 1 != clause.constraints.len() {
                     binder
                         .report(Diagnostic::new(DiagnosticKind::NewConstraintMustBeLast, *span));
                 }
@@ -1622,24 +1977,82 @@ fn validate_constraint_order(binder: &mut Binder, clause: &TypeParameterConstrai
             {
                 binder.gate_feature(Feature::NotNullConstraint, reference.span);
             }
+            SyntaxConstraint::Type(reference)
+                if crate::declaration::is_unmanaged_constraint(reference) && !unmanaged_is_a_type =>
+            {
+                if index > 0 {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::ClassOrStructConstraintMustBeFirst,
+                        reference.span,
+                    ));
+                }
+                binder.gate_feature(Feature::UnmanagedConstraint, reference.span);
+                // The constraint's metadata names `System.Runtime.InteropServices.UnmanagedType`,
+                // so a reference set without that type cannot express it.
+                if binder
+                    .model()
+                    .get("System.Runtime.InteropServices", "UnmanagedType")
+                    .is_none()
+                {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::PredefinedTypeMissing {
+                            full_name: "System.Runtime.InteropServices.UnmanagedType".into(),
+                        },
+                        reference.span,
+                    ));
+                }
+                primary.get_or_insert(PrimaryConstraint::Unmanaged);
+            }
             SyntaxConstraint::Type(reference) => {
-                let _ = has_class_or_struct;
-                validate_constraint_type(binder, reference);
+                validate_constraint_type(binder, reference, clause, declared, primary);
             }
         }
     }
 }
 
-/// CS0701 -- a named constraint must be an interface, a non-sealed class, or a type parameter.
+/// The rules a named constraint obeys where it is written (ECMA-334 7th ed, 15.2.5): an
+/// interface, a non-sealed class or a type parameter (CS0701), never `object`, `System.Array` or
+/// `System.ValueType` (CS0702), no class type beside a primary constraint (CS0450, CS8380), and
+/// no type parameter that has the `struct` or `unmanaged` constraint (CS0456, CS8379).
+/// `primary` is the primary constraint written before this one.
 ///
 /// **Silence when the model does not know the type.** `is_sealed` defaults to `false` for a
 /// referenced or synthetic type, so a type we failed to decode is not reported -- the same safe
 /// under-report the flag itself documents. A false CS0701 would refuse a legal program against an
 /// assembly we merely could not read.
-fn validate_constraint_type(binder: &mut Binder, reference: &lamella_syntax::ast::TypeRef) {
+fn validate_constraint_type(
+    binder: &mut Binder,
+    reference: &lamella_syntax::ast::TypeRef,
+    clause: &TypeParameterConstraintClause,
+    declared: Option<Span>,
+    primary: Option<PrimaryConstraint>,
+) {
     let annotated = binder.bind_annotated_type(reference, true);
-    let symbol = binder.resolve_named_type_quietly(&annotated, reference.span);
+    let symbol = match declared {
+        Some(parameter) => binder.resolve_constraint_type(&annotated, reference.span, parameter),
+        None => binder.resolve_named_type_quietly(&annotated, reference.span),
+    };
     if symbol.is_error() {
+        return;
+    }
+    // A type parameter that must be a value type is effectively sealed: the parameter it would
+    // constrain could only ever be the same type. Reported at that parameter, where the
+    // dependency is declared.
+    if let TypeSymbol::Named(parts) = &symbol
+        && let [name] = &parts[..]
+        && let Some(constraints) = binder.constraints_in_scope(name)
+    {
+        let (value_type, unmanaged) = (constraints.value_type, constraints.unmanaged);
+        if value_type && let Some(dependent) = declared {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::ValueTypeParameterAsConstraint {
+                    parameter: name.clone(),
+                    dependent: clause.parameter.clone(),
+                    unmanaged,
+                },
+                dependent,
+            ));
+        }
         return;
     }
     let invalid = if binder.is_value_type(&symbol) {
@@ -1657,37 +2070,75 @@ fn validate_constraint_type(binder: &mut Binder, reference: &lamella_syntax::ast
             },
             reference.span,
         ));
+        return;
+    }
+    let system_name = match &symbol {
+        TypeSymbol::Special(SpecialType::Object) => Some("Object"),
+        TypeSymbol::Named(parts) => match &parts[..] {
+            [namespace, name] if &**namespace == "System" => Some(&**name),
+            _ => None,
+        },
+        _ => None,
+    };
+    match system_name {
+        Some("Object" | "Array" | "ValueType") => {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::SpecialClassConstraint {
+                    constraint: symbol.short_name().into(),
+                },
+                reference.span,
+            ));
+            return;
+        }
+        Some("Enum") => binder.gate_feature(Feature::EnumConstraint, reference.span),
+        Some("Delegate" | "MulticastDelegate") => {
+            binder.gate_feature(Feature::DelegateConstraint, reference.span);
+        }
+        _ => {}
+    }
+    let is_class = binder
+        .model()
+        .get_by_symbol(&symbol)
+        .is_some_and(|info| info.kind == crate::symbols::TypeKind::Class);
+    if !is_class {
+        return;
+    }
+    // A class type is a primary constraint itself, so one written after another is refused --
+    // except `System.Enum` beside any of them, and `System.Delegate` or `System.MulticastDelegate`
+    // beside `class`, which narrow it rather than compete with it.
+    let narrows = match primary {
+        None => true,
+        Some(PrimaryConstraint::Class) => {
+            matches!(system_name, Some("Enum" | "Delegate" | "MulticastDelegate"))
+        }
+        Some(PrimaryConstraint::Struct | PrimaryConstraint::Unmanaged) => {
+            system_name == Some("Enum")
+        }
+    };
+    if !narrows {
+        binder.report(Diagnostic::new(
+            DiagnosticKind::ClassTypeConstraintWithPrimary {
+                constraint: symbol.short_name().into(),
+                unmanaged: primary == Some(PrimaryConstraint::Unmanaged),
+            },
+            reference.span,
+        ));
     }
 }
 
-/// `CS8345`: a field whose type is BY-REF-LIKE, where it is not an INSTANCE member of a
-/// `ref struct` (C# 7.2).
+/// `CS8345`: a field or an auto-implemented property whose type is BY-REF-LIKE, where it is not an
+/// INSTANCE member of a `ref struct` (C# 7.2). The auto-property's case is the same rule: its
+/// backing field is a field of that type.
 ///
 /// **THE IMPORTED CASE IS THE ONE THAT MATTERS FIRST.** `System.Span<T>` is a `ref struct`, so
 /// `class Buffer { Span<byte> data; }` is the shape this rule exists to refuse -- and it needs no
 /// `ref struct` declared in this compilation to arise. Before the rule, that compiled clean and
 /// stored a stack reference in a heap object.
 ///
-/// Measured against csc, one compilation per row:
 ///
-/// | declaration | csc |
-/// |---|---|
-/// | a field of a `ref struct` type in a class or ordinary struct | `CS8345` |
-/// | a `static` field of one, even INSIDE a `ref struct` | `CS8345` |
-/// | an INSTANCE field of one inside a `ref struct` | clean |
-/// | an auto-implemented property of one, anywhere | `CS8345` |
-/// | a field of one of the three RESTRICTED types, static or instance | `CS0610` ALONE |
 ///
-/// The static row is the one worth stating: `static` is refused even where an instance field is
-/// allowed, because a stack-only type has nowhere to live for a type's lifetime. csc's message
-/// says INSTANCE member and means it.
 ///
-/// **THE RESTRICTED ROW IS WHY THIS RULE STANDS DOWN RATHER THAN ADDING TO CS0610.** The two
-/// families overlap in the model: `System.TypedReference` is genuinely by-ref-like, so this rule
-/// fires on it as readily as on a `Span<T>`. csc does not stack them -- a `TypedReference` field
-/// is `CS0610` and nothing else, measured at ISO-1 and at `latest`, static and instance alike,
-/// for all three restricted types -- while `Span<byte>` is `CS8345` at `latest` (and `CS8022` at
-/// ISO-1, which refuses the generic type before the field rule is ever reached).
+///
 fn validate_by_ref_like_fields(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
     binder.enter_type(declared_symbol(namespace, declaration));
     let declaring_is_by_ref_like = matches!(declaration.kind, TypeKind::Struct)
@@ -1696,13 +2147,7 @@ fn validate_by_ref_like_fields(binder: &mut Binder, namespace: &str, declaration
             .iter()
             .any(|m| matches!(m, Modifier::Ref));
     for member in &declaration.members {
-        let Member::Field {
-            modifiers,
-            ty,
-            declarators,
-            ..
-        } = member
-        else {
+        let Member::Field { modifiers, ty, .. } = member else {
             continue;
         };
         if restricted_type_name(ty).is_some() {
@@ -1716,15 +2161,44 @@ fn validate_by_ref_like_fields(binder: &mut Binder, namespace: &str, declaration
         if declaring_is_by_ref_like && !is_static {
             continue;
         }
-        let rendered = field_ty.to_string();
-        for declarator in declarators {
-            binder.report(Diagnostic::new(
-                DiagnosticKind::ByRefLikeFieldType {
-                    ty: rendered.clone().into(),
-                },
-                declarator.span,
-            ));
+        binder.report(Diagnostic::new(
+            DiagnosticKind::ByRefLikeFieldType {
+                ty: field_ty.to_string().into(),
+            },
+            ty.span,
+        ));
+    }
+    let is_interface = matches!(declaration.kind, TypeKind::Interface);
+    for member in &declaration.members {
+        let Member::Property {
+            modifiers,
+            ty,
+            getter,
+            setter,
+            ..
+        } = member
+        else {
+            continue;
+        };
+        if !is_auto_property(modifiers, getter.as_ref(), setter.as_ref(), is_interface)
+            || restricted_type_name(ty).is_some()
+        {
+            continue;
         }
+        let property_ty = binder.canonicalize(&bind_type(ty));
+        if !binder.type_is_by_ref_like(&property_ty) {
+            continue;
+        }
+        let is_static = modifiers.iter().any(|m| matches!(m, Modifier::Static));
+        if declaring_is_by_ref_like && !is_static {
+            continue;
+        }
+        binder.report(Diagnostic::new(
+            DiagnosticKind::ByRefLikeFieldType {
+                ty: property_ty.to_string().into(),
+            },
+            ty.span,
+        ));
     }
     binder.exit_type();
 }
@@ -1766,12 +2240,6 @@ fn validate_volatile_fields(binder: &mut Binder, namespace: &str, declaration: &
 /// The declaration rules for a `required` member (C# 11), measured against csc one compilation per
 /// row. Three diagnostics, and which one a member draws depends on WHY it cannot be required:
 ///
-/// | declaration | csc |
-/// |---|---|
-/// | a settable instance field or property, visible enough | clean |
-/// | a method, constructor, indexer, event, static or `const` member, or the TYPE itself | `CS0106` |
-/// | a `readonly` field, or a property with no `set` | `CS9034` |
-/// | less visible than the type that declares it | `CS9032` |
 ///
 /// **THE VISIBILITY RULE IS NOT THE ACCESSIBILITY-DOMAIN MASK, AND A MEASURED ROW PROVES IT.**
 /// `protected class C { protected required int F; }` draws `CS9032` even though the member and the
@@ -2155,19 +2623,12 @@ fn member_attributes(member: &Member) -> Option<&[AttributeSection]> {
 /// the compilation -- csc's behavior, and the reason a program with one bad signature reports that
 /// signature and nothing else.
 ///
-/// WHY A COMPILER DOES THIS. Bodies are checked AGAINST declarations. If a declaration is wrong,
-/// every conclusion drawn from it is suspect: an `out` parameter of an illegal type is not really
-/// an out parameter, so "you did not assign it" is a statement about a method that does not exist
-/// as written. csc reports the declaration and stops, and the repair is to fix the declaration and
-/// compile again.
 ///
 /// IT IS COMPILATION-WIDE, NOT PER-MEMBER, and the consequence is easy to miss: a bad
 /// signature in one class withholds an unrelated definite-assignment error in a DIFFERENT class,
 /// in a different file. The two passes are over the whole compilation, so the gate is too -- which
 /// is why this takes every unit's diagnostics at once rather than filtering each as it finishes.
 ///
-/// ERRORS ONLY. A declaration WARNING does not gate: csc reports an unused-field warning and a
-/// body's definite-assignment error together. Measured, both directions.
 ///
 /// THIS CANNOT CHANGE ANY PROGRAM'S VERDICT, which is what makes it safe to apply so broadly. It
 /// fires only when a declaration ERROR is already present, so the compilation was failing before
@@ -2194,7 +2655,6 @@ pub fn withhold_body_diagnostics_after_declaration_error(units: &mut [Vec<Diagno
 /// compiled clean and threw `TypeLoadException` at the first use, which is the worst shape a
 /// defect can take. Refusing at the attribute makes the whole class unreachable.
 ///
-/// The attribute's own span, where csc points.
 fn validate_indexer_name_attribute(binder: &mut Binder, declaration: &TypeDecl) {
     for member in &declaration.members {
         let Member::Indexer {
@@ -2230,8 +2690,6 @@ fn validate_attributes(binder: &mut Binder, attributes: &[AttributeSection]) {
     let mut seen: alloc::collections::BTreeSet<String> = alloc::collections::BTreeSet::new();
     for section in attributes {
         for attribute in &section.attributes {
-            // `[global::System.Obsolete]` (C# 2.0) is gated at the `global`, where csc reports it;
-            // the name itself is resolved quietly below, so the gate is raised here.
             if attribute
                 .name
                 .parts
@@ -2337,34 +2795,13 @@ fn validate_attributes(binder: &mut Binder, attributes: &[AttributeSection]) {
 /// message is the ordinary "The type or namespace name 'Name' could not be found", measured
 /// against csc rather than predicted, since CS0117 is what the shape suggests.
 ///
-/// MEASURED, AND IT DISSOLVED THE HAZARD THIS RULE WAS EXPECTED TO CARRY. The worry was that a
-/// name like `Missing` would be found as `System.Reflection.Missing` by an unqualified lookup into
-/// an un-imported namespace -- an easy trap. It does not arise: csc
-/// answers CS0246 for `Missing` and for a pure nonsense name alike, so the diagnostic does not
-/// depend on type lookup at all, and neither does this. The test is membership in the ATTRIBUTE
-/// CLASS, which is a scoped question with one answer.
 ///
 /// CS0181: the attribute constructor this application binds to takes a parameter whose type cannot
 /// be encoded as an attribute argument (24.1.3). An attribute's arguments are baked into metadata,
 /// so the legal set is exactly what the blob can carry.
 ///
-/// FOUR PROPERTIES, ALL MEASURED AGAINST csc RATHER THAN ASSUMED, because each one changed the
-/// implementation:
-/// - It fires at the APPLICATION, not the declaration. An attribute class with a bad constructor
-///   that is never applied is clean, and so is one whose OTHER constructor is the one used.
-/// - ONE DIAGNOSTIC PER BAD PARAMETER, in declaration order -- not one per attribute.
-/// - Per application SITE: applying the same attribute to two types reports twice.
 ///
-/// **THE ARITY GUARD WAS A DELIBERATE UNDER-REPORT AND THIS IS THE INCREMENT ITS DOC ASKED FOR.**
-/// It matched constructors on arity alone, so it stayed silent wherever two shared a count and --
-/// far worse -- said nothing at all when NO constructor had the given arity, which is where csc
-/// reports CS1729 and CS7036. Nine accepts-invalid, measured by `tools/attribute-arguments.ps1`.
 ///
-/// **THE REPAIR IS A ROUTE, NOT NEW LOGIC.** `[A(x)]` and `new A(x)` ask the same question, and the
-/// `new` path already agreed with csc on all thirteen shapes this gate measures. So the arguments
-/// are bound and handed to [`Binder::check_constructor`] -- the same resolver, with the same
-/// accessible-set filter and the same CS0122 second pass -- and the parameter-type check below runs
-/// on the constructor IT chose rather than on one picked by counting.
 ///
 /// SILENT WHEN THE PARAMETER HAS NO KNOWN NAME. The message quotes the name, and a method whose
 /// source could not supply one has no honest way to fill that slot -- a blank or invented name in
@@ -2553,9 +2990,6 @@ fn parameter_modes(parameters: &[Parameter]) -> alloc::vec::Vec<crate::symbols::
 /// Which duplicate-member code two same-signature members earn: `CS0663` when they differ only in
 /// a by-reference parameter's MODE, `CS0111` otherwise.
 ///
-/// The two are indistinguishable by parameter TYPE -- `ref int` and `out int` are both `ByRef(int)`
-/// -- so the collision is detected the same way and only the recorded modes separate the codes.
-/// csc names the LATER declaration's modifier first, then the earlier one; measured both orders.
 fn duplicate_or_modifier_clash(
     type_name: &str,
     member: &str,
@@ -3043,8 +3477,9 @@ fn validate_constructors(binder: &mut Binder, declaration: &TypeDecl) {
 /// binder's method checking, not this walk.
 /// The async method DECLARATION rules of 15.15.1, each measured against csc: the return type is
 /// `void`, `Task` or `Task<T>` (CS1983 otherwise, csc's current text), no `ref` or `out`
-/// parameters (CS1988), and the two phase-split refusals by name -- a `Task<T>` return and a
-/// generic async method are both permitted-but-unbuilt (LAM0001) until phase 2. Lives HERE, on
+/// parameters (CS1988) and no ref struct parameter (CS4012), and the phase-split refusal by name
+/// -- a generic async method is permitted-but-unbuilt (LAM0001). A `Task<T>` return takes its
+/// feature's version gate. Lives HERE, on
 /// the AST, because a parameter's mode and a method's own type-parameter list are declaration
 /// facts `bind_method`'s signature never carries. Guarded on the dialect supporting async at
 /// all: below C# 5 the parser's one modifier gate is the whole report (measured).
@@ -3087,6 +3522,17 @@ fn validate_async_method_signatures(binder: &mut Binder, declaration: &TypeDecl)
         }) {
             binder.report(Diagnostic::new(DiagnosticKind::AsyncByRefParameter, *span));
         }
+        for parameter in parameters {
+            let ty = binder.canonicalize(&bind_type(&parameter.ty));
+            if crate::conversion::is_by_ref_like(binder.model(), &ty) {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::AsyncByRefLikeParameter {
+                        ty: ty.to_string().into(),
+                    },
+                    parameter.span,
+                ));
+            }
+        }
         if !type_parameters.is_empty() || !declaration.type_parameters.is_empty() {
             binder.gate_feature(Feature::AsyncGenericMethod, *span);
         }
@@ -3109,8 +3555,9 @@ fn written_as_task_of_t(ty: &lamella_syntax::ast::TypeRef) -> bool {
 
 /// The async ENTRY-POINT rules, measured: `static async void Main()` (or `int`) is CS4009 `A
 /// void or int returning entry point cannot be async` at every dialect that has async at all,
-/// and `static async Task Main()` is the separately-gated 'async main' feature -- CS8026 at
-/// C# 5 asking for 7.1, LAM0001 from 7.1 up while unbuilt. Guarded on the dialect supporting
+/// and `static async Task Main()` or `static async Task<int> Main()` is the separately-gated
+/// 'async main' feature -- CS8026 at C# 5 asking for 7.1, LAM0001 from 7.1 up while unbuilt.
+/// Guarded on the dialect supporting
 /// async functions, since below 5 the parser's one modifier gate is the whole report.
 fn validate_async_entry_points(binder: &mut Binder, declaration: &TypeDecl) {
     if !binder.language_version().supports(Feature::AsyncFunction)
@@ -3148,7 +3595,10 @@ fn validate_async_entry_points(binder: &mut Binder, declaration: &TypeDecl) {
         if return_symbol.is_void() || matches!(return_symbol, TypeSymbol::Special(SpecialType::Int32))
         {
             binder.report(Diagnostic::new(DiagnosticKind::AsyncVoidEntryPoint, *span));
-        } else if crate::bound::is_system_task(&return_symbol) {
+        } else if crate::bound::is_system_task(&return_symbol)
+            || crate::bound::task_result_type(&return_symbol)
+                .is_some_and(|result| matches!(result, TypeSymbol::Special(SpecialType::Int32)))
+        {
             binder.gate_feature(Feature::AsyncMain, *span);
         }
     }
@@ -3243,13 +3693,7 @@ fn validate_destructors(binder: &mut Binder, declaration: &TypeDecl) {
 /// lands on the SECOND declaration, as csc's does.
 /// The `extern` modifier's two diagnostics, over every member kind that can carry it.
 ///
-/// **`CS0626` FIRES ON "NO ATTRIBUTES AT ALL", NOT ON "NO `DllImport`"**, which is csc's wording
-/// and csc's behavior -- measured: `[Obsolete] public static extern void M();` warns nothing,
-/// while the bare form warns. An attribute is taken as a promise that something supplies the body.
 ///
-/// **A CONSTRUCTOR GETS ITS OWN CODE AND A DIFFERENT SENTENCE.** csc says `CS0824 Constructor
-/// 'C.C()' is marked external` and stops -- no advice about `DllImport`, where every other member
-/// kind gets it. Two codes because csc has two, not because the condition differs.
 ///
 /// **`CS0179` IS THE OTHER DIRECTION AND IS AN ERROR**: `extern` says the implementation comes
 /// from elsewhere, so a body is a second answer to the question the modifier already answered.
@@ -3360,8 +3804,11 @@ fn validate_parameter_names(binder: &mut Binder, parameters: &[Parameter]) {
 }
 
 fn bind_type_bodies(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
-    let type_parameters =
-        binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+    let type_parameters = binder.enter_declared_type_parameters(
+        &declared_symbol(namespace, declaration),
+        &declaration.type_parameters,
+        &declaration.constraints,
+    );
     bind_type_bodies_inner(binder, namespace, declaration);
     binder.exit_type_parameters(type_parameters);
 }
@@ -3378,20 +3825,23 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
         };
         validate_parameter_names(binder, parameters);
     }
-    validate_constraint_clauses(
-        binder,
-        &quote_candidate(
-            &declaration.name,
-            declaration.type_parameters.len(),
-            &declaration
-                .type_parameters
-                .iter()
-                .map(|parameter| parameter.name.clone())
-                .collect::<Vec<_>>(),
-        ),
-        &declaration.type_parameters,
-        &declaration.constraints,
+    let quoted = quote_candidate(
+        &declaration.name,
+        declaration.type_parameters.len(),
+        &declaration
+            .type_parameters
+            .iter()
+            .map(|parameter| parameter.name.clone())
+            .collect::<Vec<_>>(),
     );
+    binder.in_type_header(&enclosing, |binder| {
+        validate_constraint_clauses(
+            binder,
+            &quoted,
+            &declaration.type_parameters,
+            &declaration.constraints,
+        );
+    });
     for member in &declaration.members {
         if let Member::Method {
             name,
@@ -3415,7 +3865,11 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                         .collect::<Vec<_>>(),
                 )
             );
+            let outer = binder.replace_current_type(Some(enclosing.clone()));
+            let entered = binder.enter_type_parameters(type_parameters, constraints);
             validate_constraint_clauses(binder, &quoted, type_parameters, constraints);
+            binder.exit_type_parameters(entered);
+            binder.replace_current_type(outer);
         }
     }
     validate_volatile_fields(binder, namespace, declaration);
@@ -4999,8 +5453,11 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
         _ => {}
     }
     binder.check_base_constructor_call(&enclosing, declaration);
-    let signature_scope =
-        binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+    let signature_scope = binder.enter_declared_type_parameters(
+        &enclosing,
+        &declaration.type_parameters,
+        &declaration.constraints,
+    );
     binder.enter_type(enclosing.clone());
     binder.check_interface_implementations(&enclosing, declaration);
     binder.check_explicit_interface_accessors(declaration);
@@ -5584,11 +6041,6 @@ fn type_is_resolvable(model: &Model, ty: &TypeSymbol, type_parameters: &[Box<str
 /// Whether `accessor` is STRICTLY more restrictive than `property`, which is what 10.7.2 requires of
 /// an accessor's own access modifier.
 ///
-/// **`protected` AND `internal` ARE INCOMPARABLE, NOT EQUAL, AND EQUAL IS NOT ENOUGH EITHER.** Both
-/// facts fall out of one rank if `protected` and `internal` share it: `<` then rejects
-/// protected-under-internal and internal-under-protected (same rank) and rejects a modifier that
-/// merely repeats the property's. Measured against csc over the whole five-by-five lattice, and the
-/// two incomparable cells are the ones a plain ordering gets wrong.
 fn is_more_restrictive_than(accessor: Accessibility, property: Accessibility) -> bool {
     fn rank(accessibility: Accessibility) -> u8 {
         match accessibility {
@@ -5655,9 +6107,6 @@ mod tests {
     /// unless `reference.rs` reads a `TypeDef`'s visibility bits: unread, every imported type
     /// arrives claiming to be public.
     ///
-    /// Measured against csc over 31 declarations covering both halves. The rows here are the
-    /// same-assembly half; the cross-assembly half needs a real reference and lives in the
-    /// emitter's consumer tests.
     ///
     /// `internal` is ACCESSIBLE in the same assembly, which is why those rows are clean rather than
     /// diagnosed: a rule that fired on every non-public type would pass the private rows and refuse
@@ -5714,6 +6163,68 @@ mod tests {
             ),
             []
         );
+    }
+
+    /// **A TYPE NAMED AS THE RECEIVER OF A MEMBER ACCESS IS NAMED TOO, AND SO IS A CONSTRUCTED
+    /// ONE.** csc reports `CS0122` for each row below. The cross-assembly half, an `internal` type
+    /// of a reference, is `lcsc`'s `internal_types_of_a_reference` test.
+    #[test]
+    fn a_type_named_in_an_expression_or_constructed_is_cs0122_too() {
+        let outer = "namespace M { public class O { private class I \
+                     { public static int X = 1; public const int K = 2; public static int Get() { return 3; } } } } ";
+        for body in [
+            "return M.O.I.X;",
+            "return M.O.I.K;",
+            "return M.O.I.Get();",
+            "M.O.I.X += 1; return 0;",
+        ] {
+            assert_eq!(
+                sorted_codes(&format!("{outer}class P {{ static int Go() {{ {body} }} }}")),
+                [122],
+                "{body}"
+            );
+        }
+        let generic = "namespace M { public class O { private class I<V> { public static int X = 1; } } } ";
+        for body in [
+            "M.O.I<int> i = null; return i == null ? 0 : 1;",
+            "return M.O.I<int>.X;",
+        ] {
+            assert_eq!(
+                sorted_codes(&format!("{generic}class P {{ static int Go() {{ {body} }} }}")),
+                [122],
+                "{body}"
+            );
+        }
+
+        assert_eq!(
+            sorted_codes(
+                "namespace M { public class O { private class I<V> { public static int X = 1; } \
+                 private class J { public static int Y = 2; } \
+                 static int Go() { M.O.I<int> i = null; return M.O.I<int>.X + M.O.J.Y + (i == null ? 0 : 1); } } }"
+            ),
+            []
+        );
+        assert_eq!(
+            sorted_codes(
+                "namespace M { public class O { protected class I<V> { public static int X = 1; } } } \
+                 class D : M.O { static int Go() { M.O.I<int> i = null; return M.O.I<int>.X + (i == null ? 0 : 1); } }"
+            ),
+            []
+        );
+    }
+
+    /// `+=` and `-=` on a member access bind the receiver once to ask whether the member is an
+    /// event, and again with the whole target when it is not: what the receiver reports is
+    /// reported once, as csc reports it.
+    #[test]
+    fn a_compound_assignment_reports_its_receiver_once() {
+        for body in ["nope.F += 1;", "nope.F -= 1;", "nope.F *= 1;"] {
+            assert_eq!(
+                sorted_codes(&format!("class P {{ static void Go() {{ {body} }} }}")),
+                [103],
+                "{body}"
+            );
+        }
     }
 
     /// [`sorted_codes`] at the ISO-1 rung, for the rows whose subject IS that rung.
@@ -5782,11 +6293,11 @@ mod tests {
             ),
             [103]
         );
-        assert!(
+        assert_eq!(
             sorted_codes(
                 "using static N1.A; using static N1.A;                  namespace N1 { public class A { public static int M() { return 1; } } }                  namespace N2 { class P { static int Go() { return M(); } } }"
-            )
-            .is_empty()
+            ),
+            [105]
         );
         assert_eq!(
             sorted_codes(
@@ -5810,10 +6321,6 @@ mod tests {
 
     /// A restricted type is `CS0610` and NOT also `CS8345`, although it satisfies both rules.
     ///
-    /// `System.TypedReference` is genuinely by-ref-like, so the two field rules overlap on it and
-    /// lcsc reported both codes where csc reports one. Declaring it here as a `ref struct` is what
-    /// puts the flag in the model that a real corlib import otherwise supplies -- without it this
-    /// test would pass whatever the rules did, never reaching the by-ref-like branch at all.
     ///
     /// The second row is the guard on the first: it holds the `CS8345` rule to still firing on a
     /// genuine `ref struct`, so a stand-down that went too far and silenced the rule outright
@@ -5830,6 +6337,34 @@ mod tests {
         assert_eq!(
             sorted_codes("ref struct R { } class C { static R f; }"),
             [8345]
+        );
+    }
+
+    /// An auto-implemented property of a by-ref-like type is `CS8345` wherever a field of that
+    /// type would be, because its backing field is one; and csc puts the diagnostic on the
+    /// declaration's TYPE, once per declaration, a type's fields before its properties.
+    ///
+    #[test]
+    fn a_by_ref_like_auto_property_is_cs8345_at_its_type_as_a_field_is() {
+        let source = "ref struct R { } \
+                      class C { R P { get; set; } static R Q { get; } R a, b; \
+                      R B { get { return default(R); } } } \
+                      ref struct S { R I { get; set; } static R T { get; set; } }";
+        let unit = parse_compilation_unit(source).unit;
+        let found: Vec<usize> = bind_compilation_unit(&unit)
+            .iter()
+            .filter(|d| d.code() == 8345)
+            .map(|d| d.span.start as usize)
+            .collect();
+        let at = |text: &str, skip: usize| source.find(text).unwrap() + skip;
+        assert_eq!(
+            found,
+            [
+                at("R a, b", 0),
+                at("R P {", 0),
+                at("static R Q", 7),
+                at("static R T", 7),
+            ]
         );
     }
 
@@ -5869,6 +6404,111 @@ mod tests {
             sorted_codes(&alloc::format!("{corlib}delegate int D(int v); class Q : D {{ }}")),
             [509]
         );
+    }
+
+    /// The declarations the `global using` tests name, a unit of their own: two namespaces with a
+    /// type `T` each, a static member to import, a nested namespace and an empty one.
+    const GLOBAL_USING_LIBRARY: &str = "namespace N1 { public class A { public static int F = 1; } \
+        public class T { public static int M() { return 1; } } } \
+        namespace N2 { public class T { public static int M() { return 2; } } public class B { } } \
+        namespace N1.Inner { public class C { } } namespace Empty { }";
+
+    /// Each unit's diagnostics as `(code, offset)` pairs, the units bound as ONE compilation in the
+    /// order given.
+    fn codes_per_unit(sources: &[&str]) -> Vec<Vec<(u16, usize)>> {
+        let units: Vec<CompilationUnit> =
+            sources.iter().map(|source| parse_compilation_unit(source).unit).collect();
+        bind_compilation_units_with_references(&units, &[])
+            .iter()
+            .map(|diagnostics| {
+                diagnostics.iter().map(|d| (d.code(), d.span.start as usize)).collect()
+            })
+            .collect()
+    }
+
+    /// A `global using` directive of each kind is in scope in every unit of the compilation --
+    /// in a unit that writes none, and inside its namespaces -- and nowhere when it is not written.
+    #[test]
+    fn a_global_using_is_in_scope_in_every_unit() {
+        let program = "class P { static int Go() { AB b = null; T t = null; \
+                       return F + (b == null ? 0 : 1) + (t == null ? 0 : 1); } }";
+        let nested = "namespace Z { class Q { static int Go() { return F + T.M(); } } }";
+        let globals = "global using N1; global using static N1.A; global using AB = N2.B;";
+        let bound = codes_per_unit(&[globals, GLOBAL_USING_LIBRARY, program, nested]);
+        assert!(bound.iter().all(Vec::is_empty), "{bound:?}");
+        let bound = codes_per_unit(&["", GLOBAL_USING_LIBRARY, program, nested]);
+        assert!(!bound[2].is_empty() && !bound[3].is_empty(), "{bound:?}");
+    }
+
+    /// A global directive stands beside a file's own at the same level, as one list: a type both
+    /// import by one name is ambiguous, CS0104, whichever file wrote the global one.
+    #[test]
+    fn a_global_using_and_a_files_own_are_one_level() {
+        let program = "using N2; class P { static int Go() { return T.M(); } }";
+        let bound = codes_per_unit(&["global using N1;", GLOBAL_USING_LIBRARY, program]);
+        assert_eq!(bound[2], [(104, program.find("T.M").unwrap())], "{bound:?}");
+    }
+
+    /// The repeats csc reports, where it reports them (each measured): a second global alias of one
+    /// name is CS1537 in the unit that wrote it second; a file's own alias of a global alias's name
+    /// is CS1537 at the file's, whichever file comes first; a namespace or a type imported twice by
+    /// one FILE's list -- its global directives, then its own -- is the warning CS0105, and across
+    /// files it is nothing.
+    #[test]
+    fn a_repeated_directive_is_reported_where_csc_reports_it() {
+        let lib = GLOBAL_USING_LIBRARY;
+        let second = "global using X = N2.B;";
+        assert_eq!(
+            codes_per_unit(&[second, lib, second])[2],
+            [(1537, second.find('X').unwrap())]
+        );
+        let own = "using X = N2.B; class Q { }";
+        assert_eq!(codes_per_unit(&[second, lib, own])[2], [(1537, own.find('X').unwrap())]);
+        assert_eq!(codes_per_unit(&[own, lib, second])[0], [(1537, own.find('X').unwrap())]);
+        let twice = "global using N1; global using static N1.A; using N1; using static N1.A;";
+        assert_eq!(
+            codes_per_unit(&[twice, lib])[0],
+            [(105, twice.find("N1; using static").unwrap()), (105, twice.rfind("N1.A").unwrap())]
+        );
+        let block = "namespace Z { using N1; using N1; }";
+        assert_eq!(codes_per_unit(&[block, lib])[0], [(105, block.rfind("N1").unwrap())]);
+        let third = "global using N1; using N1; class Q { }";
+        let bound = codes_per_unit(&["global using N1;", lib, third]);
+        assert_eq!(bound[2], [(105, third.rfind("N1").unwrap())], "the file's own list repeats: {bound:?}");
+        let bound = codes_per_unit(&["global using N1;", lib, "using N1; class Q { }"]);
+        assert!(bound.iter().all(Vec::is_empty), "across files a repeat is nothing: {bound:?}");
+    }
+
+    /// A namespace directive, ordinary or global, has to name a namespace, and csc's codes say
+    /// what it names instead, at csc's positions (each measured): nothing at all is CS0246 at the
+    /// name, nothing after `global::` CS0400 at the part, nothing inside a namespace CS0234 at the
+    /// part, and a type CS0138 at the name. An empty namespace is a namespace, and a first name is
+    /// looked up from the body the directive is written in outward (16.3.2).
+    #[test]
+    fn a_namespace_directive_names_a_namespace() {
+        let lib = GLOBAL_USING_LIBRARY;
+        let rows: &[(&str, u16, &str)] = &[
+            ("using Nope; class Q { }", 246, "Nope"),
+            ("global using Nope; class Q { }", 246, "Nope"),
+            ("using N1.Nope; class Q { }", 234, "Nope"),
+            ("using global::Nope; class Q { }", 400, "Nope"),
+            ("using N1.A; class Q { }", 138, "N1.A"),
+            ("global using N1.A; class Q { }", 138, "N1.A"),
+        ];
+        for (source, code, at) in rows {
+            assert_eq!(
+                codes_per_unit(&[source, lib])[0],
+                [(*code, source.find(at).unwrap())],
+                "{source}"
+            );
+        }
+        for clean in [
+            "using N1.Inner; using Empty; using global::N1; class Q { }",
+            "namespace N1 { using Inner; class Q { } }",
+            "namespace N1.Inner { using Inner; class Q { } }",
+        ] {
+            assert!(codes_per_unit(&[clean, lib]).iter().all(Vec::is_empty), "{clean}");
+        }
     }
 
     fn sorted_codes(unit: &str) -> Vec<u16> {
@@ -5924,25 +6564,7 @@ mod tests {
     /// reported. Both spellings of each pair are asserted, because a fix that reported everywhere
     /// would pass the nested half alone.
     ///
-    /// Measured against csc (ISO-1) before the fix: `class C { public abstract delegate void D(); }`
-    /// and `class C { public abstract enum E { A } }` are CS0106 there and were silent here.
-    /// `a ?? b` (14.13): the result type comes from a CONVERSION between the operands, and the
-    /// left operand must be a reference type. Every row was scored against csc first -- the two
-    /// error codes are its, byte for byte.
-    /// A BODYLESS ACCESSOR IS FOUR DIFFERENT ANSWERS, and each was measured against csc at ISO-2,
-    /// 3, 5, 6 and latest before it was written here. The four are asserted together because the
-    /// shapes are told apart by ONE predicate: a rule that decided "auto-property" by "some
-    /// accessor is bodyless" passes any one row alone and fails three of the others.
     ///
-    /// The last two rows are where csc CANNOT oracle this rung. Modern csc reads a half-written
-    /// property as C# 14's `field` keyword and reports that feature's gate; a compiler with no
-    /// `field` keyword has only 10.7.2's rule -- an accessor without a body is permitted for an
-    /// abstract or extern accessor and for those of an automatically implemented property -- so
-    /// CS0501 is the answer at every rung lcsc compiles, and these rows cannot live in
-    /// `tools/corpus-invalid`, whose harness holds every code against csc's.
-    /// An access modifier on an ACCESSOR (C# 2.0's 10.7.2). Every row was scored against csc at
-    /// ISO-1, ISO-2, 5 and latest before it was written here, and the two incomparable cells of the
-    /// accessibility lattice are the ones a plain ordering gets wrong.
     #[test]
     fn an_accessor_carries_its_own_accessibility_under_the_property_s() {
         use crate::diagnostic::CodeNamespace;
@@ -8856,10 +9478,6 @@ mod tests {
     /// The entry-point rules the TARGET decides: `CS5001` for none where one was asked for, and
     /// `CS0017` only where an executable is actually being produced.
     ///
-    /// **THE LIBRARY ROWS ARE THE ONES TO KEEP.** Both diagnostics are conditioned on the target,
-    /// and getting that wrong is silent in opposite directions: `CS0017` fired regardless of target
-    /// refuses a two-`Main` LIBRARY that csc compiles, while no `CS5001` accepts every unusable
-    /// `Main` under `/target:exe`.
     #[test]
     fn the_target_decides_the_entry_point_rules() {
         let codes = |unit: &str, target: OutputKind| {
@@ -9668,10 +10286,6 @@ mod tests {
     /// the `CS0246` this feature exists to stop reporting. So the codes are pinned here and the
     /// inferred types are pinned there.
     ///
-    /// **EVERY ROW WAS MEASURED AGAINST csc BEFORE IT WAS WRITTEN DOWN**, one compilation each,
-    /// including the rows expected to PASS -- a refusal that is too WIDE is invisible in a table
-    /// made only of refusals, and the three contextual-keyword rows at the end are exactly where
-    /// that would have happened.
     #[test]
     fn implicitly_typed_locals_report_cscs_codes() {
         use crate::diagnostic::CodeNamespace;
@@ -9821,13 +10435,7 @@ mod tests {
 
     /// The rung gate for implicitly typed locals: C# 3.0, refused below it by NAME.
     ///
-    /// **The message is csc's, measured at both rungs rather than transcribed**, and the CODE is a
-    /// function of the version being compiled -- `CS8022` at C# 1, `CS8023` at C# 2 -- so a single
-    /// hard-coded code would be right for one rung and wrong for the other.
     ///
-    /// `foreach` gates under the SAME feature name. csc calls an iteration variable an
-    /// "implicitly typed local variable" here, measured; a second `Feature` variant reading
-    /// "iteration variable" would have produced a message no csc user ever sees.
     #[test]
     fn implicitly_typed_locals_are_gated_below_csharp3() {
         use crate::diagnostic::CodeNamespace;
@@ -9889,17 +10497,17 @@ mod tests {
     }
 
     /// An async method's return type that does not RESOLVE is not the wrong type: its own
-    /// diagnostic is the report and csc adds no CS1983 to it. A `Task<T>` written there is still
-    /// the construct this build refuses by name. A type that resolves and is not task-like keeps
-    /// its CS1983.
+    /// diagnostic is the report and csc adds no CS1983 to it -- a `Task<T>` written there too,
+    /// which draws nothing else. A type that resolves and is not task-like keeps its CS1983.
     #[test]
-    fn an_unresolved_async_return_type_draws_no_cs1983_and_a_task_of_t_is_refused_by_name() {
+    fn an_unresolved_async_return_type_draws_no_cs1983() {
         let v11 = LanguageVersion::CSharp11;
         let codes = sorted_codes_parsed_at(
             "class P { static async Task<int> F() { return 1; } }",
             v11,
         );
-        assert!(codes.contains(&(CodeNamespace::Lam, 1)), "{codes:?}");
+        assert!(!codes.is_empty(), "the unresolved type reports itself");
+        assert!(!codes.contains(&(CodeNamespace::Lam, 1)), "{codes:?}");
         assert!(!codes.iter().any(|&(_, code)| code == 1983), "{codes:?}");
         let codes = sorted_codes_parsed_at("class P { static async Nope F() { } }", v11);
         assert!(!codes.iter().any(|&(_, code)| code == 1983), "{codes:?}");

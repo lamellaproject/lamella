@@ -563,11 +563,33 @@ impl LcscCompiler {
     /// which each crate that tests through this search turns on for its tests alone. A test build
     /// looks there first, so every test binds the same corlib whatever else the tree holds.
     pub fn discover() -> Result<LcscCompiler, String> {
-        let ref_dir = std::env::var_os("LAMELLA_REF_DIR").map(std::path::PathBuf::from);
+        Self::discover_with(None, None)
+    }
+
+    /// As [`Self::discover`], for a command line that takes the folder as the option `option`:
+    /// `given`, the folder that option names, is read in place of the one `LAMELLA_REF_DIR` names,
+    /// and the variable is read only when no folder was given. The refusal for nothing found names
+    /// the option beside the variable.
+    ///
+    /// # Errors
+    /// As [`Self::discover`].
+    pub fn discover_from(given: Option<&std::path::Path>, option: &str) -> Result<LcscCompiler, String> {
+        Self::discover_with(given, Some(option))
+    }
+
+    /// The search behind [`Self::discover`] and [`Self::discover_from`].
+    fn discover_with(given: Option<&std::path::Path>, option: Option<&str>) -> Result<LcscCompiler, String> {
+        let ref_dir = Self::named_folder(given, std::env::var_os("LAMELLA_REF_DIR"));
         let corlib = std::env::var_os("LAMELLA_CORLIB").map(std::path::PathBuf::from);
         let places = Self::implicit_places(cfg!(any(test, feature = "fixture-corlib")));
-        let (references, folder) = Self::search(ref_dir.as_deref(), corlib.as_deref(), &places)?;
+        let (references, folder) = Self::search(ref_dir.as_deref(), corlib.as_deref(), &places, option)?;
         Ok(LcscCompiler { references, folder, source_path: None })
+    }
+
+    /// The folder a reference set is named by: `given`, the folder a command line names, or else
+    /// `variable`, what `LAMELLA_REF_DIR` holds.
+    fn named_folder(given: Option<&std::path::Path>, variable: Option<std::ffi::OsString>) -> Option<std::path::PathBuf> {
+        given.map(std::path::Path::to_path_buf).or_else(|| variable.map(std::path::PathBuf::from))
     }
 
     /// A compiler over the reference set in `dir`, every assembly in it with the corlib first: the
@@ -602,9 +624,29 @@ impl LcscCompiler {
     /// Each takes its namesake's place, so the corlib stays first. One with no namesake in the set
     /// is not added, because the shared set is what a program may bind against.
     #[must_use]
-    pub fn for_family(mut self, family: &str) -> (LcscCompiler, Vec<String>) {
+    pub fn for_family(self, family: &str) -> (LcscCompiler, Vec<String>) {
         let dir = self.folder.join("families").join(family);
-        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+        self.standing_in_from(&dir)
+    }
+
+    /// This compiler with the assemblies built for board `board` in place of the assemblies of the
+    /// same names, and the names of the ones it replaced.
+    ///
+    /// A board's builds sit in `boards/<board>/` beside the reference set, where `csharp/build-boards.ps1`
+    /// writes them: the board's facts assembly, `Lamella.Hardware.Facts`, which stands in for the
+    /// boardless one `Lamella.Hardware` was compiled against. Each takes its namesake's place, as a
+    /// family's builds do in [`Self::for_family`].
+    #[must_use]
+    pub fn for_board_folder(self, board: &str) -> (LcscCompiler, Vec<String>) {
+        let dir = self.folder.join("boards").join(board);
+        self.standing_in_from(&dir)
+    }
+
+    /// This compiler with each assembly in `dir` in place of the one of the same name in the set,
+    /// and the names of the ones it replaced; [`Self::for_family`] and [`Self::for_board_folder`] are
+    /// this rule over their folders.
+    fn standing_in_from(mut self, dir: &std::path::Path) -> (LcscCompiler, Vec<String>) {
+        let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
             .into_iter()
             .flatten()
             .flatten()
@@ -693,7 +735,8 @@ impl LcscCompiler {
     }
 
     /// The reference set the first of these holds, corlib first, and the folder it was read from:
-    /// the folder `ref_dir`, then the corlib `corlib`, then each of `places`.
+    /// the folder `ref_dir`, then the corlib `corlib`, then each of `places`. `option` is the
+    /// command line's option for the folder, if it has one, which the refusal names.
     ///
     /// # Errors
     /// A folder or corlib that was named and cannot be read, and none of them holding a corlib.
@@ -701,6 +744,7 @@ impl LcscCompiler {
         ref_dir: Option<&std::path::Path>,
         corlib: Option<&std::path::Path>,
         places: &[std::path::PathBuf],
+        option: Option<&str>,
     ) -> Result<(Vec<Vec<u8>>, std::path::PathBuf), String> {
         if let Some(dir) = ref_dir {
             return Ok((Self::references_in_dir(dir)?, dir.to_path_buf()));
@@ -715,16 +759,22 @@ impl LcscCompiler {
                 return Ok((Self::with_libraries_beside(place, bytes), Self::folder_of(place)));
             }
         }
+        let name_one = match option {
+            Some(option) => {
+                format!("name a folder holding corlib.dll and the libraries with {option} or LAMELLA_REF_DIR")
+            }
+            None => "set LAMELLA_REF_DIR to a folder holding corlib.dll and the libraries".to_owned(),
+        };
         let Some(tree) = Self::source_tree() else {
-            return Err("no class library to compile against: set LAMELLA_REF_DIR to a folder \
-                        holding corlib.dll and the libraries, which a project built with the Lamella \
-                        SDK names for you"
-                .to_owned());
+            return Err(format!(
+                "no class library to compile against: {name_one}, which a project built with the \
+                 Lamella SDK names for you"
+            ));
         };
         Err(format!(
             "no class library to compile against: build it with `pwsh -File csharp/build-managed.ps1` \
-             (Windows) or `./csharp/build-managed.sh` (Linux, macOS) in {}, which writes it to {}; or set \
-             LAMELLA_REF_DIR to a folder holding corlib.dll and the libraries",
+             (Windows) or `./csharp/build-managed.sh` (Linux, macOS) in {}, which writes it to {}; or \
+             {name_one}",
             tree.display(),
             tree.join("managed").display()
         ))
@@ -1507,7 +1557,7 @@ mod tests {
         }
         let places = [tree.join("absent").join("corlib.dll"), managed.join("corlib.dll")];
 
-        let (set, folder) = LcscCompiler::search(None, None, &places).expect("the class library is there");
+        let (set, folder) = LcscCompiler::search(None, None, &places, None).expect("the class library is there");
 
         let corlib = std::fs::read(managed.join("corlib.dll")).expect("read back the corlib");
         let gpio = std::fs::read(managed.join("System.Device.Gpio.dll")).expect("read back the library");
@@ -1578,9 +1628,9 @@ mod tests {
         let places = [dir.join("place").join("corlib.dll")];
         let first = |set: Result<(Vec<Vec<u8>>, std::path::PathBuf), String>| set.expect("found").0.first().cloned();
 
-        assert_eq!(first(LcscCompiler::search(Some(&folder), Some(&corlib), &places)), Some(b"folder".to_vec()));
-        assert_eq!(first(LcscCompiler::search(None, Some(&corlib), &places)), Some(b"corlib".to_vec()));
-        assert_eq!(first(LcscCompiler::search(None, None, &places)), Some(b"places".to_vec()));
+        assert_eq!(first(LcscCompiler::search(Some(&folder), Some(&corlib), &places, None)), Some(b"folder".to_vec()));
+        assert_eq!(first(LcscCompiler::search(None, Some(&corlib), &places, None)), Some(b"corlib".to_vec()));
+        assert_eq!(first(LcscCompiler::search(None, None, &places, None)), Some(b"places".to_vec()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1589,13 +1639,37 @@ mod tests {
     /// symbols `csharp/build-managed.ps1` passes.
     #[test]
     fn with_nothing_found_the_refusal_names_the_build_step_and_where_it_writes() {
-        let error = LcscCompiler::search(None, None, &[]).expect_err("there is nothing to find");
+        let error = LcscCompiler::search(None, None, &[], None).expect_err("there is nothing to find");
         let managed = LcscCompiler::source_tree().expect("a test build is a build from a source tree").join("managed");
         assert!(error.contains("pwsh -File csharp/build-managed.ps1"), "{error}");
         assert!(error.contains("./csharp/build-managed.sh"), "{error}");
         assert!(error.contains(&managed.display().to_string()), "where it writes: {error}");
         assert!(error.contains("LAMELLA_REF_DIR"), "and the variable that names another: {error}");
         assert!(!error.contains("lcsc"), "{error}");
+    }
+
+    /// **A FOLDER GIVEN ON A COMMAND LINE OUTRANKS THE ONE `LAMELLA_REF_DIR` NAMES**, and the
+    /// variable still names one when no folder is given.
+    #[test]
+    fn a_folder_given_on_a_command_line_outranks_the_one_the_variable_names() {
+        let given = std::path::Path::new("given");
+        let variable = || Some(std::ffi::OsString::from("variable"));
+        assert_eq!(LcscCompiler::named_folder(Some(given), variable()), Some(given.to_path_buf()));
+        assert_eq!(LcscCompiler::named_folder(None, variable()), Some(std::path::PathBuf::from("variable")));
+        assert_eq!(LcscCompiler::named_folder(None, None), None);
+    }
+
+    /// **A COMMAND LINE THAT TAKES THE FOLDER AS AN OPTION IS TOLD OF THE OPTION**, beside the
+    /// variable, and one that takes no option keeps its words.
+    #[test]
+    fn with_nothing_found_the_refusal_names_the_option_beside_the_variable() {
+        let error = LcscCompiler::search(None, None, &[], Some("--ref-dir")).expect_err("there is nothing to find");
+        assert!(
+            error.contains("name a folder holding corlib.dll and the libraries with --ref-dir or LAMELLA_REF_DIR"),
+            "{error}"
+        );
+        let without = LcscCompiler::search(None, None, &[], None).expect_err("there is nothing to find");
+        assert!(!without.contains("--ref-dir"), "{without}");
     }
 }
 

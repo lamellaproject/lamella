@@ -90,6 +90,11 @@ pub struct Project {
     /// The preprocessor symbols the compile defines. A project file read here defines none, as
     /// `csc` defines none unasked; `dotnet build` hands over its `DefineConstants`.
     pub defines: Vec<String>,
+    /// Whether the compile reads the sources as a file-based app's, taking their `#:` directives:
+    /// on for the project `dotnet run app.cs` writes for a file, whose `Features` name
+    /// `FileBasedProgram`, and off for a project file, which states the same things in its own
+    /// elements.
+    pub file_based: bool,
 }
 
 /// The board a project names with `<LamellaTargetBoard>`.
@@ -561,6 +566,7 @@ impl Project {
             packages,
             package_warnings,
             defines: Vec::new(),
+            file_based: false,
         })
     }
 }

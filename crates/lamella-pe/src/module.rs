@@ -172,6 +172,9 @@ pub struct ImageBuilder {
     /// landed yet. [`ImageBuilder::finish`] refuses while any remain: an RVA of 0 is a method
     /// that traps on first call, and nothing downstream could attribute that to the add site.
     deferred_bodies: Vec<Token>,
+    /// The place of each `CustomAttribute` row among its parent's rows, by the order the rows
+    /// were added: see [`ImageBuilder::add_custom_attribute_at`].
+    custom_attribute_places: Vec<u8>,
 }
 
 impl ImageBuilder {
@@ -197,6 +200,7 @@ impl ImageBuilder {
             pdb_id: derive_pdb_id(module_name),
             mvid: 0,
             deferred_bodies: Vec::new(),
+            custom_attribute_places: Vec::new(),
         };
 
         let mvid = builder.guids.add([0; 16]);
@@ -795,7 +799,28 @@ impl ImageBuilder {
     /// Rows may be added in any order; `finish` sorts the table by parent (a reader, e.g.
     /// the CLR, binary-searches it by `HasCustomAttribute`). Used both for user attributes
     /// and synthesized markers such as the AOT base-chain vector (`<ExceptionBaseChain>`).
+    ///
+    /// The row is written after every row of its parent added before it, and after every row
+    /// of its parent that [`ImageBuilder::add_custom_attribute_at`] placed.
     pub fn add_custom_attribute(&mut self, parent: Token, constructor: Token, value: &[u8]) {
+        self.add_custom_attribute_at(parent, constructor, value, u8::MAX);
+    }
+
+    /// [`ImageBuilder::add_custom_attribute`], with the row's `place` among its parent's rows:
+    /// `finish` writes a parent's rows in ascending `place`, and the rows of one `place` in the
+    /// order they were added.
+    ///
+    /// A reader returns a member's attributes in table order, and csc writes the attributes it
+    /// synthesizes before the ones a declaration carries, in an order of its own. A compiler that
+    /// can add a synthesized marker only once every type exists (an attribute type it synthesizes
+    /// is the last `TypeDef`) places the marker instead of adding it first.
+    pub fn add_custom_attribute_at(
+        &mut self,
+        parent: Token,
+        constructor: Token,
+        value: &[u8],
+        place: u8,
+    ) {
         let blob = self.blobs.intern(value);
         self.tables.add_row(
             table::CUSTOM_ATTRIBUTE,
@@ -805,6 +830,7 @@ impl ImageBuilder {
                 Column::BlobRef(blob),
             ],
         );
+        self.custom_attribute_places.push(place);
     }
 
     /// Adds a `Property` row (flags, name, the property-signature blob), returning
@@ -1305,14 +1331,15 @@ impl ImageBuilder {
             self.deferred_bodies
         );
         align4(&mut self.bodies);
-        self.tables.sort_by_coded_parent(table::CUSTOM_ATTRIBUTE);
         self.tables.sort_by_coded_column(table::CONSTANT, 1);
         self.tables.sort_by_coded_column(table::METHOD_SEMANTICS, 2);
         self.tables.sort_by_coded_column_remapping(
             table::GENERIC_PARAM,
             2,
-            &[table::GENERIC_PARAM_CONSTRAINT],
+            &[table::GENERIC_PARAM_CONSTRAINT, table::CUSTOM_ATTRIBUTE],
         );
+        self.tables
+            .sort_by_coded_parent_then_place(table::CUSTOM_ATTRIBUTE, &self.custom_attribute_places);
         self.tables.sort_by_index_column(table::CLASS_LAYOUT, 2);
         self.tables.sort_by_index_column(table::FIELD_LAYOUT, 1);
         self.tables.sort_by_coded_parent(table::FIELD_MARSHAL);

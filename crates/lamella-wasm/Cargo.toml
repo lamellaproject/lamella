@@ -18,8 +18,12 @@ lamella-metadata = { path = "../lamella-metadata" }
 lamella-cil-runtime = { path = "../lamella-cil-runtime" }
 # The MethodDef token for srcmap's module.resolve (source-map export, used under `bake`).
 lamella-token = { path = "../lamella-token" }
-# The DAP feature pulls in the debugger and a JSON codec for its wire messages.
-lamella-dap = { path = "../lamella-dap", optional = true }
+# The debugger, and a JSON codec for its wire messages: the DAP feature takes it with its
+# interpreter, and the probe's debugger without one, over the device backend below.
+lamella-dap = { path = "../lamella-dap", optional = true, default-features = false }
+# The device debug backend, for the probe's debugger: it drives the part a probe session reaches,
+# and reads the program's line table, functions, frames and variables from its debug ELF.
+lamella-debug-device = { path = "../lamella-debug-device", optional = true }
 # The compile feature pulls in the compiler (source -> assembly) for in-page builds.
 lamella-assemble = { path = "../lamella-assemble", optional = true }
 # Completion (IntelliSense) drives the binder + parser directly.
@@ -43,6 +47,9 @@ lamella-probe-core = { path = "../lamella-probe-core", optional = true }
 lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf", optional = true }
 lamella-cmsis-dap-rp2350 = { path = "../lamella-cmsis-dap-rp2350", optional = true }
 lamella-cmsis-dap-rp2040 = { path = "../lamella-cmsis-dap-rp2040", optional = true }
+# The probe feature also follows a program's console ring in a board's RAM, through the same reader
+# `lamella run --manifest` follows it with, and finds the ring in the image's ELF.
+lamella-probe-console = { path = "../lamella-probe-console", optional = true }
 # The py feature pulls in the Python front end + runtime for the in-page Python runner.
 lamella-py-frontend = { path = "../lamella-py-frontend", optional = true }
 lamella-py-runtime = { path = "../lamella-py-runtime", optional = true }
@@ -55,6 +62,8 @@ lamella-wire-host = { path = "../lamella-wire-host", optional = true, default-fe
 [dev-dependencies]
 # The debug agent's tests compile their programs, so a program's source sits beside what it checks.
 lamella-assemble = { path = "../lamella-assemble" }
+# The probe agent's console tests write the ELF a ring is found in, as the class-library build does.
+lamella-elf = { path = "../lamella-elf" }
 
 [features]
 # Adds the lamella_selftest export so a wasm host can validate the module end to end
@@ -62,7 +71,7 @@ lamella-assemble = { path = "../lamella-assemble" }
 selftest = []
 # Adds the in-page DAP agent (lamella_dap_create/request/dispose) for browser
 # debugging. Off by default so the run-only .wasm stays lean (no serde).
-dap = ["dep:lamella-dap", "dep:serde_json"]
+dap = ["dep:lamella-dap", "lamella-dap/interpreter", "dep:serde_json"]
 # Adds the in-page compiler (lamella_compile: C# source -> assembly + PDB + diagnostics)
 # and completion (lamella_complete) so Lamella Code builds + assists the user's
 # own code client-side. Off by default.
@@ -87,17 +96,26 @@ aot = [
 ]
 # Adds the in-page debug-probe agent (lamella_probe_create/request/flash/dispose): CMSIS-DAP over a
 # host-supplied packet transport, the ADIv5 MEM-AP and Cortex-M run control above it, and the
-# per-part flash routines -- so a page connects a real probe, programs a chip and debugs it. This is
-# the Debug ACCESS PORT and is unrelated to the `dap` feature, which is the Debug ADAPTER PROTOCOL
-# agent for a program running in this module. Off by default.
+# per-part flash routines -- so a page connects a real probe, programs a chip and debugs it -- and
+# follows the program's console ring in the board's RAM without halting it
+# (lamella_probe_follow_console and the `consolePoll` request). This is the Debug ACCESS PORT and is
+# unrelated to the `dap` feature, which is the Debug ADAPTER PROTOCOL agent for a program running in
+# this module. Off by default.
 probe = [
     "dep:lamella-cmsis-dap",
     "dep:lamella-probe-core",
     "dep:lamella-cmsis-dap-nrf",
     "dep:lamella-cmsis-dap-rp2350",
     "dep:lamella-cmsis-dap-rp2040",
+    "dep:lamella-probe-console",
     "dep:serde_json",
 ]
+# Adds the probe's debugger (lamella_probe_debug_create/request/poll/running/dispose): a Debug
+# Adapter Protocol session over the program on the part a probe session reaches, driven through that
+# same session -- breakpoints, stepping, the call stack and variables, read from the program's debug
+# ELF. It is the adapter over the device debug backend, without the interpreter the `dap` feature
+# carries. Pulls in `probe`. Off by default, so a probe build without it keeps its size.
+probe-debug = ["probe", "dep:lamella-dap", "dep:lamella-debug-device"]
 # Adds the in-page Python runner (lamella_py_run: Python source -> compile + run main() -> rendered
 # result + diagnostics) so Lamella Code compiles + runs the user's Python client-side. Off by default.
 py = ["dep:lamella-py-frontend", "dep:lamella-py-runtime"]

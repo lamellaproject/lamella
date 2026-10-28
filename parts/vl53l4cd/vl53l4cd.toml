@@ -1,13 +1,13 @@
 # PART: ST VL53L4CD, a time-of-flight ranging sensor.
 #
-# TWO THINGS HERE ARE UNLIKE EVERY OTHER PART IN THIS DIRECTORY, and both are stated rather than
+# Two things here are unlike every other part in this directory, and both are stated rather than
 # worked around.
 #
-# ITS REGISTER INDEX IS SIXTEEN BITS. Every other part addressed here writes ONE byte before a read;
+# Its register index is sixteen bits. Every other part addressed here writes ONE byte before a read;
 # this one writes two, most significant first. A driver that sent a single byte would address a
 # different register and read a plausible value from it.
 #
-# AND ITS REGISTER MAP IS NOT PUBLISHED. The document states the identity registers and then says
+# And its register map is not published. The document states the identity registers and then says
 # outright that full register details are not exposed, directing a reader to the vendor's own
 # software driver instead. So this table can make the part FINDABLE and can go no further, and the
 # `[sourcing] facts` value below is true of what is here while being unavailable for the rest.
@@ -39,7 +39,7 @@ validation = "none"
 
 # --- identity ------------------------------------------------------------------------------------
 #
-# THE INDEX IS 0x010F AND THAT IS NOT A TYPO FOR 0x0F. It is a sixteen-bit register index, and the
+# The index is 0x010F and that is not a typo for 0x0F. It is a sixteen-bit register index, and the
 # LSM6DSOX in this same directory has its WHO_AM_I at the single byte 0x0F -- so the two parts'
 # identity registers look alike written down and are reached by different transfers entirely.
 
@@ -51,13 +51,13 @@ notes = "DS13812 Rev 8 identification table: register Model_ID at index 0x010F r
 
 # --- address -------------------------------------------------------------------------------------
 #
-# THE DOCUMENT'S HEADLINE ADDRESS IS THE 8-BIT ONE, AND TRANSCRIBING IT IS WRONG BY A FACTOR OF TWO.
+# The document's headline address is the 8-bit one, and transcribing it is wrong by a factor of two.
 # DS13812 states "Address: 0x52" and later "a default device address of 0x52", and its own protocol
 # section says why that is not the number a 7-bit address field wants: "The first byte contains the
 # device address (0x52) and also specifies the data direction" -- so 0x52 is the address SHIFTED UP
 # with the read/write bit appended. The 7-bit address is 0x29.
 #
-# THE SAME VENDOR USES THE OTHER CONVENTION IN THE SAME DIRECTORY. The LSM6DSOX datasheet gives
+# The same vendor uses the other convention in the same directory. The LSM6DSOX datasheet gives
 # its address as 110101xb -- seven bits -- and puts the composed bytes in a separate table clearly
 # labelled as such. Two datasheets, one vendor, two conventions, and only one of them can be typed
 # into this field as printed.
@@ -94,13 +94,13 @@ width = 8
 access = "read"
 notes = "DS13812 Rev 8 gives its value as 0xAA. A SECOND self-describing byte at the next index: reading both is a stronger check than reading either, because two constants at two indices cannot both be produced by an off-by-one in the index arithmetic that a single one might survive."
 
-# --- WHAT IS NOT HERE, AND WHY IT CANNOT BE ----------------------------------------------------------
+# --- What is not here, and why it cannot be ----------------------------------------------------------
 #
-# NO RANGING REGISTERS, NO MODE REGISTERS, NO TIMING BUDGET. The document declines to publish them:
+# No ranging registers, no mode registers, no timing budget. The document declines to publish them:
 # it states that the customer must use the vendor's software driver and that, in consequence, full
 # register details are not exposed.
 #
-# THAT IS A SOURCING PROBLEM RATHER THAN A TRANSCRIPTION BACKLOG, and the difference matters to
+# That is a sourcing problem rather than a transcription backlog, and the difference matters to
 # whoever picks this up. The missing rows are not waiting to be read from a page nobody has turned
 # to -- they are not in the document at all, so filling them in would mean sourcing them from
 # somewhere this table's `facts = "primary"` does not cover.

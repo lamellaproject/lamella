@@ -3,7 +3,7 @@
 // *Bindings enum; the driver never holds a base address, a pin register, or a divisor of its
 // own.
 //
-// THE TX AND RX MUX FACTS ARE SEPARATE, one descriptor each, because a USART's two pins need not
+// The TX and RX mux facts are separate, one descriptor each, because a USART's two pins need not
 // share anything: they may sit on different GPIO ports, and a pin above 7 takes its
 // alternate-function nibble from a different register than a pin below. Where they do coincide the
 // two descriptors carry the same register address and the driver's two read-modify-writes land on

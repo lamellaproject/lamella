@@ -7,7 +7,7 @@
 // run time.
 namespace Lamella.Generated
 {
-    public sealed class Vl53l4cdPart
+    internal sealed class Vl53l4cdPart
     {
         private Vl53l4cdPart() { }
         public const string PART = "vl53l4cd";

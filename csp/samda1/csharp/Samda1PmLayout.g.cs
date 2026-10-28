@@ -5,7 +5,7 @@
 // instance bases live in Samda1Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Samda1PmLayout
+    internal sealed class Samda1PmLayout
     {
         private Samda1PmLayout() { }
 

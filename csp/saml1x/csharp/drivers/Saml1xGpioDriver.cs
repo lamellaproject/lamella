@@ -3,7 +3,7 @@ using System.Device.Gpio;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Saml1xGpioDriver : GpioDriver
+internal sealed class Saml1xGpioDriver : GpioDriver
 {
     protected override int PinCount { get { return 32; } }
 
@@ -79,8 +79,8 @@ public sealed class Saml1xGpioDriver : GpioDriver
 
     /// <summary>The logical pin number for a generated group base and pin index -- the form every
     /// board binding emits.</summary>
-    /// <remarks>ON THE DRIVER RATHER THAN ON EACH BOARD, because which group a BASE is happens to be
-    /// family truth. THIS FAMILY HAS ONE GROUP, so the method is a check rather than a switch -- and
+    /// <remarks>On the driver rather than on each board, because which group a BASE is happens to be
+    /// family truth. This family has one group, so the method is a check rather than a switch -- and
     /// it is kept rather than dropped because every board class on every SAM family calls it, and a
     /// family that answered a pin number without validating the base would be the one place a wrong
     /// base passed silently.</remarks>

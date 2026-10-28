@@ -6,7 +6,7 @@
 // lines, and the carrier identity. The board's facts are stated in board.toml.
 namespace Lamella.Generated
 {
-    public sealed class ArduinoGigaR1WifiBindings
+    internal sealed class ArduinoGigaR1WifiBindings
     {
         private ArduinoGigaR1WifiBindings() { }
 

@@ -47,6 +47,13 @@ namespace Lamella.Hardware
                 Word(BoardBuses.Spi, bus, 8), Word(BoardBuses.Spi, bus, 9), pins));
         }
 
+        /// <summary>Whether this build constructs a driver for bus <paramref name="bus"/> of
+        /// <paramref name="kind"/>: whether the image carries a table and it names that bus.</summary>
+        internal static bool Serves(int kind, int bus)
+        {
+            return BoardBuses.Length(kind, bus) > 0;
+        }
+
         /// <summary>The GPIO controller's driver, or null when the image carries no table or the
         /// board has no controller.</summary>
         internal static GpioDriver CreateGpio()

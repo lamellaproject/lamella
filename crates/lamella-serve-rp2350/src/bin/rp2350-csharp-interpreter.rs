@@ -729,18 +729,6 @@ mod serve {
 
     pub(crate) use crate::systick_clock as clock;
 
-    /// The full name of this board's C# class, in `bsp/boards/<board>/csharp`, which the runtime
-    /// initializes before a program's entry point when the program carries it. One bin serves four
-    /// boards, so it follows the same feature switch as the board identity in `lamella_main`.
-    #[cfg(all(feature = "cyw43", not(feature = "pico-plus-2-w")))]
-    const BOARD_CLASS: &str = "Lamella.Boards.RaspberryPi.Pico2W";
-    #[cfg(feature = "pico-plus-2-w")]
-    const BOARD_CLASS: &str = "Lamella.Boards.Pimoroni.PicoPlus2W";
-    #[cfg(feature = "pico-plus-2")]
-    const BOARD_CLASS: &str = "Lamella.Boards.Pimoroni.PicoPlus2";
-    #[cfg(not(any(feature = "cyw43", feature = "pico-plus-2")))]
-    const BOARD_CLASS: &str = "Lamella.Boards.RaspberryPi.Pico2";
-
     /// Installs the board seams on a fresh evaluation `Vm` (the runner's `_with` hook). Every
     /// build gets the board's clock. A cyw43 build also brings the radio up and joins on the first
     /// evaluation, streams that narration into the run's stdout and -- whenever the radio runs,
@@ -748,7 +736,6 @@ mod serve {
     /// the radio to the program's Wi-Fi classes, plus the TLS engine in a `tls` build.
     fn configure_vm(vm: &mut lamella_cil_runtime::Vm) {
         vm.set_clock(clock::now_ms, clock::sleep_ms);
-        vm.set_board_class(BOARD_CLASS);
         vm.set_pin_event_source(crate::rp2350_pin_events::source_for_a_new_program());
         #[cfg(feature = "arena-trace")]
         vm.set_console_tap(arena_trace);

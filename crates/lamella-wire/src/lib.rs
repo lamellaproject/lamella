@@ -1551,6 +1551,22 @@ pub mod product_model {
     /// low-power UART on two pins that sit on a separately powered rail.
     pub const NUCLEO_L4R5ZI: u16 = 63;
 
+    /// Pimoroni Pico LiPo 2 (RP2350B in the QFN-80 package, 16 MB flash, 8 MB PSRAM, a LiPo
+    /// charger). The Pico Plus 2's part, memory and header on a board that charges a battery and
+    /// senses it: the battery's voltage on GP43, and USB power on GP24.
+    pub const PICO_LIPO_2: u16 = 64;
+    /// Pimoroni Pico LiPo 2 XL W (the LiPo 2's part and memory, a Raspberry Pi RM2 radio module and
+    /// a 60-position header). The radio takes GP23, GP24, GP25 and GP29 and the user LED with them,
+    /// and the boot/user button moves from GP45 to GP30.
+    pub const PICO_LIPO_2_XL_W: u16 = 65;
+    /// Adafruit Feather RP2350 with HSTX Port (RP2350A in the QFN-60 package, 8 MB flash). Its I2C
+    /// bus is I2C1, on GP2 and GP3, and its SPI bus brings out no chip select.
+    pub const FEATHER_RP2350_HSTX: u16 = 66;
+    /// Adafruit Feather RP2350 with HSTX Port and 8 MB PSRAM. A separate model rather than a variant
+    /// flag: the PSRAM takes GP8 as its chip select, and the two boards share their part, their
+    /// flash and their USB identity, so this number is what tells them apart on the wire.
+    pub const FEATHER_RP2350_HSTX_PSRAM: u16 = 67;
+
     /// The display name for a `product_model` wire value, or `None` for an unrecognized code. This is the one
     /// canonical value -> name map: every surface that displays a board name derives from it rather than
     /// keeping a table of its own. Add a board => one `const` above plus one arm here, and each of those
@@ -1622,6 +1638,10 @@ pub mod product_model {
             PICO_PLUS_2 => "Pimoroni Pico Plus 2",
             PICO_PLUS_2_W => "Pimoroni Pico Plus 2 W",
             NUCLEO_L4R5ZI => "NUCLEO-L4R5ZI",
+            PICO_LIPO_2 => "Pimoroni Pico LiPo 2",
+            PICO_LIPO_2_XL_W => "Pimoroni Pico LiPo 2 XL W",
+            FEATHER_RP2350_HSTX => "Adafruit Feather RP2350 with HSTX Port",
+            FEATHER_RP2350_HSTX_PSRAM => "Adafruit Feather RP2350 with HSTX Port and 8MB PSRAM",
             _ => return None,
         })
     }

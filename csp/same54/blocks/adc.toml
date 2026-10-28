@@ -1,14 +1,14 @@
 # The ADC of the Microchip SAM D5x/E5x family -- the BLOCK layout. Register offsets are
 # ADC-instance-relative; nothing here names an instance, a pin, a board or a clock plan.
 #
-# THIS CONVERTER DOES NOT WORK OUT OF RESET AND THE MANUAL SAYS SO IN THOSE TERMS. Three production
+# This converter does not work out of reset and the manual says so in those terms. Three production
 # calibration values live in the NVM Software Calibration Area and "must be loaded ... into the ADC
 # Calibration register (CALIB) by software TO ALLOW CONVERSION and to achieve specified accuracy".
 # Not merely to be accurate -- to convert at all. A driver that enables this block and starts a
 # conversion without doing that first has skipped a required step, and the way that presents is a
 # result register holding something rather than an error.
 #
-# AND THE THREE VALUES ARE PACKED IN A DIFFERENT ORDER IN THE TWO PLACES, which is the trap this
+# And the three values are packed in a different order in the two places, which is the trap this
 # note exists for. Same three names, same three widths, middle two exchanged:
 #
 #                    in the NVM row        in the CALIB register

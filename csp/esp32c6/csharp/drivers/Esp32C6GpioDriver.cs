@@ -2,7 +2,7 @@
 using System.Device.Gpio;
 using Lamella.Hardware;
 
-public sealed class Esp32C6GpioDriver : GpioDriver
+internal sealed class Esp32C6GpioDriver : GpioDriver
 {
     const uint GPIO_OUT_W1TS = 0x60091008;
     const uint GPIO_OUT_W1TC = 0x6009100C;

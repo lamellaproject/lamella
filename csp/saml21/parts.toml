@@ -11,7 +11,7 @@
 # So "it is a PCHCTRL part" says which GENERATOR ARM resolves it and nothing about where anything
 # sits. Every value in instances.toml was read off this part's own Table 14-1.
 #
-# THIS PART HAS TWO RAM REGIONS AND THE SCHEMA HAS ONE FIGURE. Ch 2 states System SRAM and
+# This part has two RAM regions and the schema has one figure. Ch 2 states System SRAM and
 # Low-power SRAM as separate rows -- 32 KB and 8 KB on the 18 density code -- at different
 # addresses in different power domains. The `ram` field below is the SYSTEM SRAM alone, which is
 # the contiguous span a linker can believe, and the low-power region is documented-excluded rather

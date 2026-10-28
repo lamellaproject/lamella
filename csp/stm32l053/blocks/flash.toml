@@ -3,10 +3,10 @@
 #
 # Two facts, and each `sources` entry names the one it backs.
 #
-# THIS FAMILY ERASES TO ZERO, WHICH INVERTS THE USUAL BLANK CHECK. A correctly erased part reads as
+# This family erases to zero, which inverts the usual blank check. A correctly erased part reads as
 # full and a full part reads as erased.
 #
-# THE WRITE UNIT IS ONE 32-BIT WORD. RM0367 was read for this family on its own rather than carried
+# The write unit is one 32-bit word. RM0367 was read for this family on its own rather than carried
 # across from the L0x1 block, which is the rule for every fact in these files. The two manuals agree
 # here -- they do NOT agree about flash organization, which is what separates the categories -- and
 # an agreement that was checked is a different thing from one that was assumed.

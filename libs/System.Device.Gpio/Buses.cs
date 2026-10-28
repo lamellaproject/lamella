@@ -46,6 +46,7 @@ namespace Lamella.Hardware
         private static readonly I2cDriverFactory[] _i2cFactories = new I2cDriverFactory[BusCount];
         private static readonly I2cDriver[] _i2cDrivers = new I2cDriver[BusCount];
         private static readonly int[] _i2cRates = new int[BusCount];
+        private static readonly int[] _i2cRunning = new int[BusCount];
 
         /// <summary>The rate an I2C bus runs at unless its board binds another: 100 kHz, the
         /// standard-mode rate every I2C device supports.</summary>
@@ -172,8 +173,8 @@ namespace Lamella.Hardware
         }
 
         /// <summary>The I2C driver of bus <paramref name="busId"/>, bound or from the board's bus
-        /// table, creating it on first use and configuring it, once, at the rate its board bound, or
-        /// <see cref="DefaultI2cBusHz"/> for a bus from the table.</summary>
+        /// table, creating it on first use and, unless the bus already runs, configuring it, once, at
+        /// the rate its board bound, or <see cref="DefaultI2cBusHz"/> for a bus from the table.</summary>
         /// <remarks>The same instance the standard factories use; see
         /// <see cref="ResolveSpi"/> for why that guarantee is what makes this worth exposing.</remarks>
         /// <exception cref="System.ArgumentOutOfRangeException">The bus id is out of range.</exception>
@@ -220,29 +221,53 @@ namespace Lamella.Hardware
         }
 
         /// <summary>I2C bus <paramref name="busId"/>'s driver, configured, or null where there is
-        /// none.</summary>
+        /// none. A bus not yet running is brought up at the rate its board bound, or
+        /// <see cref="DefaultI2cBusHz"/> for a bus from the board's bus table.</summary>
         internal static I2cDriver FindI2c(int busId)
+        {
+            I2cDriver driver = CreatedI2c(busId);
+            if ((object)driver == null) return null;
+            RunI2c(busId, (object)_i2cFactories[busId] != null ? _i2cRates[busId] : DefaultI2cBusHz);
+            return driver;
+        }
+
+        /// <summary>I2C bus <paramref name="busId"/>'s driver, bound or from the board's bus table,
+        /// created on first use and configured only when the bus first runs, or null where there is
+        /// none.</summary>
+        internal static I2cDriver CreatedI2c(int busId)
         {
             if (busId < 0 || busId >= BusCount) return null;
             if ((object)_i2cDrivers[busId] != null) return _i2cDrivers[busId];
             I2cDriverFactory factory = _i2cFactories[busId];
             I2cDriver created;
-            int busHz;
             if ((object)factory != null)
             {
                 created = factory();
                 if ((object)created == null) throw FactoryReturnedNull("I2C", "bus", busId);
-                busHz = _i2cRates[busId];
             }
             else
             {
                 created = BoardDrivers.CreateI2c(busId);
                 if ((object)created == null) return null;
-                busHz = DefaultI2cBusHz;
             }
-            created.Configure(busHz);
             _i2cDrivers[busId] = created;
             return created;
+        }
+
+        /// <summary>Brings I2C bus <paramref name="busId"/> up at <paramref name="busHz"/> unless it
+        /// already runs, and answers the rate it runs at: <paramref name="busHz"/> where this call
+        /// brought it up, the rate its first configuration set otherwise, and 0 where there is no
+        /// such bus. A bus runs at one rate for the program's run.</summary>
+        internal static int RunI2c(int busId, int busHz)
+        {
+            I2cDriver driver = CreatedI2c(busId);
+            if ((object)driver == null) return 0;
+            if (_i2cRunning[busId] == 0)
+            {
+                driver.Configure(busHz);
+                _i2cRunning[busId] = busHz;
+            }
+            return _i2cRunning[busId];
         }
 
         /// <summary>The GPIO controller's driver, or null where there is none.</summary>
@@ -265,6 +290,24 @@ namespace Lamella.Hardware
             }
             _gpioDriver = created;
             return created;
+        }
+
+        /// <summary>Whether I2C bus <paramref name="busId"/> has a driver, bound or from the board's
+        /// bus table: whether the I2C lookup finds one. Creates nothing.</summary>
+        internal static bool ServesI2c(int busId)
+        {
+            if (busId < 0 || busId >= BusCount) return false;
+            return (object)_i2cDrivers[busId] != null || (object)_i2cFactories[busId] != null
+                || BoardDrivers.Serves(BoardBuses.I2c, busId);
+        }
+
+        /// <summary>Whether SPI bus <paramref name="busId"/> has a driver, bound or from the board's
+        /// bus table: whether the SPI lookup finds one. Creates nothing.</summary>
+        internal static bool ServesSpi(int busId)
+        {
+            if (busId < 0 || busId >= BusCount) return false;
+            return (object)_spiDrivers[busId] != null || (object)_spiFactories[busId] != null
+                || BoardDrivers.Serves(BoardBuses.Spi, busId);
         }
 
         /// <summary>Why SPI bus <paramref name="busId"/> has no driver.</summary>

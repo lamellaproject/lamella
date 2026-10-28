@@ -33,6 +33,9 @@ public enum Rp2350Instances {
     public static let I2C0_BASE: UInt32 = 0x40090000
     public static let I2C0_RESET_BIT: UInt32 = 4
     public static let I2C0_RESET_MASK: UInt32 = 0x10
+    public static let I2C1_BASE: UInt32 = 0x40098000
+    public static let I2C1_RESET_BIT: UInt32 = 5
+    public static let I2C1_RESET_MASK: UInt32 = 0x20
     public static let ADC_BASE: UInt32 = 0x400A0000
     public static let ADC_RESET_BIT: UInt32 = 0
     public static let ADC_RESET_MASK: UInt32 = 0x1

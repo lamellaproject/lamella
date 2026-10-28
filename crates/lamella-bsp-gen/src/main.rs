@@ -86,10 +86,9 @@ fn run_family(mode: &str, repo_root: &str, family: &str) -> ExitCode {
 
 /// Refuses to touch a target whose directory already holds a file differing from it only by CASE.
 ///
-/// A GENERATOR THAT FORKS IS WORSE THAN ONE THAT FAILS, and this defect arrived reported from
-/// outside rather than from any gate here. A board named with an internal word boundary can be
-/// spelled two ways -- `MicrobitV1Bindings` against `BbcMicroBitV1Bindings` -- and what happens next
-/// depends on the filesystem, with three different bad endings:
+/// A generator that forks is worse than one that fails. A board named with an internal word
+/// boundary can be spelled two ways -- `MicrobitV1Bindings` against `BbcMicroBitV1Bindings` -- and
+/// what happens next depends on the filesystem, with three different bad endings:
 ///
 ///   case-sensitive     two files. The build keeps compiling the committed one, which is now
 ///                      stale and which no regeneration will ever touch again. It compiles

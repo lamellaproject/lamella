@@ -2,7 +2,7 @@
 # on-board devices, the carrier, the clock plan, and the soldered XIP flash. Chip truth lives in
 # csp/rp2040/.
 #
-# A FACT A READER WOULD GET WRONG BY ASSUMING: the STEMMA QT / header I2C on GP2/GP3 is
+# A fact a reader would get wrong by assuming: the STEMMA QT / header I2C on GP2/GP3 is
 # **I2C1**, NOT I2C0 -- SDA/SCL on function F3, per the RP2040 datasheet's GPIO Functions table
 # (GPIO2: SPI0 SCK | UART0 CTS | I2C1 SDA | PWM1 A | SIO). The instance decides the base
 # (I2C1 = 0x40048000, I2C0 = 0x40044000), so "the QT port is on I2C0" would be wrong by 0x4000.
@@ -77,15 +77,15 @@ source = "CircuitPython pins.c for this board: SD_CARD_DETECT = GPIO16"
 
 # --- the expansion socket -----------------------------------------------------------------------
 #
-# THE SOCKET IS STATED AS TWO SINGLE LINES RATHER THAN AS A BUS, AND THAT IS THE HONEST FORM HERE
-# RATHER THAN A WEAKER ONE. A bus a socket brings out whole is named by the binding role that
+# The socket is stated as two single lines rather than as a bus, and that is the honest form here
+# rather than a weaker one. A bus a socket brings out whole is named by the binding role that
 # serves it, and this board has no i2c binding to name: csp/rp2040 carries no i2c pin-map rows and
 # no emission for the block, so a role written here would name nothing. What the board can support
 # either way is which two pads reach the socket, and that is what these rows say. A bus row joins
 # this connector when the family's i2c arm lands, and these two lines leave it -- one wire, one
 # statement, in whichever form is the stronger.
 #
-# THE SOCKET AND THE FEATHER HEADER ARE ONE BUS, not two. GP2 and GP3 reach both, so a module on
+# The socket and the Feather header are one bus, not two. GP2 and GP3 reach both, so a module on
 # the socket shares an address space with anything wired to the header pins, and neither can be
 # addressed without the other.
 

@@ -1,18 +1,18 @@
 # PART FAMILY: Bosch BME68x environmental sensors -- the shared base of the BME680 and the BME688,
 # each of which measures temperature, pressure, humidity and gas.
 #
-# THIS FAMILY IS NOT A BMx280 AND MUST NOT BE READ AS ONE. It occupies the same two I2C addresses
+# This family is not a BMx280 and must not be read as one. It occupies the same two I2C addresses
 # and answers the same identity register, and there the resemblance stops: the control registers
 # live in a different part of the map, the data registers live in another, and a gas channel with a
 # heater exists here that has no counterpart there. Four parts across the two families therefore
 # reach the same two addresses through the same register, and only the value distinguishes them.
 #
-# THIS FILE IS AN AUTHORING CONVENIENCE ONLY. A member names it with `base` and states its own
+# This file is an authoring convenience only. A member names it with `base` and states its own
 # deltas; the generator RESOLVES the base and emits a fully flattened table per part. Nothing
 # downstream ever reads an inherited value, because a value that is only ever inherited is pinned
 # in no emitted artifact and so cannot be checked for drift between languages.
 #
-# WHAT THE BASE DELIBERATELY DOES NOT HOLD, and why each is a member's own statement:
+# What the base deliberately does not hold, and why each is a member's own statement:
 #   - the identity VALUE, which is where a family base is expected to stop;
 #   - `ctrl_gas_1`, because the two members put the gas enable bit in DIFFERENT POSITIONS of the
 #     same register at the same address;
@@ -80,7 +80,7 @@ high = 0x77
 # Required of every part. A member states its own accepted values; the base states only where to
 # look.
 #
-# THE USUAL REASON FOR THAT SPLIT DOES NOT HOLD IN THIS FAMILY, and saying so is the point. In a
+# The usual reason for that split does not hold in this family, and saying so is the point. In a
 # family whose members differ here, the base cannot know the value. In THIS family both members
 # answer the SAME value, so the register does not separate them at all: it narrows a reading to
 # this family and stops. Each member states the value anyway, so that the emitted tables show the

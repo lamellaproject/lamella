@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.AutomationDirect
 {
-    public sealed class P1am100
+    internal sealed class P1am100
     {
         /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
         public static readonly int BoardModel = AutomationdirectP1am100Bindings.BOARD_MODEL;
@@ -16,11 +16,11 @@ namespace Lamella.Boards.AutomationDirect
         public static readonly int LedPin =
             LogicalPin(AutomationdirectP1am100Bindings.LED_PORT_BASE, AutomationdirectP1am100Bindings.LED_PIN);
 
-        /// <summary>The recessed RUN / STOP toggle behind the faceplate. READS LOW IN THE RUN
-        /// POSITION -- the switch ties this pad to ground on the RUN side and to 3.3 V on the STOP
+        /// <summary>The recessed RUN / STOP toggle behind the faceplate. Reads low in the run
+        /// position -- the switch ties this pad to ground on the RUN side and to 3.3 V on the STOP
         /// side -- so the pin wants <see cref="PinMode.Input"/> and a program comparing against
         /// <see cref="PinValue.Low"/>.</summary>
-        /// <remarks>NOTHING IN HARDWARE ACTS ON THIS SWITCH. It is an input like any other, so what
+        /// <remarks>Nothing in hardware acts on this switch. It is an input like any other, so what
         /// RUN means for a machine is the program's to decide and no part of this board enforces
         /// it.</remarks>
         public static readonly int RunSwitchPin =

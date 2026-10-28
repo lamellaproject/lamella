@@ -3,7 +3,7 @@
 # record is sam3x-shaped: the peripheral id is one number serving as both the PMC clock-gate bit
 # and the NVIC line; system controllers (PMC, EEFC) have no id (-1 emits nothing).
 #
-# THE PORT ROWS SAY WHICH GROUP THEY ARE, RATHER THAN LEAVING IT TO THEIR NAMES. A pin named
+# The port rows say which group they are, rather than leaving it to their names. A pin named
 # PC10 has to resolve to the base address of the port group that backs it, and this vendor calls
 # that group PIOC where others call theirs PORTC, GPIOC or PORT0. `port` states the answer as
 # data, so nothing has to recognize the spelling.

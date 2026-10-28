@@ -2,13 +2,13 @@
 # lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
 # uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
-# THE RECORD IS THE PCHCTRL FAMILIES', because on this architecture which APB mask register gates
+# The record is the PCHCTRL families', because on this architecture which APB mask register gates
 # an instance is per-instance rather than always APBC. On this part it is three different registers
 # for the blocks below: PORT is gated from APBAMASK, SERCOM0..4 from APBCMASK, and SERCOM5 from
 # APBDMASK. A row therefore states `apb_mask_offset` -- WHICH register, as an offset from MCLK's
 # base -- alongside its bit.
 #
-# EVERY VALUE WAS READ OFF THIS PART'S OWN TABLE 14-1, AND NOT ONE OF THEM MATCHES THE SAM C21's
+# Every value was read off this part's own table 14-1, and not one of them matches the SAM C21's
 # despite the two families sharing an architecture. The C21 puts MCLK at 0x40000800, GCLK at
 # 0x40001C00, PORT at 0x41000000 and SERCOM0 at 0x42000400; this part puts them at 0x40000400,
 # 0x40001800, 0x40002800 and 0x42000000. Sharing a generator arm is a statement about SHAPE.
@@ -76,7 +76,7 @@ apb_mask_offset = 0x1C
 apb_bit = 4
 irq = 12
 
-# THE ODD ONE OUT, ON THREE AXES AT ONCE: a different bridge (D, at 0x43000000), a different gate
+# The odd one out, on three axes at once: a different bridge (D, at 0x43000000), a different gate
 # register (APBDMASK), a different power domain (PD0), and a core clock id that skips the number a
 # stride would give it because its own slow clock takes that number.
 [[instances]]
@@ -106,7 +106,7 @@ apb_mask_offset = -1
 apb_bit = -1
 irq = -1
 
-# PORT SITS BEHIND BRIDGE A ON THIS FAMILY, which is why its gate is APBAMASK bit 10 and not an
+# Port sits behind bridge A on this family, which is why its gate is APBAMASK bit 10 and not an
 # APBC bit. Nothing consumes that gate today -- the GPIO driver assumes the reset state, where
 # Table 14-1 marks PORT's APB clock 'Enabled at Reset: Y' -- and the row states it so that a
 # consumer which ever needs to gate it has the register rather than a guess.

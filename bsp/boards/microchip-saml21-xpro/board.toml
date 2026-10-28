@@ -1,7 +1,7 @@
 # The SAM L21 Xplained Pro (ATSAML21-XPRO-B): board truth only -- what is wired to what. Chip
 # truth lives in csp/saml21/.
 #
-# THE VIRTUAL COM PORT'S FUNCTION COLUMN MATTERS ON THIS FAMILY AND THE GUIDE DOES NOT STATE IT.
+# The virtual COM port's function column matters on this family and the guide does not state it.
 # Atmel-42405 Table 4-10 names SERCOM3 PAD[0] on PA22 and SERCOM3 PAD[1] on PA23 and stops there.
 # DS60001477E Table 7-1 puts SERCOM3 in column C on both pads AND SERCOM5 in column D, so the
 # letter is a real choice: naming D would bind SERCOM5, which on this part sits behind a different
@@ -31,7 +31,7 @@ notes = [
 
 [[carriers]]
 kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
-usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+usb_vid = 0x03EB            # Note: no usb_pid row, and its absence is a sourced position rather than
 role = "vcp"                # AN OMISSION. A product id is a property of the debugger's FIRMWARE:
 baud = 115200               # this kit's user guide never prints one, and the EDBG user guide
 plan = "osc16m-4mhz"        # Atmel-42096 describes the composite device without giving an id
@@ -48,7 +48,7 @@ gclk_gen = 0                # instances. Both pads carry SERCOM5 in column D, an
 tx = { pin = "PA22", pad = 0 }   # part is behind a different APB bridge entirely.
 rx = { pin = "PA23", pad = 1 }
 
-# THE DEFAULT CLOCK PLAN, AND THE DATASHEET NAMES THE GENERATOR RATHER THAN LEAVING IT INFERRED:
+# The default clock plan, and the datasheet names the generator rather than leaving it inferred:
 # "Generator 0 is using OSC16M at 4MHz as source and generates GCLK_MAIN". So GCLK0 is 4 MHz at
 # reset -- the same rate as the SAM C21 reaches by a different oscillator, and not the SAM D21
 # line's 8 MHz. Every baud divisor the generator derives rides that rate.

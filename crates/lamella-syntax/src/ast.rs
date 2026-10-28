@@ -40,13 +40,6 @@ impl Expr {
     /// for anything that is not a bare name, and `None` for a verbatim one, which 9.4.2 forces
     /// back to an ordinary identifier.
     ///
-    /// **THE EXPRESSION-POSITION HALF OF THE RULE `Parser::current_contextual_keyword` SPENDS FOR
-    /// TOKENS.** The parser's sites see a token and can read its `@` directly; a binder site sees
-    /// an [`Expr`] whose name has already had the `@` dropped, so the flag has to travel on the
-    /// node and be spent here rather than at whichever site notices first. `@nameof(x)` is a call
-    /// to a method called `nameof` -- csc reports `CS0103` when no such method exists, measured --
-    /// and a site comparing the text alone reads it as the operator and accepts an invalid
-    /// program in silence.
     #[must_use]
     pub fn contextual_keyword(&self) -> Option<&str> {
         match &self.kind {
@@ -81,8 +74,6 @@ pub enum InterpolationPart {
 /// Which position a `ref` operand was written in, for the sake of the diagnostic a BAD operand
 /// draws there.
 ///
-/// **ONE OPERAND, FOUR POSITIONS, THREE DIFFERENT CODES -- MEASURED AGAINST csc AT 7.3, NOT
-/// REASONED.** The same non-ref property `P`:
 ///
 /// | position | code |
 /// |---|---|
@@ -92,11 +83,6 @@ pub enum InterpolationPart {
 ///
 /// and a `readonly` field in the same three: `CS0192`, `CS0191`, `CS8160`.
 ///
-/// **THE POSITION RIDES THE NODE BECAUSE ONLY THE PARSER KNOWS IT.** The binder builds one
-/// `BoundExprKind::Ref` for every position -- which is right, since they all mean *the address of*
-/// -- so a check written there cannot tell them apart, and one written at each consumer is a list
-/// of sites for the next position to be forgotten from. A first cut did exactly that and made
-/// `return ref P` report `CS0206` where csc reports `CS8156`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefPosition {
     /// A `ref`/`out` ARGUMENT at a call site, and a `ref` LOCAL's initializer. csc answers these
@@ -205,21 +191,12 @@ pub enum ExprKind {
     },
     /// A DECONSTRUCTION -- `(a, b) = t`, `(int a, int b) = t`, `var (a, b) = t` (C# 7.0).
     ///
-    /// **ONE NODE FOR ALL THREE SPELLINGS, BECAUSE THEY DIFFER ONLY IN HOW EACH TARGET IS
-    /// WRITTEN.** `var (a, b)` makes every leaf a declaration with no written type; `(int a, b)`
-    /// declares the first and assigns the second; `(a, b)` assigns both. Measured against csc,
-    /// all three run the same lowering and `(var b, a) = t` compiles -- so a representation that
-    /// split them would have to rejoin them to bind the mixed form.
     ///
     /// **`var (...)` IS NOT A DISTRIBUTED TYPE, IT IS A DESIGNATION**, and that is why the
     /// parser normalizes it away: under it, `(b, a)` with an `a` already in scope is `CS0128`
     /// rather than an assignment to that `a` (measured). Every leaf under a `var` is a
     /// declaration, so recording one at each leaf loses nothing and gives the binder one rule.
     ///
-    /// **A DECLARATION TARGET MAKES THE WHOLE FORM STATEMENT-ONLY.** `var q = (var (a, b) = t)`
-    /// and `var q = ((int a, int b) = t)` are both `CS8185`, while `M((a, b) = t)` compiles --
-    /// so the value form is exactly the one with no declaration in it. `var_span` records where
-    /// to report that, since csc puts it at the `var` rather than at the assignment.
     Deconstruction {
         /// The `var` of a `var (a, b)` designation, when the form was written that way. `None`
         /// for `(a, b) = t` and `(int a, int b) = t`, which carry their types at the leaves.
@@ -246,11 +223,6 @@ pub enum ExprKind {
     },
     /// An `await` expression `await unary-expression` (ECMA-334 5th ed, 12.8.8).
     ///
-    /// `await` is not a keyword: inside an async method every use of the bare word is this node
-    /// (the word is reserved there, 12.8.8.1), and OUTSIDE one the parser builds it only for the
-    /// measured operator shapes -- `await` followed by an identifier, a literal, or `new` in an
-    /// expression position -- reporting CS4033, so `await(1)` stays a call and `await + 1` stays
-    /// an identifier plus a binary operator, exactly as csc reads them.
     Await(Box<Expr>),
     /// A `ref`/`out` argument (17.5.1): the address of a variable, passed to a byref
     /// parameter. `out` additionally means the callee assigns the variable.
@@ -307,12 +279,6 @@ pub enum ExprKind {
     },
     /// A THROW EXPRESSION, `throw e` in expression position (C# 7.0).
     ///
-    /// **It is parsed far more widely than it is PERMITTED, and that is csc's shape rather than a
-    /// looseness here.** The parser admits one wherever an expression is parsed at null-coalescing
-    /// precedence or lower, which is why `f(throw e)` and `(throw e)` reach the binder at all --
-    /// csc refuses both as `CS8115`, a message about the CONTEXT, and it can only say that about
-    /// something it parsed. As the operand of a binary operator it is not admitted by either
-    /// compiler, and both say `CS1525` there instead.
     Throw(Box<Expr>),
     /// A LAMBDA EXPRESSION (C# 3.0): `x => x + 1`, `(a, b) => a * b`, `() => 0`,
     /// `(int x) => x`, `x => { return x; }`.
@@ -444,9 +410,6 @@ pub enum ExprKind {
     /// A VARIABLE DECLARED INSIDE AN EXPRESSION (C# 7.0): the `int a` of `M(out int a)` and the
     /// `var a` of `M(out var a)`.
     ///
-    /// **ITS SCOPE IS THE ENCLOSING BLOCK, NOT THE EXPRESSION** -- that is the whole point of the
-    /// form, and what makes it a declaration rather than a temporary. Measured against csc:
-    /// `M(out int a); return a;` compiles, and a later `int a;` in the same block is `CS0128`.
     ///
     /// **`var` IS NOT RESOLVED HERE AND CANNOT BE.** An implicitly typed out variable takes its
     /// type from the parameter of the overload that is SELECTED, so the type is known only after
@@ -459,11 +422,6 @@ pub enum ExprKind {
     },
     /// A SWITCH EXPRESSION, `governing switch { pattern => value, ... }` (C# 8.0).
     ///
-    /// **IT IS A POSTFIX OPERATOR AND ITS PRECEDENCE IS NOT THE SWITCH STATEMENT'S ANYTHING.**
-    /// Measured against csc: `2 * x switch { _ => "s" }` is `CS0019` for `int * string`, so the
-    /// switch binds TIGHTER than `*`; `-x switch { _ => "s" }` compiles, so it binds LOOSER than
-    /// unary. That places it between multiplicative and unary, which is where the grammar puts it
-    /// (`multiplicative_expression : switch_expression | ...`).
     ///
     /// **THE GOVERNING EXPRESSION IS EVALUATED ONCE**, which the emitter guarantees with a spill:
     /// `M() switch { 1 => .., _ => .. }` calls `M` once however many arms test it.
@@ -472,10 +430,6 @@ pub enum ExprKind {
         governing: Box<Expr>,
         /// The `switch` keyword's own span.
         ///
-        /// **CARRIED BECAUSE THE DIAGNOSTIC POSITION NEEDS IT AND THE NODE'S SPAN IS NOT IT.**
-        /// csc reports `CS8509` at the keyword, and the node's span starts at the governing
-        /// expression -- two columns apart in the shortest program and arbitrarily far apart in a
-        /// real one.
         keyword: Span,
         /// The arms, in source order. Order is semantic: the first arm whose pattern matches and
         /// whose guard holds is the one that runs.
@@ -508,10 +462,6 @@ pub enum ExprKind {
         arguments: Vec<Argument>,
         /// The object or collection initializer `{ ... }` that follows (C# 3.0), if written.
         ///
-        /// Independent of `arguments`: `new C(1) { F = 2 }` has both, `new C { F = 2 }` has only
-        /// this, and `new C()` has neither. An EMPTY `new C { }` is `Some` of an empty object
-        /// initializer rather than `None` -- the braces were written, and csc reports an empty one
-        /// as an OBJECT initializer.
         initializer: Option<Initializer>,
     },
     /// An array creation `new element[lengths] extra-ranks` (14.5.10.2). When
@@ -524,9 +474,9 @@ pub enum ExprKind {
         /// The size expressions of the first dimension; empty if unsized.
         lengths: Vec<Expr>,
         /// The rank of the first dimension.
-        rank: u8,
+        rank: u32,
         /// Trailing jagged rank-specifiers, outermost first.
-        extra_ranks: Vec<u8>,
+        extra_ranks: Vec<u32>,
         /// The `{ ... }` initializer, if present.
         initializer: Option<Box<Expr>>,
     },
@@ -541,11 +491,6 @@ pub enum ExprKind {
 
 /// A PATTERN (ECMA-334 12.x): what the right side of an `is` names, and what a switch arm matches.
 ///
-/// **`x is null` IS NOT `x == null`.** The pattern ignores a user-defined `operator ==`, so a type
-/// whose `==` answers `true` for a null operand still tests false against the pattern -- measured:
-/// csc emits `ldnull; ceq` for the pattern and `call op_Equality` for the comparison. Binding the
-/// two the same way is a silent wrong answer, which is why the right side is a choice here rather
-/// than a `TypeRef` the binder reinterprets.
 ///
 /// **THE SAME TOKENS MEAN DIFFERENT PATTERNS AFTER `is` THAN IN A SWITCH ARM, AND THAT IS THE
 /// LANGUAGE'S RULE RATHER THAN A PARSER CONVENIENCE.** `x is T` has been a type test since C# 1.0,
@@ -565,17 +510,10 @@ pub enum Pattern {
     Constant(Box<Expr>),
     /// `_` -- a DISCARD pattern, which matches anything and binds nothing.
     ///
-    /// **IT IS A SWITCH ARM'S FORM AND NOT AN `is`'s**, which is the language's rule and not this
-    /// parser's: measured, `o is _` is `CS0246` under csc at every version, because a bare name
-    /// after `is` was a type long before it could be a discard.
     Discard(Span),
     /// `x is T t` -- a DECLARATION PATTERN (C# 7.0): the type test, and a variable holding the
     /// converted value on the branch where it succeeded.
     ///
-    /// **THE NAME IS PART OF THE `is`, NOT A SEPARATE STATEMENT**, and its scope is the enclosing
-    /// block: measured against csc, `if (o is string s) { }` followed by `string s;` is `CS0128`.
-    /// What confines it to the true branch is definite assignment and not scope -- reading it in
-    /// the `else` is `CS0165`, which is why this needed the two-state lattice first.
     ///
     /// `as` never carries one: `x as T t` is not a form, and the parser offers the designator
     /// only after `is`.
@@ -741,9 +679,6 @@ pub enum TypeRefKind {
     /// `TypeSpec`, member lookup for `HasValue`/`Value` and emission are the ones a constructed
     /// generic struct already has.
     ///
-    /// **THE SPELLING SURVIVES PARSING BECAUSE A DIAGNOSTIC QUOTES IT.** csc says *Cannot
-    /// implicitly convert type 'string' to 'int?'*, never `System.Nullable<int>`, so the `?` form
-    /// has to reach the binder even though what it denotes is an ordinary constructed type.
     Nullable(Box<TypeRef>),
     /// An array type (12.1): an element type and the rank (dimension count) of
     /// this array. `int[][]` nests an `Array` whose element is another `Array`.
@@ -751,7 +686,7 @@ pub enum TypeRefKind {
         /// The element type.
         element: Box<TypeRef>,
         /// The number of dimensions, so `T[]` is 1 and `T[,]` is 2.
-        rank: u8,
+        rank: u32,
     },
     /// An unsafe pointer type (III.1.1.5): `T*`. `int**` nests a `Pointer` whose element is
     /// another `Pointer`. The pointed-to type is the element.
@@ -1031,9 +966,41 @@ pub enum StmtKind {
     },
     /// A `goto` statement (15.9.3).
     Goto(GotoTarget),
+    /// A LOCAL FUNCTION declaration (C# 7.0, ECMA-334 7th ed 13.6.4): `int Sq(int v) => v * v;`
+    /// written among a block's statements.
+    ///
+    /// **A DECLARATION THAT RUNS NOTHING WHERE IT STANDS.** The function is in scope throughout
+    /// its block, before the declaration as well as after it, so the binder declares every local
+    /// function of a block when it enters the block and binds this statement's body where it is
+    /// written; the statement itself emits no code.
+    LocalFunction(Box<LocalFunction>),
     /// A placeholder for a statement that could not be parsed, emitted with a
     /// diagnostic for recovery.
     Error,
+}
+
+/// A local function's declaration (ECMA-334 7th ed 13.6.4), read as a method declaration in the
+/// context of a block: the same parts, minus the accessibility, plus the block it lives in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalFunction {
+    /// The modifiers as written: `static`, `async`, `unsafe`, `extern`, in any order.
+    pub modifiers: Vec<Modifier>,
+    /// The return type.
+    pub return_type: TypeRef,
+    /// The function's name.
+    pub name: Box<str>,
+    /// The name's own span, where csc anchors a diagnostic about the function itself (`CS8321`,
+    /// `CS0128`, `CS8112`).
+    pub name_span: Span,
+    /// The function's own type parameters (`T Id<T>(T x) => x;`). Empty for an ordinary one.
+    pub type_parameters: Vec<TypeParameter>,
+    /// The `where` clauses after the parameter list.
+    pub constraints: Vec<TypeParameterConstraintClause>,
+    /// The formal parameters.
+    pub parameters: Vec<Parameter>,
+    /// The body: a block, or an expression body desugared into the block it means. `None` for a
+    /// bare `;`, which only an `extern` local function may write (`CS8112`).
+    pub body: Option<Stmt>,
 }
 
 /// One section of a `switch` statement (15.7.2): its labels and statements.
@@ -1119,6 +1086,15 @@ pub enum AttributeArgument {
 /// top-level namespace and type declarations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompilationUnit {
+    /// The unit's `global using` directives (C# 10): the three kinds [`Self::usings`] holds, in
+    /// scope in EVERY unit of the compilation rather than in this one alone.
+    ///
+    /// **A list of their own, because no walk over one file's directives may read them as that
+    /// file's.** A walk that applies a unit's `usings` would otherwise import another file's
+    /// directive as if this file had written it, or leave it out of every file but its own. The
+    /// binder imports these once for the whole compilation, beneath every file's own directives,
+    /// and reports on each in the file that wrote it.
+    pub global_usings: Vec<UsingDirective>,
     /// The file-level using directives.
     pub usings: Vec<UsingDirective>,
     /// The top-level namespace and type declarations.
@@ -1152,6 +1128,10 @@ pub struct QualifiedName {
     pub last_verbatim: bool,
     /// The byte range the name covers.
     pub span: Span,
+    /// Each part's own byte range, in the order of [`Self::parts`]: what a diagnostic about ONE
+    /// part points at, as `using System.Nope;` names `Nope` and not `System`. An alias qualifier's
+    /// part covers the alias identifier.
+    pub part_spans: Vec<Span>,
 }
 
 /// One element of a TUPLE TYPE: `int` or `int x` (C# 7.0).
@@ -1202,10 +1182,6 @@ pub enum DeconstructionTarget {
     },
     /// An assignable expression -- `a`, `c.F`, `arr[0]`.
     ///
-    /// **A BARE `_` REACHES THE BINDER AS THIS AND NOT AS A [`DeconstructionTarget::Discard`]**,
-    /// because only the binder knows whether a variable named `_` is in scope: `int _ = 0;
-    /// (a, _) = (40, 2);` ASSIGNS to that `_` and csc runs it (measured). Under a `var (...)`
-    /// designation there is no such question and the parser records the discard directly.
     Expression(Expr),
     /// `_` under a `var (...)` designation -- the element is computed and dropped.
     Discard(Span),
@@ -1247,11 +1223,6 @@ impl Argument {
 
 /// The name of a named argument, with the extent its diagnostics point at.
 ///
-/// **CARRIED SEPARATELY FROM THE VALUE'S SPAN BECAUSE EVERY DIAGNOSTIC THIS FEATURE OWNS NAMES THE
-/// IDENTIFIER, NOT THE ARGUMENT.** `CS1739` for a parameter no overload has, `CS1744` for one a
-/// positional argument already filled, `CS8323` for one out of position ahead of an unnamed
-/// argument: measured against csc, all three point at the identifier, and none of them would be
-/// reachable from the value's span alone.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArgumentName {
     /// The identifier written before the `:`.
@@ -1262,27 +1233,17 @@ pub struct ArgumentName {
 
 /// An object or collection initializer following a `new` (C# 3.0).
 ///
-/// **Which one it is comes from the FIRST element, and csc names them differently in its
-/// diagnostics** (`'object initializer'` vs `'collection initializer'`), so they are separate
-/// variants rather than one list with a flag. An empty `{ }` is [`Initializer::Object`] --
-/// measured, and it is the tie-break the parser needs for a case with nothing to look at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Initializer {
     /// `{ F = 1, P = 2 }` -- assignments into the new object's own members.
     Object(Vec<MemberInitializer>),
     /// `{ 1, 2 }` -- elements handed to the type's `Add` method.
     ///
-    /// The type must implement `IEnumerable` (csc CS1922) and have an applicable `Add`
-    /// (CS1061); neither is a syntactic condition, so both are the binder's to enforce.
     Collection(Vec<CollectionElement>),
 }
 
 /// One element of a collection initializer: the arguments one `Add` call receives.
 ///
-/// **AN ELEMENT IS AN ARGUMENT LIST, NOT AN EXPRESSION.** `{ 1 }` hands `Add` one argument and
-/// `{ { 1, 2 } }` hands it two, which is the whole of how a dictionary initializer works -- there
-/// is no separate dictionary construct, only an element with two arguments. Measured: csc accepts
-/// a braced element of one, two or three values, and mixes braced and bare in one initializer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionElement {
     /// The arguments, in source order.
@@ -1336,10 +1297,6 @@ pub enum UsingKind {
     /// `using static A.B ;` (C# 6.0) -- bring one TYPE's directly declared static members and
     /// nested types into scope, nameable without qualification (ECMA-334 6th ed, 13.5.4).
     ///
-    /// **The operand is a `type_name`, not a namespace**, which is the whole difference from
-    /// [`UsingKind::Namespace`] and the reason it is a separate variant rather than a flag: csc
-    /// reports `CS7007` for `using static System;`, naming the mistake, where a namespace import
-    /// of the same text is correct.
     Static(QualifiedName),
     /// `using X = A.B.C ;` -- an alias for a namespace or type.
     Alias {
@@ -1347,6 +1304,8 @@ pub enum UsingKind {
         name: Box<str>,
         /// The aliased namespace or type name.
         target: QualifiedName,
+        /// The alias identifier's byte range, where a second alias of the same name is reported.
+        name_span: Span,
     },
 }
 
@@ -1459,6 +1418,9 @@ pub struct TypeDecl {
     pub kind: TypeKind,
     /// The type's name.
     pub name: Box<str>,
+    /// Where the name is written: where csc reports what is wrong with the declaration as a
+    /// whole, such as a circular base class (CS0146).
+    pub name_span: Span,
     /// The type parameters declared after the name (C# 2.0): `class Box<T>` holds one. Empty for
     /// an ordinary type, which is what every C# 1.0 declaration is.
     pub type_parameters: Vec<TypeParameter>,
@@ -1508,18 +1470,10 @@ pub const TOP_LEVEL_ENTRY_POINT_DISPLAY: &str = "<top-level-statements-entry-poi
 
 /// What a `record` declaration carries beyond an ordinary class (C# 9).
 ///
-/// Its presence on a [`TypeDecl`] is what makes the type a record; the fields describe only the
-/// parts that vary between record FORMS, because everything else csc generates -- value equality,
-/// `ToString`/`PrintMembers`, `<Clone>$`, the copy constructor -- is emitted for every form alike
-/// and so needs nothing recorded here. Measured over three forms against csc.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordParts {
     /// The positional parameter list, `None` when none was written.
     ///
-    /// **`None` AND `Some(vec![])` ARE DIFFERENT DECLARATIONS**: `record R { }` has no parameter
-    /// list and gets a parameterless constructor and no `Deconstruct`; `record R();` HAS an empty
-    /// one and gets both. Collapsing them to a `Vec` would make the two forms identical here and
-    /// silently drop a `Deconstruct` csc emits.
     pub parameters: Option<Vec<Parameter>>,
     /// The argument list on a base record -- the `(X)` of `record D(int X, int Y) : B(X)` (14.5.11
     /// applies to the arguments; the base type itself is the first entry in [`TypeDecl::bases`]).
@@ -1653,10 +1607,6 @@ pub enum Modifier {
     /// `partial` (C# 2.0, ECMA-334 4th ed 17.1.4) -- this declaration is one PART of a type whose
     /// other parts are declared elsewhere, possibly in another file.
     ///
-    /// CONTEXTUAL, like [`Modifier::Required`] and [`Modifier::Async`], and more tightly placed
-    /// than either: 17.1.4 admits it only IMMEDIATELY before `class`, `struct` or `interface`, so
-    /// `class partial { }` and a field of type `partial` both keep compiling (measured against
-    /// csc). See `Parser::partial_is_a_modifier_here`.
     Partial,
     /// `required` (C# 11) -- an initializer the caller MUST supply.
     ///
@@ -1669,12 +1619,6 @@ pub enum Modifier {
     /// `async` (C# 5, ECMA-334 5th ed 15.15) -- the method is an async function and `await` is
     /// reserved in its body.
     ///
-    /// CONTEXTUAL, like [`Modifier::Required`] and unlike everything else here: `async` stays an
-    /// ordinary identifier elsewhere, so `class async { }`, a field of type `async`, and a method
-    /// `async async()` RETURNING that type all keep compiling (measured against csc). See
-    /// `Parser::async_is_a_modifier_here` for the lookahead -- which, unlike `required`'s
-    /// two-token peek, must scan a full type, because `async Task<int> M()` puts arbitrarily many
-    /// tokens between the modifier and the name that proves it is one.
     Async,
     /// `ref` on a STRUCT declaration (C# 7.2): `ref struct S { }`, and `readonly ref struct`
     /// with `readonly` first -- `ref readonly struct` is CS1031 under csc, measured.
@@ -1684,11 +1628,6 @@ pub enum Modifier {
     /// [`TypeKind::Struct`] arm wrong by omission, when a ref struct IS-A struct at nearly all
     /// of them and only the sites that enforce the by-ref-like restrictions may ask.
     ///
-    /// POSITIONAL, not contextual: `ref` is a keyword everywhere, but it is a MODIFIER only
-    /// immediately before `struct` or before `partial struct`. `ref class` and `ref interface`
-    /// are CS1031 under csc -- it does not take `ref` as a modifier there either -- and a
-    /// `ref`-returning member (`ref int P => ...`) must keep parsing as one. See
-    /// `Parser::ref_is_a_modifier_here`.
     Ref,
 }
 
@@ -1720,11 +1659,6 @@ pub enum Member {
         name: Box<str>,
         /// The NAME's own span, which is where csc anchors a diagnostic about the method itself.
         ///
-        /// **NOT [`Member::Method::span`], AND THE TWO ARE FAR APART.** The member's span starts at
-        /// its first modifier or attribute; csc's `CS0626` and `CS0179` put the caret on the name,
-        /// twenty-six columns later in the shortest program that has both. A synthesized member
-        /// has no name in any source, so it carries whatever span its synthesis site has -- nothing
-        /// reports on one.
         name_span: Span,
         /// The type parameters declared after the name (C# 2.0): the `T` in `T M<T>(T x)`. Empty
         /// for an ordinary method. These are the method's OWN parameters, distinct from any the
@@ -1789,10 +1723,6 @@ pub enum Member {
         /// The byte range of the NAME alone -- the identifier, and for an explicit implementation
         /// the part after the last dot rather than the whole qualified name.
         ///
-        /// A member-level diagnostic about the property AS A WHOLE lands here, which is where csc
-        /// puts one: `CS0551` points at the `P` of `int I.P { get { } }`, not at the `int`. The
-        /// member's own [`Member::Property::span`] starts at its modifiers and is four to a dozen
-        /// columns earlier, so it is not a substitute.
         name_span: Span,
         /// The `get` accessor, if present.
         getter: Option<Accessor>,
@@ -1964,11 +1894,6 @@ impl Member {
 /// is why this lives in the syntax crate, which both of the others already depend on, rather than
 /// being asked twice.
 ///
-/// **THE GETTER IS REQUIRED AND THE SETTER IS NOT.** `{ get; }` is C# 6.0's readonly auto-property,
-/// whose backing field is `initonly`; `{ get; set; }` is C# 3.0's. `{ set; }` is neither -- csc
-/// answers CS8051, and a property with nothing to read it back through has no field to synthesize.
-/// A half-written `{ get; set { ... } }` is not one either: an accessor with a body is the
-/// program's implementation, and generating a field beside it would give the property two.
 ///
 /// `is_interface` is the DECLARING type's kind, which the member alone cannot say. An interface
 /// property, like an `abstract` or `extern` one, is bodyless because it declares only a contract.
@@ -1995,11 +1920,6 @@ pub fn is_auto_property(
 /// The metadata name of an auto-property's backing field: csc's `<Name>k__BackingField`, and
 /// `<IHas.N>k__BackingField` for an explicit interface implementation -- measured.
 ///
-/// **NOT A LEGAL C# IDENTIFIER, ON PURPOSE.** The angle brackets are what keep it from colliding
-/// with anything the program can declare, and copying csc's spelling exactly is what lets a
-/// debugger, a serializer or a reflection-based tool recognize the field for what it is. It is also
-/// what lets the binder hold the field under a name no source expression can reach, so an
-/// initializer can be lowered onto it without the name becoming part of the language.
 ///
 /// The interface qualifier is not decoration either: a type may explicitly implement `N` from two
 /// different interfaces AND declare its own `N`, which is three distinct auto-properties whose

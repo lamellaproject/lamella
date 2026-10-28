@@ -4,17 +4,17 @@
 #
 # Two facts, and each `sources` entry names the one it backs.
 #
-# THE WRITE UNIT IS A 128-BIT QUAD-WORD AND IT IS NOT A CHOICE. The controller programs 137 bits at
+# The write unit is a 128-bit quad-word and it is not a choice. The controller programs 137 bits at
 # a time -- 128 of data and 9 of ECC -- and RM0456 refuses anything narrower: a byte or half-word
 # write sets SIZERR, and a quad-word at an address that is not quad-word aligned sets PGAERR.
 #
-# AND THIS PART STATES THE REPROGRAM PROHIBITION AS PLAINLY AS ANY ST MANUAL DOES:
+# And this part states the reprogram prohibition as plainly as any ST manual does:
 # `Programming in a previously programmed address is not allowed except if the data to write is full
 # zero`, with PROGERR raised otherwise. So a rule of the form `write the record, then write its
 # magic into the same unit afterwards` does not merely risk an ECC problem here -- the controller
 # refuses it.
 #
-# RM0456 IS TITLED FOR THE SERIES AND SPLITS BY SUB-GROUP WHERE IT MATTERS. Its flash ORGANIZATION
+# RM0456 is titled for the series and splits by sub-group where it matters. Its flash ORGANIZATION
 # is two tables, one for STM32U575/585 and one for STM32U59x/5Ax. Its programming granularity is
 # not split, and section 7.3.7 states the quad-word rule for the series without qualification.
 

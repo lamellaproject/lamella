@@ -2,7 +2,7 @@
 # line uses, so a block that is not listed is not described here, rather than absent from the
 # part.
 #
-# THIS PART HAS PORTS A, C AND D AND NO PORT B. That is not an omission here: the reference
+# This part has ports A, C and D and no port B. That is not an omission here: the reference
 # manual's own GPIO register list (Table 7-15) has three columns, x = A/C/D, and the clock-enable
 # register leaves the bit where port B's enable would sit marked Reserved. A driver written
 # against the STM32F1 this IP resembles, which does have a port B, would enable a clock that does
@@ -24,7 +24,7 @@ base = 0x40021000   # CH32V003 RM V1.9 Table 3-1: R32_RCC_CTLR at 0x40021000 is 
                     # taken from. The clock-enable register a GPIO port needs is at offset 0x18.
 
 [[instances]]
-name = "gpioa"      # NAMED FOR WHAT THE MANUAL CALLS IT. The register list spells these
+name = "gpioa"      # Named for what the manual calls it. The register list spells these
 block = "gpio"      # R32_GPIOA_* / R32_GPIOC_* / R32_GPIOD_*, so the instance ids follow the
 base = 0x40010800   # document rather than a house convention. RM V1.9 Table 7-15:
                     # R32_GPIOA_CFGLR at 0x40010800.

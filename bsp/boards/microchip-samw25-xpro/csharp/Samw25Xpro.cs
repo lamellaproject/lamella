@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Microchip
 {
-    public sealed class Samw25Xpro
+    internal sealed class Samw25Xpro
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = MicrochipSamw25XproBindings.BOARD_MODEL;

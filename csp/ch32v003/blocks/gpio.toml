@@ -1,7 +1,7 @@
 # BLOCK layout: the CH32V003 GPIO port block. Transcribed from the CH32V003 Reference Manual
 # V1.9 (WCH), section 7.3.1, with the document open.
 #
-# EIGHT PINS PER PORT, WHICH IS WHY THERE IS ONLY A CFGLR. The STM32F1 family this IP resembles
+# Eight pins per port, which is why there is only a CFGLR. The STM32F1 family this IP resembles
 # splits its per-pin configuration across CFGLR (pins 0-7) and CFGHR (pins 8-15); this part has no
 # CFGHR because it has no pins above 7, and Table 7-15 lists none. Every whole-port register here
 # is therefore 8 bits wide with the rest reserved -- a driver that writes a 16-bit port word

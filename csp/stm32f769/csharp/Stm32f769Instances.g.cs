@@ -5,7 +5,7 @@
 // Layout offsets live in the *Layout classes; wiring lives in the per-board *Bindings.
 namespace Lamella.Generated
 {
-    public sealed class Stm32f769Instances
+    internal sealed class Stm32f769Instances
     {
         private Stm32f769Instances() { }
 

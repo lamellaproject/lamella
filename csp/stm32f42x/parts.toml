@@ -18,7 +18,7 @@
 # bus, so a linker script cannot treat the two as one region. The 4 KB backup SRAM is excluded for
 # the same reason -- it lives in the backup domain.
 #
-# THE FAMILY NAME COVERS TWO LINES THAT SHARE A DEVICE ID AND DIFFER IN PERIPHERALS, and it now
+# The family name covers two lines that share a device id and differ in peripherals, and it now
 # holds one part from each of them. RM0090 gives DEV_ID 0x419 for STM32F42xxx and STM32F43xxx alike,
 # and its boundary-scan section gives BOTH the same JTAG ID code 0x06419041 -- so neither identity
 # register separates the two rows below, and a program that needs to know which part it is running
@@ -26,7 +26,7 @@
 # line per section: its cryptographic-processor (23) and hash-processor (25) sections each state
 # that they apply to "STM32F415/417xx and STM32F43xxx devices", which is to say to the stm32f439zi
 # row and not to the stm32f429zi one.
-# A CONSEQUENCE WORTH STATING OUTRIGHT: a part is named by the board that carries it and is never
+# A consequence worth stating outright: a part is named by the board that carries it and is never
 # probed for. On most families probing would merely be redundant; on this one it cannot work.
 
 [table]

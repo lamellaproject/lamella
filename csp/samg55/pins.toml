@@ -2,7 +2,7 @@
 # rows exist for every binding a board package uses, each with its source; grow the table with
 # the boards, never from recall. A binding whose (pin, function) row is missing REFUSES.
 #
-# THE TWO ROWS BELOW ARE PRESENT WHILE NO BOARD BINDS THEM, AND THAT IS DELIBERATE. This table is
+# The two rows below are present while no board binds them, and that is deliberate. This table is
 # CHIP truth -- which pad carries which peripheral signal on which function letter -- and for the
 # SAM G55 Xplained Pro's virtual COM port that is fully settled by Table 9-4. What is NOT settled is
 # FLEXCOM6's peripheral identifier, which is a field of ../instances.toml rather than of this table,
@@ -10,7 +10,7 @@
 # the binding is one field away rather than one investigation away when somebody reads that id off
 # silicon.
 #
-# THE FUNCTION LETTER IS "B" AND ON THIS ARCHITECTURE THAT IS TWO REGISTER WRITES, NOT A NIBBLE.
+# The function letter is "B" and on this architecture that is two register writes, not a nibble.
 # blocks/pio.toml carries the encoding: ABCDSR1 holds the low bit and ABCDSR2 the high one, so
 # function B is ABCDSR1 bit set and ABCDSR2 bit clear. A driver that wrote a single selector
 # register -- which is what the sibling csp/sam3x's ABSR is -- would set the low bit correctly and

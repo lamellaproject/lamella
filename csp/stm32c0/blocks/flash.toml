@@ -4,17 +4,17 @@
 #
 # Two facts, and each `sources` entry names the one it backs.
 #
-# THE WRITE UNIT IS A 64-BIT DOUBLE WORD AND IT IS NOT A CHOICE. RM0490 is flat about it: only a
+# The write unit is a 64-bit double word and it is not a choice. RM0490 is flat about it: only a
 # double word can be programmed, a byte or half-word write sets SIZERR, and a double word at an
 # address that is not double-word aligned sets PGAERR. So the unit carries an alignment requirement
 # rather than a preference.
 #
-# THIS IS NOT THE STM32F0's CONTROLLER, WHICH IS THE MISTAKE THE FAMILY INVITES. Both are
+# This is not the STM32F0's controller, which is the mistake the family invites. Both are
 # Cortex-M0-class ST parts with a 2 Kbyte flash page, and the page size is the only thing they share
 # here: the F0 programs a HALF-WORD, two bytes, and the C0 programs eight. Four times the unit, on
 # the family a reader is most likely to reach for a value from.
 #
-# AND A UNIT IS WRITE-ONCE BETWEEN ERASES. The controller enforces it rather than advising it:
+# And a unit is write-once between erases. The controller enforces it rather than advising it:
 # PROGERR is raised when a double word to be programmed does not currently read as erased, and the
 # only exception is writing all zeros, which carries no information.
 

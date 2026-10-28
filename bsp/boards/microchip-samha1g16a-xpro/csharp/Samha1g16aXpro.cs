@@ -5,14 +5,14 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Microchip
 {
-    public sealed class Samha1g16aXpro
+    internal sealed class Samha1g16aXpro
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = MicrochipSamha1g16aXproBindings.BOARD_MODEL;
 
         /// <summary>The yellow user LED LED0 on PA00, ACTIVE LOW: it lights when driven
         /// <see cref="PinValue.Low"/>.</summary>
-        /// <remarks>THIS PAD IS SHARED WITH THE EXT1 HEADER, which the kit guide states in its own
+        /// <remarks>This pad is shared with the EXT1 header, which the kit guide states in its own
         /// comment column, so a program driving the LED is also driving whatever an extension board
         /// presents on that line. It is additionally the part's XIN32 pad -- this board fits no
         /// 32.768 kHz crystal, so nothing is in contention here, but a board that fitted one could
@@ -26,7 +26,7 @@ namespace Lamella.Boards.Microchip
             Samha1GpioDriver.LogicalPin(MicrochipSamha1g16aXproBindings.BUTTON0_PORT_BASE, MicrochipSamha1g16aXproBindings.BUTTON0_PIN);
 
         /// <summary>The mode the user button wants.</summary>
-        /// <remarks>THIS KIT'S GUIDE DOES NOT SAY WHETHER AN EXTERNAL PULL-UP IS FITTED, where the
+        /// <remarks>This kit's guide does not say whether an external pull-up is fitted, where the
         /// Curiosity Nano guides state outright that none is. <see cref="PinMode.InputPullUp"/> is
         /// nevertheless the right answer under BOTH readings, which is why it can be offered without
         /// settling the question: if the board fits no pull-up the internal one is required, and if
@@ -49,7 +49,7 @@ namespace Lamella.Boards.Microchip
         private static GpioDriver MakeGpio() { return new Samha1GpioDriver(); }
 
         /// <summary>The family PORT driver this board bound.</summary>
-        /// <remarks>THE DRIVER SPANS BOTH PORT GROUPS AND THIS PACKAGE BONDS PART OF EACH. A pin
+        /// <remarks>The driver spans both port groups and this package bonds part of each. A pin
         /// number the package does not carry is addressable and connected to nothing, which is why
         /// the constants above name only pads this board's own guide names.</remarks>
         public GpioDriver CreateGpioDriver()

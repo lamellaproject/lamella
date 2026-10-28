@@ -14,7 +14,6 @@ workspace = true
 [dependencies]
 lamella-debug-backend = { path = "../lamella-debug-backend" }
 lamella-probe-core = { path = "../lamella-probe-core" }
-lamella-cmsis-dap = { path = "../lamella-cmsis-dap" }
 # THE OTHER PRODUCER OF THE SAME MAPPING, AND THE ONE THAT REACHES A LANGUAGE THAT IS NOT C#.
 # A Swift or RHU program is a linked ELF with DWARF and no Portable PDB, so the metadata route
 # stops at the language boundary and this one does not. `lamella-elf` flattens the image the same
@@ -25,7 +24,9 @@ lamella-elf = { path = "../lamella-elf" }
 # NO PROBE SELECTION AND NO PART, AND THAT IS THE POINT. `DeviceBackend` must not know which probes
 # or which parts exist -- that is the property the widening to `TargetAccess` bought. The server that
 # picks a probe and a part is a package of its own, `lamella-debug-server`, and the optional
-# crates that work needs belong to that package.
+# crates that work needs belong to that package. A probe family's crate belongs there too:
+# CMSIS-DAP's turns on a native USB transport by default, which no WebAssembly build can contain,
+# and the engine SDK's probe blob builds this crate for WebAssembly.
 
 [dev-dependencies]
 # THE POINT OF WIDENING `DeviceBackend` TO `TargetAccess`, ASSERTED RATHER THAN CLAIMED: an

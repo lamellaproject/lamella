@@ -3,28 +3,28 @@
 # enable registers that differ per line, so [base, rcc_en_off, rcc_en_bit] states each gate in full.
 # `-1` = the row gates nothing (the RCC itself).
 #
-# THE REFERENCE MANUAL DOCUMENTS TWO RCC BLOCKS AND ONLY ONE OF THEM IS THIS PART'S. Its section 6
+# The reference manual documents two RCC blocks and only one of them is this part's. Its section 6
 # is "Reset and clock control for STM32F42xxx and STM32F43xxx"; its section 7 is the same thing for
 # STM32F405xx/07xx and STM32F415xx/17xx. Every offset and bit below is from SECTION 6. The two
 # sections state overlapping register names at overlapping offsets, so reading the wrong one
 # produces a table that looks entirely plausible and gates the wrong peripherals.
 #
-# ALL ELEVEN GPIO PORTS ARE PLACED, THOUGH THIS FILE OTHERWISE PLACES ONLY THE BLOCKS A BINDING
-# USES. On that rule GPIOH through GPIOK would be absent, because no binding here touches one. A GPIO DRIVER is a different
+# All eleven GPIO ports are placed, though this file otherwise places only the blocks a binding
+# uses. On that rule GPIOH through GPIOK would be absent, because no binding here touches one. A GPIO DRIVER is a different
 # kind of consumer from a binding: it presents a pin count and answers for every pin inside it, so
 # a map with holes hands a caller a pin number whose port has no base -- and the hole sits wherever
 # nothing happened to be bound rather than anywhere a reader would predict. The four joined with
 # the driver, from the same table as the seven already here.
 #
-# THE BOUNDARY TABLE DESCRIBES THE ADDRESS SPACE, WHICH IS NOT A PAD LIST, AND THE GAP IS LARGE ON
-# THIS FAMILY. Every part here decodes eleven port register blocks; no package bonds eleven ports'
+# The boundary table describes the address space, which is not a pad list, and the gap is large on
+# this family. Every part here decodes eleven port register blocks; no package bonds eleven ports'
 # worth of pads. DS9405 Rev 13 Table 2 gives the widest of them 168 GPIOs, which is ports A to J
-# whole plus PK0-PK7 -- so PORT K IS EIGHT PADS WIDE ON THE DIE ITSELF, and its register still
+# whole plus PK0-PK7 -- so port K is eight pads wide on the die itself, and its register still
 # carries sixteen fields. The LQFP144 bonds 114: that datasheet's figure 13 shows ports A to G
 # whole, PH0 and PH1, and no PI, PJ or PK pad at all. What a part BONDS is that part's `pins`
 # list in parts.toml, and nothing in this file.
 #
-# RM0090's TABLE 1 PRINTS IN DESCENDING ADDRESS ORDER, so a reader walking DOWN that page is
+# RM0090's table 1 prints in descending address order, so a reader walking DOWN that page is
 # walking UP the port letters, and GPIOK is the first GPIO row rather than the last. The eleven
 # bases below run the other way.
 
@@ -55,7 +55,7 @@ base = 0x40011000
 rcc_en_off = 0x44   # RCC_APB2ENR
 rcc_en_bit = 4      # USART1EN
 
-# A SECOND PERIPHERAL ON THE SAME ENABLE REGISTER, AND THE BIT IS NOWHERE NEAR THE FIRST. SPI5 sits
+# A second peripheral on the same enable register, and the bit is nowhere near the first. SPI5 sits
 # at bit 20 of the register whose bit 4 is USART1, which is why an enable is a (register, bit) pair
 # per instance rather than an index a driver could compute from a peripheral number.
 [[instances]]
@@ -65,7 +65,7 @@ base = 0x40015000
 rcc_en_off = 0x44   # RCC_APB2ENR
 rcc_en_bit = 20     # SPI5EN
 
-# PORT A CARRIES BOTH PINS OF A TWO-PIN SERIAL BINDING, so one port row is enough for a greeting.
+# Port A carries both pins of a two-pin serial binding, so one port row is enough for a greeting.
 # Ports join this table when something reaches them, not because the package has them.
 
 [[instances]]
@@ -75,13 +75,13 @@ base = 0x40020000
 rcc_en_off = 0x30   # RCC_AHB1ENR
 rcc_en_bit = 0      # GPIOAEN
 
-# THE SIX PORTS AN EXTERNAL MEMORY REACHES ACROSS. A serial binding needs one or two ports; a 16-bit
+# The six ports an external memory reaches across. A serial binding needs one or two ports; a 16-bit
 # SDRAM on the memory controller needs thirty-eight signals spread over six of them. The bases are a
 # plain 0x400 stride and the enable bits are the port index, but both are stated per row rather than
 # computed: a family that placed one port elsewhere would break a formula silently, and there is
 # nothing to gain by not writing them down.
 #
-# ALL SIX GATE FROM ONE REGISTER, which is a fact about this family and not a rule. A driver that
+# All six gate from one register, which is a fact about this family and not a rule. A driver that
 # enables a bus's ports reads six offsets and may find them equal; it may not assume they are.
 
 [[instances]]
@@ -126,7 +126,7 @@ base = 0x40021800
 rcc_en_off = 0x30   # RCC_AHB1ENR
 rcc_en_bit = 6      # GPIOGEN
 
-# THE FOUR PORTS NO BINDING REACHES, PLACED FOR THE GPIO DRIVER. They are the exception this file's
+# The four ports no binding reaches, placed for the GPIO driver. They are the exception this file's
 # header states: a driver answers for every pin in its count, so the four that no board has bound
 # have to be here or a caller's pin number lands on a port with no base.
 
@@ -165,7 +165,7 @@ base = 0x40023800
 rcc_en_off = -1
 rcc_en_bit = -1
 
-# THREE MORE PLACED INSTANCES, none of them reached by the binding above. A second USART, the USB
+# Three more placed instances, none of them reached by the binding above. A second USART, the USB
 # full-speed core and the embedded-flash interface are copies this part carries wherever they are
 # driven from, so they are stated here for the same reason every other row is.
 #

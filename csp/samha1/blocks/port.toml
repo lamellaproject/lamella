@@ -5,18 +5,18 @@
 #   PINCFG[p] = group_base + 0x40 + p        (p = the pin index within the group)
 # The generator owns those derivations; drivers receive resolved addresses through their bindings.
 #
-# EVERY OFFSET HERE CAME OFF THIS FAMILY'S OWN 25.9 REGISTER DESCRIPTIONS, WHICH STATE ONE OFFSET
-# EACH IN PROSE, AND NOT OFF THE 25.8 REGISTER-SUMMARY TABLE. In that table each register occupies
+# Every offset here came off this family's own 25.9 register descriptions, which state one offset
+# each in prose, and not off the 25.8 register-summary table. In that table each register occupies
 # four rows, one per byte lane, and carries its name and its offset on only the first of them.
 # The two datasheets in this family number these sections identically.
 #
-# TWO GROUPS ON THE DIE, AND THE COUNT COMES FROM THE PAD SET RATHER THAN FROM AN OFFSET
-# EXPRESSION. This document bounds the group count nowhere -- "The number of PORT groups on a
+# Two groups on the die, and the count comes from the pad set rather than from an offset
+# expression. This document bounds the group count nowhere -- "The number of PORT groups on a
 # device may depend on the package or number of pins" -- and its offsets carry no group term, so
 # the bound is taken from Table 7-1: the G package bonds pads in group B and so group 1 exists.
 # The sibling samr21 states its own count in its offset expressions; this family does not.
 #
-# THE E PACKAGE BONDS NO GROUP-B PAD AT ALL, AND THAT DOES NOT MAKE IT A ONE-GROUP PART. Both
+# The E package bonds no group-B pad at all, and that does not make it a one-group part. Both
 # groups are on the die -- the E and G share silicon -- and the E's own SBC uses PB11, which is a
 # group-B pad reaching no package pin. So a driver spans both groups on every part of this family
 # and the package decides only which pads reach the outside. That is stated in parts.toml.
@@ -92,7 +92,7 @@ fields = { PMUXEN = [0, 1], INEN = [1, 1], PULLEN = [2, 1], DRVSTR = [6, 1] }
 notes = "Element 0 of the per-pin config array; see the block header for the element derivation. Reset value 0x40 as printed in 25.9.13."
 
 # Function-letter values for PMUX nibbles (family-wide; the pin-map rows name letters).
-# NOTE: WHAT A LETTER SELECTS IS PER-PART ON THIS FAMILY MORE THAN ON ITS SIBLINGS. Table 7-1's
+# Note: what a letter selects is per-part on this family more than on its siblings. Table 7-1's
 # note 4 states that TCC3 exists only on the SAM HAxG17A, so the F column is populated on one part
 # and empty on the others at several pads. A pin-map row carries the letter and this table turns it
 # into a nibble; what the letter SELECTS is Table 7-1's business, and which Table 7-1 depends on

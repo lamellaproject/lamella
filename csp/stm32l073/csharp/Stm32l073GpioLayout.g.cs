@@ -5,7 +5,7 @@
 // instance bases live in Stm32l073Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Stm32l073GpioLayout
+    internal sealed class Stm32l073GpioLayout
     {
         private Stm32l073GpioLayout() { }
 

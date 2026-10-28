@@ -5,20 +5,20 @@
 # Cross-block bring-up (RCC enables, GPIO muxing) is DRIVER code per language; only block-local
 # facts ride here.
 #
-# THIS PERIPHERAL IS AN SPI AND AN I2S IN ONE REGISTER MAP, and that is the first thing to know
+# This peripheral is an SPI and an I2S in one register map, and that is the first thing to know
 # about it rather than a footnote. I2SCFGR at 0x1C selects which of the two the block IS, and its
 # reset value selects SPI -- so a master that never touches I2SCFGR is correct, and a driver that
 # writes it without meaning to changes the peripheral's kind rather than a mode within it. The two
 # I2S registers are stated below because they are part of this map, not because an SPI driver
 # needs them.
 #
-# THE DATA REGISTER IS ONE ADDRESS SERVING TWO DIRECTIONS. DR at 0x0C is the transmit register when
+# The data register is one address serving two directions. DR at 0x0C is the transmit register when
 # written and the receive register when read, as this vendor's older USART is. On a full-duplex
 # master every byte clocked out clocks one in, so a transfer that writes without reading leaves a
 # byte in the receive path and OVR is set on the next one -- which is why a polled master reads DR
 # even when the value is discarded.
 #
-# BR IS A PRESCALER EXPONENT, NOT A DIVISOR. The three BR bits select the peripheral clock divided
+# BR is a prescaler exponent, not a divisor. The three BR bits select the peripheral clock divided
 # by 2^(BR+1), so the slowest setting is /256 and there is no /1. A driver that wrote a divisor
 # there would run the bus 2^(divisor+1) times slow at best and above the part's maximum at worst.
 

@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Arduino
 {
-    public sealed class OptaWifi
+    internal sealed class OptaWifi
     {
         /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
         public static readonly int BoardModel = ArduinoOptaWifiBindings.BOARD_MODEL;

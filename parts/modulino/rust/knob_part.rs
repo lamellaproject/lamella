@@ -12,7 +12,7 @@ pub const FAMILY: &str = "modulino";
 pub const SOURCING_FACTS: &str = "primary";
 pub const SOURCING_VALIDATION: &str = "none";
 
-/// identity: THIS PART HAS NONE, and that is a fact about the part rather than a gap in this table. There is no register to read, so nothing can confirm which part answered an address -- the `identified` validation rung is unreachable for it by construction, and confidence has to be earned by exercising it instead.
+/// identity: this part has none, and that is a fact about the part rather than a gap in this table. There is no register to read, so nothing can confirm which part answered an address -- the `identified` validation rung is unreachable for it by construction, and confidence has to be earned by exercising it instead.
 pub const IDENTITY_ABSENT: &str = "These nodes run vendor firmware as an I2C target and Arduino's manuals document no identity register for any of them: no WHO_AM_I, no device id, no part id. Nothing on the bus can confirm WHICH node answered an address -- and because every address here is software-assignable, an address is not evidence of type either. Presence and type can be established only by exercising the node.";
 
 /// address: a base plus which pin contributes which bit. The part states the range; a carrier fixes the straps, so no strap is defaulted here.

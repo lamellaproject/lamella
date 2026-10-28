@@ -116,4 +116,21 @@ mod tests {
         );
         assert_eq!(evaluate(&mut slot, "1 + 1")["result"], json!("2"));
     }
+
+    #[test]
+    fn an_array_is_an_instance_only_of_what_system_array_implements() {
+        if LcscCompiler::discover().is_err() {
+            eprintln!("skipping: no reference assemblies on this host");
+            return;
+        }
+        let mut slot = None;
+        assert_eq!(
+            evaluate(&mut slot, "((object)new int[3]) is System.IComparable")["result"],
+            json!("False")
+        );
+        assert_eq!(
+            evaluate(&mut slot, "((object)new int[3]) is System.Collections.IEnumerable")["result"],
+            json!("True")
+        );
+    }
 }

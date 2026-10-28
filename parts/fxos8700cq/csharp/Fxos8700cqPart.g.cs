@@ -7,7 +7,7 @@
 // run time.
 namespace Lamella.Generated
 {
-    public sealed class Fxos8700cqPart
+    internal sealed class Fxos8700cqPart
     {
         private Fxos8700cqPart() { }
         public const string PART = "fxos8700cq";

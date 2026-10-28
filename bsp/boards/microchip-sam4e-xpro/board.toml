@@ -27,8 +27,8 @@ notes = [
 [[carriers]]
 kind = "edbg-vcp"           # the on-board EDBG bridge's VCP.
 usb_vid = 0x03EB            # the debugger's own USB identity, read off this kit rather than
-usb_pid = 0x2111            # inherited from a sibling. THE PAIR NARROWS TO A KIT AND NEVER TO A
-                            # BOARD: several Xplained Pro kits answer 0x2111, so anything that must
+usb_pid = 0x2111            # inherited from a sibling. The pair narrows to a kit and never to a
+                            # board: several Xplained Pro kits answer 0x2111, so anything that must
                             # reach THIS board settles the rest on the probe's serial.
 baud = 115200
 default = true              # this board states no [[plans]] row, so the carrier names no
@@ -36,10 +36,10 @@ default = true              # this board states no [[plans]] row, so the carrier
 
 # --- control lines ---------------------------------------------------------------------------
 #
-# BOTH ARE ACTIVE LOW AND THE GUIDE SAYS SO IN WORDS: a button "drive[s] the I/O line to GND", and
+# Both are active low and the guide says so in words: a button "drive[s] the I/O line to GND", and
 # the LED "can be activated by driving the connected I/O line to GND".
 #
-# AND THE GUIDE STATES THE PULL-UP REQUIREMENT OUTRIGHT, which its siblings' guides do not: "in
+# And the guide states the pull-up requirement outright, which its siblings' guides do not: "in
 # order to read the button status the internal pull-up must be enabled". That is the same fact the
 # SAM4S Xplained's schematic had to be read for -- there the only pull-up in the block is marked
 # do-not-populate -- and it is worth carrying on the row rather than in a driver's memory, because

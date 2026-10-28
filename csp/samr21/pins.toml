@@ -16,8 +16,8 @@ notes = [
 
 # ---- the SAM R21 Xplained Pro's EDBG virtual COM port -------------------------------------------
 #
-# WARNING: THE KIT'S OWN USER GUIDE IS WRONG ABOUT ONE OF THESE TWO PINS AND THE PART DATASHEET
-# IS RIGHT. Table 4-12 of the SAM R21 Xplained Pro user guide (Atmel-42243D) prints:
+# Warning: the kit's own user guide is wrong about one of these two pins and the part datasheet
+# is right. Table 4-12 of the SAM R21 Xplained Pro user guide (Atmel-42243D) prints:
 #
 #     PA04     SERCOM0 PAD[0] UART TXD (SAM R21 TX line)
 #     PA05     SERCOM1 PAD[1] UART RXD (SAM R21 RX line)

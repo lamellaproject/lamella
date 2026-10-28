@@ -30,11 +30,6 @@ pub(crate) struct StructLayout {
     pub(crate) type_flags: u32,
     /// The `Pack` and `Size` of the `ClassLayout` row, or `None` when both are zero or absent.
     ///
-    /// **THE ROW IS CONDITIONAL AND THE BITS ARE NOT.** Measured: csc writes no `ClassLayout` for
-    /// `[StructLayout(LayoutKind.Explicit)]` with neither `Size` nor `Pack`, and none for
-    /// `Pack = 0` (which MEANS "the platform default" rather than "pack to zero") -- while both
-    /// still get their layout bits. `Size = 0` written explicitly beside a nonzero `Pack` DOES get
-    /// a row, with a zero in the size column, so the condition is on the pair and not on each.
     pub(crate) class_layout: Option<(u16, u32)>,
 }
 
@@ -87,9 +82,6 @@ pub(crate) fn field_offset(
 /// Reads the marshalling descriptor a `[MarshalAs(...)]` among `attributes` asks for, or `None`
 /// if there is none (or if its `UnmanagedType` does not resolve).
 ///
-/// **THE RULES FOR WHICH TAIL FIELDS AN `LPArray` WRITES ARE HERE AND NOT IN THE ENCODER**, because
-/// they are about which named arguments the SOURCE supplied rather than about II.23.4. Measured
-/// against csc across six `LPArray` spellings; `MarshalSpec`'s own tests carry the bytes.
 pub(crate) fn marshal_spec(
     binder: &mut Binder,
     enclosing: &TypeSymbol,

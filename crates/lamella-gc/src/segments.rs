@@ -1,29 +1,49 @@
-//! The allocation-free collection over a heap of SEVERAL SEGMENTS: regions at unrelated addresses,
-//! such as a part's SRAM and a PSRAM that sits below it in the address map. One mark pass covers
-//! every segment, each segment compacts in place, and no object moves from one segment to another.
+//! The ALLOCATION-FREE collection: the sliding mark-compact [`mark_compact`](crate::heap) runs, with
+//! every piece of bookkeeping in storage the caller supplies, over a heap of one segment or of
+//! several -- regions at unrelated addresses, such as a part's SRAM and a PSRAM that sits below it in
+//! the address map. One mark pass covers every segment, each segment compacts in place, and no
+//! object moves from one segment to another. Every device heap collects here.
 //!
-//! It is the one-segment allocation-free collection generalized, phase for phase: the same mark
-//! with its storage-free finish, the same forwarding by replay, every reference rewritten before
-//! anything moves, the same free blocks below a pin and the same zeroed tail. What changes is that
-//! an address is first resolved to the segment that holds it. A reference may point from any
+//! # Why the bookkeeping is the caller's
+//!
+//! The allocating engine keeps its worklist in a `Vec`, its live set in a `BTreeSet` and its
+//! forwarding table in a `BTreeMap`, so a collection allocates from the Rust global allocator:
+//! roughly 31 bytes per live object and about 2.5 times the heap being compacted. That is affordable
+//! on a host and impossible on a device image, whose only allocator is the one that just failed. The
+//! `collection-scratch-cost` example reports the figures. Here each of the three is replaced:
+//!
+//! * the live set by one mark bitmap per segment, a bit per word of its region;
+//! * the worklist by a fixed array, which falls back to sweeping to a fixpoint when it overflows;
+//! * the forwarding table by a replay of the compaction, which the forwarding index below shortens.
+//!
+//! # The order of operations
+//!
+//! **Every reference is rewritten BEFORE any object moves.** A destination is a function of the
+//! marks and the object footprints, and a footprint depends on the header word and the leading
+//! payload words -- an array's dimensions, never a reference -- so rewriting reference slots cannot
+//! perturb the destinations still being computed, and moving first would destroy the layout they
+//! are computed from. The roots are enumerated twice for the same reason: once to mark, once to
+//! rewrite. A pinned survivor stays where it is, and the dead bytes the survivors beneath it could not
+//! slide over become a free block the allocator reuses; what the survivors vacate reads zero, since
+//! it is the next allocation's payload.
+//!
+//! An address is first resolved to the segment that holds it. A reference may point from any
 //! segment into any other, so marking and rewriting look the target up; walking an object, finding
-//! where it lands and moving it all stay inside its own segment.
-//!
-//! A segment keeps its own bump pointer, its own free chain and its own mark bitmap, so each one is
-//! a heap of the one-segment shape, and the collection answers one of each per segment.
+//! where it lands and moving it all stay inside its own segment. A segment keeps its own bump
+//! pointer, its own free chain and its own mark bitmap, and the collection answers one of each per
+//! segment.
 //!
 //! # The forwarding index
 //!
-//! Where a survivor lands is the cursor after every survivor below it has been placed, and the
-//! one-segment collection finds it by replaying the segment from its base, once per reference it
-//! rewrites. That costs the number of references times the number of objects, which a few kilobytes
-//! of SRAM can afford and megabytes of PSRAM behind a cache that flash shares cannot: a collection
-//! there grows with the square of what the segment holds, and reaches minutes. So a segment may carry
+//! Where a survivor lands is the cursor after every survivor below it has been placed, which a walk
+//! from the segment's base can replay, once per reference the collection rewrites. That costs the
+//! number of references times the number of objects, so the collection grows with the square of
+//! what the segment holds: seconds on a hundred kilobytes, minutes on megabytes. So a segment carries
 //! a FORWARDING INDEX: for each [`INDEX_CHUNK`]-byte chunk, the first object that starts in or after
 //! it and where the replay's cursor stands there, built in one walk after marking. A lookup then
 //! replays one chunk instead of the segment. The index changes where the replay starts and nothing
-//! else, so a collection with one answers exactly what it answers without; a segment without one is
-//! replayed from its base, as before.
+//! else, so a collection with one answers exactly what it answers without, and a segment given none
+//! is replayed from its base.
 //!
 //! No step here makes an exclusive or atomic access to a heap word or a bitmap word. That is a
 //! property to keep: some parts support exclusive accesses only in SRAM, and on the RP2350 a
@@ -253,8 +273,8 @@ fn build_index(
 
 /// Collects a heap of several segments without allocating: marks from the roots across every
 /// segment, rewrites every reference, then compacts each segment in place. On success it writes
-/// each segment's new top and the head of its free chain into `answers` (offsets from that
-/// segment's base, as the one-segment collection answers them) and answers `true`.
+/// each segment's new top and the head of its free chain into `answers`, as offsets from that
+/// segment's base, and answers `true`.
 ///
 /// `marks` holds one bitmap per segment, each covering its segment's whole region, and `answers`
 /// one slot per segment. A segment's forwarding index, when it has one, is rebuilt from scratch, so

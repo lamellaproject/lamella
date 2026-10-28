@@ -1,13 +1,13 @@
 # The SAMC21N Xplained Pro (ATSAMC21N-XPRO): board truth only -- what is wired to what. Chip truth
 # lives in csp/samc21/.
 #
-# THIS IS THE 100-PIN PART AND IT IS NOT A BIGGER VERSION OF ITS SIBLING BOARD. microchip-samc21-xpro is the
+# This is the 100-pin part and it is not a bigger version of its sibling board. microchip-samc21-xpro is the
 # 64-pin J; this is the N, and the differences are silicon rather than layout: a THIRD PORT GROUP,
 # which is where this board's LED sits, and TWO EXTRA SERCOMS behind a fourth APB bridge. The two
 # boards also read from DIFFERENT TABLES in the same datasheet -- Table 6-1 and Table 12-1 here,
 # Table 6-2 and Table 12-3 there.
 #
-# THE VIRTUAL COM PORT IS THE ONE THING THE TWO BOARDS SHARE. Both put it on SERCOM4 at PB10/PB11,
+# The virtual COM port is the one thing the two boards share. Both put it on SERCOM4 at PB10/PB11,
 # and that was checked in both tables rather than carried across.
 
 [table]
@@ -35,7 +35,7 @@ notes = [
 
 [[carriers]]
 kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
-usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+usb_vid = 0x03EB            # Note: no usb_pid row, and its absence is a sourced position rather than
 role = "vcp"                # AN OMISSION -- see microchip-samc21-xpro, whose note states the reasoning and the
 baud = 115200               # evidence that a sibling kit's product id cannot be borrowed.
 plan = "osc48m-4mhz"
@@ -50,7 +50,7 @@ gclk_gen = 0                # pad carries a column-C SERCOM, and the guide names
 tx = { pin = "PB10", pad = 2 }
 rx = { pin = "PB11", pad = 3 }
 
-# THE DEFAULT CLOCK PLAN. Same family, same reset oscillator, same rate as microchip-samc21-xpro -- and
+# The default clock plan. Same family, same reset oscillator, same rate as microchip-samc21-xpro -- and
 # stated here from the datasheet rather than pointed at the sibling, because a plan is a BOARD fact
 # and two boards agreeing about one is a result rather than an inheritance.
 [[plans]]

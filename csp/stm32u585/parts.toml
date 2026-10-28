@@ -2,13 +2,13 @@
 # against the datasheet's pinout, not the whole package, so a consumer must not read one as the
 # package. A pin that is not listed is refused rather than assumed.
 #
-# WHY THIS FAMILY IS NAMED FOR A PART AND NOT FOR THE SERIES. A family owns ONE reference manual
+# Why this family is named for a part and not for the series. A family owns ONE reference manual
 # AND one pin-function table, and for this vendor's U5 those two halves disagree. RM0456 is titled for
 # the STM32U5 SERIES and its introduction claims "complete information on how to use memory and
 # peripherals of the STM32U5 series microcontrollers" -- naming no products at all, which is the
 # same shape csp/ra4m1 met and resolved by reading the enumeration out of the DATASHEET instead.
 #
-# AND THE MANUAL DISAGREES WITH ITSELF, WHICH IS THE NEW PART. Its title is series-wide; its
+# And the manual disagrees with itself, which is the new part. Its title is series-wide; its
 # CONTENT is per sub-group, in three separate places:
 #   * Table 6, the register boundary table, prints FOUR product columns -- STM32U535/545,
 #     STM32U575/585, STM32U59x/5Ax and STM32U5Fx/5Gx -- and a peripheral present in one is absent
@@ -20,14 +20,14 @@
 #     U535/545, against 0xFFFFFFFF for both here -- and those are the two ports this board uses.
 # So the manual's title cannot enumerate a family and its tables refuse to enumerate one uniformly.
 #
-# WHICH CONJUNCT GETS PRIORITY: the PIN-FUNCTION TABLE, which is the datasheet.
+# Which conjunct gets priority: the PIN-FUNCTION TABLE, which is the datasheet.
 # DS13086 is titled "STM32U585xx" and names U575 once in 350 pages. A family named `stm32u5` would
 # need four datasheets to fill one pins.toml honestly, and a pin map complete for one sub-group and
 # silently absent for three is worse than a narrow name. A later U575 joins only if ITS datasheet's
 # own product list says so -- checked, the way the F072 was checked against RM0091, never assumed
 # from the number.
 #
-# THE ORDER CODE DECIDES WHICH PINOUT TABLE APPLIES, AND GETTING IT WRONG IS INVISIBLE. DS13086
+# The order code decides which pinout table applies, and getting it wrong is invisible. DS13086
 # Table 27 prints TWO complete sets of package columns: the left set every one suffixed "SMPS" (the
 # dedicated SMPS step-down pinout, the `Q` option in the order code) and the right set without. So
 # there are two columns both headed UFBGA169 with different ball assignments, and only the order
@@ -60,18 +60,18 @@ pins = [
     "PG5-PG13",
     "PH10-PH15",
 ]
-# EVERY PIN BELOW WAS RESOLVED THROUGH ITS BALL AND ITS ALTERNATE FUNCTION, NEVER THROUGH A ROW
-# POSITION IN A DRAWING. A schematic symbol commonly places each ball designator on the wire stub,
+# Every pin below was resolved through its ball and its alternate function, never through a row
+# position in a drawing. A schematic symbol commonly places each ball designator on the wire stub,
 # ABOVE its pin-name baseline, so a pin label and the ball on its own line are not vertically centred
 # on each other and a text conversion groups every ball with the PREVIOUS pin. Read that way a whole
 # port block slides by one, and the slide is silent, because both the intended pin and its neighbour
 # are real pins of this part.
 #
-# THE ALTERNATE FUNCTION IS WHAT SETTLES IT, BEING INDEPENDENT OF EVERY LAYOUT QUESTION. LPUART1_CTS
+# The alternate function is what settles it, being independent of every layout question. LPUART1_CTS
 # is an alternate function of PG5 and NOT of PG4 -- DS13086 Table 27 gives PG4 only SPI1_MOSI,
 # FMC_A14 and SAI2_MCLK_B -- so a net carrying that signal on ball J9 can only be PG5.
 #
-# PG11 IS INSIDE THE STATED RANGE AND CARRIES NO BINDING, WHICH IS WHY THE RANGE HAS A HOLE IN IT.
+# PG11 is inside the stated range and carries no binding, which is why the range has a hole in it.
 # It is SPI3_MOSI -- but not the BOOTLOADER's SPI3_MOSI, which AN2606 Rev 70 Table 217 places on
 # PB5. A design reaching the system bootloader over SPI3 therefore leaves PG11 open and takes MOSI
 # from PB5, which is also the pin a 3.3 V signal must use when PG[2:15] is powered from VDDIO2 at a

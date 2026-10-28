@@ -1,7 +1,7 @@
 # BOARD binding: the ST NUCLEO-L011K4. Board truth ONLY: role bindings, the carrier, and the clock
 # plan. Chip truth lives in csp/stm32l0/.
 #
-# THIS BOARD'S VCP IS NOT ON THE PAIR EVERY OTHER NUCLEO USES. UM1956 puts the transmit line on PA2
+# This board's VCP is not on the pair every other Nucleo uses. UM1956 puts the transmit line on PA2
 # and the RECEIVE line on PA15, not PA3 -- each behind its own solder bridge, SB2 and SB3, both ON
 # by default. PA3 is a real USART2_RX pad on this part and is left for the Arduino Nano header
 # instead, so the choice is the board's and not the chip's.

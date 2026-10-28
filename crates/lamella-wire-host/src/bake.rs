@@ -10,7 +10,7 @@ use lamella_metadata::Assembly;
 /// holds that firmware too. A fit verdict over the size is therefore an upper bound on the room the
 /// image has, and every tool that answers one says so in these words.
 pub const SIZE_LEAVES_OUT: &str =
-    "the serve firmware already resident on the board, which this image is loaded INTO rather than replacing";
+    "the resident interpreter firmware already on the board, which this image is loaded into rather than replacing";
 
 /// A baked image, and what it carries.
 #[derive(Debug)]

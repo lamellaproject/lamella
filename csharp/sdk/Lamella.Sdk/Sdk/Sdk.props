@@ -1,60 +1,65 @@
 <!--
   Lamella.Sdk: the MSBuild project SDK for C# programs that run on Lamella.
 
-  A project names it together with its version, <Project Sdk="Lamella.Sdk/VERSION">, and targets
-  lamella1.0. This file is imported before the project file. It imports Microsoft.NET.Sdk first, so
-  that the dotnet command and editors treat the project as an ordinary .NET project, and then sets
-  what a lamella1.0 build needs.
+  A project names it together with its version, <Project Sdk="Lamella.Sdk/VERSION">, and its target framework picks
+  what it builds for: lamella1.0 is Lamella. This file is imported before the project file. It imports
+  Microsoft.NET.Sdk first, so that the dotnet command and editors treat the project as an ordinary .NET project, and
+  then names where the parts of a lamella1.0 build are. Nothing here changes a build: the project file has not set its
+  target framework yet when this file is read, so every setting of a lamella1.0 build is made in
+  Lamella.TargetFramework.targets, once the target framework is known, and for lamella1.0 alone. A build for any
+  other target framework is Microsoft.NET.Sdk's own.
 -->
 <Project>
 
-  <!-- A reference resolves only from what the project names. The framework folder below holds the
-       core library and also every library a project reaches through a PackageReference, so a bare
-       assembly name is never looked up there. -->
-  <PropertyGroup>
-    <AssemblySearchPath_UseTargetFrameworkDirectory>false</AssemblySearchPath_UseTargetFrameworkDirectory>
-  </PropertyGroup>
-
   <Import Project="Sdk.props" Sdk="Microsoft.NET.Sdk" />
 
+  <!-- The namespaces Microsoft.NET.Sdk imports implicitly, as it lists them, before the project adds
+       any using of its own: a lamella1.0 build keeps each one its references define (Sdk.targets). -->
+  <ItemGroup>
+    <_LamellaImplicitUsing Include="@(Using)" />
+  </ItemGroup>
+
   <PropertyGroup>
-    <!-- This package's version. The lamella tool the build uses has the same version. -->
+    <!-- This package's version. The package of the lamella tool the build uses has the same version, and
+         the tool inside it keeps its own. -->
     <LamellaSdkVersion>$version$</LamellaSdkVersion>
     <LamellaSdkRoot>$([MSBuild]::NormalizeDirectory('$(MSBuildThisFileDirectory)', '..'))</LamellaSdkRoot>
 
     <!-- Lamella's class library: the core library, the libraries Lamella provides for package
          references, and the builds for a family of chips under families. MSBuild resolves references
-         from this folder, and every call to the lamella tool names the same folder in the
-         LAMELLA_REF_DIR environment variable, so both read one copy. -->
+         from this folder, and every call to the lamella tool names the same folder, so both read one
+         copy: the command dotnet run starts names it with the tool's ref-dir option, and every other
+         call in the LAMELLA_REF_DIR environment variable. -->
     <LamellaRefDir>$([MSBuild]::NormalizePath('$(LamellaSdkRoot)', 'ref', 'Lamella', 'v1.0'))</LamellaRefDir>
 
     <!-- The runtime support archives a program is linked with when the lamella tool writes an image
          for a board: one for each instruction set, or for each board where the archive carries the
          board's own startup, console and clock. They are built from the same sources as the class
-         library above, and every call to the lamella tool names this folder in the
+         library above, and every call to the lamella tool names this folder: the command dotnet run
+         starts names it with the tool's runtime-support-dir option, and every other call in the
          LAMELLA_RUNTIME_SUPPORT_DIR environment variable. -->
     <LamellaRuntimeSupportDir>$([MSBuild]::NormalizePath('$(LamellaSdkRoot)', 'runtime-support'))</LamellaRuntimeSupportDir>
 
-    <!-- The target framework lamella1.0 is Lamella,Version=v1.0, and its reference assemblies are the
-         class library above, found through RedistList/FrameworkList.xml beside it. -->
+    <!-- The boards this SDK checks a project's board against: those the lamella tool knows, and
+         those Lamella RHU supports (Lamella.Boards.targets). -->
+    <_LamellaBoardsFile Condition="'$(_LamellaBoardsFile)' == ''">$(MSBuildThisFileDirectory)Lamella.Boards.props</_LamellaBoardsFile>
+    <_LamellaRhuBoardsFile Condition="'$(_LamellaRhuBoardsFile)' == ''">$(MSBuildThisFileDirectory)Lamella.RhuBoards.props</_LamellaRhuBoardsFile>
+
+    <!-- The packages this SDK downloads, each with the hash it is checked against (Sdk.targets), and the
+         release of Lamella RHU it pins. -->
+    <_LamellaKnownPacksFile Condition="'$(_LamellaKnownPacksFile)' == ''">$(MSBuildThisFileDirectory)Lamella.KnownPacks.props</_LamellaKnownPacksFile>
+
+    <!-- The version of the contract between this SDK and Lamella RHU's build package: what a net11.0
+         build hands RHU's targets, and what they hand back. A release of RHU states the version it
+         implements, and this SDK takes a release only of this version. -->
+    <LamellaShellContract>1</LamellaShellContract>
+
+    <!-- The packages the lamella tool provides for lamella1.0 from the class library (Sdk.targets). -->
+    <_LamellaPackagesFile Condition="'$(_LamellaPackagesFile)' == ''">$(MSBuildThisFileDirectory)Lamella.Packages.props</_LamellaPackagesFile>
+
+    <!-- The .NET SDK imports this file just before it infers a framework from the project's target
+         framework, which is the first point at which the target framework is known. -->
     <BeforeTargetFrameworkInferenceTargets>$(MSBuildThisFileDirectory)Lamella.TargetFramework.targets</BeforeTargetFrameworkInferenceTargets>
-    <TargetFrameworkRootPath>$([MSBuild]::NormalizeDirectory('$(LamellaSdkRoot)', 'ref'))</TargetFrameworkRootPath>
-
-    <!-- No .NET framework is referenced: the core library is Lamella's own. -->
-    <NoStdLib>true</NoStdLib>
-    <DisableImplicitFrameworkReferences>true</DisableImplicitFrameworkReferences>
-
-    <!-- The attributes these generators write are types Lamella's core library does not define. -->
-    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
-    <GenerateTargetFrameworkAttribute>false</GenerateTargetFrameworkAttribute>
-
-    <!-- The build writes the program's assembly alone, with no reference assembly beside it. -->
-    <ProduceReferenceAssembly>false</ProduceReferenceAssembly>
-
-    <!-- A program builds to a .dll, as on .NET. The C# version defaults to 11, the newest that
-         Lamella's compiler accepts, so an editor flags what the build would refuse. -->
-    <TargetExt>.dll</TargetExt>
-    <LangVersion Condition="'$(LangVersion)' == ''">11</LangVersion>
   </PropertyGroup>
 
 </Project>

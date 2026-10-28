@@ -1,7 +1,7 @@
 # PART: NXP (Freescale) MAG3110, a three-axis 16-bit magnetometer.
 #
 #
-# ITS IDENTITY REGISTER IS NOT WHERE ITS SIBLINGS PUT THEIRS. The MMA8653FC and the FXOS8700CQ both
+# Its identity register is not where its siblings put theirs. The MMA8653FC and the FXOS8700CQ both
 # answer WHO_AM_I at 0x0D; this part answers at 0x07. Same vendor, different register -- which is
 # worth stating because a probe written for one of them finds nothing here, and a probe that assumed
 # a vendor convention would read this part's Z-axis data instead.
@@ -22,7 +22,7 @@ notes = [
 #
 # Primary: every fact below is read from this part's own data sheet.
 #
-# WHAT THIS TABLE DELIBERATELY DOES NOT STATE: the output data rates and oversampling codes, the
+# What this table deliberately does not state: the output data rates and oversampling codes, the
 # operating and standby mode encodings, the automatic magnetic reset behavior, the raw-versus-
 # corrected data selection, the die temperature scaling, and the user offset arithmetic. All are in
 # the data sheet and none is transcribed.
@@ -43,7 +43,7 @@ width = 8
 values = [0xC4]
 notes = "Device ID Number, reset value 0xC4. NOT at 0x0D, where two other parts from this vendor in this catalog answer theirs -- on this part 0x0D is the high byte of the user Z offset, which is writable configuration rather than an identity."
 
-# --- address: FIXED, and a SIBLING PART TAKES THE NEXT ONE ------------------------------------------
+# --- address: FIXED, and a sibling part takes the next one ------------------------------------------
 #
 # One address with no selection pin. The data sheet names a related part, the FXMS3110CD, which is
 # assigned 0x0F instead -- so the neighbouring address belongs to a different device rather than to

@@ -20,12 +20,12 @@ package = "QFN-60"
 flash = 0
 ram = 0x80000
 pins = ["GP0-GP29"]
-# TWO PROCESSOR SOCKETS, AND EACH ONE RUNS EITHER ARCHITECTURE. This is why the field below lists
+# Two processor sockets, and each one runs either architecture. This is why the field below lists
 # architectures per socket rather than naming one: the ARCHSEL register "has one bit for each
 # processor socket", so which core sits in a socket is SELECTED rather than fixed, and the part
 # offers four combinations. Both Arm and both RISC-V are the ones a single image can use.
 #
-# AND THE MIXED COMBINATIONS SHOW THAT SHARED MEMORY IS NOT THE WHOLE TEST. The manual
+# And the mixed combinations show that shared memory is not the whole test. The manual
 # permits "either Arm core 0 and RISC-V core 1, or RISC-V core 0 and Arm core 1", and says of them:
 # "this requires two separate program images". The two still share memory -- "a shared variable can
 # be safely, concurrently accessed by an Arm processor performing ldrex, strex instructions and a
@@ -42,11 +42,11 @@ package = "QFN-80"
 flash = 0
 ram = 0x80000
 pins = ["GP0-GP47"]
-# THE SAME TWO SOCKETS AS THE A ROW, and for the same reason: the package changes how many pads are
+# The same two sockets as the A row, and for the same reason: the package changes how many pads are
 # bonded out, not what is behind them.
 cores = { core0 = ["cortex-m33", "hazard3"], core1 = ["cortex-m33", "hazard3"] }
 cores_share_memory = true
-# ANALOGUE INPUT MOVES WITH THE PACKAGE AND IS THE TRAP IN THIS PART. On the QFN-60 the ADC reads
+# Analogue input moves with the package and is the trap in this part. On the QFN-60 the ADC reads
 # GPIO26-29; on the QFN-80 it reads GPIO40-47 and NOT GPIO26-29, so a GPIO number that is analogue on
 # one package is digital-only on the other, and an ADC channel number is not derivable from it.
 source = "RP2350 datasheet Table 1: RP2350B is the QFN-80 (10 x 10 mm) member, no internal flash, 48 GPIO, 8 analogue inputs. Chapter 1 NOTE: GPIOs 0 through 29 are available in all package variants, GPIOs 30 through 47 only in QFN-80 (RP2350B) -- so GP0-GP47 is the whole bonded set. Second NOTE, same chapter: analogue input is on GPIOs 26 through 29 in QFN-60 for four inputs, and on GPIOs 40 through 47 in QFN-80 for eight. Section 4.2 gives the SRAM, unchanged across the family: 520 kB as 8 x 64 kB striped to 0x2007ffff plus 2 x 4 kB above the watermark, and this row states the contiguous 512 KB window the A row states."

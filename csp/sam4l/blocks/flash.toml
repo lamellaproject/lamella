@@ -1,17 +1,17 @@
 # BLOCK: the SAM4L flash controller (FLASHCALW), stated only as far as the facts consumers outside
 # the controller need. Its command set, its security bit and its picocache are not described here.
 #
-# NOT AN EEFC, WHICH IS THE FIRST THING TO KNOW ABOUT IT. The SAM3X, SAM4S, SAM4E and SAM4N use the
+# Not an EEFC, which is the first thing to know about it. The SAM3X, SAM4S, SAM4E and SAM4N use the
 # Enhanced Embedded Flash Controller and report their geometry from a Get Flash Descriptor command;
 # the SAM4L uses FLASHCALW, which does not. Both kinds still state a page size their own family
 # holds to, so both can be declared -- what differs is whether a driver can also ASK the part, and
 # on an EEFC it should, because the descriptor is the live cross-check against this file.
 #
-# THE PAGE IS 512 BYTES ACROSS EVERY DENSITY, and that is what makes it a block fact rather than a
+# The page is 512 bytes across every density, and that is what makes it a block fact rather than a
 # part one: the parameter table gives 512 for the 1024-page, 512-page and 256-page devices alike.
 # A family whose densities DIFFERED would have to state this per part.
 #
-# THE ERASED VALUE COMES FROM THE PART'S OWN BLANK CHECK. FLASHCALW offers Quick Page Read, which
+# The erased value comes from the part's own blank check. FLASHCALW offers Quick Page Read, which
 # "read[s] all words in an addressed page. All bits in all words in this page are AND'ed together"
 # and is "useful to check that a page is in an erased state". A blank check built on AND returning
 # one is a part saying that erased is all ones, in a stronger form than a sentence would.

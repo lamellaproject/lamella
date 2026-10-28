@@ -4,19 +4,19 @@
 #
 # Two facts, and each `sources` entry names the one it backs.
 #
-# THE WRITE UNIT IS A 128-BIT QUAD-WORD -- 16 BYTES -- AND THE PART OFFERS A LARGER ONE, NOT A
-# SMALLER. Table 25-2 gives the main banks a write granularity of `Quad-Word or Page`: a page is
+# The write unit is a 128-bit quad-word -- 16 bytes -- and the part offers a larger one, not a
+# smaller. Table 25-2 gives the main banks a write granularity of `Quad-Word or Page`: a page is
 # 512 bytes and is the bulk mode, and the quad-word is the smallest operation the array performs.
 #
-# AND THE ONE THAT WILL BE MISREAD: WMODE OFFERS A `DOUBLE WORD` MODE AND IT IS NOT AN 8-BYTE
-# WRITE UNIT. The datasheet's own description of ADW says the command it triggers is WQW -- write
+# And the one that will be misread: WMODE offers a `DOUBLE WORD` mode and it is not an 8-byte
+# write unit. The datasheet's own description of ADW says the command it triggers is WQW -- write
 # quad word -- at the quad-word addressed by ADDR, and requires `The other double-word inside the
 # page buffer must be all one`. So ADW changes WHEN the quad-word write fires, not what the array
 # commits: the other half is still programmed, with ones. A consumer reading the mode list and
 # concluding 8 would place a record that a torn write can split, on a part where the manual gave
 # the correct number in a table two chapters earlier.
 #
-# THE ERASE UNIT ON THE MAIN BANKS IS A BLOCK, NOT A PAGE, AND IS SIXTEEN PAGES. That is 512 times
+# The erase unit on the main banks is a block, not a page, and is sixteen pages. That is 512 times
 # the write unit. It is not declared here; it is mentioned because a consumer that dedicates `one
 # erase unit` to a record on this part is dedicating 8 Kbytes.
 

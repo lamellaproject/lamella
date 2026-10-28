@@ -1,7 +1,8 @@
 //! `lamella run` and `lamella build`: a program, in whichever language it is written.
 
-use crate::args::{self, Spec};
+use crate::args::{self, Positional, Spec};
 use crate::ending::Ended;
+use crate::folders::{Folders, REF_DIR, RUNTIME_SUPPORT_DIR};
 use lamella_catalog::{self as catalog, BOARD_PYTHON};
 use lamella_bsp_gen::fit::fit;
 use lamella_wire_host::debug::reason;
@@ -38,7 +39,7 @@ impl Language {
                 "{}: lamella run and lamella build read .cs (C#), .csproj (a C# project), .py (Python) and\n\
 .js (ECMAScript, also known as JavaScript).\n\n\
 An image another toolchain has already produced -- .elf, .bin, .hex or .s19 -- is written by\n\
-`lamella flash <image> --board <id>`, which compiles nothing. A linked .elf is taken directly\n\
+`lamella flash <image> --board <board>`, which compiles nothing. A linked .elf is taken directly\n\
 and flattened by physical address, so it needs no conversion step first.",
                 path.display()
             )),
@@ -56,43 +57,65 @@ const BOTH_MODES: &str = "\
 generated `board` module on the import path -- a fact table, with nothing behind the addresses --
 which is not what `run` means to a reader.
 
-    (neither)         run it on this machine
-    --device <d>      run it ON the board at <d>, with its output here";
+    (neither)            run it on this machine
+    --device <device>    run it ON the board at <device>, with its output here";
 
 pub(crate) const RUN_USAGE: &str = "\
-usage: lamella run <file.cs|file.csproj|file.py|file.js> [--device <d>] [-- <arguments>]
+Usage:
+  lamella run <file> [--device <device>] [-- <args>...]
 
-Compiles and runs the program, and STAYS until it ends -- its output appears here as it is
-printed. A program written to loop forever runs until you stop this tool.
+Build a program and run it on this computer or on a connected board, staying connected to its
+output.
 
-Whatever follows -- is the program's own: a C# program's Main(string[] args) receives each
-argument whole and in the order given, as `dotnet run` passes them. A program on a board cannot
-take arguments yet, and neither can a Python or a JavaScript program, so a run given them is
-refused and nothing is sent or run.
+Arguments:
+  <file>     The program: a .cs file, a .csproj project, a .py file or a .js file.
+  <args>...  The program's own arguments. Everything after -- goes to the program unread.
 
-With neither option it runs on this machine, which needs no hardware and is the fastest way to
-find out whether a program compiles and does what you meant.
+Options:
+  --device <device>               Run a C# program on the board at <device>, a run target ID that
+                                  `lamella devices` prints. Default: this computer.
+  --ref-dir <folder>              The class library's folder, which holds corlib.dll and the
+                                  libraries a C# program is compiled against. Default:
+                                  LAMELLA_REF_DIR.
+  --runtime-support-dir <folder>  The folder of runtime support archives. A run links none of
+                                  them. Default: LAMELLA_RUNTIME_SUPPORT_DIR.
 
-A .csproj compiles every .cs beside it as one program, as `lamella build` compiles it. This
-machine runs a program against the class library alone, so here a project that references
-libraries of its own is refused; with --device the board is sent them, and
-`lamella build --board <id> --format <f>` links them.
+What happens:
+  The program is compiled and run, and this tool stays connected until it ends: its output appears
+  here as it is printed. A program that loops forever runs until you stop this tool. With --device,
+  the board also stores the program and runs it again at every reset.
 
---device <d> runs a C# program -- a .cs or a .csproj -- ON a board that already has firmware, with
-the output still appearing here. `lamella devices` prints the word to pass. The program is
-deployed as `lamella deploy` deploys it, so the board stores it and runs it again at every reset,
-and it then runs under the board's scheduler: threads, locks and blocking calls such as a socket's
-work as they do here. A board that already stores exactly this program is sent nothing; over a
-Pico 2 W's own USB a 326 KB program is written in about 2 seconds. The program is baked with the
-corlib and the libraries it was compiled against -- the class library's own, System.Device.Gpio
-among them, and the ones a project's <Reference> elements name -- keeping only what Main reaches.
-A Python program and a JavaScript program run on this machine.
+  The exit code is the program's own. When the program cannot be run, or an exception nothing
+  caught stops it, the exit code is 1 and the reason is on standard error.
 
-Two questions this verb does not answer: whether a program FITS a board is `build --board <id>`,
-and putting it on a board while returning you to your shell is `deploy`.
+Examples:
+  lamella run Program.cs
+  lamella run Program.cs -- first second
+  lamella run Program.cs --device COM8
 
-The run ends with the program's own exit code. When this tool cannot run it, or an exception
-nothing caught stops it, the run ends with 1 and says why on standard error.";
+Details:
+  On this computer, a program runs with no hardware attached, which is the fastest way to find out
+  whether it compiles and does what you meant.
+
+  A C# program's Main(string[] args) receives each argument whole and in the order given, as
+  `dotnet run` passes them. A program on a board cannot take arguments yet, and neither can a
+  Python or JavaScript program, so such a run is refused and nothing is sent or run.
+
+  A .csproj compiles every .cs beside it as one program, as `lamella build` compiles it. On this
+  computer a program runs against the class library alone, so a project that references libraries
+  of its own is refused here. With --device, the board is sent them, and
+  `lamella build <file> --board <board> --format <format>` links them.
+
+  With --device, the board is sent a .lmli image for its resident interpreter firmware: the program
+  with the corlib and the libraries it was compiled against, System.Device.Gpio among them, keeping
+  only what Main reaches. A board that already stores exactly this program is sent nothing. On the
+  board, threads, locks and blocking calls such as a socket's work as they do on this computer. A
+  Python or JavaScript program runs on this computer only.
+
+  A project built with the Lamella SDK names both folders for you.
+
+  Whether a program fits a board is `lamella build <file> --board <board>`. To put a program on a
+  board and return to your shell, use `lamella deploy`.";
 
 /// A `run` command line's own options, and the program's arguments: everything after the first
 /// `--`, which this tool hands to the program rather than reading.
@@ -134,16 +157,33 @@ pub fn run_command(args: &[String]) -> Ended {
     if options.iter().any(|argument| argument == crate::msbuild::BUILT) {
         return crate::msbuild::run_built(options, program_args);
     }
-    let spec = Spec { verb: "run", usage: Some(RUN_USAGE), values: &["--board", "--device"], flags: &[] };
+    if options.iter().any(|argument| argument == crate::emulator_run::EMULATOR) {
+        return crate::emulator_run::run_emulator(options, program_args);
+    }
+    let spec = Spec {
+        verb: "run",
+        usage: Some(RUN_USAGE),
+        values: &["--board", "--device", REF_DIR, RUNTIME_SUPPORT_DIR],
+        repeats: &[],
+        flags: &[],
+        positional: Positional::One("source file"),
+    };
     let parsed = match args::parse_or_halt(options, &spec) {
         Ok(parsed) => parsed,
         Err(args::Halt::Help) => return Ended::Program(0),
         Err(args::Halt::Bad) => return Ended::Failed,
     };
+    let folders = match Folders::from_options(&parsed, "run") {
+        Ok(folders) => folders,
+        Err(refusal) => {
+            eprintln!("{refusal}");
+            return Ended::Failed;
+        }
+    };
     let path = match parsed.only_positional("run", "source file") {
         Ok(path) => Path::new(path).to_path_buf(),
-        Err(error) => {
-            eprintln!("{error}\n\n{}", RUN_USAGE.lines().next().unwrap_or_default());
+        Err(refusal) => {
+            eprintln!("{refusal}");
             return Ended::Failed;
         }
     };
@@ -155,10 +195,10 @@ pub fn run_command(args: &[String]) -> Ended {
         if refuses_arguments_on_a_board(program_args) {
             return Ended::Failed;
         }
-        return run_on_target(&path, target);
+        return run_on_target(&path, target, &folders);
     }
     if crate::flash::is_project(&path) {
-        return run_project(&path, program_args);
+        return run_project(&path, program_args, &folders);
     }
 
     let (language, source) = match read(&path) {
@@ -173,7 +213,7 @@ pub fn run_command(args: &[String]) -> Ended {
         return Ended::Failed;
     }
     match language {
-        Language::CSharp => run_csharp(&path, &source, program_args),
+        Language::CSharp => run_csharp(&path, &source, program_args, &folders),
         Language::Python => run_python(&path, &source, None),
         Language::JavaScript => run_javascript(&path, &source),
     }
@@ -274,30 +314,45 @@ fn seed() -> u64 {
 
 /// Run on a board in a build that can, and name the missing feature in one that cannot.
 #[cfg(feature = "bake")]
-fn run_on_target(path: &Path, target: &str) -> Ended {
-    crate::own_lines::say(&mut std::io::stderr(), &crate::attach::forever_warning());
-    crate::attach::run_on_target(path, target)
+fn run_on_target(path: &Path, target: &str, folders: &Folders) -> Ended {
+    crate::attach::run_on_target(path, target, folders)
 }
 
 /// As [`run_on_target`], for an assembly a build already made: baked for the board that answers,
 /// with the libraries it references from the class library and from beside it, and refused when
-/// that board is not the one `board` checks for.
+/// that board is not the one `board` checks for. The run opens with the line `first_line` makes from
+/// the product model the board answered as.
 #[cfg(feature = "bake")]
-pub(crate) fn run_built_on_target(path: &Path, target: &str, board: Option<&crate::project::BoardCheck>) -> Ended {
-    crate::own_lines::say(&mut std::io::stderr(), &crate::attach::forever_warning());
-    crate::attach::run_image_on_target(path, target, board, |answered| {
-        crate::bake::image_of_built(path, "run", answered)
-    })
+pub(crate) fn run_built_on_target(
+    path: &Path,
+    target: &str,
+    board: Option<&crate::project::BoardCheck>,
+    first_line: impl FnOnce(u16) -> String,
+    folders: &Folders,
+) -> Ended {
+    crate::attach::run_image_on_target(
+        path,
+        target,
+        board,
+        |answered| Some(first_line(answered)),
+        |answered| crate::bake::image_of_built(path, "run", answered, folders),
+    )
 }
 
 /// In a build that cannot bake, the sentence that names the missing feature.
 #[cfg(not(feature = "bake"))]
-pub(crate) fn run_built_on_target(path: &Path, target: &str, _board: Option<&crate::project::BoardCheck>) -> Ended {
-    run_on_target(path, target)
+pub(crate) fn run_built_on_target(
+    path: &Path,
+    target: &str,
+    _board: Option<&crate::project::BoardCheck>,
+    _first_line: impl FnOnce(u16) -> String,
+    folders: &Folders,
+) -> Ended {
+    run_on_target(path, target, folders)
 }
 
 #[cfg(not(feature = "bake"))]
-fn run_on_target(_path: &Path, _target: &str) -> Ended {
+fn run_on_target(_path: &Path, _target: &str, _folders: &Folders) -> Ended {
     eprintln!(
         "lamella run: this build cannot run a program on a board.\n\n\
          Doing so bakes it into an image first, which needs the `bake` feature:\n\
@@ -316,8 +371,8 @@ fn run_on_target(_path: &Path, _target: &str) -> Ended {
 /// hardware belongs on `deploy`, which takes a source file and `--unsafe`, and the diagnostic below
 /// says so where it comes up. **Not `flash`**, which takes an image rather than a source file and
 /// declares no `--unsafe` at all.
-fn run_csharp(path: &Path, source: &str, program_args: &[String]) -> Ended {
-    match compile_csharp_assembly_with_corlib(path, source, false, &[], None, "run") {
+fn run_csharp(path: &Path, source: &str, program_args: &[String], folders: &Folders) -> Ended {
+    match compile_csharp_assembly_with_corlib(path, source, false, &[], None, "run", folders) {
         Ok((assembly, corlib)) => report(run_here(corlib, &assembly, program_args)),
         Err(text) => refuse_diagnostics(&text),
     }
@@ -368,7 +423,7 @@ fn refuse_diagnostics(text: &str) -> Ended {
             "\nunsafe code is off by default, as it is in csc without /unsafe -- and this \
              verb has no switch\nfor it, because a raw pointer at a device register means \
              nothing on this machine. A program that\ndrives hardware goes on a board:\n\
-             \x20   lamella deploy <file> --board <id> --unsafe\n\n\
+             \x20   lamella deploy <file> --board <board> --unsafe\n\n\
              Not `flash`: that verb writes an image somebody already built, so it\n\
              takes no --unsafe -- by the time it runs, the compiling is over."
         );
@@ -386,8 +441,8 @@ fn refuse_diagnostics(text: &str) -> Ended {
 /// **A PROJECT THAT NAMES LIBRARIES IS REFUSED, NOT RUN.** This machine runs a program against the
 /// class library alone, so a name that resolves into a library of the project's own would load with
 /// nothing to resolve to -- a failure that would point at the program rather than at this verb.
-fn run_project(path: &Path, program_args: &[String]) -> Ended {
-    match project_run(path, program_args) {
+fn run_project(path: &Path, program_args: &[String], folders: &Folders) -> Ended {
+    match project_run(path, program_args, folders) {
         Ok(run) => report(run),
         Err(refusal) => {
             eprintln!("{refusal}");
@@ -402,14 +457,18 @@ fn run_project(path: &Path, program_args: &[String]) -> Ended {
 /// # Errors
 /// A project that cannot be read or compiled, a class library, or a project naming libraries of its
 /// own, each with the sentence that says so.
-fn project_run(path: &Path, program_args: &[String]) -> Result<Result<HostRun, ReplError>, String> {
+fn project_run(
+    path: &Path,
+    program_args: &[String],
+    folders: &Folders,
+) -> Result<Result<HostRun, ReplError>, String> {
     let project = program_project(
         path,
         "run",
         "This verb runs a program on this machine",
-        &format!("lamella build {} --board <id> --format <f>", path.display()),
+        &format!("lamella build {} --board <board> --format <format>", path.display()),
     )?;
-    let (assembly, corlib) = compile_project_assembly(&project, &[], None, "run")?;
+    let (assembly, corlib) = compile_project_assembly(&project, &[], None, "run", folders)?;
     Ok(run_here(corlib, &assembly, program_args))
 }
 
@@ -708,11 +767,18 @@ fn refuse_directive(directive: &lamella_syntax::lexer::FileDirective) -> Result<
 pub fn board_module_run_command(args: &[String]) -> ExitCode {
     eprintln!(
         "lamella board-module-run: DEPRECATED and internal. It runs the program on this machine \
-         with\n<id>'s generated `board` module on the import path -- a fact table, with nothing \
+         with\n<board>'s generated `board` module on the import path -- a fact table, with nothing \
          behind the\naddresses. It answers whether a program NAMES a board's facts correctly and \
          nothing else.\nDo not build on it."
     );
-    let spec = Spec { verb: "board-module-run", usage: None, values: &["--board"], flags: &[] };
+    let spec = Spec {
+        verb: "board-module-run",
+        usage: None,
+        values: &["--board"],
+        repeats: &[],
+        flags: &[],
+        positional: Positional::One("source file"),
+    };
     let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
         Err(halt) => return halt.code(),
@@ -725,7 +791,7 @@ pub fn board_module_run_command(args: &[String]) -> ExitCode {
         }
     };
     let Some(id) = parsed.value("--board") else {
-        eprintln!("lamella board-module-run: --board <id> is required; it is the whole point.");
+        eprintln!("lamella board-module-run: --board <board> is required; it is the whole point.");
         return ExitCode::FAILURE;
     };
     if let Err(error) = catalog::resolve(id) {
@@ -764,15 +830,22 @@ pub fn board_module_run_command(args: &[String]) -> ExitCode {
 
 /// `lamella build <file> [--board <id>] [--out <path>]`: produce the artifact a device runs.
 pub fn build_command(args: &[String]) -> ExitCode {
-    if args.first().is_some_and(|first| first == crate::msbuild::REFERENCES || first == crate::msbuild::COMPILE) {
+    if args.first().is_some_and(|first| {
+        first == crate::msbuild::REFERENCES
+            || first == crate::msbuild::COMPILE
+            || first == crate::msbuild::PUBLISH
+            || first == crate::msbuild::PACKAGES
+    }) {
         return crate::msbuild::build(args);
     }
     let usage = usage();
     let spec = Spec {
         verb: "build",
         usage: Some(&usage),
-        values: &["--board", "--out", "--format"],
+        values: &["--board", "--out", "--format", REF_DIR, RUNTIME_SUPPORT_DIR],
+        repeats: &[],
         flags: &["--unsafe", crate::flash::CLASS_LIBRARY_FLAG, crate::flash::FLAT_FLAG],
+        positional: Positional::One("source file"),
     };
     let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
@@ -780,8 +853,27 @@ pub fn build_command(args: &[String]) -> ExitCode {
     };
     let path = match parsed.only_positional("build", "source file") {
         Ok(path) => Path::new(path).to_path_buf(),
-        Err(error) => {
-            eprintln!("{error}\n\n{usage}");
+        Err(refusal) => {
+            eprintln!("{refusal}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(board) = parsed.value("--board")
+        && let Err(refusal) = args::known_board("build", board)
+    {
+        eprintln!("{refusal}");
+        return ExitCode::FAILURE;
+    }
+    if let Some(name) = parsed.value("--format")
+        && lamella_flash_routes::artifact::Output::parse(name).is_err()
+    {
+        eprintln!("{}", unknown_format(name));
+        return ExitCode::FAILURE;
+    }
+    let folders = match Folders::from_options(&parsed, "build") {
+        Ok(folders) => folders,
+        Err(refusal) => {
+            eprintln!("{refusal}");
             return ExitCode::FAILURE;
         }
     };
@@ -820,6 +912,7 @@ pub fn build_command(args: &[String]) -> ExitCode {
             parsed.flag("--unsafe"),
             tier,
             &libraries,
+            &folders,
         );
     }
 
@@ -832,8 +925,8 @@ pub fn build_command(args: &[String]) -> ExitCode {
                 "Without --format this builds the ordinary artifact -- an assembly, a baked image \
                  or a\nPython bundle -- and none of those has a link step.",
                 &format!(
-                    "--format <f> asks for the image a chip takes, which is the build that \
-                     links:\n\n\x20   lamella build <file> --board <id> --format bin {flag}"
+                    "--format <format> asks for the image a chip takes, which is the build that \
+                     links:\n\n\x20   lamella build <file> --board <board> --format bin {flag}"
                 ),
                 "Nothing was built.",
             )
@@ -844,9 +937,9 @@ pub fn build_command(args: &[String]) -> ExitCode {
     if crate::flash::is_project(&path) {
         eprintln!(
             "lamella build: {} is a project, and this build is not producing a chip image.\n\n\
-             --format <f> asks for the image a chip takes, which is the artifact a project \
+             --format <format> asks for the image a chip takes, which is the artifact a project \
              describes:\n\n\
-             \x20   lamella build {} --board <id> --format bin\n\n\
+             \x20   lamella build {} --board <board> --format bin\n\n\
              Nothing was built.",
             path.display(),
             path.display()
@@ -855,7 +948,9 @@ pub fn build_command(args: &[String]) -> ExitCode {
     }
 
     let built = match language {
-        Language::CSharp => build_csharp(&path, &source, parsed.flag("--unsafe"), parsed.value("--board")),
+        Language::CSharp => {
+            build_csharp(&path, &source, parsed.flag("--unsafe"), parsed.value("--board"), &folders)
+        }
         Language::Python => build_python(&path, &source, parsed.value("--board")),
         Language::JavaScript => Err(format!(
             "{}: lamella build produces a device artifact, and the JavaScript tier runs on this \
@@ -867,10 +962,32 @@ Use lamella run to execute it here.",
     let built = match built {
         Ok(built) => built,
         Err(error) => {
-            eprintln!("lamella build: {error}");
+            if error.starts_with("lamella build: ") {
+                eprintln!("{error}");
+            } else {
+                eprintln!("lamella build: {error}");
+            }
             return ExitCode::FAILURE;
         }
     };
+
+    let fit = match parsed.value("--board").map(|board_id| fit_of(board_id, &built)) {
+        None => None,
+        Some(Ok(fit)) => Some(fit),
+        Some(Err(refusal)) => {
+            eprintln!("{refusal}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if let Some(over) = fit.as_ref().and_then(FitAnswer::over) {
+        eprintln!(
+            "lamella build: the {} does not fit {}: it is {over} B more than the board's flash holds.\n\
+             Nothing was written.",
+            built.what,
+            parsed.value("--board").unwrap_or_default()
+        );
+        return ExitCode::FAILURE;
+    }
 
     let out = match parsed.value("--out") {
         Some(given) => Path::new(given).to_path_buf(),
@@ -880,16 +997,23 @@ Use lamella run to execute it here.",
         eprintln!("lamella build: write {}: {error}", out.display());
         return ExitCode::FAILURE;
     }
-    println!("{} <- {}", out.display(), path.display());
-    match built.note {
-        Some(note) => println!("  {} ({note})  {} B", built.what, built.bytes.len()),
-        None => println!("  {}  {} B", built.what, built.bytes.len()),
+    println!("Wrote {} ({} B)", out.display(), built.bytes.len());
+    println!("{}", built.detail());
+    if let Some(fit) = fit {
+        println!("Fit: {}", fit.summary(&built));
     }
+    ExitCode::SUCCESS
+}
 
-    let Some(board_id) = parsed.value("--board") else {
-        return ExitCode::SUCCESS;
+/// The refusal of a `--format` this build does not write, naming the ones it does.
+fn unknown_format(name: &str) -> String {
+    let formats: Vec<&str> =
+        lamella_flash_routes::artifact::Output::all().map(|output| output.extension()).collect();
+    let named = match formats.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} or {last}", rest.join(", ")),
+        _ => formats.join(""),
     };
-    answer_fit(board_id, &built)
+    args::refusal("build", &format!("--format \"{name}\" is not a format this build writes: {named}"))
 }
 
 /// The verb's usage text.
@@ -899,43 +1023,65 @@ Use lamella run to execute it here.",
 fn usage() -> String {
     let formats: String = lamella_flash_routes::artifact::Output::all()
         .map(|output| match output.gloss() {
-            Some(gloss) => format!("\n    {:<5} {gloss}", output.extension()),
-            None => format!("\n    {}", output.extension()),
+            Some(gloss) => format!("\n{:36}{:<5}  {gloss}", "", output.extension()),
+            None => format!("\n{:36}{}", "", output.extension()),
         })
         .collect();
     format!(
         "\
-usage: lamella build <file.cs|file.csproj|file.py> [--board <id>] [--format <f>] [--out <path>]
-                                      [--nostdlib]
+Usage:
+  lamella build <file> [--board <board>] [--format <format>] [--out <path>]
 
-With --format, it builds the BARE-METAL IMAGE for --board and writes it in that format -- which is
-exactly what `lamella flash` takes, so `build` produces what `flash` consumes and neither has to
-touch hardware. The formats:
-{formats}
+Build a program and write the output to a file.
 
-Without --format it builds the ordinary artifact -- an assembly, a baked image, or a Python bundle
--- and with --board it also answers whether that fits. A baked image carries the corlib and the
-libraries the program was compiled against, keeping only what Main reaches, so the program may
-call into System.* and System.Device.Gpio on the board.
+Arguments:
+  <file>  The program: a .cs file, a .csproj project or a .py file.
 
-A .csproj builds every .cs beside it as ONE program and links the assemblies its <Reference>
-elements name, each by a <HintPath>. It goes with --format, which is the build that links.
+Options:
+  --board <board>                 The board ID to build for, as `lamella boards` lists it. Output
+                                  too large for the board is refused, and a .lmli or .lpyc build
+                                  ends with a Fit line.
+  --format <format>               Write a native image for --board, in one of these formats:{formats}
+                                  Default: a .lmli image for the resident interpreter firmware, or
+                                  a .lpyc bundle for a Python program.
+  --out <path>                    The file to write. Default: <file> with the output's extension.
+  --nostdlib                      Build the flat tier: the program alone, with no class library.
+                                  Only with --format, and not with --format elf.
+  --unsafe                        Allow C# unsafe code.
+  --ref-dir <folder>              The class library's folder. Default: LAMELLA_REF_DIR.
+  --runtime-support-dir <folder>  The runtime support archives' folder. Default:
+                                  LAMELLA_RUNTIME_SUPPORT_DIR.
 
-The image links the program with the class library and the runtime support archive, so it may
-allocate, use floating point and call into System.*. That tier's collector reclaims an object
-without finalizing it, so a finalizer (a class's ~destructor) never runs there. It covers fewer
-boards than the flat tier, and a board it has no plan for is refused, naming the ones there are.
---nostdlib builds the flat tier instead, which is linker-free and resolves no call outside the
-program. Every build says which tier produced it.
+What happens:
+  The build writes nothing until it has succeeded. It then writes the output, and beside a .bin
+  or .elf image a <image>.manifest.json sidecar that `lamella flash` checks the image against, and
+  names each file it wrote. A build that is refused exits 1 and leaves the folder as it found it.
 
---format elf writes the image as a linked ELF that also carries the program's debug information,
-which is the file a debugger takes as the program. The class-library tier is the one that carries
-debug information into an image, so --format elf does not go with --nostdlib.
+Examples:
+  lamella build Program.cs --board rpi-pico2
+  lamella build Program.cs --board rpi-pico2 --format uf2
 
-A class-library image is always compiled as a debug build is, whatever format it is written in:
---format elf writes the debug information beside it and every other format sets it aside. So the
-image a board is written with is the one --format elf describes, and a debugger can attach to any
-board running it. The flat tier is compiled without debug information.
+Details:
+  With --format, the build is a native image: the program linked with the class library and the
+  runtime support archive, so it may allocate, use floating point and call into System.*. That is
+  exactly what `lamella flash` takes. The class-library tier covers fewer boards than the flat
+  tier, and a board it has no plan for is refused, naming the boards there are. The output says
+  which tier built it.
+
+  On the class-library tier, the collector reclaims an object without finalizing it, so a
+  finalizer (a class's ~destructor) never runs there.
+
+  A class-library image is always compiled as a debug build is. --format elf writes the debug
+  information beside the image, and every other format sets it aside, so the image a board is
+  written with is the one --format elf describes. The flat tier has no debug information.
+
+  A .lmli image carries the corlib and the libraries the program was compiled against, keeping
+  only what Main reaches, so the program may call into System.* and System.Device.Gpio on the
+  board.
+
+  A .csproj builds every .cs beside it as one program and links the assemblies its <Reference>
+  elements name, each by its <HintPath>. It goes with --format, which is the build that links. A
+  project that names its board with <LamellaTargetBoard> needs no --board.
 "
     )
 }
@@ -957,6 +1103,7 @@ fn build_flashable(
     unsafe_code: bool,
     tier: crate::flash::Tier,
     libraries: &[crate::flash::Library],
+    folders: &Folders,
 ) -> ExitCode {
     let output = match lamella_flash_routes::artifact::Output::parse(format_name) {
         Ok(output) => output,
@@ -984,12 +1131,12 @@ fn build_flashable(
     let format = match output {
         lamella_flash_routes::artifact::Output::Image(format) => format,
         lamella_flash_routes::artifact::Output::Elf => {
-            return build_debug_elf(path, source, board_id, out, unsafe_code, tier, libraries);
+            return build_debug_elf(path, source, board_id, out, unsafe_code, tier, libraries, folders);
         }
     };
 
     let (image, base) =
-        match crate::flash::image_for_board(path, source, board_id, unsafe_code, tier, libraries) {
+        match crate::flash::image_for_board(path, source, board_id, unsafe_code, tier, libraries, folders) {
             Ok(built) => built,
             Err(error) => {
                 eprintln!("{error}");
@@ -1017,16 +1164,29 @@ fn build_flashable(
         eprintln!("lamella build: write {}: {error}", out.display());
         return ExitCode::FAILURE;
     }
-    println!("{} <- {}", out.display(), path.display());
-    println!(
-        "  {} at {base:#010x}, {} B of image in {} B of {}",
-        format.description(),
-        image.len(),
-        rendered.len(),
-        format.description()
-    );
-    println!("  {}", tier.line());
-    println!("\nwrite it with:\n    lamella flash {} --board {board_id}", out.display());
+    let manifest = match format {
+        lamella_flash_routes::artifact::Format::Bin => {
+            let manifest = lamella_flash_routes::manifest::for_bin(board_id, base, &rendered, &producer());
+            match write_manifest_beside(&out, &manifest) {
+                Ok(written) => written,
+                Err(refusal) => {
+                    eprintln!("{refusal}");
+                    return ExitCode::FAILURE;
+                }
+            }
+        }
+        _ => None,
+    };
+    println!("Wrote {} ({} B)", out.display(), rendered.len());
+    if let Some(manifest) = manifest {
+        println!("Manifest: {}", manifest.display());
+    }
+    println!("{}: {} B at {base:#010x}", image_name(format), image.len());
+    if let Some(heap) = crate::flash::heap_line(board_id, &image) {
+        println!("{}", capitalized(&heap));
+    }
+    println!("Tier: {}", tier.summary());
+    println!("Next: lamella flash {} --board {board_id}", command_path(&out));
     ExitCode::SUCCESS
 }
 
@@ -1047,13 +1207,14 @@ fn build_debug_elf(
     unsafe_code: bool,
     tier: crate::flash::Tier,
     libraries: &[crate::flash::Library],
+    folders: &Folders,
 ) -> ExitCode {
     if let Some(refusal) = elf_refusal(tier) {
         eprintln!("{refusal}");
         return ExitCode::FAILURE;
     }
     let elf =
-        match crate::flash::debug_elf_for_board(path, source, board_id, unsafe_code, libraries) {
+        match crate::flash::debug_elf_for_board(path, source, board_id, unsafe_code, libraries, folders) {
             Ok(elf) => elf,
             Err(error) => {
                 eprintln!("{error}");
@@ -1075,20 +1236,105 @@ fn build_debug_elf(
         Some(given) => Path::new(given).to_path_buf(),
         None => path.with_extension(lamella_flash_routes::artifact::Output::Elf.extension()),
     };
-    if let Err(error) = std::fs::write(&out, &elf) {
-        eprintln!("lamella build: write {}: {error}", out.display());
-        return ExitCode::FAILURE;
+    let manifest = match write_elf_with_record(&out, &elf, board_id, "build") {
+        Ok(written) => written,
+        Err(refusal) => {
+            eprintln!("{refusal}");
+            return ExitCode::FAILURE;
+        }
+    };
+    println!("Wrote {} ({} B)", out.display(), elf.len());
+    if let Some(manifest) = manifest {
+        println!("Manifest: {}", manifest.display());
     }
-    println!("{} <- {}", out.display(), path.display());
-    println!(
-        "  ELF at {:#010x}, {} B of image and the program's debug information in {} B of ELF",
-        loaded.base,
-        loaded.bytes.len(),
-        elf.len()
-    );
-    println!("  {}", tier.line());
-    println!("\nwrite it with:\n    lamella flash {} --board {board_id}", out.display());
+    println!("ELF image: {} B at {:#010x}, with debug information", loaded.bytes.len(), loaded.base);
+    if let Some(heap) = crate::flash::heap_line(board_id, &loaded.bytes) {
+        println!("{}", capitalized(&heap));
+    }
+    println!("Tier: {}", tier.summary());
+    println!("Next: lamella flash {} --board {board_id}", command_path(&out));
     ExitCode::SUCCESS
+}
+
+/// The console channel the record beside `elf`, an image built for `board_id`, states; `None` where
+/// the build cannot show that the image carries exactly that channel.
+///
+/// **A RECORD NEVER STATES A CHANNEL ITS IMAGE DOES NOT HAVE.** It states `memory` only where the
+/// image names Lamella's console ring, the board's default channel is `memory`, and the board links
+/// a runtime support archive of its own, which this tree builds with the ring as its only console.
+/// An archive several boards share -- the micro:bits' -- carries whatever console it was built with,
+/// so an image linked against one states no channel.
+fn record_channel(board_id: &str, elf: &[u8]) -> Option<&'static str> {
+    let own_archive = lamella_flash_routes::programmer_for(board_id)
+        .ok()
+        .and_then(|row| row.aot_target)
+        .is_some_and(crate::tiers::per_board);
+    let default = lamella_catalog::load_board(board_id).map(|board| lamella_catalog::console_default(&board));
+    let names_ring = matches!(lamella_probe_console::ring_in(elf), Ok((lamella_probe_console::LAMELLA_RING, _)));
+    (own_archive && names_ring && default == Some(lamella_catalog::ConsoleChannel::Memory)).then_some("memory")
+}
+
+/// What wrote an image, as the manifest beside it names it.
+fn producer() -> String {
+    format!("lamella {}", crate::TOOL_VERSION)
+}
+
+/// Writes `elf`, the linked ELF of an image for `board_id`, to `out`, and its record beside it: the
+/// one pair `build --format elf` and `dotnet publish` both write.
+///
+/// # Errors
+/// A file that could not be written, worded for `verb`.
+pub(crate) fn write_elf_with_record(
+    out: &Path,
+    elf: &[u8],
+    board_id: &str,
+    verb: &str,
+) -> Result<Option<std::path::PathBuf>, String> {
+    std::fs::write(out, elf).map_err(|error| format!("lamella {verb}: write {}: {error}", out.display()))?;
+    let mut manifest = lamella_flash_routes::manifest::for_elf(board_id, elf, &producer());
+    manifest.console_channel = record_channel(board_id, elf).map(str::to_owned);
+    write_manifest_beside(out, &manifest)
+}
+
+/// Writes `lmli`, an image Lamella's firmware runs for `board_id`, to `out`, and its record beside it,
+/// as `dotnet publish` writes them: the record states the interpreter's model, so every publish
+/// records how its image runs.
+///
+/// # Errors
+/// A file that could not be written, worded for `verb`.
+#[cfg_attr(not(feature = "bake"), allow(dead_code))]
+pub(crate) fn write_lmli_with_record(out: &Path, lmli: &[u8], board_id: &str, verb: &str) -> Result<(), String> {
+    std::fs::write(out, lmli).map_err(|error| format!("lamella {verb}: write {}: {error}", out.display()))?;
+    let manifest = lamella_flash_routes::manifest::for_lmli(board_id, lmli, &producer());
+    lamella_flash_routes::manifest::write(out, &manifest).map(|_| ()).map_err(|why| {
+        let _ = std::fs::remove_file(lamella_flash_routes::manifest::path_for(out));
+        format!("lamella {verb}: wrote {}, but not the manifest beside it: {why}", out.display())
+    })
+}
+
+/// Writes `manifest` beside `out`, the file `build` just wrote, when the file's extension is the
+/// format the record states.
+///
+/// **THE RECORD IS WHAT `lamella flash` CHECKS THE FILE AGAINST.** With it beside the file, `flash`
+/// takes the board from the record and refuses a board the image was not built for, and it refuses
+/// bytes the record does not describe. The record describes `.elf` and `.bin` files alone, so a
+/// file named otherwise gets none: a record beside a file it cannot describe would stop every write
+/// of that file.
+///
+/// # Errors
+/// A record that could not be written. Any record an earlier build left beside the file is removed
+/// then, because it describes other bytes and would refuse these.
+fn write_manifest_beside(
+    out: &Path,
+    manifest: &lamella_flash_routes::manifest::Manifest,
+) -> Result<Option<std::path::PathBuf>, String> {
+    if lamella_flash_routes::artifact::classify_format(out).as_deref() != Some(manifest.format.as_str()) {
+        return Ok(None);
+    }
+    lamella_flash_routes::manifest::write(out, manifest).map(Some).map_err(|why| {
+        let _ = std::fs::remove_file(lamella_flash_routes::manifest::path_for(out));
+        format!("lamella build: wrote {}, but not the manifest beside it: {why}", out.display())
+    })
 }
 
 /// Why `--format elf` cannot be written on `tier`, or `None` where it can.
@@ -1127,7 +1373,7 @@ struct Built {
     /// **A NOUN PHRASE, BECAUSE TWO OF ITS THREE READERS PUT IT IN THE MIDDLE OF A SENTENCE.**
     /// It follows "cannot run this" and "the number compared is the", so anything that is not a
     /// plain name for the thing arrives inside prose that then reads as nonsense. A warning about
-    /// the artifact belongs in [`Built::note`] or [`Built::excludes`]; this is only its name.
+    /// the artifact belongs in [`Built::note`]; this is only its name.
     what: &'static str,
     /// A warning about the artifact, shown beside its name where it is REPORTED and nowhere else.
     ///
@@ -1135,23 +1381,49 @@ struct Built {
     /// this is printed in parentheses after the artifact line, where a reader is looking at what
     /// they just got, and it is never spliced into a sentence about the board.
     note: Option<&'static str>,
-    /// **WHAT THE BYTE COUNT DOES NOT INCLUDE, AND THEREFORE WHAT A FIT VERDICT OVER IT MEANS.**
-    ///
-    /// A fit verdict compares a number against a board's whole flash budget, which is the right
-    /// comparison only when the artifact is the whole flash occupant. For a tier where the board
-    /// is already running firmware that the image is loaded INTO, it is not -- the headroom is an
-    /// upper bound rather than the space the image will have. Carried with the artifact rather
-    /// than reconstructed at the comparison, so the caveat cannot be attached to the wrong tier.
-    excludes: &'static str,
     /// **WHETHER THIS ARTIFACT IS LOADED INTO FIRMWARE ALREADY ON THE BOARD**, rather than being the
     /// whole flash occupant.
     ///
     /// A fit verdict over an artifact of this kind presumes a board that can HOLD that firmware, and
-    /// a board declaring no carrier never can. Declared by the artifact for the same reason
-    /// [`Built::excludes`] is: reconstructing it at the comparison is how an answer gets attached to
-    /// the wrong tier, and an artifact kind added later has to state its own rather than inherit
-    /// whichever happened to be true when the check was written.
+    /// a board declaring no carrier never can. And its headroom is an upper bound, since the board's
+    /// flash holds that firmware too, which the artifact's size does not count. Declared by the
+    /// artifact rather than reconstructed at the comparison, which is how an answer gets attached to
+    /// the wrong tier, and an artifact kind added later has to state its own.
     loaded_into_firmware: bool,
+}
+
+impl Built {
+    /// The line `build` prints under the file it wrote, naming what was written.
+    fn detail(&self) -> String {
+        match (self.what, self.note) {
+            (BAKED_FLASH_IMAGE, _) => "Baked image for the resident interpreter".to_owned(),
+            (PYTHON_BUNDLE, _) => "Python bundle for the resident interpreter".to_owned(),
+            (what, Some(note)) => format!("{} ({note})", capitalized(what)),
+            (what, None) => capitalized(what),
+        }
+    }
+}
+
+/// `text` with its first letter a capital.
+fn capitalized(text: &str) -> String {
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
+}
+
+/// What `build` calls an image written in `format`.
+fn image_name(format: lamella_flash_routes::artifact::Format) -> &'static str {
+    match format {
+        lamella_flash_routes::artifact::Format::Bin => "Raw binary image",
+        lamella_flash_routes::artifact::Format::IntelHex => "Intel HEX image",
+        lamella_flash_routes::artifact::Format::SRecord => "Motorola S-record image",
+        lamella_flash_routes::artifact::Format::Uf2 { .. } => "UF2 image",
+    }
+}
+
+/// `path` as a command line takes it: in quotes when it holds a space.
+fn command_path(path: &Path) -> String {
+    let shown = path.display().to_string();
+    if shown.contains(char::is_whitespace) { format!("\"{shown}\"") } else { shown }
 }
 
 /// Compile a C# program to a .NET assembly.
@@ -1168,34 +1440,37 @@ struct Built {
 ///
 /// An image for `board` carries the board's bus table and binds against its family's builds; the
 /// assembly alone carries neither, so the board does not change it.
-fn build_csharp(path: &Path, source: &str, unsafe_code: bool, board: Option<&str>) -> Result<Built, String> {
+fn build_csharp(
+    path: &Path,
+    source: &str,
+    unsafe_code: bool,
+    board: Option<&str>,
+    folders: &Folders,
+) -> Result<Built, String> {
     #[cfg(not(feature = "bake"))]
     let _ = board;
     #[cfg(feature = "bake")]
     {
         let (assembly, references) =
-            compile_csharp_assembly_with_references(path, source, unsafe_code, &[], board, "build")?;
+            compile_csharp_assembly_with_references(path, source, unsafe_code, &[], board, "build", folders)?;
         let image = crate::bake::bake(assembly, &references, lamella_wire_host::boards::bus_table(board))?;
         return Ok(Built {
             bytes: image,
             extension: "lmli",
             what: BAKED_FLASH_IMAGE,
             note: None,
-            excludes: lamella_wire_host::bake::SIZE_LEAVES_OUT,
             loaded_into_firmware: true,
         });
     }
     #[cfg(not(feature = "bake"))]
     let (assembly, _) =
-        compile_csharp_assembly_with_corlib(path, source, unsafe_code, &[], None, "build")?;
+        compile_csharp_assembly_with_corlib(path, source, unsafe_code, &[], None, "build", folders)?;
     #[cfg(not(feature = "bake"))]
     Ok(Built {
         bytes: assembly,
         extension: "dll",
         what: ASSEMBLY,
-        note: Some("NOT a flash image -- this build has no `bake` feature"),
-        excludes: "everything the device supplies -- this is the assembly, not an image. \
-                   Build the tool with `--features bake` for the flash image a board runs",
+        note: Some("not a flash image: this build has no bake feature"),
         loaded_into_firmware: true,
     })
 }
@@ -1218,6 +1493,8 @@ fn build_csharp(path: &Path, source: &str, unsafe_code: bool, board: Option<&str
 /// program BINDS against them here and LINKS against them later, and it has to be the same set in
 /// the same order or the build would resolve a name at compile time that the link cannot find.
 ///
+/// The class library is the one `folders` names, or else the one the tool finds without it.
+///
 /// # Errors
 /// The compiler's diagnostics, rendered as `CSnnnn` lines, or the emit error when binding was
 /// clean and a construct is not lowered; a reference set carrying no corlib to hand back; or a
@@ -1229,8 +1506,9 @@ pub fn compile_csharp_assembly_with_corlib(
     libraries: &[crate::flash::Library],
     board: Option<&str>,
     verb: &str,
+    folders: &Folders,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    compile_csharp_file(path, source, unsafe_code, libraries, board, verb, false)
+    compile_csharp_file(path, source, unsafe_code, libraries, board, verb, false, folders)
         .map(|compiled| (compiled.assembly, compiled.corlib))
 }
 
@@ -1249,8 +1527,9 @@ pub fn compile_csharp_assembly_with_references(
     libraries: &[crate::flash::Library],
     board: Option<&str>,
     verb: &str,
+    folders: &Folders,
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
-    compile_csharp_file(path, source, unsafe_code, libraries, board, verb, false)
+    compile_csharp_file(path, source, unsafe_code, libraries, board, verb, false, folders)
         .map(|compiled| (compiled.assembly, compiled.references))
 }
 
@@ -1278,8 +1557,9 @@ pub fn compile_csharp_for_debugging(
     libraries: &[crate::flash::Library],
     board: Option<&str>,
     verb: &str,
+    folders: &Folders,
 ) -> Result<Debuggable, String> {
-    let compiled = compile_csharp_file(path, source, unsafe_code, libraries, board, verb, true)?;
+    let compiled = compile_csharp_file(path, source, unsafe_code, libraries, board, verb, true, folders)?;
     compiled.debuggable(|| format!("lamella {verb}: {}", path.display()))
 }
 
@@ -1305,9 +1585,9 @@ pub(crate) use lamella_wire_host::refusal::names_the_corlib;
 /// compiler searched them, which is first-declarer-wins.
 ///
 /// **THE WHOLE SET, AND THE TIER TAKES WHAT THE PROGRAM REFERENCES**, as the bake does. A project
-/// names a board's assembly; the board's assembly names `Lamella.Hardware`; handed only the project's
-/// own references, the link met that library's types as nothing and refused the board's type
-/// initializer.
+/// names `Lamella.Hardware`; `Lamella.Hardware` names `Lamella.Hardware.Facts`, the facts the board
+/// supplies; handed only the project's own references, the link would meet the facts' types as
+/// nothing and refuse `TargetBoard`'s constructor, which calls into them.
 pub(crate) fn link_libraries(references: &[Vec<u8>], corlib: &[u8]) -> Vec<Vec<u8>> {
     let Ok(corlib) = lamella_metadata::Assembly::read(corlib) else {
         return Vec::new();
@@ -1404,8 +1684,9 @@ fn compile_csharp_file(
     board: Option<&str>,
     verb: &str,
     debug: bool,
+    folders: &Folders,
 ) -> Result<Compiled, String> {
-    let set = lamella_wire_host::boards::ReferenceSet::discover(board)?;
+    let set = folders.reference_set(board).map_err(|error| format!("lamella {verb}: {error}"))?;
     let compiler = set.compiler();
     let mut references: Vec<lamella_metadata::Assembly> = compiler
         .references()
@@ -1499,8 +1780,9 @@ pub fn compile_project_assembly(
     libraries: &[crate::flash::Library],
     board: Option<&str>,
     verb: &str,
+    folders: &Folders,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    compile_project(project, libraries, board, verb, false)
+    compile_project(project, libraries, board, verb, false, folders)
         .map(|compiled| (compiled.assembly, compiled.corlib))
 }
 
@@ -1515,8 +1797,9 @@ pub fn compile_project_assembly_with_references(
     libraries: &[crate::flash::Library],
     board: Option<&str>,
     verb: &str,
+    folders: &Folders,
 ) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
-    compile_project(project, libraries, board, verb, false)
+    compile_project(project, libraries, board, verb, false, folders)
         .map(|compiled| (compiled.assembly, compiled.references))
 }
 
@@ -1531,8 +1814,9 @@ pub fn compile_project_for_debugging(
     libraries: &[crate::flash::Library],
     board: Option<&str>,
     verb: &str,
+    folders: &Folders,
 ) -> Result<Debuggable, String> {
-    let compiled = compile_project(project, libraries, board, verb, true)?;
+    let compiled = compile_project(project, libraries, board, verb, true, folders)?;
     compiled.debuggable(|| format!("lamella {verb}: {}", project.assembly_name))
 }
 
@@ -1545,11 +1829,12 @@ fn compile_project(
     board: Option<&str>,
     verb: &str,
     debug: bool,
+    folders: &Folders,
 ) -> Result<Compiled, String> {
     for warning in &project.package_warnings {
         eprintln!("{warning}");
     }
-    let set = lamella_wire_host::boards::ReferenceSet::discover(board)?;
+    let set = folders.reference_set(board).map_err(|error| format!("lamella {verb}: {error}"))?;
     compile_project_against(project, libraries, &set, verb, debug)
 }
 
@@ -1565,6 +1850,22 @@ pub(crate) fn compile_project_assembly_against(
     verb: &str,
 ) -> Result<Vec<u8>, String> {
     compile_project_against(project, libraries, set, verb, false).map(|compiled| compiled.assembly)
+}
+
+/// As [`compile_project_assembly_against`], compiled for a debugger, as
+/// [`compile_project_for_debugging`] compiles a project file: what `dotnet publish` hands over
+/// becomes the image a debugger takes as the program.
+///
+/// # Errors
+/// As [`compile_project_for_debugging`].
+pub(crate) fn compile_project_for_debugging_against(
+    project: &crate::project::Project,
+    libraries: &[crate::flash::Library],
+    set: &lamella_wire_host::boards::ReferenceSet,
+    verb: &str,
+) -> Result<Debuggable, String> {
+    let compiled = compile_project_against(project, libraries, set, verb, true)?;
+    compiled.debuggable(|| format!("lamella {verb}: {}", project.assembly_name))
 }
 
 /// The compile behind [`compile_project`], against the set it is handed.
@@ -1623,7 +1924,7 @@ fn compile_project_against(
         .collect();
     let options = lamella_syntax::lexer::LexOptions {
         unsafe_code: project.allow_unsafe,
-        file_based: false,
+        file_based: project.file_based,
         defines: project.defines.iter().map(|symbol| symbol.as_str().into()).collect(),
         ..Default::default()
     };
@@ -1738,8 +2039,6 @@ fn build_python(path: &Path, source: &str, board: Option<&str>) -> Result<Built,
         extension: "lpyc",
         what: PYTHON_BUNDLE,
         note: None,
-        excludes: "the Python interpreter firmware, which is by far the larger half and is \
-                   already on the board",
         loaded_into_firmware: true,
     })
 }
@@ -1772,44 +2071,61 @@ fn no_carrier_refusal(
          It declares no carrier -- no Lamella Link wire reaches it -- so there is no resident \
          firmware for\nthis artifact to be loaded into, and a flash headroom figure would measure \
          it against a tier the\nboard does not have.\n\n\
-         That is a property of the part rather than a gap in this build. The artifact itself was \
-         written\nand is unaffected; it is the fit question that has no answer here.\n\n\
-         `lamella boards` lists what each board can be given.",
+         That is a property of the part rather than a gap in this build. `lamella boards` lists \
+         what each\nboard can be given.\n\n\
+         Nothing was written.",
         built.what
     ))
 }
 
-/// Answer "does this fit on that board" about what was just built.
+/// "Does this fit on that board", answered about what was just built.
 ///
 /// **THIS IS THE HALF `fit` CANNOT REACH ON ITS OWN.** `lamella fit` wants an image size, and this
 /// is the verb that produces one; without it the question can be asked only by somebody who
 /// already knows the answer.
-fn answer_fit(board_id: &str, built: &Built) -> ExitCode {
-    let (board, part) = match catalog::resolve(board_id) {
-        Ok(resolved) => resolved,
-        Err(error) => {
-            eprintln!("lamella build: {error}");
-            return ExitCode::FAILURE;
+struct FitAnswer<'a> {
+    /// The board the build was for.
+    board_id: &'a str,
+    /// The verdict about the artifact's size on it.
+    verdict: lamella_bsp_gen::fit::FitVerdict,
+}
+
+impl FitAnswer<'_> {
+    /// By how many bytes the artifact is too large for the board, when it is.
+    fn over(&self) -> Option<i64> {
+        match self.verdict.flash_fit {
+            lamella_bsp_gen::fit::Fit::Exceeds { over } => Some(over),
+            _ => None,
         }
-    };
-    let image_bytes = match i64::try_from(built.bytes.len()) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            eprintln!("lamella build: the artifact is too large to compare against a budget");
-            return ExitCode::FAILURE;
-        }
-    };
-    if let Some(refusal) = no_carrier_refusal(board_id, &board, built) {
-        eprintln!("{refusal}");
-        return ExitCode::FAILURE;
     }
-    println!("\ndoes it fit on {board_id}?");
-    println!("  the number compared is the {}, which excludes", built.what);
-    println!("  {},", built.excludes);
-    println!("  so the headroom below is an UPPER BOUND rather than the room this image has.\n");
-    let verdict = fit(&board, &part, image_bytes);
-    print!("{}", crate::verdicts::render(board_id, &verdict));
-    crate::verdicts::exit_for(&verdict)
+
+    /// The answer as `build` prints it about `built`, in one line: the full assumptions and limits
+    /// are `lamella fit`'s, where they are asked for.
+    fn summary(&self, built: &Built) -> String {
+        match &self.verdict.flash_fit {
+            lamella_bsp_gen::fit::Fit::Fits { headroom } if built.loaded_into_firmware => {
+                format!("at most {headroom} B to spare; resident interpreter firmware is not counted.")
+            }
+            lamella_bsp_gen::fit::Fit::Fits { headroom } => format!("{headroom} B to spare."),
+            lamella_bsp_gen::fit::Fit::Exceeds { over } => format!("{over} B over."),
+            lamella_bsp_gen::fit::Fit::Unknown { missing } => format!("not known: {missing}."),
+        }
+    }
+}
+
+/// The fit of `built` on `board_id`, or the refusal of a build for a board that cannot run it.
+///
+/// # Errors
+/// A board that resolves to no part row, an artifact too large to measure, and a board with no
+/// firmware for the artifact to be loaded into.
+fn fit_of<'a>(board_id: &'a str, built: &Built) -> Result<FitAnswer<'a>, String> {
+    let (board, part) = catalog::resolve(board_id).map_err(|error| format!("lamella build: {error}"))?;
+    let image_bytes = i64::try_from(built.bytes.len())
+        .map_err(|_| "lamella build: the artifact is too large to compare against a budget".to_owned())?;
+    if let Some(refusal) = no_carrier_refusal(board_id, &board, built) {
+        return Err(refusal);
+    }
+    Ok(FitAnswer { board_id, verdict: fit(&board, &part, image_bytes) })
 }
 
 /// Read a source file and decide its language.
@@ -1852,7 +2168,83 @@ fn host_sleep_ns(nanos: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use lamella_flash_routes::manifest;
     use lamella_wire_host::engine::ReplCompiler;
+
+    /// A scratch directory of the test's own.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("lamella-program-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        dir
+    }
+
+    /// **`build` WRITES THE RECORD BESIDE AN `.elf` AND A `.bin`**, and `lamella flash` reads it
+    /// back as describing exactly the bytes written, for the board they were built for.
+    #[test]
+    fn build_writes_the_record_beside_an_elf_and_a_bin() {
+        let dir = scratch("manifest-written");
+        let elf = dir.join("app.elf");
+        std::fs::write(&elf, b"elf bytes").expect("the ELF");
+        write_manifest_beside(&elf, &manifest::for_elf("rpi-pico2", b"elf bytes", &producer())).expect("written");
+        let read = manifest::read(&elf).expect("readable").expect("present");
+        manifest::check_identity(&read, b"elf bytes", Some("elf")).expect("it describes the bytes");
+        assert_eq!(read.board, "rpi-pico2");
+        assert_eq!(read.producer, Some(format!("lamella {}", crate::TOOL_VERSION)));
+
+        let bin = dir.join("app.bin");
+        std::fs::write(&bin, [0u8; 64]).expect("the bin");
+        write_manifest_beside(&bin, &manifest::for_bin("rpi-pico2", 0x1000_0000, &[0u8; 64], &producer()))
+            .expect("written");
+        let read = manifest::read(&bin).expect("readable").expect("present");
+        manifest::check_identity(&read, &[0u8; 64], Some("bin")).expect("it describes the bytes");
+        assert_eq!(read.base, Some(0x1000_0000));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A debug ELF naming `objects` as `(name, address, size)`, as the class-library build writes one.
+    fn elf_naming(objects: &[(&'static str, u32, u32)]) -> Vec<u8> {
+        let named: Vec<lamella_elf::NamedObject<'_>> = objects
+            .iter()
+            .map(|&(name, address, size)| lamella_elf::NamedObject { name, section: name, address, size })
+            .collect();
+        lamella_elf::write_debuggable_executable_with_objects(lamella_elf::Machine::Arm, &[0x00, 0xBF], 0, 0x1000_0000, true, &[], &named)
+    }
+
+    /// **A RECORD NEVER STATES A CHANNEL ITS IMAGE DOES NOT HAVE.** An RP2350 board's image that names
+    /// Lamella's ring states `memory`; one that names no ring, or RHU's, states none; and a micro:bit's
+    /// image states none even when it names the ring, because the archive it links is shared by both
+    /// micro:bits and keeps whatever console it was built with.
+    #[test]
+    fn a_record_states_only_the_channel_its_image_has() {
+        let ring = elf_naming(&[(lamella_probe_console::LAMELLA_RING, 0x2000_8000, 16 + 16384)]);
+        let rhu = elf_naming(&[(lamella_probe_console::RHU_RING, 0x2000_8000, 16 + 16384)]);
+        let neither = elf_naming(&[]);
+        for board in ["rpi-pico2", "rpi-pico2-w", "pimoroni-pico-plus-2", "pimoroni-pico-plus-2-w"] {
+            assert_eq!(record_channel(board, &ring), Some("memory"), "{board}");
+            assert_eq!(record_channel(board, &neither), None, "{board}: no ring");
+            assert_eq!(record_channel(board, &rhu), None, "{board}: RHU's ring");
+        }
+        for board in ["bbc-micro-bit-v1", "bbc-micro-bit-v2"] {
+            assert_eq!(record_channel(board, &ring), None, "{board}: its archive is shared");
+        }
+    }
+
+    /// **A FILE THE RECORD CANNOT DESCRIBE GETS NONE**: a `.uf2`, a `.hex`, an `.s19`, a name no
+    /// format has, and a file whose name says another format than the record's. A record beside a
+    /// file it cannot describe would stop every `lamella flash` of that file.
+    #[test]
+    fn a_file_the_record_cannot_describe_gets_none() {
+        let dir = scratch("manifest-none");
+        for name in ["app.uf2", "app.hex", "app.s19", "app.img", "app.elf"] {
+            let out = dir.join(name);
+            std::fs::write(&out, b"bytes").expect("the file");
+            let record = manifest::for_bin("rpi-pico2", 0x1000_0000, b"bytes", &producer());
+            write_manifest_beside(&out, &record).expect("nothing to write");
+            assert!(!manifest::path_for(&out).exists(), "{name} got a record");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// **A trapped run's output is on screen before its trap report**, in the one screen both
     /// streams write to. Standard output is buffered by line and standard error is not, so output
@@ -2187,7 +2579,7 @@ mod tests {
         }
         let project = project_at("runs", "Exe", "", PRINTS);
         assert_eq!(run_command(&[project.to_string_lossy().into_owned()]), Ended::Program(0));
-        match project_run(&project, &[]) {
+        match project_run(&project, &[], &Folders::default()) {
             Ok(Ok(run)) => {
                 assert_eq!(run.stdout, "from the project\n", "the program's own output");
                 assert_eq!(run.ended, Ended::Program(0));
@@ -2219,7 +2611,7 @@ mod tests {
             std::fs::write(&project, project_bytes).expect("write the project");
             let directory = project.parent().expect("its directory").to_path_buf();
             std::fs::write(directory.join("Program.cs"), source_bytes).expect("write the program");
-            match project_run(&project, &[]) {
+            match project_run(&project, &[], &Folders::default()) {
                 Ok(Ok(run)) => {
                     assert_eq!(run.stdout, "from the project\n", "{what}: the program's own output");
                     assert_eq!(run.ended, Ended::Program(0), "{what}");
@@ -2254,7 +2646,7 @@ mod tests {
     #[test]
     fn a_library_project_and_one_naming_libraries_are_refused_by_run() {
         let library = project_at("library", "Library", "", PRINTS);
-        let refusal = project_run(&library, &[]).expect_err("a class library has no entry point");
+        let refusal = project_run(&library, &[], &Folders::default()).expect_err("a class library has no entry point");
         assert!(
             refusal.contains("builds a class library") && refusal.contains("<Reference>"),
             "{refusal}"
@@ -2269,11 +2661,11 @@ mod tests {
             gpio.display()
         );
         let referencing = project_at("referencing", "Exe", &items, PRINTS);
-        let refusal = project_run(&referencing, &[]).expect_err("its libraries are not linked here");
+        let refusal = project_run(&referencing, &[], &Folders::default()).expect_err("its libraries are not linked here");
         assert!(
             refusal.contains("references libraries of its own")
                 && refusal.contains("System.Device.Gpio.dll")
-                && refusal.contains("--board <id> --format <f>")
+                && refusal.contains("--board <board> --format <format>")
                 && !refusal.contains("--class-library"),
             "{refusal}"
         );
@@ -2359,7 +2751,6 @@ mod tests {
             extension: "lmli",
             what,
             note: None,
-            excludes: "the serve firmware already resident on the board",
             loaded_into_firmware,
         }
     }
@@ -2396,8 +2787,8 @@ mod tests {
             "and the fact it read: {refusal}"
         );
         assert!(
-            refusal.contains("was written"),
-            "and that the artifact survived: {refusal}"
+            refusal.ends_with("\n\nNothing was written."),
+            "and that nothing was written: {refusal}"
         );
         assert!(
             refusal.starts_with(
@@ -2636,7 +3027,7 @@ mod tests {
             "and what it actually was: {BOTH_MODES}"
         );
         assert!(
-            !BOTH_MODES.lines().any(|line| line.trim_start().starts_with("--board <id>")),
+            !BOTH_MODES.lines().any(|line| line.trim_start().starts_with("--board <board>")),
             "it must not still be listed as a mode of this verb: {BOTH_MODES}"
         );
     }
@@ -2699,13 +3090,33 @@ mod tests {
             );
         }
     }
-    /// **A KIND OF FILE THE VERBS TAKE IS NAMED WHERE A READER LOOKS FOR IT**: the usage line a
-    /// reader retypes, and the refusal met after naming a file the verbs do not take. Both took a
+    /// The entry `name` has in a help page's Arguments or Options: its line, and the lines under it
+    /// that continue it, joined.
+    fn entry(page: &str, name: &str) -> String {
+        let lines: Vec<&str> = page.lines().collect();
+        let start = lines
+            .iter()
+            .position(|line| line.trim_start().strip_prefix(name).is_some_and(|rest| rest.starts_with("  ")))
+            .unwrap_or_else(|| panic!("no entry for `{name}`:\n{page}"));
+        let indent = |line: &str| line.len() - line.trim_start().len();
+        let mut text = lines[start].trim().to_owned();
+        for line in &lines[start + 1..] {
+            if line.trim().is_empty() || indent(line) <= indent(lines[start]) {
+                break;
+            }
+            text.push(' ');
+            text.push_str(line.trim());
+        }
+        text
+    }
+
+    /// **A KIND OF FILE THE VERBS TAKE IS NAMED WHERE A READER LOOKS FOR IT**: the argument the
+    /// reader's file is, and the refusal met after naming a file the verbs do not take. Both took a
     /// project and neither said so.
     #[test]
     fn run_names_the_project_it_takes() {
-        let first = RUN_USAGE.lines().next().unwrap_or_default();
-        assert!(first.contains("file.csproj"), "the usage line: {first}");
+        let file = entry(RUN_USAGE, "<file>");
+        assert!(file.contains(".csproj"), "the argument: {file}");
         let refusal = Language::of(Path::new("app.ts")).expect_err("refuses");
         assert!(refusal.contains(".csproj"), "the refusal: {refusal}");
     }
@@ -2713,19 +3124,19 @@ mod tests {
     /// **A VERB WITH NO USAGE TEXT ANSWERS `--help` BY PRINTING NOTHING AND EXITING 0**, which
     /// reads to a person as "this tool has no help" and to a script as success.
     ///
-    /// Asserting the FIRST LINE rather than the presence of a string also catches the likelier
+    /// Asserting the FIRST LINES rather than the presence of a string also catches the likelier
     /// drift: a usage block copied from a neighbouring verb and not renamed.
     #[test]
     fn the_usage_opens_with_the_verb_it_belongs_to() {
         assert!(
-            RUN_USAGE.starts_with("usage: lamella run"),
+            RUN_USAGE.starts_with("Usage:\n  lamella run "),
             "`run` must open with the line a reader retypes: {}",
-            RUN_USAGE.lines().next().unwrap_or_default()
+            RUN_USAGE.lines().nth(1).unwrap_or_default()
         );
         assert!(
-            usage().starts_with("usage: lamella build"),
+            usage().starts_with("Usage:\n  lamella build "),
             "`build` must open with the line a reader retypes: {}",
-            usage().lines().next().unwrap_or_default()
+            usage().lines().nth(1).unwrap_or_default()
         );
     }
 
@@ -2831,14 +3242,11 @@ mod tests {
             !RUN_USAGE.contains("would FIT"),
             "`run --board` does not answer fit -- `build --board` does:\n{RUN_USAGE}"
         );
-        for (flag, language) in [("--device <d>", "C#")] {
-            let paragraph = RUN_USAGE
-                .split("\n\n")
-                .find(|block| block.starts_with(flag))
-                .unwrap_or_else(|| panic!("no paragraph opens with `{flag}`:\n{RUN_USAGE}"));
+        for (flag, language) in [("--device <device>", "C#")] {
+            let entry = entry(RUN_USAGE, flag);
             assert!(
-                paragraph.contains(language),
-                "`{flag}` serves {language} only today and the usage does not say so:\n{paragraph}"
+                entry.contains(language),
+                "`{flag}` serves {language} only today and the usage does not say so:\n{entry}"
             );
         }
     }

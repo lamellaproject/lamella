@@ -22,6 +22,10 @@ namespace Lamella.Hardware
         /// <summary>The GPIO controller's driver; null, as this build has none.</summary>
         internal static GpioDriver CreateGpio() { return null; }
 
+        /// <summary>Whether this build constructs a driver for bus <paramref name="bus"/> of
+        /// <paramref name="kind"/>; false, as it constructs none.</summary>
+        internal static bool Serves(int kind, int bus) { return false; }
+
         /// <summary>Why bus <paramref name="bus"/> of <paramref name="kind"/> has no driver here: this
         /// build carries no board's drivers.</summary>
         internal static string Describe(int kind, int bus)

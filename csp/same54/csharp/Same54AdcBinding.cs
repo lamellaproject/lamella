@@ -1,7 +1,7 @@
 // The descriptor a SAM E54 ADC driver consumes: one binding's resolved values, exactly the consts
 namespace Lamella.Boards
 {
-    public sealed class Same54AdcBinding
+    internal sealed class Same54AdcBinding
     {
         /// <summary>The bound converter's base address.</summary>
         public readonly uint AdcBase;

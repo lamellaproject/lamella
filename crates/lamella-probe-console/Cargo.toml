@@ -1,0 +1,15 @@
+[package]
+name = "lamella-probe-console"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Following a program's console ring in a board's RAM over a debug probe, without halting the board: the ring's layout and its end, the reader, and the symbols an image's ELF names the ring by."
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+lamella-elf = { path = "../lamella-elf" }

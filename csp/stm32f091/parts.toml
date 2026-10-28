@@ -1,6 +1,6 @@
 # PARTS table for the stm32f091 family. PARTIAL.
 #
-# THE FAMILY NAME IS TOO NARROW FOR ITS CONTENTS, and that is a naming question rather than a
+# The family name is too narrow for its contents, and that is a naming question rather than a
 # structural one. RM0091's introduction states its own scope: it "applies to the STM32F031x4/x6,
 # STM32F051x4/x6/x8, STM32F071x8/xB, STM32F091xB/xC, STM32F042x4/x6, STM32F072x8/xB,
 # STM32F038x6, STM32F048x6, STM32F058x8, STM32F078xB and STM32F098xC devices" -- eleven lines

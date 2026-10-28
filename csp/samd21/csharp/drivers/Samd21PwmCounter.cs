@@ -3,7 +3,7 @@
 // binds one counter per PWM chip, and each output it wired to the counter is one channel of that
 // chip, created by PwmChannel.Create. Samd21TcPwm and Samd21TccPwm are its two register backends.
 //
-// ONE RATE PER COUNTER. The counter's period is the period of every output it drives, and each
+// One rate per counter. The counter's period is the period of every output it drives, and each
 // output owns only its compare value, which sets its duty cycle. So a frequency asked of one
 // output re-times the counter and every output of it that is not started: each keeps its duty
 // cycle, and its Frequency then reads the new rate. A started output is never re-timed under its
@@ -31,7 +31,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public abstract class Samd21PwmCounter
+internal abstract class Samd21PwmCounter
 {
     /// <summary>A bound on every hardware wait, so a counter that never answers is reported rather
     /// than waited on forever.</summary>

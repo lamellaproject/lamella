@@ -5,7 +5,7 @@
 // instance bases live in Samd21Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Samd21EicLayout
+    internal sealed class Samd21EicLayout
     {
         private Samd21EicLayout() { }
 

@@ -1,7 +1,7 @@
 # BOARD binding: the Arduino UNO R4 Minima, an R7FA4M1AB3CFM on Arduino's ABX00080 in the UNO form
 # factor.
 #
-# THIS BOARD EXPOSES SWD DIRECTLY AND CARRIES NEITHER A DEBUGGER NOR A SERIAL BRIDGE, and all
+# This board exposes SWD directly and carries neither a debugger nor a serial bridge, and all
 # three halves of that are read rather than assumed. The user manual's component table names every
 # populated part -- the microcontroller, a buck converter, the reset button, four LEDs, three diodes
 # and the connectors -- and none of them is a debug probe, a bridge or a radio. What the board
@@ -11,17 +11,17 @@
 # below is `native-usb` and names neither a baud nor an operating point, because a rate is a
 # property of a wire that has one and this wire does not.
 #
-# THE SIBLING BOARD IN THIS PRODUCT LINE DEBUGS THROUGH A DIFFERENT PATH, WHICH IS WHY THE ABOVE
-# IS STATED FROM THIS BOARD'S OWN DOCUMENTS. The WiFi variant of the same UNO R4 carries a second
+# The sibling board in this product line debugs through a different path, which is why the above
+# is stated from this board's own documents. The WiFi variant of the same UNO R4 carries a second
 # processor that acts as its debug and firmware-update bridge; this variant carries no such part at
 # all, so its SWD lines go straight to the connector. A debug path is a per-board reading and does
 # not transfer between two boards that share a microcontroller.
 #
-# THE ONLY BUTTON IS THE RESET BUTTON AND IT IS NOT A PIN A PROGRAM CAN READ. PB1 drives the
+# The only button is the reset button and it is not a pin a program can read. PB1 drives the
 # microcontroller's reset line, not a port pin, so there is no `gpio-in` row below and the absence
 # is deliberate. A row naming a pin for it would have to invent one.
 #
-# NOT MODELLED, AND NAMED SO EACH OMISSION IS DELIBERATE: the 8 KB of data flash the part carries
+# Not modelled, and named so each omission is deliberate: the 8 KB of data flash the part carries
 # beside its code flash and SRAM; the power LED DL3, which no pin drives; the header serial pair on
 # D0 and D1, which reaches a host only through an external adapter and whose operating point no
 # document here settles; the ICSP header J1; the DC jack and its buck converter; and the two I2C
@@ -51,7 +51,7 @@ notes = [
 
 # --- the carrier ------------------------------------------------------------------------------
 #
-# THE MICROCONTROLLER'S OWN USB DEVICE CONTROLLER, over the USB-C connector J3. There is no bridge
+# The microcontroller's own USB device controller, over the USB-C connector J3. There is no bridge
 # between it and the host, which is why the row carries no vendor identity: a bridge has a USB
 # identity of its own to state and this path has only the device the target itself presents.
 
@@ -61,7 +61,7 @@ default = true
 
 # --- control lines ----------------------------------------------------------------------------
 #
-# THE OPENING WRITE NEEDS NO CLOCK GATE OPENED FIRST, which is worth knowing before the first
+# The opening write needs no clock gate opened first, which is worth knowing before the first
 # thing anyone drives on this board. The part's I/O ports are absent from the list of modules its
 # module-stop function can stop, so a port answers out of reset. What a pin DOES need is its
 # direction bit: every pin comes out of reset as an input, so a program that writes an output level

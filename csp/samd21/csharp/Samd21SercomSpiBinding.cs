@@ -1,7 +1,7 @@
 // The descriptor a SAMD21 SERCOM-SPI master driver consumes: one binding's resolved values.
 namespace Lamella.Boards
 {
-    public sealed class Samd21SercomSpiBinding
+    internal sealed class Samd21SercomSpiBinding
     {
         /// <summary>The bound SERCOM instance's base address.</summary>
         public readonly uint SercomBase;

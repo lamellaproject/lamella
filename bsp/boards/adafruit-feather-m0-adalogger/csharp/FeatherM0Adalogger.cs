@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Adafruit
 {
-    public sealed class FeatherM0Adalogger
+    internal sealed class FeatherM0Adalogger
     {
         /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
         public static readonly int BoardModel = AdafruitFeatherM0AdaloggerBindings.BOARD_MODEL;

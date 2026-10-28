@@ -192,6 +192,10 @@ impl Debugger {
     /// it halts, or empty while it is still going. The serve loop calls this while
     /// [`is_running`](Debugger::is_running) holds; the backend's `poll` may block until
     /// the target halts, so this does not busy-wait.
+    ///
+    /// A stop at a breakpoint is taken through its hit count and its logpoint first, as a stop a
+    /// command comes to is: a logpoint writes its message and the target runs on, and a hit count
+    /// not yet met resumes it without a stop being reported.
     #[must_use]
     pub fn poll(&mut self) -> Vec<Message> {
         let mut events: Vec<(&'static str, Option<Json>)> = Vec::new();
@@ -200,7 +204,7 @@ impl Debugger {
                 Stop::Running => self.flush_output(&mut events),
                 stop => {
                     self.running = false;
-                    self.finish(stop, &mut events);
+                    self.settle(stop, &mut events);
                 }
             }
         }
@@ -674,7 +678,7 @@ impl Debugger {
         if matches!(action, Action::Resume) {
             self.note_inactive_breakpoints(events);
         }
-        let mut stop = match action {
+        let stop = match action {
             Action::Resume => self.backend.resume(),
             Action::StepIn | Action::StepOver | Action::StepOut if self.backend.has_source() => {
                 self.source_step(action, events)
@@ -686,6 +690,18 @@ impl Debugger {
             Action::StepOver => self.step_to_depth(|depth, start| depth <= start, events),
             Action::StepOut => self.step_to_depth(|depth, start| depth < start, events),
         };
+        self.settle(stop, events);
+    }
+
+    /// Takes a stop through what its breakpoint asks for, then reports where the target is: at a
+    /// logpoint the message is written and the target resumed, at a hit count not yet met the target
+    /// is resumed with nothing reported, and any other stop, or a target left running, is reported as
+    /// it is.
+    ///
+    /// Both [`Debugger::run`] and [`Debugger::poll`] come here. On a target that resumes at once, as a
+    /// device does, every breakpoint stop arrives through `poll`, so a decision made only in `run`
+    /// is never made for it.
+    fn settle(&mut self, mut stop: Stop, events: &mut Vec<(&'static str, Option<Json>)>) {
         while matches!(stop, Stop::Breakpoint) {
             match self.breakpoint_action() {
                 BreakpointAction::Stop => break,

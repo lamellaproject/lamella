@@ -5,13 +5,13 @@
 #   PINCFG[p] = group_base + 0x40 + p        (p = the pin index within the group)
 # The generator owns those derivations; drivers receive resolved addresses through their bindings.
 #
-# THE REGISTER LAYOUT IS THE SAM D21 LINE'S AND THE BASE IS NOT. Every offset below matches the
+# The register layout is the SAM D21 line's and the base is not. Every offset below matches the
 # samd20, samda1, samha1 and samr21 blocks value for value -- but this family's PORT sits at
 # 0x41000000 where theirs sit at 0x41004400, and the group bases follow from that. The layout
 # agreeing is what makes the driver code the same shape; the base differing is why not one address
 # may be carried across.
 #
-# THREE GROUPS ON THE DIE, AND THE COUNT COMES FROM THE PAD SET. This document bounds the group
+# Three groups on the die, and the count comes from the pad set. This document bounds the group
 # count nowhere, as its D20 and DA1 siblings do not; Table 6-1's 100-pin column reaches PC28, which
 # is what puts a group 2 on this part. The 64-pin package bonds none of it -- see parts.toml.
 
@@ -86,7 +86,7 @@ fields = { PMUXEN = [0, 1], INEN = [1, 1], PULLEN = [2, 1], DRVSTR = [6, 1] }
 notes = "Element 0 of the per-pin config array; see the block header for the element derivation."
 
 # Function-letter values for PMUX nibbles (family-wide; the pin-map rows name letters).
-# NOTE: THIS TABLE RUNS TO I AND THE SAM D21 LINE'S STOPS AT H. The values are still 0..n in
+# Note: this table runs to I and the SAM D21 line's stops at H. The values are still 0..n in
 # letter order; what is new is that there is a ninth column at all. A pin-map row carries the
 # letter and this table turns it into a nibble; what the letter SELECTS is Table 6-1's or 6-2's
 # business, and WHICH of those two depends on the package.

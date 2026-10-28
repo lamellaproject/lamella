@@ -1,12 +1,12 @@
 # PART: NXP FXOS8700CQ, a six-axis accelerometer and magnetometer in ONE combined device.
 #
-# THE SHAPE THIS PART EXISTS TO CONTRAST WITH. It measures the same two quantities as an LSM303AGR
+# The shape this part exists to contrast with. It measures the same two quantities as an LSM303AGR
 # and presents them completely differently: one slave address, one identity register, one continuous
 # register map covering both sensors. Where the ST part is two bus residents, this is one. So the
 # decision to model that part as two members follows the silicon rather than a preference -- the
 # same function arrives here as a single device and is described as one.
 #
-# WHY THIS PART IS IN THE CATALOG AT ALL: it is the ALTERNATIVE on a shared footprint. The
+# Why this part is in the catalog at all: it is the ALTERNATIVE on a shared footprint. The
 # micro:bit v2 has one motion-sensor footprint that takes either this part or an LSM303AGR, only one
 # is ever placed, and the board's own vendor states that its reference runtime detects which at run
 # time. A board file cannot say which is fitted, so a reader must be able to describe both.
@@ -27,7 +27,7 @@ notes = [
 #
 # Primary: every fact below is read from this part's own data sheet.
 #
-# WHAT THIS TABLE DELIBERATELY DOES NOT STATE: the output data rates, the dynamic ranges and the
+# What this table deliberately does not state: the output data rates, the dynamic ranges and the
 # counts-per-unit each implies, the hybrid accelerometer-plus-magnetometer mode and its rate
 # halving, the FIFO, the orientation and pulse detection blocks, the magnetic threshold interrupts,
 # and the hard-iron offset registers. All are in the data sheet and none is transcribed.
@@ -41,7 +41,7 @@ validation = "none"
 
 # --- buses -----------------------------------------------------------------------------------------
 #
-# ONLY THE I2C PATH IS DESCRIBED. The part also has an SPI interface, documented in its own chapter,
+# Only the I2C path is described. The part also has an SPI interface, documented in its own chapter,
 # and nothing about it is transcribed here -- treat it as absent rather than defaulted.
 
 [buses.i2c]
@@ -53,7 +53,7 @@ notes = "THE BURST RULE IS THE OPPOSITE OF THE PART THIS ONE SHARES A FOOTPRINT 
 
 # --- identity ------------------------------------------------------------------------------------
 #
-# ONE REGISTER, ONE VALUE, AND IT IS NOWHERE NEAR THE ST PART'S. That matters because the two parts
+# One register, one value, and it is nowhere near the ST part's. That matters because the two parts
 # can occupy the SAME ADDRESS, so an identity read is the only thing that separates them -- see the
 # address section below, which is where this gets dangerous.
 
@@ -63,7 +63,7 @@ width = 8
 values = [0xC7]
 notes = "The register map lists this as Device ID with a reset value of 0xC7."
 
-# --- address: THE MODEL CANNOT STATE THIS PART'S ADDRESS, AND NO STRAP IS DECLARED ------------------
+# --- address: the model cannot state this part's address, and no strap is declared ------------------
 #
 # Four addresses selected by two pins, SA1 and SA0. The data sheet gives them as a table:
 #
@@ -73,14 +73,14 @@ notes = "The register map lists this as Device ID with a reset value of 0xC7."
 #      1    0    0x1C
 #      1    1    0x1F
 #
-# THAT IS NOT A BASE PLUS PER-PIN BITS, WHICH IS THE ONLY ADDRESS MODEL THIS SCHEMA HAS. A strap row
+# That is not a base plus per-pin bits, which is the only address model this schema has. A strap row
 # states that one pin contributes one bit at one position, and here SA0's contribution DEPENDS ON
 # SA1: setting SA0 moves the address down by one from the 0,0 corner and up by three from the 1,0
 # corner. Written as bits, the low two are `SA1 XNOR SA0` and `SA0`, which no per-pin row can say.
 #
-# SO NO STRAP IS DECLARED, AND THAT IS A DELIBERATE ABSENCE RATHER THAN A CLAIM. A reader of the
+# So no strap is declared, and that is a deliberate absence rather than a claim. A reader of the
 # emitted table will find a strap count of zero, which elsewhere in this catalog means an address
-# that cannot be moved. IT DOES NOT MEAN THAT HERE. The alternative was to invent two strap rows
+# that cannot be moved. It does not mean that here. The alternative was to invent two strap rows
 # whose composed addresses would be wrong for two of the four combinations, and a wrong address that
 # computes is worse than an absent one that is described.
 #
@@ -155,7 +155,7 @@ width = 16
 access = "read-only"
 fields = { m_out_z_lsb = [0, 8], m_out_z_msb = [8, 8] }
 
-# STATED BECAUSE OF WHAT IT COLLIDES WITH, not because a driver needs it. This register holds
+# Stated because of what it collides with, not because a driver needs it. This register holds
 # measured magnetometer data -- a value that changes with the field the board is sitting in -- and
 # it is at the address the LSM303AGR magnetometer answers its IDENTITY at. See the note below.
 [registers.min_z_msb]

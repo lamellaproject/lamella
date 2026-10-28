@@ -6,17 +6,17 @@
 # position here, header position to pad in the board's own `header` row -- and neither file names
 # the other's half.
 #
-# THE TWO SOCKETS SHARE THEIR BUSES AND NOTHING ELSE. SPI's clock and data lines and I2C's two lines
+# The two sockets share their buses and nothing else. SPI's clock and data lines and I2C's two lines
 # reach both sockets from one set of header positions; each socket has its own UART, chip select,
 # reset, interrupt, PWM and analog line. A module that uses a shared line uses it for both sockets.
 #
-# THE TWO REVISIONS DIFFER IN ONE PLACE, AND IT IS NOT COSMETIC. v101 wires the sockets' MOSI to
+# The two revisions differ in one place, and it is not cosmetic. v101 wires the sockets' MOSI to
 # header position GP19 and MISO to GP16; v100 wires them the other way round, in both sockets.
 # Every other line, the power circuit and the parts list are the same in both drawings. So which
 # revision a unit is decides where SPI data lands, and the file states both: the unit's revision is
 # a fact about the physical shield, stated where the unit is described, not here.
 #
-# THE SOCKETS ARE NAMED socket-1 AND socket-2. The drawings designate them MIKROBUS0 and MIKROBUS1;
+# The sockets are named socket-1 and socket-2. The drawings designate them MIKROBUS0 and MIKROBUS1;
 # the mikroBUS standard numbers a board's sockets from 1, and socket-1 is the drawings' MIKROBUS0.
 
 [table]

@@ -6,7 +6,7 @@
 // every one of these facts.
 namespace Lamella.Generated
 {
-    public sealed class Bme68xCommon
+    internal sealed class Bme68xCommon
     {
         private Bme68xCommon() { }
         public const string FAMILY = "bme68x";

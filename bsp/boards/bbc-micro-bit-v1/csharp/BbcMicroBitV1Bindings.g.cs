@@ -6,7 +6,7 @@
 // lines, and the carrier identity. The board's facts are stated in board.toml.
 namespace Lamella.Generated
 {
-    public sealed class BbcMicroBitV1Bindings
+    internal sealed class BbcMicroBitV1Bindings
     {
         private BbcMicroBitV1Bindings() { }
 

@@ -2,16 +2,16 @@
 # consumers outside the controller need. Its command set, its lock bits and its GPNVM bits are not
 # described here.
 #
-# READ THE FAMILY'S OWN TABLE, NOT THE CONTROLLER'S BOILERPLATE. Every EEFC datasheet carries the
+# Read the family's own table, not the controller's boilerplate. Every EEFC datasheet carries the
 # sentence "The embedded Flash size, the page size, the organization of lock regions and the
 # definition of GPNVM bits are specific to the device", and it is easy to read that as "this cannot
 # be a family fact". It is a statement about the CONTROLLER being reused across products, not about
 # variation within one family -- and each family then states its own page size flatly. Checked here
 # rather than assumed in either direction.
 #
-# THE UNIT A PROGRAM COMMITS IS A PAGE, AND IT IS 512 BYTES ON EVERY DEVICE IN THIS FAMILY.
+# The unit a program commits is a page, and it is 512 bytes on every device in this family.
 #
-# THE ERASED STATE IS ALL ONES, in the datasheet's own words: an erased state is one where "all bits
+# The erased state is all ones, in the datasheet's own words: an erased state is one where "all bits
 # read as logic level 1", and the programming section says the remaining part of a partly-used page
 # "must be erased (written with 1)".
 

@@ -5,7 +5,7 @@
 // instance bases live in Stm32l476Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Stm32l476FlashLayout
+    internal sealed class Stm32l476FlashLayout
     {
         private Stm32l476FlashLayout() { }
 

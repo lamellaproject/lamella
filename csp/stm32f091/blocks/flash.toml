@@ -4,13 +4,13 @@
 #
 # Two facts, and each `sources` entry names the one it backs.
 #
-# THE WRITE UNIT IS A HALF-WORD, WHICH IS AS NARROW AS AN ST CONTROLLER GETS. Two bytes -- an order
+# The write unit is a half-word, which is as narrow as an ST controller gets. Two bytes -- an order
 # of magnitude below the STM32H7's thirty-two, which is why the number is stated per family and
 # never carried across one. RM0091 enforces it hard: `Any attempt to write data that are not
 # half-word long results in a bus error generating a Hard Fault interrupt`. Not a status flag, a
 # fault.
 #
-# THE ERASED VALUE COMES FROM THE PART'S OWN BLANK CHECK RATHER THAN FROM A SENTENCE ABOUT ERASING.
+# The erased value comes from the part's own blank check rather than from a sentence about erasing.
 # RM0091 does not state in words what a page reads as after an erase. It does define the EMPTY flag,
 # which the silicon sets `when the content of the address 0x0800 0000 is read as 0xFFFF FFFF` and
 # describes as the condition of `a virgin device`. That is the part telling us what it considers

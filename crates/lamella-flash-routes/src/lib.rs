@@ -635,6 +635,42 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
     },
     Programming {
+        board: "pimoroni-pico-lipo-2",
+        aot_target: None,
+        programmer: Programmer::Uf2Volume {
+            family: RP2350_UF2_FAMILY,
+            base: RP2_XIP_BASE,
+        },
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+    },
+    Programming {
+        board: "pimoroni-pico-lipo-2-xl-w",
+        aot_target: None,
+        programmer: Programmer::Uf2Volume {
+            family: RP2350_UF2_FAMILY,
+            base: RP2_XIP_BASE,
+        },
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+    },
+    Programming {
+        board: "adafruit-feather-rp2350-hstx",
+        aot_target: None,
+        programmer: Programmer::Uf2Volume {
+            family: RP2350_UF2_FAMILY,
+            base: RP2_XIP_BASE,
+        },
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+    },
+    Programming {
+        board: "adafruit-feather-rp2350-hstx-psram",
+        aot_target: None,
+        programmer: Programmer::Uf2Volume {
+            family: RP2350_UF2_FAMILY,
+            base: RP2_XIP_BASE,
+        },
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+    },
+    Programming {
         board: "rpi-pico",
         aot_target: Some("rp2040"),
         programmer: Programmer::Uf2Volume {
@@ -883,10 +919,13 @@ pub const PICOBIN_SCAN_BYTES: usize = 4096;
 /// verb exists for: an image somebody else's toolchain produced, where stamping is a separate step
 /// in their build rather than a property of the linker output.
 ///
+/// `chip` is the chip family of the board the image is for, as the board's facts name it
+/// (`rp2350`), whether or not this build compiles for that board.
+///
 /// # Errors
 /// When `bytes` is for an RP2350 board and carries no PICOBIN block in the scanned window.
-pub fn check_rp2350_stamp(bytes: &[u8], aot_target: Option<&str>) -> Result<(), String> {
-    if aot_target != Some("rp2350") {
+pub fn check_rp2350_stamp(bytes: &[u8], chip: Option<&str>) -> Result<(), String> {
+    if chip != Some("rp2350") {
         return Ok(());
     }
     let window = &bytes[..bytes.len().min(PICOBIN_SCAN_BYTES)];
@@ -900,7 +939,7 @@ pub fn check_rp2350_stamp(bytes: &[u8], aot_target: Option<&str>) -> Result<(), 
         "this image carries no PICOBIN IMAGE_DEF block in its first {} bytes, and the RP2350 \
          bootrom will not boot it.\nThere is no symptom to read back: an unstamped image looks \
          exactly like a blank chip.\nStamp it in the build that linked it -- `lamella build \
-         --board <id>` stamps what it produces.",
+         --board <board>` stamps what it produces.",
         window.len()
     ))
 }
@@ -916,8 +955,40 @@ pub fn check_rp2350_stamp(bytes: &[u8], aot_target: Option<&str>) -> Result<(), 
 ///
 /// # Errors
 /// Naming a selector the chosen route does not use. Refused rather than ignored: a `--probe`
-/// silently dropped on a volume route reads as "I told it which board" while nothing was told.
+/// silently dropped on a volume route reads as "I told it which board" while nothing was told. And
+/// naming the one it uses with an empty value, which names nothing: read as no name, an empty serial
+/// falls through to `LAMELLA_PROBE_SERIAL` and then to the one probe attached.
 pub fn selector_for(
+    programmer: Programmer,
+    probe: Option<&str>,
+    volume: Option<&str>,
+    device: Option<&str>,
+) -> Result<Option<String>, String> {
+    let chosen = selector_named(programmer, probe, volume, device)?;
+    let names_nothing = |value: &str| match programmer {
+        Programmer::Uf2Volume { .. } | Programmer::StDfu { .. } => value.trim().is_empty(),
+        _ => lamella_probe_core::selection::serial_named(value).is_empty(),
+    };
+    if chosen.as_deref().is_some_and(names_nothing) {
+        return Err(match programmer {
+            Programmer::Uf2Volume { .. } => {
+                "--volume was given no drive. A bootloader drive is named as `lamella devices` lists it, under \
+                 DRIVE."
+            }
+            Programmer::StDfu { .. } => {
+                "--dfu was given no serial number. A system bootloader over USB DFU is named by its USB serial \
+                 number."
+            }
+            _ => "--probe was given no serial number. A probe is named by its USB serial number, as `lamella \
+                  devices` lists it.",
+        }
+        .to_owned());
+    }
+    Ok(chosen)
+}
+
+/// [`selector_for`]'s choice of the option the route uses, and its refusal of the others.
+fn selector_named(
     programmer: Programmer,
     probe: Option<&str>,
     volume: Option<&str>,
@@ -1170,7 +1241,8 @@ pub fn prepare_image(
         None => (crate::artifact::read(path)?, None),
     };
     check_base(&artifact, placement)?;
-    check_rp2350_stamp(&artifact.bytes, row.aot_target)?;
+    let chip = catalog::load_board(row.board).map(|board| board.family);
+    check_rp2350_stamp(&artifact.bytes, chip.as_deref())?;
     let window = match (window, external) {
         (Some(half), Some(flash)) => Some(window_half(row.board, half, flash)?),
         _ => None,
@@ -1365,16 +1437,16 @@ fn open_sam_route(
             let (vid, pid) = programmer
                 .usb_identity()
                 .ok_or_else(|| "this mechanism has no probe to open".to_owned())?;
-            let serial =
-                lamella_probe::resolve_serial(vid, pid, probe).map_err(|why| format!("{why}"))?;
+            let serial = lamella_probe::resolve_serial(vid, pid, probe)
+                .map_err(|why| nothing_written(format!("{why}")))?;
             let session = lamella_probe::open(&lamella_probe::Selector::by_serial(&serial))
-                .map_err(|why| format!("{why}"))?;
+                .map_err(|why| nothing_written(format!("{why}")))?;
             (session, "the board's EDBG")
         }
         Programmer::SamExternalProbe { .. } => {
             let selector = lamella_probe::Selector::named_or_environment(probe);
             let session = lamella_probe::open(&selector)
-                .map_err(|why| describe_probe_choice(&why, &selector, probe, programmer))?;
+                .map_err(|why| nothing_written(describe_probe_choice(&why, &selector, probe, programmer)))?;
             (session, "the attached probe")
         }
         _ => {
@@ -1429,7 +1501,7 @@ fn write_with(
             return crate::backends::write_rp2350(
                 |clock_hz, say| {
                     let session = lamella_probe::open(&selector).map_err(|why| {
-                        Rp2350Failure::Other(describe_probe_choice(&why, &selector, probe, programmer))
+                        Rp2350Failure::Unopened(describe_probe_choice(&why, &selector, probe, programmer))
                     })?;
                     let mut dap = lamella_probe_core::ArmDap::new(session.into_dap());
                     let idcode = lamella_cmsis_dap_rp2350::connect(&mut dap).map_err(|why| {
@@ -1476,7 +1548,7 @@ fn write_with(
                     return write_through_stlink(
                         || {
                             lamella_stlink::StLink::open(product_id, Some(serial))
-                                .map_err(describe_stlink_choice)
+                                .map_err(|why| nothing_written(describe_stlink_choice(why)))
                         },
                         family,
                         &image,
@@ -1487,7 +1559,7 @@ fn write_with(
                 }
             }
             let session = lamella_probe::open(&selector)
-                .map_err(|why| describe_probe_choice(&why, &selector, probe, programmer))?;
+                .map_err(|why| nothing_written(describe_probe_choice(&why, &selector, probe, programmer)))?;
             let mut dap = lamella_probe_core::ArmDap::new(session.into_dap());
             if family.plan().attach_under_reset {
                 attach_under_reset(&mut dap, family.plan().low_power_debug).map_err(|why| {
@@ -1549,7 +1621,7 @@ fn write_with(
         Programmer::Rp2040Probe { base } => {
             let selector = lamella_probe::Selector::named_or_environment(probe);
             let session = lamella_probe::open(&selector)
-                .map_err(|why| describe_probe_choice(&why, &selector, probe, programmer))?;
+                .map_err(|why| nothing_written(describe_probe_choice(&why, &selector, probe, programmer)))?;
             let mut dap = lamella_probe_core::ArmDap::new(session.into_dap());
             let idcode = lamella_cmsis_dap_rp2040::connect(&mut dap)
                 .map_err(|why| format!("connecting to the RP2040: {why}"))?;
@@ -1568,7 +1640,7 @@ fn write_with(
         }
         Programmer::StlinkOnboard { family, probe_id } => {
             return write_through_stlink(
-                || lamella_stlink::StLink::open(probe_id, probe).map_err(describe_stlink_choice),
+                || lamella_stlink::StLink::open(probe_id, probe).map_err(|why| nothing_written(describe_stlink_choice(why))),
                 family,
                 &image,
                 allow,
@@ -1581,9 +1653,10 @@ fn write_with(
     let (vid, pid) = programmer
         .usb_identity()
         .ok_or_else(|| "this mechanism has no probe to open".to_owned())?;
-    let serial = lamella_probe::resolve_serial(vid, pid, probe).map_err(|why| format!("{why}"))?;
+    let serial =
+        lamella_probe::resolve_serial(vid, pid, probe).map_err(|why| nothing_written(format!("{why}")))?;
     let session = lamella_probe::open(&lamella_probe::Selector::by_serial(&serial))
-        .map_err(|why| format!("{why}"))?;
+        .map_err(|why| nothing_written(format!("{why}")))?;
     let target = lamella_probe_core::ArmDap::new(session.into_dap());
     let mut backend = crate::backends::MicrobitDaplink::new(target, idcode, what);
 
@@ -1666,7 +1739,7 @@ pub fn write_set(
         ));
     };
     let stlink = attach_stlink(
-        || lamella_stlink::StLink::open(probe_id, probe).map_err(describe_stlink_choice),
+        || lamella_stlink::StLink::open(probe_id, probe).map_err(|why| nothing_written(describe_stlink_choice(why))),
         family,
         "the board's ST-LINK",
     )?;
@@ -1973,6 +2046,12 @@ Name one with --probe <serial>, or set LAMELLA_PROBE_SERIAL.
     }
 }
 
+/// `refusal`, a route's refusal before anything was written, saying so, as every hardware refusal
+/// does: a probe that could not be chosen or opened.
+pub(crate) fn nothing_written(refusal: String) -> String {
+    format!("{refusal}\n\nNothing was written.")
+}
+
 /// A probe-selection failure, worded for the person holding the board.
 ///
 /// The interesting case is the refusal: several probes are attached, the route has no way to tell
@@ -2022,8 +2101,9 @@ Name one with --probe <serial>, or set LAMELLA_PROBE_SERIAL.
             message
         }
         lamella_probe::ProbeError::NotFound => {
+            let given_serial = named.map(|given| lamella_probe_core::selection::serial_named(given.trim()));
             let mut message = match selector.serial.as_deref() {
-                Some(serial) if named.is_some_and(|given| given.trim() == serial) => {
+                Some(serial) if given_serial.is_some_and(|given| given.eq_ignore_ascii_case(serial)) => {
                     format!("no attached probe has the serial `{serial}`, which --probe named.
 ")
                 }
@@ -2405,6 +2485,24 @@ mod tests {
         );
         assert!(text.contains("STALEEXPORT0000"), "names the serial: {text}");
         assert!(text.contains("LAMELLA_PROBE_SERIAL"), "names where it came from: {text}");
+    }
+
+    /// **A PROBE NAMED BY ITS ID, `probe:<serial>`, IS REFUSED AS THE `--probe` THAT NAMED IT**, in
+    /// either case: the id is what a device list prints, and a refusal that blamed
+    /// `LAMELLA_PROBE_SERIAL` sent the reader to correct a variable nobody set.
+    #[test]
+    fn a_probe_named_by_its_id_that_nothing_carries_is_refused_as_the_options() {
+        for named in ["probe:NOSUCHPROBE0000", "PROBE:nosuchprobe0000"] {
+            let text = describe_probe_choice(
+                &lamella_probe::ProbeError::NotFound,
+                &lamella_probe::Selector::named_or_environment(Some(named)),
+                Some(named),
+                Programmer::StExternalProbe { family: StFamily::H7 },
+            );
+            assert!(text.to_ascii_lowercase().contains("nosuchprobe0000"), "names the serial: {text}");
+            assert!(text.contains("which --probe named"), "{named}: names where it came from: {text}");
+            assert!(!text.contains("LAMELLA_PROBE_SERIAL"), "{named}: the environment named nothing: {text}");
+        }
     }
 
     /// A Pico's probe route that found nothing still points at the bootloader volume, which a Pico
@@ -2826,6 +2924,27 @@ mod tests {
         assert!(error.contains("--volume <name>"), "and it names the option that IS right: {error}");
     }
 
+    /// **A NAME GIVEN EMPTY IS REFUSED BY THE OPTION THAT TOOK IT, NOT READ AS NO NAME.** Read as no
+    /// name, an empty serial falls through to `LAMELLA_PROBE_SERIAL` and then to the one probe
+    /// attached ([`lamella_probe::Selector::named_or`]), so `--probe "$SERIAL"` with the variable
+    /// unset wrote whatever board was attached.
+    #[test]
+    fn a_name_given_empty_is_refused_by_the_option_that_took_it() {
+        let volume = Programmer::Uf2Volume { family: RP2350_UF2_FAMILY, base: RP2_XIP_BASE };
+        let probe = Programmer::Rp2350Probe { base: RP2_XIP_BASE };
+        let dfu = Programmer::StDfu { family: StFamily::H7 };
+        for empty in ["", "  "] {
+            let error = selector_for(probe, Some(empty), None, None).expect_err("an empty probe");
+            assert!(error.starts_with("--probe was given no serial number."), "{error}");
+            let error = selector_for(volume, None, Some(empty), None).expect_err("an empty drive");
+            assert!(error.starts_with("--volume was given no drive."), "{error}");
+            let error = selector_for(dfu, None, None, Some(empty)).expect_err("an empty bootloader");
+            assert!(error.starts_with("--dfu was given no serial number."), "{error}");
+        }
+        let error = selector_for(probe, Some("probe:"), None, None).expect_err("a probe's id with no serial");
+        assert!(error.starts_with("--probe was given no serial number."), "{error}");
+    }
+
     #[test]
     fn a_board_keeps_its_volume_route_unless_a_probe_is_asked_for() {
         let pico = PROGRAMMING
@@ -2968,6 +3087,101 @@ mod tests {
         }
     }
 
+    /// The Pimoroni Pico LiPo 2 and Pico LiPo 2 XL W and the two Adafruit Feather RP2350s, with
+    /// and without PSRAM.
+    const LIPO_2_AND_FEATHER_RP2350_BOARDS: [&str; 4] = [
+        "pimoroni-pico-lipo-2",
+        "pimoroni-pico-lipo-2-xl-w",
+        "adafruit-feather-rp2350-hstx",
+        "adafruit-feather-rp2350-hstx-psram",
+    ];
+
+    /// The two Pimoroni Pico LiPo 2s and the two Adafruit Feather RP2350s take the Pico 2's two
+    /// routes: the bootloader drive by default, which checks the RP2350 family, and by `--via probe`
+    /// the route that reads every byte back.
+    ///
+    /// Each carries the Pico 2's die, the two Pimoroni boards in its QFN-80 package and the two
+    /// Feathers in its QFN-60, so the bootrom, the memory map and the boot block are the Pico 2's,
+    /// and so is every fact a route states.
+    #[test]
+    fn the_pico_lipo_2s_and_the_feather_rp2350s_take_the_pico_2s_two_routes() {
+        for board in LIPO_2_AND_FEATHER_RP2350_BOARDS {
+            let row = programmer_for(board).unwrap_or_else(|refusal| panic!("{board}: {refusal}"));
+            assert_eq!(
+                route_for(row, None),
+                Ok(Programmer::Uf2Volume {
+                    family: RP2350_UF2_FAMILY,
+                    base: RP2_XIP_BASE
+                }),
+                "{board}: the bootloader drive, which needs no probe"
+            );
+            assert_eq!(
+                route_for(row, Some("probe")),
+                Ok(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+                "{board}: the probe route, which reads every byte back"
+            );
+            assert_eq!(uf2_family_for_board(board), Some(RP2350_UF2_FAMILY), "{board}");
+            assert_eq!(
+                aot_target_for(board),
+                Err(NoAotTarget::WritableButNotBuildable),
+                "{board}: written, and not built for until it has an archive of its own"
+            );
+        }
+    }
+
+    /// An image that carries no PICOBIN block is refused for each of these boards on both routes,
+    /// as for a Pico 2: the guard asks the chip the image boots on, whatever the board's
+    /// ahead-of-time target.
+    #[test]
+    fn an_unstamped_image_is_refused_for_each_pico_lipo_2_and_feather_rp2350() {
+        let plain = linked_elf(&[(RP2_XIP_BASE, &[0u8; 700])]);
+        let unstamped = image_file("lipo-feather-stamp", "plain.elf", &plain);
+        for board in LIPO_2_AND_FEATHER_RP2350_BOARDS {
+            let row = programmer_for(board).unwrap_or_else(|refusal| panic!("{board}: {refusal}"));
+            for via in [None, Some("probe")] {
+                let route = route_for(row, via).expect("a route");
+                let error = prepare_image(&unstamped, row, route, &placed(row, route))
+                    .expect_err("an unstamped RP2350 image");
+                assert!(
+                    error.contains("PICOBIN"),
+                    "{board} {via:?}: it names what is missing: {error}"
+                );
+            }
+        }
+    }
+
+    /// Each of the four boards bounds an image by its own flash: 16 MB on the two Pimoroni boards
+    /// and 8 MB on the two Feathers. An ELF that runs past the Pico 2's 4 MB fits each of them, and
+    /// one that runs past a board's own flash is refused on both routes, naming what the board
+    /// holds.
+    #[test]
+    fn each_pico_lipo_2_and_feather_rp2350_image_is_bounded_by_its_own_flash() {
+        let code = stamped(700);
+        let data = [0xAA_u8; 16];
+        let past_4mb = linked_elf(&[(RP2_XIP_BASE, &code), (RP2_XIP_BASE + 0x40_0000, &data)]);
+        let fits = image_file("lipo-feather-fit", "fits.elf", &past_4mb);
+        let flashes = [0x100_0000_u32, 0x100_0000, 0x80_0000, 0x80_0000];
+        for (board, flash) in LIPO_2_AND_FEATHER_RP2350_BOARDS.into_iter().zip(flashes) {
+            let past_flash = linked_elf(&[(RP2_XIP_BASE, &code), (RP2_XIP_BASE + flash, &data)]);
+            let over = image_file("lipo-feather-fit", &format!("over-{board}.elf"), &past_flash);
+            let row = programmer_for(board).unwrap_or_else(|refusal| panic!("{board}: {refusal}"));
+            for via in [None, Some("probe")] {
+                let route = route_for(row, via).expect("a route");
+                prepare_image(&fits, row, route, &placed(row, route))
+                    .unwrap_or_else(|why| panic!("{board} {via:?}: past 4 MB fits {flash} B: {why}"));
+                let error = prepare_image(&over, row, route, &placed(row, route))
+                    .expect_err("larger than the flash");
+                let end = format!("{:#010x}", RP2_XIP_BASE + flash + 0x10);
+                assert!(error.contains(&end), "{board} {via:?}: where it ends, {end}: {error}");
+                assert!(
+                    error.contains(&format!("{flash} B of flash")),
+                    "{board} {via:?}: what the board holds: {error}"
+                );
+                assert!(error.contains("-- 16 B too many"), "{board} {via:?}: by how much: {error}");
+            }
+        }
+    }
+
     #[test]
     fn an_unknown_route_explains_the_two_that_exist() {
         let row = PROGRAMMING
@@ -3073,21 +3287,41 @@ mod tests {
     #[test]
     fn the_stamp_guard_does_not_fire_on_other_parts() {
         let plain = vec![0u8; 512];
-        for target in ["microbit", "nrf52833", "rp2040"] {
+        for chip in ["nrf51", "nrf52833", "rp2040", "stm32u5a5"] {
             assert!(
-                check_rp2350_stamp(&plain, Some(target)).is_ok(),
-                "{target} has no PICOBIN block and does not need one"
+                check_rp2350_stamp(&plain, Some(chip)).is_ok(),
+                "{chip} has no PICOBIN block and does not need one"
             );
         }
     }
 
     #[test]
-    fn the_stamp_guard_does_not_fire_on_a_board_that_names_no_target() {
+    fn the_stamp_guard_does_not_fire_on_a_board_that_names_no_chip() {
         let plain = vec![0u8; 512];
         assert!(
             check_rp2350_stamp(&plain, None).is_ok(),
-            "a board with no ahead-of-time target is not an RP2350"
+            "a board whose facts name no chip is not an RP2350"
         );
+    }
+
+    /// The guard asks the board's chip, so every RP2350 row's board answers `rp2350`, whether or
+    /// not this build compiles for it, and no other row's board does.
+    #[test]
+    fn the_stamp_guard_reads_the_chip_of_every_rp2350_row() {
+        for row in PROGRAMMING {
+            let chip = catalog::load_board(row.board).map(|board| board.family);
+            let rp2350_route = matches!(
+                row.programmer,
+                Programmer::Uf2Volume { family: RP2350_UF2_FAMILY, .. }
+                    | Programmer::Rp2350Probe { .. }
+            );
+            assert_eq!(
+                chip.as_deref() == Some("rp2350"),
+                rp2350_route,
+                "{}: {chip:?}",
+                row.board
+            );
+        }
     }
 
     #[test]

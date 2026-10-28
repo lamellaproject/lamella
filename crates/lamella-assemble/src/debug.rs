@@ -52,7 +52,10 @@ impl LineMap {
     /// The 1-based line and column of `offset` in `source`.
     #[must_use]
     pub fn position(&self, source: &str, offset: u32) -> (u32, u32) {
-        let offset = offset.min(source.len() as u32);
+        let mut offset = offset.min(source.len() as u32);
+        while !source.is_char_boundary(offset as usize) {
+            offset -= 1;
+        }
         let line_index = match self.line_starts.binary_search(&offset) {
             Ok(index) => index,
             Err(index) => index - 1,
@@ -115,6 +118,15 @@ mod tests {
         let map = LineMap::new(source);
         let b = source.find('b').unwrap() as u32;
         assert_eq!(map.position(source, b), (1, 11));
+    }
+
+    #[test]
+    fn an_offset_inside_a_character_maps_to_that_characters_column() {
+        let source = "(int \u{e9};";
+        let map = LineMap::new(source);
+        let e = source.find('\u{e9}').unwrap() as u32;
+        assert_eq!(map.position(source, e + 1), (1, 6));
+        assert_eq!(map.position(source, e + 2), (1, 7));
     }
 
     #[test]

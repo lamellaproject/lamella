@@ -2,13 +2,13 @@
 # PARTIAL: per-pin fields are stated for the pins the boards claim and grow as more do. Offsets are
 # instance-base-relative; port instance bases live in ../instances.toml.
 #
-# THE BLOCK IS FOUR 32-BIT REGISTERS AND EACH PACKS TWO 16-BIT HALVES, one bit per pin in each half.
+# The block is four 32-bit registers and each packs two 16-bit halves, one bit per pin in each half.
 # A port's direction and its output data therefore live in ONE register: PCNTR1 holds the direction
 # bits in [15:0] and the output data bits in [31:16], so pin n's direction is bit n and its output
 # level is bit n + 16 of the same word.
 #
-# EACH HALF ALSO HAS A 16-BIT NAME AND AN ADDRESS OF ITS OWN, AND THE TWO ARE ORDERED THE
-# OPPOSITE WAY ROUND FROM WHAT THE BIT POSITIONS PREDICT. This is the sharpest trap the block holds.
+# Each half also has a 16-bit name and an address of its own, and the two are ordered the
+# opposite way round from what the bit positions predict. This is the sharpest trap the block holds.
 # In all four registers the manual places the HIGH half [31:16] at the register's own address and
 # the LOW half [15:0] two bytes above it:
 #
@@ -28,14 +28,14 @@
 # stating them would mean choosing between the manual's address list and the arithmetic, and a
 # 32-bit access needs neither.
 #
-# TWO OF THESE REGISTERS DO NOT EXIST ON EVERY PORT, and one of the absences lands on a port this
+# Two of these registers do not exist on every port, and one of the absences lands on a port this
 # family already places. PCNTR4 is listed for PORT1 through PORT4 only, so PORT0 has no PCNTR4 at
 # all; the EIDR half of PCNTR2 is listed for the same four ports, while its PIDR half is listed for
 # every port. Those are the event-link registers, and a port outside that range has no event input
 # or output to carry. An offset here is the block's layout and not a promise that every instance
 # carries the register.
 #
-# A PIN NEEDS NO CLOCK GATE OPENED BEFORE ANY OF THIS. The I/O ports are absent from the list of
+# A pin needs no clock gate opened before any of this. The I/O ports are absent from the list of
 # modules the module-stop function can stop, so a port answers out of reset -- which is the opposite
 # of the usual opening move and is stated on the instance map beside the module-stop reading itself.
 

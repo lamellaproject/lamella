@@ -1,0 +1,140 @@
+<!--
+  The board a project names, checked before anything is restored or built. LamellaTargetBoard must be a board this
+  SDK knows, and the project's target framework one that supports it: lamella1.0 supports the boards Lamella knows,
+  and net11.0 the boards Lamella RHU supports. A board that is not recognized is reported with the boards nearest to
+  it, as a misspelled name usually is; a board the target framework does not support is reported with the target
+  framework that does. A project that names no board is not checked: building needs no board.
+
+  The two lists come with this SDK. Lamella.Boards.props holds the boards the lamella tool knows, as that tool wrote
+  them, and Lamella.RhuBoards.props the boards Lamella RHU supports, which Sdk.targets reads at its top, since a
+  net11.0 build reads them before restore. In a project that targets several frameworks, each framework's build is
+  checked on its own.
+-->
+<Project>
+
+  <Import Project="$(_LamellaBoardsFile)" Condition="'$(_LamellaBoardsFile)' != '' and Exists('$(_LamellaBoardsFile)')" />
+
+  <!-- Whether Board is one of the two lists' boards, and, if so, whether TargetFramework supports it.
+       Problem is the sentence that says what is wrong, or empty. Board ids are compared exactly, as
+       the lamella tool compares them; the nearest boards are found without regard to case. -->
+  <UsingTask TaskName="LamellaCheckBoard" TaskFactory="RoslynCodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <Board ParameterType="System.String" Required="true" />
+      <TargetFramework ParameterType="System.String" Required="true" />
+      <LamellaBoards ParameterType="Microsoft.Build.Framework.ITaskItem[]" />
+      <RhuBoards ParameterType="Microsoft.Build.Framework.ITaskItem[]" />
+      <Problem ParameterType="System.String" Output="true" />
+      <ProblemCode ParameterType="System.String" Output="true" />
+    </ParameterGroup>
+    <Task>
+      <Code Type="Class" Language="cs"><![CDATA[
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Microsoft.Build.Framework;
+using Microsoft.Build.Utilities;
+
+public sealed class LamellaCheckBoard : Task
+{
+    [Required] public string Board { get; set; }
+    [Required] public string TargetFramework { get; set; }
+    public ITaskItem[] LamellaBoards { get; set; }
+    public ITaskItem[] RhuBoards { get; set; }
+    [Output] public string Problem { get; set; }
+    [Output] public string ProblemCode { get; set; }
+
+    public override bool Execute()
+    {
+        List<string> lamella = Ids(LamellaBoards), rhu = Ids(RhuBoards);
+        bool onLamella = lamella.Contains(Board), onRhu = rhu.Contains(Board);
+        if (!onLamella && !onRhu)
+        {
+            List<string> near = Nearest(Board, lamella.Union(rhu));
+            ProblemCode = "LAMSDK0006";
+            Problem = "The LamellaTargetBoard value '" + Board + "' was not recognized. It may be misspelled"
+                + (near.Count == 0 ? "." : ": did you mean " + Join(near, "or") + "?");
+            return true;
+        }
+        bool isLamella = Is(TargetFramework, "lamella1.0"), isRhu = Is(TargetFramework, "net11.0");
+        if ((isLamella && onLamella) || (isRhu && onRhu))
+        {
+            return true;
+        }
+        List<string> others = new List<string>();
+        if (onLamella && !isLamella) others.Add("lamella1.0 (Lamella)");
+        if (onRhu && !isRhu) others.Add("net11.0 (Lamella RHU)");
+        string named = isLamella ? "lamella1.0 (Lamella)" : isRhu ? "net11.0 (Lamella RHU)" : TargetFramework;
+        ProblemCode = "LAMSDK0007";
+        Problem = "The board '" + Board + "' is not supported by " + named + "."
+            + (others.Count == 0 ? "" : " It is supported by " + Join(others, "and") + ".");
+        return true;
+    }
+
+    static List<string> Ids(ITaskItem[] items)
+    {
+        return (items ?? new ITaskItem[0]).Select(item => item.ItemSpec).ToList();
+    }
+
+    static bool Is(string framework, string name)
+    {
+        return string.Equals(framework, name, StringComparison.OrdinalIgnoreCase);
+    }
+
+    // The three boards nearest to a name that was not recognized: those a few edits away, and those
+    // whose id contains it, nearest first.
+    static List<string> Nearest(string typed, IEnumerable<string> ids)
+    {
+        string name = typed.ToLowerInvariant();
+        int limit = Math.Max(2, name.Length / 3);
+        return ids
+            .Select(id => new { Id = id, Edits = Edits(name, id.ToLowerInvariant()), Holds = name.Length >= 3 && id.ToLowerInvariant().Contains(name) })
+            .Where(candidate => candidate.Edits <= limit || candidate.Holds)
+            .OrderBy(candidate => candidate.Edits).ThenBy(candidate => candidate.Id, StringComparer.Ordinal)
+            .Take(3)
+            .Select(candidate => candidate.Id)
+            .ToList();
+    }
+
+    // The fewest single-character insertions, deletions and substitutions that turn a into b.
+    static int Edits(string a, string b)
+    {
+        int[] previous = new int[b.Length + 1], current = new int[b.Length + 1];
+        for (int j = 0; j <= b.Length; j++) previous[j] = j;
+        for (int i = 1; i <= a.Length; i++)
+        {
+            current[0] = i;
+            for (int j = 1; j <= b.Length; j++)
+            {
+                int substitute = previous[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1);
+                current[j] = Math.Min(substitute, Math.Min(previous[j] + 1, current[j - 1] + 1));
+            }
+            int[] swap = previous; previous = current; current = swap;
+        }
+        return previous[b.Length];
+    }
+
+    static string Join(List<string> words, string last)
+    {
+        return words.Count == 1 ? words[0]
+            : string.Join(", ", words.Take(words.Count - 1)) + " " + last + " " + words[words.Count - 1];
+    }
+}
+]]></Code>
+    </Task>
+  </UsingTask>
+
+  <!-- Before restore, which would otherwise look for packages of a board that does not exist, and
+       before every build, which a restore may have skipped, and every publish: a publish of an
+       ahead-of-time program compiles without building, and BuildOnlySettings begins it as it begins a
+       build. -->
+  <Target Name="_LamellaCheckBoard"
+          BeforeTargets="CollectPackageReferences;_CheckForInvalidConfigurationAndPlatform;BuildOnlySettings"
+          Condition="'$(LamellaTargetBoard)' != '' and '$(TargetFramework)' != '' and '$(_LamellaBoardsFile)' != '' and Exists('$(_LamellaBoardsFile)')">
+    <LamellaCheckBoard Board="$(LamellaTargetBoard)" TargetFramework="$(TargetFramework)" LamellaBoards="@(LamellaBoard)" RhuBoards="@(LamellaRhuBoard)">
+      <Output TaskParameter="Problem" PropertyName="_LamellaBoardProblem" />
+      <Output TaskParameter="ProblemCode" PropertyName="_LamellaBoardProblemCode" />
+    </LamellaCheckBoard>
+    <Error Condition="'$(_LamellaBoardProblem)' != ''" File="$(MSBuildProjectFullPath)" Code="$(_LamellaBoardProblemCode)" Text="$(_LamellaBoardProblem)" />
+  </Target>
+
+</Project>

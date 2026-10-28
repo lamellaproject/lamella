@@ -5,7 +5,7 @@
 // instance bases live in Rp2040Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Rp2040PadsBank0Layout
+    internal sealed class Rp2040PadsBank0Layout
     {
         private Rp2040PadsBank0Layout() { }
 

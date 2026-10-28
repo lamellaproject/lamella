@@ -1,10 +1,10 @@
 # PIN map for the SAM4L family: pin x function -> (instance, signal), or -> nothing. It lists
 # only the cells a binding uses.
 #
-# IT HAS NO ROWS: the only pins this family's boards place are an LED and a user button, and a
+# It has no rows: the only pins this family's boards place are an LED and a user button, and a
 # control pin rides no alternate function, so neither needs a cell here.
 #
-# WHEN ROWS ARRIVE THEY WILL NOT LOOK LIKE THE OTHER SAM4 FAMILIES'. Those select a peripheral
+# When rows arrive they will not look like the other SAM4 families'. Those select a peripheral
 # through a PIO controller's ABCD selection registers; this series muxes through the GPIO
 # controller's own peripheral-mux registers, and its function columns are the datasheet's
 # A through H rather than a PIO's four. The mux is also where its low-power design shows: a pin

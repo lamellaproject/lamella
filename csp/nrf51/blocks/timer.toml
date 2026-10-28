@@ -3,13 +3,11 @@
 # into a monotonic clock with no interrupt.
 #
 # Transcribed from the nRF51 Series Reference Manual v3.0 (Nordic Semiconductor, 2014-10-20),
-# chapter 18, Tables 140-148, with the document open, and the nRF51822 Product Specification v3.4,
-# Table 12, for what each instance supports.
+# chapter 18, Tables 140-148, and the nRF51822 Product Specification v3.4, Table 12, for what each
+# instance supports.
 #
-# Every bit position below was placed from the printed table's column coordinates: each field
-# letter was assigned to the bit column it is printed over, and INTENSET and INTENCLR were required
-# to agree. Two of these tables print their field letters away from the low bits their order
-# suggests: the interrupt bits are 16 to 19, and the shortcut-to-STOP bits are 8 to 11.
+# Two of these tables print their field letters away from the low bits their order suggests: the
+# interrupt bits are 16 to 19, and the shortcut-to-STOP bits are 8 to 11.
 
 [table]
 kind = "block"

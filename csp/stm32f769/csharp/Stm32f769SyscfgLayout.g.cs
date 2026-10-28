@@ -5,7 +5,7 @@
 // instance bases live in Stm32f769Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Stm32f769SyscfgLayout
+    internal sealed class Stm32f769SyscfgLayout
     {
         private Stm32f769SyscfgLayout() { }
 

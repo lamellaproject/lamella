@@ -255,7 +255,9 @@ fn lower_module_inner(
     for func in &program {
         for (result, inst) in func.blocks.iter().flat_map(|b| &b.insts) {
             match inst {
-                Inst::FuncAddr { .. } | Inst::VirtualFuncAddr { .. } => needs_table = true,
+                Inst::FuncAddr { .. }
+                | Inst::VirtualFuncAddr { .. }
+                | Inst::InterfaceFuncAddr { .. } => needs_table = true,
                 Inst::CallVirtual {
                     args, returns_value, ..
                 }
@@ -2357,6 +2359,11 @@ fn lower_inst(
             body.i32_load(MemArg::new(4, 0));
             body.local_set(local(result));
         }
+        Inst::InterfaceFuncAddr { object, tag } => {
+            let found = emit_interface_target(body, local(*object), *tag);
+            body.local_get(found);
+            body.local_set(local(result));
+        }
         Inst::CallVirtual {
             slot,
             args,
@@ -2438,53 +2445,10 @@ fn lower_inst(
             let result_ty = call_result_ty(*returns_value, result, value_types);
             let sig = call_site_type(args, result_ty, value_types)?;
             let type_index = ctx.indirect_type(&sig)?;
-            let desc = body.add_local(ValType::I32);
-            let ptr = body.add_local(ValType::I32);
-            let count = body.add_local(ValType::I32);
-            let found = body.add_local(ValType::I32);
             for &arg in args.iter() {
                 body.local_get(local(arg));
             }
-            body.local_get(local(receiver));
-            body.i32_const(4);
-            body.i32_sub();
-            body.i32_load(MemArg::new(4, 0));
-            body.local_set(desc);
-            emit_itable_base(body, desc);
-            body.local_set(ptr);
-            body.local_get(ptr);
-            body.i32_load(MemArg::new(4, 0));
-            body.local_set(count);
-            body.local_get(ptr);
-            body.i32_const(4);
-            body.i32_add();
-            body.local_set(ptr);
-            body.loop_(BlockType::Empty);
-            body.local_get(count);
-            body.i32_eqz();
-            body.if_(BlockType::Empty);
-            body.unreachable();
-            body.end();
-            body.local_get(ptr);
-            body.i32_load(MemArg::new(4, 0));
-            body.i32_const(*tag as i32);
-            body.i32_eq();
-            body.if_(BlockType::Empty);
-            body.local_get(ptr);
-            body.i32_load(MemArg::new(4, 4));
-            body.local_set(found);
-            body.else_();
-            body.local_get(ptr);
-            body.i32_const(8);
-            body.i32_add();
-            body.local_set(ptr);
-            body.local_get(count);
-            body.i32_const(1);
-            body.i32_sub();
-            body.local_set(count);
-            body.br(1);
-            body.end();
-            body.end();
+            let found = emit_interface_target(body, local(receiver), *tag);
             body.local_get(found);
             body.call_indirect(type_index, 0);
             if *returns_value {
@@ -2873,6 +2837,58 @@ fn emit_class_word_guarded(body: &mut Func, descriptor: u32, offset: u32) {
     body.end();
 }
 
+/// Searches the itable of the object in local `receiver` for `tag` and returns the local that then
+/// holds the implementation's table index; a missing entry is `unreachable`. ONE lookup for both
+/// readers -- [`Inst::CallInterface`] calls the index and [`Inst::InterfaceFuncAddr`] hands it to a
+/// delegate -- so the two cannot disagree about which implementation a receiver has.
+fn emit_interface_target(body: &mut Func, receiver: u32, tag: u32) -> u32 {
+    let desc = body.add_local(ValType::I32);
+    let ptr = body.add_local(ValType::I32);
+    let count = body.add_local(ValType::I32);
+    let found = body.add_local(ValType::I32);
+    body.local_get(receiver);
+    body.i32_const(4);
+    body.i32_sub();
+    body.i32_load(MemArg::new(4, 0));
+    body.local_set(desc);
+    emit_itable_base(body, desc);
+    body.local_set(ptr);
+    body.local_get(ptr);
+    body.i32_load(MemArg::new(4, 0));
+    body.local_set(count);
+    body.local_get(ptr);
+    body.i32_const(4);
+    body.i32_add();
+    body.local_set(ptr);
+    body.loop_(BlockType::Empty);
+    body.local_get(count);
+    body.i32_eqz();
+    body.if_(BlockType::Empty);
+    body.unreachable();
+    body.end();
+    body.local_get(ptr);
+    body.i32_load(MemArg::new(4, 0));
+    body.i32_const(tag as i32);
+    body.i32_eq();
+    body.if_(BlockType::Empty);
+    body.local_get(ptr);
+    body.i32_load(MemArg::new(4, 4));
+    body.local_set(found);
+    body.else_();
+    body.local_get(ptr);
+    body.i32_const(8);
+    body.i32_add();
+    body.local_set(ptr);
+    body.local_get(count);
+    body.i32_const(1);
+    body.i32_sub();
+    body.local_set(count);
+    body.br(1);
+    body.end();
+    body.end();
+    found
+}
+
 /// Pushes the ADDRESS of a descriptor's itable COUNT word, for EITHER shape.
 ///
 /// The two shapes keep their itable in the same relative place -- immediately past their header
@@ -3206,6 +3222,8 @@ fn emit_convert(body: &mut Func, kind: ConvKind) -> Result<(), LowerError> {
         ConvKind::Float32ToInt => body.i32_trunc_sat_f32_s(),
         ConvKind::IntToFloat32 => body.f32_convert_i32_s(),
         ConvKind::Float64ToInt => body.i32_trunc_sat_f64_s(),
+        ConvKind::Float32ToUInt => body.i32_trunc_sat_f32_u(),
+        ConvKind::Float64ToUInt => body.i32_trunc_sat_f64_u(),
         ConvKind::Float32ToLong => body.i64_trunc_sat_f32_s(),
         ConvKind::Float64ToLong => body.i64_trunc_sat_f64_s(),
         ConvKind::Float32ToULong => body.i64_trunc_sat_f32_u(),

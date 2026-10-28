@@ -4,7 +4,7 @@
 // deliberately mechanical -- every value is read from `Bme280Part` and none is restated here, which
 // is what lets a generator produce this for any part without the two drifting apart.
 //
-// ONE CLASS OF FACT IS EXEMPT FROM THAT CLAIM AND THE EXEMPTION IS FORCED. A behavioural fact is
+// One class of fact is exempt from that claim and the exemption is forced. A behavioural fact is
 // emitted as `StaticString` -- `BUS_SPI_REGISTER_READ_TRANSFORM` is `"set-bit7"` -- and a
 // `StaticString` is not comparable in Embedded Swift, so `Bme280Part.BUS_SPI_REGISTER_READ_TRANSFORM
 // == "set-bit7"` does not compile. `overSpi` below therefore NAMES `.setBit7` rather than reading

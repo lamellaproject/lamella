@@ -6,7 +6,7 @@
 // extension binds to any host that offers a socket of this standard.
 namespace Lamella.Generated
 {
-    public sealed class Atio1XproExtension
+    internal sealed class Atio1XproExtension
     {
         private Atio1XproExtension() { }
         public const string EXTENSION = "atio1-xpro";

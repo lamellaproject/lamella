@@ -3,20 +3,20 @@
 # and chip select), and two power groups. This file is the JOIN VOCABULARY between an add-on board
 # and whatever carries the socket, the way xplained-pro.toml is for that connector.
 #
-# THE NAMES ARE THE SOCKET'S, AND THE SOCKET IS THE HOST. The standard marks a socket and a board
+# The names are the socket's, and the socket is the host. The standard marks a socket and a board
 # differently on purpose: its UART markings are criss-crossed, so the position a socket prints TX is
 # the one an add-on board prints RX, because a receiver is matched to a transmitter. So `tx` below is
 # the line the HOST transmits on, and `miso` the line the host receives SPI data on, whatever an
 # add-on board's own silkscreen calls the same pin. A board file that copied its pin names off an
 # add-on board's silkscreen would join its transmit line to the host's.
 #
-# THE STANDARD NUMBERS NO PIN, SO `number` HERE IS ITS OWN LISTING ORDER. The pinout page draws the
+# The standard numbers no pin, so `number` here is its own listing order. The pinout page draws the
 # socket as two 1x8 headers and lists the left one top to bottom -- AN, RST, CS, SCK, MISO, MOSI,
 # +3.3V, GND -- then the right one top to bottom -- PWM, INT, RX, TX, SCL, SDA, +5V, GND. The numbers
 # 1 to 16 are that order, so each position can be found on the page. They are not printed on any
 # socket, and a document that numbers the pins some other way is not contradicting this file.
 #
-# A SOCKET IS NUMBERED WHEN A BOARD CARRIES MORE THAN ONE. The standard's silkscreen rules ask for a
+# A socket is numbered when a board carries more than one. The standard's silkscreen rules ask for a
 # socket number only then, and number sockets from 1. That number names a socket on its board; it is
 # the board's fact, not a position here.
 

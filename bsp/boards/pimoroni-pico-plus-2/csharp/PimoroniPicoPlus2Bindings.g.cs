@@ -6,7 +6,7 @@
 // lines, and the carrier identity. The board's facts are stated in board.toml.
 namespace Lamella.Generated
 {
-    public sealed class PimoroniPicoPlus2Bindings
+    internal sealed class PimoroniPicoPlus2Bindings
     {
         private PimoroniPicoPlus2Bindings() { }
 

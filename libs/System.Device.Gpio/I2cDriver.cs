@@ -28,11 +28,32 @@ namespace Lamella.Hardware
 
         /// <summary>Claims the bus's pins and runs the chip's initialization sequence at
         /// <paramref name="busHz"/>. A rate outside the chip's envelope is rejected loudly.
-        /// The bus rate is bus-level state, configured ONCE (the official device settings carry
-        /// no frequency): <see cref="Lamella.Hardware.Buses"/> does it at the rate a board bound,
-        /// before any device sees the driver, and a driver made outside the table is configured
-        /// by whoever made it.</summary>
+        /// The bus rate is bus-level state, configured once (the official device settings carry
+        /// no frequency): <see cref="Lamella.Hardware.Buses"/> does it before any device sees the
+        /// driver, at the rate the bus's first device asked for through
+        /// <c>Lamella.Hardware.TargetBoard</c>, or else at the rate a board bound. A driver made
+        /// outside the table is configured by whoever made it.</summary>
         public abstract void Configure(int busHz);
+
+        /// <summary>The rates in hertz <see cref="Configure"/> runs the bus at, slowest first: the
+        /// rates this driver serves at its chip's clock. Null for a driver that sets no clock, whose
+        /// bus runs at its default rate whatever it is asked.</summary>
+        public virtual int[] Rates
+        {
+            get { return null; }
+        }
+
+        /// <summary>Whether <paramref name="busHz"/> is one of <see cref="Rates"/>.</summary>
+        public bool Serves(int busHz)
+        {
+            int[] rates = Rates;
+            if ((object)rates == null) return false;
+            for (int index = 0; index < rates.Length; index++)
+            {
+                if (rates[index] == busHz) return true;
+            }
+            return false;
+        }
 
         /// <summary>One write transaction: START, address+W, <paramref name="count"/> bytes
         /// of <paramref name="buffer"/>, STOP. A count of zero sends the address alone. Returns

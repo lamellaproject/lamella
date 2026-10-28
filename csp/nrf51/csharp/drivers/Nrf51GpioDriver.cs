@@ -12,7 +12,7 @@ using System.Device.Gpio;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Nrf51GpioDriver : GpioDriver
+internal sealed class Nrf51GpioDriver : GpioDriver
 {
     private readonly uint _reserved;
 

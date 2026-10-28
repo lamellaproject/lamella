@@ -2,10 +2,9 @@
 # lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
 # uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
-# EVERY VALUE BELOW WAS READ OFF THE SAM DA1'S OWN TABLE 14-1, AND THE RESULT IS THAT THEY ALL
-# AGREE WITH THE SAM D21'S. That agreement is a FINDING rather than a shortcut taken, and saying
-# so matters because the SAM D20 is out of the same lineage and its SERCOM generic-clock ids and
-# NVIC lines DISAGREE with the D21's while its bases agree.
+# Every value below comes from the SAM DA1's own table 14-1, and all of them agree with the SAM
+# D21's. That is not true of the whole lineage: the SAM D20's SERCOM generic-clock ids and NVIC
+# lines disagree with the D21's while its bases agree.
 #
 #     field           SAM DA1      SAM D20      SAM D21 / SAM R21
 #     SERCOM0 base    0x42000800   0x42000800   0x42000800

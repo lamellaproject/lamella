@@ -1,7 +1,7 @@
 # INSTANCE map for the STM32L053 (L0x3, category 3): where each block copy sits, plus its RCC
 # clock-enable routing. `-1` = the row gates nothing (the RCC itself).
 #
-# THE PORT SET IS CATEGORY 3's AND IT IS NOT CATEGORY 1's. RM0367 table 2 gives GPIOA, GPIOB and
+# The port set is category 3's and it is not category 1's. RM0367 table 2 gives GPIOA, GPIOB and
 # GPIOC full, GPIOD as [2] alone, and GPIOH as [0:1]. csp/stm32l0's category 1 set is GPIOA full,
 # GPIOB [0:9] and GPIOC [14:15] with no D or H at all. Neither map can be derived from the other.
 #

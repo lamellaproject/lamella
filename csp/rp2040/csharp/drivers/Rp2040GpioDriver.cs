@@ -3,7 +3,7 @@ using System.Device.Gpio;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Rp2040GpioDriver : GpioDriver
+internal sealed class Rp2040GpioDriver : GpioDriver
 {
     private readonly uint _resetsClr;
     private readonly uint _resetsDone;
@@ -26,7 +26,7 @@ public sealed class Rp2040GpioDriver : GpioDriver
     /// <summary>Reserves the pins whose bits are set, so <c>SetPinMode</c> refuses them. A board
     /// passes the lines it must keep -- its debug transport, a fixed peripheral's control pin --
     /// because only the board knows which those are.</summary>
-    /// <remarks>THE PICO W IS WHY THIS EXISTS ON THIS FAMILY. Its wireless part sits on GP23, GP24,
+    /// <remarks>The Pico W is why this exists on this family. Its wireless part sits on GP23, GP24,
     /// GP25 and GP29, and GP25 is the pin that drives the user LED on an RP2040 product carrying no
     /// radio. So the line that blinks a Pico asserts the radio's chip select on a Pico W, from
     /// identical source and with nothing to see.</remarks>

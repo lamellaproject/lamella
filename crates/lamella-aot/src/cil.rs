@@ -2854,25 +2854,12 @@ fn compare(
     Ok(())
 }
 
-/// Pops one operand and pushes its sub-word width conversion (the CLI's `conv.i1`/
-/// `conv.u1`/`conv.i2`/`conv.u2`); the result is `int32`.
-/// Converts the top of stack to `int64` (truncating toward zero) if it is a FLOAT, and leaves any
-/// other type alone.
+/// Converts the top of stack to `int64` (truncating toward zero, saturating) if it is a float, and
+/// leaves any other type alone: the step before `conv.i8` and `conv.u8` widen.
 ///
-/// This is the step III.3.27 puts before every integer conversion whose source is on the stack as an
-/// `F`: the CLI converts the float to an integer and then narrows or widens. Without it the
-/// following narrow reads the operand's IEEE ENCODING -- `(byte)255.9` answering 205, the low byte
-/// of `0x406FFCCCCCCCCCCD`, rather than 255 -- and does so silently, with no build error and no trap.
-///
-/// `int64` rather than `int32` is what makes the AOT agree with the interpreter, which reaches every
-/// integer conversion through one `f as i64`. Going via `int32` would agree for values that fit and
-/// diverge on the saturating edge.
-///
-/// `signed` IS THE CLI TARGET'S SIGNEDNESS AND IT REACHES THE FLOAT HELPER, which is the whole point
-/// of threading it here: `conv.u8` from a float is an UNSIGNED conversion, and taking the signed one
-/// instead loses the entire top half of the `u64` range (see [`ConvKind::Float64ToULong`]). It was
-/// dropped on this path for as long as the path existed -- `widen` had the flag and used it only for
-/// the integer `Inst::Widen` below.
+/// `signed` is the CLI target's signedness, and it reaches the float helper: `conv.u8` from a float
+/// is an unsigned conversion, and taking the signed one instead loses the whole top half of the `u64`
+/// range (see [`ConvKind::Float64ToULong`]).
 fn float_to_long_first(
     value_types: &mut Vec<MirType>,
     stack: &mut Vec<ValueId>,
@@ -2894,13 +2881,40 @@ fn float_to_long_first(
     Ok(())
 }
 
+/// Converts the top of stack to a saturated `int32` (truncating toward zero) if it is a float, and
+/// leaves any other type alone: the step before a sub-word narrowing.
+///
+/// The CLI converts a float to an integer before it narrows (ECMA-335 III.3.27). Without this step
+/// the narrow would read the operand's IEEE encoding -- `(byte)255.9` answering 205, the low byte of
+/// `0x406FFCCCCCCCCCCD`, rather than 255. Saturating at `int32`'s range and then keeping the low
+/// bits gives `(byte)1e10` as 255 and `(short)70000.5` as 4464 (see [`ConvKind`]).
+fn float_to_int_first(
+    value_types: &mut Vec<MirType>,
+    stack: &mut Vec<ValueId>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> Result<(), CilError> {
+    let top = *stack.last().ok_or(CilError::StackUnderflow)?;
+    let kind = match value_types.get(top.index()) {
+        Some(MirType::F32) => ConvKind::Float32ToInt,
+        Some(MirType::F64) => ConvKind::Float64ToInt,
+        _ => return Ok(()),
+    };
+    let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+    let result = new_value(value_types, MirType::I32);
+    insts.push((result, Inst::Convert { value, kind }));
+    stack.push(result);
+    Ok(())
+}
+
+/// Pops one operand and pushes its sub-word width conversion (the CLI's `conv.i1`/
+/// `conv.u1`/`conv.i2`/`conv.u2`); the result is `int32`.
 fn convert(
     value_types: &mut Vec<MirType>,
     stack: &mut Vec<ValueId>,
     insts: &mut Vec<(ValueId, Inst)>,
     kind: ConvKind,
 ) -> Result<(), CilError> {
-    float_to_long_first(value_types, stack, insts, true)?;
+    float_to_int_first(value_types, stack, insts)?;
     narrow_to_i32(value_types, stack, insts)?;
     let value = stack.pop().ok_or(CilError::StackUnderflow)?;
     let result = new_value(value_types, MirType::I32);
@@ -3496,7 +3510,9 @@ fn apply_value_op(
         Opcode::Ldvirtftn => {
             let object = stack.pop().ok_or(CilError::StackUnderflow)?;
             let result = new_value(value_types, MirType::I32);
-            if let Some(slot) = resolver.virtual_slot(&inst.operand) {
+            if let Some(tag) = resolver.interface_call_tag(&inst.operand) {
+                insts.push((result, Inst::InterfaceFuncAddr { object, tag }));
+            } else if let Some(slot) = resolver.virtual_slot(&inst.operand) {
                 insts.push((
                     result,
                     Inst::VirtualFuncAddr {
@@ -3704,8 +3720,15 @@ fn apply_value_op(
                 .and_then(|top| value_types.get(top.index()))
                 .is_some_and(|ty| ty.is_float()) =>
         {
-            float_to_long_first(value_types, stack, insts, true)?;
-            narrow_to_i32(value_types, stack, insts)?;
+            let value = stack.pop().ok_or(CilError::StackUnderflow)?;
+            let kind = if value_types.get(value.index()) == Some(&MirType::F32) {
+                ConvKind::Float32ToUInt
+            } else {
+                ConvKind::Float64ToUInt
+            };
+            let result = new_value(value_types, MirType::I32);
+            insts.push((result, Inst::Convert { value, kind }));
+            stack.push(result);
         }
         Opcode::ConvI4
         | Opcode::ConvU4
@@ -10053,6 +10076,90 @@ mod tests {
         assert!(lamella_ir::verify(&func).is_ok());
     }
 
+    /// `dup; ldvirtftn M` -- what csc emits for a method group over a virtual slot -- resolves M for
+    /// the popped object's runtime type: by its TAG in the itable when M is an interface member, by
+    /// its vtable slot when it has one, and only otherwise as the static target `ldftn` would name.
+    #[test]
+    fn ldvirtftn_on_an_interface_member_finds_the_implementation_by_its_tag() {
+        use lamella_token::Token;
+        #[derive(Clone, Copy, Debug, PartialEq)]
+        enum Target {
+            Interface,
+            Virtual,
+            Static,
+        }
+        struct Method(Target);
+        impl CallResolver for Method {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 1,
+                    has_result: true,
+                    result_type: Some(MirType::I32),
+                    has_this: true,
+                    target: CallTarget::Internal(5),
+                })
+            }
+            fn virtual_slot(&self, _: &Operand) -> Option<usize> {
+                (self.0 == Target::Virtual).then_some(4)
+            }
+            fn interface_call_tag(&self, _: &Operand) -> Option<u32> {
+                (self.0 == Target::Interface).then_some(0x51)
+            }
+        }
+        for target in [Target::Interface, Target::Virtual, Target::Static] {
+            let code = alloc::vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::Ldvirtftn, Operand::Token(Token::new(0x0A, 2))),
+                Instruction::simple(Opcode::Ret),
+            ];
+            let body = MethodBodyImage {
+                max_stack: 1,
+                init_locals: true,
+                local_var_sig: None,
+                code: code.into_boxed_slice(),
+                handlers: Vec::new().into_boxed_slice(),
+            };
+            let (func, _) = lower_method_typed(
+                &body,
+                &Method(target),
+                &[MirType::ObjectRef],
+                &[],
+                Returns::FromBody,
+                Narrowing::default(),
+            )
+            .unwrap_or_else(|e| panic!("{target:?}: {e:?}"));
+            assert!(lamella_ir::verify(&func).is_ok(), "{target:?}");
+            let receiver = func.blocks[func.entry.index()].params[0];
+            let pointer = func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .find_map(|(_, i)| match i {
+                    Inst::InterfaceFuncAddr { .. }
+                    | Inst::VirtualFuncAddr { .. }
+                    | Inst::FuncAddr { .. } => Some(i.clone()),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{target:?}: ldvirtftn yields a code pointer"));
+            match (target, pointer) {
+                (Target::Interface, Inst::InterfaceFuncAddr { object, tag: 0x51 })
+                | (
+                    Target::Virtual,
+                    Inst::VirtualFuncAddr {
+                        object, slot: 4, ..
+                    },
+                ) => {
+                    assert_eq!(
+                        object, receiver,
+                        "{target:?}: resolved on the popped object"
+                    );
+                }
+                (Target::Static, Inst::FuncAddr { func: 5 }) => {}
+                (target, other) => panic!("{target:?}: lowered to {other:?}"),
+            }
+        }
+    }
+
     /// A `ref`/`out` local passed to an INSTANCE method is an argument, never the receiver.
     ///
     /// `obj.M(out s, 5)` is `ldarg.0; ldloca s; ldc.i4.5; callvirt`, and `obj.M(5, out s)` puts the
@@ -12463,11 +12570,12 @@ mod tests {
         func
     }
 
-    /// AN UNSIGNED 32-BIT TARGET FROM A FLOAT CONVERTS THROUGH THE 64-BIT ROUTINE. The 32-bit routine is
-    /// signed and stops at int's maximum, so `(uint)3000000000.0` answered 2147483647; the int64 route
-    /// holds every value a uint can. A signed target keeps the 32-bit routine, which is the control.
+    /// An unsigned 32-bit target from a float takes the unsigned 32-bit conversion, which saturates at
+    /// both ends of uint's range. The signed one stops at int's maximum, so `(uint)3000000000.0`
+    /// answered 2147483647; through an `int64` the value wrapped, so `(uint)-1.0` answered 4294967295
+    /// rather than 0. A signed target keeps the signed conversion, which is the control.
     #[test]
-    fn an_unsigned_int_from_a_float_converts_through_the_long_routine() {
+    fn an_unsigned_int_from_a_float_takes_the_unsigned_32_bit_conversion() {
         let kinds = |op: Opcode, source: MirType| -> Vec<ConvKind> {
             lower_one_conversion(op, source)
                 .blocks
@@ -12480,9 +12588,10 @@ mod tests {
                 .collect()
         };
         for (op, source, route) in [
-            (Opcode::ConvU4, MirType::F64, ConvKind::Float64ToLong),
-            (Opcode::ConvU4, MirType::F32, ConvKind::Float32ToLong),
-            (Opcode::ConvOvfU4, MirType::F64, ConvKind::Float64ToLong),
+            (Opcode::ConvU4, MirType::F64, ConvKind::Float64ToUInt),
+            (Opcode::ConvU4, MirType::F32, ConvKind::Float32ToUInt),
+            (Opcode::ConvOvfU4, MirType::F64, ConvKind::Float64ToUInt),
+            (Opcode::ConvOvfU4, MirType::F32, ConvKind::Float32ToUInt),
         ] {
             assert_eq!(kinds(op, source), [route], "{op:?} from {source:?}");
         }
@@ -14375,56 +14484,56 @@ mod tests {
         }
     }
 
-    /// A sub-word narrowing from a float converts FIRST and narrows second (III.3.27), so the bits
-    /// the narrow reads are the value's and not the encoding's: `(byte)255.9` answered 205 -- the low
-    /// byte of `0x406FFCCCCCCCCCCD` -- and `(char)65.9` answered U+999A.
+    /// A sub-word narrowing from a float converts first and narrows second (III.3.27), so the bits
+    /// the narrow reads are the value's and not the encoding's: `(byte)255.9` is 255, not 205, the
+    /// low byte of `0x406FFCCCCCCCCCCD`.
     ///
-    /// Via `int64`, which is the width the interpreter reaches every integer conversion through, so
-    /// the two tiers agree on the saturating edge as well as on values that fit.
+    /// The conversion is to a saturated `int32`, and the narrow then keeps its low bits, so
+    /// `(byte)1e10` is 255 and `(short)70000.5` is 4464 (see [`ConvKind`]). No `int64` and no
+    /// truncation of one is in the way: through an `int64`, `(short)3e9` wrapped to 24064.
     #[test]
-    fn a_narrowing_conversion_from_a_double_converts_before_it_narrows() {
-        for (opcode, narrow) in [
-            (Opcode::ConvU1, ConvKind::ZeroExtend8),
-            (Opcode::ConvI1, ConvKind::SignExtend8),
-            (Opcode::ConvU2, ConvKind::ZeroExtend16),
-            (Opcode::ConvI2, ConvKind::SignExtend16),
-        ] {
-            let body = MethodBodyImage {
-                max_stack: 1,
-                init_locals: false,
-                local_var_sig: None,
-                code: vec![
-                    Instruction::new(Opcode::LdcR8, Operand::Float64(255.9)),
-                    Instruction::simple(opcode),
-                    Instruction::simple(Opcode::Ret),
-                ]
-                .into_boxed_slice(),
-                handlers: Vec::new().into_boxed_slice(),
-            };
-            let func = lower_method(&body).unwrap();
-            assert!(lamella_ir::verify(&func).is_ok());
-            assert_eq!(func.ret, Some(MirType::I32));
-            let kinds: Vec<ConvKind> = func
-                .blocks
-                .iter()
-                .flat_map(|b| &b.insts)
-                .filter_map(|(_, i)| match i {
-                    Inst::Convert { kind, .. } => Some(*kind),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(
-                kinds,
-                vec![ConvKind::Float64ToLong, narrow],
-                "{opcode:?} converts to an integer before narrowing it"
-            );
-            assert!(
-                func.blocks
+    fn a_narrowing_conversion_from_a_float_saturates_to_int_before_it_narrows() {
+        let sources = [
+            (Instruction::new(Opcode::LdcR8, Operand::Float64(255.9)), ConvKind::Float64ToInt),
+            (Instruction::new(Opcode::LdcR4, Operand::Float32(255.9)), ConvKind::Float32ToInt),
+        ];
+        for (load, first) in sources {
+            for (opcode, narrow) in [
+                (Opcode::ConvU1, ConvKind::ZeroExtend8),
+                (Opcode::ConvI1, ConvKind::SignExtend8),
+                (Opcode::ConvU2, ConvKind::ZeroExtend16),
+                (Opcode::ConvI2, ConvKind::SignExtend16),
+            ] {
+                let body = MethodBodyImage {
+                    max_stack: 1,
+                    init_locals: false,
+                    local_var_sig: None,
+                    code: vec![load.clone(), Instruction::simple(opcode), Instruction::simple(Opcode::Ret)]
+                        .into_boxed_slice(),
+                    handlers: Vec::new().into_boxed_slice(),
+                };
+                let func = lower_method(&body).unwrap();
+                assert!(lamella_ir::verify(&func).is_ok());
+                assert_eq!(func.ret, Some(MirType::I32));
+                let kinds: Vec<ConvKind> = func
+                    .blocks
                     .iter()
                     .flat_map(|b| &b.insts)
-                    .any(|(_, i)| matches!(i, Inst::Truncate { .. })),
-                "{opcode:?} truncates the int64 to a word before the sub-word narrow"
-            );
+                    .filter_map(|(_, i)| match i {
+                        Inst::Convert { kind, .. } => Some(*kind),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(kinds, vec![first, narrow], "{opcode:?} from {first:?} converts to an int before narrowing it");
+                assert!(
+                    !func
+                        .blocks
+                        .iter()
+                        .flat_map(|b| &b.insts)
+                        .any(|(_, i)| matches!(i, Inst::Truncate { .. })),
+                    "{opcode:?} from {first:?} goes through no int64"
+                );
+            }
         }
     }
 

@@ -3,7 +3,7 @@ using System.Device.Gpio;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Same54GpioDriver : GpioDriver
+internal sealed class Same54GpioDriver : GpioDriver
 {
     private const int PinsPerGroup = 32;
     private const int GroupCount = 4;
@@ -18,7 +18,7 @@ public sealed class Same54GpioDriver : GpioDriver
     /// <c>ClosePin</c> leaves them alone. A board passes the lines it must keep -- its debug
     /// transport, a fixed peripheral's control pin -- because only the board knows which those
     /// are.</summary>
-    /// <remarks>TWO MASKS, COVERING PA00 THROUGH PB31 ONLY, AND THE DEBUG PINS ARE INSIDE THEM.
+    /// <remarks>Two masks, covering PA00 through PB31 only, and the debug pins are inside them.
     /// SWCLK is PA30 and SWDIO is PA31. The manual notes that only SWCLK is mapped to the normal
     /// PORT functions and that a debugger's plug detection switches SWDIO to its debug function by
     /// itself -- so SWCLK is the one an ordinary GPIO call can genuinely take, and it is bit 30 of
@@ -51,7 +51,7 @@ public sealed class Same54GpioDriver : GpioDriver
 
     /// <summary>The logical pin number for a generated group base and pin index -- the form every
     /// board binding emits.</summary>
-    /// <remarks>ON THE DRIVER RATHER THAN ON EACH BOARD, because which group a BASE is happens to be
+    /// <remarks>On the driver rather than on each board, because which group a BASE is happens to be
     /// family truth: the bases come from this family's instance map and the pins-per-group is this
     /// family's, so each board class carrying a four-way switch would be one copy per board of one
     /// fact. What stays a BOARD fact is which base a device sits on, and that is what a board passes

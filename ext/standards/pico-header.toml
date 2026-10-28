@@ -3,19 +3,19 @@
 # VOCABULARY between a board that carries the header and an extension that plugs onto it, the way
 # xplained-pro.toml is for that connector.
 #
-# THE POSITIONS ARE NAMED BY THE PICO'S OWN LABELS, IN LOWER CASE. `gp0` is the position the Pico
+# The positions are named by the Pico's own labels, in lower case. `gp0` is the position the Pico
 # prints GP0, and a board states which pad of ITS chip sits behind it. On the Raspberry Pi Pico
 # boards and on Pimoroni's Pico Plus 2 boards that pad is the GPIO of the same number, so their rows
 # read as the identity -- and each is still stated per board, because the header is a shape other
 # makers copy, and nothing obliges a copy to wire position GP0 to its chip's GPIO0.
 #
-# ONE POSITION CAN REACH TWO PADS, AND THAT IS A BOARD FACT RATHER THAN ONE OF THIS FILE'S. The
+# One position can reach two pads, and that is a board fact rather than one of this file's. The
 # Pimoroni Pico Plus 2 boards carry an RP2350B, whose analog inputs are GPIO40 to GPIO47, so each of
 # the three analog positions lands on its low-numbered GPIO directly and on an ADC pad through 1k.
 # The position is the same position; which pad digitizes it is stated by the board, next to its
 # converter.
 #
-# ONLY THE TWENTY-SIX GPIO POSITIONS ARE ROUTABLE. RUN is the chip's enable input and ADC_VREF its
+# Only the twenty-six GPIO positions are routable. RUN is the chip's enable input and ADC_VREF its
 # converter's supply and reference; neither is a GPIO, and no binding reaches either. The power and
 # ground positions reach no pad at all. They are all stated so the table is the connector's rather
 # than a subset chosen by what happens to be bindable.

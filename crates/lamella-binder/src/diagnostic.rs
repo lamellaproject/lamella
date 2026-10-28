@@ -125,8 +125,6 @@ mod namespace_tests {
 impl DiagnosticKind {
     /// Which namespace this kind's code belongs to.
     ///
-    /// `Cs` for everything csc also has a concept of, which is nearly all of it. A new arm here is
-    /// a claim that csc has NO code for the condition -- check before adding one.
     #[must_use]
     pub fn namespace(&self) -> CodeNamespace {
         match self {
@@ -140,10 +138,6 @@ impl DiagnosticKind {
 
 /// The namespace a diagnostic code belongs to.
 ///
-/// **Re-exported from `lamella-syntax`, where it now lives.** It moved because the PARSER needs it
-/// too: a parse diagnostic was assumed to always be csc's, and `LAM0001` was therefore unreachable
-/// from the half of the compiler that raises most of the feature gates. Two copies of this enum
-/// would have been two answers to "which prefix does this condition get".
 pub use lamella_syntax::diagnostic::CodeNamespace;
 
 /// A semantic-diagnostic kind, with any detail its message needs.
@@ -241,14 +235,42 @@ impl SignaturePosition {
     }
 }
 
+/// What a type argument that fails a named constraint IS, which decides the code it is reported
+/// under (25.7.1): the argument's kind, not the constraint's, says which conversion is missing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConstraintConversion {
+    /// `CS0311`: a reference type, or a type parameter known to be one -- no implicit reference
+    /// conversion reaches the constraint.
+    Reference,
+    /// `CS0312`: a nullable value type against a class constraint.
+    NullableToClass,
+    /// `CS0313`: a nullable value type against an interface constraint.
+    NullableToInterface,
+    /// `CS0314`: a type parameter not known to be a reference type -- neither a boxing nor a type
+    /// parameter conversion reaches the constraint.
+    TypeParameter,
+    /// `CS0315`: a value type -- no boxing conversion reaches the constraint.
+    Boxing,
+}
+
+impl ConstraintConversion {
+    /// The diagnostic code this kind of argument is reported under.
+    #[must_use]
+    pub fn code(self) -> u16 {
+        match self {
+            ConstraintConversion::Reference => 311,
+            ConstraintConversion::NullableToClass => 312,
+            ConstraintConversion::NullableToInterface => 313,
+            ConstraintConversion::TypeParameter => 314,
+            ConstraintConversion::Boxing => 315,
+        }
+    }
+}
+
 /// Which noun CS0305/CS0308 name, because csc's message templates are parameterized by it:
 /// *"Using the generic **{0}** '{1}' requires {2} type arguments"*. Both codes serve types and
 /// methods, and the two messages differ ONLY in this word -- so it is carried rather than baked in.
 ///
-/// Measured against csc, not assumed: `Id<int,string>(1)` on `T Id<T>(T)` reports
-/// *"Using the generic method 'C.Id<T>(T)' requires 1 type arguments"* under the same CS0305 a
-/// wrong-arity TYPE draws. A hardcoded "type" would have produced a confidently wrong sentence
-/// under a right code, which is worse than a wrong code -- a reader believes the prose.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GenericMember {
     /// A generic type: csc says "type" and quotes `Box<T>`.
@@ -310,9 +332,6 @@ pub enum WriteUse {
 
 /// What a binder diagnostic IS, one variant per rule the binder enforces.
 ///
-/// Each variant carries the parts its message needs rather than a formatted string, so the code
-/// (`DiagnosticKind::code`) and the text (`Display`) are derived from one place and cannot drift
-/// apart. The codes are csc's, because a code is a search key a user takes to a search engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum DiagnosticKind {
@@ -357,10 +376,6 @@ pub enum DiagnosticKind {
     },
     /// `CS0822`: a local CONSTANT declared `var` -- `const var x = 1;`.
     ///
-    /// A separate code from the four above because 8.5.1's restrictions do not reach it: a
-    /// `local-constant-declaration` is `const type constant-declarators`, and its `type` is a
-    /// *type*, never a `local-variable-type`. So `var` is not admitted by the grammar there at all,
-    /// and csc reports the dedicated code rather than a restriction violation.
     ImplicitlyTypedLocalConstant,
     /// `CS0825`: `var` written where the grammar has no `local-variable-type` -- a field, a
     /// parameter, a return type, or an array element type such as `var[]`.
@@ -397,11 +412,6 @@ pub enum DiagnosticKind {
     },
     /// `CS0452`: a type argument violates its parameter's `class` constraint (25.7.1).
     ///
-    /// **Every message in this constraint family was measured from csc rather than recalled**, and
-    /// they are NOT interchangeable phrasings of one idea: CS0452 says *must be a reference type*,
-    /// CS0453 says *must be a non-nullable value type*, CS0310 names the constructor requirement,
-    /// and CS0311 quotes the missing conversion. A single "constraint not satisfied" message under
-    /// one code would be a different diagnostic from csc's for all four.
     TypeArgumentMustBeReferenceType {
         /// The offending type argument, as csc quotes it.
         argument: Box<str>,
@@ -409,8 +419,6 @@ pub enum DiagnosticKind {
         parameter: Box<str>,
         /// The generic type or method, as csc quotes it: `Box<T>`.
         declaration: Box<str>,
-        /// Which noun csc puts in the message. See [`GenericMember`].
-        member: GenericMember,
     },
     /// `CS0453`: a type argument violates its parameter's `struct` constraint (25.7.1).
     TypeArgumentMustBeValueType {
@@ -420,14 +428,19 @@ pub enum DiagnosticKind {
         parameter: Box<str>,
         /// The generic type or method, as csc quotes it.
         declaration: Box<str>,
-        /// Which noun csc puts in the message. See [`GenericMember`].
-        member: GenericMember,
+    },
+    /// `CS8377`: a type argument violates its parameter's `unmanaged` constraint (ECMA-334 7th ed,
+    /// 15.2.5): it is not a non-nullable value type free of references at every depth.
+    TypeArgumentMustBeUnmanaged {
+        /// The offending type argument.
+        argument: Box<str>,
+        /// The type parameter's declared name.
+        parameter: Box<str>,
+        /// The generic type or method, with its type parameters: `Box<T>`.
+        declaration: Box<str>,
     },
     /// `CS0310`: a type argument violates its parameter's `new()` constraint (25.7.1).
     ///
-    /// **csc quotes the argument WITHOUT a leading "The type"**, unlike CS0452/CS0453/CS0311 --
-    /// *"'NoCtor' must be a non-abstract type..."*. Measured, not stylistic: matching it is what
-    /// keeps a diff against csc empty.
     TypeArgumentNeedsDefaultConstructor {
         /// The offending type argument, as csc quotes it.
         argument: Box<str>,
@@ -435,10 +448,10 @@ pub enum DiagnosticKind {
         parameter: Box<str>,
         /// The generic type or method, as csc quotes it.
         declaration: Box<str>,
-        /// Which noun csc puts in the message. See [`GenericMember`].
-        member: GenericMember,
     },
-    /// `CS0311`: a type argument does not convert to a named constraint (25.7.1).
+    /// `CS0311`, `CS0312`, `CS0313`, `CS0314` or `CS0315`: a type argument does not convert to a
+    /// named constraint (25.7.1). Which code depends on what the argument is: see
+    /// [`ConstraintConversion`].
     TypeArgumentNoConversionToConstraint {
         /// The offending type argument, as csc quotes it.
         argument: Box<str>,
@@ -448,8 +461,8 @@ pub enum DiagnosticKind {
         declaration: Box<str>,
         /// The constraint type the argument does not convert to.
         constraint: Box<str>,
-        /// Which noun csc puts in the message. See [`GenericMember`].
-        member: GenericMember,
+        /// The kind of argument, which chooses the code and the message's last sentence.
+        conversion: ConstraintConversion,
     },
     /// `CS0699`: a `where` clause names an identifier that the declaration does not declare as a
     /// type parameter -- `class Box<T> where Q : class`.
@@ -471,6 +484,35 @@ pub enum DiagnosticKind {
     NewConstraintMustBeLast,
     /// `CS0451`: `new()` written together with `struct`, which already implies it.
     NewConstraintWithStructConstraint,
+    /// `CS8375`: `new()` written together with `unmanaged`, which already implies it.
+    NewConstraintWithUnmanagedConstraint,
+    /// `CS0450` and `CS8380`: a class type constraint written after `class`, `struct` or
+    /// `unmanaged` -- each is a primary constraint, and a clause has one (ECMA-334 7th ed, 15.2.5).
+    ClassTypeConstraintWithPrimary {
+        /// The class type.
+        constraint: Box<str>,
+        /// Whether the primary constraint is `unmanaged` (`CS8380`) rather than `class` or
+        /// `struct` (`CS0450`).
+        unmanaged: bool,
+    },
+    /// `CS0702`: `object`, `System.Array` or `System.ValueType` as a constraint type
+    /// (ECMA-334 7th ed, 15.2.5).
+    SpecialClassConstraint {
+        /// The class, by its keyword or simple name.
+        constraint: Box<str>,
+    },
+    /// `CS0456` and `CS8379`: a type parameter with the `struct` or `unmanaged` constraint named
+    /// as another type parameter's constraint, which would force the two to be one type
+    /// (ECMA-334 7th ed, 15.2.5).
+    ValueTypeParameterAsConstraint {
+        /// The type parameter named as the constraint.
+        parameter: Box<str>,
+        /// The type parameter it would constrain.
+        dependent: Box<str>,
+        /// Whether `parameter`'s constraint is `unmanaged` (`CS8379`) rather than `struct`
+        /// (`CS0456`).
+        unmanaged: bool,
+    },
     /// `CS0701`: a named constraint is not a valid one -- a sealed class, a struct, or a
     /// predefined value type. Only an interface, a non-sealed class or a type parameter may stand
     /// there.
@@ -580,10 +622,6 @@ pub enum DiagnosticKind {
     },
     /// `CS8754`: a target-typed `new()` in a position that supplies no type to take.
     ///
-    /// The whole of what makes `new()` a construct is that the CONTEXT names the type, so a
-    /// position with no target has not written an incomplete expression -- it has written one that
-    /// cannot mean anything. csc's text names the syntax rather than a type, because there is no
-    /// type to name.
     NoTargetTypeForNew,
     /// `CS0551`: an explicit interface implementation OMITS an accessor the interface member
     /// declares. The mirror of [`DiagnosticKind::ExplicitImplementationAddsAccessor`] and the same
@@ -755,10 +793,6 @@ pub enum DiagnosticKind {
     /// `LAM0002`: the member EXISTS on a referenced type and this build could not decode its
     /// signature, so it could not be bound.
     ///
-    /// **THIS IS THE OTHER HALF OF `CS0117` AND THE DISTINCTION IS THE WHOLE POINT.** csc has no
-    /// code for it because csc has no such limitation, so borrowing `CS0117` here would tell the
-    /// programmer their spelling is wrong when the member is right there in the assembly. The
-    /// repair is different too: nothing they write fixes it.
     ///
     /// Today this means a generic signature (ECMA-335 4th ed II.23.2.1 -- the extra leading
     /// `GenParamCount` the decoder refuses rather than misreading).
@@ -770,9 +804,6 @@ pub enum DiagnosticKind {
     },
     /// `CS1739`: a named argument names a parameter the chosen overload does not have.
     ///
-    /// csc says "the BEST overload", and that wording is exact: with several overloads the name is
-    /// judged against the one the call came closest to, not against their union. A name matching
-    /// SOME overload is not this diagnostic -- it is a call that simply resolved elsewhere.
     NoParameterNamed {
         /// The method, as csc spells it in this message: the bare name.
         method: Box<str>,
@@ -800,11 +831,6 @@ pub enum DiagnosticKind {
     },
     /// `CS1738`: a named argument followed by an unnamed one, below C# 7.2.
     ///
-    /// **A BINDER GATE AND NOT A PARSER ONE, WHICH IS WHERE csc PUTS IT TOO.** Whether a named
-    /// argument is "non-trailing" is a fact about the argument LIST, and csc reports it at the
-    /// offending positional argument at every version below 7.2 -- including versions that have no
-    /// named arguments at all, where it lands alongside the version code rather than instead of it
-    /// (measured at C# 3).
     NonTrailingNamedArgument,
     /// `CS1501`: no overload of the method takes the given number of arguments.
     NoOverloadForArgumentCount {
@@ -847,9 +873,6 @@ pub enum DiagnosticKind {
     /// resolves; only the parameter's recorded mode distinguishes them. csc names the mode
     /// the PARAMETER wants, not the one the argument wrote.
     ///
-    /// A missing modifier where the parameter is byref is also this code in csc, but it
-    /// cannot arise here: an unmodified argument does not share the parameter's `ByRef`
-    /// type, so no candidate is applicable and the call is `CS1503` instead.
     ArgumentModeRequired {
         /// The 1-based argument position.
         index: u32,
@@ -958,12 +981,6 @@ pub enum DiagnosticKind {
     MultipleEntryPoints,
     /// `CS5001`: an EXECUTABLE target declares no usable entry point.
     ///
-    /// **"SUITABLE" IS THE LOAD-BEARING WORD AND csc'S MESSAGE SAYS IT**: a `Main` that is
-    /// lowercase, an instance method, generic, or wrongly signed is not ABSENT -- it is present and
-    /// unusable, and csc answers this one code for all of them rather than naming what is wrong.
-    /// Measured: a two-argument `Main`, `main`, an instance `Main`, a `string`-returning `Main` and
-    /// a `Main` in a generic class are each `CS5001`, while `void`/`int` x `()`/`(string[])` are
-    /// the four that work -- in a struct or a class, public or private.
     NoEntryPoint,
     /// `CS7022` (a warning): a method that would be an entry point is ignored, because the
     /// program's TOP-LEVEL STATEMENTS are its entry point (C# 9). One per such method, at its name.
@@ -1163,10 +1180,6 @@ pub enum DiagnosticKind {
     NonConstantAttributeArgument,
     /// `CS9244`: a BY-REF-LIKE type used as a type argument.
     ///
-    /// A `ref struct` lives only on the stack; a type argument may be stored anywhere the
-    /// constructed type stores it, so no generic type or method may take one. **`S?` reaches
-    /// this rule rather than a rule of its own** -- `S?` is `System.Nullable<S>`, so it is a type
-    /// ARGUMENT, and csc names `Nullable<T>` as the declaration in the message. Measured.
     ///
     /// C# 13's `allows ref struct` lifts this for a parameter that opts in. No rung this
     /// compiler supports reaches it -- the ladder stops at C# 11 -- so the refusal is
@@ -1182,10 +1195,6 @@ pub enum DiagnosticKind {
     /// `CS8345`: a field, or an auto-implemented property, whose type is BY-REF-LIKE where it is
     /// not an instance member of a `ref struct` (C# 7.2).
     ///
-    /// A `ref struct` may live only on the stack. A field of one in a class puts it on the heap;
-    /// a field of one in an ordinary struct puts it wherever that struct goes, which may be the
-    /// heap. **A `static` field is refused even inside a `ref struct`** -- csc's message says
-    /// INSTANCE member, and a static field of a stack-only type has nowhere to live. Measured.
     ByRefLikeFieldType {
         /// The by-ref-like type, as csc renders it in the message.
         ty: Box<str>,
@@ -1194,10 +1203,6 @@ pub enum DiagnosticKind {
     /// the right operand of `??` and in either arm of `?:`, and nowhere else -- a PARENTHESIZED
     /// one, `s ?? (throw e)`, is refused too, measured.
     ///
-    /// It is a diagnostic about the CONTEXT rather than the expression, which is why the parser
-    /// admits one wherever an expression is parsed at null-coalescing precedence: there is
-    /// something to refuse only because it parsed. Where the grammar does not reach at all -- the
-    /// operand of a binary operator -- csc says `CS1525` instead, and so does this.
     ThrowExpressionNotAllowed,
     /// `CS0227`: the source contains `unsafe` but the compilation was not given `/unsafe`. The
     /// language supports unsafe code in full; a compilation opts IN to containing it, exactly as
@@ -1290,6 +1295,19 @@ pub enum DiagnosticKind {
         /// The repeated alias.
         alias: Box<str>,
     },
+    /// `CS0105`, a warning: one list of `using` directives -- a file's, `global` ones first, or a
+    /// namespace body's -- imports the same namespace or the same type a second time. The second
+    /// directive adds nothing, and the program means what it meant without it.
+    RepeatedUsingDirective {
+        /// The namespace, or the type as written after its namespace.
+        name: Box<str>,
+    },
+    /// `CS0138`: a namespace `using` directive names a type. The directive imports a namespace's
+    /// members, and a type's are imported by `using static`.
+    UsingNamespaceNamesAType {
+        /// The type as written after its namespace.
+        name: Box<str>,
+    },
     /// `CS0020`: a division or remainder by a constant zero. The operation has no value, and it is
     /// a compile-time fact rather than a run-time one.
     DivisionByConstantZero,
@@ -1368,9 +1386,6 @@ pub enum DiagnosticKind {
     /// `CS0273`: an accessor's own access modifier is not STRICTLY more restrictive than the
     /// property or indexer it belongs to (10.7.2).
     ///
-    /// **`protected` AND `internal` ARE INCOMPARABLE, NOT EQUAL**, so `protected int P` with an
-    /// `internal set` is this error and so is the reverse -- measured against csc over the whole
-    /// five-by-five lattice. Equal accessibility is an error too: the modifier has to NARROW.
     AccessorAccessibilityNotMoreRestrictive {
         /// The accessor's qualified name (`C.P.set`).
         accessor: Box<str>,
@@ -1400,10 +1415,6 @@ pub enum DiagnosticKind {
     },
     /// `CS8051`: an automatically implemented property declares a `set` accessor and no `get`.
     ///
-    /// **THE RULE IS NOT SYMMETRIC.** `int P { get; }` is a legal *readonly* auto-property (C# 6.0);
-    /// `int P { set; }` is refused at EVERY version, because the backing field it would generate
-    /// could then only be written and never read -- measured against csc at ISO-2, 3, 5, 6 and
-    /// latest, which reports this at all five.
     AutoPropertyMustHaveGetAccessor,
     /// `CS0501`: a non-abstract, non-extern method in a class or struct declares no body.
     MethodMustHaveBody {
@@ -1454,10 +1465,6 @@ pub enum DiagnosticKind {
     /// `CS0626` (warning): an `extern` member carries no attributes, so nothing says where its
     /// implementation comes from.
     ///
-    /// **THE CONDITION IS "NO ATTRIBUTES AT ALL", NOT "NO `DllImport`"**, which is what csc's own
-    /// wording says and what it does: measured, `[Obsolete] extern void M();` warns nothing. The
-    /// attribute is taken as a promise that SOMETHING supplies the body -- a `DllImport`, or a
-    /// runtime that recognizes some other marker.
     ExternMemberHasNoAttributes {
         /// The member, as csc renders it: `C.M()`, `C.P.get`, `C.operator +(C, C)`, `C.~C()`.
         member: Box<str>,
@@ -1526,10 +1533,6 @@ pub enum DiagnosticKind {
     SwitchExpressionExceptionMissing,
     /// `CS8116`: a pattern names a NULLABLE type -- `o is int? n`.
     ///
-    /// **A PATTERN TESTS THE UNDERLYING TYPE AND csc SAYS SO IN THE MESSAGE.** `int?` is a
-    /// `Nullable<int>`, which a boxed `int` is not an instance of, so the test could only ever be
-    /// false; the repair is to write the underlying type, and the diagnostic names it. Reported
-    /// for BOTH spellings, `int?` and `Nullable<int>` -- measured, csc renders both as `int?`.
     NullableTypeInPattern {
         /// The nullable type as written, rendered `T?` whichever spelling was used.
         nullable: Box<str>,
@@ -1544,10 +1547,6 @@ pub enum DiagnosticKind {
     /// `CS8627`: at C# 8.0, `T?` over a type parameter not known to be a value type or a
     /// NON-NULLABLE reference type. C# 9.0 admits it as an annotation. Reported at the type's start.
     ///
-    /// Known means a `struct` constraint, or a `class` or class-type constraint written without `?`
-    /// where annotations are enabled -- a `class` written where they are disabled is oblivious and
-    /// does not count, and neither does `notnull`, an interface, or another type parameter
-    /// (measured against csc 10.0.301).
     NullableUnconstrainedTypeParameter,
     /// `CS8639`: `typeof` of a nullable reference type, `typeof(string?)`. The annotation is not
     /// part of the type, so there is no `Type` object for it. Reported at `typeof`.
@@ -1742,12 +1741,6 @@ pub enum DiagnosticKind {
     /// written accessor body, or an `abstract` or `extern` one, which has no backing field for the
     /// value to initialize.
     ///
-    /// **THE TEXT IS csc's SENTENCE WITH ONE CLAUSE DROPPED, DELIBERATELY.** Modern csc says
-    /// *"Only auto-implemented properties, or properties that use the 'field' keyword, can have
-    /// initializers."* -- and the `field` keyword is C# 14, above the top of this compiler's
-    /// version ladder and unparseable by it. Naming it would send a reader looking for a construct
-    /// no `/langversion` here can select. This is the same call the CS0501 rule below already makes
-    /// for a half-written property, for the same reason.
     InitializerOnNonAutoProperty,
     /// `CS8053`: an instance property declared in an INTERFACE carries an initializer. An interface
     /// has no instance state and no constructor to run one in.
@@ -1755,10 +1748,6 @@ pub enum DiagnosticKind {
     /// `CS1061`: a member is not found on the type of an EXPRESSION (as opposed to `CS0117`, which
     /// is the same absence on a type named directly).
     ///
-    /// **csc's message names extension methods, and we keep it verbatim even though this compiler
-    /// has no extension methods.** The message is a search key: a user pasting it must land where a
-    /// csc user lands. Softening it to describe only what we implement would break exactly the
-    /// property the wording exists for.
     ///
     /// **THE SPLIT IS MEASURED: THE RECEIVER DECIDES IT.** One program naming a missing member
     /// both ways reports one of each -- `T.Nope()` through the type is `CS0117`, and `t.Nope()` on
@@ -1771,9 +1760,6 @@ pub enum DiagnosticKind {
     },
     /// `CS8132`: a deconstruction's target count does not match the tuple's element count.
     ///
-    /// **BOTH NUMBERS ARE QUOTED, AND csc QUOTES THEM IN SINGLE QUOTES THOUGH THEY ARE NUMBERS**:
-    /// *Cannot deconstruct a tuple of '3' elements into '2' variables.* Measured, and copied
-    /// exactly -- the message is a search key.
     ///
     /// Reported at the OPENING BRACKET of the target list, which is the same position for all
     /// three spellings: `var (a, b) = ...`, `(int a, int b) = ...` and `(a, b) = ...` (measured,
@@ -1799,34 +1785,21 @@ pub enum DiagnosticKind {
     },
     /// `CS8130`: an implicitly typed deconstruction variable whose type could not be inferred.
     ///
-    /// The CASCADE of the two above: once the value cannot be taken apart, no element type
-    /// reaches a `var` target. csc reports one per inferred variable and none for a target that
-    /// wrote its type, so an explicit `(int a, int b)` gets the primary diagnostic alone.
     UninferredDeconstructionVariable {
         /// The variable that has no inferred type.
         name: Box<str>,
     },
     /// `CS8185`: a declaring deconstruction was written where a value is wanted.
     ///
-    /// `var q = (var (a, b) = t)` and `var q = ((int a, int b) = t)` are both this, while
-    /// `M((a, b) = t)` compiles and yields the tuple -- so the form with a value is exactly the
-    /// one that declares nothing. csc reports it at the `var` of a designation and at the
-    /// declaring target otherwise; both measured.
     DeclarationNotPermitted,
     /// `CS1922`: a collection initializer targets a type that does not implement `IEnumerable`.
     ///
-    /// Separate from the missing-`Add` case (`CS1061`) because the two name different repairs --
-    /// implement the interface, or supply the method -- and csc reports them separately. Measured.
     NotACollectionInitializerTarget {
         /// The type being created.
         type_name: Box<str>,
     },
     /// `CS1914`: a STATIC field or property is named in an object initializer.
     ///
-    /// Its own code rather than the ordinary "cannot assign" family, because the mistake is
-    /// specific: an object initializer assigns members OF THE NEW OBJECT, and a static member does
-    /// not belong to one. MEASURED -- csc reports this even when the initializer is also refused by
-    /// the language-version gate, so it is not suppressed by that gate.
     StaticMemberInObjectInitializer {
         /// The member, qualified as csc renders it (`C.F`).
         member: Box<str>,
@@ -1857,11 +1830,6 @@ pub enum DiagnosticKind {
     },
     /// `CS9032`: a `required` member is less visible than the type that declares it.
     ///
-    /// A caller that cannot see the member cannot satisfy it, so the type would be
-    /// unconstructible from where it is visible. **csc's sentence also covers a SETTER less
-    /// visible than the containing type, which this compiler cannot yet express** -- accessor
-    /// access modifiers are not carried on the declaration -- so only the member's own visibility
-    /// is checked. The message is csc's whole sentence either way, because it is a search key.
     RequiredMemberLessVisible {
         /// The member, qualified as csc renders it (`C.F`).
         member: Box<str>,
@@ -1882,14 +1850,7 @@ pub enum DiagnosticKind {
     /// `CS9036`: a `required` member is given a NESTED member or collection initializer rather
     /// than a value.
     ///
-    /// **Its own code, not `CS9035`, and measured: a nested initializer does not assign the
-    /// member -- it assigns INTO whatever the member already refers to** -- so naming it in the
-    /// initializer neither satisfies the requirement nor leaves it merely unmentioned. csc reports
-    /// this one INSTEAD of `CS9035` for that member.
     ///
-    /// One measured difference that is not the code: csc anchors this on the NESTED INITIALIZER's
-    /// opening brace and this compiler anchors it on the member name, four columns earlier -- the
-    /// nested initializer carries no span of its own to point at.
     RequiredMemberNeedsValue {
         /// The member, qualified as csc renders it (`C.F`).
         member: Box<str>,
@@ -2063,10 +2024,6 @@ pub enum DiagnosticKind {
     /// auto-property, or enum member) initializer, which runs before the constructor's own body
     /// and outside any member.
     ///
-    /// **A DIFFERENT CODE FROM [`DiagnosticKind::ThisInStaticContext`] AND csc SPLITS THEM**, which
-    /// is worth stating because both refuse `this`: CS0026 is a static MEMBER naming it, and its
-    /// sentence lists the three static contexts; CS0027 is a position with no member at all, and
-    /// its sentence names none.
     ThisNotAvailableInContext,
     /// `CS0176`: a static member was accessed through an instance.
     StaticMemberViaInstance {
@@ -2125,9 +2082,6 @@ pub enum DiagnosticKind {
     },
     /// `CS8149`: `return ref e;` in a member that returns BY VALUE.
     ///
-    /// The two codes are the two directions and csc's wording is the reverse of what the code
-    /// number suggests, which is why both texts are quoted from a measured run rather than
-    /// reconstructed: 8149 is the one about a BY-REFERENCE return being in the wrong place.
     ByRefReturnInValueMethod,
     /// `CS8150`: `return e;` in a member that returns BY REFERENCE -- the `ref` is missing.
     ByValueReturnInRefMethod,
@@ -2194,21 +2148,12 @@ pub enum DiagnosticKind {
     /// `CS8157`: `return ref r;` where `r` is a `ref` local bound to storage that does not outlive
     /// the frame.
     ///
-    /// **A `ref` LOCAL IS RETURNABLE OR NOT ACCORDING TO WHAT IT WAS BOUND TO, WHICH IS A FACT
-    /// ABOUT ITS DECLARATION AND NOT ABOUT THE `return`.** `ref int r = ref f;` may be returned;
-    /// `ref int r = ref x;` for a local `x` may not, and csc quotes the REF LOCAL's name rather
-    /// than the storage's -- so the answer has to be carried from the declaration.
     CannotReturnRefLocalInitializedToValue {
         /// The ref local's name, which csc quotes.
         name: Box<str>,
     },
     /// `CS9075`: `return ref x;` where `x` is an `out` parameter.
     ///
-    /// **AN `out` PARAMETER IS BYREF AND STILL NOT RETURNABLE, WHICH IS WHY THIS IS NOT
-    /// [`DiagnosticKind::CannotReturnParameterByReference`].** Its storage IS the caller's, so the
-    /// frame-lifetime argument that refuses a by-value parameter does not apply; what refuses it is
-    /// that `out` is implicitly SCOPED to the method, and csc says so in those words at every rung
-    /// -- measured at 7.0, four releases before `scoped` was spellable.
     CannotReturnScopedParameterByReference {
         /// The parameter's name, which csc quotes.
         name: Box<str>,
@@ -2294,6 +2239,19 @@ pub enum DiagnosticKind {
         /// The enclosing method's name, as `check_return` renders method names.
         method: Box<str>,
     },
+    /// `CS4012`: a parameter of a ref struct type on an async method -- the method's parameters
+    /// live in its state machine, which cannot hold one; csc quotes the type.
+    AsyncByRefLikeParameter {
+        /// The parameter's type, as diagnostics render types.
+        ty: Box<str>,
+    },
+    /// `CS4016`: a `return` in an async method returning `Task<T>` whose value is the declared
+    /// `Task<T>` itself and does not convert to `T` -- the task's result is what is returned
+    /// (15.15.2); csc quotes `T`.
+    AsyncReturnOfTask {
+        /// The task's result type `T`.
+        result: Box<str>,
+    },
     /// `CS4008`: `await` on a `void`-returning call -- there is no value to await.
     CannotAwaitVoid,
     /// `CS4001`: `await` on an expression with no type at all -- the null literal (csc renders
@@ -2339,10 +2297,6 @@ pub enum DiagnosticKind {
     /// `CS8917`: a lambda in a position with NO target type -- `var f = x => x;` or a conversion to
     /// `object`.
     ///
-    /// **A DIFFERENT CODE FROM CS1660 AND csc SPLITS THEM ON A REAL DISTINCTION**: CS1660 is a
-    /// target that exists and is not a delegate, CS8917 is no usable target at all. Measured: `int
-    /// f = x => x;` is CS1660 and `object f = x => x;` is CS8917, because from C# 10 a lambda has a
-    /// natural type and converting to `object` asks for it.
     LambdaTypeNotInferred,
     /// `CS1593`: the target delegate takes a different number of arguments than the lambda declares.
     LambdaParameterCount {
@@ -2372,10 +2326,6 @@ pub enum DiagnosticKind {
     },
     /// `CS1673`: a lambda inside a STRUCT reads an instance member of `this`.
     ///
-    /// **NOT A LOWERING GAP -- A LANGUAGE RULE**, and the reason is `this` in a value type: it is
-    /// a managed pointer to the caller's storage, so a delegate that outlived the call would hold
-    /// a reference to a struct that no longer exists. csc refuses it outright and says what to do
-    /// instead, so the message carries the whole remedy.
     LambdaCapturesStructThis,
     /// `CS1628`: a lambda captures a `ref`, `out` or `in` PARAMETER.
     ///
@@ -2389,8 +2339,6 @@ pub enum DiagnosticKind {
     },
     /// `CS8175`: a lambda captures a `ref` LOCAL, or a local whose type is ref-like.
     ///
-    /// csc says "ref local" for BOTH, including a plain `Span<int> s` that is not a ref local at
-    /// all. The wording is csc's.
     LambdaCapturesRefLocal {
         /// The local's name.
         name: Box<str>,
@@ -2421,6 +2369,27 @@ pub enum DiagnosticKind {
     /// distinct from the 'async main' GATE, which is what a `Task`-returning async `Main`
     /// draws instead (that one is a real C# 7.1 feature; this one is never legal).
     AsyncVoidEntryPoint,
+    /// `CS8321` (warning): a local function nothing refers to -- not even itself, since a
+    /// recursive call counts as a use, measured.
+    LocalFunctionNeverUsed {
+        /// The function's name.
+        name: Box<str>,
+    },
+    /// `CS8421`: a `static` local function names a local or parameter of an enclosing function,
+    /// which it would have to capture. Reported at each reference, as csc reports it.
+    StaticLocalFunctionCapture {
+        /// The variable's name.
+        name: Box<str>,
+    },
+    /// `CS8422`: a `static` local function reaches `this` or `base`, explicitly or through an
+    /// instance member's implicit receiver.
+    StaticLocalFunctionThis,
+    /// `CS8112`: a local function with a bare `;` where its body goes, which only a `static
+    /// extern` one may write (C# 9).
+    LocalFunctionMissingBody {
+        /// The function as csc renders it: its name and its parameter types, `F(int)`.
+        signature: Box<str>,
+    },
 }
 
 impl DiagnosticKind {
@@ -2441,13 +2410,32 @@ impl DiagnosticKind {
             DiagnosticKind::TypeArgumentsCannotBeInferred { .. } => 411,
             DiagnosticKind::TypeArgumentMustBeReferenceType { .. } => 452,
             DiagnosticKind::TypeArgumentMustBeValueType { .. } => 453,
+            DiagnosticKind::TypeArgumentMustBeUnmanaged { .. } => 8377,
             DiagnosticKind::TypeArgumentNeedsDefaultConstructor { .. } => 310,
-            DiagnosticKind::TypeArgumentNoConversionToConstraint { .. } => 311,
+            DiagnosticKind::TypeArgumentNoConversionToConstraint { conversion, .. } => {
+                conversion.code()
+            }
             DiagnosticKind::UnknownConstrainedTypeParameter { .. } => 699,
             DiagnosticKind::DuplicateConstraintClause { .. } => 409,
             DiagnosticKind::ClassOrStructConstraintMustBeFirst => 449,
             DiagnosticKind::NewConstraintMustBeLast => 401,
             DiagnosticKind::NewConstraintWithStructConstraint => 451,
+            DiagnosticKind::NewConstraintWithUnmanagedConstraint => 8375,
+            DiagnosticKind::ClassTypeConstraintWithPrimary { unmanaged, .. } => {
+                if *unmanaged {
+                    8380
+                } else {
+                    450
+                }
+            }
+            DiagnosticKind::SpecialClassConstraint { .. } => 702,
+            DiagnosticKind::ValueTypeParameterAsConstraint { unmanaged, .. } => {
+                if *unmanaged {
+                    8379
+                } else {
+                    456
+                }
+            }
             DiagnosticKind::InvalidConstraintType { .. } => 701,
             DiagnosticKind::CannotCreateVariableTypeInstance { .. } => 304,
             DiagnosticKind::NonGenericTypeWithTypeArguments { .. } => 308,
@@ -2579,6 +2567,8 @@ impl DiagnosticKind {
             DiagnosticKind::RethrowOutsideCatch => 156,
             DiagnosticKind::ControlLeavesFinally => 157,
             DiagnosticKind::DuplicateUsingAlias { .. } => 1537,
+            DiagnosticKind::RepeatedUsingDirective { .. } => 105,
+            DiagnosticKind::UsingNamespaceNamesAType { .. } => 138,
             DiagnosticKind::DivisionByConstantZero => 20,
             DiagnosticKind::LockRequiresReferenceType { .. } => 185,
             DiagnosticKind::CannotCreateAbstractInstance { .. } => 144,
@@ -2742,6 +2732,8 @@ impl DiagnosticKind {
             DiagnosticKind::AsyncReturnType => 1983,
             DiagnosticKind::AsyncByRefParameter => 1988,
             DiagnosticKind::AsyncReturnWithValue { .. } => 1997,
+            DiagnosticKind::AsyncReturnOfTask { .. } => 4016,
+            DiagnosticKind::AsyncByRefLikeParameter { .. } => 4012,
             DiagnosticKind::CannotAwaitVoid => 4008,
             DiagnosticKind::CannotAwaitExpression { .. } => 4001,
             DiagnosticKind::AwaitRequiresSuitableGetAwaiter { .. } => 1986,
@@ -2765,6 +2757,10 @@ impl DiagnosticKind {
             DiagnosticKind::ConstantTrueFilter => 7095,
             DiagnosticKind::ConstantFalseFilter => 8360,
             DiagnosticKind::AsyncVoidEntryPoint => 4009,
+            DiagnosticKind::LocalFunctionNeverUsed { .. } => 8321,
+            DiagnosticKind::StaticLocalFunctionCapture { .. } => 8421,
+            DiagnosticKind::StaticLocalFunctionThis => 8422,
+            DiagnosticKind::LocalFunctionMissingBody { .. } => 8112,
         }
     }
 
@@ -2776,6 +2772,7 @@ impl DiagnosticKind {
         match self {
             DiagnosticKind::UnusedLocal { .. }
             | DiagnosticKind::UnusedLocalValue { .. }
+            | DiagnosticKind::LocalFunctionNeverUsed { .. }
             | DiagnosticKind::UnusedField { .. }
             | DiagnosticKind::FieldNeverUsed { .. }
             | DiagnosticKind::FieldNeverAssigned { .. }
@@ -2787,7 +2784,8 @@ impl DiagnosticKind {
             | DiagnosticKind::ExternMemberHasNoAttributes { .. }
             | DiagnosticKind::ExternConstructor { .. }
             | DiagnosticKind::NullableAnnotationOutsideContext
-            | DiagnosticKind::TopLevelStatementsIgnoreMain { .. } => Severity::Warning,
+            | DiagnosticKind::TopLevelStatementsIgnoreMain { .. }
+            | DiagnosticKind::RepeatedUsingDirective { .. } => Severity::Warning,
             _ => Severity::Error,
         }
     }
@@ -2848,48 +2846,79 @@ impl fmt::Display for DiagnosticKind {
                 argument,
                 parameter,
                 declaration,
-                member,
             } => write!(
                 f,
                 "The type '{argument}' must be a reference type in order to use it as \
-                 parameter '{parameter}' in the generic {} '{declaration}'",
-                member.as_str()
+                 parameter '{parameter}' in the generic type or method '{declaration}'"
             ),
             DiagnosticKind::TypeArgumentMustBeValueType {
                 argument,
                 parameter,
                 declaration,
-                member,
             } => write!(
                 f,
                 "The type '{argument}' must be a non-nullable value type in order to use it as \
-                 parameter '{parameter}' in the generic {} '{declaration}'",
-                member.as_str()
+                 parameter '{parameter}' in the generic type or method '{declaration}'"
+            ),
+            DiagnosticKind::TypeArgumentMustBeUnmanaged {
+                argument,
+                parameter,
+                declaration,
+            } => write!(
+                f,
+                "The type '{argument}' must be a non-nullable value type, along with all fields at \
+                 any level of nesting, in order to use it as parameter '{parameter}' in the generic \
+                 type or method '{declaration}'"
             ),
             DiagnosticKind::TypeArgumentNeedsDefaultConstructor {
                 argument,
                 parameter,
                 declaration,
-                member,
             } => write!(
                 f,
                 "'{argument}' must be a non-abstract type with a public parameterless constructor \
-                 in order to use it as parameter '{parameter}' in the generic {} '{declaration}'",
-                member.as_str()
+                 in order to use it as parameter '{parameter}' in the generic type or method \
+                 '{declaration}'"
             ),
             DiagnosticKind::TypeArgumentNoConversionToConstraint {
                 argument,
                 parameter,
                 declaration,
                 constraint,
-                member,
-            } => write!(
-                f,
-                "The type '{argument}' cannot be used as type parameter '{parameter}' in the \
-                 generic {} '{declaration}'. There is no implicit reference conversion from \
-                 '{argument}' to '{constraint}'.",
-                member.as_str()
-            ),
+                conversion,
+            } => {
+                write!(
+                    f,
+                    "The type '{argument}' cannot be used as type parameter '{parameter}' in the \
+                     generic type or method '{declaration}'. "
+                )?;
+                match conversion {
+                    ConstraintConversion::Reference => write!(
+                        f,
+                        "There is no implicit reference conversion from '{argument}' to \
+                         '{constraint}'."
+                    ),
+                    ConstraintConversion::NullableToClass => write!(
+                        f,
+                        "The nullable type '{argument}' does not satisfy the constraint of \
+                         '{constraint}'."
+                    ),
+                    ConstraintConversion::NullableToInterface => write!(
+                        f,
+                        "The nullable type '{argument}' does not satisfy the constraint of \
+                         '{constraint}'. Nullable types can not satisfy any interface constraints."
+                    ),
+                    ConstraintConversion::TypeParameter => write!(
+                        f,
+                        "There is no boxing conversion or type parameter conversion from \
+                         '{argument}' to '{constraint}'."
+                    ),
+                    ConstraintConversion::Boxing => write!(
+                        f,
+                        "There is no boxing conversion from '{argument}' to '{constraint}'."
+                    ),
+                }
+            }
             DiagnosticKind::UnknownConstrainedTypeParameter {
                 declaration,
                 parameter,
@@ -2910,6 +2939,40 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::NewConstraintWithStructConstraint => {
                 f.write_str("The 'new()' constraint cannot be used with the 'struct' constraint")
             }
+            DiagnosticKind::NewConstraintWithUnmanagedConstraint => {
+                f.write_str("The 'new()' constraint cannot be used with the 'unmanaged' constraint")
+            }
+            DiagnosticKind::ClassTypeConstraintWithPrimary {
+                constraint,
+                unmanaged,
+            } => {
+                if *unmanaged {
+                    write!(
+                        f,
+                        "'{constraint}': cannot specify both a constraint class and the \
+                         'unmanaged' constraint"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "'{constraint}': cannot specify both a constraint class and the 'class' \
+                         or 'struct' constraint"
+                    )
+                }
+            }
+            DiagnosticKind::SpecialClassConstraint { constraint } => {
+                write!(f, "Constraint cannot be special class '{constraint}'")
+            }
+            DiagnosticKind::ValueTypeParameterAsConstraint {
+                parameter,
+                dependent,
+                unmanaged,
+            } => write!(
+                f,
+                "Type parameter '{parameter}' has the '{}' constraint so '{parameter}' cannot be \
+                 used as a constraint for '{dependent}'",
+                if *unmanaged { "unmanaged" } else { "struct" }
+            ),
             DiagnosticKind::InvalidConstraintType { constraint } => write!(
                 f,
                 "'{constraint}' is not a valid constraint. A type used as a constraint must be an \
@@ -3457,6 +3520,15 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::DuplicateUsingAlias { alias } => write!(
                 f,
                 "The using alias '{alias}' appeared previously in this namespace"
+            ),
+            DiagnosticKind::RepeatedUsingDirective { name } => write!(
+                f,
+                "The using directive for '{name}' appeared previously in this namespace"
+            ),
+            DiagnosticKind::UsingNamespaceNamesAType { name } => write!(
+                f,
+                "A 'using namespace' directive can only be applied to namespaces; '{name}' is a type \
+                 not a namespace. Consider a 'using static' directive instead"
             ),
             DiagnosticKind::DivisionByConstantZero => write!(f, "Division by constant zero"),
             DiagnosticKind::LockRequiresReferenceType { ty } => write!(
@@ -4110,6 +4182,16 @@ impl fmt::Display for DiagnosticKind {
                 "Since '{method}' is an async method that returns 'Task', a return keyword must \
                  not be followed by an object expression"
             ),
+            DiagnosticKind::AsyncByRefLikeParameter { ty } => write!(
+                f,
+                "Parameters of type '{ty}' cannot be declared in async methods or async lambda \
+                 expressions."
+            ),
+            DiagnosticKind::AsyncReturnOfTask { result } => write!(
+                f,
+                "Since this is an async method, the return expression must be of type '{result}' \
+                 rather than 'Task<{result}>'"
+            ),
             DiagnosticKind::CannotAwaitVoid => f.write_str("Cannot await 'void'"),
             DiagnosticKind::CannotAwaitExpression { description } => {
                 write!(f, "Cannot await '{description}'")
@@ -4196,6 +4278,20 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::AsyncVoidEntryPoint => {
                 f.write_str("A void or int returning entry point cannot be async")
             }
+            DiagnosticKind::LocalFunctionNeverUsed { name } => {
+                write!(f, "The local function '{name}' is declared but never used")
+            }
+            DiagnosticKind::StaticLocalFunctionCapture { name } => {
+                write!(f, "A static local function cannot contain a reference to '{name}'.")
+            }
+            DiagnosticKind::StaticLocalFunctionThis => {
+                f.write_str("A static local function cannot contain a reference to 'this' or 'base'.")
+            }
+            DiagnosticKind::LocalFunctionMissingBody { signature } => write!(
+                f,
+                "Local function '{signature}' must declare a body because it is not marked 'static \
+                 extern'."
+            ),
         }
     }
 }

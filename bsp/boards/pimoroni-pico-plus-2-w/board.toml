@@ -1,26 +1,26 @@
 # BOARD binding: the Pimoroni Pico Plus 2 W, an RP2350B carrier with a Raspberry Pi RM2 radio
 # module. Board truth ONLY: role bindings and the wiring. Chip truth lives in csp/rp2350/.
 #
-# THE RADIO TAKES THE USER LED WITH IT, AND THAT IS THIS BOARD'S SHARPEST DIFFERENCE FROM THE PLAIN
-# PLUS 2. There is no LED on GP25 here: the indicator hangs off the RM2 module's own GPIO0, so no
+# The radio takes the user LED with it, and that is this board's sharpest difference from the plain
+# Plus 2. There is no LED on GP25 here: the indicator hangs off the RM2 module's own GPIO0, so no
 # RP2350 pin reaches it and a program that blinks it must go through the radio. GP25 instead carries
 # the radio's chip select. A board file that copied the plain board's led0 row and changed nothing
 # would name a pin that drives the radio.
 #
-# THE HEADER SAYS 26/A0 AND MEANS TWO PINS, exactly as on the plain board. On the QFN-80 the ADC
+# The header says 26/A0 and means two pins, exactly as on the plain board. On the QFN-80 the ADC
 # reads GPIO40-47 and does NOT read GPIO26-29, so each of the 26/27/28 header positions is bridged
 # to an ADC pad through a 1k resistor -- GP26 to GP40 (ADC0), GP27 to GP41 (ADC1), GP28 to GP42
 # (ADC2). One header position, two MCU pins: digital through the low number, analogue through the
 # high one.
 #
-# EVERY PIN THIS BOARD WIRES ABOVE GP31 IS A BANK-1 ROW, and its mask is named for that bank.
+# Every pin this board wires above GP31 is a bank-1 row, and its mask is named for that bank.
 # A device row's mask is only meaningful against the register set a consumer writes, and on the
 # RP2350B one SIO block serves all 48 pins through two of them -- so the boot/user button on
 # GP45, the PSRAM chip select on GP47 and the three analogue pads on GP40-GP42 publish
 # `<NAME>_BANK = 1` and `<NAME>_BANK1_MASK` rather than `<NAME>_MASK`. A shim written for the
 # ordinary case cannot read one by accident; it fails to compile instead.
 #
-# THE BOOT BUTTON IS ALSO THE USER BUTTON, under the schematic's own title "Combined USB boot & user
+# The boot button is also the user button, under the schematic's own title "Combined USB boot & user
 # switch". Same arrangement as the plain board and different resistors: 3k3 here where that board
 # fits 10k, which is why this row is read off this board's schematic rather than shared with it.
 #
@@ -57,7 +57,7 @@ kind = "flash"
 size = 0x1000000
 source = "Schematic sheet 2: U2 is a 16MB W25Q128JVPIQ on the QSPI lines, the same part the plain Plus 2 fits. 16 MB = 0x1000000."
 
-# THE PSRAM SHARES THE FLASH'S CLOCK AND FOUR DATA LINES AND HAS A SELECT OF ITS OWN, GP47 (the
+# The PSRAM shares the flash's clock and four data lines and has a select of its own, GP47 (the
 # `psram-cs` row below), so it answers in the QSPI memory interface's second window: 0x11000000,
 # chip select 1's, beside the flash's 0x10000000. That address is the window's CACHED view; the XIP
 # cache sits in front of both windows, and the same bytes read uncached at 0x15000000. Nothing

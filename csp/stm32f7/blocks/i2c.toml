@@ -4,9 +4,9 @@
 # Cross-block bring-up (RCC enables, GPIO muxing) is DRIVER code per language; only block-local
 # sequences ride here.
 #
-# THIS IS NOT THE I2C AN OLDER ST PART CARRIES, and the difference is not a detail. The older
-# design sets its bit rate through a CCR divisor and a TRISE rise-time register; THIS ONE HAS
-# NEITHER. It has a single TIMINGR holding a prescaler and four separately programmed counts, and
+# This is not the I2C an older ST part carries, and the difference is not a detail. The older
+# design sets its bit rate through a CCR divisor and a TRISE rise-time register; this one has
+# neither. It has a single TIMINGR holding a prescaler and four separately programmed counts, and
 # it drives the whole transfer from CR2 -- the target address, the byte count, the direction and
 # the START are one word, and the controller issues the stop itself. A driver written against the
 # older register map does not fail to compile against this one; it writes to reserved addresses

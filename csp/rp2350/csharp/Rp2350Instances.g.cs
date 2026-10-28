@@ -5,7 +5,7 @@
 // Layout offsets live in the *Layout classes; wiring lives in the per-board *Bindings.
 namespace Lamella.Generated
 {
-    public sealed class Rp2350Instances
+    internal sealed class Rp2350Instances
     {
         private Rp2350Instances() { }
 
@@ -38,6 +38,9 @@ namespace Lamella.Generated
         public const uint I2C0_BASE = 0x40090000;
         public const uint I2C0_RESET_BIT = 4;
         public const uint I2C0_RESET_MASK = 0x10;
+        public const uint I2C1_BASE = 0x40098000;
+        public const uint I2C1_RESET_BIT = 5;
+        public const uint I2C1_RESET_MASK = 0x20;
         public const uint ADC_BASE = 0x400A0000;
         public const uint ADC_RESET_BIT = 0;
         public const uint ADC_RESET_MASK = 0x1;

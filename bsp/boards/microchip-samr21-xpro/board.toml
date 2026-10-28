@@ -1,11 +1,11 @@
 # The SAM R21 Xplained Pro (ATSAMR21-XPRO): board truth only -- what is wired to what. Chip
 # truth lives in csp/samr21/.
 #
-# THE PART IS A SAM D21 AND AN AT86RF233 IN ONE PACKAGE, and the kit exists to show the radio.
+# The part is a SAM D21 and an AT86RF233 in one package, and the kit exists to show the radio.
 # What that costs a board is stated once, in csp/samr21/parts.toml: 28 general-purpose I/O pins
 # where a 48-pin SAM D21 has 38. Nothing here may reach SERCOM4 or PA10/PA11/PB16/PB17.
 #
-# WARNING: THIS KIT'S OWN USER GUIDE HAS A TYPOGRAPHICAL ERROR IN THE ONE TABLE THIS FILE DEPENDS ON.
+# Warning: this kit's own user guide has a typographical error in the one table this file depends on.
 # Atmel-42243D Table 4-12 gives the virtual COM port as SERCOM0 PAD[0] on PA04 and SERCOM*1*
 # PAD[1] on PA05. A UART's two pads belong to one instance; the part datasheet's Table 5-1 gives
 # PA05 as SERCOM0/PAD[1] and gives it no SERCOM1 function at all. The binding below is SERCOM0
@@ -33,7 +33,7 @@ notes = [
 
 [[carriers]]
 kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
-usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+usb_vid = 0x03EB            # Note: no usb_pid row, and its absence is a sourced position rather than
 role = "vcp"                # AN OMISSION. A product id is a property of the debugger's FIRMWARE:
 baud = 115200               # this kit's user guide never prints one, and the EDBG user guide
 plan = "osc8m-8mhz"         # Atmel-42096 describes the composite device without giving an id

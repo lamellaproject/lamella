@@ -1,7 +1,7 @@
 # BOARD binding: the Adafruit Feather M0 WiFi (ATWINC1500). Board truth ONLY: the WINC wiring,
 # the on-board indicator, the carrier, and the clock plan. Chip truth lives in csp/samd21/.
 #
-# THE SAME TWO PARTS AS THE ATSAMW25 MODULE, WIRED DIFFERENTLY. The module is a SAMD21G18A and an
+# The same two parts as the ATSAMW25 module, wired differently. The module is a SAMD21G18A and an
 # ATWINC1500 in ONE orderable package with FIXED internal wiring, so its pins are module truth
 # (csp/samw25/module.toml). This board solders the two parts down separately and routes them its
 # own way: the module reaches the WINC on SERCOM2 (function C, pads 0/1/3), this board on SERCOM4

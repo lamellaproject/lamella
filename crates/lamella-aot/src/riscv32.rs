@@ -500,6 +500,8 @@ fn soft_float_convert(kind: ConvKind) -> Option<(&'static str, u32, u32)> {
         ConvKind::Float64ToInt => ("__fixdfsi", 2, 1),
         ConvKind::Float32ToLong => ("__fixsfdi", 1, 2),
         ConvKind::Float64ToLong => ("__fixdfdi", 2, 2),
+        ConvKind::Float32ToUInt => ("__fixunssfsi", 1, 1),
+        ConvKind::Float64ToUInt => ("__fixunsdfsi", 2, 1),
         ConvKind::Float32ToULong => ("__fixunssfdi", 1, 2),
         ConvKind::Float64ToULong => ("__fixunsdfdi", 2, 2),
         ConvKind::Float32ToFloat64 => ("__extendsfdf2", 1, 2),
@@ -1965,6 +1967,7 @@ fn lower_function(
                     | Inst::CallVirtual { .. }
                     | Inst::CallInterface { .. }
                     | Inst::VirtualFuncAddr { .. }
+                    | Inst::InterfaceFuncAddr { .. }
                     | Inst::LoadTypeDesc { .. }
                     | Inst::TypeDescAddr { .. }
                     | Inst::CastClassScan { .. }
@@ -2936,6 +2939,50 @@ fn fault_unless_vector(enc: &mut Encoder, descriptor: Reg, scratch: Reg, one: Re
     enc.branch(BranchCond::Eq, scratch, one, vector);
     enc.ebreak();
     enc.bind_label(vector);
+}
+
+/// Leaves in `scratch` the code pointer of `tag`'s implementation for the object in the frame slot
+/// `receiver`: its descriptor's itable is searched for `tag`, and a missing entry traps. ONE lookup
+/// for both readers -- [`Inst::CallInterface`] calls the pointer and [`Inst::InterfaceFuncAddr`]
+/// hands it to a delegate -- so the two cannot disagree about which implementation a receiver has.
+/// Clobbers a0 and t0-t2.
+fn emit_interface_target(enc: &mut Encoder, receiver: i32, tag: u32, scratch: Reg) {
+    let (t0, t1, t2) = (Reg::T0, Reg::T1, Reg::T2);
+    enc.li(Reg::A0, tag as i32);
+    slot_load(enc, t0, receiver);
+    enc.lw(t0, t0, -4);
+    let array_form = enc.new_label();
+    let have_itable = enc.new_label();
+    enc.lw(t1, t0, 0);
+    enc.srli(t1, t1, 24);
+    enc.li(t2, (ARRAY_DESC_MARK >> 24) as i32);
+    enc.branch(BranchCond::Eq, t1, t2, array_form);
+    enc.lw(t1, t0, 4);
+    enc.slli(t1, t1, 2);
+    enc.addi(t1, t1, (DESC_HEADER_WORDS * 4) as i32);
+    enc.j(have_itable);
+    enc.bind_label(array_form);
+    fault_unless_vector(enc, t0, t1, t2);
+    enc.li(t1, crate::resolver::ARRAY_ITABLE_OFFSET as i32);
+    enc.bind_label(have_itable);
+    enc.add(t1, t0, t1);
+    enc.lw(t2, t1, 0);
+    enc.addi(t1, t1, 4);
+    let loop_top = enc.new_label();
+    let notfound = enc.new_label();
+    let found = enc.new_label();
+    enc.bind_label(loop_top);
+    enc.branch(BranchCond::Eq, t2, Reg::ZERO, notfound);
+    enc.lw(scratch, t1, 0);
+    enc.branch(BranchCond::Eq, scratch, Reg::A0, found);
+    enc.addi(t1, t1, 8);
+    enc.addi(t2, t2, -1);
+    enc.j(loop_top);
+    enc.bind_label(notfound);
+    enc.ebreak();
+    enc.bind_label(found);
+    enc.lw(scratch, t1, 4);
+    enc.add(scratch, t0, scratch);
 }
 
 /// Lowers one instruction in the all-spilled frame: load operands from their slots into `t0`-`t2`,
@@ -4012,41 +4059,7 @@ fn lower_inst_spilled(
         }
         Inst::CallInterface { tag, args, .. } => {
             let receiver = *args.first().ok_or(LowerError::ControlFlowUnsupported)?;
-            enc.li(Reg::A0, *tag as i32);
-            slot_load(enc, t0, slot(receiver));
-            enc.lw(t0, t0, -4);
-            let array_form = enc.new_label();
-            let have_itable = enc.new_label();
-            enc.lw(t1, t0, 0);
-            enc.srli(t1, t1, 24);
-            enc.li(t2, (ARRAY_DESC_MARK >> 24) as i32);
-            enc.branch(BranchCond::Eq, t1, t2, array_form);
-            enc.lw(t1, t0, 4);
-            enc.slli(t1, t1, 2);
-            enc.addi(t1, t1, (DESC_HEADER_WORDS * 4) as i32);
-            enc.j(have_itable);
-            enc.bind_label(array_form);
-            fault_unless_vector(enc, t0, t1, t2);
-            enc.li(t1, crate::resolver::ARRAY_ITABLE_OFFSET as i32);
-            enc.bind_label(have_itable);
-            enc.add(t1, t0, t1);
-            enc.lw(t2, t1, 0);
-            enc.addi(t1, t1, 4);
-            let loop_top = enc.new_label();
-            let notfound = enc.new_label();
-            let found = enc.new_label();
-            enc.bind_label(loop_top);
-            enc.branch(BranchCond::Eq, t2, Reg::ZERO, notfound);
-            enc.lw(scratch, t1, 0);
-            enc.branch(BranchCond::Eq, scratch, Reg::A0, found);
-            enc.addi(t1, t1, 8);
-            enc.addi(t2, t2, -1);
-            enc.j(loop_top);
-            enc.bind_label(notfound);
-            enc.ebreak();
-            enc.bind_label(found);
-            enc.lw(scratch, t1, 4);
-            enc.add(scratch, t0, scratch);
+            emit_interface_target(enc, slot(receiver), *tag, scratch);
             marshal_call_args(enc, slot, value_types, args, 0, profile, t0)?;
             enc.jalr(Reg::RA, scratch, 0);
             store_call_result(enc, slot, value_types, result);
@@ -4066,6 +4079,10 @@ fn lower_inst_spilled(
             enc.lw(t1, t0, -(entry_off as i32));
             enc.add(t0, t0, t1);
             slot_store(enc, t0, slot(result));
+        }
+        Inst::InterfaceFuncAddr { object, tag } => {
+            emit_interface_target(enc, slot(*object), *tag, scratch);
+            slot_store(enc, scratch, slot(result));
         }
         Inst::LoadTypeDesc { object } => {
             let not_null = enc.new_label();
@@ -4509,6 +4526,8 @@ fn emit_convert(enc: &mut Encoder, dest: Reg, src: Reg, kind: ConvKind) -> Resul
         ConvKind::Float32ToInt
         | ConvKind::IntToFloat32
         | ConvKind::Float64ToInt
+        | ConvKind::Float32ToUInt
+        | ConvKind::Float64ToUInt
         | ConvKind::Float32ToLong
         | ConvKind::Float64ToLong
         | ConvKind::Float32ToULong

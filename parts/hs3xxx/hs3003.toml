@@ -1,12 +1,12 @@
 # PART: Renesas HS3003, a relative-humidity and temperature sensor.
 #
-# THE PART THAT THIS MODEL COULD NOT DESCRIBE UNTIL IT GAINED A WAY TO SAY "NO IDENTITY". Its
-# datasheet describes no identity register anywhere -- there is no WHO_AM_I, no device id, no part
-# id -- and until an absent identity could be STATED, a table for it could not be written at all.
+# A part with no identity register: its datasheet describes none anywhere -- there is no WHO_AM_I,
+# no device id, no part id -- so this table states the absence (`[identity] absent`) rather than
+# leaving a field out.
 #
-# IT IS ALSO NOT REGISTER-ADDRESSED, which is the second thing a reader would assume and be wrong
+# It is also not register-addressed, which is the second thing a reader would assume and be wrong
 # about. There is no register byte to write before a read. A measurement is requested by addressing
-# the part with a write bit AND NO DATA AT ALL, and the result is collected by a separate read.
+# the part with a write bit and no data at all, and the result is collected by a separate read.
 
 [table]
 kind = "device"
@@ -24,7 +24,7 @@ notes = [
 #
 # `none`, and unlike most parts at this rung that is not merely a matter of nobody having tried.
 # A device acknowledged 0x44 on an I2C walk, which establishes only that something
-# answered that address. THE RUNG ABOVE IS UNREACHABLE FOR THIS PART BY CONSTRUCTION -- `identified`
+# answered that address. The rung above is unreachable for this part by construction -- `identified`
 # means one answered its identity register, and it has none. Confidence in this part can only come
 # from exercising it: requesting a measurement and decoding a plausible one.
 
@@ -43,7 +43,7 @@ absent = "R36DS0045EU0101 Rev.1.01 describes no identity register: the part has 
 
 # --- address -------------------------------------------------------------------------------------
 #
-# NO STRAP, AND NO SOFTWARE SETTING EITHER -- a third address model, and the one the schema's
+# No strap, and no software setting either -- a third address model, and the one the schema's
 # base-plus-straps shape fits least. The address is fixed in the part, and a different one is a
 # FACTORY option rather than anything a board or a program can change. So a board carrying two of
 # these cannot separate them by address at all; it needs two buses, or a multiplexer.
@@ -68,7 +68,7 @@ register_write_transform = "identity"
 read_protocol = "measurement-request-then-data-fetch"
 notes = "R36DS0045EU0101 Rev.1.01 ch 7.5: 'Initiate the Measurement Request by sending the 7-bit slave address followed by an eighth bit = 0 (WRITE)' -- the request carries no data byte. Ch 7.6 collects the result with a separate read. Ch 7.4: the part is factory-programmed to sleep and converts only on request, so the two transfers are ordered and a fetch issued before the conversion completes returns the previous result flagged stale by the status bits of ch 7.8."
 
-# --- WHAT IS NOT HERE ------------------------------------------------------------------------------
+# --- What is not here ------------------------------------------------------------------------------
 #
 # NO REGISTER MAP, because the part has no addressable one in the sense this model means. The
 # non-volatile resolution settings of ch 7.9 and 7.10 are reached through a programming-mode

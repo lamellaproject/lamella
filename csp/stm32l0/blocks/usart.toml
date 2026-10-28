@@ -1,7 +1,7 @@
 # BLOCK layout: the STM32L0x1 USART block. Offsets are instance-base-relative; the instance bases
 # live in ../instances.toml.
 #
-# READ THE PRESENCE TABLE BEFORE YOU TRUST THIS LAYOUT ON A GIVEN PART. RM0377 documents ONE
+# Read the presence table before you trust this layout on a given part. RM0377 documents ONE
 # USART register map for the whole L0x1 line, but the line's categories do not all implement the
 # same USART. On category 1 devices -- which is what STM32L011x is -- RM0377 table 2 records
 # USART2 as having 'no synchronous mode, no LIN mode, no dual clock, no receiver timeout, no

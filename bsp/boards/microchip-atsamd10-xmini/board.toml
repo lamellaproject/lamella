@@ -2,7 +2,7 @@
 # csp/samd10/. Kit ATSAMD10-XMINI, part ATSAMD10D14AM (24-pin QFN, 16 KB): its mEDBG virtual COM
 # port is SERCOM0 on PA10/PA11 at peripheral function C.
 #
-# THE PART IS STATED HERE BECAUSE NO DOCUMENT THIS BOARD SHIPS WITH STATES IT. The user guide says
+# The part is stated here because no document this board ships with states it. The user guide says
 # "ATSAMD10" fifteen times and never a part number, a package or a flash size. The package follows
 # from its headers naming PA10, PA11, PA17 and PA27, which only the 24-pin QFN carries -- but the
 # DENSITY does not follow from anything on the board: the 16 KB and 8 KB QFN variants are

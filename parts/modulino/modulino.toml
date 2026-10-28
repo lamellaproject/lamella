@@ -1,16 +1,16 @@
 # PART FAMILY: the Arduino Modulino nodes whose I2C interface is FIRMWARE rather than silicon.
 #
-# THESE ARE NOT SENSORS WITH DATASHEETS. Each carries its own microcontroller running Arduino's
+# These are not sensors with datasheets. Each carries its own microcontroller running Arduino's
 # firmware, and what answers on the bus is that firmware. The register map is defined by a software
 # release, not by a part, and the vendor's own document publishes none -- so these tables record
 # what makes each node FINDABLE and stop there, deliberately.
 #
-# THREE MODULINO NODES ARE NOT IN THIS FAMILY, and the split is the point rather than an accident of
+# Three Modulino nodes are not in this family, and the split is the point rather than an accident of
 # filing: Movement, Distance and Thermo carry ordinary sensors with their own manufacturers'
 # datasheets, so they are `parts/lsm6dsox`, `parts/vl53l4cd` and `parts/hs3xxx`. The Hub carries a
 # bus multiplexer with its own datasheet and is `parts/tca9548a`.
 #
-# THIS FILE IS AN AUTHORING CONVENIENCE ONLY. A member names it with `base` and states its own
+# This file is an authoring convenience only. A member names it with `base` and states its own
 # deltas; the generator resolves the base and emits a fully flattened table per part.
 
 [table]
@@ -27,7 +27,7 @@ notes = [
 
 # --- the bus -------------------------------------------------------------------------------------
 #
-# NO READ PROTOCOL IS NAMED, and that is the honest state rather than an oversight. The manuals
+# No read protocol is named, and that is the honest state rather than an oversight. The manuals
 # document an address and nothing about how to talk to the node: no register map, no command set, no
 # transfer shape. Naming a protocol here would state something no document supports.
 

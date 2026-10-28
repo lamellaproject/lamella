@@ -1,15 +1,15 @@
 # The SAM HA1G17A Xplained Pro (EV47P31A): board truth only -- what is wired to what. Chip truth
 # lives in csp/samha1/.
 #
-# THE ORDER CODE IS EV47P31A AND THE BOARD NAME IS NOT. Microchip's roster entry for this kit is an
+# The order code is EV47P31A and the board name is not. Microchip's roster entry for this kit is an
 # EV-code rather than the -XPRO form its siblings carry; the guide's own title is "SAMHA1G17A
 # Xplained Pro". Recorded because a search for "ATSAMHA1G17A-XPRO" finds nothing.
 #
-# THE PART IS A SAM D21 RELATIVE AND A LIN SYSTEM BASIS CHIP IN ONE PACKAGE. On this G-series part
+# The part is a SAM D21 relative and a LIN System Basis Chip in one package. On this G-series part
 # the transceiver is wired to SERCOM5 at PB30 and PB23, neither of which is a package pin, so a
 # board has five SERCOMs rather than six. Nothing here binds SERCOM5.
 #
-# THIS BOARD AND microchip-samha1g16a-xpro ARE THE SAME WIRING ON A LARGER PART. Both put LED0 on PA00, SW0
+# This board and microchip-samha1g16a-xpro are the same wiring on a larger part. Both put LED0 on PA00, SW0
 # on PB03 and the virtual COM port on SERCOM1 at PA27/PA28, and the two guides agree pad for pad.
 # What differs is the silicon: 128 KB flash against 64, 16 KB SRAM against 8, and a TCC3 this part
 # has and its sibling does not.
@@ -36,7 +36,7 @@ notes = [
 
 [[carriers]]
 kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
-usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+usb_vid = 0x03EB            # Note: no usb_pid row, and its absence is a sourced position rather than
 role = "vcp"                # AN OMISSION -- see microchip-samha1g16a-xpro, whose note states the reasoning and
 baud = 115200               # the evidence that a sibling kit's id cannot be borrowed.
 plan = "osc8m-8mhz"

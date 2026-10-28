@@ -1,7 +1,7 @@
 # PARTS table for the STM32U5A5, the part on the NUCLEO-U5A5ZJ-Q.
 #
-# WHY THIS IS ITS OWN FAMILY AND NOT A ROW IN csp/stm32u585, WHICH IS THE ASSUMPTION IT LOOKS LIKE
-# IT SHOULD BE. csp/stm32u585's own header states the rule this follows: a family owns ONE reference
+# Why this is its own family and not a row in csp/stm32u585, which is the assumption it looks like
+# it should be. csp/stm32u585's own header states the rule this follows: a family owns ONE reference
 # manual AND one pin-function table, and RM0456 is titled for the series while its CONTENT is
 # per sub-group. Three of that manual's structures separate this part from the U585 rather than
 # joining them:
@@ -18,8 +18,6 @@
 # tenth GPIO port the U585 does not have, and its clock-enable bit is real either way -- RCC_AHB2ENR1
 # bit 9 GPIOJEN carries no sub-group qualifier in its own bit description, while the neighboring
 # ADC12EN at bit 10 does. The presence column is the only place the manual says it.
-#
-# FLASH AND RAM HERE ARE MEASURED ON THE PART AND CORROBORATED FROM THE MANUAL, INDEPENDENTLY.
 
 [table]
 kind = "parts"

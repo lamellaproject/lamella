@@ -8,9 +8,9 @@
 // whole-group OUT or DIR register: a read-modify-write can lose a concurrent change to another
 // board line sharing the group, and boards do share groups.
 //
-// WHY THIS IS A SEPARATE FILE FROM THE SAMD21 ONE, given the two are line-for-line the same.
-// The E5x PORT block is a strict SUPERSET of the D21's and the three registers this driver touches
-// sit at identical offsets -- measured from the two `blocks/port.toml` files, not assumed:
+// Why this is a separate file from the SAMD21 one, given the two are line-for-line the same.
+// The E5x PORT block is a strict superset of the D21's, and the three registers this driver
+// touches sit at identical offsets in the two `blocks/port.toml` files:
 //
 //     DIRSET 0x08   OUTCLR 0x14   OUTSET 0x18      identical in both families
 //     E5x also adds DIRTGL 0x0C, OUTTGL 0x1C, CTRL 0x24, WRCONFIG 0x28, EVCTRL 0x2C

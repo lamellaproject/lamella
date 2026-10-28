@@ -4,7 +4,7 @@
 // a second GPIO.
 namespace Lamella.Boards
 {
-    public sealed class Rp2350AdcBinding
+    internal sealed class Rp2350AdcBinding
     {
         /// <summary>The ADC block's base address.</summary>
         public readonly uint AdcBase;

@@ -5,7 +5,7 @@
 // instance bases live in Samha1Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Samha1PortLayout
+    internal sealed class Samha1PortLayout
     {
         private Samha1PortLayout() { }
 

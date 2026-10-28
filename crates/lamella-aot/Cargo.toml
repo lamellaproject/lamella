@@ -32,6 +32,7 @@ lamella-linker = { path = "../lamella-linker", optional = true }
 # link lays them, the same one the bake and the interpreter make, so the three agree on what a table
 # is. no_std, allocation-free, no dependencies of its own.
 lamella-board-buses = { path = "../lamella-board-buses", optional = true }
+lamella-console-ring = { path = "../lamella-console-ring", optional = true }
 
 [dev-dependencies]
 lamella-dwarf = { path = "../lamella-dwarf" }
@@ -53,7 +54,7 @@ default = ["arm32"]
 # Each target backend is independently selectable, so a deployment compiles only
 # the code generators it needs -- an ARM32 device never builds the RISC-V or WASM
 # paths, and vice versa.
-arm32 = ["dep:lamella-asm-arm32"]
+arm32 = ["dep:lamella-asm-arm32", "dep:lamella-console-ring"]
 # The LINKED image path: compile, link against corlib + the runtime-support archive, and wrap the
 # result in a part's boot image. Off by default because it pulls the linker in, and a consumer that
 # only lowers (the browser export, a differential runner) wants neither.

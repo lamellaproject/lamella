@@ -6,7 +6,7 @@
 // lines, and the carrier identity. The board's facts are stated in board.toml.
 namespace Lamella.Generated
 {
-    public sealed class StStm32f746gDiscoBindings
+    internal sealed class StStm32f746gDiscoBindings
     {
         private StStm32f746gDiscoBindings() { }
 
@@ -48,7 +48,7 @@ namespace Lamella.Generated
         public const uint VCP_PCLK_HZ = 16000000;
         public const uint VCP_BRR_115200_HSI_16MHZ = 0x8B;
 
-        // -- CODEC_I2C: an st-i2c binding descriptor. BOTH PINS ARE OPEN DRAIN --
+        // -- CODEC_I2C: an st-i2c binding descriptor. Both pins are open drain --
         // a push-pull output cannot be pulled low by the device at the other end, so an
         // acknowledge is fought instead of seen and nothing ever answers, with the mux
         // perfectly correct. The timing words are the manual's own compliant points at
@@ -79,7 +79,7 @@ namespace Lamella.Generated
         public const uint CODEC_I2C_TIMINGR_100K_HSI_16MHZ = 0x30420F13;
         public const uint CODEC_I2C_TIMINGR_400K_HSI_16MHZ = 0x10320309;
 
-        // -- HEADER_I2C: an st-i2c binding descriptor. BOTH PINS ARE OPEN DRAIN --
+        // -- HEADER_I2C: an st-i2c binding descriptor. Both pins are open drain --
         // a push-pull output cannot be pulled low by the device at the other end, so an
         // acknowledge is fought instead of seen and nothing ever answers, with the mux
         // perfectly correct. The timing words are the manual's own compliant points at
@@ -141,10 +141,10 @@ namespace Lamella.Generated
         public const uint MEMORY_QSPI_FSIZE = 23;
         public const uint MEMORY_QSPI_DCR = 0x170100;
 
-        /// -- read configurations. Each word below is a COMPLETE command EXCEPT two fields, and
+        /// -- read configurations. Each word below is a complete command except two fields, and
         /// which two is the point: the functional mode is the driver's choice (indirect or
-        /// memory-mapped, both in the block layout), and THE DUMMY COUNT IS THE PART'S ANSWER.
-        /// A dummy phase covers the device's internal latency in TIME, so the cycles that cover it
+        /// memory-mapped, both in the block layout), and the dummy count is the part's answer.
+        /// A dummy phase covers the device's internal latency in time, so the cycles that cover it
         /// fall with the interface clock -- and a wrong count does not fail, it shifts every byte
         /// and returns plausible garbage. Walk the range and keep the first count that reads back a
         /// payload you already know; the anchors below say what this board answered, and at what --

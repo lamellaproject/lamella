@@ -5,7 +5,7 @@
 // instance bases live in Saml1xInstances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Saml1xGclkLayout
+    internal sealed class Saml1xGclkLayout
     {
         private Saml1xGclkLayout() { }
 

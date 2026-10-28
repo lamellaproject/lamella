@@ -5,7 +5,7 @@
 # Cross-block bring-up (RCC enables, GPIO muxing) is DRIVER code per language; only block-local
 # sequences ride here.
 #
-# THIS IS THE SAME USART DESIGN OTHER ST LINES CARRY, and every offset and field below was still
+# This is the same USART design other ST lines carry, and every offset and field below was still
 # read from THIS part's own manual. ST shares the design but not bit-for-bit: the design is shared
 # but the lines are not bit-for-bit identical -- one line implements CR3.UCESM where another
 # reserves that bit, and some fields exist only on particular part numbers. The register map and

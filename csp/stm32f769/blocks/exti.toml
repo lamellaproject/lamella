@@ -1,29 +1,29 @@
 # BLOCK: the STM32F76x/F77x external interrupt controller, plus the facts an ISR needs that are not
 # EXTI registers at all -- which NVIC vector a line arrives on, and how a line is bound to a port.
 #
-# A LINE IS THE PIN INDEX AND THE PORT IS A SEPARATE CHOICE. This vendor spells the relationship the
+# A line is the pin index and the port is a separate choice. This vendor spells the relationship the
 # opposite way round from Microchip's EIC: there EXTINT is a per-pad alternate function whose number
 # does not follow the pad, and here line x is driven by pin x of whichever port SYSCFG_EXTICR selects
 # for it. So PA5, PB5, PC5 and every other port's pin 5 all drive line 5, and only SYSCFG says which
 # one is live. Neither family may be inferred from the other, and a dispatch design that assumes a
 # line is derivable from a pad works here and is unbuildable there.
 #
-# THE CONSEQUENCE IS A COLLISION THIS TABLE CANNOT RESOLVE: two pads with the same INDEX compete for
+# The consequence is a collision this table cannot resolve: two pads with the same INDEX compete for
 # one line whatever ports they are on, and nothing in the chip reports the competition. It is the
 # same class of conflict as a pad serving two peripherals and belongs to whatever resolves pin
 # bindings.
 #
-# ROUTING A PIN NEEDS THE SYSCFG CLOCK AND EXTI HAS NO CLOCK OF ITS OWN. EXTI is not gated in RCC;
+# Routing a pin needs the SYSCFG clock and EXTI has no clock of its own. EXTI is not gated in RCC;
 # SYSCFG is, at RCC_APB2ENR bit 14. A driver that configures EXTI without enabling SYSCFG writes
 # EXTICR into a peripheral that is not clocked, the write is lost, and the line stays bound to
 # whatever port the reset value selects -- port A. That failure presents as an interrupt from the
 # wrong pin rather than as no interrupt at all.
 #
-# TWENTY-FIVE LINES AND ONLY THE FIRST SIXTEEN ARE PADS. The controller has up to 25 edge detectors;
+# Twenty-five lines and only the first sixteen are pads. The controller has up to 25 edge detectors;
 # lines 0 to 15 are the GPIO lines this table is about, and the rest are internal sources -- PVD, RTC
 # alarms, USB wakeup and the like -- which reach the same registers and are not selected by SYSCFG.
 #
-# SEVEN VECTORS FOR SIXTEEN LINES, WHICH DECIDES THE SHAPE OF A HANDLER. Lines 0 to 4 have a vector
+# Seven vectors for sixteen lines, which decides the shape of a handler. Lines 0 to 4 have a vector
 # each; lines 5 to 9 share one; lines 10 to 15 share another. So a handler for the shared vectors is
 # entered without knowing which pad fired and must read EXTI_PR to find out, and may have to service
 # several lines from one entry.

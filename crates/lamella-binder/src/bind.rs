@@ -19,9 +19,6 @@ const TUPLE_CHUNK: usize = 7;
 /// conversion, they share every member, and metadata has only the second name for either. So the
 /// binder answers with the instantiation and no pass after this one has to know what a tuple is.
 ///
-/// Past seven elements the rest nest in `TRest`, one chunk of seven at a time, which is what csc
-/// emits and what the runtime's own `ToString` walks.
-/// One `System.ValueTuple` over exactly these arguments, WITHOUT the chunking.
 ///
 /// For a caller whose list is already in the eight-slot shape -- seven elements and a nested rest
 /// -- because [`value_tuple`] would then split it a SECOND time and wrap the rest twice. That is

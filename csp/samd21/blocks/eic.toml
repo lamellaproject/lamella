@@ -1,33 +1,33 @@
 # BLOCK: the SAM D21 external interrupt controller, plus the two facts an ISR needs that are not
 # registers at all -- which NVIC vector the controller is delivered on, and which clock gate feeds it.
 #
-# WHY THIS BLOCK IS THE THING BLOCKING GPIO EVENTS. A pin-change callback needs three layers under
+# Why this block is the thing blocking GPIO events. A pin-change callback needs three layers under
 # it: a managed surface, a runtime seam from an interrupt to a delegate, and a chip fact saying
 # which interrupt a pad can even raise. The third is this file, and until it existed no driver on
 # this family had a line number to configure.
 #
-# A LINE IS NOT A PAD ON THIS VENDOR, AND THAT IS THE WHOLE DIFFICULTY. EXTINT is a PERIPHERAL
-# FUNCTION selected in the pad's PMUX, and THE EXTINT NUMBER DOES NOT FOLLOW THE PAD NUMBER. It
+# A line is not a pad on this vendor, and that is the whole difficulty. EXTINT is a PERIPHERAL
+# FUNCTION selected in the pad's PMUX, and the EXTINT number does not follow the pad number. It
 # looks as though it does -- for most pads the line is the pad index modulo sixteen, and PA16 raising
-# EXTINT[0] fits that -- and SIX PADS BREAK IT: PA24 raises EXTINT[12] where the pattern says 8,
+# EXTINT[0] fits that -- and six pads break it: PA24 raises EXTINT[12] where the pattern says 8,
 # PA25 raises 13 where it says 9, PA27 raises 15 where it says 11, PA28 raises 8 where it says 12,
 # PA30 raises 10 where it says 14, and PA31 raises 11 where it says 15. A derivation calibrated on
 # the pads that fit is wrong on those six and right everywhere a casual check would look, so the
 # mapping is transcribed per pad and never computed.
 #
-# SEVERAL PADS SHARE ONE EXTINT NUMBER and only one of them can be live, because the line is the
+# Several pads share one EXTINT number and only one of them can be live, because the line is the
 # thing that interrupts and the pad merely feeds it. Nothing in the chip reports the competition.
 # That is the same class of conflict as a pad serving two peripherals, and it belongs to whatever
 # resolves pin bindings rather than to this table.
 #
-# SIXTEEN LINES, AND THE REGISTERS ARE WIDER THAN THAT. The device states 16 external interrupts and
+# Sixteen lines, and the registers are wider than that. The device states 16 external interrupts and
 # names them EXTINT[15:0] in its feature list and its signal table. The interrupt and wake registers
 # below carry bits up to 17 -- WAKEUP's own field description reads [x=17..0] -- and this family has
 # nothing behind bits 16 and 17. A register layout is a SUPERSET of what a device implements, in the
 # same way a memory map is a superset of what a package bonds, and a consumer that sized a line
 # count from the register width would invent two lines.
 #
-# ONE INTERRUPT FOR ALL SIXTEEN, WHICH DECIDES THE SHAPE OF A HANDLER. The whole controller is
+# One interrupt for all sixteen, which decides the shape of a handler. The whole controller is
 # delivered on a single NVIC line, so an ISR is entered without yet knowing which pad fired and must
 # read INTFLAG to find out. A handler may therefore have to service SEVERAL lines from one entry.
 # NMI is separate and is not an NVIC line at all.

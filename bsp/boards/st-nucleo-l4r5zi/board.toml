@@ -1,13 +1,13 @@
 # BOARD binding: the ST NUCLEO-L4R5ZI. Chip truth lives in csp/stm32l4r5/.
 #
-# ONE REFERENCE BOARD, SIX PRODUCTS. UM2179 covers MB1312 under six order codes -- NUCLEO-L496ZG,
+# One reference board, six products. UM2179 covers MB1312 under six order codes -- NUCLEO-L496ZG,
 # -L496ZG-P, -L4A6ZG, -L4P5ZG, -L4R5ZI and -L4R5ZI-P -- with different parts on the same copper, and
 # its schematic is drawn for all of them. So the board id selects the part row here, and every fact
 # below was checked against this product's own column of the manual. The -P board is a different
 # product: its part has the external-SMPS pinout, and this file does not describe it.
 #
-# THE VIRTUAL COM PORT IS LPUART1 ON PG7 AND PG8, AND TWO PROPERTIES OF THAT PAIR DECIDE HOW IT IS
-# DRIVEN. LPUART1's divisor is 256 x fck / baud (RM0432 section 51.4.7), where a USART's is
+# The virtual COM port is LPUART1 on PG7 and PG8, and two properties of that pair decide how it is
+# driven. LPUART1's divisor is 256 x fck / baud (RM0432 section 51.4.7), where a USART's is
 # fck / baud, and the manual forbids any divisor below 0x300. And both pads are on the VDDIO2 rail,
 # which is isolated at reset until IOSV in PWR_CR2 is set. So the order is PWREN, then IOSV, then
 # the pins, then LPUART1.
@@ -42,13 +42,13 @@ default = true              # this board states no [[plans]] row, so the carrier
 
 # --- control lines ---------------------------------------------------------------------------
 #
-# ALL THREE LEDS ARE ACTIVE HIGH. UM2179 says so for the three at once, and the schematic shows two
+# All three LEDs are active high. UM2179 says so for the three at once, and the schematic shows two
 # different reasons for it. LD2 and LD3 are driven from their pins through a series resistor into
 # the LED's ANODE, with the cathode at ground. LD1 is driven through a unity-gain follower (U8),
 # which does not invert, so HIGH lights it too -- while PC7 itself sources only the follower's
 # input current.
 #
-# THE USER BUTTON IS ACTIVE HIGH AS WELL. R42, a 220K, holds PC13 DOWN, and the switch ties it UP
+# The user button is active high as well. R42, a 220K, holds PC13 DOWN, and the switch ties it UP
 # to VDD_MCU -- so the pin reads LOW at rest and HIGH while pressed. A driver that enables a
 # pull-up and waits for a low edge waits forever. The pull-down is on the board, so the pin needs
 # no internal one.

@@ -176,8 +176,7 @@ fn segment_name(segment: &str) -> (&str, bool) {
 /// property's type, or a method's return type (a method group resolves to its return
 /// type for the purpose of continuing a `.` chain). `None` if no such member exists.
 fn member_type(model: &Model, ty: &TypeSymbol, name: &str) -> Option<TypeSymbol> {
-    let mut current = model.get_by_symbol(&member_lookup_type(ty));
-    while let Some(info) = current {
+    for (_, info) in model.base_class_chain(&member_lookup_type(ty)).resolved() {
         if let Some(field) = info.find_field(name) {
             return Some(field.ty.clone());
         }
@@ -187,7 +186,6 @@ fn member_type(model: &Model, ty: &TypeSymbol, name: &str) -> Option<TypeSymbol>
         if let Some(method) = info.methods_named(name).next() {
             return Some(method.return_type.clone());
         }
-        current = info.base.as_ref().and_then(|base| model.get_by_symbol(base));
     }
     None
 }
@@ -599,8 +597,7 @@ fn type_members(model: &Model, ty: &TypeSymbol) -> Vec<Completion> {
     let mut method_order: Vec<Box<str>> = Vec::new();
     let mut method_groups: BTreeMap<String, MethodGroup> = BTreeMap::new();
 
-    let mut current = model.get_by_symbol(&member_lookup_type(ty));
-    while let Some(info) = current {
+    for (_, info) in model.base_class_chain(&member_lookup_type(ty)).resolved() {
         for field in &info.fields {
             if values.insert(field.name.to_string()) && !method_groups.contains_key(&*field.name) {
                 out.push(Completion::simple(
@@ -640,7 +637,6 @@ fn type_members(model: &Model, ty: &TypeSymbol) -> Vec<Completion> {
                 group.count += 1;
             }
         }
-        current = info.base.as_ref().and_then(|base| model.get_by_symbol(base));
     }
 
     for name in &method_order {
@@ -757,8 +753,7 @@ fn typed_name(ty: &TypeSymbol, name: &str) -> Box<str> {
 /// Describes the member `name` on `ty` or a base: a field/property's typed name, or a
 /// method's signature with its overload count.
 fn describe_member(model: &Model, ty: &TypeSymbol, name: &str) -> Option<Hover> {
-    let mut current = model.get_by_symbol(&member_lookup_type(ty));
-    while let Some(info) = current {
+    for (_, info) in model.base_class_chain(&member_lookup_type(ty)).resolved() {
         if let Some(field) = info.find_field(name) {
             return Some(Hover {
                 kind: CompletionKind::Field,
@@ -784,7 +779,6 @@ fn describe_member(model: &Model, ty: &TypeSymbol, name: &str) -> Option<Hover> 
                 signature: signature.into(),
             });
         }
-        current = info.base.as_ref().and_then(|base| model.get_by_symbol(base));
     }
     None
 }
@@ -882,15 +876,13 @@ fn enclosing_call(source: &str, offset: usize) -> Option<(usize, usize)> {
 fn method_overloads(model: &Model, ty: &TypeSymbol, name: &str) -> Vec<Box<str>> {
     let mut signatures = Vec::new();
     let mut seen: BTreeSet<String> = BTreeSet::new();
-    let mut current = model.get_by_symbol(&member_lookup_type(ty));
-    while let Some(info) = current {
+    for (_, info) in model.base_class_chain(&member_lookup_type(ty)).resolved() {
         for method in info.methods_named(name) {
             let signature = method_signature_label(method);
             if seen.insert(signature.clone()) {
                 signatures.push(signature.into());
             }
         }
-        current = info.base.as_ref().and_then(|base| model.get_by_symbol(base));
     }
     signatures
 }

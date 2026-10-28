@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Microchip
 {
-    public sealed class Samd21Cnano
+    internal sealed class Samd21Cnano
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = MicrochipSamd21CnanoBindings.BOARD_MODEL;
@@ -20,7 +20,7 @@ namespace Lamella.Boards.Microchip
         /// <summary>The SW0 user switch on PB11, ACTIVE LOW: pressing it drives the line to ground,
         /// so a pressed switch reads <see cref="PinValue.Low"/>.</summary>
         /// <remarks>OPEN IT WITH <see cref="ButtonMode"/>. There is no pull-up resistor on this
-        /// board, so a plain input floats. THIS PAD IS SHARED: it is the debugger's DBG2 line as
+        /// board, so a plain input floats. This pad is shared: it is the debugger's DBG2 line as
         /// well as the switch, so a host-side tool driving that line and a program reading the
         /// button are reaching for the same pad.</remarks>
         public static readonly int ButtonPin =
@@ -45,7 +45,7 @@ namespace Lamella.Boards.Microchip
         private static GpioDriver MakeGpio() { return new Samd21GpioDriver(); }
 
         /// <summary>The family PORT driver this board bound.</summary>
-        /// <remarks>THE DRIVER SPANS BOTH PORT GROUPS AND THIS PACKAGE BONDS PART OF EACH. A pin
+        /// <remarks>The driver spans both port groups and this package bonds part of each. A pin
         /// number the package does not carry is addressable and connected to nothing, which is why
         /// the constants above name only pads this board's own guide names against this part
         /// number.</remarks>

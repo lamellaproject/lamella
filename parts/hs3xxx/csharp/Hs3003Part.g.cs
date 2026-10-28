@@ -7,7 +7,7 @@
 // run time.
 namespace Lamella.Generated
 {
-    public sealed class Hs3003Part
+    internal sealed class Hs3003Part
     {
         private Hs3003Part() { }
         public const string PART = "hs3003";
@@ -17,7 +17,7 @@ namespace Lamella.Generated
         public const string SOURCING_FACTS = "primary";
         public const string SOURCING_VALIDATION = "none";
 
-        /// identity: THIS PART HAS NONE, and that is a fact about the part rather than a gap in this table. There is no register to read, so nothing can confirm which part answered an address -- the `identified` validation rung is unreachable for it by construction, and confidence has to be earned by exercising it instead.
+        /// identity: this part has none, and that is a fact about the part rather than a gap in this table. There is no register to read, so nothing can confirm which part answered an address -- the `identified` validation rung is unreachable for it by construction, and confidence has to be earned by exercising it instead.
         public const string IDENTITY_ABSENT = "R36DS0045EU0101 Rev.1.01 describes no identity register: the part has no WHO_AM_I, device id or part id, and its interface is a measurement request followed by a data fetch rather than an addressable register map. Nothing on the bus can confirm WHICH part answered this address, so two parts of different types sharing 0x44 are indistinguishable to any reader.";
 
         /// address: a base plus which pin contributes which bit. The part states the range; a carrier fixes the straps, so no strap is defaulted here.

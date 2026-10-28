@@ -5,8 +5,8 @@
 # the F0 from AHBENR. `[base, rcc_en_off, rcc_en_bit]` states each gate in full so that no
 # consumer has to know which line it is looking at. `-1` = the row gates nothing (the RCC itself).
 #
-# THE ROWS BELOW ARE THE CATEGORY 1 SET, WHICH IS WHAT STM32L011x IS, AND THAT IS A NARROWER CLAIM
-# THAN THE MEMORY MAP MAKES. RM0377 documents one memory map for the whole L0x1 line and a
+# The rows below are the category 1 set, which is what STM32L011x is, and that is a narrower claim
+# than the memory map makes. RM0377 documents one memory map for the whole L0x1 line and a
 # SEPARATE table of which peripherals each category actually implements. The two disagree about
 # this part in a way that a transcription of the map alone cannot see:
 #

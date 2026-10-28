@@ -3,24 +3,24 @@
 # Function ids are the ST alternate-function numbers (AF0..AF15) that the
 # AFRL/AFRH nibbles select.
 #
-# THE ALTERNATE-FUNCTION TABLE IS SIXTEEN FUNCTION COLUMNS WIDE, and a cell means nothing without
+# The alternate-function table is sixteen function columns wide, and a cell means nothing without
 # its column header: the header is the only thing that says which AF NUMBER the signal belongs to.
 #
-# THE TABLE IS IN THE DATASHEET, NOT THE REFERENCE MANUAL, and the manual has a table that looks
+# The table is in the datasheet, not the reference manual, and the manual has a table that looks
 # like it is. RM0090's "Table 185. Alternate function mapping" sits inside its Ethernet section and
 # carries a single column, AF11, for the MAC's own signals; the manual's own instruction is to refer
 # to the alternate-function table in the datasheets for the detailed mapping. A reader who matched
 # the title would transcribe an Ethernet pin map.
 #
-# AF12 IS NOT "THE MEMORY CONTROLLER'S NUMBER", AND THAT IS THE ONE THING TO CARRY AWAY FROM THIS
-# FILE. Its column is headed FMC/SDIO/OTG2_FS: three unrelated peripherals share it, so the number
+# AF12 is not "the memory controller's number", and that is the one thing to carry away from this
+# file. Its column is headed FMC/SDIO/OTG2_FS: three unrelated peripherals share it, so the number
 # alone does not say which one a pin reaches. PB15's AF12 cell is OTG_HS_DP, a USB data line -- mux
 # it as part of a memory bus and the pin drives a differential USB signal at a memory's timing.
 # The memory controller IS uniform at AF12 across all thirty-eight of its signals below -- but that is
 # a fact about these thirty-eight cells and not a rule a thirty-ninth will follow, so a signal not
 # listed here has to be taken from its own pin's row.
 #
-# SEVERAL PINS HERE CARRY A SECOND FUNCTION A BOARD COULD HAVE USED. PA10 is USART1_RX at AF7 and
+# Several pins here carry a second function a board could have used. PA10 is USART1_RX at AF7 and
 # OTG_FS_ID at AF10; PE11 is FMC_D8 at AF12 and LCD_G3 at AF14; PF11 is FMC_SDNRAS at AF12 and
 # DCMI_D12 at AF13. That is chip multiplexing rather than a conflict -- a pin offers many functions
 # and the mux picks one -- and the distinction matters because only a board file can say which of a
@@ -60,7 +60,7 @@ source = "DS9405 Rev 13 Table 12 page 75: PA10's AF7 cell is USART1_RX. Its AF10
 # AF5 IS HEADED SPI1/2/3/4/5/6, so six peripherals share the number and it says which SPI no more
 # than AF12 says which memory controller. Every row below names the one it read.
 #
-# THE MOSI SIGNAL HAS TWO PINS AND ONE OF THEM IS SPOKEN FOR. SPI5_MOSI appears at AF5 on PF9 and
+# The MOSI signal has two pins and one of them is spoken for. SPI5_MOSI appears at AF5 on PF9 and
 # again on PF11, and PF11's AF12 cell is FMC_SDNRAS -- a signal the memory bus in this same file
 # uses. Choosing the alternative would put a serial line on a memory strobe, so a pin map that
 # offered both without saying so would be worse than one that offers neither.
@@ -91,7 +91,7 @@ source = "DS9405 Rev 13 Table 12 page 81, the AF5 column headed SPI1/2/3/4/5/6: 
 
 # --- FMC data bus: sixteen lines, all AF12 ----------------------------------------------------
 #
-# NOT IN PIN ORDER AND NOT IN ONE PORT. D0 and D1 are the two HIGHEST pins of port D while D2 and D3
+# Not in pin order and not in one port. D0 and D1 are the two HIGHEST pins of port D while D2 and D3
 # are its two lowest, and the run from D4 crosses into port E and back again for D13 to D15. Each
 # line is a row of its own for that reason: there is no base plus a count that would reproduce it.
 
@@ -314,7 +314,7 @@ source = "DS9405 Rev 13 Table 12 page 81: PG5's AF12 cell reads FMC_A15/FMC_BA1 
 
 # --- FMC control: byte lanes, the three SDRAM strobes, clock, clock enable and chip select -----
 #
-# THE LAST THREE ARE THE ONLY ROWS HERE THAT NAME A CONTROLLER BANK, and they name the SECOND one.
+# The last three are the only rows here that name a controller bank, and they name the SECOND one.
 # A device's chip select and clock enable are per-bank signals, so these three rows are the whole
 # difference between a memory that answers at one window and one that answers at another; the other
 # thirty-five signals are shared by both banks and say nothing about which is wired.

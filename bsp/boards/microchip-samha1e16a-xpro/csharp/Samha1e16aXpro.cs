@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Microchip
 {
-    public sealed class Samha1e16aXpro
+    internal sealed class Samha1e16aXpro
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = MicrochipSamha1e16aXproBindings.BOARD_MODEL;
@@ -21,7 +21,7 @@ namespace Lamella.Boards.Microchip
             Samha1GpioDriver.LogicalPin(MicrochipSamha1e16aXproBindings.BUTTON0_PORT_BASE, MicrochipSamha1e16aXproBindings.BUTTON0_PIN);
 
         /// <summary>The mode the user button wants.</summary>
-        /// <remarks>THIS KIT'S GUIDE DOES NOT SAY WHETHER AN EXTERNAL PULL-UP IS FITTED, where the
+        /// <remarks>This kit's guide does not say whether an external pull-up is fitted, where the
         /// Curiosity Nano guides state outright that none is. <see cref="PinMode.InputPullUp"/> is
         /// nevertheless the right answer under BOTH readings: if the board fits no pull-up the
         /// internal one is required, and if it fits one the internal resistor pulls the same way and
@@ -43,7 +43,7 @@ namespace Lamella.Boards.Microchip
         private static GpioDriver MakeGpio() { return new Samha1GpioDriver(); }
 
         /// <summary>The family PORT driver this board bound.</summary>
-        /// <remarks>THE DRIVER SPANS BOTH PORT GROUPS AND THIS PACKAGE BONDS PADS IN ONLY ONE. A
+        /// <remarks>The driver spans both port groups and this package bonds pads in only one. A
         /// group-B pin number is addressable here and reaches no package pin, which is why the
         /// constants above name only pads this board's own guide names.</remarks>
         public GpioDriver CreateGpioDriver()

@@ -2,14 +2,14 @@
 # lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
 # uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
-# ONE MAP FOR BOTH PARTS. Table 12-1 carries a SINGLE base-address column and the SAM L10 and SAM
+# One map for both parts. Table 12-1 carries a SINGLE base-address column and the SAM L10 and SAM
 # L11 share every value below -- see parts.toml, which states the difference table that settles it.
 #
-# THE RECORD IS THE PCHCTRL FAMILIES', because on this architecture which APB mask register gates
+# The record is the PCHCTRL families', because on this architecture which APB mask register gates
 # an instance is per-instance rather than always APBC. On this part it is two different registers
 # for the blocks below: PORT is gated from APBAMASK and SERCOM0..2 from APBCMASK.
 #
-# THIS FAMILY HAS FOUR NVIC LINES PER SERCOM AND THE `irq` FIELD HOLDS ONE. That is a schema
+# This family has four NVIC lines per SERCOM and the `irq` field holds one. That is a schema
 # limit and it is stated here rather than resolved by choosing one:
 #
 #     SERCOM0   22: INTFLAG bit 0   23: bit 1   24: bit 2   25: bits 3-6
@@ -17,8 +17,8 @@
 #     SERCOM2   30: bit 0           31: bit 1   32: bit 2   33: bits 3-6
 #
 # Every other SAM family on this arm gives a SERCOM ONE line, so a reader who has seen those will
-# not expect four. `irq = -1` below therefore means "THE SCHEMA HAS ONE SLOT AND THIS PART HAS
-# FOUR" and NOT "this instance has no interrupt" -- which is what -1 means everywhere else, and is
+# not expect four. `irq = -1` below therefore means "the schema has one slot and this part has
+# four" and NOT "this instance has no interrupt" -- which is what -1 means everywhere else, and is
 # why it is spelled out. Nothing consumes a SERCOM's IRQ constant today (the generator emits it and
 # no driver reads it), so emitting nothing is honest rather than lossy; emitting ONE of four would
 # be a published constant that is wrong three ways out of four.
@@ -61,7 +61,7 @@ apb_mask_offset = 0x1C
 apb_bit = 2
 irq = -1
 
-# PRESENT ON THE 32-PIN PARTS ONLY. Table 4-1's note 3 states that 24-pin packages carry SERCOM0
+# Present on the 32-pin parts only. Table 4-1's note 3 states that 24-pin packages carry SERCOM0
 # and SERCOM1 alone, and Table 1-1's SERCOM column reads 2 for every D part. Both parts declared in
 # parts.toml are 32-pin E parts, so this row is real for both of them; a later D part would need
 # the refusal stated per PART, the way csp/samha1 states which SERCOM its series spends.
@@ -92,7 +92,7 @@ apb_mask_offset = -1
 apb_bit = -1
 irq = -1
 
-# THE ONLY PORT GROUP. Its base matches no relative on this arm -- see parts.toml's table. The
+# The only port group. Its base matches no relative on this arm -- see parts.toml's table. The
 # 0x80 group stride is printed in the register descriptions and is not used here, because there is
 # no second group to derive.
 [[instances]]

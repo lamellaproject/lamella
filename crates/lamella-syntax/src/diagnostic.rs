@@ -20,9 +20,6 @@ pub enum DiagnosticKind {
     /// `CS1547`: `void` written where a type is required -- here, the referent of a `ref` return
     /// (`ref void M()`).
     ///
-    /// **A `ref` RETURN NAMES STORAGE, AND `void` NAMES NONE.** csc reports it at the `void` token
-    /// rather than at the `ref`, measured, and with the same text it uses for a `void` local: the
-    /// keyword is not usable in this context, whichever context that is.
     VoidByReference,
     /// A delimited comment was not closed with `*/` before the end of the file.
     UnterminatedDelimitedComment,
@@ -79,15 +76,9 @@ pub enum DiagnosticKind {
     FileDirectiveAfterFirstToken,
     /// A `#!` shebang in a compilation that is not a file-based program.
     ///
-    /// A separate code from [`Self::FileDirectiveOutsideFileBasedProgram`], and csc's wording
-    /// names scripts as well -- the two features share the mode and not the diagnostic.
     ShebangOutsideFileBasedProgram,
     /// Two null-suppression operators in a row, `s!!`.
     ///
-    /// The operator is an assertion to the nullable analysis and asserting twice says nothing the
-    /// first did not, so csc refuses it rather than accepting it as a no-op -- measured. A build
-    /// with no nullable analysis at all still has to refuse it, or it accepts a program csc does
-    /// not.
     DuplicateNullSuppression,
     /// A directive line carried tokens past its content where only white space,
     /// a single-line comment, or the end of the line was allowed (9.5).
@@ -119,21 +110,9 @@ pub enum DiagnosticKind {
     TupleTooFewElements,
     /// An element access supplied NO index -- `a[]` (12.8.11.2).
     ///
-    /// **`[]` IS A RANK SPECIFIER EVERYWHERE ELSE, WHICH IS WHY THIS IS EASY TO ACCEPT BY
-    /// ACCIDENT.** `int[] a`, `new int[]{1}` and `typeof(int[])` all contain the same two tokens
-    /// and all are legal; only after a VALUE do they have to hold at least one index. An empty
-    /// argument list is a perfectly good empty list, so nothing upstream objects and the access
-    /// binds -- against a `params` indexer it even binds to an empty array and runs. csc refuses
-    /// it at the `]`, and the message is about the missing value rather than about indexers.
     ValueExpectedInElementAccess,
     /// A named argument was followed by an unnamed one, below C# 7.2 (12.6.2.1).
     ///
-    /// **A CONDITION ABOUT THE ARGUMENT LIST AND NOTHING ELSE, WHICH IS WHY IT IS A SYNTAX
-    /// DIAGNOSTIC.** No method, no overload and no parameter is consulted: from C# 4.0 to 7.1 a
-    /// named argument may be followed only by named ones, and that is visible in the tokens. csc
-    /// reports it at the offending POSITIONAL argument, and at every version below 7.2 --
-    /// including the versions with no named arguments at all, where it lands ALONGSIDE the version
-    /// code rather than instead of it (measured at C# 3, which gives CS8024 and this).
     NonTrailingNamedArgument,
     /// A parenthesised pre-processing expression was missing its `)` (9.5.2).
     CloseParenExpected,
@@ -166,9 +145,6 @@ pub enum DiagnosticKind {
     /// An interpolation hole, or its alignment after the `,`, held no expression at all --
     /// `$"{}"`, `$"{n,}"` (csc `CS1733`).
     ///
-    /// A DIFFERENT CODE FROM `CS1525`, measured: csc says *Expected expression* where a term is
-    /// simply ABSENT and *Invalid expression term* where one is present and cannot begin an
-    /// expression. Both sentences exist in csc and they are not interchangeable.
     ExpectedExpression,
     /// An interpolated string's hole was opened with `{` and the string ended before its `}`
     /// (csc `CS8076`).
@@ -198,18 +174,10 @@ pub enum DiagnosticKind {
     /// A conditional expression written directly in an interpolation hole, where its `:` is read
     /// as the start of the format specifier -- `$"{c ? a : b}"` (csc `CS8361`).
     ///
-    /// **THE `:` ALWAYS ENDS THE HOLE; csc DOES NOT DISAMBIGUATE, IT REPORTS.** Measured, and it
-    /// is the reason this diagnostic exists at all rather than a cleverer scan: the fix csc names
-    /// -- parenthesize -- is the only one, because inside `(...)` the `:` is at a nesting depth
-    /// the format specifier never reaches.
     ConditionalInInterpolation,
     /// An interpolated verbatim string spelled `@$"..."` rather than `$@"..."`, under a dialect
     /// before C# 8.0 (csc `CS8401`).
     ///
-    /// **NOT the `Feature '...'` gate family**, which is why it is its own kind: csc gives the
-    /// two orderings different rungs (`$@` is C# 6.0, `@$` is C# 8.0) and refuses the late one
-    /// with a sentence of its own that names neither a feature nor the CURRENT version. Measured
-    /// at every dialect from 1 to 8.
     AtDollarRequiresLaterVersion,
     /// A primary expression was expected, but the token there cannot begin one
     /// (ECMA-334 1st ed, 14.5).
@@ -271,15 +239,7 @@ pub enum DiagnosticKind {
     /// **ONE PER OFFENDING ITEM, AT ITS OWN START** -- measured: `[Obsolete] public namespace N { }`
     /// draws TWO, at the `[` and at the `public`, not one for the declaration.
     ///
-    /// **TOP-LEVEL ONLY.** Inside a namespace BODY csc answers `CS0116` instead, at a different
-    /// position -- a nested `[Obsolete] namespace Inner { }` is parsed as an attempt at a member, so
-    /// the diagnostic is about what a namespace may CONTAIN rather than about the declaration.
-    /// Applying this rule uniformly would report a code csc does not.
     ///
-    /// **AND THE NESTED CASE IS STILL AN ACCEPTS-INVALID, MEASURED: lcsc reports NOTHING for
-    /// `namespace Outer { [Obsolete] namespace Inner { } }` where csc reports CS0116.** This rule
-    /// did not close that; it is a separate `CS0116` item and is recorded here rather than left to
-    /// look closed by association.
     NamespaceCannotHaveModifiersOrAttributes,
     /// `CS1730`: an `[assembly:]` or `[module:]` section appeared after a member (24.2).
     ///
@@ -293,6 +253,12 @@ pub enum DiagnosticKind {
     /// Reported at the `using` of each directive out of place, and the directive is then read and
     /// set aside, so the declarations after it still parse.
     UsingMustPrecedeMembers,
+    /// `CS8915`: a `global using` directive (C# 10) followed an ordinary one in the same compilation
+    /// unit. Reported at the `global` of each one out of order.
+    GlobalUsingMustPrecedeUsings,
+    /// `CS8914`: a `global using` directive (C# 10) was written inside a namespace declaration,
+    /// block or file-scoped. Reported at its `global`.
+    GlobalUsingInNamespace,
     /// `operator` was not followed by an overloadable operator (17.9).
     OverloadableOperatorExpected,
     /// A `foreach` header was missing the `in` keyword (15.8.4).
@@ -329,31 +295,17 @@ pub enum DiagnosticKind {
     /// A second file-scoped namespace declaration (`namespace N;`) appeared inside the first one's
     /// body (csc CS8954).
     ///
-    /// MEASURED, and the shape is not the one the message suggests: a file-scoped namespace's body
-    /// runs to the end of the file, so a second one is never a SIBLING -- it is always written
-    /// inside the first. csc reports it at the second declaration's NAME.
     OnlyOneFileScopedNamespace,
     /// A top-level statement written after a type or namespace declaration (csc CS8803).
     ///
-    /// MEASURED: csc answers this at every dialect, including those without top-level
-    /// statements at all, and in place of the feature gate rather than beside it -- the program
-    /// is wrong in its ORDER whichever rung it is compiled at. Reported once, at the first
-    /// statement out of place.
     TopLevelStatementsMustPrecedeMembers,
     /// A file-scoped namespace declaration and a brace-delimited one were nested inside one another
     /// (csc CS8955), in either order.
     ///
-    /// MEASURED: this is a rule about the immediate CONTAINER, not about the file as a whole. A
-    /// `namespace M { }` written after a file-scoped namespace is inside its body and draws this; a
-    /// `namespace M { }` written BEFORE one does not, because nothing is nested. csc reports it at
-    /// the inner declaration's NAME.
     BothFileScopedAndNormalNamespaces,
     /// A file-scoped namespace declaration was preceded by a type or namespace declaration (csc
     /// CS8956).
     ///
-    /// MEASURED: `using` directives, `extern alias` declarations and `[assembly:]` / `[module:]`
-    /// attribute sections may precede it; a type or a namespace may not. csc reports it at the
-    /// file-scoped declaration's NAME.
     FileScopedNamespaceMustPrecedeMembers,
     /// An `__arglist` parameter marker appeared before other parameters; it must
     /// close the list (csc CS0257). Tokenized only under the typedref knob.
@@ -363,11 +315,6 @@ pub enum DiagnosticKind {
     ArglistNotValidInThisContext,
     /// `CS4033`: the `await` operator outside an async method (ECMA-334 5th ed, 12.8.8.1).
     ///
-    /// MEASURED in three shapes (statement, initializer, and inside `Main`): csc reports 4033 --
-    /// the "async method" wording -- for every one lcsc can produce, because 4032's wording
-    /// belongs to async lambdas, which do not exist here. Raised by the parser, which owns the
-    /// context bit; the operand still parses and binds, so an unawaitable operand reports its
-    /// own diagnostic beside this one exactly as csc does.
     AwaitOutsideAsync,
     /// `CS4003`: `await` used as a declared identifier inside an async method (12.8.8.1, which
     /// reserves the word there and offers `@await` as the escape).
@@ -382,19 +329,7 @@ pub enum DiagnosticKind {
 
 /// The namespace a diagnostic code belongs to.
 ///
-/// **`CS` MEANS WHAT csc MEANS BY IT, ALWAYS.** A code is a search key: a developer who hits
-/// `CS0649` will look it up and land on
-/// csc's documentation, so lcsc may only spell a condition `CS` when csc has that same concept. It
-/// follows that a condition csc has NO concept of cannot borrow a `CS` number -- an unused one
-/// today is one a future Roslyn release may claim, and then the same key means two things
-/// depending on which compiler emitted it.
 ///
-/// **`LAM` IS FOR EXACTLY THOSE CONDITIONS, AND IT IS A SMALL FAMILY.** Almost everything routes to
-/// csc's own codes: a BCL surface we do not ship reports as `CS0246`/`CS0234` (which is also how
-/// nanoFramework expresses a restricted platform, measured), a construct above the selected dialect
-/// reports as the `CS8022` family, and a language feature missing a compiler-required member reports
-/// as `CS0518`/`CS0656`. What is left is the condition none of those describe: the dialect permits
-/// the construct and THIS BUILD cannot produce it.
 ///
 /// **The user-visible payoff is that the prefix says which kind of problem it is.** A `CS` code is a
 /// statement about the language; a `LAM` code is a statement about this build's coverage, and the
@@ -429,8 +364,6 @@ impl CodeNamespace {
 impl DiagnosticKind {
     /// Which namespace this kind's code belongs to.
     ///
-    /// `Cs` for everything csc also has a concept of, which is nearly all of it. A new arm here is
-    /// a claim that csc has NO code for the condition -- check before adding one.
     ///
     #[must_use]
     pub fn namespace(&self) -> CodeNamespace {
@@ -504,6 +437,8 @@ impl DiagnosticKind {
             DiagnosticKind::NamespaceCannotHaveModifiersOrAttributes => 1671,
             DiagnosticKind::GlobalAttributeMustPrecedeMembers => 1730,
             DiagnosticKind::UsingMustPrecedeMembers => 1529,
+            DiagnosticKind::GlobalUsingMustPrecedeUsings => 8915,
+            DiagnosticKind::GlobalUsingInNamespace => 8914,
             DiagnosticKind::OverloadableOperatorExpected => 1037,
             DiagnosticKind::InExpected => 1515,
             DiagnosticKind::FeatureRequiresLaterVersion { current, .. } => current.feature_gate_code(),
@@ -683,6 +618,12 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::UsingMustPrecedeMembers => f.write_str(
                 "A using clause must precede all other elements defined in the namespace except \
                  extern alias declarations",
+            ),
+            DiagnosticKind::GlobalUsingMustPrecedeUsings => f.write_str(
+                "A global using directive must precede all non-global using directives.",
+            ),
+            DiagnosticKind::GlobalUsingInNamespace => f.write_str(
+                "A global using directive cannot be used in a namespace declaration.",
             ),
             DiagnosticKind::OverloadableOperatorExpected => {
                 f.write_str("Overloadable operator expected")

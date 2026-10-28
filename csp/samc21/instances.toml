@@ -2,14 +2,14 @@
 # lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
 # uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
-# THE RECORD IS NOT THE SAM D21 LINE'S, AND THE DIFFERENCE IS THE POINT. Those families carry
+# The record is not the SAM D21 line's, and the difference is the point. Those families carry
 # `apbc_bit` -- the APB gate is always APBC there, so the register is a constant and only the bit
 # varies. On this family it is not: the SERCOMs are gated from APBCMASK, PORT from APBBMASK, and
 # SERCOM6/7 from APBDMASK. So a row states `apb_mask_offset` -- WHICH mask register, as an offset
 # from MCLK's base -- alongside its bit. That is the same record `csp/same54` uses, and the
 # generator's PCHCTRL arm reads it.
 #
-# EIGHT SERCOM ROWS, AND ONLY SIX EXIST ON THE 64-PIN PART. SERCOM6 and SERCOM7 are behind
+# Eight SERCOM rows, and only six exist on the 64-pin part. SERCOM6 and SERCOM7 are behind
 # AHB-APB Bridge D at 0x43000000 and are present only on the N. They are rowed because they are
 # real placed silicon on the part that has them; parts.toml states which package carries what.
 
@@ -87,7 +87,7 @@ apb_mask_offset = 0x1C
 apb_bit = 6
 irq = 14
 
-# THE 100-PIN PART'S TWO EXTRA SERCOMS, BEHIND BRIDGE D. Absent from the 64-pin package entirely.
+# The 100-pin part's two extra SERCOMs, behind bridge D. Absent from the 64-pin package entirely.
 # Their gate is APBDMASK (0x20), not APBCMASK, and their NVIC lines are SERCOM0's and SERCOM1's.
 [[instances]]
 name = "sercom6"

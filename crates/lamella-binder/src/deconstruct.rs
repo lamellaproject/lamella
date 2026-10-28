@@ -53,9 +53,6 @@ impl Binder {
 
     /// Binds a deconstruction in VALUE position -- `M((a, b) = t)`, `var q = ((a, b) = t)`.
     ///
-    /// **ONLY THE ASSIGNING FORM HAS A VALUE.** A declaration among the targets is `CS8185`,
-    /// reported at the `var` of a designation and at the declaring target otherwise, which is
-    /// csc's position for each.
     ///
     /// **THE RESULT TYPE IS THE TARGETS' TYPES, NOT THE VALUE'S**: `long a; int b;
     /// ((a, b) = (40, 2))` is `(long, int)`, measured. So the tuple handed back is built from the
@@ -159,11 +156,6 @@ impl Binder {
     /// Declares every target a failed deconstruction would have declared, and says why each
     /// implicitly typed one has no type.
     ///
-    /// **A FAILURE THAT DECLARES NOTHING TURNS ONE ERROR INTO ONE PER LATER USE.** `var (a, b) =
-    /// (1, 2, 3); return a;` is `CS8132` from csc and nothing else; without this it was `CS8132`
-    /// plus a `CS0103` blaming `a` for not existing, in a statement that is not at fault -- and
-    /// then, once the name existed, a `CS0165` blaming it for being unassigned. Both are the same
-    /// mistake: a variable the source DID declare, reported as though the source had not.
     ///
     /// **`CS8130` IS NARROWER THAN "THE DECONSTRUCTION FAILED", AND THE MEASUREMENT IS THE ONLY
     /// WAY TO KNOW WHICH WAY.** `var (a, b) = (1, 2, 3)` is `CS8132` ALONE -- both variables still
@@ -496,16 +488,7 @@ impl Binder {
     /// The parameter types of the `Deconstruct` a target count selects, or `None` when the type
     /// has none that fits.
     ///
-    /// **CHOSEN BY ARITY, NOT BY OVERLOAD RESOLUTION**, because there are no argument types to
-    /// resolve over: every argument is an `out` variable whose type the method itself supplies.
-    /// csc admits two arities on one type and picks by the number of targets, measured.
     ///
-    /// The three refusals are csc's and each was measured: a `static` one does not qualify
-    /// (`CS0176` beside `CS8129`), a non-`void` one does not (`CS8129` alone), and a `ref`
-    /// parameter where `out` is wanted does not (`CS1620` beside `CS8129`).
-    /// The parameter types of ANY `Deconstruct` of this arity, usable or not -- the candidate a
-    /// refusal is about. Used only to give the rejected call real argument types so the ordinary
-    /// invocation path can say what is wrong with it.
     fn deconstruct_candidate_parameters(
         &mut self,
         ty: &TypeSymbol,

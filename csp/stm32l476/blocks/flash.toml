@@ -4,14 +4,14 @@
 #
 # Two facts, and each `sources` entry names the one it backs.
 #
-# THE WRITE UNIT IS A 64-BIT DOUBLE WORD AND IT IS NOT A CHOICE. Unlike the F4 and F7 controllers,
+# The write unit is a 64-bit double word and it is not a choice. Unlike the F4 and F7 controllers,
 # which let software pick a parallelism, this one programs 72 bits at a time -- 64 bits of data and
 # 8 of ECC -- and RM0351 is flat about it: only a double word can be programmed, and a program at an
 # address that is not double-word aligned is refused. So a consumer cannot get a narrower unit here
 # by asking for one; software that wants to write a single 32-bit word completes the double word
 # with the erase value and programs both halves together.
 #
-# THAT ECC IS ALSO WHY A UNIT SHOULD BE TREATED AS WRITE-ONCE BETWEEN ERASES. The code is computed
+# That ECC is also why a unit should be treated as write-once between erases. The code is computed
 # over the double word being programmed, so a second program of the same double word recomputes it
 # over content the first program already changed. RM0351 does not offer the F4's `successive writes
 # that only clear bits` escape, and a placement rule that relies on one is not portable to this part.

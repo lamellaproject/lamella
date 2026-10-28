@@ -3,7 +3,7 @@
 # The older of the two members. It holds ONE set of measurement results and offers two operating
 # modes, where its sibling holds three sets and offers three.
 #
-# WHAT A READER SHOULD TAKE FROM THIS FILE BEFORE ANY OTHER FACT IN IT: the identity value below is
+# What a reader should take from this file before any other fact in it: the identity value below is
 # the SAME value the BME688 answers, at the same register, in the same two-address range. The
 # identity register narrows a reading to this family and cannot go further, so nothing that
 # distinguishes this part from its sibling can be established by reading it.
@@ -25,7 +25,7 @@ notes = [
 #
 # Primary: every fact below is read from this part's own datasheet, the document `sources` cites.
 #
-# WHAT THIS TABLE DELIBERATELY DOES NOT STATE, so that a reader can tell a fact from a gap:
+# What this table deliberately does not state, so that a reader can tell a fact from a gap:
 #   - the temperature, pressure and humidity trimming parameters and their compensation arithmetic;
 #   - the gas resistance conversion and the heater resistance calculation, which turns a target
 #     heater temperature into a register code;
@@ -44,7 +44,7 @@ validation = "none"
 #
 # One accepted value, and the datasheet documents no sample-revision alternatives for it.
 #
-# THE SET HAS ONE MEMBER AND STILL DOES NOT IDENTIFY THE PART. Everywhere else in this catalog
+# The set has one member and still does not identify the part. Everywhere else in this catalog
 # the identity register answers the question the address could not; here it answers a strictly
 # smaller one. A reading of 0x61 at 0xD0 on an address in this range establishes that the part is a
 # BME680 OR a BME688, and no further read of this register will ever separate the two.
@@ -57,7 +57,7 @@ notes = "The BME688 answers this same value at this same register. What separate
 
 # --- the gas enable bit, which is NOT where the sibling puts it -----------------------------------
 #
-# THE SHARPEST DIFFERENCE IN THE FAMILY AND THE ONE WITH THE QUIETEST FAILURE. Both members put
+# The sharpest difference in the family and the one with the quietest failure. Both members put
 # this register at 0x71 and both spell the field `run_gas`. This part places it at bit 4 and the
 # BME688 places it at bit 5. The datasheets even give the two bits different names, `run_gas_l`
 # here and `run_gas_h` there, which is the vendor acknowledging the move.

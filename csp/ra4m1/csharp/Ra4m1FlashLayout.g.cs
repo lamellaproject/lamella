@@ -5,7 +5,7 @@
 // instance bases live in Ra4m1Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Ra4m1FlashLayout
+    internal sealed class Ra4m1FlashLayout
     {
         private Ra4m1FlashLayout() { }
 

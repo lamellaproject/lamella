@@ -5,7 +5,7 @@
 // instance bases live in Samg55Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Samg55PmcLayout
+    internal sealed class Samg55PmcLayout
     {
         private Samg55PmcLayout() { }
 

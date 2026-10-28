@@ -1,11 +1,11 @@
 # The SAM HA1G16A Xplained Pro (ATSAMHA1G16A-XPRO): board truth only -- what is wired to what.
 # Chip truth lives in csp/samha1/.
 #
-# THE PART IS A SAM D21 RELATIVE AND A LIN SYSTEM BASIS CHIP IN ONE PACKAGE. On this G-series part
+# The part is a SAM D21 relative and a LIN System Basis Chip in one package. On this G-series part
 # the transceiver is wired to SERCOM5 at PB30 and PB23, neither of which is a package pin, so a
 # board has five SERCOMs rather than six. Nothing here binds SERCOM5.
 #
-# THE VIRTUAL COM PORT'S TWO PADS WERE CHECKED AGAINST THE PART DATASHEET. Atmel-9426 Table 4-8
+# The virtual COM port's two pads were checked against the part datasheet. Atmel-9426 Table 4-8
 # names SERCOM1 PAD[0] on PA27 and PAD[1] on PA28 WITHOUT naming a function column, and
 # DS20005841E Table 7-1 gives both pads SERCOM1 in column C with no column-D SERCOM at all -- so
 # the letter is not a choice on these two pads, and the guide's omission costs nothing here.
@@ -32,7 +32,7 @@ notes = [
 
 [[carriers]]
 kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
-usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+usb_vid = 0x03EB            # Note: no usb_pid row, and its absence is a sourced position rather than
 role = "vcp"                # AN OMISSION. A product id is a property of the debugger's FIRMWARE:
 baud = 115200               # this kit's user guide never prints one, and the EDBG user guide
 plan = "osc8m-8mhz"         # Atmel-42096 describes the composite device without giving an id

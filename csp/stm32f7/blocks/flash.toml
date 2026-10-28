@@ -4,16 +4,16 @@
 #
 # Two facts, and each `sources` entry names the one it backs.
 #
-# THE WRITE UNIT IS A SOFTWARE CHOICE ON THIS PART, AND THE VALUE HERE IS THE ONE A BOARD AT AN
-# ORDINARY SUPPLY CAN TAKE. PSIZE selects x8, x16, x32 or x64 -- one, two, four or eight bytes per
+# The write unit is a software choice on this part, and the value here is the one a board at an
+# ordinary supply can take. PSIZE selects x8, x16, x32 or x64 -- one, two, four or eight bytes per
 # program operation -- capped by supply voltage. x64 needs an external VPP of 8 to 9 V; at 2.7-3.6 V
 # without it the cap is x32, so four bytes is the largest unit this part can be programmed in on a
 # board that does not supply VPP.
 #
-# WARNING: RM0385 TABLE 6 HAS FIVE VOLTAGE COLUMNS AND FOUR PARALLELISM VALUES, because the x16 cell
+# Warning: RM0385 table 6 has five voltage columns and four parallelism values, because the x16 cell
 # SPANS two of the columns. A reader who pairs them off one by one is wrong for two of the five.
 #
-# READ IN RM0385 RATHER THAN CARRIED ACROSS FROM RM0090. The F4 and F7 controllers reach the same
+# Read in RM0385 rather than carried across from RM0090. The F4 and F7 controllers reach the same
 # answer, and this file records the answer RM0385 gives, because a value taken from a sibling family
 # is right until the day it is not and nothing marks the day.
 

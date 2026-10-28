@@ -17,16 +17,16 @@ pub(crate) fn attached() -> Vec<SerialPortDesc> {
     lamella_wire_host::list_serial()
 }
 
-/// The port `target` names among `ports`: for `serial:<id>`, the one port whose USB serial number
+/// The port `target` names among `ports`: for `usb-serial:<id>`, the one port whose USB serial number
 /// contains `<id>`, ignoring case; any other target is a port name already.
 ///
 /// **A SERIAL THAT MATCHES SEVERAL PORTS IS REFUSED, NOT RESOLVED BY PICKING ONE**, since a write to
 /// the wrong board succeeds. The rule is `lamella-wire-host`'s `resolve_target`, over this list.
 ///
 /// # Errors
-/// A serial number that matches no port, or more than one.
+/// A serial number that matches no port, or more than one, each as the sentence a refusal says.
 pub(crate) fn resolve(target: &str, ports: &[SerialPortDesc]) -> Result<String, String> {
-    let Some(wanted) = target.strip_prefix("serial:") else {
+    let Some(wanted) = target.strip_prefix("usb-serial:") else {
         return Ok(target.to_owned());
     };
     let needle = wanted.to_ascii_lowercase();
@@ -39,11 +39,10 @@ pub(crate) fn resolve(target: &str, ports: &[SerialPortDesc]) -> Result<String, 
         .collect();
     match matching.as_slice() {
         [one] => Ok((*one).to_owned()),
-        [] => Err(format!(
-            "no attached port has a USB serial number containing {wanted:?}; `lamella devices` lists them"
-        )),
+        [] => Err(format!("{target} is not attached.")),
         many => Err(format!(
-            "{wanted:?} is in the USB serial number of {} attached ports ({}); give more of it, or the port's name",
+            "cannot open {target}: {wanted:?} is in the USB serial number of {} attached ports ({}); give more of \
+             it, or the port's name.",
             many.len(),
             many.join(", ")
         )),
@@ -107,7 +106,7 @@ mod tests {
         }
     }
 
-    /// **`serial:` NAMES ONE PORT OR NONE.** A part of a serial number, in either case, finds the
+    /// **`usb-serial:` NAMES ONE PORT OR NONE.** A part of a serial number, in either case, finds the
     /// port carrying it; a port with no serial number is never found; a serial two ports share is
     /// refused with both names; and any other target is a port name already.
     #[test]
@@ -118,13 +117,13 @@ mod tests {
             port("COM76", Some("PROBEALPHA001")),
             port("COM3", None),
         ];
-        assert_eq!(resolve("serial:e6640000", &ports), Ok("COM75".to_owned()));
+        assert_eq!(resolve("usb-serial:e6640000", &ports), Ok("COM75".to_owned()));
         assert_eq!(resolve("COM3", &ports), Ok("COM3".to_owned()));
         assert_eq!(resolve("/dev/ttyACM0", &ports), Ok("/dev/ttyACM0".to_owned()));
-        let refusal = resolve("serial:PROBEALPHA", &ports).expect_err("two ports share it");
+        let refusal = resolve("usb-serial:PROBEALPHA", &ports).expect_err("two ports share it");
         assert!(refusal.contains("COM11, COM76"), "{refusal}");
-        let refusal = resolve("serial:NOSUCH", &ports).expect_err("nothing carries it");
-        assert!(refusal.contains("`lamella devices`"), "{refusal}");
+        let refusal = resolve("usb-serial:NOSUCH", &ports).expect_err("nothing carries it");
+        assert_eq!(refusal, "usb-serial:NOSUCH is not attached.");
     }
 
     /// **ON LINUX THE PORTS ARE READ FROM SYSFS, AND ONLY USB ONES**: a CDC port and a USB-serial

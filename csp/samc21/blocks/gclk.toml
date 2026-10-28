@@ -2,7 +2,7 @@
 # paths touch (partial, append-only). Offsets are GCLK-base-relative; the base lives in
 # ../instances.toml. WHICH generator runs at WHAT rate is a PLAN fact (board.toml), never here.
 #
-# TWO ARRAYS, INDEXED BY DIFFERENT THINGS -- the same hazard the SAM E54 block records, and why
+# Two arrays, indexed by different things -- the same hazard the SAM E54 block records, and why
 # this family cannot ride the SAM D21 line's UART arm:
 #
 #   GENCTRL[n]   n is a GENERATOR. A generator takes a clock source and divides it.

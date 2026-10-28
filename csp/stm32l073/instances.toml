@@ -1,11 +1,11 @@
 # INSTANCE map for the STM32L073 (L0x3, category 5): where each block copy sits, plus its RCC
 # clock-enable routing. `-1` = the row gates nothing (the RCC itself).
 #
-# THE PORT SET IS CATEGORY 5's, AND GPIOE IS THE ROW THAT MAKES THIS A FAMILY. RM0367 table 2
+# The port set is category 5's, and GPIOE is the row that makes this a family. RM0367 table 2
 # gives category 5 GPIOA, GPIOB and GPIOC full-featured, GPIOD full-featured where category 3 has
 # [2] alone, and GPIOE full-featured where category 3 has nothing at all.
 #
-# THIS MAP DESCRIBES THE DIE AND THE PARTS ROW DESCRIBES THE PACKAGE, and on this family the two
+# This map describes the die and the parts row describes the package, and on this family the two
 # say different things. No LQFP64 pad reaches port E, so the parts row lists none -- and the port
 # is still here, because an instance map states where a block copy SITS and not whether a package
 # brings it out. A 100-pin variant would bond those pads with nothing in this file changing.

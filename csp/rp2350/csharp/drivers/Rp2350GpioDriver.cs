@@ -3,7 +3,7 @@ using System.Device.Gpio;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Rp2350GpioDriver : GpioDriver
+internal sealed class Rp2350GpioDriver : GpioDriver
 {
     private readonly uint _resetsClr;
     private readonly uint _resetsDone;
@@ -31,7 +31,7 @@ public sealed class Rp2350GpioDriver : GpioDriver
     /// <summary>Reserves the pins whose bits are set, so <c>SetPinMode</c> refuses them. A board
     /// passes the lines it must keep -- its debug transport, a fixed peripheral's control pin --
     /// because only the board knows which those are.</summary>
-    /// <remarks>THE PICO 2 W IS WHY THIS EXISTS ON THIS FAMILY. Its wireless part sits on GP23,
+    /// <remarks>The Pico 2 W is why this exists on this family. Its wireless part sits on GP23,
     /// GP24, GP25 and GP29, and GP25 is the pin that drives the user LED on a Pico 2. So the line
     /// that blinks a Pico 2 asserts the radio's chip select on a Pico 2 W, from identical source and
     /// with nothing to see.</remarks>
@@ -42,7 +42,7 @@ public sealed class Rp2350GpioDriver : GpioDriver
     /// <paramref name="partnerPads"/>, a second pad the board wires to the same net. Setting a mode
     /// on a paired pin first leaves its partner high-impedance with no pull, so the partner neither
     /// drives the line nor loads it.</summary>
-    /// <remarks>THE PIMORONI PICO PLUS 2 BOARDS ARE WHY. Their header positions 26 to 28 reach
+    /// <remarks>The Pimoroni Pico Plus 2 boards are why. Their header positions 26 to 28 reach
     /// GPIO26 to GPIO28 and, through 1k, the converter's pads GPIO40 to GPIO42. A pad keeps its
     /// reset pull-down until something configures it, so without this a pulled-up input on one of
     /// those positions sits near half the rail.</remarks>

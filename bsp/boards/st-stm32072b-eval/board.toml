@@ -2,21 +2,21 @@
 # which is a different KIND of product: it exists to demonstrate every peripheral of the part at
 # once. Most of what this file has to say is in what it DOES NOT contain.
 #
-# TWENTY POPULATED DEVICE BLOCKS, AND THE SCHEMA HAS ROOM FOR THREE OF THEM. UM1714's own
+# Twenty populated device blocks, and the schema has room for three of them. UM1714's own
 # introduction lists what is fitted: a motor-control connector, USB full-speed, RS232, RS485, an
 # audio DAC and a microphone ADC, touch-sensing buttons, a TFT LCD, CAN, IrDA, an IR LED and an IR
 # receiver, a light-dependent resistor, a microSD card, HDMI CEC on two connectors, a smart-card
 # slot, an RF EEPROM and a temperature sensor. What lands below is four LEDs, a button and a
 # joystick.
 #
-# AND THE LIMIT IS NOT THE COUNT -- IT IS THE NUMBER OF SHAPES. A `[[devices]]` row is EITHER
+# And the limit is not the count -- it is the number of shapes. A `[[devices]]` row is EITHER
 # pin-wired (a GPIO line with a level) OR bus-wired (a role plus an address, the I2C shape). A
 # colour TFT reached over SPI with a chip select is neither. A microSD with its own select and a
 # card-detect line is neither. A smart card is neither. So the omissions below are not a backlog to
 # be worked through -- each one is the same missing shape, and adding fifty rows of the two shapes
 # that exist would not reach any of them.
 #
-# THIS BOARD HAS NO VIRTUAL COM PORT, WHICH NO OTHER BOARD HERE CAN SAY. Its debugger is an
+# This board has no virtual COM port, which no other board here can say. Its debugger is an
 # ST-LINK/V2 rather than a V2-1, and UM1714 describes no VCP anywhere: the serial console leaves
 # through an RS-232 transceiver to a 9-pin D connector, so it reaches a host only through a cable
 # and an adapter that are not part of the board. Every carrier kind the model has -- `stlink-vcp`,
@@ -24,7 +24,7 @@
 # board. This one has none, so the board declares no carrier at all, and that is a statement rather
 # than an omission.
 #
-# AND UM1714's IO TABLE HAS TWO ASSIGNMENT COLUMNS, NOT ONE. Table 34 is headed "STM32072B-EVAL
+# And UM1714's IO table has two assignment columns, not one. Table 34 is headed "STM32072B-EVAL
 # general IO assignment" and "STM32072B-EVAL motor control IO assignment", and the same pins carry
 # different board-level meanings in the two: PA1 is the light sensor's output in one column and
 # MC_BusVoltage / Emergency_STOP3 in the other; PA6 and PA7 are unused in one and motor encoder
@@ -55,7 +55,7 @@ notes = [
 
 # --- control lines ---------------------------------------------------------------------------
 #
-# ALL FOUR LEDS ARE ACTIVE LOW, and the schematic shows why in one direction: the LED's anode sits
+# All four LEDs are active low, and the schematic shows why in one direction: the LED's anode sits
 # at +3V3 and its cathode returns through a series resistor to the MCU pin, so the pin SINKS the
 # current. Read backwards, a board's LEDs are lit from reset until a program drives them high.
 # That is the opposite of the two Nucleo-144 boards, the F429 Discovery and the F769 Discovery,
@@ -64,10 +64,10 @@ notes = [
 # the two: where an ST manual's prose and its own schematic have disagreed about a LED, the
 # schematic held.
 #
-# THE TAMPER KEY IS ACTIVE LOW TOO, and for once that is the arrangement a reader expects: R195, a
+# The tamper key is active low too, and for once that is the arrangement a reader expects: R195, a
 # 4K7, holds the pin up to VDD and the switch shorts it to ground.
 #
-# THE JOYSTICK IS THE OTHER WAY: its five lines are annotated on the schematic as "input pins with
+# The joystick is the other way: its five lines are annotated on the schematic as "input pins with
 # pull-down", so each rests LOW and reads HIGH while its direction is held. One board, both
 # conventions again.
 

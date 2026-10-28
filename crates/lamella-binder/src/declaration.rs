@@ -36,6 +36,7 @@ pub fn collect_model(unit: &CompilationUnit) -> Model {
 /// reference assemblies). The caller links bases once the model is complete.
 pub fn collect_into(model: &mut Model, unit: &CompilationUnit) {
     collect_declared(model, unit);
+    model.add_global_usings(&unit.global_usings);
     model.link_nested_type_parameters();
 }
 
@@ -57,6 +58,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
     match member {
         NamespaceMember::Namespace(declaration) => {
             let inner = join_namespace(namespace, &declaration.name);
+            model.declare_namespace(&inner);
             for inner_member in &declaration.members {
                 collect_namespace_member(inner_member, &inner, model);
             }
@@ -355,10 +357,6 @@ fn fold_const(expr: &Expr, lookup: &dyn Fn(&str) -> Option<Literal>) -> Option<L
 /// (`PinMode.Input` names a type this pass may not have collected). `None` means "not yet known",
 /// never "required" -- only the second pass settles that.
 ///
-/// **`default(T)` IS NOT `fold_const`'s BUSINESS AND IS THIS FUNCTION'S**, because a default
-/// argument is the only constant position where the shape appears at all. It is folded to the
-/// value csc EMITS rather than to the one the language describes, and those differ in a way no
-/// reading of 15.6.2.13 would predict:
 ///
 /// ```text
 ///     default(int)     Int32 0            the type's zero, as expected
@@ -366,9 +364,6 @@ fn fold_const(expr: &Expr, lookup: &dyn Fn(&str) -> Option<Literal>) -> Option<L
 ///     default(S)       NullReference      MEASURED. A STRUCT, spelled as a null reference.
 /// ```
 ///
-/// The third row is the one to keep: a struct has no null value, and csc writes a `NullReference`
-/// constant for it regardless -- so any predefined value type folds to its zero and everything
-/// else, struct or not, folds to null.
 pub fn fold_parameter_default(expr: &Expr) -> Option<Literal> {
     if let ExprKind::DefaultValue(Some(target)) = &expr.kind {
         return Some(default_value_literal(target));
@@ -447,20 +442,7 @@ pub(crate) fn const_expr_references(expr: &Expr, out: &mut Vec<Box<str>>) {
 /// becoming `long.MinValue` and `2^31` becoming `int.MinValue` -- with the special type each takes.
 /// `None` for every other operand, which negates ordinarily.
 ///
-/// **ONE FUNCTION BECAUSE THE RULE HAD TWO IMPLEMENTATIONS AND THE MISSING CASE WAS MISSING FROM
-/// BOTH.** `bind_unary` applies it at a use site and [`fold_const_unary`] at a constant
-/// initializer, and each spelled its own `matches!`. Both admitted the unsuffixed spelling ONLY,
-/// so `long v = -9223372036854775808L;` was `CS0023 Operator '-' cannot be applied to operand of
-/// type 'ulong'` in five positions -- expression, `const` field, `case` label, and the hex
-/// spelling `-0x8000000000000000L` -- while csc accepts all five. Adding the case carefully at one
-/// of the two sites would have left the other refusing, and nothing would have said so.
 ///
-/// **THE TWO CLAUSES DIFFER BY EXACTLY THE SUFFIX, AND THAT IS THE STANDARD AND NOT AN OVERSIGHT.**
-/// 9.4.4.2 admits *"no integer-type-suffix or the integer-type-suffix L or l"* for the `long` case
-/// and *"no integer-type-suffix"* alone for the `int` case. Measured against csc: `-2147483648L` is
-/// an ordinary `long` negation and needs no rule, while `-9223372036854775808UL`, `-...U` and
-/// `-...LU` are `CS0023` under BOTH compilers -- a `u` forces `ulong` and the rule does not reach
-/// it.
 ///
 /// **A PARENTHESIZED OPERAND IS NOT THIS RULE**: the clause says the literal must be *"the token
 /// immediately following a unary minus operator token"*, so `-(9223372036854775808L)` is `CS0023`,
@@ -544,16 +526,6 @@ const SINGLE_NAN_BITS: u32 = 0xFFC0_0000;
 /// A `float` or `double` constant of `value`: rounded to single precision when `suffix` is
 /// [`RealSuffix::Float`], and held at [`NAN_BITS`] when it is a NaN, whichever NaN it is.
 ///
-/// **THE BITS OF A NaN ARE THE ONE PART OF A FOLDED VALUE THE BUILD HOST CHOOSES.** IEEE 754 fixes
-/// every other result of `+`, `-`, `*`, `/` and a cast exactly, and `%` is exact too, but it leaves
-/// a NaN's sign and payload to the implementation: for `0.0 / 0.0` x86 makes the negative NaN
-/// above and AArch64 the positive `0x7FF8000000000000`, and the C library that computes `%` makes
-/// whichever its authors chose. A compiler that kept the host's NaN would build a different
-/// assembly on each kind of machine from one source. csc writes .NET's NaN for EVERY NaN constant:
-/// one made from operands that are not NaN, one that takes a NaN operand of either sign or with a
-/// payload, a negated NaN, a converted one, and a NaN read from a referenced assembly's constant.
-/// So every real constant the binder computes from another or reads from a reference is made
-/// here. One converted from an integer is never a NaN.
 pub(crate) fn real_constant(value: f64, suffix: RealSuffix) -> Literal {
     let value = if suffix == RealSuffix::Float {
         f64::from(value as f32)
@@ -752,8 +724,11 @@ fn constant_member(
             let type_name = declared_type_name(declaration);
             let enclosing = named_symbol(namespace, &type_name);
             let full = qualified_type_name(namespace, &type_name);
-            let type_parameters =
-                binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+            let type_parameters = binder.enter_declared_type_parameters(
+                &enclosing,
+                &declaration.type_parameters,
+                &declaration.constraints,
+            );
             let mut folded = false;
             for member in &declaration.members {
                 match member {
@@ -927,8 +902,11 @@ fn delegate_defaults(
         type_name: &type_name,
         enclosing: &enclosing,
     };
-    let scope =
-        binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+    let scope = binder.enter_declared_type_parameters(
+        &enclosing,
+        &declaration.type_parameters,
+        &declaration.constraints,
+    );
     store_member_defaults(binder, &owner, "Invoke", 0, &declaration.parameters, None);
     binder.exit_type_parameters(scope);
 }
@@ -1180,6 +1158,13 @@ pub fn constraints_by_parameter(
                 SyntaxConstraint::ValueType(_) => slot.value_type = true,
                 SyntaxConstraint::DefaultConstructor(_) => slot.default_constructor = true,
                 SyntaxConstraint::Type(reference) if is_notnull_constraint(reference) => {}
+                // `unmanaged` (C# 7.3) is the value type constraint and more, and adds no type. A
+                // type declared with that name turns it back into a type where the name is in
+                // scope, which only the binder's scope can see (`Binder::unmanaged_names_a_type`).
+                SyntaxConstraint::Type(reference) if is_unmanaged_constraint(reference) => {
+                    slot.unmanaged = true;
+                    slot.value_type = true;
+                }
                 SyntaxConstraint::Type(reference) => slot.types.push(bind_type(
                     match &reference.kind {
                         lamella_syntax::ast::TypeRefKind::Nullable(underlying) => underlying,
@@ -1198,9 +1183,23 @@ pub fn constraints_by_parameter(
 /// not share with csc, which binds the name first.
 #[must_use]
 pub fn is_notnull_constraint(reference: &lamella_syntax::ast::TypeRef) -> bool {
+    is_contextual_constraint(reference, "notnull")
+}
+
+/// Whether a written type constraint is spelled as the `unmanaged` constraint (C# 7.3): the bare
+/// name, not verbatim. It is that constraint unless a type named `unmanaged` is found where the
+/// clause is written, which makes it a class type constraint (ECMA-334 7th ed, 15.2.5); the
+/// binder's scope decides that ([`crate::Binder::unmanaged_names_a_type`]). It reaches the model as
+/// [`TypeParameterConstraints::unmanaged`].
+#[must_use]
+pub fn is_unmanaged_constraint(reference: &lamella_syntax::ast::TypeRef) -> bool {
+    is_contextual_constraint(reference, "unmanaged")
+}
+
+fn is_contextual_constraint(reference: &lamella_syntax::ast::TypeRef, keyword: &str) -> bool {
     !reference.verbatim_name
         && matches!(&reference.kind, lamella_syntax::ast::TypeRefKind::Name(parts)
-            if parts.len() == 1 && &*parts[0] == "notnull")
+            if parts.len() == 1 && &*parts[0] == keyword)
 }
 
 /// Builds the [`TypeInfo`] for one type declaration, collecting its fields and
@@ -1856,10 +1855,6 @@ mod tests {
     /// carry the mangled name AND the declared parameter names through; a version that dropped the
     /// names would leave every hand-built test green and print `Box<>` to every real programmer.
     ///
-    /// It stops at the table on purpose: declaring a generic type draws the declaration-phase
-    /// LAM0001, and a declaration-phase error withholds body binding entirely (csc does the same),
-    /// so a test that put `Box<int,int>` in a METHOD BODY would measure the phase order and report
-    /// nothing about this.
     #[test]
     fn a_source_declared_generic_reaches_cs0305_through_the_real_type_table() {
         use crate::diagnostic::Diagnostic;

@@ -7,7 +7,7 @@
 // run time.
 namespace Lamella.Generated
 {
-    public sealed class Bme280Part
+    internal sealed class Bme280Part
     {
         private Bme280Part() { }
         public const string PART = "bme280";

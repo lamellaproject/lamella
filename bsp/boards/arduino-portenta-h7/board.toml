@@ -1,7 +1,7 @@
 # BOARD binding: the Arduino Portenta H7, an STM32H747XIH6 on Arduino's ABX00042 in the Portenta
 # form factor.
 #
-# THIS IS A MODULE RATHER THAN A BOARD WITH HEADERS, AND ITS DEBUG PATH IS OFF-BOARD. Nothing on
+# This is a module rather than a board with headers, and its debug path is off-board. Nothing on
 # the module is a debugger and nothing on it is a serial bridge; the datasheet's block diagram names
 # every fitted part and the debug signals leave through the two 80-pin high-density connectors,
 # where its own high-density pinout carries SWDIO and SWCK. So a probe reaches this part only
@@ -9,24 +9,24 @@
 # USB-C connector J3 is wired to the microcontroller's own device controller, which is what the
 # carrier row below names.
 #
-# ONE DATASHEET COVERS THREE PRODUCTS AND THIS FILE IS TRUE OF ALL THREE, WHICH IS WORTH STATING
-# BECAUSE IT IS A COINCIDENCE OF WHAT IS MODELLED RATHER THAN A CLAIM THAT THEY ARE THE SAME BOARD.
+# One datasheet covers three products and this file is true of all three, which is worth stating
+# because it is a coincidence of what is modelled rather than a claim that they are the same board.
 # The collective datasheet's own comparison table separates ABX00042 from ABX00045 and ABX00046 on
 # exactly two axes: the security element (a second one, an NXP SE050C2, is fitted only to ABX00042)
 # and connectivity (the wireless module is absent from ABX00045). It gives all three the same
 # microcontroller, the same 8 Mbytes of SDRAM and the same 16 Mbytes of QSPI flash. Every fact below
 # is on the common side of that split.
-# AND NOTHING A DEBUG PORT CAN READ SEPARATES THEM. The part is identical, so its identification
+# And nothing a debug port can read separates them. The part is identical, so its identification
 # registers are identical; the difference is which components are populated, and a populated-part
 # difference is invisible to every instrument here. A model number is the only discriminator, and it
 # has to be told rather than discovered.
 #
-# THERE IS NO USER BUTTON AND THE ABSENCE IS READ RATHER THAN ASSUMED. The word button does not
+# There is no user button and the absence is read rather than assumed. The word button does not
 # occur anywhere in this module's datasheet, and the same publisher's manual for the carrier-less
 # board in the same family names its RESET and BOOT0 buttons explicitly -- so a document that names
 # buttons where they exist names none here. No `gpio-in` row is stated.
 #
-# NOT MODELLED, AND NAMED SO EACH OMISSION IS DELIBERATE: the 8 Mbytes of SDRAM and the 16 Mbytes of
+# Not modelled, and named so each omission is deliberate: the 8 Mbytes of SDRAM and the 16 Mbytes of
 # QSPI NOR flash (both fitted, both belonging to the external-memory stratum), the wireless module,
 # both security elements, the Ethernet PHY, the MIPI-DSI bridge and its camera and display
 # connectors, the power management circuit and its battery connector, and the two 80-pin
@@ -56,7 +56,7 @@ notes = [
 
 # --- the carrier ------------------------------------------------------------------------------
 #
-# THE MICROCONTROLLER'S OWN USB DEVICE CONTROLLER, over the USB-C connector J3. No bridge sits
+# The microcontroller's own USB device controller, over the USB-C connector J3. No bridge sits
 # between it and the host, so the row carries no vendor identity: a bridge has a USB identity of its
 # own to state and this path has only the device the target itself presents.
 
@@ -66,12 +66,12 @@ default = true
 
 # --- control lines ----------------------------------------------------------------------------
 #
-# ALL THREE LEGS SINK, AND THE POLARITY IS READ FROM THE WIRING RATHER THAN FROM A WORD. The
+# All three legs sink, and the polarity is read from the wiring rather than from a word. The
 # schematic joins DL1's three anodes to the +3V1 rail and returns each cathode through its own
 # 330 ohm resistor to a microcontroller pin, so the pin is the driven end below the diode and a leg
 # lights when its pin is driven LOW.
 #
-# THE OPENING WRITE IS NOT THE ONE A DRIVER WOULD EXPECT ON THIS PART. Pins come out of reset in
+# The opening write is not the one a driver would expect on this part. Pins come out of reset in
 # ANALOG mode rather than as inputs, so a program that sets or clears an output register without
 # first putting the pin in output mode drives nothing at all. That is a chip fact and it lives on
 # the gpio block table; it is repeated here because these three rows are the first thing anyone

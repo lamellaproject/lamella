@@ -2,7 +2,7 @@
 # transcribed here (partial, append-only, schema total). Offsets are PM-base-relative; the base
 # lives in ../instances.toml.
 #
-# THE BIT ASSIGNMENT IS NOT THE SAMD21's AND THE OVERLAP IS THE TRAP. Both families put SERCOM0 at
+# The bit assignment is not the SAMD21's and the overlap is the trap. Both families put SERCOM0 at
 # bit 2, so the first bit anyone checks agrees -- and the D21 continues SERCOM1..5 through bit 7,
 # where this family runs out of SERCOMs at bit 4 and spends bits 5..7 on TCC0, TC1 and TC2. A mask
 # borrowed from the D21 would gate a timer believing it was gating a serial port.

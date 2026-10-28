@@ -1,7 +1,7 @@
 # PART FAMILY: ST LSM303AGR, a three-axis accelerometer and a three-axis magnetometer in one
-# package -- and TWO INDEPENDENT BUS RESIDENTS rather than one part with two addresses.
+# package -- and two independent bus residents rather than one part with two addresses.
 #
-# WHY THIS FAMILY HAS TWO MEMBERS INSTEAD OF ONE TABLE WITH A PLURAL ADDRESS. The vendor treats the
+# Why this family has two members instead of one table with a plural address. The vendor treats the
 # two halves as separate devices everywhere it matters:
 #
 #   - two I2C slave addresses, 0011001b and 0011110b, each stated as its own factory setting;
@@ -15,10 +15,10 @@
 # board file carries two `[[devices]]` rows for one package, on the grounds that one package
 # answering two addresses is two bus residents.
 #
-# THE MEMBER NAMES ARE THE VENDOR'S OWN ABBREVIATIONS, taken from those chip-select names: XL for the
+# The member names are the vendor's own abbreviations, taken from those chip-select names: XL for the
 # accelerometer and MAG for the magnetometer.
 #
-# THIS FILE IS AN AUTHORING CONVENIENCE ONLY. A member names it with `base` and states its own
+# This file is an authoring convenience only. A member names it with `base` and states its own
 # facts; the generator RESOLVES the base and emits a fully flattened table per part.
 
 [table]

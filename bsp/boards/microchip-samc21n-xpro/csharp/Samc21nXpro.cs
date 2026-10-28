@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Microchip
 {
-    public sealed class Samc21nXpro
+    internal sealed class Samc21nXpro
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = MicrochipSamc21nXproBindings.BOARD_MODEL;
@@ -25,7 +25,7 @@ namespace Lamella.Boards.Microchip
             Samc21GpioDriver.LogicalPin(MicrochipSamc21nXproBindings.BUTTON0_PORT_BASE, MicrochipSamc21nXproBindings.BUTTON0_PIN);
 
         /// <summary>The mode the user button wants.</summary>
-        /// <remarks>THIS KIT'S GUIDE DOES NOT SAY WHETHER AN EXTERNAL PULL-UP IS FITTED, where the
+        /// <remarks>This kit's guide does not say whether an external pull-up is fitted, where the
         /// Curiosity Nano guides state outright that none is. <see cref="PinMode.InputPullUp"/> is
         /// nevertheless the right answer under BOTH readings: if the board fits no pull-up the
         /// internal one is required, and if it fits one the internal resistor pulls the same way and
@@ -47,7 +47,7 @@ namespace Lamella.Boards.Microchip
         private static GpioDriver MakeGpio() { return new Samc21GpioDriver(); }
 
         /// <summary>The family PORT driver this board bound.</summary>
-        /// <remarks>THE DRIVER SPANS THREE PORT GROUPS AND THIS PACKAGE BONDS PADS IN ALL THREE.
+        /// <remarks>The driver spans three port groups and this package bonds pads in all three.
         /// This part also carries two SERCOM instances the 64-pin sibling does not -- SERCOM6 and
         /// SERCOM7, behind a fourth APB bridge -- and nothing on this board binds either.</remarks>
         public GpioDriver CreateGpioDriver()

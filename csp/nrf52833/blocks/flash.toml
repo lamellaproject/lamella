@@ -4,12 +4,12 @@
 #
 # Two facts, and each `sources` entry names the one it backs.
 #
-# THE WRITE UNIT IS A 32-BIT WORD. `Only full 32-bit words can be written to flash memory using the
+# The write unit is a 32-bit word. `Only full 32-bit words can be written to flash memory using the
 # NVMC interface`, and software wanting to change fewer bits writes the whole word with the rest set
 # to 1 -- which is possible because a 1 in the written word leaves the stored bit alone.
 #
-# AND THE FACT THAT SEPARATES THIS PART FROM ITS nRF51 SIBLING: A WORD MAY BE WRITTEN TWICE, AND
-# ONLY TWICE. The product specification gives nWRITE = 2 -- `Number of times a 32-bit word can be
+# And the fact that separates this part from its nRF51 sibling: a word may be written twice, and
+# only twice. The product specification gives nWRITE = 2 -- `Number of times a 32-bit word can be
 # written before erase` -- and says the limit still applies to the write-the-whole-word-with-ones
 # trick above. So this part does permit the shape of `write the record, then write its magic into
 # the same unit`, but it permits it exactly once more, and a consumer that uses the allowance for

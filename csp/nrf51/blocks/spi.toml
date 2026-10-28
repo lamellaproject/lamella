@@ -7,10 +7,9 @@
 # relies on (26.1.2).
 #
 # Transcribed from the nRF51 Series Reference Manual v3.0 (Nordic Semiconductor, 2014-10-20),
-# chapter 26, Tables 220-234, with the document open; every bit position was placed from the printed
-# table's column coordinates, and INTEN, INTENSET and INTENCLR were required to agree.
+# chapter 26, Tables 220-234.
 #
-# THE PIN SELECT REGISTERS DIFFER FROM THE SIBLING FAMILY'S: here each is a plain 32-bit pin number,
+# The pin select registers differ from the sibling family's: here each is a plain 32-bit pin number,
 # 0xFFFFFFFF meaning disconnected, because this part has one GPIO port and no connect bit.
 
 [table]

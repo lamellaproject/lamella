@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.St
 {
-    public sealed class NucleoF439zi
+    internal sealed class NucleoF439zi
     {
         /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
         public static readonly int BoardModel = StNucleoF439ziBindings.BOARD_MODEL;

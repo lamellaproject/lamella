@@ -6,7 +6,7 @@
 // extension binds to any host that offers a socket of this standard.
 namespace Lamella.Generated
 {
-    public sealed class ClickShieldForPiPicoExtension
+    internal sealed class ClickShieldForPiPicoExtension
     {
         private ClickShieldForPiPicoExtension() { }
         public const string EXTENSION = "click-shield-for-pi-pico";

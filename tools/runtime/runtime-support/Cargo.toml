@@ -26,6 +26,7 @@ lamella-softmath = { path = "../../../crates/lamella-softmath" }
 # The bus table's one reading -- the SAME crate the interpreter, the bake and the AOT link use, so a
 # linked image answers `Lamella.Hardware.BoardBuses` exactly as the interpreter does from a baked one.
 lamella-board-buses = { path = "../../../crates/lamella-board-buses" }
+lamella-console-ring = { path = "../../../crates/lamella-console-ring", optional = true }
 # The networking + TLS C-ABI layer (feature `net`): the same NetBackend/TlsBackend stacks
 # the interpreter binds, exported as lamella_net_* / lamella_tls_* archive members. Pulled
 # in HERE as a dependency (never as a second staticlib) so the image keeps exactly one
@@ -63,6 +64,14 @@ default = ["console-semihosting"]
 console-semihosting = []
 console-board = []
 console-none = []
+# `console-memory` MIRRORS every console byte into a ring in RAM that a debug probe reads while the
+# core runs (`__lamella_console_log`), and records in the ring's header how the program ended. It is
+# not a fourth destination: it sits beside whichever of the three above the build picks, or alone, so
+# an image followed over the probe still prints wherever its board's console goes. The image's
+# startup arms the ring (`lamella_console_arm`) and ends it when the entry point comes back
+# (`lamella_console_finish`), calling each only when the link kept it, so a build without this
+# feature links exactly the image it always did.
+console-memory = ["dep:lamella-console-ring"]
 # The monotonic clock seam. A board's millisecond counter is a board FACT -- which timer peripheral,
 # what tick rate, which prescaler -- and this archive is built once per ISA for every board, so it
 # cannot name one. Under `clock-board` the image supplies `lamella_board_now_ms` and every timed
@@ -73,12 +82,15 @@ console-none = []
 # Its ABSENCE is not an error, because a program that never sleeps needs no clock. What is an
 # error is selecting it and not providing the symbol.
 clock-board = []
-# A board build: the console and the clock come from that board's half, compiled in. One board per
-# archive, built in its own directory, never the default path the gates build into.
-board-rpi-pico2 = ["console-board", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-rpi-pico2"]
-board-rpi-pico2-w = ["console-board", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-rpi-pico2-w"]
-board-pimoroni-pico-plus-2 = ["console-board", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-pimoroni-pico-plus-2", "psram-heap"]
-board-pimoroni-pico-plus-2-w = ["console-board", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-pimoroni-pico-plus-2-w", "psram-heap"]
+# A board build: the startup and the clock come from that board's half, compiled in. One board per
+# archive, built in its own directory, never the default path the gates build into. The console goes
+# to the ring in RAM that a debug probe reads (`console-memory`) and nowhere else, because the console
+# a board takes by default never takes a UART the program may be using: nothing brings the board's
+# UART up, and its pins stay the program's.
+board-rpi-pico2 = ["console-memory", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-rpi-pico2"]
+board-rpi-pico2-w = ["console-memory", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-rpi-pico2-w"]
+board-pimoroni-pico-plus-2 = ["console-memory", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-pimoroni-pico-plus-2", "psram-heap"]
+board-pimoroni-pico-plus-2-w = ["console-memory", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-pimoroni-pico-plus-2-w", "psram-heap"]
 # The managed heap takes the PSRAM the board's startup brought up as its SECOND SEGMENT: objects go
 # to the SRAM band first and spill into the PSRAM once it is full, and one collection covers both.
 # Selected by the board features of a board that fits a PSRAM, never on its own: the window comes

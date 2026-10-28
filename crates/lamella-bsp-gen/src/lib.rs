@@ -612,7 +612,7 @@ pub fn parse(text: &str) -> Result<Table, String> {
 /// The rows of a channel map that a table's own layout states: every row, unless the map differs
 /// by package.
 ///
-/// A MAP KEYED BY PACKAGE IS BOARD TRUTH. The RP2350's ADC reads GPIO26-29 on the QFN-60 and
+/// A map keyed by package is board truth. The RP2350's ADC reads GPIO26-29 on the QFN-60 and
 /// GPIO40-47 on the QFN-80, with the temperature sensor at 4 and at 8, so a layout holding either
 /// map would be wrong for the other package's boards. Each board's adc binding emits the map of its
 /// own part's package instead, and the layout states none of it. A map with a package on some rows
@@ -687,7 +687,7 @@ pub fn emit_csharp(table: &Table, source: &str) -> Result<String, String> {
          // stay in the table; drivers hand-execute them with their own bounded polls.\n\
          namespace Lamella.Generated\n\
          {{\n\
-         \x20   public sealed class {class}\n\
+         \x20   internal sealed class {class}\n\
          \x20   {{\n\
          \x20       private {class}() {{ }}\n",
         source = source,

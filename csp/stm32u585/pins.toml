@@ -3,19 +3,19 @@
 # Function ids are the ST alternate-function numbers (AF0..AF15) that the
 # AFRL/AFRH nibbles select.
 #
-# THE ALTERNATE-FUNCTION TABLE IS SPLIT ACROSS TWO TABLES AND READING ONE ALONE GIVES A FALSE
-# NEGATIVE. DS13086 prints AF0 to AF7 as Table 28 and AF8 to AF15 as Table 29, nine pages apart,
+# The alternate-function table is split across two tables and reading one alone gives a false
+# negative. DS13086 prints AF0 to AF7 as Table 28 and AF8 to AF15 as Table 29, nine pages apart,
 # each with the same Port column and the same pin rows. A signal absent from one is not absent from
 # the part -- it is in the other. The two peripherals below fall on opposite sides of that split:
 # SPI3 is AF6 and lives in Table 28, LPUART1 is AF8 and lives in Table 29. A reader who found the
 # SPI3 rows in Table 28 and stopped would conclude this part routes no LPUART1 to port G at all.
 #
-# AND A CELL MEANS NOTHING WITHOUT ITS COLUMN HEADER, which is the only thing that says which AF
+# And a cell means nothing without its column header, which is the only thing that says which AF
 # NUMBER a signal belongs to. Both tables are read as printed rather than converted: the AF6 header
 # reads I2C3/MDF1/OCTOSPIM_P2/SPI3 and the AF8 header reads LPUART1/SDMMC1/UART4/5, and those
 # headers are what turn a signal name into the nibble a driver writes.
 #
-# THE BALL IS THE JOIN KEY AND A ROW POSITION IS NOT. A schematic symbol commonly draws each ball
+# The ball is the join key and a row position is not. A schematic symbol commonly draws each ball
 # designator on the wire stub ABOVE its pin-name baseline, so a text conversion pairs every ball
 # with the PREVIOUS pin and a whole port block reads one row low. The check that catches it is the
 # alternate function itself: LPUART1_CTS is a function of PG5 and not of PG4, so a net carrying that
@@ -39,7 +39,7 @@ notes = [
 
 # --- LPUART1: a link to a companion processor, AF8 ---------------------------------------------
 #
-# AF8 IS IN TABLE 29, NOT TABLE 28. See the note at the top of this file.
+# AF8 is in table 29, not table 28. See the note at the top of this file.
 
 [[pins]]
 pin = "PG5"

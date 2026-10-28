@@ -5,11 +5,11 @@
 #   PINCFG[p] = group_base + 0x40 + p        (p = the pin index within the group)
 # The generator owns those derivations; drivers receive resolved addresses through their bindings.
 #
-# THE REGISTER LAYOUT IS SHARED ACROSS THE WHOLE SAM LINE AND THE BASE IS THIS FAMILY'S ALONE.
+# The register layout is shared across the whole SAM line and the base is this family's alone.
 # Every offset below matches its relatives value for value. Where the block SITS is a fourth
 # distinct answer: 0x41006000, behind AHB-APB Bridge B, gated from APBBMASK bit 3.
 #
-# THREE GROUPS, AND ON THIS FAMILY GROUP C IS NOT THE SPARE ONE. Its board puts the LED, the
+# Three groups, and on this family group C is not the spare one. Its board puts the LED, the
 # button and both virtual-COM-port pads in it. The count comes from the pad set, which Table 6-1
 # carries to PC28.
 
@@ -84,7 +84,7 @@ fields = { PMUXEN = [0, 1], INEN = [1, 1], PULLEN = [2, 1], DRVSTR = [6, 1] }
 notes = "Element 0 of the per-pin config array; see the block header for the element derivation."
 
 # Function-letter values for PMUX nibbles (family-wide; the pin-map rows name letters).
-# NOTE: THIS TABLE RUNS TO I AND THE SAM D21 LINE'S STOPS AT H. The values are still 0..n in
+# Note: this table runs to I and the SAM D21 line's stops at H. The values are still 0..n in
 # letter order; what is new is that there is a ninth column at all. A pin-map row carries the
 # letter and this table turns it into a nibble; what the letter SELECTS is Table 6-1's business.
 [constants]

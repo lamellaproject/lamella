@@ -1,8 +1,8 @@
 # The SAM G55 Xplained Pro (ATSAMG55-XPRO, ATSAMG55J19): board truth only -- what is wired to
 # what. Chip truth lives in csp/samg55/.
 #
-# THIS BOARD BINDS GPIO AND DOES NOT BIND ITS VIRTUAL COM PORT, AND THE REASON IS A DATASHEET
-# CONTRADICTION RATHER THAN MISSING WORK. The EDBG's serial gateway is wired to PB0 and PB1, which
+# This board binds GPIO and does not bind its virtual COM port, and the reason is a datasheet
+# contradiction. The EDBG's serial gateway is wired to PB0 and PB1, which
 # Table 9-4 gives as TXD6 and RXD6 on Peripheral B -- the pads are not in doubt. What is in doubt is
 # FLEXCOM6's peripheral identifier, which is the bit a driver must set in PMC_PCER0 to clock it:
 #
@@ -10,13 +10,13 @@
 #     Figure 6-1 (Product Mapping)         disagrees with Table 9-1 on SIX of the eight FLEXCOM
 #                                          instances, and annotates no id at all on this one
 #
-# csp/samg55/instances.toml states both readings in full. A WRONG PMC BIT DOES NOT FAULT -- the
+# csp/samg55/instances.toml states both readings in full. A wrong PMC bit does not fault -- the
 # peripheral never clocks while every register reads back what was written -- so binding this on a
 # contested number would ship the failure mode that reads as a wiring problem. The carrier row
 # below is kept because the port is a board fact; binding it needs FLEXCOM6's identifier read off
 # the part itself.
 #
-# THE KIT GUIDE ALSO MISNAMES ONE OF THE TWO PADS AND THE DATASHEET SETTLES IT. Atmel-42389's
+# The kit guide also misnames one of the two pads and the datasheet settles it. Atmel-42389's
 # connection table reads "PB00 USART0 TXD" against "PB01 USART6 RXD" -- two instances for one link,
 # which cannot be right. Table 9-4 gives PB0 TXD6/SPI6_MOSI/TWD6 and PB1 RXD6/SPI6_MISO/TWCK6, both
 # on Peripheral B, so the instance is USART6 on both pads and the guide's TX row is the error. Same
@@ -44,13 +44,13 @@ notes = [
     "THE 16 KB OF CACHE AND I/D RAM IS NOT IN THE PART'S `ram` FIGURE. csp/samg55/parts.toml records the 160 KB contiguous span alone and says why.",
 ]
 
-# NO `role` ON THIS CARRIER, AND THAT IS THE SHAPE A CARRIER TAKES WHEN NOTHING BINDS IT. A role
+# No `role` on this carrier, and that is the shape a carrier takes when nothing binds it. A role
 # is what ties a carrier to the MCU peripheral behind it, and this board declares no binding -- see
 # the header. The generator refuses a carrier whose role no binding declares, which is the right
 # refusal: a role with nothing behind it would claim a driver that does not exist.
 [[carriers]]
 kind = "edbg-vcp"           # the on-board EDBG's CDC virtual port, opened like any serial port.
-usb_vid = 0x03EB            # NOTE: NO usb_pid ROW, AND ITS ABSENCE IS A SOURCED POSITION RATHER THAN
+usb_vid = 0x03EB            # Note: no usb_pid row, and its absence is a sourced position rather than
 baud = 115200               # AN OMISSION. A product id is a property of the debugger's FIRMWARE:
 plan = "rc8m-master"        # this kit's user guide never prints one, and the EDBG user guide
 default = true              # Atmel-42096 describes the composite device without giving an id
@@ -59,7 +59,7 @@ default = true              # Atmel-42096 describes the composite device without
                             # DIFFERENT ARCHITECTURES, so a product id read off one board is not
                             # a fact about another. It is read from the kit it belongs to.
 
-# THE RESET MASTER CLOCK. The PMC description names the oscillator and the rate together: the chip
+# The reset master clock. The PMC description names the oscillator and the rate together: the chip
 # starts on the 8/16/24 MHz RC oscillator running at 8 MHz. Nothing here derives a baud divisor
 # from it today -- there is no UART binding -- and the plan is recorded because the carrier names
 # one and because the rate is a board-visible fact the moment a binding lands.

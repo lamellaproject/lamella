@@ -1,7 +1,7 @@
 # BOARD binding: the Arduino GIGA R1 WiFi, an STM32H747XIH6 on Arduino's ABX00063 in the Mega form
 # factor.
 #
-# THIS BOARD HAS NO ON-BOARD DEBUGGER AND NO USB-SERIAL BRIDGE, AND BOTH ABSENCES ARE DELIBERATE
+# This board has no on-board debugger and no USB-serial bridge, and both absences are deliberate
 # rather than unrecorded. The user manual's component table names every populated integrated circuit
 # -- the microcontroller, the SDRAM, the flash, the secure element, the wireless module and two buck
 # converters -- and none of them is a debug probe or a serial bridge. What the board offers instead
@@ -9,20 +9,20 @@
 # OWN device controller. So the carrier below is `native-usb`, and it names neither a baud nor an
 # operating point, because a rate is a property of a wire that has one and this wire does not.
 #
-# THE FOUR HEADER SERIAL PORTS ARE A SECOND CARRIER THAT IS NOT DECLARED HERE. The pinout gives
+# The four header serial ports are a second carrier that is not declared here. The pinout gives
 # Serial0 through Serial3 as PA9/PB7, PD5/PD6, PH13/PI9 and PG14/PC7, and each is a real path to a
 # host through an EXTERNAL dongle. Binding one would need its own operating point and its own
 # divisor, and the choice of which is not a fact this document settles, so no uart binding is
 # stated and none is implied.
 #
-# THE USER BUTTON IS THE BOOT0 BUTTON, WHICH IS A HARDER FACT THAN IT LOOKS. The schematic runs
+# The user button is the BOOT0 button, which is a harder fact than it looks. The schematic runs
 # ONE net to both the microcontroller's PC13 ball and its BOOT0 ball, so a program may read the
 # button freely at run time, but a unit powered up with it held enters the system bootloader
 # instead of the application. The device row below states the pin a program reads; it cannot state
 # what the same pin does to a reset, and nothing here should be read as saying the button is free
 # of consequence at power-on.
 #
-# NOT MODELLED, AND NAMED SO EACH OMISSION IS DELIBERATE: the 16 Mbytes of QSPI NOR flash and the
+# Not modelled, and named so each omission is deliberate: the 16 Mbytes of QSPI NOR flash and the
 # 8 Mbytes of SDRAM (both fitted, both belonging to the external-memory stratum, and the SDRAM is
 # the one a summary of this board is most likely to miss), the wireless module and its antenna
 # connector, the secure element, the camera and display connectors, the audio jack and its two
@@ -53,7 +53,7 @@ notes = [
 
 # --- the carrier ------------------------------------------------------------------------------
 #
-# THE MICROCONTROLLER'S OWN USB DEVICE CONTROLLER, over the USB-C connector J12, which the manual
+# The microcontroller's own USB device controller, over the USB-C connector J12, which the manual
 # lists as the programming port. There is no bridge between it and the host, which is why the row
 # carries no vendor identity: a bridge has a USB identity of its own to state and this path has
 # only the device the target itself presents.
@@ -64,20 +64,20 @@ default = true
 
 # --- control lines ----------------------------------------------------------------------------
 #
-# ALL THREE LEDS SINK AND THE POLARITY IS READ FROM THE WIRING, NOT FROM A WORD. The component
+# All three LEDs sink and the polarity is read from the wiring, not from a word. The component
 # table calls DL2 a common anode LED, which is a strong reading and not a diagram; the schematic
 # settles it directly by putting DL2's pin 4 on +3V3 and running each of the three cathodes through
 # its own 330 ohm resistor to a microcontroller pin. The pin is the driven end of the diode, so it
 # sinks, and a leg lights when its pin is driven LOW.
 #
-# AND THAT IS THE OPPOSITE OF THE OTHER STM32H7 CARRIER DESCRIBED FOR THIS FAMILY, whose three
+# And that is the opposite of the other STM32H7 carrier described for this family, whose three
 # user LEDs are on when the I/O is high and off when it is low, in its own manual's words. One
 # family, two carriers, opposite conventions on the pins a first program drives: a reader who
 # learned the rule from one gets the other wrong three times, and dark is exactly what a wrong
 # polarity and a missing wire look like alike. Polarity is a per-BOARD reading, never a per-family
 # or per-vendor one.
 #
-# THE OPENING WRITE IS ALSO NOT THE ONE A DRIVER WOULD EXPECT. Pins on this part come out of
+# The opening write is also not the one a driver would expect. Pins on this part come out of
 # reset in ANALOG mode rather than as inputs, so a program that sets or clears an output register
 # without first putting the pin in output mode drives nothing at all. That is a chip fact and it
 # lives on the gpio block table; it is repeated here because these four rows are the first thing

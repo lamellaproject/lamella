@@ -5,13 +5,13 @@
 #   PINCFG[p] = group_base + 0x40 + p        (p = the pin index within the group)
 # The generator owns those derivations; drivers receive resolved addresses through their bindings.
 #
-# THE REGISTER LAYOUT IS SHARED ACROSS THE WHOLE SAM LINE AND THE BASE IS THIS FAMILY'S ALONE.
+# The register layout is shared across the whole SAM line and the base is this family's alone.
 # Every offset below matches the samd20, samda1, samha1, samr21, samc21, saml21, saml22 and samr30
 # blocks value for value. What differs is where the block sits: 0x40003000, behind AHB-APB Bridge
 # A, which is a fifth distinct address on this arm -- see ../parts.toml.
 #
-# THE FUNCTION LETTERS SKIP F AND THE NIBBLE VALUES DO NOT COMPACT. THIS IS THE ONE THING ON
-# THIS FAMILY MOST LIKELY TO BE GOT WRONG, so it is stated with the register evidence rather than
+# The function letters skip F and the nibble values do not compact. This is the one thing on
+# this family most likely to be got wrong, so it is stated with the register evidence rather than
 # left to the letter list. Section 4.1 says a pin "can be assigned to one of the peripheral
 # functions: A, B, C, D, E, G, H, or I" -- eight letters, no F. The obvious reading is that the
 # eight letters take the eight values 0..7, and THAT IS WRONG. The PMUX register's own value table
@@ -32,7 +32,7 @@
 # looking up `FUNC_<letter>`, a board naming function F on this family is REFUSED at generation
 # time with that constant's name in the error, instead of silently selecting a Reserved encoding.
 #
-# PMUX15 RESETS TO 0x06 AND EVERY OTHER PMUX RESETS TO 0x00. Element 15 covers PA30 and PA31, whose
+# PMUX15 resets to 0x06 and every other PMUX resets to 0x00. Element 15 covers PA30 and PA31, whose
 # reset function is G -- SWCLK and SWDIO. So the debug pads arrive muxed and a driver taking them
 # for plain I/O is fighting the reset state rather than a previous configuration.
 
@@ -110,7 +110,7 @@ fields = { PMUXEN = [0, 1], INEN = [1, 1], PULLEN = [2, 1], DRVSTR = [6, 1] }
 notes = "Element 0 of the per-pin config array; see the block header for the element derivation."
 
 # Function-letter values for PMUX nibbles (family-wide; the pin-map rows name letters).
-# THERE IS NO FUNC_F AND ITS ABSENCE IS LOAD-BEARING. 0x5 is Reserved on this family; see the
+# There is no FUNC_F and its absence is load-bearing. 0x5 is Reserved on this family; see the
 # block header for the register table that says so. The values are otherwise POSITIONAL and
 # identical to every relative's, which is the whole point: G is 6 here exactly as it is there.
 [constants]

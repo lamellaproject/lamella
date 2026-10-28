@@ -2,7 +2,7 @@
 # offsets are GCLK-instance-relative; nothing here names an instance, a pin, a board or a clock
 # plan.
 #
-# TWO ARRAYS, AND THEY ARE INDEXED BY DIFFERENT THINGS. This is the single most available way to
+# Two arrays, and they are indexed by different things. This is the single most available way to
 # misconfigure a peripheral on this family:
 #
 #   GENCTRL[n]   n is a GENERATOR, 0 to 11. A generator takes a clock source and divides it.
@@ -15,7 +15,7 @@
 # peripheral owns channel 0 and leaves the intended generator untouched, and every register
 # involved reads back exactly what was written.
 #
-# THE CHANNEL INDEX FOR A GIVEN PERIPHERAL IS INSTANCE TRUTH AND LIVES IN THE INSTANCE MAP, on the
+# The channel index for a given peripheral is instance truth and lives in the instance map, on the
 # row for that instance, so that a driver names the peripheral it means rather than an integer.
 
 [table]

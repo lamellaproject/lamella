@@ -5,7 +5,7 @@
 // instance bases live in Samd11Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Samd11SercomI2cMasterLayout
+    internal sealed class Samd11SercomI2cMasterLayout
     {
         private Samd11SercomI2cMasterLayout() { }
 

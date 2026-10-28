@@ -1,7 +1,7 @@
 # The SAMC21 Main Clock block: the peripheral-bus gate registers. Offsets are MCLK-base-relative;
 # the base lives in ../instances.toml.
 #
-# THIS IS WHERE THE SAM D21 LINE'S `pm` BLOCK WENT. On those families the Power Manager holds one
+# This is where the SAM D21 line's `pm` block went. On those families the Power Manager holds one
 # APBCMASK and the SERCOMs are all behind it. Here the clock gates moved to a controller of their
 # own and there are FOUR of them, so which register gates an instance is a per-instance fact --
 # the instance rows carry `apb_mask_offset` for exactly this reason. The Power Manager still

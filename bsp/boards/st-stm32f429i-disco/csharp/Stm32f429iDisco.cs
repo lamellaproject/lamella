@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.St
 {
-    public sealed class Stm32f429iDisco
+    internal sealed class Stm32f429iDisco
     {
         /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
         public static readonly int BoardModel = StStm32f429iDiscoBindings.BOARD_MODEL;

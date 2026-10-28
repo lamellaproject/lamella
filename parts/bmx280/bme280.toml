@@ -1,7 +1,7 @@
 # PART: Bosch BME280 humidity, pressure and temperature sensor.
 #
 # A BMP280 plus humidity. Everything not stated here is inherited from the family base and is
-# FLATTENED INTO THE EMITTED TABLE by the generator, so a reader of the emitted artifact never has
+# flattened into the emitted table by the generator, so a reader of the emitted artifact never has
 # to chase a base to see the whole truth.
 
 [table]

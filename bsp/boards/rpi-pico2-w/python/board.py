@@ -233,6 +233,7 @@ INSTANCES = {
     "uart1": {"block": "uart", "base": 0x40078000, "reset_bit": 0x1B},
     "spi0": {"block": "spi", "base": 0x40080000, "reset_bit": 0x12},
     "i2c0": {"block": "i2c", "base": 0x40090000, "reset_bit": 0x4},
+    "i2c1": {"block": "i2c", "base": 0x40098000, "reset_bit": 0x5},
     "adc": {"block": "adc", "base": 0x400A0000, "reset_bit": 0x0},
     "timer0": {"block": "timer", "base": 0x400B0000, "reset_bit": 0x17},
     "ticks": {"block": "ticks", "base": 0x40108000},

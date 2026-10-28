@@ -5,7 +5,7 @@
 // instance bases live in Nrf51Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Nrf51FlashLayout
+    internal sealed class Nrf51FlashLayout
     {
         private Nrf51FlashLayout() { }
 

@@ -1,11 +1,11 @@
 # BOARD binding: the ST NUCLEO-U5A5ZJ-Q. Chip truth lives in csp/stm32u5a5/.
 #
-# THE VIRTUAL COM PORT IS SELECTABLE BETWEEN TWO PERIPHERALS BY SOLDER BRIDGE, and the default is
+# The virtual COM port is selectable between two peripherals by solder bridge, and the default is
 # USART1 on PA9/PA10 rather than the LPUART. UM2861 gives the reason in its own words: USART1 is the
 # interface that supports bootloader mode. The alternative is LPUART1 on PG7/PG8, reached by moving
 # SB24/SB26 ON and SB25/SB27/SB32/SB34 OFF.
 #
-# ONE REFERENCE BOARD, TWO DIFFERENT PARTS. UM2861 covers MB1549 under two order codes --
+# One reference board, two different parts. UM2861 covers MB1549 under two order codes --
 # NUCLEO-U575ZI-Q and NUCLEO-U5A5ZJ-Q -- so the board id selects the chip row and the board SHAPE
 # does not. A sibling board file for the U575 variant would point at a different family entirely.
 

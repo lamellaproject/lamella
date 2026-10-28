@@ -3,12 +3,11 @@
 # PIN_CNF[n] = 0x700 + 4*n.
 #
 # Transcribed from the nRF51 Series Reference Manual v3.0 (Nordic Semiconductor, 2014-10-20),
-# section 14.2, Tables 74/75/83, with the document open.
+# section 14.2, Tables 74/75/83.
 #
-# The offsets below happen to match the nRF52833's. That was NOT assumed -- it was read -- and the
-# two parts genuinely differ elsewhere: Table 74 lists ONE GPIO instance on this part, where the
-# nRF52833 has two ports at separate bases. Assuming the layouts carry over would have been right
-# about the offsets and wrong about the port count in the same breath.
+# The offsets below match the nRF52833's, and the two parts differ elsewhere: Table 74 lists one
+# GPIO instance on this part, where the nRF52833 has two ports at separate bases, so a layout
+# carried over from it would be right about the offsets and wrong about the port count.
 
 [table]
 kind = "block"

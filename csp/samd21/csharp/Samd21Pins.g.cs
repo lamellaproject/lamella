@@ -5,7 +5,7 @@
 // A pad raises its line only while its multiplexer selects the EIC function.
 namespace Lamella.Generated
 {
-    public sealed class Samd21Pins
+    internal sealed class Samd21Pins
     {
         private Samd21Pins() { }
 

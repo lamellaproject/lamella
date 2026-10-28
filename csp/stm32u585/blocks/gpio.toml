@@ -2,7 +2,7 @@
 # muxes through. PARTIAL: MODER fields are stated for the pins the boards claim and grow as more do.
 # Offsets are instance-base-relative; port instance bases live in ../instances.toml.
 #
-# THE RESET MODE IS ANALOG, NOT INPUT, AND IT FAILS SILENTLY. On the vendor's F0, F4 and F7 lines
+# The reset mode is analog, not input, and it fails silently. On the vendor's F0, F4 and F7 lines
 # MODER reads 00 -- input -- for a pin nobody has configured. The encoding here is the same four
 # values but the DEFAULT is the other end of it: RM0456 marks 11, analog mode, as the reset state
 # and gives the register's reset value as 0xFFFF FFFF for both ports this family places. So an
@@ -10,17 +10,17 @@
 # reads zero forever. A driver carried across from one of those lines that reads a button without
 # writing MODER works there and reads a permanently unpressed button here.
 #
-# AND MODER'S RESET VALUE IS ONE OF THIS MANUAL'S SUB-GROUP SPLITS, ON EXACTLY THE TWO PORTS
-# THIS FAMILY USES. RM0456 gives port G 0xFFFF FFF0 and port H 0x0000 00CF on STM32U535/545, against
+# And MODER's reset value is one of this manual's sub-group splits, on exactly the two ports
+# this family uses. RM0456 gives port G 0xFFFF FFF0 and port H 0x0000 00CF on STM32U535/545, against
 # 0xFFFF FFFF for both on STM32U575/585. The value below is this family's. A family spanning the
 # series would have to state one of them and be wrong for half its members -- which is the concrete
 # reason ../parts.toml rules the family narrow.
 #
-# THREE REGISTERS HERE DO NOT EXIST ON csp/stm32h7, so its block file is not a template for this
+# Three registers here do not exist on csp/stm32h7, so its block file is not a template for this
 # one: BRR at 0x28 (a bit-reset register beside BSRR), HSLVR at 0x2C and SECCFGR at 0x30. Reading
 # the H7's layout across would place the first ten correctly and then simply lack the last three.
 #
-# PORT J EXISTS IN THE REGISTER SECTION'S SCOPE LINE BUT NOT ON THIS PART. Every section below is
+# Port J exists in the register section's scope line but not on this part. Every section below is
 # headed "(x = A to J)", and RM0456's own MODER reset list gives port J a value only for
 # STM32U59x/5Ax/5Fx/5Gx. A scope line naming ports is a statement about the SERIES the manual
 # covers, not about the part -- the same distinction the family rule turns on.

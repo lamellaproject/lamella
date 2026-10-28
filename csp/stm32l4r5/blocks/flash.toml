@@ -3,12 +3,12 @@
 #
 # Two facts, and each `sources` entry names the one it backs.
 #
-# THE WRITE UNIT IS A 64-BIT DOUBLE WORD AND IT IS NOT A CHOICE. The controller programs 72 bits at a
+# The write unit is a 64-bit double word and it is not a choice. The controller programs 72 bits at a
 # time -- 64 of data and 8 of ECC -- and RM0432 refuses anything narrower: a byte or half-word write
 # sets SIZERR, and a double word at an address that is not double-word aligned sets PGAERR. Software
 # that wants to write a single 32-bit word completes the double word with the erase value.
 #
-# A UNIT IS ALSO WRITE-ONCE BETWEEN ERASES, AND THE CONTROLLER ENFORCES IT. The ECC is computed over
+# A unit is also write-once between erases, and the controller enforces it. The ECC is computed over
 # the double word being programmed, and a second program of an already-programmed address sets
 # PROGERR unless the data is all zero.
 

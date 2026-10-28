@@ -3,9 +3,9 @@
 # record schema is uniform across rows; -1 marks a field that does not apply to a row and emits
 # nothing.
 #
-# READ INDEPENDENTLY FROM THE SAM D10's OWN TABLE 11-1, not carried over from `csp/samd11`. The two
+# Read independently from the SAM D10's own table 11-1, not carried over from `csp/samd11`. The two
 # tables then agree row for row on every peripheral they share -- and they differ by one: the SAM
-# D11 places USB at 0x41005000 and THIS FAMILY HAS NO USB AT ALL, so IRQ line 7 is unused here where
+# D11 places USB at 0x41005000 and this family has no USB at all, so IRQ line 7 is unused here where
 # the D11 spends it. That agreement is worth having as a MEASUREMENT rather than an assumption; had
 # it been assumed, the missing row is exactly the kind of thing an assumption carries across.
 

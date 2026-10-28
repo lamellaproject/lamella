@@ -1,6 +1,7 @@
 //! Baking a compiled assembly into the flash image a device runs.
 
 use lamella_wire_host::bake as shared;
+#[cfg(test)]
 use lamella_wire_host::boards::ReferenceSet;
 
 /// What a refusal tells a reader whose program calls into an assembly its image cannot carry: the
@@ -70,7 +71,8 @@ pub fn refuse_uncompilable(
 /// name, and the image carries the ones the program references.
 ///
 /// `board` is the board that answered: the image is built for it, with its bus table and against
-/// its family's builds ([`lamella_wire_host::boards`]). `None` builds for no board.
+/// its family's builds ([`lamella_wire_host::boards`]). `None` builds for no board. The class
+/// library is the one `folders` names, or else the one the tool finds without it.
 ///
 /// # Errors
 /// A file that is not C#, one that cannot be read, a project that is a class library or names a
@@ -80,12 +82,13 @@ pub fn image_for_firmware(
     verb: &str,
     refusal: impl Fn(&std::path::Path, &crate::deploy::Uncompilable) -> String,
     board: Option<&str>,
+    folders: &crate::folders::Folders,
 ) -> Result<Vec<u8>, String> {
     if crate::flash::is_project(path) {
         let project = crate::program::runnable_project(path, verb)?;
         let libraries = crate::flash::project_references(&project, verb)?;
         let (assembly, references) = crate::program::compile_project_assembly_with_references(
-            &project, &libraries, board, verb,
+            &project, &libraries, board, verb, folders,
         )?;
         return bake(assembly, &references, lamella_wire_host::boards::bus_table(board));
     }
@@ -93,7 +96,7 @@ pub fn image_for_firmware(
     let source = crate::text::read_text(path)
         .map_err(|error| format!("lamella {verb}: read {}: {error}", path.display()))?;
     let (assembly, references) =
-        crate::program::compile_csharp_assembly_with_references(path, &source, false, &[], board, verb)?;
+        crate::program::compile_csharp_assembly_with_references(path, &source, false, &[], board, verb, folders)?;
     bake(assembly, &references, lamella_wire_host::boards::bus_table(board))
 }
 
@@ -101,17 +104,23 @@ pub fn image_for_firmware(
 ///
 /// **ITS LIBRARIES ARE THE CLASS LIBRARY'S AND THE ONES BESIDE IT**, as a .NET build leaves a
 /// program's own libraries beside it: every library the program references that the class library
-/// does not hold is read from the program's folder, and the libraries those reference with it.
+/// does not hold is read from the program's folder, and the libraries those reference with it. The
+/// class library is the one `folders` names, or else the one the tool finds without it.
 ///
 /// # Errors
 /// An assembly that cannot be read, a library it references that is in neither place, a program
 /// the set cannot build for the board, or any bake failure.
-pub fn image_of_built(path: &std::path::Path, verb: &str, board: Option<&str>) -> Result<Vec<u8>, String> {
+pub fn image_of_built(
+    path: &std::path::Path,
+    verb: &str,
+    board: Option<&str>,
+    folders: &crate::folders::Folders,
+) -> Result<Vec<u8>, String> {
     let read = |path: &std::path::Path| {
         std::fs::read(path).map_err(|error| format!("lamella {verb}: read {}: {error}", path.display()))
     };
     let assembly = read(path)?;
-    let set = ReferenceSet::discover(board).map_err(|error| format!("lamella {verb}: {error}"))?;
+    let set = folders.reference_set(board).map_err(|error| format!("lamella {verb}: {error}"))?;
     let offered = set.compiler().library_names();
     let folder = path.parent().unwrap_or_else(|| std::path::Path::new("."));
     let mut references = set.carried().to_vec();
@@ -144,6 +153,7 @@ pub fn image_of_built(path: &std::path::Path, verb: &str, board: Option<&str>) -
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use crate::folders::Folders;
     use lamella_metadata::Assembly;
     use lamella_wire_host::engine::LcscCompiler;
 
@@ -222,7 +232,8 @@ pub(crate) mod tests {
                 (Some("rpi-pico2-w"), "8 1074331648 12 17 2 595591168 0\n"),
                 (None, "-1 0 -1 0 -1 0 -1\n"),
             ] {
-                let image = image_for_firmware(path, "run", |path, _| format!("refused {}", path.display()), board)
+                let refused = |path: &std::path::Path, _: &_| format!("refused {}", path.display());
+                let image = image_for_firmware(path, "run", refused, board, &Folders::default())
                     .unwrap_or_else(|error| panic!("{}, {board:?}: {error}", path.display()));
                 assert_eq!(run_baked(image), read, "{}, {board:?}", path.display());
             }
@@ -251,9 +262,9 @@ pub(crate) mod tests {
         }
         let path = project("firmware");
         for verb in ["run", "deploy"] {
-            let image =
-                image_for_firmware(&path, verb, |path, _| format!("refused {}", path.display()), None)
-                    .unwrap_or_else(|error| panic!("{verb}: {error}"));
+            let refused = |path: &std::path::Path, _: &_| format!("refused {}", path.display());
+            let image = image_for_firmware(&path, verb, refused, None, &Folders::default())
+                .unwrap_or_else(|error| panic!("{verb}: {error}"));
             assert_eq!(&image[..4], b"LML1", "{verb}: a baked image");
         }
         let _ = std::fs::remove_dir_all(path.parent().expect("its directory"));
@@ -351,9 +362,9 @@ pub(crate) mod tests {
         };
         let path = greeting_project(&dir, &["Greeting", "Punctuation"]);
         for verb in ["run", "deploy"] {
-            let image =
-                image_for_firmware(&path, verb, |path, _| format!("refused {}", path.display()), None)
-                    .unwrap_or_else(|error| panic!("{verb}: {error}"));
+            let refused = |path: &std::path::Path, _: &_| format!("refused {}", path.display());
+            let image = image_for_firmware(&path, verb, refused, None, &Folders::default())
+                .unwrap_or_else(|error| panic!("{verb}: {error}"));
             assert_eq!(run_baked(image), "hello, board!\n", "{verb}");
         }
         let _ = std::fs::remove_dir_all(dir);
@@ -369,7 +380,8 @@ pub(crate) mod tests {
             return;
         };
         let path = greeting_project(&dir, &["Greeting"]);
-        let refusal = image_for_firmware(&path, "deploy", |path, _| format!("refused {}", path.display()), None)
+        let refused = |path: &std::path::Path, _: &_| format!("refused {}", path.display());
+        let refusal = image_for_firmware(&path, "deploy", refused, None, &Folders::default())
             .expect_err("the image cannot carry Punctuation");
         assert!(
             refusal.contains(

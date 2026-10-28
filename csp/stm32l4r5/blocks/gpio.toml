@@ -1,12 +1,12 @@
 # BLOCK layout: the STM32L4R5 GPIO port block. Offsets are instance-base-relative; the port
 # instance bases live in ../instances.toml.
 #
-# THE RESET MODE IS ANALOG, NOT INPUT, ON EVERY PORT BUT ONE, AND IT FAILS SILENTLY. The encoding is
+# The reset mode is analog, not input, on every port but one, and it fails silently. The encoding is
 # the usual four values but 11, analog mode, is the reset state: an untouched pin has its input
 # buffer off and IDR reads zero forever. A driver that reads a button without first writing MODER
 # reads a permanently unpressed button.
 #
-# THE EXCEPTIONS ARE PER PORT, AND RM0432 section 8.4.1 STATES FOUR RESET VALUES FOR MODER:
+# The exceptions are per port, and RM0432 section 8.4.1 states four reset values for MODER:
 #   * port A, 0xABFF FFFF: PA13, PA14 and PA15 come out of reset in alternate-function mode, because
 #     they are the debug port's JTMS/SWDIO, JTCK/SWCLK and JTDI;
 #   * port B, 0xFFFF FEBF: PB3 and PB4 do the same for JTDO/TRACESWO and NJTRST;
@@ -15,7 +15,7 @@
 #     untouched pin is analog is wrong for this port. PH3 then leaves input mode for analog when
 #     it is not BOOT0 (section 8.3.15).
 #
-# AND PG2 TO PG15 NEED THEIR RAIL BEFORE THEY NEED THIS BLOCK. Those fourteen pins are isolated at
+# And PG2 to PG15 need their rail before they need this block. Those fourteen pins are isolated at
 # reset until IOSV in PWR_CR2 is set (see ../parts.toml). Every register below still reads and
 # writes on port G, so a correct configuration can be written and read back while the pad itself
 # does nothing.

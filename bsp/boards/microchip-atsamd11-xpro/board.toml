@@ -2,7 +2,7 @@
 # csp/samd11/. Kit ATSAMD11-XPRO, part ATSAMD11D14AM (24-pin QFN): its EDBG virtual COM port is
 # SERCOM2 on PA10/PA11 at peripheral function D.
 #
-# THE PART IS STATED HERE BECAUSE THE BOARD CANNOT STATE IT. The kit and its user guide print
+# The part is stated here because the board cannot state it. The kit and its user guide print
 # "ATSAMD11D14A", which names four ordering codes across three packages with 22, 18 and 18 pads.
 # This board is the 24-pin QFN: its connector tables name PA10, PA11, PA17 and PA27, and those four
 # pads exist on no other package in the family. A DSU read returns DID 0x10030100, whose DEVSEL of

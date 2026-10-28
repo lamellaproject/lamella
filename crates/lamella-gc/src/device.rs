@@ -426,6 +426,14 @@ pub unsafe extern "C" fn lamella_gc_alloc_impl(
     })
 }
 
+/// How many bytes the device heap can still hand out ([`DeviceHeap::free_bytes`]), or 0 before it is
+/// installed: what an embedder reports beside a request [`lamella_gc_alloc_impl`] could not serve,
+/// which has already been through that call's collection.
+#[cfg(not(feature = "second-segment"))]
+pub fn lamella_gc_device_free_bytes() -> u32 {
+    critical_section(|| unsafe { (*DEVICE_GC.heap.get()).as_ref().map_or(0, DeviceHeap::free_bytes) })
+}
+
 
 /// The heap's SECOND SEGMENT, when the image has one, installed by
 /// [`lamella_gc_init_device_second_segment`]: allocation spills into it once the first segment is
@@ -439,6 +447,17 @@ unsafe impl Sync for SecondSegmentCell {}
 
 #[cfg(feature = "second-segment")]
 static SECOND_SEGMENT: SecondSegmentCell = SecondSegmentCell(UnsafeCell::new(None));
+
+/// [`lamella_gc_device_free_bytes`] for a heap that can have a SECOND SEGMENT: the bytes both segments
+/// can still hand out, or the first's alone when none was installed.
+#[cfg(feature = "second-segment")]
+pub fn lamella_gc_device_free_bytes() -> u32 {
+    critical_section(|| unsafe {
+        let first = (*DEVICE_GC.heap.get()).as_ref().map_or(0, DeviceHeap::free_bytes);
+        let second = (*SECOND_SEGMENT.0.get()).as_ref().map_or(0, DeviceHeap::free_bytes);
+        first + second
+    })
+}
 
 /// A collection the EMBEDDER runs when the heap is exhausted, answering whether it ran -- in a build
 /// whose heap can have a SECOND SEGMENT, which the hook is handed beside the first (`None` when the

@@ -66,9 +66,13 @@ pub enum CmpOp {
     UnsignedGe,
 }
 
-/// A width conversion: narrowing an `int32` to a smaller integer and re-extending it to
-/// the stack's 32-bit width, signed or unsigned -- the CLI's `conv.i1`/`conv.u1`/
-/// `conv.i2`/`conv.u2`.
+/// A conversion between the stack's value types: the CLI's narrowings and widenings, the
+/// conversions between integers and floats, and the one-word retypes.
+///
+/// Every conversion from a float to an integer truncates toward zero and saturates: a NaN gives 0,
+/// and a value below or above the target's range gives the target's minimum or maximum. A narrowing
+/// from a float (`conv.i1`, `conv.u1`, `conv.i2`, `conv.u2`) first saturates to `int32` and then
+/// keeps the low bits, so `(byte)1e10` is 255 and `(short)70000.5` is 4464.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ConvKind {
     /// Sign-extend the low 8 bits (`conv.i1`).
@@ -79,15 +83,31 @@ pub enum ConvKind {
     SignExtend16,
     /// Zero-extend the low 16 bits (`conv.u2`).
     ZeroExtend16,
-    /// Truncate a 32-bit float toward zero to a signed `int32` (`conv.i4` from an `R4`). A
-    /// no-FPU target lowers this with a soft routine rather than a hardware convert.
+    /// Truncate a 32-bit float toward zero to a signed `int32`, saturating (`conv.i4` from an `R4`).
+    /// ARM `__aeabi_f2iz`, or an inline routine in an image with no linker; wasm
+    /// `i32.trunc_sat_f32_s`.
+    ///
+    /// This is also the first step of every sub-word narrowing from a 32-bit float.
     Float32ToInt,
     /// Convert a signed `int32` to a 32-bit float (`conv.r4` from an integer), exact for
     /// magnitudes below 2^24. The soft form on a no-FPU target.
     IntToFloat32,
-    /// Truncate a 64-bit float toward zero to a signed `int32` (`conv.i4` from an `R8`). wasm has a
-    /// native truncate; a no-FPU ARM target needs the aeabi soft helper (unsupported).
+    /// Truncate a 64-bit float toward zero to a signed `int32`, saturating (`conv.i4` from an `R8`).
+    /// ARM `__aeabi_d2iz`; wasm `i32.trunc_sat_f64_s`.
+    ///
+    /// This is also the first step of every sub-word narrowing from a 64-bit float.
     Float64ToInt,
+    /// Truncate a 32-bit float toward zero to an unsigned `int32`, saturating (`conv.u4` from an
+    /// `R4`): a NaN or any value below 0 gives 0, and a value of 2^32 or more gives
+    /// `uint.MaxValue`. ARM `__aeabi_f2uiz`; RISC-V `__fixunssfsi`; wasm `i32.trunc_sat_f32_u`.
+    ///
+    /// A distinct conversion from [`ConvKind::Float32ToInt`], since a signed one cannot reach the
+    /// upper half of the unsigned range.
+    Float32ToUInt,
+    /// Truncate a 64-bit float toward zero to an unsigned `int32`, saturating (`conv.u4` from an
+    /// `R8`), as [`ConvKind::Float32ToUInt`] does. ARM `__aeabi_d2uiz`; RISC-V `__fixunsdfsi`; wasm
+    /// `i32.trunc_sat_f64_u`.
+    Float64ToUInt,
     /// Truncate a 32-bit float toward zero to a signed `int64` (`conv.i8` from an `R4`).
     /// ARM `__aeabi_f2lz`; wasm `i64.trunc_f32_s`.
     Float32ToLong,
@@ -97,22 +117,18 @@ pub enum ConvKind {
     Float32ToULong,
     /// Truncate a 64-bit float toward zero to a signed `int64` (`conv.i8` from an `R8`).
     /// ARM `__aeabi_d2lz`; wasm `i64.trunc_f64_s`.
-    ///
-    /// This is also the FIRST step of every sub-word narrowing from a float (`conv.i1` and friends):
-    /// the CLI converts the float to an integer and THEN narrows, so without it the narrow reads the
-    /// operand's IEEE encoding rather than its value.
     Float64ToLong,
-    /// Truncate a 64-bit float toward zero to an UNSIGNED `int64` (`conv.u8` from an `R8`).
+    /// Truncate a 64-bit float toward zero to an unsigned `int64` (`conv.u8` from an `R8`).
     /// ARM `__aeabi_d2ulz`; wasm `i64.trunc_f64_u`.
     ///
-    /// A DISTINCT CONVERSION FROM [`ConvKind::Float64ToLong`], not that one's result reinterpreted.
+    /// A distinct conversion from [`ConvKind::Float64ToLong`], not that one's result reinterpreted.
     /// ECMA-335 III.3.27 defines `conv.u8` as a conversion to *unsigned* int64 truncating toward
     /// zero, so the target's range reaches `2^64` and every answer below it is specified --
     /// including the whole half above `2^63`, which a signed conversion cannot represent at all.
     ///
     /// NaN and the infinities are the exception the same clause names: the result is unspecified
-    /// when the value does not fit the target or is a NaN. Those answers are not a contract, and a
-    /// saturating soft helper is free to differ from an interpreter that biases instead.
+    /// when the value does not fit the target or is a NaN. There it saturates, as every conversion
+    /// from a float to an integer does (see [`ConvKind`]).
     Float64ToULong,
     /// Convert a signed `int32` to a 64-bit float (`conv.r8` from an int32 -- e.g. `double d = intVar`).
     /// The no-FPU ARM form is the `__aeabi_i2d` soft helper; wasm has `f64.convert_i32_s`.
@@ -181,6 +197,8 @@ impl ConvKind {
             | ConvKind::ZeroExtend16
             | ConvKind::Float32ToInt
             | ConvKind::Float64ToInt
+            | ConvKind::Float32ToUInt
+            | ConvKind::Float64ToUInt
             | ConvKind::RefToInt => MirType::I32,
         }
     }
@@ -417,6 +435,16 @@ pub enum Inst {
         slot: u32,
         /// The type that declares the method; see [`Inst::CallVirtual`].
         declaring_type: Option<TypeHandle>,
+    },
+    /// The function pointer for a `ldvirtftn` on an INTERFACE method -- [`Inst::VirtualFuncAddr`]'s
+    /// twin for a method with no vtable slot: the implementation is found by matching `tag` in the
+    /// object's itable, as [`Inst::CallInterface`] dispatches, so a delegate created from an interface
+    /// method binds the receiver's implementation. The result is the same `i32` code pointer.
+    InterfaceFuncAddr {
+        /// The object whose runtime type's itable resolves the pointer (`ldvirtftn` pops it).
+        object: ValueId,
+        /// The interface method's identity tag; see [`Inst::CallInterface`].
+        tag: u32,
     },
     /// An INDIRECT call through a code pointer in `target` (the CIL `calli`, and the engine of a
     /// delegate's `Invoke`): passes `args` in the ABI's argument registers and calls `target`.

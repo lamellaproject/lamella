@@ -6,7 +6,7 @@
 // lines, and the carrier identity. The board's facts are stated in board.toml.
 namespace Lamella.Generated
 {
-    public sealed class EspEsp32c6DevkitcBindings
+    internal sealed class EspEsp32c6DevkitcBindings
     {
         private EspEsp32c6DevkitcBindings() { }
 

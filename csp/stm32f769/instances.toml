@@ -7,7 +7,7 @@
 # AHB3 -- three different banks, which is exactly why the offset is data rather than a per-family
 # constant.
 #
-# ELEVEN PORTS, A THROUGH K, AND THE HIGH ONES ARE NOT DECORATION. The port this board's user
+# Eleven ports, A through K, and the high ones are not decoration. The port this board's user
 # LEDs sit on is J, whose enable bit is 9 -- so a driver that derived a port's enable bit from a
 # letter's position in a shorter alphabet would be right for A through H and wrong here, silently,
 # on the only two pins a first program blinks.
@@ -34,7 +34,7 @@ base = 0x40011000
 rcc_en_off = 0x44   # RCC_APB2ENR
 rcc_en_bit = 4      # USART1EN
 
-# THE SECOND SD/MMC CONTROLLER, AND IT IS NOT THE FIRST ONE. SDMMC1 is a separate peripheral at a
+# The second SD/MMC controller, and it is not the first one. SDMMC1 is a separate peripheral at a
 # separate base (0x40012C00 in the same table) reached by its own pads, so a design that names
 # "the SD controller" has said nothing: which one a given socket reaches is a wiring fact, and the
 # two do not share a pin.
@@ -68,12 +68,12 @@ rcc_en_bit = -1
 
 # --- the external interrupt controller and the register that routes pins to it ------------------
 #
-# TWO INSTANCES BECAUSE THEY ARE TWO PERIPHERALS AND ONLY ONE OF THEM HAS A CLOCK. EXTI is not
+# Two instances because they are two peripherals and only one of them has a clock. EXTI is not
 # gated in RCC at all, so its row states no enable; SYSCFG is, and a pin cannot be routed to a line
 # without it. A driver that enables only what it thinks of as "the interrupt peripheral" gets an
 # EXTICR write that goes nowhere and a line still bound to port A by the reset value.
 #
-# THE RECORD CANNOT NAME THE NVIC VECTORS AND NO SINGLE FIELD COULD: sixteen GPIO lines arrive on
+# The record cannot name the NVIC vectors and no single field could: sixteen GPIO lines arrive on
 # SEVEN vectors -- one each for lines 0 to 4, one shared by 5 to 9, one shared by 10 to 15. The
 # mapping is stated in blocks/exti.toml.
 
@@ -93,7 +93,7 @@ rcc_en_bit = 14            # SYSCFGEN, RM0410 Rev 5 section 5.3.14
 
 # --- the quad-SPI controller ----------------------------------------------------------------------
 #
-# THE BASE BELOW IS WHERE ITS REGISTERS SIT, NOT WHERE ITS FLASH APPEARS. The controller's
+# The base below is where its registers sit, not where its flash appears. The controller's
 # registers are a 4-Kbyte block on AHB3; the memory it maps is a separate 256-Mbyte window at
 # 0x90000000, stated as MEMORY_MAPPED_BASE in blocks/quadspi.toml. A driver that wrote commands
 # into the window, or read flash out of this block, would be addressing the wrong one of the two.

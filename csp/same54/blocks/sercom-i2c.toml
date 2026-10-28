@@ -7,7 +7,7 @@
 # time. Those headings are the datasheet's authoritative per-register statement, and taking each one
 # individually is what keeps a register's offset tied to the same passage that gives its fields.
 #
-# THIS BLOCK IS NOT THE SAMD21's SERCOM AND MUST NOT BE FOLDED WITH IT. Three differences, each of
+# This block is not the SAMD21's SERCOM and must not be folded with it. Three differences, each of
 # which a copy would get wrong in a direction that still compiles:
 #
 #   CTRLC at 0x08     does not exist in the SAMD21's I2C master at all. It carries DATA32B.

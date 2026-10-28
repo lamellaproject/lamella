@@ -28,18 +28,29 @@ use lamella_cmsis_dap_stm32::{
 use lamella_flash_backend::{FlashBackend, FlashError, Image, PartIdentity, Report};
 use lamella_probe_core::{ProbeError, TargetAccess, TargetAccessExt};
 
-/// Leaves a written part running its image: every hardware breakpoint removed, then a reset to run.
+/// Leaves a written part running its image as it would with no debugger attached: every hardware
+/// breakpoint removed, a reset to run, and then the part handed back with halting debug off.
 ///
 /// **The breakpoints come off first because nothing else takes them off.** A comparator a debug
 /// session armed outlives a system reset -- `FP_CTRL.ENABLE` "resets to zero on a Cold reset"
 /// (Armv8-M Architecture Reference Manual, DDI 0553B.y, D1.2, `FP_CTRL`) -- and a session that ends
 /// without handing the part back leaves its comparators armed. Halting debug is still on after
-/// the reset, so the new image halts at the first of those addresses its own code reaches, with no
-/// debugger attached to resume it.
+/// the reset, so the new image would halt at the first of those addresses its own code reaches,
+/// with no debugger attached to resume it.
+///
+/// **And halting debug is turned off after the reset**, through [`lamella_probe_core::hand_back`]:
+/// the reset's own resume leaves `DHCSR.C_DEBUGEN` set, and with it set a `BKPT` the program meets
+/// later -- a semihosting call among them -- halts the core and waits for a debugger that is not
+/// there. A hand-back that fails is an error, though the image is written and verified, because the
+/// part is not in the state a write promises.
 fn leave_running<A: TargetAccess>(target: &mut A) -> Result<(), FlashError> {
     target.set_breakpoints(&[])?;
     target.reset_and_run()?;
-    Ok(())
+    lamella_probe_core::hand_back(target).map_err(|why| {
+        FlashError::Refused(format!(
+            "the image is written and verified, but the part was not handed back: {why}"
+        ))
+    })
 }
 
 /// A micro:bit's on-board DAPLink probe, over SWD.
@@ -304,6 +315,8 @@ pub(crate) enum Rp2350Failure {
     AtSpeed(String),
     /// Anything else, worded for a reader: a write at the fallback clock would meet it too.
     Other(String),
+    /// No probe could be chosen or opened, so this attempt wrote nothing, worded for a reader.
+    Unopened(String),
 }
 
 /// What a write through the RP2350 route that failed at `clock_hz` with `error` is.
@@ -341,6 +354,7 @@ pub(crate) fn write_rp2350(
     match attempt(SWD_CLOCK_HZ, say) {
         Ok(report) => Ok(report),
         Err(Rp2350Failure::Other(why)) => Err(why),
+        Err(Rp2350Failure::Unopened(why)) => Err(crate::nothing_written(why)),
         Err(Rp2350Failure::AtSpeed(why)) => {
             say(&format!(
                 "the write at {} failed ({why}), so it is made again from the start at {}",
@@ -348,7 +362,7 @@ pub(crate) fn write_rp2350(
                 megahertz(FALLBACK_SWD_CLOCK_HZ)
             ));
             attempt(FALLBACK_SWD_CLOCK_HZ, say).map_err(|failure| match failure {
-                Rp2350Failure::AtSpeed(why) | Rp2350Failure::Other(why) => why,
+                Rp2350Failure::AtSpeed(why) | Rp2350Failure::Other(why) | Rp2350Failure::Unopened(why) => why,
             })
         }
     }
@@ -527,6 +541,31 @@ impl Uf2Volume {
     }
 }
 
+/// The drive `named`, as `--volume` gave it, when it is a board's bootloader drive, or why not.
+///
+/// A UF2 bootloader puts `INFO_UF2.TXT` on its drive, which is how [`crate::bootsel::waiting`]
+/// finds one. A path without it -- a drive that is not mounted, or a folder that is no bootloader's
+/// -- is refused by the name given and before anything is written: a folder would take the file,
+/// and the write would be reported as a board running the program. `mounted` is the bootloader
+/// drives mounted now, which the refusal names.
+fn named_volume(named: &str, mounted: &[crate::bootsel::Waiting]) -> Result<String, FlashError> {
+    if std::path::Path::new(named).join("INFO_UF2.TXT").is_file() {
+        return Ok(named.to_owned());
+    }
+    let now = match mounted {
+        [] => "No board is in its bootloader.".to_owned(),
+        drives => format!(
+            "Bootloader drives mounted now: {}.",
+            drives.iter().map(|found| found.volume.as_str()).collect::<Vec<_>>().join(", ")
+        ),
+    };
+    Err(FlashError::Refused(format!(
+        "{named} is not a board's bootloader drive: it holds no INFO_UF2.TXT, the file a UF2 bootloader \
+         puts on its drive.\n{now} `lamella devices` lists the drives that are, under DRIVE.\n\n\
+         Nothing was written."
+    )))
+}
+
 impl FlashBackend for Uf2Volume {
     fn mechanism(&self) -> &'static str {
         "the board's bootloader volume, by copying the image"
@@ -547,13 +586,13 @@ impl FlashBackend for Uf2Volume {
             .filter(|found| found.via == crate::bootsel::Via::Bootloader)
             .collect();
         let volume = match &self.requested {
-            Some(named) => named.clone(),
+            Some(named) => named_volume(named, &mounted)?,
             None => match mounted.as_slice() {
                 [] => {
                     return Err(FlashError::Refused(
-                        "no board is in its bootloader. Hold BOOTSEL while plugging the board in \
-                         (or press RESET
-with BOOTSEL held), and it will appear as a drive."
+                        "no board is in its bootloader.\nHold BOOTSEL while plugging in the board, or hold \
+                         BOOTSEL and press RESET; the board will appear as a drive.\n\n\
+                         Nothing was written."
                             .to_owned(),
                     ));
                 }

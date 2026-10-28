@@ -1,21 +1,21 @@
 // A driver for the ST LSM6DSOX six-axis inertial module: find it, configure it, read it.
 //
-// EVERY REGISTER NUMBER, ADDRESS, MASK, SHIFT AND EXPECTED VALUE COMES FROM `Lsm6dsoxPart`, which is
+// Every register number, address, mask, shift and expected value comes from `Lsm6dsoxPart`, which is
 // generated from `parts/lsm6dsox/lsm6dsox.toml`. Nothing about the part is retyped here, so this
 // driver and the table cannot drift: if the table is wrong this is wrong in the same way, which is
 // what makes the table worth checking.
 //
-// WHAT IS HAND-WRITTEN IS THE ARITHMETIC AND THE ORDER -- the two things a table deliberately does
+// What is hand-written is the arithmetic and the order -- the two things a table deliberately does
 // not generate. A part's registers are facts; turning six bytes into an acceleration, and knowing
 // that a configuration write must precede a read, is code.
 //
-// THE C# DRIVER BESIDE THIS ONE IS THE SOURCE FOR EVERYTHING THE TABLE DOES NOT CARRY.
+// The C# driver beside this one is the source for everything the table does not carry.
 // `parts/lsm6dsox/csharp/drivers/Lsm6dsox.cs` is written against this same table; the operating
 // point, the sensitivity and the reasons for both are carried across from it rather than derived
 // again here, so the two drivers agree by construction. The one place this one departs from it is
 // noted below.
 //
-// THIS DRIVER CONFIGURES ONE OPERATING POINT AND SAYS SO. The part's rate and full-scale
+// This driver configures one operating point and says so. The part's rate and full-scale
 // enumerations are each selected by a bit in ANOTHER register, so most codes name two different
 // values -- which is why the table states neither enumeration. The one point used here is built from
 // the two codes that mean the same thing whichever way those other bits are set, so this driver
@@ -33,7 +33,7 @@
 
     /// The magnitude of the vector, in milli-g.
     ///
-    /// THE ONE FIGURE THAT CHECKS ITSELF. A body at rest reads about 1000 here whatever its
+    /// The one figure that checks itself. A body at rest reads about 1000 here whatever its
     /// orientation, so a caller can tell a working sensor from a plausible-looking wrong one without
     /// a reference instrument and without knowing which way up the part is mounted -- which matters,
     /// because a module on a cable has no defined orientation.
@@ -58,7 +58,7 @@
 public enum Lsm6dsox {
     /// The strap this board's carrier ties SA0 to decides the address.
     ///
-    /// THE ADDRESS IS REQUIRED RATHER THAN DEFAULTED. The part states two and a carrier picks one by
+    /// The address is required rather than defaulted. The part states two and a carrier picks one by
     /// where it tied a pin, so a default here would be this driver guessing at a fact only the board
     /// knows.
     @inline(__always)
@@ -136,7 +136,7 @@ public struct Lsm6dsoxDriver<Bus: BurstRegisterBus> {
 
     /// Whether the part on the other end is an LSM6DSOX, and the value it actually answered with.
     ///
-    /// ON A MISMATCH THE VALUE READ IS RETURNED, not merely a false. A rejected part reads as no
+    /// On a mismatch the value read is returned, not merely a false. A rejected part reads as no
     /// part at all, and the number is what tells a wrong part from an empty address.
     public func identify() -> (isPresent: Bool, received: UInt8) {
         let register = Lsm6dsox.identityRegister
@@ -146,7 +146,7 @@ public struct Lsm6dsoxDriver<Bus: BurstRegisterBus> {
 
     /// Brings the accelerometer out of power-down at 12.5 Hz, plus or minus 2 g.
     ///
-    /// REQUIRED BEFORE ANY READING. The part powers up with its rate field zero, which is
+    /// Required before any reading. The part powers up with its rate field zero, which is
     /// power-down: without this the output registers hold zero and the part reports no error, so an
     /// unconfigured device looks like a stationary one in free fall.
     ///
@@ -167,13 +167,13 @@ public struct Lsm6dsoxDriver<Bus: BurstRegisterBus> {
 
     /// Reads one acceleration sample, or `nil` if the bus returned a short frame.
     ///
-    /// ONE BURST FROM THE ACCELERATION BLOCK, never six single reads: the axes must come from one
+    /// One burst from the acceleration block, never six single reads: the axes must come from one
     /// conversion, and byte-at-a-time reads can straddle two. The burst also depends on the
     /// interface auto-increment bit, which this part sets at reset -- without it every axis comes
     /// back equal to X, which is a plausible frame rather than a failure.
     public func readAcceleration() -> Acceleration? {
         // Six bytes on the stack. A fixed-size tuple cannot allocate under any optimization, which
-        // an array literal can -- see `IdentitySet` in PartKit for where that was measured.
+        // an array literal can.
         var frame: (UInt8, UInt8, UInt8, UInt8, UInt8, UInt8) = (0, 0, 0, 0, 0, 0)
         let register = Lsm6dsox.accelerationBlock
         let onTheWire = profile.readTransform.apply(to: register.address)

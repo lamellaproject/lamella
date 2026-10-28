@@ -1,7 +1,7 @@
 // The descriptor an ESP32-C6 HP-UART driver consumes: one binding's resolved values, exactly
 namespace Lamella.Boards
 {
-    public sealed class Esp32C6UartBinding
+    internal sealed class Esp32C6UartBinding
     {
         /// <summary>The bound HP-UART instance's base address.</summary>
         public readonly uint UartBase;

@@ -1,0 +1,509 @@
+<!--
+  The devices dotnet run lists and chooses from, and the command dotnet run starts. Sdk.targets imports this file
+  only for a build whose runs Lamella.Sdk serves, a lamella1.0 build or a net11.0 build of Lamella RHU, because dotnet
+  run takes a project that defines ComputeAvailableDevices for one with devices to choose from, whatever the condition
+  on the target: under a target that was only skipped, a project for another framework would be refused with "No
+  devices are available for this project." Each target here hands its work to a target for one framework.
+
+  A device is reached one of three ways, and its description says which first, since that is how the program runs
+  there. A board running Lamella's firmware, and this computer, run a lamella1.0 program under Lamella's interpreter.
+  A debug probe runs a program as a native image: dotnet run publishes the program for the board, as dotnet publish
+  does, writes the image to the board over the probe, and follows its output while it runs. An emulator Lamella RHU
+  installs runs a net11.0 program as a native image too: the lamella tool starts the command RHU's targets compose
+  for it, once it has said how the program runs.
+-->
+<Project>
+
+  <!-- This computer, which a lamella1.0 project that names no board lists first: the one device this SDK adds itself,
+       so that it is listed without asking the lamella tool. -->
+  <ItemGroup>
+    <_LamellaLocalDevice Include="local" Description="This computer, under Lamella's interpreter" Type="Local" Model="interpreter" />
+  </ItemGroup>
+
+  <Target Name="ComputeAvailableDevices" DependsOnTargets="_LamellaComputeAvailableDevices;_LamellaRhuComputeAvailableDevices" Returns="@(_LamellaDevice)" />
+
+  <!-- What is attached, as the lamella tool lists it by the USB identity this computer already holds, writing to no
+       device, so listing disturbs no program running on a board and no other session: a board whose USB identity is
+       Lamella firmware's own, a debug probe's UART bridge (Bridge="true"), whose board is not identified, and the
+       debug probes, each with its family and USB serial number. They go into a small project whose targets
+       LamellaDevices and LamellaProbes return them. When the tool cannot list, nothing is found, and each framework's
+       list says why. -->
+  <Target Name="_LamellaListAttached" DependsOnTargets="_LamellaToolFault;_LamellaToolExecutable">
+    <MakeDir Condition="'$(_LamellaToolFault)' == ''" Directories="$(_LamellaIntermediateDir)" />
+    <Delete Files="$(_LamellaDevicesFile)" />
+    <Exec Condition="'$(_LamellaToolFault)' == ''"
+          Command="&quot;$(_LamellaTool)&quot; devices --msbuild &quot;$(_LamellaDevicesFile)&quot;"
+          EnvironmentVariables="LAMELLA_REF_DIR=$(LamellaRefDir);LAMELLA_RUNTIME_SUPPORT_DIR=$(LamellaRuntimeSupportDir)"
+          ContinueOnError="true"
+          EchoOff="true"
+          StandardOutputImportance="low" />
+    <MSBuild Condition="Exists('$(_LamellaDevicesFile)')" Projects="$(_LamellaDevicesFile)" Targets="LamellaDevices" Properties="LamellaDevicesStamp=$([System.DateTime]::UtcNow.Ticks)" ContinueOnError="true">
+      <Output TaskParameter="TargetOutputs" ItemName="_LamellaFoundDevice" />
+    </MSBuild>
+    <MSBuild Condition="Exists('$(_LamellaDevicesFile)')" Projects="$(_LamellaDevicesFile)" Targets="LamellaProbes" Properties="LamellaDevicesStamp=$([System.DateTime]::UtcNow.Ticks)" ContinueOnError="true">
+      <Output TaskParameter="TargetOutputs" ItemName="_LamellaFoundProbe" />
+    </MSBuild>
+  </Target>
+
+  <!-- The devices dotnet run lists and chooses from, for a lamella1.0 build.
+
+       dotnet run picks a list of one without asking and asks about a longer one, and it takes a
+       device only from its command line: a Device property a project sets does not choose. So the
+       list decides, and a bridge is never alone in it, since a bridge can carry any program. A
+       project that names no board lists this computer first, where the program runs under Lamella's
+       interpreter, then every board and bridge found. With nothing found that is a list of one, and
+       the program runs on this computer. With anything found, dotnet run asks, and its first choice
+       is this computer; where it cannot ask, as in a script or a CI job, it refuses with the list,
+       and naming the device local with dotnet run's device option runs the program here.
+
+       A project that names a board lists the boards running Lamella firmware, each described as
+       the interpreter on that board, at the port or USB identity it is reached at, and the tool then
+       sends the program only to the board the project names. Where the lamella tool writes a native
+       image for that board and runs it through a debug probe, the list also holds each attached probe
+       of a family the tool runs the board through, named by its id, probe: and its USB serial number.
+       A probe is described as the native image for the board the project names, through that probe,
+       since a listing cannot ask which board is wired to it. A board behind a probe is also reached by naming its
+       bridge with dotnet run's device option, and when bridges alone are attached a warning says so:
+       dotnet run shows a warning beside its own "No devices are available", where its terminal
+       logger would show a message only at a detailed verbosity.
+
+       When the tool cannot list, the reason is a warning and no board is listed, since dotnet run
+       treats a failing list as no list at all and would run the program with no device. -->
+  <Target Name="_LamellaComputeAvailableDevices"
+          DependsOnTargets="_LamellaListAttached"
+          Condition="'$(TargetFrameworkIdentifier)' == 'Lamella'">
+    <Warning Condition="'$(_LamellaToolFault)' != ''" Code="$(_LamellaToolFaultCode)" Text="$(_LamellaToolFault) No board is listed." />
+
+    <!-- The probe families the named board's native image runs through, from the boards this SDK
+         knows (Lamella.Boards.targets): none for a board the tool writes no native image for. -->
+    <ItemGroup Condition="'$(LamellaTargetBoard)' != ''">
+      <_LamellaNamedBoard Include="@(LamellaBoard)" Condition="'%(Identity)' == '$(LamellaTargetBoard)'" />
+    </ItemGroup>
+    <PropertyGroup>
+      <_LamellaBoardNativeImage>@(_LamellaNamedBoard->'%(NativeImage)')</_LamellaBoardNativeImage>
+      <_LamellaBoardProbeFamilies Condition="'$(_LamellaBoardNativeImage)' == 'true'">@(_LamellaNamedBoard->'%(ProbeFamilies)')</_LamellaBoardProbeFamilies>
+    </PropertyGroup>
+    <ItemGroup>
+      <_LamellaRunProbe Include="@(_LamellaFoundProbe)" Condition="'$(_LamellaBoardProbeFamilies)' != '' and $([System.String]::Copy(';$(_LamellaBoardProbeFamilies);').Contains(';%(_LamellaFoundProbe.Family);'))">
+        <Description>Native image for $(LamellaTargetBoard) through probe %(_LamellaFoundProbe.Serial)</Description>
+      </_LamellaRunProbe>
+    </ItemGroup>
+
+    <ItemGroup>
+      <_LamellaFoundBoard Include="@(_LamellaFoundDevice)" Condition="'%(_LamellaFoundDevice.Bridge)' != 'true'" />
+      <_LamellaFoundBridge Include="@(_LamellaFoundDevice)" Condition="'%(_LamellaFoundDevice.Bridge)' == 'true'" />
+    </ItemGroup>
+    <ItemGroup Condition="'$(LamellaTargetBoard)' == ''">
+      <_LamellaDevice Include="@(_LamellaLocalDevice)" />
+      <_LamellaDevice Include="@(_LamellaFoundDevice)" />
+    </ItemGroup>
+    <ItemGroup Condition="'$(LamellaTargetBoard)' != ''">
+      <_LamellaDevice Include="@(_LamellaFoundBoard)">
+        <Description>Interpreter on $(LamellaTargetBoard) at %(_LamellaFoundBoard.Endpoint)</Description>
+      </_LamellaDevice>
+      <_LamellaDevice Include="@(_LamellaRunProbe)" />
+    </ItemGroup>
+    <Warning Condition="'$(LamellaTargetBoard)' != '' and '@(_LamellaDevice)' == '' and '@(_LamellaFoundBridge)' != ''"
+             Code="LAMSDK0016"
+             Text="A board behind a debug probe is not listed for a project that names a board, because the probe cannot say which board it is. Reach it with dotnet run --device &lt;ID&gt;, where &lt;ID&gt; names the probe's UART bridge: @(_LamellaFoundBridge, ', '). lamella devices lists every device with its ID." />
+  </Target>
+
+  <!-- The rows of a net11.0 device list, from Lamella RHU's routes, the boards this SDK knows and the probes attached:
+       for each route RHU runs a board on, a probe route by every attached probe of a family this SDK's catalog runs
+       that board through, and an emulator route when RHU reports its emulator installed. A probe row is named by the
+       probe's id, or, where the project named no board, by the probe's id and the board after it; it is described as
+       the native image for the board, through the probe. An emulator row is named by its machine and described as the
+       native image in that machine's emulator. No id is listed twice. With RestoreFor, every row carries it as its
+       RuntimeIdentifier. Unreached names each board RHU runs on a probe that the catalog runs through no probe
+       family. -->
+  <UsingTask TaskName="LamellaRhuDeviceRows" TaskFactory="RoslynCodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <ParameterGroup>
+      <Routes ParameterType="Microsoft.Build.Framework.ITaskItem[]" />
+      <LamellaBoards ParameterType="Microsoft.Build.Framework.ITaskItem[]" />
+      <Probes ParameterType="Microsoft.Build.Framework.ITaskItem[]" />
+      <Board ParameterType="System.String" />
+      <Qualified ParameterType="System.Boolean" />
+      <RestoreFor ParameterType="System.String" />
+      <Devices ParameterType="Microsoft.Build.Framework.ITaskItem[]" Output="true" />
+      <Unreached ParameterType="System.String" Output="true" />
+    </ParameterGroup>
+    <Task>
+      <Code Type="Class" Language="cs"><![CDATA[
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using Microsoft.Build.Framework;
+using Microsoft.Build.Utilities;
+
+public sealed class LamellaRhuDeviceRows : Task
+{
+    public ITaskItem[] Routes { get; set; }
+    public ITaskItem[] LamellaBoards { get; set; }
+    public ITaskItem[] Probes { get; set; }
+    public string Board { get; set; }
+    public bool Qualified { get; set; }
+    public string RestoreFor { get; set; }
+    [Output] public ITaskItem[] Devices { get; set; }
+    [Output] public string Unreached { get; set; }
+
+    public override bool Execute()
+    {
+        Dictionary<string, string[]> families = new Dictionary<string, string[]>(StringComparer.Ordinal);
+        foreach (ITaskItem board in LamellaBoards ?? new ITaskItem[0])
+        {
+            families[board.ItemSpec] = board.GetMetadata("ProbeFamilies").Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
+        }
+        List<ITaskItem> devices = new List<ITaskItem>();
+        HashSet<string> listed = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        List<string> unreached = new List<string>();
+        foreach (ITaskItem route in Routes ?? new ITaskItem[0])
+        {
+            string board = route.GetMetadata("Board");
+            if (board.Length == 0) board = Board ?? "";
+            if (board.Length == 0) continue;
+            if (route.ItemSpec == "probe")
+            {
+                string[] reach;
+                if (!families.TryGetValue(board, out reach) || reach.Length == 0)
+                {
+                    unreached.Add(board);
+                    continue;
+                }
+                foreach (ITaskItem probe in (Probes ?? new ITaskItem[0]).Where(probe => reach.Contains(probe.GetMetadata("Family"))))
+                {
+                    TaskItem row = new TaskItem(Qualified ? probe.ItemSpec + "/" + board : probe.ItemSpec);
+                    if (!listed.Add(row.ItemSpec)) continue;
+                    row.SetMetadata("Description", "Native image for " + board + " through probe " + probe.GetMetadata("Serial"));
+                    row.SetMetadata("Type", probe.GetMetadata("Type"));
+                    row.SetMetadata("Status", probe.GetMetadata("Status"));
+                    row.SetMetadata("Model", "native");
+                    row.SetMetadata("Serial", probe.GetMetadata("Serial"));
+                    row.SetMetadata("Board", board);
+                    row.SetMetadata("Route", "probe");
+                    devices.Add(row);
+                }
+            }
+            else if (route.ItemSpec == "emulator" && string.Equals(route.GetMetadata("Available"), "true", StringComparison.OrdinalIgnoreCase))
+            {
+                string machine = route.GetMetadata("Machine");
+                TaskItem row = new TaskItem("emulator:" + machine);
+                if (!listed.Add(row.ItemSpec)) continue;
+                row.SetMetadata("Description", "Native image in the " + machine + " emulator (not your board)");
+                row.SetMetadata("Type", "Emulator");
+                row.SetMetadata("Status", "Installed");
+                row.SetMetadata("Model", "native");
+                row.SetMetadata("Board", board);
+                row.SetMetadata("Machine", machine);
+                row.SetMetadata("Route", "emulator");
+                devices.Add(row);
+            }
+        }
+        if (!string.IsNullOrEmpty(RestoreFor))
+        {
+            foreach (ITaskItem row in devices) row.SetMetadata("RuntimeIdentifier", RestoreFor);
+        }
+        Devices = devices.ToArray();
+        Unreached = string.Join(";", unreached);
+        return true;
+    }
+}
+]]></Code>
+    </Task>
+  </UsingTask>
+
+  <!-- The devices dotnet run lists and chooses from, for a net11.0 build of Lamella RHU (the shell contract, section 4,
+       with amendment 1). Lamella RHU says which routes it runs a board on (RhuRunRoutes): a debug probe for a board,
+       and its emulator for an emulator's row, when the emulator is installed. A probe is listed for a board when its
+       family is one this SDK's catalog runs the board through, as for a lamella1.0 build.
+
+       A project that names a board lists the probes that reach it, by their ids, and its emulator. One that names
+       none lists each probe once for each of RHU's boards it reaches, probe:<serial>/<board>, and every emulator
+       installed, so the device dotnet run chooses names the board too (Lamella.Rhu.targets takes it before restore);
+       a device that so named the board lists the same way. dotnet run restores a project before it lists its
+       devices, and restores again for the device it chooses only when that device carries a RuntimeIdentifier, which
+       it then sets for the run. So each row of a project that names no board carries the build's own, and the
+       restore made for the device chosen brings its board's packages; the build's runtime identifier is the same
+       either way. dotnet run uses a list of one without asking, asks about a longer one, and refuses with the list
+       where it cannot ask. With nothing listed, dotnet run says that no devices are available, and a warning beside it
+       says why: the board the project names has no probe route in this SDK yet, or the project names no board and
+       nothing that reaches one was found.
+
+       When the lamella tool cannot list, the reason is a warning and no probe is listed; an emulator is still listed,
+       since RHU starts it. When RHU's targets cannot be read, the reason is a warning and nothing is listed. -->
+  <Target Name="_LamellaRhuComputeAvailableDevices"
+          DependsOnTargets="_LamellaListAttached"
+          Condition="'$(TargetFramework)' == 'net11.0' and '$(_LamellaRhuDispatch)' == 'true'">
+    <Warning Condition="'$(_LamellaToolFault)' != ''" Code="$(_LamellaToolFaultCode)" Text="$(_LamellaToolFault) No debug probe is listed." />
+    <CallTarget Targets="_LamellaRhuRoutes">
+      <Output TaskParameter="TargetOutputs" ItemName="_LamellaRhuRouteFound" />
+    </CallTarget>
+    <ItemGroup>
+      <_LamellaRhuRoute Include="@(_LamellaRhuRouteFound)" Condition="'%(Identity)' != 'fault'" />
+    </ItemGroup>
+    <PropertyGroup>
+      <_LamellaRhuRouteFault>@(_LamellaRhuRouteFound->WithMetadataValue('Identity', 'fault')->'%(Text)')</_LamellaRhuRouteFault>
+      <_LamellaRhuRouteFaultCode>@(_LamellaRhuRouteFound->WithMetadataValue('Identity', 'fault')->'%(Code)')</_LamellaRhuRouteFaultCode>
+    </PropertyGroup>
+    <Warning Condition="'$(_LamellaRhuRouteFault)' != ''" Code="$(_LamellaRhuRouteFaultCode)" Text="$(_LamellaRhuRouteFault) No device is listed." />
+    <PropertyGroup>
+      <_LamellaRhuQualified>false</_LamellaRhuQualified>
+      <_LamellaRhuQualified Condition="'$(LamellaTargetBoard)' == '' or '$(_LamellaRhuBoardFromDevice)' == 'true'">true</_LamellaRhuQualified>
+    </PropertyGroup>
+    <PropertyGroup>
+      <_LamellaRhuRestoreFor Condition="'$(LamellaTargetBoard)' == ''">$(RuntimeIdentifier)</_LamellaRhuRestoreFor>
+    </PropertyGroup>
+    <LamellaRhuDeviceRows Routes="@(_LamellaRhuRoute)" LamellaBoards="@(LamellaBoard)" Probes="@(_LamellaFoundProbe)" Board="$(LamellaTargetBoard)" Qualified="$(_LamellaRhuQualified)" RestoreFor="$(_LamellaRhuRestoreFor)">
+      <Output TaskParameter="Devices" ItemName="_LamellaDevice" />
+      <Output TaskParameter="Unreached" PropertyName="_LamellaRhuUnreached" />
+    </LamellaRhuDeviceRows>
+    <PropertyGroup>
+      <_LamellaRhuBoardUnreached Condition="'$(LamellaTargetBoard)' != '' and $([System.String]::Copy(';$(_LamellaRhuUnreached);').Contains(';$(LamellaTargetBoard);'))">true</_LamellaRhuBoardUnreached>
+    </PropertyGroup>
+    <Warning Condition="'$(_LamellaRhuBoardUnreached)' == 'true' and '$(_LamellaRhuBoardFromDevice)' != 'true'" Code="LAMSDK0017" Text="$(LamellaTargetBoard) has no probe route in this SDK yet." />
+    <Warning Condition="'$(LamellaTargetBoard)' == '' and '@(_LamellaDevice)' == '' and '$(_LamellaRhuRouteFault)' == ''"
+             Code="LAMSDK0018"
+             Text="This project names no board, and no debug probe or emulator that reaches one of Lamella RHU's boards was found. Attach a debug probe wired to the board, and dotnet run lists it once for each board it reaches; or name the board as LamellaTargetBoard, in the project file or with -p:LamellaTargetBoard=&lt;id&gt; on the dotnet run command line." />
+  </Target>
+
+  <!-- Lamella RHU's routes (RhuRunRoutes), or, when RHU's targets cannot be read, one item, fault, whose Text says why.
+       dotnet run evaluates a project before it restores it, and on a project's first restore lists its devices from
+       that evaluation, which has none of RHU's targets, since they come from a package: the routes then come from a
+       fresh evaluation of the project, made once the restore has written its assets file. -->
+  <Target Name="_LamellaRhuRoutes" DependsOnTargets="_LamellaRhuFault" Returns="@(_LamellaRhuRouteOrFault)">
+    <CallTarget Condition="'$(_LamellaRhuImports)' == 'true'" Targets="RhuRunRoutes">
+      <Output TaskParameter="TargetOutputs" ItemName="_LamellaRhuRouteOrFault" />
+    </CallTarget>
+    <MSBuild Condition="'$(_LamellaRhuImports)' != 'true' and '$(_LamellaRhuRoutesAfterRestore)' != 'true' and Exists('$(ProjectAssetsFile)')"
+             Projects="$(MSBuildProjectFullPath)"
+             Targets="_LamellaRhuRoutes"
+             Properties="_LamellaRhuRoutesAfterRestore=true">
+      <Output TaskParameter="TargetOutputs" ItemName="_LamellaRhuRouteOrFault" />
+    </MSBuild>
+    <ItemGroup Condition="'@(_LamellaRhuRouteOrFault)' == '' and '$(_LamellaRhuImports)' != 'true'">
+      <_LamellaRhuRouteOrFault Include="fault" Text="$(_LamellaRhuFault)" Code="$(_LamellaRhuFaultCode)" />
+    </ItemGroup>
+  </Target>
+
+  <!-- The device list as a person reads it in a refusal, in dotnet run's own form: each id, its
+       description, its type and its status; how many devices it holds; and the first id. -->
+  <Target Name="_LamellaDeviceListText" DependsOnTargets="ComputeAvailableDevices">
+    <ItemGroup>
+      <_LamellaListedDevice Include="@(_LamellaDevice)" />
+      <_LamellaListedDevice Condition="'%(_LamellaListedDevice.Status)' == ''">
+        <LamellaShown>%(_LamellaListedDevice.Type)</LamellaShown>
+      </_LamellaListedDevice>
+      <_LamellaListedDevice Condition="'%(_LamellaListedDevice.Status)' != ''">
+        <LamellaShown>%(_LamellaListedDevice.Type), %(_LamellaListedDevice.Status)</LamellaShown>
+      </_LamellaListedDevice>
+    </ItemGroup>
+    <PropertyGroup>
+      <_LamellaDeviceCount>@(_LamellaDevice->Count())</_LamellaDeviceCount>
+      <_LamellaDeviceIds>@(_LamellaDevice)</_LamellaDeviceIds>
+      <_LamellaFirstDevice>$(_LamellaDeviceIds)</_LamellaFirstDevice>
+      <_LamellaFirstDevice Condition="$(_LamellaDeviceIds.Contains(';'))">$(_LamellaDeviceIds.Substring(0, $(_LamellaDeviceIds.IndexOf(';'))))</_LamellaFirstDevice>
+      <_LamellaDeviceList>@(_LamellaListedDevice->'  %(Identity) - %(Description) (%(LamellaShown))', '%0A')</_LamellaDeviceList>
+      <_LamellaEntryPointFile>$([System.IO.Path]::GetFileName('$(EntryPointFilePath)'))</_LamellaEntryPointFile>
+      <_LamellaDeviceOption>the --device argument</_LamellaDeviceOption>
+      <_LamellaDeviceOption Condition="'$(FileBasedProgram)' == 'true'">-p:Device=&lt;id&gt;</_LamellaDeviceOption>
+      <_LamellaDeviceExample>dotnet run --device $(_LamellaFirstDevice)</_LamellaDeviceExample>
+      <_LamellaDeviceExample Condition="'$(FileBasedProgram)' == 'true'">dotnet run $(_LamellaEntryPointFile) -p:Device=$(_LamellaFirstDevice)</_LamellaDeviceExample>
+    </PropertyGroup>
+  </Target>
+
+  <Target Name="ComputeRunArguments" DependsOnTargets="_LamellaComputeRunArguments;_LamellaRhuComputeRunArguments" />
+
+  <!-- The device a file-based app runs on when none is named. dotnet run chooses no device for a
+       file-based app, and does not read its device options for one: only -p:Device= reaches the
+       build. So the list is computed here, as ComputeAvailableDevices computes it for a project. A
+       lone device is used, as dotnet run uses one; none, or several, is refused in dotnet run's own
+       words, naming -p:Device=<id> in place of its option. -->
+  <Target Name="_LamellaFileBasedDevice"
+          DependsOnTargets="_LamellaDeviceListText"
+          Condition="'$(FileBasedProgram)' == 'true' and '$(Device)' == ''">
+    <Error Condition="'$(_LamellaDeviceCount)' == '0'"
+           Code="LAMSDK0019"
+           Text="No devices are available for this project. A file-based program names the device it runs on with -p:Device=&lt;id&gt;, since dotnet run takes no --device for it." />
+    <Error Condition="'$(_LamellaDeviceCount)' &gt; '1'"
+           Code="LAMSDK0020"
+           Text="Unable to run this project because multiple devices are available. Please specify which device to use by passing -p:Device=&lt;id&gt; with one of the following values:%0A$(_LamellaDeviceList)%0A%0AExample: $(_LamellaDeviceExample)" />
+    <ItemGroup>
+      <_LamellaRunDevice Include="@(_LamellaDevice)" />
+    </ItemGroup>
+  </Target>
+
+  <!-- The device dotnet run was given, which must be one the list holds. dotnet run passes an id it
+       does not know straight through as Device, so an id this project cannot run on is refused here,
+       with the list, before anything is written to a device. This computer, for a lamella1.0 project
+       that names no board, is the list's own first device, and is taken without asking the lamella
+       tool. A net11.0 device that names, after a probe's serial number, the board the project names
+       is that probe's id; a probe for a board that has no probe route in this SDK yet is refused in
+       those words. -->
+  <Target Name="_LamellaNamedDevice" DependsOnTargets="_LamellaNamedLocalDevice;_LamellaNamedListedDevice" />
+
+  <Target Name="_LamellaNamedLocalDevice" Condition="'$(Device)' == 'local' and '$(LamellaTargetBoard)' == '' and '$(TargetFrameworkIdentifier)' == 'Lamella'">
+    <ItemGroup>
+      <_LamellaRunDevice Include="@(_LamellaLocalDevice)" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="_LamellaNamedListedDevice"
+          DependsOnTargets="_LamellaDeviceListText"
+          Condition="'$(Device)' != '' and !('$(Device)' == 'local' and '$(LamellaTargetBoard)' == '' and '$(TargetFrameworkIdentifier)' == 'Lamella')">
+    <PropertyGroup>
+      <_LamellaListedId>$(Device)</_LamellaListedId>
+      <_LamellaListedId Condition="'$(_LamellaRhuDeviceNamesBoard)' != '' and '$(_LamellaRhuDeviceNamesBoard)' == '$(LamellaTargetBoard)'">$([System.Text.RegularExpressions.Regex]::Replace('$(Device)', '/[^/]+$', ''))</_LamellaListedId>
+    </PropertyGroup>
+    <ItemGroup>
+      <_LamellaRunDevice Include="@(_LamellaDevice->WithMetadataValue('Identity', '$(_LamellaListedId)'))" />
+    </ItemGroup>
+    <Error Condition="'@(_LamellaRunDevice)' == '' and '$(_LamellaRhuBoardUnreached)' == 'true' and $(Device.ToLowerInvariant().StartsWith('probe:'))"
+           Code="LAMSDK0017"
+           Text="Unable to run this project on the device '$(Device)', which is not one of its devices: $(LamellaTargetBoard) has no probe route in this SDK yet." />
+    <Error Condition="'@(_LamellaRunDevice)' == '' and '$(_LamellaDeviceCount)' == '0'"
+           Code="LAMSDK0021"
+           Text="Unable to run this project on the device '$(Device)', which is not one of its devices. No devices are available for this project." />
+    <Error Condition="'@(_LamellaRunDevice)' == '' and '$(_LamellaDeviceCount)' != '0'"
+           Code="LAMSDK0021"
+           Text="Unable to run this project on the device '$(Device)', which is not one of its devices. Please specify which device to use by passing $(_LamellaDeviceOption) with one of the following values:%0A$(_LamellaDeviceList)%0A%0AExample: $(_LamellaDeviceExample)" />
+  </Target>
+
+  <!-- A run on a debug probe runs the image dotnet publish writes, so the run's build ends in a
+       publish: dotnet run names the device it was given as the global property Device for each step
+       of the run, the build first and ComputeRunArguments after it, and its no-build option skips the
+       build alone. A build that carries a probe's id therefore publishes, natively whatever the
+       project's PublishAot, since a probe takes a native image; and a run with the no-build option
+       runs the image the last publish left, and is refused by name when there is none. The publish is
+       made through the project itself, with the publishing flag that keeps it from publishing again.
+       The device is checked first, so that nothing is published for an id the project cannot run on. -->
+  <Target Name="_LamellaRunPublish"
+          AfterTargets="Build"
+          DependsOnTargets="_LamellaNamedDevice"
+          Condition="'$(TargetFrameworkIdentifier)' == 'Lamella' and '$(_IsPublishing)' != 'true' and $(Device.ToLowerInvariant().StartsWith('probe:'))">
+    <MSBuild Projects="$(MSBuildProjectFullPath)" Targets="Publish" Properties="_IsPublishing=true;PublishAot=true" />
+  </Target>
+
+  <!-- A net11.0 run's build ends in Lamella RHU's own publish, after Build, when dotnet run names a device. The device
+       is checked first, here, so that nothing is published for an id the project cannot run on: this file is read
+       before RHU's targets, so this target runs before theirs, after Build. -->
+  <Target Name="_LamellaRhuRunDevice"
+          AfterTargets="Build"
+          DependsOnTargets="_LamellaNamedDevice"
+          Condition="'$(TargetFramework)' == 'net11.0' and '$(_LamellaRhuDispatch)' == 'true' and '$(_IsPublishing)' != 'true' and '$(Device)' != ''" />
+
+  <!-- The command dotnet run starts, after the build.
+
+       On a debug probe: the lamella tool, given the manifest of the image the run published and the
+       probe's USB serial number. It writes the image to the board over the probe, starts the program,
+       prints what the program prints, and ends with the program's exit code. A file-based app whose
+       lone device is a probe has published nothing yet, since dotnet run named no device to its
+       build, so the image is published here first.
+
+       Anywhere else: the lamella tool, given the built assembly, the class library's folder and the
+       runtime support archives' folder, and the device dotnet run chose, if any, or for a file-based
+       app the lone device; the device local is this computer. The backslashes that end a folder are
+       doubled, so that they do not escape the quote that closes it. With a device, the board the
+       project names goes too, and the tool sends the program only when the board that answers is
+       that one: the device list names each device by its USB identity alone, so it cannot say which
+       board is behind a bridge. The tool finds the program's own libraries beside the assembly, where
+       the build copies them.
+
+       Either way the bare double dash ends the tool's arguments, so anything dotnet run appends after
+       it is the program's. -->
+  <Target Name="_LamellaComputeRunArguments"
+          DependsOnTargets="_LamellaCheckTool;_LamellaFileBasedDevice;_LamellaNamedDevice"
+          Condition="'$(TargetFrameworkIdentifier)' == 'Lamella'">
+    <PropertyGroup>
+      <_LamellaRunDeviceId>@(_LamellaRunDevice)</_LamellaRunDeviceId>
+      <_LamellaRunNative>@(_LamellaRunDevice->WithMetadataValue('Model', 'native')->Count())</_LamellaRunNative>
+    </PropertyGroup>
+    <MSBuild Condition="'$(_LamellaRunNative)' == '1' and '$(Device)' == ''" Projects="$(MSBuildProjectFullPath)" Targets="Publish" Properties="_IsPublishing=true;PublishAot=true" />
+    <PropertyGroup Condition="'$(_LamellaRunNative)' == '1'">
+      <_LamellaRunManifest>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '$(PublishDir)', '$(AssemblyName).elf.manifest.json'))</_LamellaRunManifest>
+      <RunCommand>$(_LamellaTool)</RunCommand>
+      <RunArguments>run --manifest &quot;$(_LamellaRunManifest)&quot; --probe &quot;@(_LamellaRunDevice->'%(Serial)')&quot; --</RunArguments>
+      <RunWorkingDirectory>$(MSBuildProjectDirectory)</RunWorkingDirectory>
+    </PropertyGroup>
+    <Error Condition="'$(_LamellaRunNative)' == '1' and !Exists('$(_LamellaRunManifest)')"
+           Code="LAMSDK0022"
+           Text="There is no image to run on $(_LamellaRunDeviceId): no manifest at '$(_LamellaRunManifest)'. A run on a debug probe publishes the program and runs the image it writes, and a run with the no-build option publishes nothing; run without it." />
+    <PropertyGroup Condition="'$(_LamellaRunNative)' != '1'">
+      <_LamellaRunDeviceId Condition="'$(_LamellaRunDeviceId)' == ''">$(Device)</_LamellaRunDeviceId>
+      <_LamellaRefDirArgument>$([System.Text.RegularExpressions.Regex]::Replace('$(LamellaRefDir)', '(\\+)$', '$1$1'))</_LamellaRefDirArgument>
+      <_LamellaRuntimeSupportDirArgument>$([System.Text.RegularExpressions.Regex]::Replace('$(LamellaRuntimeSupportDir)', '(\\+)$', '$1$1'))</_LamellaRuntimeSupportDirArgument>
+      <RunCommand>$(_LamellaTool)</RunCommand>
+      <RunArguments>run --built &quot;$(TargetPath)&quot; --ref-dir &quot;$(_LamellaRefDirArgument)&quot; --runtime-support-dir &quot;$(_LamellaRuntimeSupportDirArgument)&quot;</RunArguments>
+      <RunArguments Condition="'$(_LamellaRunDeviceId)' != '' and '$(_LamellaRunDeviceId)' != 'local'">$(RunArguments) --device &quot;$(_LamellaRunDeviceId)&quot;</RunArguments>
+      <RunArguments Condition="'$(_LamellaRunDeviceId)' != '' and '$(_LamellaRunDeviceId)' != 'local' and '$(LamellaTargetBoard)' != ''">$(RunArguments) --board &quot;$(LamellaTargetBoard)&quot;</RunArguments>
+      <RunArguments>$(RunArguments) --</RunArguments>
+    </PropertyGroup>
+  </Target>
+
+  <!-- The command dotnet run starts for a net11.0 program, after the build and Lamella RHU's publish (the shell
+       contract, sections 3.3 and 3.4).
+
+       On a debug probe, the probe route is this SDK's, as for a lamella1.0 program: the lamella tool, given the
+       manifest in the publish folder and the probe's USB serial number, then the bare double dash, in the project's
+       folder. On an emulator, Lamella RHU composes the command, an executable and its arguments, in its
+       RhuComputeRunCommand, handed the route and the emulator's machine as LamellaDeviceRoute and
+       LamellaEmulatorMachine; the lamella tool starts that command, so that the run first says how the program runs,
+       as it does on a probe.
+
+       A file-based app chooses its device here, as for a lamella1.0 program, and its build named no device, so the
+       image is published here first. A device that names a board the project does not name cannot be run that way,
+       since the restore brought no package of that board's: the device is named on the command line instead, with
+       -p:Device=<id>, which the restore then sees. -->
+  <Target Name="_LamellaRhuComputeRunArguments"
+          DependsOnTargets="_LamellaRhuRunDeviceChosen;_LamellaRhuProbeRun;_LamellaRhuEmulatorRun"
+          Condition="'$(TargetFramework)' == 'net11.0' and '$(_LamellaRhuDispatch)' == 'true'" />
+
+  <Target Name="_LamellaRhuRunDeviceChosen" DependsOnTargets="_LamellaRhuDeviceBoardCheck;_LamellaFileBasedDevice;_LamellaNamedDevice">
+    <PropertyGroup>
+      <_LamellaRunDeviceId>@(_LamellaRunDevice)</_LamellaRunDeviceId>
+      <_LamellaRunRoute>@(_LamellaRunDevice->'%(Route)')</_LamellaRunRoute>
+      <_LamellaRunMachine>@(_LamellaRunDevice->'%(Machine)')</_LamellaRunMachine>
+      <_LamellaRunBoard>@(_LamellaRunDevice->'%(Board)')</_LamellaRunBoard>
+    </PropertyGroup>
+    <Error Condition="'$(_LamellaRunDeviceId)' == ''"
+           Code="LAMSDK0023"
+           Text="A $(TargetFramework) program runs on a device, and none was given. dotnet run chooses one from the project's devices, which dotnet run --list-devices lists." />
+    <Error Condition="'$(Device)' == '' and '$(_LamellaRunBoard)' != '$(LamellaTargetBoard)'"
+           Code="LAMSDK0024"
+           Text="Unable to run this program on the device '$(_LamellaRunDeviceId)', which is for the board $(_LamellaRunBoard), when the program names no board: the board's packages are restored only for a device named before the build. Name it: dotnet run $(_LamellaEntryPointFile) -p:Device=$(_LamellaRunDeviceId)" />
+    <MSBuild Condition="'$(Device)' == ''" Projects="$(MSBuildProjectFullPath)" Targets="Publish" Properties="_IsPublishing=true" />
+  </Target>
+
+  <Target Name="_LamellaRhuProbeRun" DependsOnTargets="_LamellaCheckTool" Condition="'$(_LamellaRunRoute)' == 'probe'">
+    <PropertyGroup>
+      <_LamellaRunManifest>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '$(PublishDir)', '$(AssemblyName).elf.manifest.json'))</_LamellaRunManifest>
+      <RunCommand>$(_LamellaTool)</RunCommand>
+      <RunArguments>run --manifest &quot;$(_LamellaRunManifest)&quot; --probe &quot;@(_LamellaRunDevice->'%(Serial)')&quot; --</RunArguments>
+      <RunWorkingDirectory>$(MSBuildProjectDirectory)</RunWorkingDirectory>
+    </PropertyGroup>
+    <Error Condition="!Exists('$(_LamellaRunManifest)')"
+           Code="LAMSDK0022"
+           Text="There is no image to run on $(_LamellaRunDeviceId): no manifest at '$(_LamellaRunManifest)'. A run on a debug probe publishes the program and runs the image it writes, and a run with the no-build option publishes nothing; run without it." />
+  </Target>
+
+  <Target Name="_LamellaRhuEmulatorRoute" Condition="'$(_LamellaRunRoute)' == 'emulator'">
+    <PropertyGroup>
+      <LamellaDeviceRoute>emulator</LamellaDeviceRoute>
+      <LamellaEmulatorMachine>$(_LamellaRunMachine)</LamellaEmulatorMachine>
+    </PropertyGroup>
+  </Target>
+
+  <!-- The run on an emulator: the lamella tool, given the executable of the command Lamella RHU composed, the device
+       and its board, which the run's first line names, and after the bare double dash RHU's arguments as RHU wrote
+       them. What dotnet run appends for the program then follows RHU's arguments, as it would have had dotnet run
+       started RHU's command itself, and the run stays in the folder RHU names. The tool starts RHU's executable with
+       exactly those arguments, and the run ends with the emulator's exit code. An executable's name that is quoted
+       already, or has blanks around it, is taken as dotnet run takes one: without them. -->
+  <Target Name="_LamellaRhuEmulatorRun" DependsOnTargets="_LamellaCheckTool;_LamellaRhuEmulatorRoute;RhuComputeRunCommand" Condition="'$(_LamellaRunRoute)' == 'emulator'">
+    <PropertyGroup>
+      <_LamellaRhuEmulator>$([System.String]::Copy('$(RunCommand)').Trim().Trim('"'))</_LamellaRhuEmulator>
+      <_LamellaRhuEmulatorArguments>$(RunArguments)</_LamellaRhuEmulatorArguments>
+      <RunCommand>$(_LamellaTool)</RunCommand>
+      <RunArguments>run --emulator &quot;$(_LamellaRhuEmulator)&quot; --device &quot;$(_LamellaRunDeviceId)&quot; --board &quot;$(_LamellaRunBoard)&quot; -- $(_LamellaRhuEmulatorArguments)</RunArguments>
+    </PropertyGroup>
+  </Target>
+
+</Project>

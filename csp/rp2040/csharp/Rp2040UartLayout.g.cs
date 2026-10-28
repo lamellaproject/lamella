@@ -5,7 +5,7 @@
 // instance bases live in Rp2040Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Rp2040UartLayout
+    internal sealed class Rp2040UartLayout
     {
         private Rp2040UartLayout() { }
 

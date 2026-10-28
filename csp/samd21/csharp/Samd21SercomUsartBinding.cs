@@ -1,7 +1,7 @@
 // The descriptor a SAMD21 SERCOM-USART driver consumes: one binding's resolved values, exactly
 namespace Lamella.Boards
 {
-    public sealed class Samd21SercomUsartBinding
+    internal sealed class Samd21SercomUsartBinding
     {
         /// <summary>The bound SERCOM instance's base address.</summary>
         public readonly uint SercomBase;

@@ -1,13 +1,13 @@
 # BLOCK layout: the STM32U5A5 GPIO port block. Offsets are instance-base-relative; the port
 # instance bases live in ../instances.toml.
 #
-# THE RESET MODE IS ANALOG, NOT INPUT, AND IT FAILS SILENTLY. The encoding is the usual four values
+# The reset mode is analog, not input, and it fails silently. The encoding is the usual four values
 # but the DEFAULT is the other end of it: 11, analog mode, is the reset state. An untouched pin is
 # not a digital input reading whatever is on it -- its input buffer is off and IDR reads zero
 # forever. A driver that reads a button without first writing MODER works on a line whose reset is
 # 00 and reads a permanently unpressed button here.
 #
-# AND PORT A's RESET VALUE IS NOT ALL-ANALOG, BECAUSE PINS COME OUT OF RESET AS DEBUG PINS.
+# And port A's reset value is not all-analog, because pins come out of reset as debug pins.
 # RM0456 13.4.1 states MODER's reset per port: 0xABFF FFFF for port A and 0xFFFF FEBF for port B,
 # against 0xFFFF FFFF for ports C to E. Port A's value puts MODE13, MODE14 and MODE15 at 10 --
 # alternate function -- which is JTMS/SWDIO, JTCK/SWCLK and JTDI, and port B's does the same for

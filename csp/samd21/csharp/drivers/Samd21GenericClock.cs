@@ -2,7 +2,7 @@
 // gives for a clock that may already be running: a running clock is stopped, and seen to stop,
 // before its generator changes (DS40001882D 15.6.3.3).
 //
-// WHAT READS BACK, AND WHAT DOES NOT. CLKCTRL reads indirectly: an 8-bit write of a clock's ID selects
+// What reads back, and what does not. CLKCTRL reads indirectly: an 8-bit write of a clock's ID selects
 // it, and the next read returns its setting (15.6.4.1). The generator reads back as written. CLKEN
 // reads 1 only while the peripheral is enabled and requesting its clock, so a clock just routed to an
 // idle peripheral reads 0: the routing is confirmed by its generator, and CLKEN is never waited on

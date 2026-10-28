@@ -3,7 +3,7 @@
 # derivation). VOLTAGE_SELECT sits at offset 0 and is per BANK rather than per pin, which is why
 # the array starts at 0x04.
 #
-# THERE IS NO ISOLATION BIT ON THIS PART, and that is the difference from the RP2350 rather than
+# There is no isolation bit on this part, and that is the difference from the RP2350 rather than
 # an omission here. This part's bit 8 is Reserved; the RP2350 puts ISO there and resets it SET, so
 # every pin on that family needs a pad write before it works at all. Here the reset state is
 # already usable -- IE = 1, SCHMITT = 1, PDE = 1, DRIVE = 4 mA -- so routing the IO_BANK0 function

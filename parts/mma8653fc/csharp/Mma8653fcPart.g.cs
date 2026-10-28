@@ -7,7 +7,7 @@
 // run time.
 namespace Lamella.Generated
 {
-    public sealed class Mma8653fcPart
+    internal sealed class Mma8653fcPart
     {
         private Mma8653fcPart() { }
         public const string PART = "mma8653fc";

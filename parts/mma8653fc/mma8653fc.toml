@@ -1,7 +1,7 @@
 # PART: NXP (Freescale) MMA8653FC, a three-axis 10-bit accelerometer.
 #
 #
-# ITS DEVICE ID SHARES A REGISTER WITH OTHER PARTS IN THIS CATALOG. Register 0x0D is WHO_AM_I here
+# Its device id shares a register with other parts in this catalog. Register 0x0D is WHO_AM_I here
 # and on the FXOS8700CQ, which is this vendor's convention rather than a coincidence. That matters
 # because their addresses OVERLAP: this part is fixed at 0x1D and the FXOS8700CQ selects among 0x1C,
 # 0x1D, 0x1E and 0x1F. At 0x1D the two are separated by the VALUE alone -- 0x5A here, 0xC7 there --
@@ -23,7 +23,7 @@ notes = [
 #
 # Primary: every fact below is read from this part's own data sheet.
 #
-# WHAT THIS TABLE DELIBERATELY DOES NOT STATE: the output data rates and their codes, the 2/4/8 g
+# What this table deliberately does not state: the output data rates and their codes, the 2/4/8 g
 # dynamic ranges and the counts-per-g each implies, the low-power and oversampling modes, the
 # orientation detection block, the freefall and motion detection block, the transient and pulse
 # blocks, and the auto-wake and sleep behavior. All are in the data sheet and none is transcribed.
@@ -50,7 +50,7 @@ notes = "The data sheet names this register's whole purpose in its title, Device
 # One address, stated as standard, with no selection pin described. So two of these cannot share a
 # bus and no configuration exists to separate them.
 #
-# A NUMBER WORTH NOT CONFUSING: the composed read and write bytes are 0x3B and 0x3A -- this address
+# A number worth not confusing: the composed read and write bytes are 0x3B and 0x3A -- this address
 # shifted up with the direction bit appended. They are not addresses in their own right, and the
 # data sheet prints them in the same table as the address itself.
 

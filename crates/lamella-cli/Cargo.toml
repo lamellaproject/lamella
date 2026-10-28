@@ -34,6 +34,9 @@ lamella-flash-routes = { path = "../lamella-flash-routes" }
 # The ECMAScript engine `lamella run <file.js>` executes on this machine.
 lamella-js-frontend = { path = "../lamella-js-frontend" }
 lamella-probe-core = { path = "../lamella-probe-core" }
+# The console ring `run --manifest` follows a program on a board by: its layout, its reader and the
+# symbols an image's ELF names it by.
+lamella-probe-console = { path = "../lamella-probe-console" }
 # The host compile-and-run seam (LcscCompiler + the REPL engine's LoopbackLink), the device
 # enumeration behind `devices`, and the target grammar every verb taking `--device` shares, with
 # `boards`: what a build for a board compiles against and its image carries. The SAME seams the MCP
@@ -125,9 +128,10 @@ lamella-debug-backend = { path = "../lamella-debug-backend", optional = true }
 
 # Ctrl+C during a run of an image on a board, noticed through the console's control handler so the
 # run lets go of the board before it ends the way a program stopped by Ctrl+C ends; and the code
-# Windows gives such a program.
+# Windows gives such a program. And this process's own command line, whose text after the first
+# `--` a run on an emulator hands to the emulator as it stands.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console", "Win32_System_Environment"] }
 
 # The same on Linux and macOS, through SIGINT.
 [target.'cfg(unix)'.dependencies]

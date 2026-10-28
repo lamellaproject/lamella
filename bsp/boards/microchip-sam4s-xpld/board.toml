@@ -1,31 +1,31 @@
 # BOARD binding: the SAM4S Xplained -- the plain Xplained, NOT the Xplained Pro that is this
 # family's other board.
 #
-# THIS BOARD CAN BE PROGRAMMED AND CANNOT BE DEBUGGED, AND THAT SPLIT IS THE POINT OF IT. Its
+# This board can be programmed and cannot be debugged, and that split is the point of it. Its
 # on-board debugger is a SAM3U4C running J-Link OB, whose protocol is not published, and the part's
 # SWD and JTAG signals reach test points with no header for a cable to land on. So no external
 # debugger reaches this silicon. What DOES reach it is the part's own boot ROM, whose monitor
 # protocol is published in the datasheet, over a USB port that belongs to the part rather than to
 # the bridge -- described in the carrier section below.
 #
-# SO IT IS AN INTERPRETER-ONLY BOARD, in the sense a hobbyist board is: a program is deployed to
+# So it is an interpreter-only board, in the sense a hobbyist board is: a program is deployed to
 # it, and a program running on it is debugged by the language runtime it is running under rather
 # than by halting the core from outside. A breakpoint on this board is the interpreter's rather than
 # the processor's, because nothing here reaches the processor's.
 #
-# THE TWO USB CONNECTORS BELONG TO DIFFERENT CHIPS, WHICH IS WHAT MAKES BOTH HALVES WORK AT ONCE:
+# The two USB connectors belong to different chips, which is what makes both halves work at once:
 # the part's own port carries the deploy, and the bridge's virtual COM port carries the console the
 # interpreter talks over. Nothing about the console requires speaking the debugger's protocol -- a
 # CDC virtual COM port is an ordinary serial port whatever else the chip presenting it does. It binds no peripheral; what this file
 # states beyond identity is the board's control lines, which need no driver -- a control pin rides
 # no alternate function.
 #
-# THE PART IS NOT THE SIBLING'S, AND THAT IS THE POINT OF HAVING BOTH. The Pro carries an
+# The part is not the sibling's, and that is the point of having both. The Pro carries an
 # ATSAM4SD32C: dual-plane, 2 MB of flash, 160 KB of SRAM. This carries an ATSAM4S16C: single
 # plane, 1 MB, 128 KB. Same family, same peripheral set, different memory -- so every fact below
 # is board truth and every size is part truth, and neither file states the other's.
 #
-# THREE DOCUMENTS AGREE ON THE FITTED PART, which is worth recording because the schematic alone
+# Three documents agree on the fitted part, which is worth recording because the schematic alone
 # is ambiguous. Its symbol reads AT91SAM4S16-LQFP100 and its designator MN4 reads ATSAM4S16AU;
 # the datasheet's ordering table gives the 100-pin SAM4S16 as the C suffix with -AU as the LQFP100
 # package code; and the board's own user documentation says outright that the board is equipped
@@ -64,35 +64,35 @@ notes = [
 
 # --- the carrier -----------------------------------------------------------------------------
 #
-# THE BRIDGE IS NOT THE SIBLING'S, AND NEITHER IS ITS USB IDENTITY. The Xplained Pro carries an
+# The bridge is not the sibling's, and neither is its USB identity. The Xplained Pro carries an
 # EDBG answering vendor id 0x03EB; this board carries a SAM3U4C, and the board's own documentation
 # settles what that SAM3U runs by naming the software a host must install for it: the J-Link
 # package from Segger, with its J-Link-OB CDC driver. So the virtual port this carrier names is a
-# Segger USB device. AN ATMEL VENDOR ID WOULD BE THE WRONG VENDOR HERE rather than an unverified
+# Segger USB device. An Atmel vendor id would be the wrong vendor here rather than an unverified
 # guess, which is why this carrier states no vid/pid pair at all where its sibling boards state
 # one. The pair a kit answers is a property of the debugger, and this board's debugger is not the
 # family's.
 #
-# THE TWO USB RECEPTACLES BELONG TO DIFFERENT CHIPS, which is the board's most consequential fact.
+# The two USB receptacles belong to different chips, which is the board's most consequential fact.
 # J21 is the SAM3U4's own high-speed port -- the J-Link OB and this carrier's CDC. J20 is the
 # SAM4S16's own full-speed device port, its data pins PB10 and PB11, and it reaches the part with
 # no bridge in between.
 #
-# SO THE BOARD HAS A PROGRAMMING ROUTE THAT USES NO DEBUGGER AT ALL. Jumper JP25 ties PB12 --
+# So the board has a programming route that uses no debugger at all. Jumper JP25 ties PB12 --
 # the part's ERASE pin -- to VDDIO-4S. Closed at power-on it asserts ERASE, which clears GPNVM bit
 # 1, and clearing GPNVM bit 1 is what maps the ROM at address 0 -- so the part boots its own 16 KB
 # ROM rather than flash and answers SAM-BA over J20. The jumper is opened again before the flashing
 # sequence. That ROM bootloader is reachable over UART0 as well, at 115200 8N1.
 #
-# AND ON THAT ROUTE THE BOARD DOES HAVE A USB IDENTITY TO STATE, BUT IT IS THE PART'S OWN AND NOT A
-# DEBUGGER'S: the ROM enumerates as 0x03EB / 0x6124, an endpoint pair of one 64-byte bulk OUT and
+# And on that route the board does have a USB identity to state, but it is the part's own and not a
+# debugger's: the ROM enumerates as 0x03EB / 0x6124, an endpoint pair of one 64-byte bulk OUT and
 # one 64-byte bulk IN. It appears only while the part is booting the ROM, so it is not this board's
 # console carrier and is not stated as one. Its precondition is met here: the ROM allows USB only
 # when it detects an external crystal at one of the frequencies it supports, and this board fits a
 # 12.000 MHz crystal, which is on that list. Without such a crystal the ROM falls back to its
 # internal 12 MHz RC and refuses USB, leaving only the UART.
 #
-# AND THE DEBUG SIGNALS REACH TEST POINTS AND NOTHING ELSE. The part's JTAG port is PB4 TDI,
+# And the debug signals reach test points and nothing else. The part's JTAG port is PB4 TDI,
 # PB5 TDO, PB6 TMS (which is SWDIO), PB7 TCK (which is SWCLK), and the board brings them out as
 # TP18, TP21, TP19 and TP20. There is no debug header: the four I/O expansion headers name none of
 # the four, their pin tables reaching PB0-PB3, PB10, PB11 and PB13 only. The one debug-shaped
@@ -112,7 +112,7 @@ default = true              # this board states no [[plans]] row, so the carrier
 
 # --- control lines ---------------------------------------------------------------------------
 #
-# BOTH LEDS ARE ACTIVE LOW, and the schematic is explicit about it in a way a reader should not
+# Both LEDs are active low, and the schematic is explicit about it in a way a reader should not
 # have to infer: each LED's ANODE sits at VDD_MAIN_3U and its cathode returns through a 220 ohm
 # resistor to the pin. The pin sinks the current, so driving it LOW lights the LED. That is the
 # opposite of the arrangement where a pin drives the anode, and getting it backwards produces a
@@ -132,7 +132,7 @@ pin = "PC17"
 active = "low"
 source = "Schematic revision B sheet 5, USER LEDS: VDD_MAIN_3U to the anode of D10 (LED Yellow), cathode through R128 220R to PC17. The pin sinks, so LOW lights it."
 
-# THE USER BUTTON HAS NO EXTERNAL PULL-UP AND THE SCHEMATIC SHOWS WHY: the only pull-up in that
+# The user button has no external pull-up and the schematic shows why: the only pull-up in that
 # block is R24, 47K, and it is marked DNP -- not fitted -- and it pulls up NRST rather than this
 # pin. So BP2 ties PA5 to ground when pressed and PA5 FLOATS when it is not, unless the part's own
 # internal pull-up is enabled. A driver that configures this as a plain input reads noise, which

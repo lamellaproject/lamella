@@ -1,7 +1,7 @@
 # BOARD binding: the NUCLEO-F439ZI -- the SAME CARRIER as this family's Nucleo, carrying a
 # DIFFERENT PART.
 #
-# THIS IS THE OTHER HALF OF A CONTROLLED TEST, and the two halves vary opposite things. The
+# This is the other half of a controlled test, and the two halves vary opposite things. The
 # NUCLEO-F429ZI put one part on a second carrier, so everything that differed between it and the
 # Discovery board was board truth by construction. This board puts a second part on THAT carrier,
 # so everything that differs between it and the NUCLEO-F429ZI is part truth by construction -- and
@@ -10,7 +10,7 @@
 # two is a single line in the product history, where one entry reads STM32F429ZIT6 on board
 # MB1137-F429ZI-B01 and the other STM32F439ZIT6 on MB1137-F439ZI-B01.
 #
-# WHAT THE PART BRINGS THAT THE OTHER DOES NOT is a cryptographic processor and a hash processor,
+# What the part brings that the other does not is a cryptographic processor and a hash processor,
 # which RM0090 scopes to the STM32F43xxx line by name. Nothing here reaches them yet. What matters
 # to a board file is that the two parts answer the SAME DEV_ID and the SAME JTAG ID code, so this
 # board and its sibling cannot be told apart by asking the silicon -- only by the number below.
@@ -47,7 +47,7 @@ default = true              # this board states no [[plans]] row, so the carrier
 
 # --- control lines ---------------------------------------------------------------------------
 #
-# ALL THREE LEDS ARE ACTIVE HIGH and UM1974 states it in words for all three at once: they are on
+# All three LEDs are active high and UM1974 states it in words for all three at once: they are on
 # when the I/O is HIGH and off when it is LOW. The schematic shows two different reasons for the
 # one behavior -- LD2 and LD3 are driven from their pins into the anode, LD1 through a unity-gain
 # follower that does not invert -- which is why the manual's single sentence is right and a reader
@@ -55,7 +55,7 @@ default = true              # this board states no [[plans]] row, so the carrier
 # boards do the opposite, feeding the anode from the supply and SINKING through the pin, so
 # polarity is a per-board reading rather than a per-vendor one.
 #
-# THE USER BUTTON IS ACTIVE HIGH TOO, AND THAT IS THE MIRROR OF WHAT A READER ASSUMES. R58, a
+# The user button is active high too, and that is the mirror of what a reader assumes. R58, a
 # 220K, holds PC13 DOWN, and the switch ties it UP to VDD through R59 -- so the pin reads LOW at
 # rest and HIGH while pressed, and a driver that enables a pull-up and waits for a low edge waits
 # forever. Both boards of this family are wired that way, so it is the vendor's habit here rather

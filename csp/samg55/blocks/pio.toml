@@ -1,8 +1,8 @@
 # The SAMG55 PIO block: the Parallel I/O Controller. Offsets are PIO-base-relative; the two
-# controller bases live in ../instances.toml. THIS IS NOT THE SAM D/L `PORT` BLOCK and shares no
+# controller bases live in ../instances.toml. This is not the SAM D/L `PORT` block and shares no
 # register with it -- different names, different offsets, and a different way of saying everything.
 #
-# WHAT A READER COMING FROM THE SAM D/L FAMILIES NEEDS TO UNMAP:
+# What a reader coming from the SAM D/L families needs to unmap:
 #
 #     SAM D/L PORT                        SAM G55 PIO
 #     DIRSET / DIRCLR   set direction     OER / ODR       Output Enable / Disable Register
@@ -12,20 +12,20 @@
 #       + the OUT bit     and pick a way                    register pair, PPDER / PPDDR
 #     PMUX nibble       pick a function   ABCDSR1/ABCDSR2 two registers, one BIT each
 #
-# THE PULL DIRECTION IS ITS OWN REGISTER HERE AND THAT IS A SIMPLIFICATION, NOT A COMPLICATION.
+# The pull direction is its own register here and that is a simplification, not a complication.
 # On the SAM D/L architecture PINCFG.PULLEN says only that "a resistor is enabled" and the pin's
 # OUT bit decides which way it pulls. This family has PUER/PUDR for up and PPDER/PPDDR for down, so
 # the choice is a register rather than a side effect, and it is where a reader expects it.
 #
-# THE PERIPHERAL SELECT IS TWO REGISTERS OF ONE BIT, NOT ONE FIELD OF FOUR. ABCDSR1 and ABCDSR2
+# The peripheral select is two registers of one bit, not one field of four. ABCDSR1 and ABCDSR2
 # each carry one bit per line, and the pair spells the function: 00 = A, 01 = B, 10 = C, 11 = D,
 # with ABCDSR1 the low bit. The sibling csp/sam3x has a SINGLE `ABSR` register at this same
 # offset 0x70 selecting between two functions, so a driver written against that block would set
 # ABCDSR1 correctly and leave ABCDSR2 unwritten -- which is right only while the reset value holds.
-# AND THIS PART USES ONLY A AND B: Table 9-3 and Table 9-4 have Peripheral A and Peripheral B
+# And this part uses only A and B: Table 9-3 and Table 9-4 have Peripheral A and Peripheral B
 # columns and no C or D, so ABCDSR2 is always 0 on a documented binding.
 #
-# A PIN IS THE PIO's OR THE PERIPHERAL's, AND THAT IS AN EXPLICIT CHOICE. PER/PDR/PSR hand a line
+# A pin is the PIO's or the peripheral's, and that is an explicit choice. PER/PDR/PSR hand a line
 # to the PIO controller or to the multiplexed peripheral. On the SAM D/L line the equivalent is
 # PINCFG.PMUXEN. A driver that sets a direction without first claiming the line in PER is
 # configuring a pin the peripheral still owns.
@@ -157,7 +157,7 @@ notes = "Pad Pull-Down Status, readable. Same inverted polarity as PUSR: 0 where
 # Function-letter values for the ABCDSR pair. The value is a TWO-BIT number spread across two
 # registers -- ABCDSR1 carries bit 0 and ABCDSR2 bit 1 -- so a consumer writes one bit into each
 # rather than a nibble into one field, which is the whole difference from the SAM D/L PMUX.
-# ONLY A AND B ARE POPULATED ON THIS PART: Table 9-3 and Table 9-4 have two peripheral columns.
+# Only A and B are populated on this part: Table 9-3 and Table 9-4 have two peripheral columns.
 # C and D are declared because the register encodes them and a reader checking a write needs the
 # full set; a pin-map row naming either would be refused by the absence of a documented pad.
 [constants]

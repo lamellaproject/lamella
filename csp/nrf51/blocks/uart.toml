@@ -3,12 +3,8 @@
 # TASKS/EVENTS, the polled shape a table-driven driver wants.
 #
 # Transcribed from the nRF51 Series Reference Manual v3.0 (Nordic Semiconductor, 2014-10-20),
-# chapter 29, Tables 273-288, with the document open.
+# chapter 29, Tables 273-288.
 #
-# Every bit position below was placed from the printed table's column coordinates: each field
-# letter was assigned to the bit column it is printed over. The interrupt registers INTEN,
-# INTENSET and INTENCLR necessarily share one bit layout, so each was read separately and the three
-# were required to agree before any of them was believed.
 
 [table]
 kind = "block"

@@ -3,7 +3,7 @@
 # select. The map lists the functions a binding uses, not the datasheet's whole table; a
 # (pin, function) pair that is not listed is refused rather than assumed.
 #
-# AN AF NUMBER IS A PER-PRODUCT FACT. Each row below was read from this part's own datasheet and not
+# An AF number is a per-product fact. Each row below was read from this part's own datasheet and not
 # carried from another family's table, where the same signal can sit at a different number.
 #
 

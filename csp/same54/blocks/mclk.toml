@@ -1,20 +1,20 @@
 # MCLK, the Main Clock controller of the SAM D5x/E5x family -- the BLOCK layout. Register offsets
 # are MCLK-instance-relative; nothing here names an instance, a pin, a board or a clock plan.
 #
-# WHAT THIS BLOCK IS FOR: every peripheral on this family sits behind two clocks, and MCLK owns one
+# What this block is for: every peripheral on this family sits behind two clocks, and MCLK owns one
 # of them. The BUS clock, enabled by a bit in one of the four APB mask registers below, is what
 # makes a peripheral's registers readable at all. The CORE clock, routed by GCLK, is what makes it
 # do work. A peripheral with only the bus clock reads and writes its registers and never acts; a
 # peripheral with only the core clock faults the bus on the first access.
 #
-# THE APB MASK REGISTERS DECLARE NO PER-PERIPHERAL FIELDS, AND THAT IS DELIBERATE. Each is thirty-
+# The APB mask registers declare no per-peripheral fields, and that is deliberate. Each is thirty-
 # two single-bit enables, and which bit belongs to which peripheral is ALREADY STATED, once, in the
 # instance map: every row carries the mask offset and the bit that clock it. Naming them again here
 # would be the same fact in two files, free to disagree, and the disagreement would be a peripheral
 # that never comes out of reset while both files look right. The register is placed; the mapping
 # has one home.
 #
-# FOUR APB BUSES, AND THE PERIPHERALS OF ONE BLOCK ARE SPREAD OVER THEM. The eight SERCOMs sit on
+# Four APB buses, and the peripherals of one block are spread over them. The eight SERCOMs sit on
 # three different masks. There is no bus that "the SERCOMs" are on.
 
 [table]

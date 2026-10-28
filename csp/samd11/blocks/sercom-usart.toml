@@ -2,7 +2,7 @@
 # SERCOM-instance-relative; nothing in this file names an instance, a pin, a board, or a clock plan.
 # Instance bases/ids live in ../instances.toml; board wiring lives in bsp/boards/<board>/board.toml.
 #
-# THE REGISTER SUMMARY DOCUMENTS TWO USARTs, NOT ONE. Table 25-4 lists CTRLB, INTENCLR, INTENSET
+# The register summary documents two USARTs, not one. Table 25-4 lists CTRLB, INTENCLR, INTENSET
 # and INTFLAG TWICE at the same offsets, once per clocking variant: the internal-clock USART has
 # SFDE and RXS where the external-clock one leaves those bits reserved. The fields below are the
 # INTERNAL-CLOCK set, which is the mode CTRLA.MODE = 1 selects and the only one this tree drives.

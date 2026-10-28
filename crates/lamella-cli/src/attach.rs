@@ -18,7 +18,8 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 
 
 /// Compile `path`, deploy it to the firmware at `target`, and run it there, streaming its output.
-pub fn run_on_target(path: &Path, target: &str) -> Ended {
+/// The class library is the one `folders` names, or else the one the tool finds without it.
+pub fn run_on_target(path: &Path, target: &str, folders: &crate::folders::Folders) -> Ended {
     let board = match crate::project::BoardCheck::for_file("run", path) {
         Ok(board) => board,
         Err(error) => {
@@ -30,23 +31,33 @@ pub fn run_on_target(path: &Path, target: &str) -> Ended {
         eprintln!("{refusal}");
         return Ended::Failed;
     }
-    run_image_on_target(path, target, board.as_ref(), |answered| {
-        crate::bake::image_for_firmware(path, "run", cannot_run_on_a_target, answered)
-    })
+    run_image_on_target(
+        path,
+        target,
+        board.as_ref(),
+        |_| None,
+        |answered| crate::bake::image_for_firmware(path, "run", cannot_run_on_a_target, answered, folders),
+    )
 }
 
 /// Deploy the image `image_for` builds for the board that answers at `target`, and run it there,
-/// streaming its output; `path` names the program in what is said.
+/// streaming its output; `path` names the program in what is said. Once the board has answered, the
+/// run opens with the line `first_line` makes from the product model it answered as, if it makes one.
 pub fn run_image_on_target(
     path: &Path,
     target: &str,
     board: Option<&crate::project::BoardCheck>,
+    first_line: impl FnOnce(u16) -> Option<String>,
     image_for: impl FnOnce(Option<&str>) -> Result<Vec<u8>, String>,
 ) -> Ended {
     let Some((mut transport, session)) = crate::deploy::connect("run", target, on_device::run_caps(), board)
     else {
         return Ended::Failed;
     };
+    let mut err = std::io::stderr();
+    if let Some(line) = first_line(session.identity.product_model) {
+        say(&mut err, &line);
+    }
     let answered = lamella_wire_host::boards::board_answering(session.identity.product_model);
     let image = match image_for(answered.as_deref()) {
         Ok(image) => image,
@@ -55,7 +66,6 @@ pub fn run_image_on_target(
             return Ended::Failed;
         }
     };
-    let mut err = std::io::stderr();
     say(&mut err, &format!("built {} B from {}", image.len(), path.display()));
     if !session.caps.has(Capabilities::EXEC_NO_RESET) {
         drop(transport);
@@ -71,12 +81,16 @@ pub fn run_image_on_target(
         );
         return run_under_the_debugger(image, target);
     }
-    let ran = on_device::run_scheduled(
+    let mut lines = OwnLines::new(std::io::stderr());
+    if let Err(refusal) = on_device::store_image(&mut transport, &session, target, &image, &mut lines) {
+        say(&mut err, &refusal);
+        return Ended::Failed;
+    }
+    say(&mut err, &forever_warning());
+    let ran = on_device::start_scheduled(
         &mut transport,
-        &session,
         target,
-        &image,
-        &mut OwnLines::new(std::io::stderr()),
+        &mut lines,
         &mut std::io::stdout(),
         &mut std::io::stderr(),
         Watch::to_the_end(),
@@ -132,6 +146,7 @@ fn run_under_the_debugger(image: Vec<u8>, target: &str) -> Ended {
         return Ended::Failed;
     }
 
+    say(&mut err, &forever_warning());
     say(&mut err, &format!("running on {target}; output follows."));
     stream(&mut backend, &mut err)
 }
@@ -217,9 +232,9 @@ fn show(backend: &mut WireHostBackend) {
 /// next command that connects takes the board back.
 #[must_use]
 pub fn forever_warning() -> String {
-    "the program is deployed to the board and stays there: the board runs it at every reset until \
-     another\nis deployed. A program that loops forever runs until you stop this tool, and stopping \
-     it may leave the\nprogram running; the next `lamella run` or `lamella deploy` takes the board \
+    "the program is deployed to the board and stays there: the board runs it at every reset\nuntil \
+     another is deployed. A program that loops forever runs until you stop this tool, and\nstopping \
+     it may leave the program running; the next `lamella run` or `lamella deploy` takes\nthe board \
      back."
         .to_owned()
 }
@@ -233,9 +248,14 @@ mod tests {
     #[test]
     fn the_warning_names_both_the_cost_and_the_recovery() {
         let text = forever_warning();
-        assert!(text.contains("may leave the\nprogram running"), "the cost: {text}");
-        assert!(text.contains("takes the board back"), "the recovery: {text}");
-        assert!(text.contains("runs it at every reset"), "and what stays on the board: {text}");
+        let flat = text.replace('\n', " ");
+        assert!(flat.contains("may leave the program running"), "the cost: {text}");
+        assert!(flat.contains("takes the board back"), "the recovery: {text}");
+        assert!(flat.contains("runs it at every reset"), "and what stays on the board: {text}");
+        let mut said = Vec::new();
+        say(&mut said, &text);
+        let said = String::from_utf8(said).expect("text");
+        assert!(said.lines().all(|line| line.chars().count() <= 100), "{said}");
     }
 
     /// **A REFUSAL RECOMMENDS ONLY WHAT THIS TOOL STILL TAKES.** `run --board` was removed, and a

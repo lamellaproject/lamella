@@ -67,7 +67,9 @@ pub(crate) fn record_names(
                     },
                     None => DispatchSlot::AnyVirtual(*slot),
                 },
-                Inst::CallInterface { tag, .. } => DispatchSlot::Interface(*tag),
+                Inst::CallInterface { tag, .. } | Inst::InterfaceFuncAddr { tag, .. } => {
+                    DispatchSlot::Interface(*tag)
+                }
                 _ => continue,
             };
             records.insert(dispatch_record_name(&slot, name));
@@ -184,6 +186,10 @@ mod tests {
                 args: vec![ValueId(0)],
                 returns_value: false,
             },
+            Inst::InterfaceFuncAddr {
+                object: ValueId(0),
+                tag: 0xCAFE,
+            },
         ])];
         let records = record_names(&funcs, &["Main"], &[], &qualifiers());
         let mut dispatches: Vec<(DispatchSlot, &str)> = records
@@ -212,6 +218,7 @@ mod tests {
                 ),
                 (DispatchSlot::AnyVirtual(5), "Main"),
                 (DispatchSlot::Interface(0xBEEF), "Main"),
+                (DispatchSlot::Interface(0xCAFE), "Main"),
             ]
         );
         assert!(

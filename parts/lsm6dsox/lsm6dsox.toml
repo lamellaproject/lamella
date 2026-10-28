@@ -1,7 +1,7 @@
 # PART: ST LSM6DSOX, a six-axis inertial module -- a three-axis accelerometer and a three-axis
 # gyroscope in one package, answering on one address.
 #
-# THIS TABLE IS DELIBERATELY PARTIAL, and what is missing is named rather than left as an absence a
+# This table is deliberately partial, and what is missing is named rather than left as an absence a
 # reader has to notice. It carries the facts a driver needs to FIND the part and talk to it -- the
 # identity, the address and its strap, the bus protocol and the control registers that select a
 # mode -- and it stops short of the rate and full-scale enumerations, for the reason given in the
@@ -22,15 +22,6 @@ notes = [
 
 # --- sourcing --------------------------------------------------------------------------------
 #
-# EXERCISED, WHICH IS TWO READINGS AND NOT ONE. The weaker came first: a part of this type answered
-# its identity register against a negative control, establishing that a part of this type is present
-# and reachable and that the identity row below is right. The stronger came after: the same part
-# produced a measurement that decoded to gravity.
-#
-# WHAT IS STILL NOT ESTABLISHED, because the measurement was taken at codes chosen to avoid the
-# ambiguity rather than to resolve it: the rate and full-scale enumerations this table declines to
-# state remain unstated. A magnitude of about 1000 mg confirms the sensitivity at ONE full scale and
-# says nothing about the other three, and it is not a rate measurement at all.
 
 [sourcing]
 facts = "primary"
@@ -51,7 +42,7 @@ notes = "DS12814 Rev 4 ch 9.14: 'WHO_AM_I register (R). This is a read-only regi
 
 # --- address ------------------------------------------------------------------------------------
 #
-# THE STRAP IS A PROPERTY OF THE CARRIER, NOT THE PART, which is why no value is defaulted here.
+# The strap is a property of the carrier, not the part, which is why no value is defaulted here.
 # The part states a range of two; which one a given board answers at depends on where that board
 # tied the pin. A carrier that leaves it floating leaves the address undefined.
 
@@ -68,7 +59,7 @@ high = 0x6B
 
 # --- the bus protocol ---------------------------------------------------------------------------
 #
-# AUTO-INCREMENT IS A CONTROL BIT ON THIS PART RATHER THAN A PROPERTY OF THE TRANSFER, which is the
+# Auto-increment is a control bit on this part rather than a property of the transfer, which is the
 # one thing here a driver written against a simpler sensor would get wrong. A burst read returns the
 # SAME register repeatedly unless IF_INC is set -- and a repeated first byte looks like a plausible
 # measurement rather than like a failure.
@@ -109,7 +100,7 @@ notes = "Carries IF_INC, which decides whether a multi-byte transfer walks the a
 
 # --- reading a measurement --------------------------------------------------------------------
 #
-# THE TWO SENSORS ARE TWO SEPARATE BLOCKS AND THE GYROSCOPE COMES FIRST. A driver that started its
+# The two sensors are two separate blocks and the gyroscope comes first. A driver that started its
 # burst at the accelerometer and read twelve bytes would get six of acceleration and six of
 # whatever follows; one that started at the gyroscope and took six would get angular rate while
 # believing it had acceleration. Each block is named, so neither is reached by arithmetic on the
@@ -134,11 +125,11 @@ width = 8
 access = "read"
 notes = "DS12814 Rev 4: the first byte of the ACCELERATION block, which runs 0x28 to 0x2D as three little-endian 16-bit values in X, Y, Z order. Each is signed, so a reader that treats them as unsigned turns half of every axis into a large positive number."
 
-# ONE BURST COVERS ONE SENSOR'S THREE AXES, and the length is per BLOCK rather than per part: this
+# One burst covers one sensor's three axes, and the length is per BLOCK rather than per part: this
 # device has two such blocks at two addresses, so a single figure describes either read and not
 # both together.
 #
-# THE AUTO-INCREMENT BIT IS A PRECONDITION. Without IF_INC set in CTRL3_C the same address is
+# The auto-increment bit is a precondition. Without IF_INC set in CTRL3_C the same address is
 # re-read for every byte, and all three axes come back equal to X -- a plausible-looking frame that
 # no length check catches.
 
@@ -146,9 +137,9 @@ notes = "DS12814 Rev 4: the first byte of the ACCELERATION block, which runs 0x2
 burst_length = 6
 resolution_bits = "16 per axis, two's complement, little-endian, at every full-scale setting"
 
-# --- WHAT IS NOT HERE, AND WHY -----------------------------------------------------------------
+# --- What is not here, and why -----------------------------------------------------------------
 #
-# THE RATE ENUMERATION IS TWO-DIMENSIONAL AND THIS MODEL'S ENUMS ARE ONE-DIMENSIONAL. Table 51 maps
+# The rate enumeration is two-dimensional and this model's enums are one-dimensional. Table 51 maps
 # ODR_XL[3:0] to a rate through TWO columns, selected by XL_HM_MODE in CTRL6_C (15h) -- a bit in a
 # DIFFERENT register. The same code means different things in the two columns: 1011 is 1.6 Hz in
 # one and 12.5 Hz in the other, an eightfold difference. An `[enums]` block here is a flat map from
@@ -160,7 +151,7 @@ resolution_bits = "16 per axis, two's complement, little-endian, at every full-s
 # as the sibling family's five-percent rate disagreement, which is why this is stated as a gap
 # rather than resolved by choosing.
 #
-# AND TABLE 51 IS NOT PRINTED IN CODE ORDER: its rows run 0000, 1011, 0001, 0010 ... so the
+# And table 51 is not printed in code order: its rows run 0000, 1011, 0001, 0010 ... so the
 # special low-power code sits second. A reader stepping down the page and counting up from zero
 # assigns every rate after the first to the wrong code.
 

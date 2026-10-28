@@ -1,7 +1,7 @@
 # BOARD binding: the ST NUCLEO-L073RZ. Board truth ONLY: role bindings, the carrier, and the clock
 # plan. Chip truth lives in csp/stm32l073/.
 #
-# ONE BOARD MANUAL, MANY BOARDS, AND THE GENERIC TEXT IS NOT ENOUGH. UM1724 covers every Nucleo-64,
+# One board manual, many boards, and the generic text is not enough. UM1724 covers every Nucleo-64,
 # and its LED section says the user LED is "PA5 (pin 21) or PB13 (pin 34) depending on the STM32
 # target" -- which settles nothing on its own. The per-board table is what does, and this board's is
 # TABLE 18, shared with the NUCLEO-L010RB: it gives D13 as PA5, and the LED is on D13.

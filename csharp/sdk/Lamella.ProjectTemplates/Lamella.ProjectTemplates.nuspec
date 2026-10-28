@@ -4,7 +4,8 @@
     <id>Lamella.ProjectTemplates</id>
     <version>$version$</version>
     <!-- Packing writes here what every package carries: authors, license, licenseUrl, projectUrl, copyright and repository. -->
-    <description>Templates for dotnet new that create C# programs for Lamella: dotnet new lamella-app creates a project that builds with dotnet build and runs with dotnet run. Install them with dotnet new install Lamella.ProjectTemplates.</description>
+    <description>Project templates for Lamella and Lamella RHU. Install with dotnet new install Lamella.ProjectTemplates, then create a C# program with dotnet new lamella-app.</description>
+    <readme>README.md</readme>
     <packageTypes>
       <packageType name="Template" />
     </packageTypes>

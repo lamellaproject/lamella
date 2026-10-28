@@ -5,14 +5,14 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Microchip
 {
-    public sealed class Saml11Xpro
+    internal sealed class Saml11Xpro
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = MicrochipSaml11XproBindings.BOARD_MODEL;
 
         /// <summary>The yellow user LED LED0 on PA07, ACTIVE LOW: it lights when driven
         /// <see cref="PinValue.Low"/>.</summary>
-        /// <remarks>THIS LINE IS ALSO THE DEBUGGER'S SPI SLAVE SELECT. The kit guide's Shared
+        /// <remarks>This line is also the debugger's SPI slave select. The kit guide's Shared
         /// Functionality column reads "DGI SPI", so a program blinking this LED is also driving the
         /// data gateway's chip select.</remarks>
         public static readonly int LedPin =
@@ -24,7 +24,7 @@ namespace Lamella.Boards.Microchip
             Saml1xGpioDriver.LogicalPin(MicrochipSaml11XproBindings.BUTTON0_PORT_BASE, MicrochipSaml11XproBindings.BUTTON0_PIN);
 
         /// <summary>The mode the user button wants.</summary>
-        /// <remarks>THIS KIT'S GUIDE DOES NOT SAY WHETHER AN EXTERNAL PULL-UP IS FITTED, where the
+        /// <remarks>This kit's guide does not say whether an external pull-up is fitted, where the
         /// Curiosity Nano guides state outright that none is. <see cref="PinMode.InputPullUp"/> is
         /// nevertheless the right answer under BOTH readings, which is why it can be offered without
         /// settling the question: if the board fits no pull-up the internal one is required, and if
@@ -47,7 +47,7 @@ namespace Lamella.Boards.Microchip
         private static GpioDriver MakeGpio() { return new Saml1xGpioDriver(); }
 
         /// <summary>The family PORT driver this board bound.</summary>
-        /// <remarks>THE DRIVER SPANS ALL 32 PINS AND THIS PACKAGE BONDS 25 OF THEM. A pin number the
+        /// <remarks>The driver spans all 32 pins and this package bonds 25 of them. A pin number the
         /// package does not carry is addressable and connected to nothing, which is why the
         /// constants above name only pads this board's own guide names. PA30 and PA31 are the
         /// board's ONLY debug path and they arrive muxed to it -- PMUX15 resets to function G -- so

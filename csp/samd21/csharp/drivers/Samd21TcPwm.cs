@@ -13,7 +13,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Samd21TcPwm : Samd21PwmCounter
+internal sealed class Samd21TcPwm : Samd21PwmCounter
 {
     readonly uint _ctrla;
     readonly uint _status;

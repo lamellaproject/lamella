@@ -2,12 +2,12 @@
 # temperature) and the BME280 (which adds humidity). The two are register compatible by the
 # vendor's own statement, with a short list of documented exceptions that each member states.
 #
-# A PART IS NOT A CHIP WE RUN ON, which is why this tree is a sibling of csp/ rather than part of
+# A part is not a chip we run on, which is why this tree is a sibling of csp/ rather than part of
 # it: a board states which BUSES exist, a part states its own IDENTITY, and a probe joins the two
 # at run time. Two boards of the same model can carry different parts at different addresses, so
 # an attachment is discovered rather than declared.
 #
-# THIS FILE IS AN AUTHORING CONVENIENCE ONLY. A member names it with `base` and states its own
+# This file is an authoring convenience only. A member names it with `base` and states its own
 # deltas; the generator RESOLVES the base and emits a fully flattened table per part. Nothing
 # downstream ever reads an inherited value, because a value that is only ever inherited is pinned
 # in no emitted artifact and so cannot be checked for drift between languages.
@@ -169,7 +169,7 @@ notes = "Any other value written to reset is ignored, so this is a command set o
 # hand-written per-language arithmetic: generating a struct READER is in scope, generating the
 # compensation math is not.
 #
-# SIGNEDNESS IS LOAD-BEARING AND IS NOT UNIFORM: dig_T1 and dig_P1 are UNSIGNED and every other
+# Signedness is load-bearing and is not uniform: dig_T1 and dig_P1 are UNSIGNED and every other
 # 16-bit word here is SIGNED. Getting the first two backwards yields a driver that compiles, runs,
 # and reports a plausible but wrong pressure.
 

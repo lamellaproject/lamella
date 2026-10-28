@@ -1,0 +1,32 @@
+<!--
+  The build of @PackageId@ for Lamella. NuGet references an assembly from a lib folder only for the frameworks it knows,
+  so this package carries its Lamella builds under lamella/lib/, a folder for each Lamella version they are built for,
+  and this file references one for a Lamella project: the build for the newest Lamella version that the project's own
+  version reaches, as NuGet chooses among lib folders. It adds no reference where the project already references an
+  assembly of this name, as it does once NuGet places a Lamella build itself.
+-->
+<Project>
+
+  <PropertyGroup Condition="'$(TargetFrameworkIdentifier)' == 'Lamella'">
+    <_LamellaLibraryVersion_@Key@>$([System.String]::Copy('$(TargetFrameworkVersion)').TrimStart('v'))</_LamellaLibraryVersion_@Key@>
+    <_LamellaLibraryFolder_@Key@ Condition="'$(_LamellaLibraryFolder_@Key@)' == '' and $([MSBuild]::VersionGreaterThanOrEquals('$(_LamellaLibraryVersion_@Key@)', '@Version@'))">@Folder@</_LamellaLibraryFolder_@Key@>
+  </PropertyGroup>
+
+  <Target Name="_LamellaLibraryReference_@Key@"
+          AfterTargets="ResolveLockFileReferences"
+          BeforeTargets="ResolveAssemblyReferences"
+          Condition="'$(TargetFrameworkIdentifier)' == 'Lamella'">
+    <Error Condition="'$(_LamellaLibraryFolder_@Key@)' == ''"
+           Code="LAMSDK0010"
+           Text="@PackageId@ carries builds for Lamella @Version@ and later, and this project targets Lamella $(_LamellaLibraryVersion_@Key@)." />
+    <ItemGroup>
+      <_LamellaLibrarySameName_@Key@ Include="@(Reference)"
+                                      Condition="'%(Reference.Filename)' == '@Assembly@' or '%(Reference.Identity)' == '@Assembly@' or $([System.String]::Copy('%(Reference.Identity)').StartsWith('@Assembly@,'))" />
+      <Reference Include="$(MSBuildThisFileDirectory)../lamella/lib/$(_LamellaLibraryFolder_@Key@)/@Assembly@.dll"
+                 Condition="'@(_LamellaLibrarySameName_@Key@)' == ''"
+                 Private="true"
+                 NuGetPackageId="@PackageId@" />
+    </ItemGroup>
+  </Target>
+
+</Project>

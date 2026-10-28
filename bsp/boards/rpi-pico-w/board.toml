@@ -5,7 +5,7 @@
 # shared-line wire through the SIO block (there is no hardware spi instance to bind), so what this
 # board states is the four control lines.
 #
-# WHAT THIS FILE MAY CARRY: everything here DESCRIBES the board -- which RP2040 pin reaches which
+# What this file may carry: everything here DESCRIBES the board -- which RP2040 pin reaches which
 # control line, and at what level. Those are facts about the copper, published by Raspberry Pi in
 # the Pico W datasheet. The radio's operating firmware, its NVRAM image and its country-locale
 # matrix are Infineon's, redistributable only in conjunction with Raspberry Pi silicon, and they
@@ -52,7 +52,7 @@ rx = { pin = "GP1" }
 #     module_pins precedent). The four are the SAME RP2040 pins the Pico 2 W uses, which is why one
 #     driver reaches the radio on both boards, and the row names are deliberately identical.
 #
-#     THESE FOUR PINS ARE THE WHOLE DIFFERENCE BETWEEN THIS BOARD AND THE PLAIN PICO. On the Pico,
+#     These four pins are the whole difference between this board and the plain Pico. On the Pico,
 #     GP23 controls the regulator's power-save mode, GP24 senses VBUS, GP25 drives the user LED and
 #     GP29 measures VSYS through ADC3. Here every one of them belongs to the radio, and the three
 #     board functions they used to perform have moved onto the CYW43439's own pins (below). The
@@ -83,7 +83,7 @@ pin = "GP29"
 active = "none"
 source = "Pico W datasheet section 2.1: 'GPIO29  OP/IP wireless SPI CLK/ADC mode (ADC3) to measure VSYS/3'. Section 3.8 gives the sharing rule: 'The CLK is shared with VSYS monitor, so only when there isn't an SPI transaction in progress can VSYS be read via the ADC', and the interface 'typically runs at 33MHz'. The schematic appendix, Figure 12, names the net WL_CLK."
 
-# --- THE USER LED IS NOT ON THIS CHIP, AND THAT IS WHY THERE IS NO ROW FOR IT ------------------
+# --- The user LED is not on this chip, and that is why there is no row for it ------------------
 #
 # On the Pico and the Pico 2 the green user LED is on GP25 and a program drives it directly. On
 # this board it is on WL_GPIO0 -- a GPIO of the CYW43439 -- so reaching it means bringing the
@@ -98,7 +98,7 @@ source = "Pico W datasheet section 2.1: 'GPIO29  OP/IP wireless SPI CLK/ADC mode
 # same ground the F429 gives for withholding its VBUS indicators: a row here would offer a
 # developer a light they do not own.
 #
-# TWO SOURCES AGREE, AND THE DATASHEET CONTRADICTS ITSELF ON A THIRD. Section 2.1's pin list gives
+# Two sources agree, and the datasheet contradicts itself on a third. Section 2.1's pin list gives
 # 'WL_GPIO0  OP connected to user LED', and the schematic appendix, Figure 12, wires the net WL_GPIO0 through
 # R3 (470R) to D2's anode with its cathode at ground. But section 1's circuitry paragraph still
 # reads "Four RP2040 I/O are used for internal functions: driving an LED, on-board switch mode

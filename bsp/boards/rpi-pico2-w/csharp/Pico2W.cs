@@ -10,7 +10,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.RaspberryPi
 {
-    public sealed class Pico2W
+    internal sealed class Pico2W
     {
         /// <summary>The wire identity this board advertises (lamella_wire::board_model).</summary>
         public static readonly int BoardModel = RpiPico2WBindings.BOARD_MODEL;

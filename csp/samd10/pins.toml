@@ -2,7 +2,7 @@
 # rows exist for the bindings a board package uses, each with its source; grow the table with the
 # boards, never from recall. A binding whose (pin, function) row is missing REFUSES.
 #
-# THE FUNCTION LETTER IS THE WHOLE ROW, and it is not derivable from the SERCOM number. Column C is
+# The function letter is the whole row, and it is not derivable from the SERCOM number. Column C is
 # SERCOM and column D is SERCOM-ALT, so the same instance appears under different letters on
 # different pins. A row carrying the right instance under the wrong letter muxes a different
 # peripheral onto the pad and reports success.

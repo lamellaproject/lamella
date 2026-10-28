@@ -216,7 +216,7 @@ impl Format {
         [Format::Bin, Format::IntelHex, Format::SRecord, Format::Uf2 { family: 0 }];
 
     /// Every format, each followed by what it is where its name does not say:
-    /// `bin, hex (Intel HEX), s19 (Motorola S-records), uf2 (a bootloader volume)`.
+    /// `bin (raw binary image), hex (Intel HEX), s19 (Motorola S-records), uf2 (a bootloader volume)`.
     #[must_use]
     pub fn listing() -> String {
         listing(Format::ALL.into_iter().map(Output::Image))
@@ -227,7 +227,7 @@ impl Format {
     #[must_use]
     pub fn gloss(self) -> Option<&'static str> {
         match self {
-            Format::Bin => None,
+            Format::Bin => Some("raw binary image"),
             Format::IntelHex => Some("Intel HEX"),
             Format::SRecord => Some("Motorola S-records"),
             Format::Uf2 { .. } => Some("a bootloader volume"),

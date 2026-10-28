@@ -1,20 +1,6 @@
 //! csc's response files: an `@file` argument stands for the arguments written in that file.
 //!
-//! The rules are csc's: as its documentation states them, and where the documentation is silent,
-//! as csc behaves. The options and sources in the file are processed as if they had been given on
-//! the command line where the `@file` stands, so an option after it overrides one inside it, and
-//! the other way round. Several arguments may share a line, and none
-//! spans two: a line ends at CR LF, LF or CR, and a quote still open there closes with it.
-//! Arguments are separated by spaces and tabs. A double quote groups what it encloses into one
-//! argument and may open and close inside one; `\"` is a literal quote; backslashes are literal
-//! except before a quote, where each pair stands for one backslash and an odd one left over makes
-//! the quote literal. A `#` where an argument would begin starts a comment that runs to the end of
-//! its line, and anywhere else it is an ordinary character. An `@file` inside a response file is
-//! read in its turn, and a relative path, a response file's own included, is taken from the
-//! current directory, never from the directory of the response file that names it.
 //!
-//! A file that cannot be opened is csc's CS2011, and nothing is compiled. A response file that
-//! includes itself, directly or through another, is refused by name.
 
 use std::fs;
 use std::path::{Path, PathBuf};

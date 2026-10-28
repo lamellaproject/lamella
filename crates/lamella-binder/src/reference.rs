@@ -45,13 +45,6 @@ pub fn load_references(references: &[Assembly], compiling_assembly: &str) -> Mod
 /// Adds every type defined in `assembly` to `model`, as they are VISIBLE to an assembly named
 /// `compiling_assembly`.
 ///
-/// **A REFERENCED ASSEMBLY'S `private` AND `internal` MEMBERS ARE NOT IMPORTED AT ALL**, which is
-/// how csc models a reference (Roslyn's `MetadataImportOptions`) and is the whole reason the
-/// diagnostics come out matching: a member that is not in the model cannot be named, so a call to
-/// one is `CS1061` and a `new` on one is `CS1729` -- *there is no such member* -- rather than the
-/// `CS0122` an accessibility CHECK would report. `protected` and `protected internal` members ARE
-/// imported, because a derived class in this assembly may legitimately reach them; they are judged
-/// at the use site, where `CS0122` is csc's answer. All four codes are measured, not reasoned.
 ///
 /// `compiling_assembly` names the assembly being built, so an `[assembly: InternalsVisibleTo]` on
 /// the reference can grant it the `internal` half. Pass `""` where there is no output assembly
@@ -114,11 +107,6 @@ pub fn load_assembly(model: &mut Model, assembly: &Assembly, compiling_assembly:
 
 /// Turns one imported parameter's `(flags, constraint tokens)` into the binder's model.
 ///
-/// **`struct` IS READ FROM THE FLAG, NOT FROM THE `System.ValueType` ROW.** csc emits BOTH for
-/// `where T : struct` -- the `0x0008` bit and a `GenericParamConstraint` naming `System.ValueType`.
-/// Taking the row as a named constraint too would make every `struct`-constrained parameter also
-/// require convertibility to `System.ValueType`, which is true but reports as a second, confusing
-/// diagnostic when it fails. The row is dropped for that reason and the flag is authoritative.
 ///
 /// **AN UNREADABLE CONSTRAINT BECOMES ABSENCE, WHICH UNDER-REPORTS.** A token whose type this
 /// binder cannot name yields nothing rather than a guess, so a call that violates it is a MISSED
@@ -135,6 +123,12 @@ fn decode_constraints(
     result.value_type = flags & 0x0008 != 0;
     result.default_constructor = flags & 0x0010 != 0 && !result.value_type;
     for &token in tokens {
+        // `unmanaged` is the `struct` flag with a row of its own, which takes the place of the
+        // `System.ValueType` row `struct` writes.
+        if result.value_type && is_unmanaged_constraint_row(assembly, token) {
+            result.unmanaged = true;
+            continue;
+        }
         let symbol = token_type_symbol(assembly, token);
         if symbol.is_error() {
             continue;
@@ -147,6 +141,25 @@ fn decode_constraints(
         result.types.push(symbol);
     }
     result
+}
+
+/// Whether the `GenericParamConstraint` row naming `token` records `where T : unmanaged`: a
+/// `TypeSpec` of `System.ValueType` under a required modifier naming
+/// `System.Runtime.InteropServices.UnmanagedType`.
+fn is_unmanaged_constraint_row(assembly: &Assembly, token: lamella_token::Token) -> bool {
+    let Some((SigType::Class(class), required)) = assembly.type_spec_signature_with_modifiers(token)
+    else {
+        return false;
+    };
+    let names = |named: lamella_token::Token, namespace: &str, name: &str| {
+        assembly
+            .type_token_full_name(named)
+            .is_some_and(|(found_namespace, found)| found_namespace == namespace && found == name)
+    };
+    names(class, "System", "ValueType")
+        && required
+            .iter()
+            .any(|&modifier| names(modifier, "System.Runtime.InteropServices", "UnmanagedType"))
 }
 
 /// The full dotted name of the type `type_def` is nested in, walking outward through the
@@ -460,23 +473,8 @@ fn imported_parameter_info(
 /// named this compilation a friend. Reads the same `MemberAccess` mask as [`member_accessibility`]
 /// (II.23.1.5 / II.23.1.10).
 ///
-/// **THIS IS THE csc RULE, AND IT IS A VISIBILITY RULE RATHER THAN AN ACCESSIBILITY ONE.** Roslyn
-/// reads a reference at `MetadataImportOptions.Public` -- public, `protected` and
-/// `protected internal` only -- and switches it to `.Internal` for an assembly an
-/// `InternalsVisibleTo` names. `private` is never imported at either setting, friend or not, which
-/// is why the friend flag does not reach the `Private`/`FamANDAssem` arms below.
 ///
-/// Measured against csc on a 63-row table before it was written, because the two rules answer with
-/// DIFFERENT diagnostics and the difference is the whole point: an imported `internal` method is
-/// `CS1061` ("does not contain a definition"), an imported `internal` constructor is `CS1729`
-/// ("does not contain a constructor that takes N arguments"), and only the `protected` family --
-/// which IS imported -- reaches `CS0122`. A binder that imported everything and then checked
-/// accessibility would report `CS0122` for all of them and match csc on none.
 ///
-/// `FamANDAssem` (`private protected`) is imported as though it were `private`, so a friend
-/// assembly's DERIVED class cannot reach one where csc lets it. That is the under-permissive
-/// direction: it refuses nothing a C# 1.0 or 2.0 source can write, because neither rung has a
-/// spelling for `private protected` at all -- that keyword arrives in C# 7.2.
 ///
 /// A METHOD asks [`method_is_imported`] instead, which adds the one exemption a field cannot need.
 /// A `TypeDef`'s declared accessibility, from its visibility bits (II.23.1.15).
@@ -508,16 +506,7 @@ fn member_is_imported(flags: u32, internals_visible: bool) -> bool {
 /// Whether a referenced assembly's METHOD is imported: [`member_is_imported`], except that a
 /// VIRTUAL method is imported whatever its access.
 ///
-/// **THE EXEMPTION IS NOT A REFINEMENT.** A method holding a vtable slot is part of the contract a
-/// DERIVED type inherits, whether or not this compilation may CALL it: an `internal abstract`
-/// member of a public class is exactly the member a derived class in another assembly cannot
-/// supply, so a filter that drops it lets `class D : ImportedBase { }` compile where csc reports
-/// `CS0534` naming it -- a contract that does not fail, but disappears.
 ///
-/// **MEASURED, ON THE PAIR THAT SEPARATES THIS RULE FROM AN ABSTRACT-ONLY ONE:** an
-/// `internal virtual` method of a referenced assembly is `CS0122` from another one -- present, and
-/// inaccessible -- while the `internal` method beside it, identical but for the keyword, is
-/// `CS1061`. Only a rule keyed on VIRTUAL answers both, and it is csc's own predicate.
 ///
 /// A FIELD is never virtual, so the field walk keeps asking [`member_is_imported`] directly.
 fn method_is_imported(flags: u32, internals_visible: bool) -> bool {
@@ -541,15 +530,7 @@ fn member_accessibility(flags: u32) -> Accessibility {
 /// argument passes for a parameter's default: the integral, char, bool, float and string values,
 /// and the NULL constant (II.22.9: `ELEMENT_TYPE_CLASS` with a 4-byte zero value).
 ///
-/// **THE NULL CONSTANT IS A VALUE LIKE ANY OTHER.** csc writes it for every `null` default and for
-/// every zero-initialized one -- `string s = null`, `int? x = null`, `S s = default(S)`, `S s = new
-/// S()`, `T t = default(T)` -- and for a `const` whose value is `null`. [`Literal::Null`] is what
-/// the binder holds for all of those when they are declared in source, so a call or a use site
-/// treats the imported one the same way.
 ///
-/// **A NaN IS READ AS .NET's NaN**, whatever bits the referenced assembly holds for it -- a
-/// payload, the positive sign, the signaling bit -- because csc writes every use of any of them as
-/// .NET's NaN: `0xFFF8000000000000` for a `double`, `0xFFC00000` for a `float`.
 fn constant_to_literal(value: ConstantValue) -> Option<Literal> {
     Some(match value {
         ConstantValue::Bool(b) => Literal::Boolean(b),
@@ -593,7 +574,7 @@ fn sigtype_to_symbol(
         SigType::TypedByRef => named_symbol("System", "TypedReference"),
         SigType::Class(token) | SigType::ValueType(token) => token_type_symbol(assembly, *token),
         SigType::SzArray(element) => recur(element).into_array(1),
-        SigType::Array { element, rank } => recur(element).into_array(*rank as u8),
+        SigType::Array { element, rank } => recur(element).into_array(*rank),
         SigType::ByRef(referent) => TypeSymbol::ByRef(Box::new(recur(referent))),
         SigType::Pointer(referent) => TypeSymbol::Pointer(Box::new(recur(referent))),
         SigType::MVar(index) => match method_parameters.get(*index as usize) {

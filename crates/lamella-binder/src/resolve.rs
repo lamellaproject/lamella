@@ -113,15 +113,6 @@ impl TypeTable {
     /// type-parameter names -- the candidates for a use site whose own arity found nothing.
     /// An entry of arity 0 is the non-generic type of that name.
     ///
-    /// **ORDERED BY ARITY, WHERE csc ORDERS BY DECLARATION.** Measured: with
-    /// `Multi<A,B,C>` declared before `Multi<T,U>`, csc's CS0305 names `Multi<A, B, C>` for a use of
-    /// ANY wrong arity -- so it quotes the first-declared candidate, not the lowest-arity one and
-    /// not the nearest. The [`crate::symbols::Model`] is a `BTreeMap` and has already lost
-    /// declaration order by the time this table is built, so matching that would cost a
-    /// declaration index on every type for a message in a program that declares one name at two
-    /// arities. **Identical to csc wherever exactly one candidate exists**, which is every
-    /// single-arity program; the divergence is recorded rather than hidden, and closing it means
-    /// carrying the order, not sorting differently here.
     #[must_use]
     pub fn candidates(&self, namespace: &str, name: &str) -> Vec<(usize, &[Box<str>])> {
         let Some(names) = self.by_namespace.get(namespace) else {
@@ -251,7 +242,6 @@ pub fn resolve_type(
 /// let a WRONG ARITY resolve**: `Box<int,int>` found `Box<T>`, and the binder went on to bind
 /// against a definition the program had not named.
 ///
-/// The three answers are csc's, measured rather than reconstructed:
 ///
 /// | the name in scope | answer |
 /// |---|---|

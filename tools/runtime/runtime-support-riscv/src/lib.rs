@@ -51,7 +51,9 @@ extern "C" {
     fn __fixdfdi(a: f64) -> i64;
     fn __fixunsdfdi(a: f64) -> u64;
     fn __fixsfsi(a: f32) -> i32;
+    fn __fixunssfsi(a: f32) -> u32;
     fn __fixsfdi(a: f32) -> i64;
+    fn __fixunssfdi(a: f32) -> u64;
     fn __extendsfdf2(a: f32) -> f64;
     fn __truncdfsf2(a: f64) -> f32;
 }
@@ -106,7 +108,9 @@ pub extern "C" fn __lamella_force_softfloat_riscv() -> i64 {
         acc += black_box(__fixdfdi(a));
         acc += black_box(__fixunsdfdi(a)) as i64;
         acc += black_box(__fixsfsi(c)) as i64;
+        acc += black_box(__fixunssfsi(c)) as i64;
         acc += black_box(__fixsfdi(c));
+        acc += black_box(__fixunssfdi(c)) as i64;
 
         acc += black_box(__extendsfdf2(c)) as i64;
         acc += black_box(__truncdfsf2(a)) as i64;
@@ -268,6 +272,8 @@ const fn worker_stack_top(id: usize) -> u32 {
 /// Why a parked thread is waiting, for the reactor block point below. Mirrors
 /// `lamella_cil_runtime::reactor::WaitReason` plus a `NotParked` slot (so the per-thread array needs no
 /// `Option`). A `Join`/lock park is woken by hand-off, not the reactor, so it stays `NotParked` here.
+/// So does a thread asleep for good, which nothing wakes: it is marked in
+/// [`Scheduler::asleep_forever`] instead.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ParkReason {
     /// Runnable or lock/join-blocked -- not on the reactor's timer/socket set.
@@ -303,6 +309,11 @@ struct Scheduler {
     entry_args: [u32; MAX_THREADS],
     /// Bit `i` set = thread `i` has exited -- what `lamella_thread_join` waits on.
     done: u32,
+    /// Bit `i` set = thread `i` is asleep for good (`Thread.Sleep(Timeout.Infinite)`). It waits on
+    /// no timer or socket, so the reactor never sees it and nothing wakes it; while any bit is set, a
+    /// scheduler with nothing to run and nothing to wait for is a program still waiting, not a
+    /// deadlock ([`sched_idle`]).
+    asleep_forever: u32,
 }
 const SCHED: *mut Scheduler = 0x8040_4000 as *mut Scheduler;
 const SCHED_COUNTER: *mut u32 = 0x8040_4800 as *mut u32;
@@ -377,9 +388,7 @@ unsafe fn sched_exit() -> ! {
             lamella_thread_switch_riscv(&mut dead, &s.contexts[next]);
             loop {}
         }
-        if !sched_block_point(s) {
-            sched_deadlock_trap();
-        }
+        sched_idle(s);
     }
 }
 
@@ -478,13 +487,13 @@ fn sched_any_parked(s: &Scheduler) -> bool {
     s.parks[..s.count as usize].iter().any(|p| *p != ParkReason::NotParked)
 }
 
-/// A parked/exiting/joining thread found NOTHING runnable and the block point NOTHING external to wait
-/// on: every live thread is blocked on a join/lock nobody can satisfy. Fail LOUD -- write the QEMU
-/// `virt` SiFive test-finisher FAIL with exit code 2 (the finisher exits with the HIGH sixteen bits,
-/// so a bare 0x3333 would exit 0, indistinguishable from PASS; real silicon has no finisher and halts
-/// in the loop) rather than silently spinning forever. The ARM twin prints `DEADLOCK`; the trap codes
-/// here are DEADLOCK = 2, LOCKFULL = 3, MONITOR = 4, NULLLOCK = 5 and HEAPFULL = 7 (harness
-/// wrong-result FAILs use 1, and the harness trap handler uses 6).
+/// A parked/exiting/joining thread found NOTHING runnable, the block point NOTHING external to wait
+/// on, and no thread asleep for good: every live thread is blocked on a join/lock nobody can satisfy.
+/// Fail LOUD -- write the QEMU `virt` SiFive test-finisher FAIL with exit code 2 (the finisher exits
+/// with the HIGH sixteen bits, so a bare 0x3333 would exit 0, indistinguishable from PASS; real
+/// silicon has no finisher and halts in the loop) rather than silently spinning forever. The ARM twin
+/// prints `DEADLOCK`; the trap codes here are DEADLOCK = 2, LOCKFULL = 3, MONITOR = 4, NULLLOCK = 5
+/// and HEAPFULL = 7 (harness wrong-result FAILs use 1, and the harness trap handler uses 6).
 fn sched_deadlock_trap() -> ! {
     const FINISHER: *mut u32 = 0x0010_0000 as *mut u32;
     unsafe { core::ptr::write_volatile(FINISHER, 0x0002_3333) };
@@ -680,6 +689,26 @@ mod no_resolver {
     }
 }
 
+/// How long the scheduler idles at a time while a thread sleeps forever and nothing can run or be
+/// waited on, before it looks again: one slice of the reactor's own sleep. The ARM twin and the C#
+/// interpreter idle the same 16 ms in the same state.
+const FOREVER_IDLE_SLICE_MS: u64 = 16;
+
+/// What a thread does when nothing is runnable: wait once at the reactor block point. When that has
+/// nothing to wait on either, a thread asleep for good means the program is still waiting -- .NET
+/// keeps the process alive for it, and an event-driven `Main` parks exactly so -- so idle one slice
+/// and let the caller look again. Without one, the threads left are lock/join-deadlocked: fail loud.
+unsafe fn sched_idle(s: &mut Scheduler) {
+    if sched_block_point(s) {
+        return;
+    }
+    if s.asleep_forever != 0 {
+        reactor_env::sleep_millis(FOREVER_IDLE_SLICE_MS);
+        return;
+    }
+    sched_deadlock_trap();
+}
+
 /// Park the current thread on `reason`: clear its runnable bit, record the reason, and run others
 /// through the shared re-entry loop. The thread resumes here once woken and rescheduled -- by the
 /// block point's wake pass (its `reason` came due) or, single-threaded, by its own wait completing.
@@ -691,12 +720,26 @@ unsafe fn sched_park(reason: ParkReason) {
     sched_block_current(s);
 }
 
-/// The blocked-thread re-entry loop shared by a reactor park ([`sched_park`]) and a Monitor block
-/// ([`sched_block_for_handoff`]). The caller has already cleared the current thread's runnable
-/// bit; run the next runnable thread until a wake sets the bit again (a self-wake with nothing
-/// else runnable is a plain return), and with NOTHING runnable drive the reactor block point --
-/// possibly on behalf of threads parked on timers/sockets while the current one awaits a hand-off.
-/// A false block point (nothing external to wait on) is the lock/join deadlock: fail loud.
+/// Park the current thread for good (`Thread.Sleep(Timeout.Infinite)`): clear its runnable bit and
+/// mark it asleep forever. It waits on no timer or socket, so nothing wakes it; the other threads run
+/// on, and once none can run the scheduler idles ([`sched_idle`]). Never returns: a wake that reached
+/// it anyway would only park it again.
+unsafe fn sched_park_forever() -> ! {
+    loop {
+        let s = &mut *SCHED;
+        let cur = s.current as usize;
+        s.asleep_forever |= 1u32 << cur;
+        s.runnable &= !(1u32 << cur);
+        sched_block_current(s);
+    }
+}
+
+/// The blocked-thread re-entry loop shared by a reactor park ([`sched_park`]), a park for good
+/// ([`sched_park_forever`]) and a Monitor block ([`sched_block_for_handoff`]). The caller has
+/// already cleared the current thread's runnable bit; run the next runnable thread until a wake
+/// sets the bit again (a self-wake with nothing else runnable is a plain return), and with NOTHING
+/// runnable drive the reactor block point -- possibly on behalf of threads parked on
+/// timers/sockets while the current one awaits a hand-off -- through [`sched_idle`].
 unsafe fn sched_block_current(s: &mut Scheduler) {
     let cur = s.current as usize;
     loop {
@@ -709,9 +752,7 @@ unsafe fn sched_block_current(s: &mut Scheduler) {
             lamella_thread_switch_riscv(&mut s.contexts[cur], &s.contexts[next]);
             return;
         }
-        if !sched_block_point(s) {
-            sched_deadlock_trap();
-        }
+        sched_idle(s);
     }
 }
 
@@ -871,6 +912,7 @@ unsafe fn sched_ensure_init() {
         s.current = 0;
         s.runnable = 1;
         s.done = 0;
+        s.asleep_forever = 0;
         for i in 0..MAX_THREADS {
             s.parks[i] = ParkReason::NotParked;
         }
@@ -912,7 +954,9 @@ extern "C" fn lamella_thread_yield_impl() {
 /// busy-join); with everything else PARKED it drives the reactor block point instead -- so joining a
 /// thread that is asleep or blocked on a socket waits in the ONE real wait rather than spinning a
 /// no-op yield forever. A false block point (nothing external left to wait on) means the joined
-/// thread can never finish: fail loud. An id no spawn returned returns at once rather than hanging.
+/// thread can never finish: fail loud -- unless a thread is asleep for good, and then the join waits
+/// for good as well, as .NET's does ([`sched_idle`]). An id no spawn returned returns at once rather
+/// than hanging.
 #[no_mangle]
 extern "C" fn lamella_thread_join_impl(id: i32) {
     unsafe {
@@ -924,19 +968,26 @@ extern "C" fn lamella_thread_join_impl(id: i32) {
             let cur = s.current as usize;
             if sched_next_runnable(s, cur) != cur {
                 sched_yield();
-            } else if !sched_block_point(s) {
-                sched_deadlock_trap();
+            } else {
+                sched_idle(s);
             }
         }
     }
 }
 
-/// C# `Thread.Sleep(ms)`: no clock seam is linked on this target yet (no RISC-V net stack), so a
-/// timed park could never truly wait; degrade to one cooperative yield (the managed surface's
-/// documented no-clock behavior). When a RISC-V net archive lands, mirror the ARM crate's `net`
-/// flavor: park `Sleep(lamella_net_now_ms() + ms)` on the reactor.
+/// C# `Thread.Sleep(ms)`. This archive links no clock, so a timed park could never truly wait: a
+/// positive timeout degrades to one cooperative yield, the managed surface's documented no-clock
+/// behavior. `Timeout.Infinite` (-1) needs no clock, because a wait that never ends has nothing to
+/// measure: it parks the thread for good. The managed `Sleep` refuses anything below -1 before this
+/// seam is reached, with .NET's `ArgumentOutOfRangeException`.
 #[no_mangle]
-extern "C" fn lamella_thread_sleep_impl(_milliseconds: i32) {
+extern "C" fn lamella_thread_sleep_impl(milliseconds: i32) {
+    if milliseconds < 0 {
+        unsafe {
+            sched_ensure_init();
+            sched_park_forever()
+        }
+    }
     lamella_thread_yield_impl();
 }
 
@@ -1416,8 +1467,8 @@ const HEAP_PTR: *mut u32 = 0x8010_0000 as *mut u32;
 /// There is no heap end to compare against here. The cursor word is shared with whichever
 /// `lamella_gc_alloc` provider the image links, and only that provider knows where its heap stops.
 /// A request whose rounding or sum overflows cannot fit by construction and ends the program through
-/// [`lamella_heap_exhausted`]; a request that runs past the provider's end without overflowing is
-/// not caught here.
+/// [`lamella_heap_exhausted`], which can name no free figure for a heap whose end it does not know,
+/// and reports 0; a request that runs past the provider's end without overflowing is not caught here.
 fn bump_alloc(bytes: u32) -> *mut u32 {
     unsafe {
         let base = core::ptr::read_volatile(HEAP_PTR);
@@ -1426,29 +1477,62 @@ fn bump_alloc(bytes: u32) -> *mut u32 {
             .map(|n| n & !7)
             .and_then(|n| base.checked_add(n))
         else {
-            lamella_heap_exhausted();
+            lamella_heap_exhausted(bytes, 0);
         };
         core::ptr::write_volatile(HEAP_PTR, next);
         base as *mut u32
     }
 }
 
-/// Ends the program because the heap cannot serve an allocation: `HEAPFULL` on the console, then the
-/// QEMU `virt` test-finisher FAIL with exit code 7, then a halt -- real silicon has no finisher and
-/// stops in the loop. The ARM twin prints the same word; the exit codes are listed at
-/// [`sched_deadlock_trap`].
+/// Ends the program because the heap cannot serve an allocation: `HEAPFULL`, the bytes the
+/// allocation asked for and the bytes the heap had free, on the console, then the QEMU `virt`
+/// test-finisher FAIL with exit code 7, then a halt -- real silicon has no finisher and stops in the
+/// loop. The line reads `HEAPFULL: asked for 40 B, 0 B free`, as the ARM twin's does; the exit codes
+/// are listed at [`sched_deadlock_trap`].
 ///
 /// Exported, because on this instruction set the image supplies `lamella_gc_alloc`: a provider with
-/// a heap end calls this when a request does not fit, so an exhausted heap reads the same whichever
-/// allocator ran out.
+/// a heap end calls this when a request does not fit, with the request (`a0`) and the room it had
+/// left (`a1`), so an exhausted heap reads the same whichever allocator ran out.
 #[no_mangle]
-pub extern "C" fn lamella_heap_exhausted() -> ! {
-    for b in *b"HEAPFULL" {
-        console_put(b);
-    }
+pub extern "C" fn lamella_heap_exhausted(asked: u32, free: u32) -> ! {
+    write_ascii(b"HEAPFULL: asked for ");
+    write_figure(asked);
+    write_ascii(b" B, ");
+    write_figure(free);
+    write_ascii(b" B free\n");
     const FINISHER: *mut u32 = 0x0010_0000 as *mut u32;
     unsafe { core::ptr::write_volatile(FINISHER, 0x0007_3333) };
     loop {}
+}
+
+/// Writes `text` to the console, a byte at a time. One copy, shared by every piece of a report.
+#[inline(never)]
+fn write_ascii(text: &[u8]) {
+    for &byte in text {
+        console_put(byte);
+    }
+}
+
+/// The powers of ten a 32-bit figure is written with, most significant first.
+static POW10_U32: [u32; 10] = [1_000_000_000, 100_000_000, 10_000_000, 1_000_000, 100_000, 10_000, 1_000, 100, 10, 1];
+
+/// Writes a 32-bit figure in decimal, most significant digit first, by repeated SUBTRACTION of powers
+/// of ten -- division-free, as [`write_udec`] is, and in 32 bits, so a report of two byte counts does
+/// not carry that function's 64-bit walk. Leading zeros are suppressed; `0` prints `0`.
+#[inline(never)]
+fn write_figure(mut value: u32) {
+    let mut started = false;
+    for &power in POW10_U32.iter() {
+        let mut digit = 0u8;
+        while value >= power {
+            value -= power;
+            digit += 1;
+        }
+        started |= digit != 0 || power == 1;
+        if started {
+            console_put(b'0' + digit);
+        }
+    }
 }
 
 unsafe extern "C" {
@@ -1491,7 +1575,7 @@ fn alloc_string(units: u32) -> *mut u32 {
         .checked_mul(2)
         .and_then(|n| n.checked_add(8))
     else {
-        lamella_heap_exhausted();
+        lamella_heap_exhausted(u32::MAX, 0);
     };
     let block = bump_alloc(bytes);
     unsafe {

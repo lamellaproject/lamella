@@ -6,6 +6,7 @@ use crate::interop;
 use crate::method::{ConstructorPrologue, EmittedBody, emit_body, max_stack};
 use crate::tokens::Tokens;
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -54,11 +55,6 @@ const TYPE_SEALED: u32 = 0x0000_0100;
 /// `beforefieldinit` (II.23.1.15): the type initializer may run at any point AT OR BEFORE the first
 /// static field access, rather than precisely at it.
 ///
-/// **ITS ABSENCE IS A DEMAND, NOT A DEFAULT.** A type without this flag requires PRECISE timing, so
-/// emitting it for nothing -- which this compiler did for every type it ever produced -- says every
-/// type in the image needs a first-access check. Measured on corlib: 100% of type-initializer
-/// trigger sites need a runtime check when the flag is omitted, against 4% under csc's on the same
-/// sources. The flag is most of a lazy initializer's cost, decided before the mechanism is written.
 const TYPE_BEFORE_FIELD_INIT: u32 = 0x0010_0000;
 
 /// The Nested* visibility bits (II.23.1.15) for a nested type, from its declared accessibility.
@@ -196,8 +192,6 @@ impl Diagnostic {
 
     /// Renders this diagnostic as `path(line,column): severity CODE: message`.
     ///
-    /// The code's prefix comes from [`Diagnostic::namespace`], so a condition csc has no concept
-    /// of is reported in Lamella's namespace rather than wearing csc's.
     ///
     /// The shape is MSBuild's, and it is not free to vary: `path(line,column): severity CODE:
     /// message` is what puts the code in a Problems pane's code column rather than inside the
@@ -438,9 +432,6 @@ fn compile_source_on_this_stack(
 /// everything below. A bare `#pragma warning disable` names no codes and means every warning,
 /// which is why an empty list is a wildcard rather than a no-op.
 ///
-/// **ERRORS ARE NEVER SUPPRESSED**, whatever a pragma says -- csc ignores a `disable` naming an
-/// error's number, and so does this: a directive that could silence an error would be a way to
-/// ship a program the compiler refused.
 fn without_suppressed_warnings(
     diagnostics: Vec<Diagnostic>,
     pragmas: &[lamella_syntax::lexer::PragmaWarning],
@@ -788,22 +779,8 @@ fn build_image(
         })
         .collect();
     let partials = index_partial_types(units, &contexts);
-    let mut source = emit_source_types(
-        program,
-        module_name,
-        assembly_name,
-        debug,
-        native_interop,
-        &contexts,
-        &partials,
-        crate::tokens::InstanceRows::new(),
-    )?;
-    if let Err(mismatch) = check_method_rows(&source.image, &source.tokens) {
-        let measured = source.tokens.take_instance_rows_written();
-        if measured.is_empty() {
-            return Err(mismatch);
-        }
-        source = emit_source_types(
+    let emit = |rows: crate::tokens::InstanceRows, structs: BTreeMap<String, Token>| {
+        let mut source = emit_source_types(
             program,
             module_name,
             assembly_name,
@@ -811,9 +788,48 @@ fn build_image(
             native_interop,
             &contexts,
             &partials,
-            measured,
+            rows,
+            structs.clone(),
         )?;
-        check_method_rows(&source.image, &source.tokens)?;
+        if let Err(mismatch) = check_method_rows(&source.image, &source.tokens) {
+            let measured = source.tokens.take_instance_rows_written();
+            if measured.is_empty() {
+                return Err(mismatch);
+            }
+            source = emit_source_types(
+                program,
+                module_name,
+                assembly_name,
+                debug,
+                native_interop,
+                &contexts,
+                &partials,
+                measured,
+                structs,
+            )?;
+            check_method_rows(&source.image, &source.tokens)?;
+        }
+        let pending_lambdas = core::mem::take(&mut source.tokens.pending_lambdas);
+        if !pending_lambdas.is_empty() || !source.tokens.pending_instance_bodies.is_empty() {
+            emit_closure_types(
+                &mut source.image,
+                &mut source.binder,
+                &mut source.tokens,
+                pending_lambdas,
+            )?;
+        }
+        Ok::<_, crate::EmitError>(source)
+    };
+    let mut source = emit(crate::tokens::InstanceRows::new(), BTreeMap::new())?;
+    if source.tokens.guessed_struct_type() {
+        let rows = source.tokens.take_instance_rows_written();
+        let structs = source.tokens.take_struct_types_written();
+        source = emit(rows, structs)?;
+        if source.tokens.guessed_struct_type() {
+            return Err(crate::EmitError::Unsupported(
+                "a display struct's token was still unknown on the emission that knew it",
+            ));
+        }
     }
     let SourceTypes {
         mut image,
@@ -822,15 +838,13 @@ fn build_image(
         entry_point,
     } = source;
     let entry_point = tokens.top_level_entry_point.or(entry_point);
-    let pending_lambdas = core::mem::take(&mut tokens.pending_lambdas);
-    if !pending_lambdas.is_empty() || !tokens.pending_instance_bodies.is_empty() {
-        emit_closure_types(&mut image, &mut binder, &mut tokens, pending_lambdas)?;
-    }
     let pending_async = core::mem::take(&mut tokens.pending_async);
     for pending in pending_async {
         emit_async_machine(&mut image, &mut binder, &mut tokens, pending)?;
     }
+    emit_by_ref_like_attributes(&mut image, binder.model(), &mut tokens);
     emit_is_readonly_attribute(&mut image, binder.model(), &mut tokens);
+    emit_is_unmanaged_attributes(&mut image, binder.model(), &mut tokens);
     for unit in units {
         emit_global_attributes(&mut image, &mut binder, &mut tokens, &unit.global_attributes);
     }
@@ -862,12 +876,14 @@ fn emit_source_types(
     contexts: &[DebugContext],
     partials: &PartialIndex<'_>,
     synthesized: crate::tokens::InstanceRows,
+    struct_types: BTreeMap<String, Token>,
 ) -> Result<SourceTypes, crate::EmitError> {
     let units = program.units;
     let references = program.references;
     let model = reference_model(units, program.imported);
     let mut binder = Binder::with_model(model);
     let mut tokens = assign_tokens(units, &mut binder, partials, synthesized);
+    tokens.expect_struct_types(struct_types);
     tokens.set_native_interop(native_interop);
     mark_external_value_types(binder.model(), &mut tokens);
     let mut image = ImageBuilder::new(module_name, assembly_name);
@@ -1638,6 +1654,11 @@ pub(crate) fn build_submission_delta(
         if !pending_lambdas.is_empty() || !tokens.pending_instance_bodies.is_empty() {
             emit_closure_types(&mut image, binder, &mut tokens, pending_lambdas)?;
         }
+        if tokens.guessed_struct_type() {
+            return Err(crate::EmitError::Unsupported(
+                "a local function capturing locals in a method of a type declared in a REPL submission",
+            ));
+        }
         let pending_async = core::mem::take(&mut tokens.pending_async);
         for pending in pending_async {
             emit_async_machine(&mut image, binder, &mut tokens, pending)?;
@@ -1911,21 +1932,6 @@ fn part_file_imports(
     imports
 }
 
-/// Emits one declaration's `GenericParam` rows (II.22.20) WITH their constraint flag word, plus a
-/// `GenericParamConstraint` row (II.22.21) for each named constraint.
-///
-/// **ONE IMPLEMENTATION FOR EVERY DECLARATION SITE** -- a class, an interface, and a generic method.
-/// constraints come from `lamella_binder::constraints_by_parameter`, the SAME function the binder
-/// checks against, so the metadata and the diagnostics cannot disagree about what the source wrote.
-///
-/// **THE FLAG BITS AND THE ROWS ARE DIFFERENT ENCODINGS AND BOTH ARE NEEDED.** `class`/`struct`/
-/// `new()` are bits `0x001C` of the flag word; a named class, interface or type parameter is a ROW.
-/// A parameter with only `where T : class` therefore produces no row at all.
-///
-/// **`struct` IMPLIES THE DEFAULT-CONSTRUCTOR BIT HERE, THOUGH NOT IN THE SOURCE.** II.10.1.7
-/// requires an emitter that sets `0x0008` to set `0x0010` with it -- every value type has a
-/// parameterless constructor. C# forbids WRITING both (CS0451), so the model keeps the source fact
-/// and the implication is applied at this boundary rather than in the checker.
 /// A `System.<name>` token: this module's own `TypeDef` when it declares the type (a corlib
 /// self-build does), else a `TypeRef`. The same two-step every other external reference takes, so a
 /// corlib build names `System.ValueType` by definition rather than referencing itself.
@@ -1936,17 +1942,35 @@ fn system_type_token(image: &mut ImageBuilder, tokens: &Tokens, name: &str) -> T
         .unwrap_or_else(|| image.type_ref("System", name))
 }
 
+/// Emits one declaration's `GenericParam` rows (II.22.20) WITH their constraint flag word, plus a
+/// `GenericParamConstraint` row (II.22.21) for each named constraint.
+///
+/// **ONE IMPLEMENTATION FOR EVERY DECLARATION SITE** -- a class, an interface, a delegate and a
+/// generic method. The constraints are the ones the binder resolved and checks against -- the
+/// model's row for a type, the method's scope for a method -- so the metadata and the diagnostics
+/// cannot disagree about what the source wrote.
+///
+/// **THE FLAG BITS AND THE ROWS ARE DIFFERENT ENCODINGS AND BOTH ARE NEEDED.** `class`/`struct`/
+/// `new()` are bits `0x001C` of the flag word; a named class, interface or type parameter is a ROW.
+/// A parameter with only `where T : class` therefore produces no row at all.
+///
+/// **`struct` IMPLIES THE DEFAULT-CONSTRUCTOR BIT HERE, THOUGH NOT IN THE SOURCE.** II.10.1.7
+/// requires an emitter that sets `0x0008` to set `0x0010` with it -- every value type has a
+/// parameterless constructor. C# forbids WRITING both (CS0451), so the model keeps the source fact
+/// and the implication is applied at this boundary rather than in the checker.
 fn emit_generic_parameters(
     image: &mut ImageBuilder,
-    tokens: &Tokens,
+    tokens: &mut Tokens,
     owner: Token,
     names: &[Box<str>],
-    clauses: &[lamella_syntax::ast::TypeParameterConstraintClause],
+    constraints: &[lamella_binder::symbols::TypeParameterConstraints],
+    method_scope: &[Box<str>],
+    declaring_scope: &[Box<str>],
 ) {
     if names.is_empty() {
         return;
     }
-    let constraints = lamella_binder::constraints_by_parameter(names, clauses);
+    let saved = tokens.enter_body_scope(method_scope, declaring_scope);
     for (number, parameter) in names.iter().enumerate() {
         let written = constraints.get(number);
         let mut flags = 0u16;
@@ -1965,20 +1989,99 @@ fn emit_generic_parameters(
         let Some(written) = written else {
             continue;
         };
-        if written.value_type {
+        if written.unmanaged {
+            if let Some(row) = unmanaged_constraint_token(image, tokens) {
+                image.add_generic_param_constraint(param_token, row);
+            }
+            tokens.pending_is_unmanaged.push(param_token);
+        } else if written.value_type {
             let value_type = system_type_token(image, tokens, "ValueType");
             image.add_generic_param_constraint(param_token, value_type);
         }
         for constraint in &written.types {
-            let token = tokens.type_token(constraint).or_else(|| {
-                split_type_name(constraint)
-                    .map(|(namespace, name)| image.type_ref(&namespace, &name))
-            });
-            if let Some(token) = token {
+            if let Some(token) = constraint_type_token(image, tokens, constraint) {
                 image.add_generic_param_constraint(param_token, token);
             }
         }
     }
+    tokens.restore_body_scope(saved);
+}
+
+/// The token of the `GenericParamConstraint` row an `unmanaged` constraint is written with:
+/// `System.ValueType` under a required modifier naming
+/// `System.Runtime.InteropServices.UnmanagedType`, a `TypeSpec` minted once and shared. With the
+/// value type flags it is what records the constraint; the attribute
+/// [`emit_is_unmanaged_attributes`] adds says so to a reader that looks for that instead.
+///
+/// `None` only when the reference set has no `UnmanagedType`, which the binder refused where the
+/// constraint is written (CS0518), so no image that reaches here lacks it.
+fn unmanaged_constraint_token(image: &mut ImageBuilder, tokens: &mut Tokens) -> Option<Token> {
+    if let Some(minted) = tokens.unmanaged_constraint_spec {
+        return Some(minted);
+    }
+    let marker = named_symbol("System.Runtime.InteropServices", "UnmanagedType");
+    mint_named_type_token(&marker, image, tokens);
+    let modifier = tokens.type_token(&marker)?;
+    let value_type = system_type_token(image, tokens, "ValueType");
+    let spec = image.type_spec(&type_signature(&TypeSig::Modified {
+        modifier,
+        inner: Box::new(TypeSig::Class(value_type)),
+    }));
+    tokens.unmanaged_constraint_spec = Some(spec);
+    Some(spec)
+}
+
+/// The constraints the model holds for the declaration `declared`, one per parameter of its row:
+/// resolved in the declaration's header, and merged across a partial type's parts, so a part that
+/// states no clause still writes the constraints another part states.
+fn declared_constraints(
+    binder: &Binder,
+    declared: &TypeSymbol,
+) -> Vec<lamella_binder::symbols::TypeParameterConstraints> {
+    binder
+        .model()
+        .get_by_symbol(declared)
+        .map(|info| info.type_parameter_constraints.clone())
+        .unwrap_or_default()
+}
+
+/// The token a `GenericParamConstraint` row (II.22.21) names for one constraint type, resolved
+/// where the clause is written and encoded in the owner's generic scope: the `TypeSpec` `!n` or
+/// `!!n` for a type parameter, a `TypeSpec` for a constructed type, and otherwise this module's
+/// `TypeDef` or a `TypeRef` by the type's full name -- the tokens a signature names the same type
+/// by.
+fn constraint_type_token(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    constraint: &TypeSymbol,
+) -> Option<Token> {
+    if let Some((is_method, index)) = tokens.body_type_parameter(constraint) {
+        let minted = if is_method {
+            tokens.mvar_spec(index)
+        } else {
+            tokens.var_spec(index)
+        };
+        if minted.is_some() {
+            return minted;
+        }
+        let signature = if is_method {
+            TypeSig::MVar(index)
+        } else {
+            TypeSig::Var(index)
+        };
+        let spec = image.type_spec(&type_signature(&signature));
+        if is_method {
+            tokens.insert_mvar_spec(index, spec);
+        } else {
+            tokens.insert_var_spec(index, spec);
+        }
+        return Some(spec);
+    }
+    if requires_type_spec(tokens, constraint) {
+        return mint_composite_type_spec(constraint, image, tokens);
+    }
+    mint_named_type_token(constraint, image, tokens);
+    tokens.type_token(constraint)
 }
 
 /// Emits an interface as a `TypeDef` with no base, no constructor, and abstract
@@ -2022,7 +2125,9 @@ fn emit_interface(
                 tokens,
                 token,
                 &own_parameters,
-                &declaration.constraints,
+                &declared_constraints(binder, &enclosing),
+                &[],
+                &own_parameters,
             );
             token
         }
@@ -2254,12 +2359,15 @@ fn emit_delegate(
         base,
         flags,
     );
+    let delegate_parameters = delegate_type_parameter_names(binder, &delegate_ty, declaration);
     emit_generic_parameters(
         image,
         tokens,
         delegate_token,
-        &delegate_type_parameter_names(binder, &delegate_ty, declaration),
-        &declaration.constraints,
+        &delegate_parameters,
+        &declared_constraints(binder, &delegate_ty),
+        &[],
+        &delegate_parameters,
     );
     if let Some(enclosing_full) = &enclosing_type {
         if let Some(enclosing_token) = tokens.type_token(&type_symbol_from_dotted(enclosing_full)) {
@@ -2684,8 +2792,11 @@ fn emit_type(
     later: &[PartialPart<'_>],
     partials: &PartialIndex<'_>,
 ) -> Result<(), crate::EmitError> {
-    let entered =
-        binder.enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+    let entered = binder.enter_declared_type_parameters(
+        &declared_type_symbol(namespace, declaration),
+        &declaration.type_parameters,
+        &declaration.constraints,
+    );
     let outer = binder.replace_current_type(Some(declared_type_symbol(namespace, declaration)));
     let emitted = emit_type_inner(
         image,
@@ -2718,9 +2829,6 @@ fn emit_type(
 /// type's members in SOURCE order, which csc names a synthesized closure member after
 /// (`<M>b__N_M`, `<>9__N_M`).
 ///
-/// **THE COUNT IS OVER MEMBERS, AND OVER SYNTHESIZED ONES TOO**, which is most of the rule and
-/// none of it is guessable. Measured against csc, member kind by member kind, each with a probe
-/// that puts one member ahead of a lambda-bearing method and reads the name back:
 ///
 /// ```text
 ///     field, per declarator            1     `static int a, b;` advances the count by two
@@ -3012,7 +3120,9 @@ fn emit_type_inner(
             tokens,
             type_token,
             &own_parameters,
-            &declaration.constraints,
+            &declared_constraints(binder, &enclosing),
+            &[],
+            &own_parameters,
         );
         if let Some(enclosing_full) = &nested_in {
             if let Some(enclosing_token) = tokens.type_token(&type_symbol_from_dotted(enclosing_full)) {
@@ -3500,6 +3610,15 @@ fn emit_type_inner(
     if declares_required_member(declaration) {
         emit_required_member_marker(image, tokens, type_token);
     }
+    if matches!(declaration.kind, TypeKind::Struct) {
+        if declaration.modifiers.contains(&Modifier::Ref) {
+            let obsolete = !declares_attribute(&declaration.attributes, "Obsolete");
+            tokens.pending_by_ref_like.push((type_token, obsolete));
+        }
+        if declaration.modifiers.contains(&Modifier::Readonly) {
+            attach_is_readonly(tokens, type_token);
+        }
+    }
     let mut first_event = None;
     for member in &declaration.members {
         if let Member::EventField {
@@ -3577,23 +3696,23 @@ fn emit_type_inner(
         emitted?;
     }
     if continuation.is_none() {
-        emit_instance_lambda_rows(image, tokens, &enclosing)?;
+        emit_instance_lambda_rows(image, binder, tokens, &enclosing)?;
     }
     Ok(())
 }
 
-/// Adds a `MethodDef` row for each `this`-capturing lambda of `enclosing`, and hands the site to
-/// the global drain to have its bytes landed.
+/// Adds a `MethodDef` row for each closure method that lives on `enclosing` itself -- a
+/// `this`-capturing lambda, and a local function lowered to a method of the enclosing type -- and
+/// hands the site to the global drain to have its bytes landed.
 ///
 /// **THE ROW NOW, THE BODY LATER, AND BOTH HALVES ARE FORCED.** The row has to be here because a
 /// type's method rows are contiguous and this type's run ends with this call. The body cannot be
 /// here because it may name a `<>c` member, and no closure type exists until every source type has
 /// been emitted -- which is the same reason the enclosing method's own body is deferred.
 ///
-/// csc's flags, measured: `private hidebysig` INSTANCE, and -- unlike a `<>c` body, where the
-/// marker sits on the type -- each of these carries `[CompilerGenerated]` itself.
 fn emit_instance_lambda_rows(
     image: &mut ImageBuilder,
+    binder: &mut Binder,
     tokens: &mut Tokens,
     enclosing: &TypeSymbol,
 ) -> Result<(), crate::EmitError> {
@@ -3616,29 +3735,153 @@ fn emit_instance_lambda_rows(
         declaring: &declaring_parameters,
     };
     for site in mine {
-        let parameter_sigs: Vec<TypeSig> = site
-            .parameters
-            .iter()
-            .map(|(_, ty)| open_type_sig(tokens, ty, scope))
-            .collect::<Result<_, _>>()?;
-        let return_sig = open_type_sig(tokens, &site.return_type, scope)?;
-        let signature = method_signature(true, &parameter_sigs, &return_sig);
+        mint_closure_signature_types(image, binder, tokens, &site)?;
+        let signature = closure_method_signature(tokens, &site, scope)?;
         let token = image.add_method_deferred_body(
             &site.method_name,
             &signature,
-            METHOD_PRIVATE | METHOD_HIDEBYSIG,
+            closure_method_flags(&site),
             IL_MANAGED,
-            &by_value_parameter_names(&site.parameters),
+            &closure_parameter_rows(&site),
         );
-        let parameters: Vec<TypeSymbol> = site.parameters.iter().map(|(_, ty)| ty.clone()).collect();
+        let parameters = site.signature_parameters();
         tokens.insert_method(enclosing, &site.method_name, &parameters, token);
         tokens.record_instance_row(enclosing, &site.method_name, &parameters);
         emit_compiler_generated_marker(image, tokens, token);
+        emit_local_function_parameter_metadata(image, binder, tokens, token, &site);
         tokens
             .pending_instance_bodies
             .push((enclosing.clone(), token, site));
     }
     Ok(())
+}
+
+/// The `MethodDef` flags of a synthesized closure method, csc's, measured: a `this`-capturing body
+/// `private hidebysig` instance; a static local function `assembly hidebysig static`; a method of
+/// `<>c` or of a display class `assembly hidebysig` instance.
+fn closure_method_flags(site: &crate::lambdalower::LoweredLambda) -> u16 {
+    use crate::lambdalower::LambdaHome;
+    match site.home {
+        LambdaHome::StaticMethod => METHOD_ASSEMBLY | METHOD_HIDEBYSIG | METHOD_STATIC,
+        LambdaHome::EnclosingType => METHOD_PRIVATE | METHOD_HIDEBYSIG,
+        LambdaHome::ClosureType | LambdaHome::DisplayClass => METHOD_ASSEMBLY | METHOD_HIDEBYSIG,
+    }
+}
+
+/// A synthesized closure method's parameters as the body emitter takes them -- the declared ones,
+/// then each struct environment a local function takes by reference -- beside how each is passed.
+fn closure_method_parameters(
+    site: &crate::lambdalower::LoweredLambda,
+) -> (Vec<(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)>, Vec<ParamPassing>) {
+    use lamella_binder::symbols::ParameterMode;
+    let mut params = param_triples(&site.parameters);
+    let mut passing: Vec<ParamPassing> = (0..site.parameters.len())
+        .map(|index| {
+            match site
+                .local
+                .as_ref()
+                .and_then(|local| local.parameter_modes.get(index))
+            {
+                Some(ParameterMode::Ref) => ParamPassing::Ref,
+                Some(ParameterMode::Out) => ParamPassing::Out,
+                _ => ParamPassing::ByValue,
+            }
+        })
+        .collect();
+    if let Some(local) = &site.local {
+        for (name, ty) in &local.environments {
+            params.push((name.clone(), ty.clone(), Vec::new()));
+            passing.push(ParamPassing::Ref);
+        }
+    }
+    (params, passing)
+}
+
+/// A synthesized closure method's `Param` rows: one per declared parameter, `out` flagged, and none
+/// for an environment -- csc writes none, measured (ilspy shows the slot as `''`).
+fn closure_parameter_rows(site: &crate::lambdalower::LoweredLambda) -> Vec<ParamRow> {
+    let (_, passing) = closure_method_parameters(site);
+    bound_parameter_names(&site.parameters, &passing)
+}
+
+/// Mints the references a synthesized closure method's signature names -- an instantiation of an
+/// imported generic such as `Func<int, int>`, as a parameter or as the return type -- before the
+/// signature is written, as a declared method's are.
+fn mint_closure_signature_types(
+    image: &mut ImageBuilder,
+    binder: &Binder,
+    tokens: &mut Tokens,
+    site: &crate::lambdalower::LoweredLambda,
+) -> Result<(), crate::EmitError> {
+    for (_, ty) in &site.parameters {
+        mint_signature_type(binder, ty, &[], &[], image, tokens)?;
+    }
+    mint_signature_type(binder, &site.return_type, &[], &[], image, tokens)
+}
+
+/// A synthesized closure method's signature: `T&` for each `ref` or `out` parameter and each
+/// struct environment, as [`crate::lambdalower::LoweredLambda::signature_parameters`] lists them.
+fn closure_method_signature(
+    tokens: &mut Tokens,
+    site: &crate::lambdalower::LoweredLambda,
+    scope: GenericScope<'_>,
+) -> Result<Vec<u8>, crate::EmitError> {
+    let declared = site.parameters.len();
+    let mut parameter_sigs: Vec<TypeSig> = Vec::new();
+    for ty in site.signature_parameters().iter().take(declared) {
+        parameter_sigs.push(match ty {
+            TypeSymbol::ByRef(inner) => TypeSig::ByRef(Box::new(open_type_sig(tokens, inner, scope)?)),
+            other => open_type_sig(tokens, other, scope)?,
+        });
+    }
+    if let Some(local) = &site.local {
+        for (_, ty) in &local.environments {
+            let token = tokens.struct_type_token(ty);
+            parameter_sigs.push(TypeSig::ByRef(Box::new(TypeSig::ValueType(token))));
+        }
+    }
+    let return_sig = open_type_sig(tokens, &site.return_type, scope)?;
+    Ok(method_signature(!site.is_static(), &parameter_sigs, &return_sig))
+}
+
+/// What a local function's declared parameters carry beyond their types, as a method's do (csc,
+/// measured): `Optional` and a `Constant` row for a default, and `[ParamArray]` on a `params`
+/// array. Nothing for a lambda.
+fn emit_local_function_parameter_metadata(
+    image: &mut ImageBuilder,
+    binder: &Binder,
+    tokens: &mut Tokens,
+    method: Token,
+    site: &crate::lambdalower::LoweredLambda,
+) {
+    let Some(local) = &site.local else {
+        return;
+    };
+    let rows = image.method_parameters(method);
+    for (index, default) in local.defaults.iter().enumerate() {
+        let (Some(literal), Some(&param), Some((_, ty))) =
+            (default, rows.get(index), site.parameters.get(index))
+        else {
+            continue;
+        };
+        let mut flags = image.param_flags(param) | PARAM_OPTIONAL;
+        if let Some((element, value)) = constant_row(binder.model(), ty, literal) {
+            flags |= PARAM_HAS_DEFAULT;
+            image.add_constant(param, element, &value);
+        } else if matches!(ty, TypeSymbol::Special(SpecialType::Decimal)) {
+            emit_decimal_parameter_attribute(image, tokens, literal, param);
+        }
+        image.set_param_flags(param, flags);
+    }
+    if local.is_params {
+        if let Some(&param) = rows.get(site.parameters.len().saturating_sub(1)) {
+            if let Some(constructor) =
+                synthesized_attribute_ctor(image, tokens, "System", "ParamArrayAttribute", &[])
+            {
+                image.add_custom_attribute(param, constructor, &[0x01, 0x00, 0x00, 0x00]);
+            }
+        }
+    }
 }
 
 /// Emits a field-like event (17.7): `add_E`/`remove_E` accessors that combine/remove
@@ -3958,8 +4201,6 @@ fn emit_bodyless_method(
 /// while also not requiring it agrees with itself -- the two halves cancel, and only a consumer
 /// outside the compilation sees that `==` is an ordinary method rather than an operator.
 ///
-/// Keying on the `op_` name prefix instead would mark a plain method spelled `op_Foo`, which csc
-/// leaves unmarked; the declaration kind is the thing that knows, so the declaration kind says so.
 fn emit_one_method(
     image: &mut ImageBuilder,
     binder: &mut Binder,
@@ -3987,7 +4228,6 @@ fn emit_one_method(
         name,
         return_type,
         type_parameters,
-        constraints,
         parameters,
         is_vararg,
         body,
@@ -4011,7 +4251,6 @@ fn emit_one_method_in_scope(
     name: &str,
     return_type: &TypeRef,
     type_parameters: &[TypeParameter],
-    constraints: &[lamella_syntax::ast::TypeParameterConstraintClause],
     parameters: &[Parameter],
     is_vararg: bool,
     body: &Stmt,
@@ -4021,7 +4260,11 @@ fn emit_one_method_in_scope(
 ) -> Result<Token, crate::EmitError> {
     let method_type_parameters: Vec<Box<str>> =
         type_parameters.iter().map(|p| p.name.clone()).collect();
-    let method_constraints = constraints;
+    let method_constraints: Vec<lamella_binder::symbols::TypeParameterConstraints> =
+        method_type_parameters
+            .iter()
+            .map(|name| binder.constraints_in_scope(name).cloned().unwrap_or_default())
+            .collect();
     let is_async = modifiers.contains(&Modifier::Async);
     let return_symbol = binder.canonicalize(&bind_type(return_type));
     let params: Vec<(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)> = parameters
@@ -4114,7 +4357,7 @@ fn emit_one_method_in_scope(
         tokens,
         enclosing,
         &method_type_parameters,
-        method_constraints,
+        &method_constraints,
         name,
         &return_symbol,
         &params,
@@ -4312,16 +4555,6 @@ struct InterfaceSlot {
 /// Every member of `info` an explicit implementation can name, in one fixed order: its methods,
 /// then each property's accessors, then each event's.
 ///
-/// **A PROPERTY OR EVENT DECLARED IN THIS COMPILATION HAS NO ACCESSOR METHODS IN THE MODEL.** A
-/// source property is one `PropertySymbol` and a source event one `EventSymbol`, while a
-/// referenced one also arrives as its `get_`/`set_` or `add_`/`remove_` methods, because metadata
-/// stores accessors as `MethodDef`s. A lookup over `methods` alone therefore found a referenced
-/// interface's accessors and missed those of an interface declared beside the class, and
-/// `int IR<T>.N { get; }` was refused where csc compiles it -- which is every interface the class
-/// library implements while the class library itself is being compiled. The accessors are built
-/// here from the property and event rows, so both kinds of interface answer alike. For a
-/// referenced interface a built accessor repeats a method listed before it, with the same
-/// signature, and the lookup takes the first.
 ///
 /// **THE ORDER IS THE CONTRACT.** A slot is chosen by its position in the SUBSTITUTED interface and
 /// read back at that position in the DEFINITION. The two lists line up because
@@ -4395,13 +4628,7 @@ fn integer_constant(value: i64) -> Literal {
 /// the author wrote is this bit -- and it was never emitted, so every `out` parameter in every
 /// assembly this compiler has built has been published as a `ref`.
 ///
-/// **`[In]` AND `[Out]` ARE PSEUDO-CUSTOM ATTRIBUTES: THEY BECOME THESE BITS AND NO
-/// `CustomAttribute` ROW.** That is measured rather than assumed -- csc emits no custom attribute
-/// on the parameter for either, so a reflector reading `ParameterInfo.IsIn`/`IsOut` is reading the
-/// flags and a reflector listing the parameter's attributes sees nothing. Writing a row as well
-/// would make the second answer disagree with csc while the first agreed.
 ///
-/// The full table this implements, one compilation per row against csc:
 ///
 /// | declaration | flags |
 /// |---|---|
@@ -4410,8 +4637,6 @@ fn integer_constant(value: i64) -> Literal {
 /// | `[In] int x` / `[In] ref int x` | `0x0001` |
 /// | `[In][Out] ref int x` | `0x0003` |
 ///
-/// `[In] out int x` is absent from the table because csc refuses that combination outright:
-/// CS0036, *"An out parameter cannot have the In attribute"*.
 ///
 /// This builder makes rows for the abstract, interface, delegate and P/Invoke paths only; an
 /// ordinary method's rows come from [`bound_parameter_names`]. The attribute bits are applied in
@@ -4427,14 +4652,7 @@ fn param_flags(modifier: Option<ParameterModifier>) -> u16 {
 /// Whether a parameter attribute is PSEUDO-CUSTOM -- consumed into metadata the runtime reads
 /// structurally, rather than kept as a `CustomAttribute` row (II.21.2.1).
 ///
-/// Measured on csc's output, not taken from the spec's list: a parameter carrying `[In]`, `[Out]`
-/// or `[MarshalAs(...)]` has **no** `CustomAttribute` row in csc's image -- the first two become
-/// `ParameterAttributes` bits and the third becomes the `HasFieldMarshal` bit plus a `FieldMarshal`
-/// row. Emitting rows for them as well would make a reflector that LISTS a parameter's attributes
-/// disagree with csc while one reading `IsIn`/`IsOut` agreed.
 ///
-/// `[ParamArray]` is NOT pseudo-custom: csc writes that one as a real `CustomAttribute` row, and
-/// so does this emitter.
 fn is_pseudo_custom_parameter_attribute(name: Option<&str>) -> bool {
     matches!(
         name,
@@ -4529,9 +4747,6 @@ fn ends_in_params_array(parameters: &[Parameter]) -> bool {
 ///
 /// ---
 ///
-/// The `params` half: `[System.ParamArrayAttribute]` on the last declared parameter when
-/// `parameters` ends in a `params` array (17.5.1.4) -- the empty-argument marker blob, matching
-/// what csc writes byte for byte.
 ///
 /// **THIS IS THE ONLY RECORD THAT SURVIVES THE ASSEMBLY BOUNDARY.** `params` is a call-site rule,
 /// and a call site in another assembly has nothing but metadata to read: without this row the
@@ -5259,23 +5474,7 @@ fn apply_init_only_modifier(
 /// than a fabricated reference being minted.
 /// Every required modifier a member's RETURN can carry, applied in one place.
 ///
-/// **`emit_method_body` BUILDS A SIGNATURE AT TWO POINTS** -- the deferred-body path an async method
-/// takes, and the ordinary `add_method` one -- and a modifier applied at one of them is absent from
-/// the other with nothing to say so. The `init` modifier was at both and the `ref readonly` one was
-/// at the first alone, which put `ref readonly int M()` and `ref int M()` in the metadata as the
-/// same method: csc reading it accepted a write through the returned reference at all five
-/// positions. **The repair is this function rather than a second careful call**, so a third
-/// modifier is added once instead of being added at one site and forgotten at the other.
-/// Marks a member's RETURN as read-only the way csc does: a sequence-0 `Param` row (II.22.33)
-/// carrying `[System.Runtime.CompilerServices.IsReadOnlyAttribute]`.
 ///
-/// **THE `modreq` ALONE IS NOT ENOUGH, AND THAT IS THE WHOLE REASON THIS EXISTS.** Emitting
-/// `T& modreq(InAttribute)` and nothing else produces a member csc cannot use AT ALL -- not even to
-/// READ it: `CS0570: 'Bag.RoAt(int)' is not supported by the language`. A bare `modreq(InAttribute)`
-/// on a RETURN is not a C# concept; the attribute on the return parameter is what says the member
-/// is `ref readonly` rather than something the language cannot express. Measured by diffing csc's
-/// own metadata against ours, where the signature blobs were byte-equivalent and csc's had a
-/// sequence-0 `Param` row that ours did not.
 ///
 /// **CALL IT WHILE THIS METHOD IS THE LAST ONE ADDED.** `add_return_param` appends to the `Param`
 /// table, and a `MethodDef`'s parameter run is read as "from my `ParamList` to the next method's" --
@@ -5283,10 +5482,6 @@ fn apply_init_only_modifier(
 /// The return `TypeSig` of a BODYLESS member -- abstract, or on an interface -- with the
 /// `ref readonly` modifier applied when the declaration carries one.
 ///
-/// **THE BODIED PATH CANNOT SERVE THESE.** `emit_method_body` builds its signature from a mark this
-/// crate sets just before calling it; a member with no body never goes through it, so an abstract
-/// or interface `ref readonly T M()` would emit a plain `T&` and every consumer would assign
-/// through it. Measured: csc refuses the write at both positions against its own metadata.
 fn bodyless_return_sig(
     return_type: &TypeRef,
     sig: TypeSig,
@@ -5308,10 +5503,6 @@ fn mark_readonly_return(image: &mut ImageBuilder, tokens: &mut Tokens, method: T
 
 /// Attaches `[System.Runtime.CompilerServices.IsReadOnlyAttribute]` to `parent`.
 ///
-/// **TWO PARENTS, AND BOTH ARE REQUIRED FOR THE MEMBER KINDS THAT HAVE THEM.** csc puts it on the
-/// sequence-0 `Param` of every `ref readonly` member AND on the `Property` row of a `ref readonly`
-/// property or indexer -- measured on csc's own output. Marking only the accessor leaves a property
-/// csc reads as an ordinary `ref`, and it will let a caller assign through it.
 fn attach_is_readonly(tokens: &mut Tokens, parent: Token) {
     tokens.pending_is_readonly.push(parent);
 }
@@ -5323,50 +5514,142 @@ const IS_READONLY_ATTRIBUTE: (&str, &str) = ("System.Runtime.CompilerServices", 
 /// Writes `[IsReadOnlyAttribute]` onto every position [`attach_is_readonly`] recorded, and -- when
 /// no reference supplies the attribute -- SYNTHESIZES the type into this assembly first.
 ///
-/// **AN ASSEMBLY THAT NAMES A TYPE NOTHING DECLARES IS NOT MERELY MISSING A MARKER: A CORLIB LIKE
-/// THAT DOES NOT LOAD AT ALL.** The emitter minted a `TypeRef` for the attribute and attached it
-/// to the sequence-0 `Param` of every `ref readonly` member, resolving into a reference that does
-/// not have it. csc reading such a core library reports `CS0518: predefined type 'System.Object'
-/// is not defined or imported` **for a one-line program** -- because a reference that fails to load
-/// reads as an EMPTY reference, and the diagnostic is about the first predefined type that goes
-/// missing rather than about the member that caused it. Isolated to one variable and proved in both
-/// directions: the same core library compiles and loads with `ref` in place of `ref readonly`, and
-/// loads again with the attribute declared in source.
 ///
-/// **AN ORDINARY LIBRARY SURVIVED IT, WHICH IS WHY IT WENT UNNOTICED.** csc reads a `ref readonly`
-/// member out of a non-corlib assembly with the same dangling reference and still answers `CS8331`
-/// for a write through it, exactly as it does for its own output. Only the core library -- the
-/// assembly whose failure to load takes `System.Object` with it -- turns the loose end into a
-/// compilation that cannot start.
 ///
-/// **SYNTHESIZED ONLY WHEN NOBODY ELSE HAS IT**, which is what csc does: compiled against a
-/// reference set that declares the attribute it emits a `TypeRef` and no type at all. The lookup
-/// covers this compilation's own declarations too, so a core library that declares the attribute in
-/// source gets one copy rather than two.
 ///
 fn emit_is_readonly_attribute(image: &mut ImageBuilder, model: &Model, tokens: &mut Tokens) {
     let pending = core::mem::take(&mut tokens.pending_is_readonly);
     if pending.is_empty() {
         return;
     }
-    let (namespace, name) = IS_READONLY_ATTRIBUTE;
-    let marker = named_symbol(namespace, name);
-    let constructor = if model.get(namespace, name).is_some() {
-        mint_named_type_token(&marker, image, tokens);
-        match tokens.type_token(&marker) {
-            Some(ty) => image.member_ref(ty, ".ctor", &method_signature(true, &[], &TypeSig::Void)),
-            None => return,
-        }
-    } else {
-        synthesize_is_readonly_attribute(image, tokens)
+    let Some(constructor) = marker_attribute_constructor(image, model, tokens, IS_READONLY_ATTRIBUTE)
+    else {
+        return;
     };
     for parent in pending {
-        image.add_custom_attribute(parent, constructor, &[0x01, 0x00, 0x00, 0x00]);
+        image.add_custom_attribute_at(
+            parent,
+            constructor,
+            &[0x01, 0x00, 0x00, 0x00],
+            PLACE_IS_READ_ONLY,
+        );
     }
 }
 
-/// Adds `internal sealed class IsReadOnlyAttribute : Attribute` and its public parameterless
-/// constructor, returning the constructor's `MethodDef` token.
+/// Where csc writes each attribute it synthesizes, among the attributes of the type or member that
+/// carries it ([`ImageBuilder::add_custom_attribute_at`]): the `ref struct` markers in this order,
+/// then `IsReadOnlyAttribute`, `DefaultMemberAttribute` and `RequiredMemberAttribute`, and every
+/// attribute the declaration carries after them all. A constructor's required-members guard takes
+/// the `ref struct` guard's two places.
+///
+const PLACE_BY_REF_LIKE: u8 = 0;
+/// See [`PLACE_BY_REF_LIKE`].
+const PLACE_OBSOLETE_GUARD: u8 = 1;
+/// See [`PLACE_BY_REF_LIKE`].
+const PLACE_FEATURE_REQUIRED: u8 = 2;
+/// See [`PLACE_BY_REF_LIKE`].
+const PLACE_IS_READ_ONLY: u8 = 3;
+/// See [`PLACE_BY_REF_LIKE`].
+const PLACE_DEFAULT_MEMBER: u8 = 4;
+/// See [`PLACE_BY_REF_LIKE`].
+const PLACE_REQUIRED_MEMBER: u8 = 5;
+
+/// The parameterless constructor of the marker attribute `(namespace, name)`: the declaration this
+/// compilation or a reference supplies, or, when none that this assembly may use does, one
+/// synthesized into this assembly (see [`emit_is_readonly_attribute`] for why, and for when it may
+/// be called).
+///
+fn marker_attribute_constructor(
+    image: &mut ImageBuilder,
+    model: &Model,
+    tokens: &mut Tokens,
+    (namespace, name): (&str, &str),
+) -> Option<Token> {
+    let usable = model.get(namespace, name).is_some_and(|info| {
+        info.assembly.is_none()
+            || info.internals_visible
+            || matches!(info.accessibility, lamella_binder::Accessibility::Public)
+    });
+    if !usable {
+        return Some(synthesize_marker_attribute(image, tokens, (namespace, name)));
+    }
+    let marker = named_symbol(namespace, name);
+    mint_named_type_token(&marker, image, tokens);
+    let ty = tokens.type_token(&marker)?;
+    Some(image.member_ref(ty, ".ctor", &method_signature(true, &[], &TypeSig::Void)))
+}
+
+/// The namespace and name of the `unmanaged` constraint's marker attribute.
+const IS_UNMANAGED_ATTRIBUTE: (&str, &str) =
+    ("System.Runtime.CompilerServices", "IsUnmanagedAttribute");
+
+/// See [`PLACE_BY_REF_LIKE`]: on a generic parameter, the one attribute synthesized for it, ahead
+/// of the parameter's own.
+const PLACE_IS_UNMANAGED: u8 = 0;
+
+/// Writes `[IsUnmanagedAttribute]` onto every generic parameter [`Tokens::pending_is_unmanaged`]
+/// recorded, synthesizing the attribute into this assembly first when no reference supplies it, as
+/// [`emit_is_readonly_attribute`] does for its own. A compiler reading this assembly knows the
+/// `unmanaged` constraint by it together with the constraint row.
+fn emit_is_unmanaged_attributes(image: &mut ImageBuilder, model: &Model, tokens: &mut Tokens) {
+    let pending = core::mem::take(&mut tokens.pending_is_unmanaged);
+    if pending.is_empty() {
+        return;
+    }
+    let Some(constructor) =
+        marker_attribute_constructor(image, model, tokens, IS_UNMANAGED_ATTRIBUTE)
+    else {
+        return;
+    };
+    for parameter in pending {
+        image.add_custom_attribute_at(
+            parameter,
+            constructor,
+            &[0x01, 0x00, 0x00, 0x00],
+            PLACE_IS_UNMANAGED,
+        );
+    }
+}
+
+/// The namespace and name of the `ref struct` marker attribute (II.23.2 has no flag for it).
+const IS_BY_REF_LIKE_ATTRIBUTE: (&str, &str) =
+    ("System.Runtime.CompilerServices", "IsByRefLikeAttribute");
+
+/// The message of the `[Obsolete(..., true)]` csc puts on a `ref struct`.
+const REF_STRUCT_OBSOLETE_MESSAGE: &str =
+    "Types with embedded references are not supported in this version of your compiler.";
+
+/// Marks every `ref struct` [`Tokens::pending_by_ref_like`] recorded as csc marks it:
+/// `[IsByRefLikeAttribute]` (synthesized into this assembly when no reference supplies it, as csc
+/// does), then `[Obsolete(<message>, true)]` unless the declaration carries an `[Obsolete]` of its
+/// own, then `[CompilerFeatureRequired("RefStructs")]` when a reference supplies that type.
+///
+/// The runtime knows a by-ref-like type by the first alone: without it .NET refuses to load a
+/// `ref struct` that holds a `Span<T>` (`TypeLoadException`), and a compilation against this
+/// assembly cannot tell the type from an ordinary struct. The other two stop a compiler that does
+/// not know the feature from using the type at all.
+fn emit_by_ref_like_attributes(image: &mut ImageBuilder, model: &Model, tokens: &mut Tokens) {
+    let pending = core::mem::take(&mut tokens.pending_by_ref_like);
+    if pending.is_empty() {
+        return;
+    }
+    let Some(constructor) =
+        marker_attribute_constructor(image, model, tokens, IS_BY_REF_LIKE_ATTRIBUTE)
+    else {
+        return;
+    };
+    for (ty, obsolete) in pending {
+        image.add_custom_attribute_at(ty, constructor, &[0x01, 0x00, 0x00, 0x00], PLACE_BY_REF_LIKE);
+        if obsolete {
+            emit_obsolete_error(image, tokens, ty, REF_STRUCT_OBSOLETE_MESSAGE);
+        }
+        emit_compiler_feature_required(image, tokens, ty, "RefStructs");
+    }
+}
+
+/// Adds the marker attribute `internal sealed class <name> : Attribute` in `namespace` (csc's
+/// `IsReadOnlyAttribute` or `IsByRefLikeAttribute`) and its public parameterless constructor,
+/// returning the constructor's `MethodDef` token.
 ///
 /// **THE BASE AND ITS CONSTRUCTOR GO THROUGH THE ORDINARY LOOKUPS**, which is the whole reason this
 /// works in a core library: there `System.Attribute` is a `TypeDef` in this very module and its
@@ -5376,8 +5659,11 @@ fn emit_is_readonly_attribute(image: &mut ImageBuilder, model: &Model, tokens: &
 /// **THE TYPE AND ITS CONSTRUCTOR ARE ADDED BACK TO BACK AND LAST**, because `add_type` fixes the
 /// type's `first_method` from the current row count and a type owns every `MethodDef` up to the
 /// next one's.
-fn synthesize_is_readonly_attribute(image: &mut ImageBuilder, tokens: &mut Tokens) -> Token {
-    let (namespace, name) = IS_READONLY_ATTRIBUTE;
+fn synthesize_marker_attribute(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    (namespace, name): (&str, &str),
+) -> Token {
     let attribute = named_symbol("System", "Attribute");
     let extends = base_type_token(&attribute, &[], image, tokens)
         .unwrap_or_else(|| image.type_ref("System", "Attribute"));
@@ -5493,7 +5779,7 @@ fn emit_method_body(
     tokens: &mut Tokens,
     enclosing: &TypeSymbol,
     method_type_parameters: &[Box<str>],
-    method_constraints: &[lamella_syntax::ast::TypeParameterConstraintClause],
+    method_constraints: &[lamella_binder::symbols::TypeParameterConstraints],
     name: &str,
     return_symbol: &TypeSymbol,
     params: &[(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)],
@@ -5524,29 +5810,40 @@ fn emit_method_body(
     let mut lambda_sites = Vec::new();
     let mut owes_instance_rows = false;
     let mut display: Option<crate::lambdalower::DisplayClass> = None;
-    if let Some(lowering) = crate::lambdalower::lower_lambdas(enclosing, name, ordinal, &bound, &param_pairs(params), &*binder)? {
+    let mut structs: Vec<crate::lambdalower::DisplayClass> = Vec::new();
+    if let Some(lowering) = crate::lambdalower::lower_lambdas(
+        enclosing,
+        name,
+        ordinal,
+        &bound,
+        &param_pairs(params),
+        &*binder,
+        !is_static,
+    )? {
         bound = lowering.body;
         for site in lowering.sites {
             match site.home {
                 crate::lambdalower::LambdaHome::ClosureType
                 | crate::lambdalower::LambdaHome::DisplayClass => lambda_sites.push(site),
-                crate::lambdalower::LambdaHome::EnclosingType => {
+                crate::lambdalower::LambdaHome::EnclosingType
+                | crate::lambdalower::LambdaHome::StaticMethod => {
                     owes_instance_rows = true;
                     tokens.pending_instance_rows.push((enclosing.clone(), site));
                 }
             }
         }
         display = lowering.display;
+        structs = lowering.structs;
     }
     if is_async {
-        let returns_task = !return_symbol.is_void();
         let machine_index = tokens.next_async_index(enclosing);
         let machine_name = format!("<{name}>d__{machine_index}");
         let lowering = crate::awaitlower::lower_async_method(
             enclosing,
             &machine_name,
             is_static,
-            returns_task,
+            &crate::awaitlower::AsyncReturn::of(return_symbol),
+            &*binder,
             &param_pairs(params),
             &bound,
         )?;
@@ -5586,7 +5883,7 @@ fn emit_method_body(
             is_static,
             flags,
         });
-        if !lambda_sites.is_empty() {
+        if !lambda_sites.is_empty() || !structs.is_empty() {
             tokens.pending_lambdas.push(PendingLambda {
                 stub_token: None,
                 body: BoundStmt {
@@ -5595,6 +5892,7 @@ fn emit_method_body(
                 },
                 sites: lambda_sites,
                 display,
+                structs,
                 prologue: prologue.cloned(),
                 enclosing: enclosing.clone(),
                 name: Box::from(name),
@@ -5646,6 +5944,7 @@ fn emit_method_body(
             body: bound,
             sites: lambda_sites,
             display,
+            structs,
             prologue: prologue.cloned(),
             enclosing: enclosing.clone(),
             name: Box::from(name),
@@ -5692,7 +5991,7 @@ fn emit_bound_body(
     tokens: &mut Tokens,
     enclosing: &TypeSymbol,
     method_type_parameters: &[Box<str>],
-    method_constraints: &[lamella_syntax::ast::TypeParameterConstraintClause],
+    method_constraints: &[lamella_binder::symbols::TypeParameterConstraints],
     name: &str,
     return_symbol: &TypeSymbol,
     params: &[(Box<str>, TypeSymbol, Vec<Option<Box<str>>>)],
@@ -5789,7 +6088,7 @@ fn emit_bound_body_in_scope(
     tokens: &mut Tokens,
     declaring_parameters: &[Box<str>],
     method_type_parameters: &[Box<str>],
-    method_constraints: &[lamella_syntax::ast::TypeParameterConstraintClause],
+    method_constraints: &[lamella_binder::symbols::TypeParameterConstraints],
     name: &str,
     enclosing: &TypeSymbol,
     return_symbol: &TypeSymbol,
@@ -5932,7 +6231,15 @@ fn emit_bound_body_in_scope(
     if readonly_return {
         mark_readonly_return(image, tokens, method);
     }
-    emit_generic_parameters(image, tokens, method, method_type_parameters, method_constraints);
+    emit_generic_parameters(
+        image,
+        tokens,
+        method,
+        method_type_parameters,
+        method_constraints,
+        method_type_parameters,
+        declaring_parameters,
+    );
     if let Some(debug) = method_debug {
         image.set_method_debug(method, debug);
     }
@@ -5958,6 +6265,8 @@ pub(crate) struct PendingLambda {
     pub(crate) sites: Vec<crate::lambdalower::LoweredLambda>,
     /// The display class this method needs, if anything in it captures.
     pub(crate) display: Option<crate::lambdalower::DisplayClass>,
+    /// The display structs its local functions take by reference.
+    pub(crate) structs: Vec<crate::lambdalower::DisplayClass>,
     /// The constructor chain call, carried to the drain that emits the deferred body. A
     /// constructor holding a lambda has its body deferred, and the drain has no prologue of its
     /// own to give it.
@@ -6022,19 +6331,33 @@ fn emit_closure_types(
         emit_closure_type(image, binder, tokens, enclosing, &sites)?;
     }
     for entry in &pending {
-        let Some(display) = &entry.display else {
-            continue;
-        };
-        let sites: Vec<crate::lambdalower::LoweredLambda> = entry
-            .sites
-            .iter()
-            .filter(|site| site.home == crate::lambdalower::LambdaHome::DisplayClass)
-            .cloned()
-            .collect();
-        emit_display_class(image, binder, tokens, &entry.enclosing, display, &sites)?;
+        let mut environments: Vec<&crate::lambdalower::DisplayClass> =
+            entry.structs.iter().chain(entry.display.iter()).collect();
+        environments.sort_by_key(|display| display.suffix);
+        let mut owed = Vec::new();
+        for display in environments {
+            if display.is_struct {
+                emit_display_struct(image, binder, tokens, &entry.enclosing, display)?;
+                continue;
+            }
+            let sites: Vec<crate::lambdalower::LoweredLambda> = entry
+                .sites
+                .iter()
+                .filter(|site| site.home == crate::lambdalower::LambdaHome::DisplayClass)
+                .cloned()
+                .collect();
+            owed.push((
+                display,
+                emit_display_class(image, binder, tokens, &entry.enclosing, display, &sites)?,
+            ));
+        }
+        for (display, bodies) in owed {
+            land_display_class_bodies(image, tokens, display, bodies)?;
+        }
     }
     for (enclosing, token, site) in core::mem::take(&mut tokens.pending_instance_bodies) {
         mint_references(&site.body, image, tokens);
+        let (params, passing) = closure_method_parameters(&site);
         emit_bound_body_into(
             token,
             image,
@@ -6042,11 +6365,11 @@ fn emit_closure_types(
             &enclosing,
             &site.method_name,
             &site.return_type,
-            &param_triples(&site.parameters),
-            &[],
+            &params,
+            &passing,
             &site.body,
-            false,
-            METHOD_PRIVATE | METHOD_HIDEBYSIG,
+            site.is_static(),
+            closure_method_flags(&site),
             None,
             None,
         )?;
@@ -6078,7 +6401,6 @@ fn emit_closure_types(
 /// Emits one `<>c__DisplayClass{N}_{S}`: the TypeDef, one public field per capture, a
 /// parameterless `.ctor`, and one instance method per body that landed on it.
 ///
-/// csc's shape, measured member for member:
 ///
 /// ```text
 ///     <>c__DisplayClass{N}_{S}   nested private, sealed, beforefieldinit, [CompilerGenerated]
@@ -6088,12 +6410,7 @@ fn emit_closure_types(
 ///     <M>b__{K}                  ASSEMBLY instance hidebysig, and NO attribute of its own
 /// ```
 ///
-/// **NOT `Serializable`, WHERE `<>c` IS.** `tdSerializable` (0x2000) is set on the closure type
-/// and not on a display class. The asymmetry is csc's.
 ///
-/// **NO `.cctor` AND NO CACHE.** The delegate closes over a particular instance, so a second
-/// evaluation has nothing to reuse; `ReferenceEquals` over two evaluations of one such lambda is
-/// `false` under csc, where the same test on a non-capturing one is `true`.
 fn emit_display_class(
     image: &mut ImageBuilder,
     binder: &mut Binder,
@@ -6101,7 +6418,7 @@ fn emit_display_class(
     enclosing: &TypeSymbol,
     display: &crate::lambdalower::DisplayClass,
     sites: &[crate::lambdalower::LoweredLambda],
-) -> Result<(), crate::EmitError> {
+) -> Result<Vec<(Token, crate::lambdalower::LoweredLambda)>, crate::EmitError> {
     let base = system_base(image, tokens, "Object");
     let name: String = match &display.symbol {
         TypeSymbol::Named(path) => path.last().map_or_else(String::new, |last| (**last).into()),
@@ -6113,21 +6430,7 @@ fn emit_display_class(
         image.add_nested_class(token, enclosing_token);
     }
     emit_compiler_generated_marker(image, tokens, token);
-    for (field, ty) in &display.fields {
-        mint_signature_type(binder, ty, &[], &[], image, tokens)?;
-        let signature = field_signature(&type_sig(tokens, ty)?);
-        let field_token = image.add_field(field, &signature, FIELD_PUBLIC);
-        tokens.insert_field(&display.symbol, field, field_token);
-    }
-    if display.hoists_this {
-        let signature = field_signature(&type_sig(tokens, enclosing)?);
-        let field_token = image.add_field(
-            crate::lambdalower::THIS_FIELD,
-            &signature,
-            FIELD_PUBLIC,
-        );
-        tokens.insert_field(&display.symbol, crate::lambdalower::THIS_FIELD, field_token);
-    }
+    emit_display_fields(image, binder, tokens, enclosing, display)?;
     let span = lamella_syntax::span::Span::empty_at(0);
     let ctor_prologue = ConstructorPrologue {
         ctor: object_base_ctor(image, tokens),
@@ -6158,41 +6461,118 @@ fn emit_display_class(
         None,
     )?;
     tokens.insert_method(&display.symbol, ".ctor", &[], ctor_token);
+    let scope = GenericScope {
+        method: &[],
+        declaring: &[],
+    };
+    let mut owed = Vec::with_capacity(sites.len());
     for site in sites {
+        mint_closure_signature_types(image, binder, tokens, site)?;
+        let signature = closure_method_signature(tokens, site, scope)?;
+        let token = image.add_method_deferred_body(
+            &site.method_name,
+            &signature,
+            METHOD_ASSEMBLY | METHOD_HIDEBYSIG,
+            IL_MANAGED,
+            &closure_parameter_rows(site),
+        );
+        tokens.insert_method(&display.symbol, &site.method_name, &site.signature_parameters(), token);
+        emit_local_function_parameter_metadata(image, binder, tokens, token, site);
+        owed.push((token, site.clone()));
+    }
+    Ok(owed)
+}
+
+/// Lands the bodies of a display class's methods, once every environment of their method exists
+/// -- a body may read a field of a struct numbered after the class.
+fn land_display_class_bodies(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    display: &crate::lambdalower::DisplayClass,
+    owed: Vec<(Token, crate::lambdalower::LoweredLambda)>,
+) -> Result<(), crate::EmitError> {
+    for (token, site) in owed {
         mint_references(&site.body, image, tokens);
-        let body_token = emit_bound_body(
+        let (params, passing) = closure_method_parameters(&site);
+        emit_bound_body_into(
+            token,
             image,
             tokens,
             &display.symbol,
-            &[],
-            &[],
             &site.method_name,
             &site.return_type,
-            &param_triples(&site.parameters),
-            &[],
+            &params,
+            &passing,
             &site.body,
-            false,
             false,
             METHOD_ASSEMBLY | METHOD_HIDEBYSIG,
             None,
             None,
         )?;
-        let parameter_types: Vec<TypeSymbol> =
-            site.parameters.iter().map(|(_, ty)| ty.clone()).collect();
-        tokens.insert_method(
-            &display.symbol,
-            &site.method_name,
-            &parameter_types,
-            body_token,
-        );
     }
     Ok(())
+}
+
+/// An environment's fields, FIRST AND CONTIGUOUS, in first-capture order with `<>4__this` among
+/// them where `this` was first read -- csc's order, measured on a class and a struct alike.
+fn emit_display_fields(
+    image: &mut ImageBuilder,
+    binder: &mut Binder,
+    tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
+    display: &crate::lambdalower::DisplayClass,
+) -> Result<(), crate::EmitError> {
+    for field in &display.fields {
+        let (name, ty) = match field {
+            crate::lambdalower::DisplayField::This => (crate::lambdalower::THIS_FIELD, enclosing),
+            crate::lambdalower::DisplayField::Named(name, ty) => (&**name, ty),
+        };
+        mint_signature_type(binder, ty, &[], &[], image, tokens)?;
+        let signature = field_signature(&type_sig(tokens, ty)?);
+        let field_token = image.add_field(name, &signature, FIELD_PUBLIC);
+        tokens.insert_field(&display.symbol, name, field_token);
+    }
+    Ok(())
+}
+
+/// Emits one display STRUCT, `<>c__DisplayClass{N}_{S}`: the environment of a scope whose
+/// variables only local functions capture, passed to each of them by reference.
+///
+///
+/// ```text
+///     <>c__DisplayClass{N}_{S}   nested private, sealed, beforefieldinit, extends ValueType,
+///                                [CompilerGenerated]
+///     {name} / <>4__this         PUBLIC instance, in first-capture order
+/// ```
+///
+/// **NO CONSTRUCTOR AT ALL** -- the holder is a zeroed local -- and no methods: the local
+/// functions live on the enclosing type and take the struct as `S&`.
+fn emit_display_struct(
+    image: &mut ImageBuilder,
+    binder: &mut Binder,
+    tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
+    display: &crate::lambdalower::DisplayClass,
+) -> Result<(), crate::EmitError> {
+    let base = system_base(image, tokens, "ValueType");
+    let name: String = match &display.symbol {
+        TypeSymbol::Named(path) => path.last().map_or_else(String::new, |last| (**last).into()),
+        _ => String::new(),
+    };
+    let token = image.add_type("", &name, base, 0x0000_0003 | TYPE_SEALED | TYPE_BEFORE_FIELD_INIT);
+    tokens.insert_type(&display.symbol, token);
+    tokens.insert_struct(&display.symbol);
+    tokens.record_struct_type(&display.symbol, token)?;
+    if let Some(enclosing_token) = tokens.type_token(enclosing) {
+        image.add_nested_class(token, enclosing_token);
+    }
+    emit_compiler_generated_marker(image, tokens, token);
+    emit_display_fields(image, binder, tokens, enclosing, display)
 }
 
 /// Emits one `<>c`: the TypeDef, the singleton and cache fields, `.cctor`, `.ctor`, and one
 /// instance method per lambda body.
 ///
-/// csc's shape, measured at `/optimize+` and reproduced flag for flag:
 ///
 /// ```text
 ///     <>c              nested private, sealed, serializable, beforefieldinit
@@ -6204,9 +6584,6 @@ fn emit_display_class(
 ///     <M>b__N_M        ASSEMBLY instance hidebysig       -- and NO [CompilerGenerated]
 /// ```
 ///
-/// The bodies are INSTANCE methods on the singleton rather than statics, which is csc's choice and
-/// not an arbitrary one: a delegate over a static method stores `null` as its target and takes the
-/// slower of the runtime's two invocation paths.
 fn emit_closure_type(
     image: &mut ImageBuilder,
     binder: &mut Binder,
@@ -6812,11 +7189,6 @@ fn event_has_backing_field(modifiers: &[Modifier], is_interface: bool) -> bool {
 /// The token a synthesized accessor must use to reach its own backing field, which is NOT always
 /// the `FieldDef` the pre-pass reserved.
 ///
-/// **INSIDE A GENERIC TYPE A `FieldDef` OPERAND IS UNVERIFIABLE IL.** `ldarg.0` in an instance
-/// method of `Bag<T>` has type `Bag<!0>`, and a `ldfld` naming the OPEN definition does not match
-/// it (II.9.7). The runtime runs it anyway -- which is what makes this worth stating: the program
-/// passes its behavioral test and `ilverify` refuses the assembly. So a generic type's own field is
-/// reached through a `MemberRef` parented on the `TypeSpec` for `Bag<!0>`, as csc emits it.
 ///
 /// Returns the plain `FieldDef` for a non-generic type, and `None` when the pre-pass reserved no
 /// field at all -- which is the caller's signal that this property is not an auto-property.
@@ -6945,10 +7317,6 @@ fn self_type_token(
 
 /// A bodyless accessor's flags: `property_accessor_flags`' answer plus `hidebysig`.
 ///
-/// **THE BIT ARRIVES FROM `slot_flags` FOR AN ABSTRACT ACCESSOR AND FROM NOWHERE FOR AN EXTERN
-/// ONE**, because an extern accessor takes no vtable slot. csc marks both -- an extern getter
-/// reads `0x0886` (public specialname hidebysig), measured -- so it is added here rather than at
-/// the four branches that would each have to remember.
 fn bodyless_flags(flags: u16) -> u16 {
     flags | METHOD_HIDEBYSIG
 }
@@ -7255,7 +7623,7 @@ fn emit_default_member_attribute(
     let mut blob = alloc::vec![0x01u8, 0x00];
     encode_ser_string(&name, &mut blob);
     blob.extend_from_slice(&0u16.to_le_bytes());
-    image.add_custom_attribute(type_token, constructor, &blob);
+    image.add_custom_attribute_at(type_token, constructor, &blob, PLACE_DEFAULT_MEMBER);
 }
 
 /// The message csc puts in a required-members constructor guard, byte for byte. Measured from a
@@ -7269,16 +7637,6 @@ const REQUIRED_MEMBERS_OBSOLETE_MESSAGE: &str =
 /// synthesizes these -- and returns its token. `None` when the type or constructor cannot be
 /// resolved, which is the same lenient posture [`emit_attributes`] takes.
 ///
-/// **OWED, AND LENIENCY IS THE WRONG POSTURE HERE, unlike for a user-written attribute.** A
-/// user-written attribute that does not resolve was already reported by the binder; these are
-/// synthesized, so nothing reports them. Against a reference set with no
-/// `RequiredMemberAttribute` this silently emits an assembly whose required members are NOT
-/// MARKED -- a consumer then reads them as ordinary and constructs the type with them unset,
-/// which is the exact failure the feature exists to prevent, arrived at silently. csc's answer is
-/// **CS0656 "missing compiler required member"**, and matching it belongs in the BINDER (which has
-/// a diagnostic sink; emission does not): when a type declares a required member, require the
-/// attribute to resolve. Not built here rather than built badly, and written down rather than
-/// left to be discovered.
 fn synthesized_attribute_ctor(
     image: &mut ImageBuilder,
     tokens: &mut Tokens,
@@ -7312,9 +7670,6 @@ fn synthesized_attribute_ctor(
 /// `[System.Runtime.CompilerServices.CompilerGenerated]` on a member the COMPILER wrote -- an
 /// auto-property's backing field and its two accessors.
 ///
-/// **IT IS NOT DECORATION: it is how a tool tells a synthesized member from a declared one.** A
-/// serializer that walks fields, a debugger deciding what to show, and a reflection-based mapper
-/// all key on it, and csc puts it on every one of the three.
 fn emit_compiler_generated_marker(image: &mut ImageBuilder, tokens: &mut Tokens, target: Token) {
     let Some(constructor) = synthesized_attribute_ctor(
         image,
@@ -7377,7 +7732,12 @@ fn emit_required_member_marker(image: &mut ImageBuilder, tokens: &mut Tokens, ta
     ) else {
         return;
     };
-    image.add_custom_attribute(target, constructor, &[0x01, 0x00, 0x00, 0x00]);
+    image.add_custom_attribute_at(
+        target,
+        constructor,
+        &[0x01, 0x00, 0x00, 0x00],
+        PLACE_REQUIRED_MEMBER,
+    );
 }
 
 /// The pair csc puts on every constructor of a type with required members that is not itself
@@ -7395,6 +7755,13 @@ fn emit_required_members_constructor_guard(
     tokens: &mut Tokens,
     constructor_token: Token,
 ) {
+    emit_obsolete_error(image, tokens, constructor_token, REQUIRED_MEMBERS_OBSOLETE_MESSAGE);
+    emit_compiler_feature_required(image, tokens, constructor_token, "RequiredMembers");
+}
+
+/// Attaches `[Obsolete(message, true)]` to `target` when a reference supplies `ObsoleteAttribute`:
+/// the down-level guard csc writes on a type or member an older compiler must not use.
+fn emit_obsolete_error(image: &mut ImageBuilder, tokens: &mut Tokens, target: Token, message: &str) {
     if let Some(obsolete) = synthesized_attribute_ctor(
         image,
         tokens,
@@ -7406,12 +7773,22 @@ fn emit_required_members_constructor_guard(
         ],
     ) {
         let mut blob = alloc::vec![0x01u8, 0x00];
-        encode_ser_string(REQUIRED_MEMBERS_OBSOLETE_MESSAGE, &mut blob);
+        encode_ser_string(message, &mut blob);
         blob.push(0x01);
         blob.extend_from_slice(&0u16.to_le_bytes());
-        image.add_custom_attribute(constructor_token, obsolete, &blob);
+        image.add_custom_attribute_at(target, obsolete, &blob, PLACE_OBSOLETE_GUARD);
     }
-    if let Some(feature) = synthesized_attribute_ctor(
+}
+
+/// Attaches `[CompilerFeatureRequired(feature)]` to `target` when a reference supplies the type: a
+/// compiler that knows `feature` uses `target`, one that does not refuses it.
+fn emit_compiler_feature_required(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    target: Token,
+    feature: &str,
+) {
+    if let Some(constructor) = synthesized_attribute_ctor(
         image,
         tokens,
         "System.Runtime.CompilerServices",
@@ -7419,9 +7796,9 @@ fn emit_required_members_constructor_guard(
         &[TypeSymbol::Special(SpecialType::String)],
     ) {
         let mut blob = alloc::vec![0x01u8, 0x00];
-        encode_ser_string("RequiredMembers", &mut blob);
+        encode_ser_string(feature, &mut blob);
         blob.extend_from_slice(&0u16.to_le_bytes());
-        image.add_custom_attribute(constructor_token, feature, &blob);
+        image.add_custom_attribute_at(target, constructor, &blob, PLACE_FEATURE_REQUIRED);
     }
 }
 
@@ -7432,10 +7809,17 @@ fn emit_required_members_constructor_guard(
 /// [`indexer_name`] matches: a program may write the attribute qualified or not, and C# lets the
 /// suffix be omitted (17.2).
 fn sets_required_members(attributes: &[AttributeSection]) -> bool {
+    declares_attribute(attributes, "SetsRequiredMembers")
+}
+
+/// Whether an attribute list carries the attribute `name` (written without its `Attribute` suffix),
+/// matched on the LAST name part, with and without the suffix: a program may write the attribute
+/// qualified or not, and C# lets the suffix be omitted (17.2).
+fn declares_attribute(attributes: &[AttributeSection], name: &str) -> bool {
     attributes.iter().any(|section| {
         section.attributes.iter().any(|attribute| {
             attribute.name.parts.last().is_some_and(|last| {
-                &**last == "SetsRequiredMembers" || &**last == "SetsRequiredMembersAttribute"
+                last.strip_suffix("Attribute").unwrap_or(last) == name
             })
         })
     })
@@ -7515,11 +7899,6 @@ fn slot_flags(modifiers: &[Modifier], visibility: u16) -> u16 {
 /// `get_Item` with its indices), which is what an interface member is matched on. `visibility`
 /// is the method's effective accessibility: an accessor with its own modifier has its own.
 ///
-/// **THE MODIFIERS ARE ASKED FIRST, AND THE ORDER IS THE RULE.** Implementing an interface adds
-/// nothing to a member that already has a slot, which is what csc emits: a `virtual` member stays
-/// overridable, an `override` reuses the inherited slot, a `sealed override` closes it and an
-/// `abstract` member stays bodyless. Asking the interface first gives an `override` a new slot of
-/// its own, so it overrides nothing and a call through the base class runs the base's member.
 ///
 /// **EVERY MEMBER KIND ASKS HERE: method, property and indexer accessor, and both event forms.**
 fn member_slot_flags(
@@ -7630,14 +8009,7 @@ fn const_field_row(
 /// A `Constant` row's (element type, little-endian blob) for `literal` held at type `ty`
 /// (II.22.9), or `None` when the type has no constant encoding.
 ///
-/// **SHARED BY `const` FIELDS AND OPTIONAL PARAMETERS, because II.22.9 is one table and they write
-/// the same row.** Three of its rules are ones a second copy would get wrong, and all three were
-/// measured against csc rather than read off the standard:
 ///
-/// * a NULL reference is `CLASS` (0x12) with four zero bytes -- and csc writes it for `= null`,
-///   for `default(string)`, for `int? x = null` AND for `default(S)` on a struct;
-/// * an ENUM constant takes its UNDERLYING integer's element type and width, not the enum's;
-/// * a `decimal` has no encoding here at all and travels in a `[DecimalConstant]` attribute.
 fn constant_row(
     model: &Model,
     field_ty: &TypeSymbol,
@@ -7814,6 +8186,9 @@ fn mint_references(stmt: &BoundStmt, image: &mut ImageBuilder, tokens: &mut Toke
                 mint_member_ref(&offset_to_string_data_reference(), image, tokens);
             }
             mint_array_members(&init.ty, image, tokens);
+            if matches!(&init.ty, TypeSymbol::Array { rank, .. } if *rank > 1) {
+                mint_member_ref(&array_length_reference(), image, tokens);
+            }
             mint_references(body, image, tokens);
         }
         BoundStmtKind::Labeled { body, .. } => mint_references(body, image, tokens),
@@ -7826,12 +8201,6 @@ fn mint_references(stmt: &BoundStmt, image: &mut ImageBuilder, tokens: &mut Toke
 /// the unique-ctor convention `emit_delegate_creation`, `emit_cached_delegate` and the
 /// source-delegate pre-pass all use (`native int` is not a [`TypeSymbol`], so it cannot be a key).
 ///
-/// **A CONSTRUCTED GENERIC DELEGATE IS PARENTED ON A `TypeSpec`, NOT A `TypeRef`**, and getting
-/// there through `split_type_name` was impossible rather than merely wrong: that function answers
-/// `None` for an `Instantiation`, so `Func<int,int> f = Twice;` minted NO constructor at all and
-/// the emitter refused it with `delegate constructor was not emitted` -- an UNCODED refusal, on a
-/// program csc compiles. The two shapes are alternatives and never a fall-through, exactly as
-/// `mint_member_ref` says of the member case it already distinguishes.
 ///
 /// The SIGNATURE does not change with the instantiation: a delegate's runtime constructor is
 /// `(object, native int)` in every delegate ever declared, and neither parameter can mention a
@@ -8355,6 +8724,21 @@ pub(crate) fn offset_to_string_data_reference() -> lamella_binder::MethodReferen
     }
 }
 
+/// `int System.Array::get_Length()` -- a rectangular array's element count, which `fixed (T* p =
+/// array)` (18.6) tests before it takes the first element's address.
+pub(crate) fn array_length_reference() -> lamella_binder::MethodReference {
+    lamella_binder::MethodReference {
+        declaring_type: named_symbol("System", "Array"),
+        name: "get_Length".into(),
+        parameters: alloc::vec![],
+        return_type: TypeSymbol::Special(SpecialType::Int32),
+        is_static: false,
+        is_vararg: false,
+        instantiation: None,
+        declaring_instantiation: None,
+    }
+}
+
 /// `bool System.String::op_Equality(string, string)` -- string value equality, the
 /// target of `string == string` (and, negated, `!=`).
 fn string_equality_reference() -> lamella_binder::MethodReference {
@@ -8717,13 +9101,6 @@ fn mint_generic_call_site(
 /// one of the method's own type parameters. Recorded under the definition's OPEN parameter key, so
 /// several sites over one method mint it once.
 ///
-/// **A METHOD DECLARED IN THIS MODULE IS REFUSED HERE, ON PURPOSE.** The token pre-pass writes
-/// every `MethodDef` with an ordinary DEFAULT signature and emits no `GenericParam` rows, because
-/// `Feature::Generics` refuses a generic DECLARATION and there has never been one to write. Taking
-/// that token would put a `MethodSpec` over a method whose own signature says it is not generic --
-/// metadata that contradicts itself, and `generic_method_signature`'s doc records what that
-/// produces (csc answers CS0308 at a call site that otherwise compiles). Refusing costs a refused
-/// call, which is what the declaration gate already answers with anyway.
 ///
 /// **Its precondition is that no `MethodDef` this module writes carries a GENERIC signature.** A
 /// build that writes them -- with their `GenericParam` rows -- makes this guard wrong, and removing
@@ -8803,15 +9180,6 @@ fn mint_generic_definition_ref(
 /// `Second<TM>` of a `Holder<int>` -- whose parent is the declaring instantiation's `TypeSpec` and
 /// whose signature is the DEFINITION's, open over BOTH numbering spaces at once.
 ///
-/// **THIS IS THE ONE SIGNATURE IN THE EMITTER WHERE `!n` AND `!!n` ARE BOTH LIVE**, and the two
-/// sibling paths each carry exactly one of them: [`mint_instantiated_member_ref`] writes `!n` with
-/// an empty method list, and the external arm of [`mint_generic_definition_ref`] writes `!!n`
-/// through [`method_scope`], whose declaring half is empty *because* it was written when the only
-/// generic call this stage emitted was on a non-generic type. Neither could name
-/// `Box<TOuter> M<TMethod>(Box<TMethod>)`, and the failure is silent in the direction that matters:
-/// a scope missing one list does not refuse, it numbers that space's names against the other list
-/// or falls through to a class lookup -- a signature that decodes cleanly and names a different
-/// type (`GenericScope`'s own doc gives csc's bytes for exactly this shape).
 ///
 /// **THE OPEN SIGNATURE COMES FROM THE DECLARING INSTANTIATION, NOT FROM THE METHOD ONE.**
 /// `MethodInstantiation::parameters` is open over the METHOD's parameters and already CLOSED over
@@ -9448,12 +9816,6 @@ fn mint_signature_type(
 /// even when a type appears only in a signature and not in any body (which `mint_references`
 /// would otherwise be the only thing to catch).
 ///
-/// **`declaring_parameters` ARE SKIPPED, AND THE COST OF NOT SKIPPING THEM IS NOT BLOAT.** A `T`
-/// is a POSITION, not a type: minting its token asks for a `TypeRef` to a type named `T` that no
-/// assembly declares, and a `class Box<T> { T item; T Get(); }` emitted one. It is unreferenced --
-/// every signature that mentions `T` encodes `!0` through the declaring scope, which matches by
-/// NAME before it would ever consult a token -- so the rows decoded correctly and the assembly
-/// merely carried a dangling reference csc never emits.
 ///
 /// **The hazard is that it makes a REFUSAL stop refusing.** `type_sig` has no case for a bare `T`
 /// and falls through to the named-type lookup, which is exactly the safety net a signature written
@@ -9575,7 +9937,9 @@ fn mint_value_type_token(ty: &TypeSymbol, image: &mut ImageBuilder, tokens: &mut
             let token = image.type_ref(namespace, name);
             tokens.insert_type(ty, token);
         }
+        return;
     }
+    mint_named_type_token(ty, image, tokens);
 }
 
 /// Mints System.Decimal's `(int lo, int mid, int hi, bool isNegative, byte scale)` constructor --
@@ -9636,9 +10000,6 @@ fn emit_decimal_constant_attribute(
 
 /// `[DecimalConstant]` on a `Param`, for an optional parameter whose default is a `decimal`.
 ///
-/// A decimal has no `Constant`-table encoding at all (II.22.9 has no element type for it), so csc
-/// writes `Optional` WITHOUT `HasDefault` and puts the value in this attribute -- the same trick a
-/// `const decimal` FIELD uses, and measured on both.
 fn emit_decimal_parameter_attribute(
     image: &mut ImageBuilder,
     tokens: &mut Tokens,
@@ -9748,14 +10109,7 @@ fn split_type_name(ty: &TypeSymbol) -> Option<(String, String)> {
 /// constructor invokes observes them already assigned. Static and const fields are excluded here
 /// (a const folds; static initializers run in the static constructor).
 ///
-/// **THE TWO KINDS INTERLEAVE AND THE ORDER IS THE SOURCE'S**, which is why one walk over the
-/// members produces both rather than one walk appending to another: `int A = 1; int P { get; } = 2;
-/// int B = 3;` stores A, P's backing field and B in that order, measured on csc's own `.ctor`.
 ///
-/// **AN AUTO-PROPERTY INITIALIZER TARGETS THE BACKING FIELD, NOT THE PROPERTY.** That is not an
-/// optimization: a getter-only auto-property has no setter to call, and going through a VIRTUAL
-/// setter would run a derived override before the derived constructor had. csc emits `stfld` here
-/// and so do we, which is the whole reason the binder models the field at all.
 fn field_initializer_statements(declaration: &TypeDecl) -> Vec<Stmt> {
     let mut statements = Vec::new();
     let mut push = |name: Box<str>, init: &Expr, span| {
@@ -9902,10 +10256,6 @@ struct StaticInitializer<'a> {
 /// Every other `const` is a compile-time literal inlined at use, and an instance initializer runs
 /// in the instance constructor -- neither belongs here.
 ///
-/// **ONE LIST FOR THE DECISION AND FOR THE BODY.** `needs_static_constructor` and
-/// `static_field_initializer_statements` must range over the same set: a `.cctor` the decision
-/// omits and the body would have filled loses its stores silently, and one the decision emits and
-/// the body leaves empty is a row csc does not write.
 fn static_initializers(declaration: &TypeDecl) -> Vec<StaticInitializer<'_>> {
     let mut found = Vec::new();
     for member in &declaration.members {
@@ -10071,10 +10421,6 @@ fn emits_static_constructor(declaration: &TypeDecl, parts: Option<&[PartialPart<
 /// Whether ANY part of the type declares an instance constructor, so the implicit parameterless
 /// one is not synthesized (17.10.4).
 ///
-/// **THE QUESTION IS ABOUT THE TYPE AND THE PARTS ARE NOT INDEPENDENT.** A `partial class` whose
-/// first part writes `W(int)` and whose second writes nothing has ONE constructor, not two, and
-/// asking each declaration on its own emitted a parameterless `.ctor` for every part that happened
-/// to declare none -- rows csc does not write, and the method tokens after them all shifted.
 fn any_part_declares_instance_constructor(
     declaration: &TypeDecl,
     later: &[PartialPart<'_>],
@@ -10172,7 +10518,7 @@ fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitErro
             return Ok(if *rank == 1 {
                 TypeSig::SzArray(element)
             } else {
-                TypeSig::Array { element, rank: *rank as u32 }
+                TypeSig::Array { element, rank: *rank }
             });
         }
         TypeSymbol::Pointer(element) => {
@@ -10236,10 +10582,6 @@ fn type_sig(tokens: &Tokens, ty: &TypeSymbol) -> Result<TypeSig, crate::EmitErro
 /// The type parameters in scope where a signature is written: the METHOD's own, and the DECLARING
 /// TYPE's. Both are live at once inside a generic method of a generic type.
 ///
-/// **THEY ARE SEPARATE NUMBERING SPACES AND `!0` IS NOT `!!0`.** `class Holder<TOuter>` with a
-/// `TOuter Echo<TMethod>(TMethod)` encodes as `!0 Echo<!!0>(!!0)` -- csc's own bytes for exactly
-/// that method are `30 01 01 13 00 1e 00`, a `VAR 0` return beside an `MVAR 0` parameter. Encoding
-/// one as the other yields a signature that decodes without error and names a different type.
 #[derive(Clone, Copy, Default)]
 struct GenericScope<'a> {
     /// The enclosing METHOD's own parameters -- `!!n` ([`TypeSig::MVar`]). Empty for an ordinary
@@ -10659,8 +11001,11 @@ fn collect_type_tokens(
     partials: &PartialIndex<'_>,
 ) {
     let declaring = declared_type_symbol(namespace, declaration);
-    let declaration_type_parameters = binder
-        .enter_type_parameters(&declaration.type_parameters, &declaration.constraints);
+    let declaration_type_parameters = binder.enter_declared_type_parameters(
+        &declaring,
+        &declaration.type_parameters,
+        &declaration.constraints,
+    );
     binder.enter_type(declaring.clone());
     if !continuation {
         *next_type += 1;
@@ -11248,9 +11593,6 @@ mod tests {
     /// csc's renders with csc's -- from the same one renderer, which is the only way the two
     /// cannot drift apart.
     ///
-    /// **THE PREFIX IS THE WHOLE POINT.** A caller that spells `CS` itself reports every
-    /// condition as one csc has a concept of, including the ones it does not, and a reader who
-    /// looks up that code in csc's documentation finds either nothing or the wrong entry.
     ///
     /// The location rides along in the same assertion rather than in a test of its own: these
     /// two are the pair that go missing together, because a caller that hard-codes the prefix is
@@ -11979,11 +12321,6 @@ mod tests {
     /// asserts the BLOB, because a `castclass` naming the DEFINITION accepts every instantiation --
     /// which decodes cleanly and answers wrongly.
     ///
-    /// **`ldtoken` IS THE FOURTH OPCODE AND IT IS NOT IN THIS TABLE**, because `typeof` lowers to
-    /// a call of `System.Type::GetTypeFromHandle` and this helper compiles against no references at
-    /// all. It is covered where a corlib exists: the generics-position probe compiles AND RUNS
-    /// `typeof(Box<T>).FullName` against csc, which is the row that reads the type ARGUMENT back
-    /// (`.Name` is `` Box`1 `` for every instantiation and cannot see it).
     #[test]
     fn every_instruction_naming_a_constructed_generic_gets_its_typespec() {
         let image = image_of_gated_source(
@@ -12062,13 +12399,6 @@ mod tests {
     /// anything else fails here rather than being emitted -- which is more than a clean bind proves,
     /// because a clean bind cannot happen at all yet.
     ///
-    /// It is also the only configuration in which the declaration stage can be observed, and it
-    /// disappears the day the gate lifts: this helper should then become an ordinary
-    /// `compile_source` call, and the test that still passes is the one that was measuring the
-    /// right thing.
-    /// The `Param` rows of the single method named `name`, as `(sequence, flags, constant)` --
-    /// the shape the optional-parameter parity harness compares against csc, asserted here so a
-    /// regression is caught by `cargo test` and not only by a tool that needs an SDK beside it.
     fn param_rows_of(image: &[u8], name: &str) -> Vec<(u32, u32, Option<(u8, Vec<u8>)>)> {
         let assembly = lamella_metadata::Assembly::read(image).expect("the image parses");
         let method = assembly
@@ -12399,9 +12729,6 @@ mod tests {
     /// is the right family and the wrong sentence; and because nothing then STOPPED the call, an
     /// `internal` constructor reached across an assembly boundary compiled clean.
     ///
-    /// **THIS REACHES REAL LIBRARIES, NOT ONLY CONTRIVED ONES.** A library in this tree compiles
-    /// against such a constructor and csc refuses the same source, so the two disagree on whether
-    /// the assembly builds at all -- which is what an A/B oracle against csc exists to catch.
     #[test]
     fn a_reference_s_internal_members_are_not_imported() {
         let library = named_image_of(
@@ -12518,9 +12845,6 @@ mod tests {
     /// beside it implements no interface member at all -- csc gives it no `virtual`, `newslot` or
     /// `final`, and this compiler gave it all three.
     ///
-    /// ONE predicate serves every member kind, so a defect in it reaches all of them at once:
-    /// a method, a property or indexer accessor, and both event accessors. Measured against csc
-    /// on this exact source.
     ///
     /// The two controls are most of the value. `Plain` implements the same interface IMPLICITLY and
     /// its members MUST keep the sealed-virtual slot; `Lonely` implements nothing and must have
@@ -12607,15 +12931,7 @@ mod tests {
     /// `internal` interface, delegate or enum as PUBLIC surface -- the declared boundary of the
     /// assembly, visible to every consumer, with nothing anywhere saying so.
     ///
-    /// **THE NESTING HALF IS WORSE THAN A WRONG BIT.** `emit_nested_types` hands the enclosing
-    /// type's full name where a namespace goes, so a path that does not translate it into real
-    /// nesting emits a nested interface or delegate as a TOP-LEVEL type whose metadata namespace is
-    /// the literal string `Lib.Outer`, with no `NestedClass` row at all.
-    /// **A consumer in another assembly then cannot name it at all**: `Outer.INested`, the spelling
-    /// the source declares, is CS0426 when csc reads the emitted assembly, because that type has no
-    /// such member. Not a shape difference -- an unreachable type.
     ///
-    /// Every expected value here was measured against csc on the same source.
     #[test]
     fn a_type_s_visibility_and_nesting_follow_its_declaration_at_every_type_kind() {
         let image = named_image_of(
@@ -12797,7 +13113,6 @@ mod tests {
     /// keeps its own accessibility: a `private set` beside an interface's get-only property is
     /// private.
     ///
-    /// Every expected value was measured against csc on the same declarations.
     #[test]
     fn an_implementing_member_takes_its_slot_from_its_own_modifiers_before_the_interface() {
         let image = named_image_of(
@@ -12945,10 +13260,7 @@ mod tests {
     /// refuses the type: `TypeLoadException: Method 'Get' in type 'C' ... does not have an
     /// implementation`. It is the shape of `Dictionary<TKey, TValue>.TryGetValue`.
     ///
-    /// The by-reference parameter must match BY REFERENCE: `F(int)` beside `F(ref int)` implements
-    /// nothing, and csc gives it no slot.
     ///
-    /// Every expected value was measured against csc on the same declarations.
     #[test]
     fn an_implementation_with_a_ref_or_out_parameter_takes_the_interface_slot() {
         let image = named_image_of(
@@ -13007,7 +13319,6 @@ mod tests {
     /// Every event form asks the same question and must get the same answer: a field-like event, one
     /// with its own accessors, a static one, an interface's, and an explicit implementation of one.
     ///
-    /// Every expected value was measured against csc on the same declarations.
     #[test]
     fn an_event_of_a_constructed_generic_delegate_is_typed_by_its_typespec() {
         let image = named_image_of(
@@ -13268,10 +13579,6 @@ mod tests {
     /// The constraint FLAG WORD (II.23.1.7), read back per parameter, with an UNCONSTRAINED
     /// parameter beside every constrained one.
     ///
-    /// **THE UNCONSTRAINED ROW IS THE INSTRUMENT.** A writer that set a fixed flag word on every
-    /// parameter satisfies every positive assertion here; only the `Plain<T>` row separates that
-    /// from a writer that reads what the source said. Every expected value was measured from csc on
-    /// the same source, not derived from the flag table.
     #[test]
     fn a_type_parameters_constraint_flags_are_emitted_and_match_csc() {
         let image = image_of_gated_source(
@@ -13371,12 +13678,6 @@ mod tests {
     /// The constraints survive a ROUND TRIP: emitted here, read back through the same reader
     /// `reference.rs` uses when it loads a referenced assembly.
     ///
-    /// **THIS IS A CLOSED LOOP AND SAYS SO.** Both halves are ours, so it proves the writer and the
-    /// reader AGREE -- not that either matches ECMA-335. The independent check is the csc
-    /// differential run by hand: for one source csc emitted the same nine flag words
-    /// byte for byte and the same six constraint rows, which is what established that `where T :
-    /// struct` carries a `System.ValueType` row as well as its flag. A row here that asserted
-    /// conformance rather than agreement would be the fixture-builds-its-own-input shape.
     #[test]
     fn emitted_constraints_read_back_through_the_reference_reader() {
         let image = image_of_gated_source(
@@ -13648,11 +13949,6 @@ mod tests {
     /// row does. That is why the defect ran silently, and why a signature-only assertion is not a
     /// substitute for this one.
     ///
-    /// **THERE ARE THREE PARENTS AND NOT TWO, AND THE THIRD IS THE ONE `Add`'S OWN BODY USES.**
-    /// `Total = Total + n` inside `Counter<T>` names the type over its OWN parameter,
-    /// `` Counter<!0> `` -- a definition reached in its own body is still an instantiation.
-    /// Measured against csc on this exact program: three `MemberRef`s named `Total`, parented by
-    /// `` Counter<!0> ``, `Counter<int>` and `Counter<string>`.
     ///
     /// **THE NON-GENERIC SIBLING IS STILL THE CONTROL, AND IT IS NOW ASSERTED BY NAME.** `Plain`
     /// is a this-module type whose static field the token pre-pass already registered, so it must
@@ -13714,15 +14010,7 @@ mod tests {
     /// that answered one row for both would make the probe's `open == closed` TRUE, which is the
     /// program's own refusal condition.
     ///
-    /// **MEASURED AGAINST csc with `System.Reflection.Metadata` over csc's own output**:
-    /// `typeof(List<>)` is `ldtoken` of the **TypeRef** `` List`1 ``, `typeof(Dictionary<,>)` of
-    /// `` Dictionary`2 ``, and `typeof(List<int>)` beside them of a `TypeSpec`. lcsc emits the same
-    /// three shapes. The unbound form names no `TypeSpec` at
-    /// all, which is the half a `TypeSpec`-vs-`TypeSpec` comparison could not have caught.
     ///
-    /// Declared in this module rather than imported, so the definition's row is a `TypeDef` and the
-    /// test needs no reference assembly; against a referenced `List<T>` the same path yields the
-    /// `TypeRef` csc emits, and `generics-parity`'s `typeof-open-generic-type` row is that case.
     ///
     /// The locals are `object` rather than `System.Type` for the helper's reason and not for
     /// style: this compiles against NO references, so naming `System.Type` in source is a CS0246
@@ -13790,14 +14078,7 @@ mod tests {
     /// first static field access. Omitting it for nothing says every type in the image needs a
     /// first-access check.
     ///
-    /// Measured on the class library: **100% of trigger sites need a runtime check when the flag
-    /// is omitted, against 4% under csc's on the same sources.** The flag is most of a lazy
-    /// initializer's cost, decided before the mechanism is written.
     ///
-    /// **THE RULE IS csc's, MEASURED ACROSS EVERY TYPE KIND RATHER THAN RECALLED -- AND TWO ROWS
-    /// ARE NOT WHAT "unless it declares a static constructor" PREDICTS.** An enum and a delegate
-    /// never carry it, which reasoning from the C# rule alone would have got wrong for two whole
-    /// type kinds.
     ///
     /// The `StaticFieldInit` row is the one that decides the implementation: it HAS a `.cctor`
     /// **`sealed` IS TWO FAULTS WITH ONE SYMPTOM, SO THE TEST IS A ROUND TRIP.** The emitter never
@@ -13861,10 +14142,6 @@ mod tests {
     /// `any_part_is_static` had ALREADY suppressed its constructor from any part -- so two halves
     /// of one type disagreed inside one image.
     ///
-    /// **THE FIRST-PART ROWS ARE THE CONTROL AND THEY WERE ALWAYS GREEN**, which is why nothing
-    /// caught this: the matrix's `partial-type` probe splits MEMBERS across parts and not
-    /// MODIFIERS, so every instrument in the tree wrote the modifier where the emitter looked.
-    /// Every row measured from csc on this same source.
     #[test]
     fn a_partial_types_flags_are_the_union_of_its_parts_modifiers() {
         let image = image_of_gated_source(
@@ -13978,8 +14255,6 @@ mod tests {
     /// `TypeRef` to an invented type called `T` (which nothing mints, precisely so this lookup
     /// cannot find one), or `!1` where `!0` was meant.
     ///
-    /// csc emits the identical token for the identical source -- `initobj` over `TypeSpec` row 1 --
-    /// measured against it rather than assumed.
     #[test]
     fn default_of_a_type_parameter_initobjs_over_a_var_type_spec() {
         let image = image_of_gated_source(
@@ -14843,13 +15118,6 @@ mod tests {
     /// `` Box`1.Cursor ``, accepted the assignment, and stored a `Cursor<int>` into a
     /// `Cursor<string>` slot.
     ///
-    /// The message is csc's, measured on this exact source at `/langversion:ISO-2`:
-    /// *Cannot implicitly convert type 'Box<int>.Cursor' to 'Box<string>.Cursor'*. The QUOTED
-    /// SPELLING is half the assertion: a symbol that spelled itself `` Box`1.Cursor<int> `` would
-    /// refuse correctly and then name a type that appears in no source, and CS0029 exists to be
-    /// read beside the program.
-    /// A NESTED GENERIC TYPE NAMED BARE takes its enclosing type's arguments too -- `Pair<string>`
-    /// written inside `Box<T>` is `Box<T>.Pair<string>`, arity 2, enclosing first (II.9.2).
     ///
     /// **ASSERTED THROUGH A REFUSAL, BECAUSE A CLEAN COMPILE CANNOT SEE THIS.** A resolution that
     /// dropped the enclosing argument still compiles -- it just names a different type, and every
@@ -14857,7 +15125,6 @@ mod tests {
     /// instantiation: if `Make()` returned anything but `Box<int>.Pair<string>`, the assignment
     /// below would either be accepted or refused with a different pair of names.
     ///
-    /// The message is csc's, measured on this source at `/langversion:ISO-2`.
     #[test]
     fn a_nested_generic_named_bare_takes_its_enclosing_type_s_arguments() {
         let options = LexOptions {
@@ -16661,11 +16928,6 @@ mod tests {
     /// A STRUCT HAS NO PREDEFINED `==`, AND SAYING IT DID WAS A WRONG ANSWER RATHER THAN A LOOSE
     /// ONE (14.9).
     ///
-    /// **THE REFUSAL IS THE FIX FOR A MISCOMPILE, WHICH IS WHY IT IS ASSERTED AS ONE.** Before it,
-    /// `a == b` on a struct declaring no `operator ==` compiled and compared THE FIRST FIELD: two
-    /// structs differing only in a later field answered EQUAL, and two `System.Nullable<int>`
-    /// holding 40 and 2 answered EQUAL because what was compared was `HasValue`. csc refuses every
-    /// one of these programs, so there was no oracle to notice until one was RUN.
     ///
     /// The accepting rows are the half that decides: an enum, a string, a class and a struct that
     /// DOES declare the operator all keep their comparison, and each is a rule this could take away
@@ -17708,7 +17970,6 @@ mod tests {
     /// `emit_declared_parameter_metadata` records for the default-value case, which is why the
     /// bits are applied there rather than in either builder.
     ///
-    /// Every row measured against csc, one compilation per row.
     #[test]
     fn in_and_out_attributes_reach_the_param_flags() {
         const PARAM_IN: u32 = 0x0001;
@@ -17768,9 +18029,6 @@ mod tests {
     /// failure this whole path exists to avoid -- `ParameterInfo.GetCustomAttributes` reads the
     /// `Param` token and nothing else.
     ///
-    /// The `[In]` row is the discriminator: `InAttribute` resolves perfectly well, so a version
-    /// that emitted every parameter attribute would produce a row for it and still pass any
-    /// assertion about the user one. csc writes no row for `[In]`, measured.
     #[test]
     fn a_user_attribute_on_a_parameter_becomes_a_row_on_that_param() {
         let image = image_of_gated_source(
@@ -18055,14 +18313,6 @@ mod tests {
     /// DIFFERENT door, which is why the corlib ratchet counted three rows after the struct-`.ctor`
     /// fix closed the first two.
     ///
-    /// **An operator lowering names its BCL member outright, so it must not mint unconditionally.**
-    /// `a + b` is `String.Concat`, `typeof(T)` is `Type.GetTypeFromHandle`; in a module that
-    /// DEFINES `System.String` and `System.Type` those are this module's own `MethodDef`s, and the
-    /// reference gave each type a second identity scoped to an `mscorlib` `AssemblyRef` the image
-    /// is not. Measured on the corlib: 108 `Concat` rows and 2 `GetTypeFromHandle` rows, every one
-    /// of them resolving correctly here (every resolver in this compiler keys on (namespace,
-    /// name)) and none of them
-    /// resolving for csc, which refused the artifact as a core library with CS0518.
     ///
     /// **A renamed indexer arrives through a NAME, not through a missing guard.** `s[i]` lowers to
     /// a hard-named `get_Chars`, while the token pre-pass reserves an indexer's accessor under the
@@ -18169,9 +18419,6 @@ mod tests {
     /// against a compiler emitting the wrong code.
     ///
     ///
-    /// These tests take no reference, so the source declares the `System.Attribute` its attribute
-    /// classes derive from. Each must derive from it: an attribute class that does not is CS0616
-    /// wherever it is applied (21.3), under csc and here.
     const INTEROP_DECLARATIONS: &str = "
         using System.Runtime.InteropServices;
         namespace System { public class Attribute { } }
@@ -18562,7 +18809,7 @@ static class Program { static int Main() { return Helper(); } static int Helper(
             .expect("the bind is taken as clean");
         let partials = index_partial_types(&units, &[]);
         let emit = |measured| {
-            emit_source_types(&program, "App", "App", None, false, &[], &partials, measured)
+            emit_source_types(&program, "App", "App", None, false, &[], &partials, measured, BTreeMap::new())
                 .unwrap_or_else(|error| panic!("the source types emit: {error}"))
         };
         let mut first = emit(crate::tokens::InstanceRows::new());

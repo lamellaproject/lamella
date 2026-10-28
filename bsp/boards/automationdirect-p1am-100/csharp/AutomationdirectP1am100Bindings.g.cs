@@ -6,7 +6,7 @@
 // lines, and the carrier identity. The board's facts are stated in board.toml.
 namespace Lamella.Generated
 {
-    public sealed class AutomationdirectP1am100Bindings
+    internal sealed class AutomationdirectP1am100Bindings
     {
         private AutomationdirectP1am100Bindings() { }
 

@@ -1,13 +1,13 @@
 # BLOCK layout: the SAM D5x/E5x PORT, the I/O pin controller. Offsets are GROUP-relative; the four
 # group bases (porta, portb, portc, portd) live in ../instances.toml, 0x80 apart.
 #
-# PMUX AND PINCFG ARE PER-PIN ARRAYS and the offsets below are the n = 0 element:
+# PMUX and PINCFG are per-pin arrays and the offsets below are the n = 0 element:
 #   PMUX[n]   = group_base + 0x30 + n        (n = pin / 2; even pin = PMUXE nibble, odd = PMUXO)
 #   PINCFG[p] = group_base + 0x40 + p        (p = the pin index within the group, 0..31)
 # The manual states both bounds -- up to 16 PMUX registers per group, one per pair, and up to 32
 # PINCFG registers, one per line.
 #
-# THE PIN CONFIGURATION SUMMARY IS THE WHOLE DRIVER CONTRACT AND IT IS ONE TABLE. Four bits across
+# The pin configuration summary is the whole driver contract and it is one table. Four bits across
 # three registers decide what a pin is, and the manual gives every combination:
 #
 #   DIR  INEN  PULLEN  OUT   configuration
@@ -20,19 +20,19 @@
 #    1    0     X      X     output, input disabled
 #    1    1     X      X     output, input enabled
 #
-# TWO THINGS IN THAT TABLE SURPRISE EVERY FIRST DRIVER WRITTEN AGAINST THIS BLOCK:
+# Two things in that table surprise every first driver written against this block:
 #
-# CLEARING DIR DOES NOT MAKE AN INPUT. The reset row is DIR = 0 with INEN = 0, and the manual calls
+# Clearing DIR does not make an input. The reset row is DIR = 0 with INEN = 0, and the manual calls
 # it "all digital disabled" -- the input buffer is off, so IN never samples the pin and reads back
 # zero forever with nothing reporting why. An input needs INEN SET as well as DIR cleared, and that
 # bit is in a different register from the direction.
 #
-# AND THE PULL DIRECTION LIVES IN OUT, THE OUTPUT-VALUE REGISTER. PULLEN turns a pull on; which way
+# And the pull direction lives in out, the output-value register. PULLEN turns a pull on; which way
 # it pulls is the OUT bit for that pin -- 1 is up, 0 is down. So configuring an input pull-up writes
 # the same bit a driver otherwise uses to drive a pin high, for an entirely different reason, and a
 # driver that reads OUT to report "what am I driving" is reading a pull selection on any input pin.
 #
-# THE RESET STATE IS THEREFORE NOT "INPUT". It is the all-digital-disabled row, which is the same
+# The reset state is therefore not "INPUT". It is the all-digital-disabled row, which is the same
 # shape the STM32H7's analog reset has and the opposite of the STM32F42x's. Returning a pin to reset
 # means clearing DIR, INEN and PULLEN, not just clearing DIR.
 
@@ -140,7 +140,7 @@ width = 8
 fields = { PMUXEN = [0, 1], INEN = [1, 1], PULLEN = [2, 1], DRVSTR = [6, 1] }
 notes = "Element 0 of the per-pin config array; see the block header for the element derivation. DRVSTR at bit 6 is stated even though no driver here writes it, because the gap between bit 2 and bit 6 is where a reader assumes a field that is not there."
 
-# Function-letter values for the PMUX nibbles. THIS FAMILY DEFINES FOURTEEN, A THROUGH N -- the
+# Function-letter values for the PMUX nibbles. This family defines fourteen, A through N -- the
 # manual's own value table, 0x0 to 0xD, with 0xE and 0xF reserved and deliberately unnamed here.
 [constants]
 FUNC_A = 0

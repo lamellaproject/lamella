@@ -3,12 +3,8 @@
 # the crystal the plan names and tells the part which crystal it has.
 #
 # Transcribed from the nRF51 Series Reference Manual v3.0 (Nordic Semiconductor, 2014-10-20),
-# chapter 13, Tables 62-73, with the document open, and chapter 7's UICR Table 34 for XTALFREQ's
-# reset.
+# chapter 13, Tables 62-73, and chapter 7's UICR Table 34 for XTALFREQ's reset.
 #
-# Every bit position below was placed from the printed table's column coordinates: each field
-# letter was assigned to the bit column it is printed over, and INTENSET and INTENCLR were required
-# to agree.
 
 [table]
 kind = "block"

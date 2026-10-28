@@ -2,7 +2,7 @@
 # SERCOM-instance-relative; nothing in this file names an instance, a pin, a board, or a clock plan.
 # Instance bases/ids live in ../instances.toml; board wiring lives in bsp/boards/<board>/board.toml.
 #
-# ONE SERCOM, THREE REGISTER MAPS. This mode shares its offsets with the USART and I2C maps at the
+# One SERCOM, three register maps. This mode shares its offsets with the USART and I2C maps at the
 # same base -- CTRLA 0x00, CTRLB 0x04, INTFLAG 0x18, DATA 0x28 in all three -- and the FIELDS
 # inside them differ. CTRLA.MODE is what decides which map a given instance is answering to, so a
 # driver that writes an SPI field into a SERCOM still in USART mode gets no error, only a device

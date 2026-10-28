@@ -12,7 +12,7 @@ pub const FAMILY: &str = "hs3xxx";
 pub const SOURCING_FACTS: &str = "primary";
 pub const SOURCING_VALIDATION: &str = "none";
 
-/// identity: THIS PART HAS NONE, and that is a fact about the part rather than a gap in this table. There is no register to read, so nothing can confirm which part answered an address -- the `identified` validation rung is unreachable for it by construction, and confidence has to be earned by exercising it instead.
+/// identity: this part has none, and that is a fact about the part rather than a gap in this table. There is no register to read, so nothing can confirm which part answered an address -- the `identified` validation rung is unreachable for it by construction, and confidence has to be earned by exercising it instead.
 pub const IDENTITY_ABSENT: &str = "R36DS0045EU0101 Rev.1.01 describes no identity register: the part has no WHO_AM_I, device id or part id, and its interface is a measurement request followed by a data fetch rather than an addressable register map. Nothing on the bus can confirm WHICH part answered this address, so two parts of different types sharing 0x44 are indistinguishable to any reader.";
 
 /// address: a base plus which pin contributes which bit. The part states the range; a carrier fixes the straps, so no strap is defaulted here.

@@ -6,9 +6,9 @@
 # MEMS gyroscope on its own SPI, USB OTG -- and none of it is here, because a board file states what
 # a binding resolves rather than what the hardware has.
 #
-# BOTH VCP PINS ARE ON ONE PORT, so this binding resolves from port A alone.
+# Both VCP pins are on one port, so this binding resolves from port A alone.
 #
-# AND THIS BOARD'S VCP IS GATED BY TWO SOLDER BRIDGES WHOSE DEFAULT DEPENDS ON THE REVISION. SB11
+# And this board's VCP is gated by two solder bridges whose default depends on the revision. SB11
 # (PA9) and SB15 (PA10) connect USART1 to the on-board debugger. Their default is ON for the
 # STM32F429I-DISC1 and OFF for the earlier 32F429IDISCOVERY, so the same binding is live on one
 # revision and dead on the other with nothing in the silicon to say which. A host seeing the
@@ -45,7 +45,7 @@ function = "AF7"
 tx = { pin = "PA9" }
 rx = { pin = "PA10" }
 
-# THE OPERATING POINT IS THE PART'S OWN RESET STATE, DELIBERATELY, because this board's external
+# The operating point is the part's own reset state, deliberately, because this board's external
 # oscillator arrangement is selected by solder bridges: the manual gives four configurations -- the
 # debugger's 8 MHz clock output, an on-board crystal, an external clock through a connector pin, or
 # no external oscillator at all -- and which one a given unit is built for is not readable from
@@ -55,7 +55,7 @@ rx = { pin = "PA10" }
 
 # --- external memory -----------------------------------------------------------------------
 #
-# ONE REGION, AND IT IS ON THE CONTROLLER'S SECOND BANK. The board wires SDCKE1 and SDNE1, so the
+# One region, and it is on the controller's second bank. The board wires SDCKE1 and SDNE1, so the
 # memory appears at 0xD0000000 rather than 0xC0000000 -- and that is more than an address. Several
 # fields of the controller's first bank describe the CONTROLLER rather than that bank, and their
 # copies in the second bank's registers are read-only or ignored, so a board here programs its
@@ -80,12 +80,12 @@ source = "UM1670 Rev 6 section 7.10 (64-Mbit SDRAM, 1Mbit x 16-bit x 4-bank): th
 
 # --- the fitted device -------------------------------------------------------------------------
 #
-# THE DEVICE IS THE SAME SHAPE AS ITS CONTROLLER NEEDS TO BE TOLD, and the two sizes above are this
+# The device is the same shape as its controller needs to be told, and the two sizes above are this
 # record's arithmetic: rows x columns x banks x width IS the size, checked rather than trusted. A
 # column count off by one halves the memory, aliases every address above the first row, and passes a
 # write-then-read.
 #
-# `size` AND `device_size` ARE EQUAL HERE, which is worth stating because the schema exists to let
+# `size` and `device_size` are equal here, which is worth stating because the schema exists to let
 # them differ: this device is 16 bits wide and all sixteen are wired, so what a program may reach and
 # what the part holds are the same number. A board that wires only some of a wider device's lines
 # reaches less than it fitted, and either number alone would be wrong for somebody.
@@ -107,7 +107,7 @@ read_burst = 1
 # The seven timings, in NANOSECONDS, converted at this plan's memory clock and rounded UP. Bounds
 # rather than this device's datasheet figures: at 8 MHz a cycle is 125 ns, an order of magnitude
 # longer than any device of this class requires, so these put timing off the list of explanations for
-# a failed bring-up at the cost of throughput nobody is measuring.
+# a failed bring-up at the cost of throughput.
 tmrd_ns = 250               # load mode register to active
 txsr_ns = 875               # exit self-refresh to active
 tras_ns = 500               # row active time
@@ -123,7 +123,7 @@ mode_register = 0x220       # the word loaded into the DEVICE's own mode registe
                             # sequential, CAS 2, single-location writes. The one value here that the
                             # chip's manual cannot tell you, because it is not the chip's.
 refresh_period_ns = 64000000 # the device holds a row for 64 ms...
-refresh_rows = 4096          # ...across 4096 of them. THE COUNT IS NOT HERE: it follows from these
+refresh_rows = 4096          # ...across 4096 of them. The count is not here: it follows from these
                              # two and the plan's memory clock, and stating it would fix this board at
                              # one operating point.
 refresh_burst = 8
@@ -132,15 +132,15 @@ source = "UM1670 Rev 6 section 7.10 gives the organization (4,096 rows by 256 co
 
 # --- the board's own controls -------------------------------------------------------------------
 #
-# TWO LEDs AND ONE BUTTON, AND ALL THREE ARE PLAIN GPIO. No alternate function is involved, so these
+# Two LEDs and one button, and all three are plain GPIO. No alternate function is involved, so these
 # rows state a pin and a level and nothing else -- which is why they need no pin-map row, while every
 # signal of the memory bus above needed one.
 #
-# EACH LED'S CATHODE IS AT GROUND through its own series resistor, so the pin drives it directly and
+# Each LED's cathode is at ground through its own series resistor, so the pin drives it directly and
 # a HIGH level lights it. The button is the mirror of the arrangement a reader might assume: it is
 # pulled DOWN by a 220 kOhm resistor and the switch ties it UP to VDD, so a press reads HIGH, not low.
 #
-# TWO MORE LEDs EXIST AND ARE DELIBERATELY ABSENT. LD5 on PB13 and LD6 on PC5 indicate that VBUS is
+# Two more LEDs exist and are deliberately absent. LD5 on PB13 and LD6 on PC5 indicate that VBUS is
 # present and that VBUS is drawing too much current; both pins carry a USB function as well, so
 # neither is a level a program chooses. A row here would offer a developer a light it does not own.
 
@@ -158,7 +158,7 @@ pin = "PG14"
 active = "high"
 source = "UM1670 Rev 6 section 7.5: user LD4 is a red LED connected to the I/O PG14. MB1075 schematic revision D-02 sheet 6 wires PG14 through R27 (680 ohm) to LD4's anode with its cathode at ground. UM1670 Rev 6 Table 7 gives PG14 as LQFP144 pin 129 and its LED column entry as the only board function on that pin."
 
-# AND THE BUTTON REACHES ITS PIN THROUGH A SOLDER BRIDGE WHOSE DEFAULT THE MANUAL DOES NOT GIVE.
+# And the button reaches its pin through a solder bridge whose default the manual does not give.
 # SB2 stands between the switch and PA0, and UM1670 Rev 6 states what its two positions mean without
 # saying which one a board leaves the factory with -- unlike the VCP's bridges, whose default it
 # gives per revision. So a program that reads this pin and never sees it change has two explanations,
@@ -187,12 +187,12 @@ pclk_hz = 16000000          # the APB clock feeding this board's bound USART. US
 # The board's motion sensor sits on its own SPI, and it is the one binding here that a HEADER does
 # not reach: the three data lines go nowhere else on the board, so this is the whole of that bus.
 #
-# THE CHIP SELECT IS A PLAIN GPIO AND THAT IS THE BOARD'S CHOICE, NOT A DRIVER'S. This controller
+# The chip select is a plain GPIO and that is the board's choice, not a driver's. This controller
 # has an NSS of its own on PF6, and the board did not use it -- the select is wired to PC1 instead,
 # on a different port from all three data lines. So the pin is board truth, the driver owns the
 # level, and a binding that claimed the hardware select would describe a wiring that is not there.
 #
-# NO RATE IS STATED, DELIBERATELY. An SPI master's clock is bounded by what is on the other end,
+# No rate is stated, deliberately. An SPI master's clock is bounded by what is on the other end,
 # and this binding names a bus rather than a part. The APB rate emits and the family's spi block
 # states the eight prescaler codes; a driver that knows which sensor answered picks one.
 

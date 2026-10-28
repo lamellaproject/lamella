@@ -3,16 +3,16 @@
 # Function ids are the ST alternate-function numbers (AF0..AF15) that the
 # AFRL/AFRH nibbles select.
 #
-# THE ALTERNATE-FUNCTION TABLE IS SIXTEEN FUNCTION COLUMNS WIDE, and a cell means nothing without
+# The alternate-function table is sixteen function columns wide, and a cell means nothing without
 # its column header: the header is the only thing that says which AF NUMBER the signal belongs to.
 #
-# ON THIS PART THE AF7 COLUMN HEADER IS NOT THE SIBLING FAMILY'S. Here it reads
+# On this part the AF7 column header is not the sibling family's. Here it reads
 # SPI2/I2S2/SPI3/I2S3/USART1/2/3/UART5/DFSDM1/SPDIF, where the STM32F7's reads
 # SPI2/3/USART1/2/3/UART5/SPDIFRX -- the same number carrying a different set. The two agree about
 # USART1, which is the only AF7 cell this map claims, and they were read separately rather than
 # one being taken as evidence for the other.
 #
-# SO DO AF9 AND AF10, AND THE QUAD-SPI INTERFACE SITS IN BOTH. Here AF9 reads
+# So do AF9 and AF10, and the quad-SPI interface sits in both. Here AF9 reads
 # CAN1/2/TIM12/13/14/QUADSPI/FMC/LCD and AF10 reads SAI2/QUADSPI/SDMMC2/DFSDM1/OTG2_HS/OTG1_FS/LCD,
 # where the STM32F7's read CAN1/2/TIM12/13/14/QUADSPI/LCD and SAI2/QUADSPI/OTG2_HS/OTG1_FS. On
 # both parts the quad-SPI clock and data cells this map claims are AF9 and its chip select is
@@ -51,14 +51,14 @@ source = "DS11532 Rev 9 Table 13: PA10's AF7 cell is USART1_RX. UM2033 Rev 5 giv
 
 # --- SDMMC2 ----------------------------------------------------------------------------------
 #
-# THE SIX LINES DO NOT SHARE ONE ALTERNATE FUNCTION. D2 and D3 are AF10; CK, CMD, D0 and D1 are
+# The six lines do not share one alternate function. D2 and D3 are AF10; CK, CMD, D0 and D1 are
 # AF11. SDMMC2 appears in TWO function columns of the mapping table -- AF10 headed
 # SAI2/QUADSPI/SDMMC2/DFSDM1/OTG2_HS/OTG1_FS/LCD, and AF11 headed I2C4/CAN3/SDMMC2/ETH -- and the
 # split is by SIGNAL rather than by port. A driver that selected one function for all six would
 # mux four lines and leave two unconnected, which is a fault that hides: transfers on a single
 # data line keep working and four-line transfers return corrupt blocks.
 #
-# PB3 AND PB4 CARRY JTDO/TRACESWO AND NJTRST AT AF0. Both are free whenever the debug port is in
+# PB3 and PB4 carry JTDO/TRACESWO and NJTRST at AF0. Both are free whenever the debug port is in
 # its two-wire mode, so a design can have either those two data lines or instruction trace, and
 # not both.
 
@@ -106,12 +106,12 @@ source = "DS11532 Rev 9 Table 13: PG10's AF11 cell is SDMMC2_D1. This row rests 
 
 # --- QUADSPI: five signals at AF9 and ONE AT AF10 ---------------------------------------------
 #
-# THE SIX LINES DO NOT SHARE ONE ALTERNATE FUNCTION, the same trap as the SD/MMC lines above in a
+# The six lines do not share one alternate function, the same trap as the SD/MMC lines above in a
 # different place. The clock and the four data lines are AF9; chip select alone is AF10. Muxing
 # all six at AF9 puts PB6 on its AF9 function, CAN2_TX, instead of chip select, and the flash is
 # never selected.
 #
-# THE SIX SPAN FOUR PORTS, and the data lines are not even in port order: the clock and chip
+# The six span four ports, and the data lines are not even in port order: the clock and chip
 # select are on port B, IO0 and IO1 on port C, IO2 on port E and IO3 on port D -- so muxing them
 # takes four port clocks, not one.
 

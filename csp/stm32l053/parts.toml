@@ -1,11 +1,11 @@
 # PARTS table for the STM32L0x3 family, category 3 (STM32L053x). Every row is an ORDERABLE variant.
 #
-# THIS IS A DIFFERENT FAMILY FROM csp/stm32l0, AND THE MANUAL IS THE REASON. csp/stm32l0 is the
+# This is a different family from csp/stm32l0, and the manual is the reason. csp/stm32l0 is the
 # L0x1 line, read from RM0377 and scoped to category 1. This is the L0x3 line, read from RM0367,
 # and it is category 3. Two reference manuals and two datasheets, which is the split
 # csp/stm32u585's header states as the rule: a family owns one of each.
 #
-# AND THE DIFFERENCE IS NOT COSMETIC. RM0367 table 2 gives category 3 GPIOA, GPIOB and GPIOC FULL,
+# And the difference is not cosmetic. RM0367 table 2 gives category 3 GPIOA, GPIOB and GPIOC FULL,
 # plus GPIOD[2] and GPIOH[0:1], where RM0377 gives category 1 GPIOB as [0:9] and GPIOC as [14:15]
 # only. Category 3 also carries USART1, which category 1 does not have at all. An instance map
 # copied between them would be wrong in both directions.

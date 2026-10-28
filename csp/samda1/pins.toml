@@ -15,8 +15,8 @@ notes = [
 
 # ---- the SAM DA1 Xplained Pro's EDBG virtual COM port -------------------------------------------
 #
-# THE KIT GUIDE AND THE PART DATASHEET AGREE HERE, AND THE AGREEMENT WAS CHECKED RATHER THAN
-# ASSUMED. Atmel-9400B Table 4-9 gives SERCOM3 PAD[0] on PA22 and SERCOM3 PAD[1] on PA23; Table
+# The kit guide and the part datasheet agree here, and the agreement was checked rather than
+# assumed. Atmel-9400B Table 4-9 gives SERCOM3 PAD[0] on PA22 and SERCOM3 PAD[1] on PA23; Table
 # 7-1 gives both pads in column C against SERCOM3. One instance owns both pads and the two
 # documents name the same one.
 #

@@ -1,6 +1,6 @@
 //! Writing bytes to a chip: the `flash` verb, and the mechanism `deploy --board` writes through.
 
-use crate::args::{self, Spec};
+use crate::args::{self, Positional, Spec};
 pub use lamella_flash_routes::{can_flash, uf2_family_for_board};
 use lamella_flash_routes::placement::{BootloaderChoice, Placement, placement_for};
 use lamella_flash_routes::{
@@ -117,11 +117,13 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             "--via",
             crate::bootprot::RESTORE_USER_ROW,
         ],
+        repeats: &[],
         flags: &[
             crate::bootprot::CLEAR_BOOTPROT,
             crate::bootprot::DRY_RUN,
             REPLACE_BOOTLOADER,
         ],
+        positional: Positional::One(POSITIONAL),
     };
     let parsed = match args::parse_or_halt(args, &spec) {
         Ok(parsed) => parsed,
@@ -133,8 +135,14 @@ pub fn flash_command(args: &[String]) -> ExitCode {
         parsed.value(crate::bootprot::RESTORE_USER_ROW).is_some(),
     ) {
         eprintln!(
-            "lamella flash: {REPLACE_BOOTLOADER} says where an image is written, and {step} \
-             writes no image.\nRun them as two commands.\n\n{USAGE}"
+            "{}",
+            args::refusal(
+                "flash",
+                &format!(
+                    "{REPLACE_BOOTLOADER} says where an image is written, and {step} writes no image; \
+                     run them as two commands"
+                )
+            )
         );
         return ExitCode::FAILURE;
     }
@@ -146,17 +154,23 @@ pub fn flash_command(args: &[String]) -> ExitCode {
     }
     if parsed.flag(crate::bootprot::DRY_RUN) {
         eprintln!(
-            "lamella flash: {} plans {} or {}, and an image write has no dry run.\n\n{USAGE}",
-            crate::bootprot::DRY_RUN,
-            crate::bootprot::CLEAR_BOOTPROT,
-            crate::bootprot::RESTORE_USER_ROW
+            "{}",
+            args::refusal(
+                "flash",
+                &format!(
+                    "{} plans {} or {}, and an image write has no dry run",
+                    crate::bootprot::DRY_RUN,
+                    crate::bootprot::CLEAR_BOOTPROT,
+                    crate::bootprot::RESTORE_USER_ROW
+                )
+            )
         );
         return ExitCode::FAILURE;
     }
     let path = match parsed.only_positional("flash", POSITIONAL) {
         Ok(path) => Path::new(path).to_path_buf(),
-        Err(error) => {
-            eprintln!("{error}\n\n{USAGE}");
+        Err(refusal) => {
+            eprintln!("{refusal}");
             return ExitCode::FAILURE;
         }
     };
@@ -183,9 +197,7 @@ pub fn flash_command(args: &[String]) -> ExitCode {
         (Some(named), None) => named,
         (None, Some(manifest)) => manifest.board.as_str(),
         (None, None) => {
-            eprintln!(
-                "lamella flash: --board is required -- it says which chip is written.\n\n{USAGE}"
-            );
+            eprintln!("{}", args::refusal("flash", "--board is required: it says which chip is written"));
             return ExitCode::FAILURE;
         }
     };
@@ -240,7 +252,7 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             eprintln!(
                 "lamella flash: {} is loaded BY firmware rather than written to a chip -- it needs \
                  a board that\nis already running Lamella, not a probe.\n\n\
-                 \x20   lamella deploy {} --device <d>\n\n\
+                 \x20   lamella deploy {} --device <device>\n\n\
                  `lamella devices` prints the target for each attached board.",
                 path.display(),
                 path.display()
@@ -284,7 +296,7 @@ pub fn flash_command(args: &[String]) -> ExitCode {
         }
     };
     let window = prepared.window.as_ref().map(|half| (row.board, half));
-    write_image_here(chosen, &placement, &prepared.bytes, window, selector.as_deref())
+    write_image_here("flash", chosen, row.board, &placement, &prepared.bytes, window, selector.as_deref())
 }
 
 /// The user-row step asked for alongside `--replace-bootloader`, which the command refuses: the
@@ -344,41 +356,63 @@ fn placement_line(placement: &Placement) -> Option<String> {
 ///
 /// A pure function so the wording is testable without a board.
 fn completion_line(programmer: Programmer, report: &lamella_flash_backend::Report) -> String {
-    let units = programmer.units(report.bytes);
+    let bytes = report.bytes;
     match report.verification {
         lamella_flash_backend::Verification::ReadBack => match programmer {
             Programmer::StDfu { .. } => format!(
-                "wrote and verified {} B ({units}); the bootloader was told to start it and does not \
-                 report whether it did -- reset the board if it does not run it.",
-                report.bytes
+                "Wrote and verified {bytes} B. Start was requested, but the bootloader does not report whether \
+                 the program started. Reset the board if the program does not run."
             ),
-            _ => format!(
-                "wrote and verified {} B ({units}); the board is running it.",
-                report.bytes
-            ),
+            _ => format!("Wrote and verified {bytes} B. The board is now running the program."),
         },
         lamella_flash_backend::Verification::NotPossible(_) => {
-            let mut line =
-                format!("wrote {} B ({units}); the board is running it.
-", report.bytes);
-            line.push_str(
-                "The bootloader admitted the image -- its family id and every block's magic and ",
-            );
-            line.push_str(
-                "index checked out --
-but NOTHING READ THE FLASH BACK: this route hands over a ",
-            );
-            line.push_str("file and the volume unmounts.");
-            line
+            format!("Wrote {bytes} B. The board is now running the program.\n{}", not_verified(programmer))
         }
-        lamella_flash_backend::Verification::Skipped => format!(
-            "wrote {} B ({units}); the board is running it.
-VERIFICATION WAS SKIPPED at your \
-             request -- this route can read every byte back and was told not to.",
-            report.bytes
-        ),
+        lamella_flash_backend::Verification::Skipped => {
+            format!("Wrote {bytes} B. The board is now running the program.\n{SKIPPED}")
+        }
     }
 }
+
+/// What to tell the reader about a completed write of two regions, the part's flash and the board's
+/// external flash: each region in its own verification state, and a caveat for each region that
+/// was not read back.
+fn two_region_completion(report: &lamella_flash_backend::SetReport) -> String {
+    use lamella_flash_backend::Verification;
+    let (boot, window) = (report.boot.bytes, report.window.bytes);
+    let read_back = |region: &lamella_flash_backend::Report| matches!(region.verification, Verification::ReadBack);
+    let mut text = if read_back(&report.boot) && read_back(&report.window) {
+        format!("Wrote and verified {boot} B, plus {window} B of external flash.")
+    } else {
+        format!("Wrote {boot} B, plus {window} B of external flash.")
+    };
+    text.push_str(" The board is now running the program.");
+    for (region, name) in [(&report.boot, "the part's flash"), (&report.window, "the external flash")] {
+        match region.verification {
+            Verification::ReadBack => {}
+            Verification::NotPossible(_) => {
+                text.push_str(&format!("\nNot verified: this route cannot read {name} back."));
+            }
+            Verification::Skipped => {
+                text.push_str(&format!("\nVerification of {name} skipped at your request; this route can read it back."));
+            }
+        }
+    }
+    text
+}
+
+/// What a route that cannot read the flash back says it checked instead.
+fn not_verified(programmer: Programmer) -> &'static str {
+    match programmer {
+        Programmer::Uf2Volume { .. } => {
+            "Not verified: this route cannot read the flash back. The bootloader accepted the UF2 file."
+        }
+        _ => "Not verified: this route cannot read the flash back.",
+    }
+}
+
+/// What a write says when the read-back it could make was skipped.
+const SKIPPED: &str = "Verification skipped at your request; this route can read the flash back.";
 
 
 
@@ -395,12 +429,16 @@ VERIFICATION WAS SKIPPED at your \
 /// Anything that stopped the write, worded for a reader; the caller prints it in its own style.
 pub(crate) fn write_image(
     programmer: Programmer,
+    board: &str,
     placement: &Placement,
     image: &[u8],
     window: Option<(&str, &WindowHalf)>,
     probe: Option<&str>,
     say: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
+    if probe.is_some() && programmer.writes_over_a_probe() {
+        named_probe_on_route(probe, board, programmer, &crate::devices::attached_probes())?;
+    }
     let probe = choose_board(programmer, probe)?;
     if let Some((board, half)) = window {
         say(&format!("writing over {}, with the board's external flash...", programmer.description()));
@@ -419,12 +457,7 @@ pub(crate) fn write_image(
             "  the external flash answered {:06x} -- {}",
             report.window.identity.value, report.window.identity.what
         ));
-        say(&format!(
-            "wrote and verified {} B ({}) and {} B of external flash; the board is running it.",
-            report.boot.bytes,
-            programmer.units(report.boot.bytes),
-            report.window.bytes
-        ));
+        say(&two_region_completion(&report));
         return Ok(());
     }
     let wrapped = wrap_for_route(programmer, image);
@@ -452,19 +485,44 @@ pub(crate) fn write_image(
     Ok(())
 }
 
-/// [`write_image`] for `flash` and `deploy`: its lines on standard output, and its failure on
-/// standard error.
-fn write_image_here(
+/// Whether the probe the command line names, `named`, may write `board` through `programmer`: on a
+/// route that writes over a probe, one of `attached` must have that USB serial number, given as
+/// itself or as the probe's id, and be of the kind the route writes through. Every other route names
+/// something else, which its own step checks.
+///
+/// # Errors
+/// A serial no attached probe has, and a probe of another kind than the route writes through, each
+/// saying that nothing was written.
+fn named_probe_on_route(
+    named: Option<&str>,
+    board: &str,
     programmer: Programmer,
+    attached: &[crate::devices::ProbeFound],
+) -> Result<(), String> {
+    let Some(named) = named.filter(|_| programmer.writes_over_a_probe()) else {
+        return Ok(());
+    };
+    let serial = lamella_probe_core::selection::serial_named(named);
+    crate::image_run::named_probe(serial, board, programmer, attached)
+        .map(|_| ())
+        .map_err(|refusal| format!("{refusal}\n\nNothing was written."))
+}
+
+/// [`write_image`] for `flash` and `deploy`, the `verb` run: its lines on standard output, and its
+/// failure on standard error, in the verb's name.
+fn write_image_here(
+    verb: &str,
+    programmer: Programmer,
+    board: &str,
     placement: &Placement,
     image: &[u8],
     window: Option<(&str, &WindowHalf)>,
     probe: Option<&str>,
 ) -> ExitCode {
-    match write_image(programmer, placement, image, window, probe, &mut |line| println!("{line}")) {
+    match write_image(programmer, board, placement, image, window, probe, &mut |line| println!("{line}")) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("lamella: {error}");
+            eprintln!("lamella {verb}: {error}");
             ExitCode::FAILURE
         }
     }
@@ -486,6 +544,7 @@ pub fn deploy_to_chip(
     unsafe_code: bool,
     tier: Tier,
     libraries: &[Library],
+    folders: &crate::folders::Folders,
 ) -> ExitCode {
     let row = match programmer_for(board_id) {
         Ok(row) => row,
@@ -525,8 +584,8 @@ pub fn deploy_to_chip(
         return ExitCode::FAILURE;
     };
     let built = match &project {
-        Some(project) => build_project_image(project, board_id, aot_target, tier, "deploy", path),
-        None => build_image(path, &source, board_id, aot_target, unsafe_code, tier, libraries, "deploy"),
+        Some(project) => build_project_image(project, board_id, aot_target, tier, "deploy", path, folders),
+        None => build_image(path, &source, board_id, aot_target, unsafe_code, tier, libraries, "deploy", folders),
     };
     let image = match built {
         Ok(image) => image,
@@ -566,7 +625,7 @@ pub fn deploy_to_chip(
             return ExitCode::FAILURE;
         }
     };
-    write_image_here(chosen, &placement, &image, None, selector.as_deref())
+    write_image_here("deploy", chosen, board_id, &placement, &image, None, selector.as_deref())
 }
 
 /// Where `deploy --board` writes the image it compiled for `row`'s board through `route`.
@@ -615,14 +674,15 @@ pub fn image_for_board(
     unsafe_code: bool,
     tier: Tier,
     libraries: &[Library],
+    folders: &crate::folders::Folders,
 ) -> Result<(Vec<u8>, u32), String> {
     let aot_target = target_to_build_for(board_id)?;
     let row = programmer_for(board_id)?;
     let image = if is_project(path) {
         let project = crate::project::Project::read_file(path, "build")?;
-        build_project_image(&project, board_id, aot_target, tier, "build", path)?
+        build_project_image(&project, board_id, aot_target, tier, "build", path, folders)?
     } else {
-        build_image(path, source, board_id, aot_target, unsafe_code, tier, libraries, "build")?
+        build_image(path, source, board_id, aot_target, unsafe_code, tier, libraries, "build", folders)?
     };
     refuse_unless_it_fits("build", board_id, &image)?;
     Ok((image, row.programmer.flash_base()))
@@ -652,10 +712,33 @@ fn image_fits(verb: &str, board_id: &str, image: &[u8], placement: &Placement) -
 
 /// The ahead-of-time target `build` compiles for `board_id`, or the refusal worded for `build`.
 fn target_to_build_for(board_id: &str) -> Result<&'static str, String> {
+    target_for(board_id, "build")
+}
+
+/// The ahead-of-time target `verb` compiles for `board_id`, or the refusal worded for `verb`.
+fn target_for(board_id: &str, verb: &str) -> Result<&'static str, String> {
     aot_target_for(board_id).map_err(|reason| match &reason {
-        NoAotTarget::UnknownBoard(error) => format!("lamella build: {error}"),
-        _ => cannot_build_for(board_id, "build", &reason),
+        NoAotTarget::UnknownBoard(error) => format!("lamella {verb}: {error}"),
+        _ => cannot_build_for(board_id, verb, &reason),
     })
+}
+
+/// The class-library image for `board_id` as a linked ELF that also carries the program's debug
+/// information, of a program a caller compiled for a debugger: what `dotnet publish` writes for a
+/// `lamella1.0` project, from what MSBuild evaluated, as [`debug_elf_for_board`] writes it for a
+/// file or a project file. `path` is the project.
+///
+/// # Errors
+/// As [`debug_elf_for_board`], worded for `verb`.
+pub(crate) fn debug_elf_of(
+    debuggable: &crate::program::Debuggable,
+    board_id: &str,
+    verb: &str,
+    path: &Path,
+    folders: &crate::folders::Folders,
+) -> Result<Vec<u8>, String> {
+    let aot_target = target_for(board_id, verb)?;
+    debug_elf_from(debuggable, board_id, aot_target, verb, path, folders)
 }
 
 /// The class-library image for `board_id` as a linked ELF that also carries the program's debug
@@ -677,14 +760,20 @@ pub fn debug_elf_for_board(
     board_id: &str,
     unsafe_code: bool,
     libraries: &[Library],
+    folders: &crate::folders::Folders,
 ) -> Result<Vec<u8>, String> {
     let aot_target = target_to_build_for(board_id)?;
     if is_project(path) {
         let project = crate::project::Project::read_file(path, "build")?;
         let libraries = project_libraries(&project, Tier::ClassLibrary, "build")?;
-        let debuggable =
-            crate::program::compile_project_for_debugging(&project, &libraries, Some(board_id), "build")?;
-        debug_elf_from(&debuggable, board_id, aot_target, "build", path)
+        let debuggable = crate::program::compile_project_for_debugging(
+            &project,
+            &libraries,
+            Some(board_id),
+            "build",
+            folders,
+        )?;
+        debug_elf_from(&debuggable, board_id, aot_target, "build", path, folders)
     } else {
         let debuggable = crate::program::compile_csharp_for_debugging(
             path,
@@ -693,8 +782,9 @@ pub fn debug_elf_for_board(
             libraries,
             Some(board_id),
             "build",
+            folders,
         )?;
-        debug_elf_from(&debuggable, board_id, aot_target, "build", path)
+        debug_elf_from(&debuggable, board_id, aot_target, "build", path, folders)
     }
 }
 
@@ -707,9 +797,10 @@ fn debug_elf_from(
     aot_target: &str,
     verb: &str,
     path: &Path,
+    folders: &crate::folders::Folders,
 ) -> Result<Vec<u8>, String> {
     require_entry_point(&debuggable.assembly, verb, path)?;
-    class_library_build(board_id, aot_target, verb, |archive| {
+    class_library_build(board_id, aot_target, verb, folders, |archive| {
         linked_debug_build(
             &debuggable.assembly,
             &debuggable.pdb,
@@ -894,6 +985,15 @@ impl Tier {
             }
         }
     }
+
+    /// The tier as `build`'s `Tier:` line names it.
+    #[must_use]
+    pub fn summary(self) -> &'static str {
+        match self {
+            Self::Flat => "flat (linker-free; no class library)",
+            Self::ClassLibrary => "class library (linked against corlib and the runtime support archive)",
+        }
+    }
 }
 
 /// A class library named on the command line, with the bytes it was read from.
@@ -1023,6 +1123,7 @@ fn build_image(
     tier: Tier,
     libraries: &[Library],
     verb: &str,
+    folders: &crate::folders::Folders,
 ) -> Result<Vec<u8>, String> {
     let (assembly, corlib, link) = if compiles_as_debug_build(tier) {
         let compiled = crate::program::compile_csharp_for_debugging(
@@ -1032,6 +1133,7 @@ fn build_image(
             libraries,
             Some(board_id),
             verb,
+            folders,
         )?;
         (compiled.assembly, compiled.corlib, compiled.libraries)
     } else {
@@ -1042,10 +1144,11 @@ fn build_image(
             libraries,
             Some(board_id),
             verb,
+            folders,
         )?;
         (assembly, corlib, Vec::new())
     };
-    image_from_assembly(&assembly, &corlib, board_id, aot_target, tier, &link, verb, path)
+    image_from_assembly(&assembly, &corlib, board_id, aot_target, tier, &link, verb, path, folders)
 }
 
 /// Whether a program built on `tier` is compiled as a debug build is, even for an image that is
@@ -1077,18 +1180,24 @@ fn build_project_image(
     tier: Tier,
     verb: &str,
     path: &Path,
+    folders: &crate::folders::Folders,
 ) -> Result<Vec<u8>, String> {
     let libraries = project_libraries(project, tier, verb)?;
     let (assembly, corlib, link) = if compiles_as_debug_build(tier) {
-        let compiled =
-            crate::program::compile_project_for_debugging(project, &libraries, Some(board_id), verb)?;
+        let compiled = crate::program::compile_project_for_debugging(
+            project,
+            &libraries,
+            Some(board_id),
+            verb,
+            folders,
+        )?;
         (compiled.assembly, compiled.corlib, compiled.libraries)
     } else {
         let (assembly, corlib) =
-            crate::program::compile_project_assembly(project, &libraries, Some(board_id), verb)?;
+            crate::program::compile_project_assembly(project, &libraries, Some(board_id), verb, folders)?;
         (assembly, corlib, Vec::new())
     };
-    image_from_assembly(&assembly, &corlib, board_id, aot_target, tier, &link, verb, path)
+    image_from_assembly(&assembly, &corlib, board_id, aot_target, tier, &link, verb, path, folders)
 }
 
 /// The class libraries `project` references, read and in the order it declares them.
@@ -1121,10 +1230,11 @@ fn image_from_assembly(
     libraries: &[Vec<u8>],
     verb: &str,
     path: &Path,
+    folders: &crate::folders::Folders,
 ) -> Result<Vec<u8>, String> {
     require_entry_point(assembly, verb, path)?;
     if tier == Tier::ClassLibrary {
-        return class_library_build(board_id, aot_target, verb, |archive| {
+        return class_library_build(board_id, aot_target, verb, folders, |archive| {
             linked_build(assembly, corlib, libraries, archive, aot_target, lamella_wire_host::boards::bus_table(Some(board_id)))
         });
     }
@@ -1168,12 +1278,13 @@ fn class_library_build<T>(
     board_id: &str,
     aot_target: &str,
     verb: &str,
+    folders: &crate::folders::Folders,
     link: impl FnOnce(&[u8]) -> Result<T, String>,
 ) -> Result<T, String> {
-    if !crate::tiers::covers(aot_target) || !linked_tier_compiled_in() {
+    if !links_class_library(aot_target) {
         return Err(class_library_refusal(verb, aot_target));
     }
-    let (archive_path, archive) = crate::tiers::runtime_archive(board_id, aot_target)
+    let (archive_path, archive) = crate::tiers::runtime_archive(board_id, aot_target, folders.runtime_support_dir())
         .map_err(|reason| format!("lamella {verb}: {reason}"))?;
     link(&archive).map_err(|error| {
         let head =
@@ -1300,6 +1411,22 @@ fn linked_debug_build(
     .map_err(|error| format!("{error}"))
 }
 
+/// The managed heap the image `image` for `board_id` hands its collector, as the line `build` prints
+/// under the image's, or `None` for an image that names none: a flat image, and one for a part whose
+/// heap the backend does not read back. READ BACK FROM THE IMAGE, so the line says what the board
+/// will use.
+#[cfg(feature = "class-library")]
+pub fn heap_line(board_id: &str, image: &[u8]) -> Option<String> {
+    let heap = lamella_aot::build::linked_heap(image, aot_target_for(board_id).ok()?)?;
+    Some(format!("managed heap at {:#010x}, {} B up to {:#010x}", heap.base, heap.bytes(), heap.end))
+}
+
+/// No heap to name in a build without the tier, as the [`linked_build`] beside it builds nothing.
+#[cfg(not(feature = "class-library"))]
+pub fn heap_line(_board_id: &str, _image: &[u8]) -> Option<String> {
+    None
+}
+
 /// Unreachable in a build without the tier, as the [`linked_build`] beside it is.
 #[cfg(not(feature = "class-library"))]
 fn linked_debug_build(
@@ -1322,6 +1449,18 @@ fn linked_debug_build(
 /// from memory rather than from the build.
 const fn linked_tier_compiled_in() -> bool {
     cfg!(feature = "class-library")
+}
+
+/// Whether this build links a program for `aot_target` with the class library: the tier is
+/// compiled in, and it has a plan and an archive for that target.
+fn links_class_library(aot_target: &str) -> bool {
+    linked_tier_compiled_in() && crate::tiers::covers(aot_target)
+}
+
+/// Whether this build writes a native image for `board_id`: a program compiled ahead of time and
+/// linked with the class library, as `dotnet publish` writes one for a `lamella1.0` project.
+pub(crate) fn links_native_image(board_id: &str) -> bool {
+    aot_target_for(board_id).is_ok_and(links_class_library)
 }
 
 /// Why the flat tier did not build this program, and -- where it applies -- which tier would.
@@ -1506,77 +1645,79 @@ fn has_entry_point(assembly: &[u8]) -> bool {
 const REPLACE_BOOTLOADER: &str = "--replace-bootloader";
 
 const USAGE: &str = "\
-usage: lamella flash <image> [--board <id>] [--via probe|volume]
-                          [--probe <serial>]      which probe, on a probe route
-                          [--volume <name>]       which drive, on a volume route
-                          [--dfu <serial>]        which bootloader, on a USB DFU route
-                          [--replace-bootloader]  over the board's bootloader, not behind it
-       lamella flash --board <id> --clear-bootprot [--dry-run] [--probe <serial>]
-       lamella flash --board <id> --restore-user-row <file> [--dry-run] [--probe <serial>]
+Usage:
+  lamella flash <image> [--board <board>] [--via probe|volume]
 
-Writes an image that ALREADY EXISTS to the board's chip, over its debug probe. It does not compile
-anything -- `lamella build <file> --board <id> --format <f>` produces what this takes, and
-`lamella deploy` is the two steps in one. The board needs nothing on it first.
+Write an already-built image file to a board.
 
-The image is read by extension: .hex, .bin, .s19, .elf, or the .uf2 a bootloader-volume board
-takes. A linked .elf is flattened the way `objcopy -O binary` would, by physical address, so an
-image another toolchain produced needs no conversion step. For a bootloader-volume board, any of
-them but a .uf2 is wrapped into one here, because the address and the family id a .uf2 carries are
-facts about the board and are already known. An image larger than the board's flash is refused
-before anything is opened.
+Arguments:
+  <image>  The image: a .hex, .bin, .s19 or .elf file, or the .uf2 a bootloader-volume board takes.
 
---probe names WHICH probe when more than one is attached; --volume names which drive; --dfu
-names which system bootloader, over USB DFU. They are different questions and each belongs to one
-route, so naming the wrong one is refused rather than ignored. Without one, a probe route takes
-LAMELLA_PROBE_SERIAL and then the sole attached probe, the other routes take the sole candidate,
-and otherwise the write is REFUSED with every candidate named. A write to the wrong board succeeds
-and reports nothing, so it is never guessed at.
+Options:
+  --board <board>       The board ID, as `lamella boards` lists it. Optional when the image has a
+                        sidecar, which names its board.
+  --via probe|volume    How the chip is written. Default: the board's own debugger if it has one,
+                        and otherwise its bootloader drive.
+  --probe <serial>      Which probe, on the probe route. Default: LAMELLA_PROBE_SERIAL, then the
+                        only probe attached.
+  --volume <name>       Which bootloader drive, on the volume route. Default: the only one.
+  --dfu <serial>        Which USB DFU bootloader, on a DFU route. Default: the only one.
+  --replace-bootloader  Write the image over the bootloader a board's product ships in flash,
+                        not behind it.
 
-WITHOUT --via, the board is written by ITS OWN mechanism: a debugger soldered to it if it has one,
-otherwise its bootloader drive. That needs no hardware you do not already own, and it is never a
-guess -- a debugger on the board cannot be the one wired to something else, so having an external
-probe plugged in as well changes nothing and you are not asked to choose.
+What happens:
+  The image is written to the board's chip, and the board then runs it. This does not compile
+  anything: `lamella build <file> --board <board> --format <format>` writes what this takes, and
+  `lamella deploy` does both in one step. The board needs nothing on it first. The last line says
+  whether the image was read back. The exit code is 0 once the image is written, and 1 when the
+  write is refused or fails.
 
---via asks for a DIFFERENT route than the board's own:
+Examples:
+  lamella flash Program.uf2 --board rpi-pico2
+  lamella flash Program.elf --board rpi-pico2 --via probe
 
-  volume   the bootloader drive. What a Pico takes by default, since it has no debugger of its
-           own. It CANNOT read the flash back; what it can tell you is whether the board
-           rebooted, which is the bootloader's acknowledgement that it took the image.
-  probe    an EXTERNAL SWD probe. Reads every byte back and compares it, which is the only way
-           to know the image is really there. Takes .bin/.hex/.elf/.s19, never a .uf2.
+Details:
+  A linked .elf is flattened by physical address, as `objcopy -O binary` does, so an image another
+  toolchain produced needs no conversion step. For a bootloader-volume board, any image but a .uf2
+  is wrapped into one here. An image larger than the board's flash is refused before anything is
+  opened.
 
-An external probe could be wired to any board, so when more than one is attached --via probe
-REFUSES until you name one with --probe <serial>. That is the same rule as everywhere else and not
-a stricter one: with a board's own debugger there is nothing to disambiguate, and here there is.
+  The volume route copies the image to the bootloader drive. It cannot read the flash back; it can
+  only tell you whether the board rebooted, which is the bootloader's sign that it took the image.
+  The probe route uses an external SWD probe and reads every byte back to check it. It takes .bin,
+  .hex, .elf and .s19 images, not .uf2.
 
-A SIDECAR beside the image -- <image>.manifest.json -- says which board it was built for and what
-its bytes hash to. When one is there, --board is optional and is checked against it, and the image
-is checked against its own digest before any probe is opened. A file of bytes cannot say which
-board it belongs to, and two boards on a bench with two images in a directory is how the wrong one
-gets written. An absent sidecar changes nothing; a sidecar that will not parse stops the write,
-because a claim nobody can check is worse than no claim.
+  When several probes, drives or bootloaders could be the one, the write is refused with every
+  candidate named. A write to the wrong board succeeds and reports nothing, so it is never guessed.
+  --probe, --volume and --dfu each belong to one route, and naming one for another route is refused.
 
-On a board whose product ships a bootloader in flash, an Arduino Zero among them, the image is
-written BEHIND the bootloader, which stays and starts it, so an IDE can still upload through it.
-The write first reads the start of flash and is refused when no bootloader is there, before
-anything is erased. --replace-bootloader writes the image at the start of flash instead, over the
-bootloader, and the board then has none until one is written back. The way back is the same
-option with the bootloader's own file; none is included here. An image linked for the other
-layout is refused, naming the option that writes it where it was linked to run.
+  A sidecar beside the image, <image>.manifest.json, names the board it was built for and the hash
+  of its bytes. When one is there, --board is checked against it, and the image against its hash,
+  before any probe is opened. A sidecar that cannot be read stops the write; delete it to write the
+  image unchecked.
 
---clear-bootprot writes no image. On a SAM D21 board it clears the part's bootloader protection,
-the BOOTPROT field of its NVM user row, which a write at address 0 needs. It prints every field of
-the row as it is and as it will be, then saves the row to a file in the working directory, named
-for the part's serial number. It erases the row, writes it back with only BOOTPROT changed, reads
-it back and compares it, and resets the part so that the new value is in force. With --dry-run it
-prints the same table and writes nothing.
+  On a board whose product ships a bootloader in flash, such as an Arduino Zero, the image is
+  written behind the bootloader, which stays and starts it. The write is refused when no
+  bootloader is there, before anything is erased. --replace-bootloader writes at the start of flash
+  instead, and the board then has no bootloader until one is written back with this option; none
+  is included here. An image linked for the other layout is refused, naming the option it needs.
 
---restore-user-row <file> is the way back: it writes a saved row back over the part's row, and it
-takes only a file saved from the same part. A written row takes effect only at the part's next
-reset, so a rewrite that is interrupted leaves the part running on its previous configuration
-until then; put the row back before anything resets the board. One case is out of reach: a part
-that has already reset with an erased row can hold itself in brown-out reset, and the plain attach
-these steps make does not reach a part held there.
+Advanced:
+  lamella flash --board <board> --clear-bootprot [--dry-run] [--probe <serial>]
+  lamella flash --board <board> --restore-user-row <file> [--dry-run] [--probe <serial>]
+
+  --clear-bootprot writes no image. On a SAM D21 board, it clears the BOOTPROT field of the part's
+  NVM user row, which a write at address 0 needs. It prints every field of the row as it is and as
+  it will be, and saves the row to a file in the working directory, named for the part's serial
+  number. It then erases the row, writes it back with only BOOTPROT changed, reads it back, and
+  resets the part so the new value is in force.
+
+  --restore-user-row <file> writes a saved row back, and takes only a file saved from the same part.
+  A written row takes effect at the part's next reset, so put the row back before anything resets
+  the board. A part that has already reset with an erased row can hold itself in brown-out reset,
+  and these steps cannot reach a part held there.
+
+  --dry-run prints the same table and writes nothing.
 ";
 
 /// What `flash` calls the word it wants, in the one place both the error and the usage read it
@@ -1592,6 +1733,66 @@ const POSITIONAL: &str = "prebuilt image";
 mod tests {
     use super::*;
     use lamella_flash_routes::{PROGRAMMING, RP2_XIP_BASE, RP2350_UF2_FAMILY, cannot_write};
+    use crate::folders::Folders;
+
+    /// **A PROBE THE COMMAND LINE NAMES MUST BE ATTACHED, AND ONE THAT CAN WRITE THE BOARD, ON EVERY
+    /// ROUTE THAT WRITES OVER A PROBE**, so a serial nothing carries is refused by that serial, the
+    /// same way whichever route the board takes -- three routes' own refusals dropped it -- and a
+    /// probe of another kind than the debugger soldered to the board is said to be one. A probe named
+    /// by its id is named, in either case, and a route that takes no probe is not this check's.
+    #[test]
+    fn a_probe_named_for_a_write_must_be_attached_and_able_to_write_the_board() {
+        let probe = |serial: String, description: &str, usb: (u16, u16)| crate::devices::ProbeFound {
+            serial: Some(serial),
+            description: description.to_owned(),
+            usb,
+            ports: Vec::new(),
+        };
+        let routes: Vec<(&str, Programmer)> = PROGRAMMING
+            .iter()
+            .flat_map(|row| [Some(row.programmer), row.alternate].into_iter().flatten().map(|route| (row.board, route)))
+            .collect();
+        let mut bench = vec![probe("E6610000000000B2".to_owned(), "Debugprobe on Pico (CMSIS-DAP)", (0x2e8a, 0x000c))];
+        for (index, (_, route)) in routes.iter().enumerate() {
+            if let Some(usb) = route.usb_identity()
+                && !bench.iter().any(|attached| attached.usb == usb)
+            {
+                bench.push(probe(format!("ONBOARD{index:08}"), "a debugger on its board", usb));
+            }
+        }
+        let mut probe_routes = 0;
+        for &(board, route) in &routes {
+            if !route.writes_over_a_probe() {
+                assert_eq!(named_probe_on_route(Some("D:\\"), board, route, &bench), Ok(()), "{board}: not a probe route");
+                continue;
+            }
+            probe_routes += 1;
+            let absent = named_probe_on_route(Some("NOSUCHPROBE0000"), board, route, &bench).expect_err("absent");
+            assert!(absent.starts_with("no attached probe has the serial number NOSUCHPROBE0000.\nAttached:\n"), "{board}: {absent}");
+            assert!(absent.ends_with("\n\nNothing was written."), "{board}: {absent}");
+            let own = bench.iter().find(|attached| route.usb_identity().is_none_or(|usb| attached.usb == usb)).expect("one fits");
+            let serial = own.serial.as_deref().expect("named");
+            assert_eq!(named_probe_on_route(Some(serial), board, route, &bench), Ok(()), "{board}: {serial}");
+            assert_eq!(
+                named_probe_on_route(Some(&format!("PROBE:{}", serial.to_ascii_lowercase())), board, route, &bench),
+                Ok(()),
+                "{board}: named by its id, in either case"
+            );
+            assert_eq!(named_probe_on_route(None, board, route, &bench), Ok(()), "{board}: the route's own ladder");
+            if route.usb_identity().is_some() {
+                assert_eq!(
+                    named_probe_on_route(Some("E6610000000000B2"), board, route, &bench),
+                    Err(format!(
+                        "E6610000000000B2 is Debugprobe on Pico (CMSIS-DAP), and {board} is written through {}.\n\n\
+                         Nothing was written.",
+                        route.description()
+                    )),
+                    "{board}: a probe of another kind"
+                );
+            }
+        }
+        assert!(probe_routes > 10, "every probe route was asked: {probe_routes}");
+    }
 
     /// **THE TWO STRINGS ARE PRINTED TOGETHER, SO THEY MUST AGREE.** `eprintln!("{error}\n\n{USAGE}")`
     /// puts *give a prebuilt image* directly above the usage, and for as long as this verb compiled
@@ -1769,11 +1970,11 @@ class Program
             volume,
             &report(4096, lamella_flash_backend::Verification::NotPossible("the bootloader")),
         );
-        assert!(!line.contains("verified"), "this route verifies nothing: {line}");
-        assert!(line.contains("NOTHING READ THE FLASH BACK"), "and it must say so: {line}");
-        assert!(
-            line.contains("bootloader admitted"),
-            "while crediting the check that DID run: {line}"
+        assert_eq!(
+            line,
+            "Wrote 4096 B. The board is now running the program.\n\
+             Not verified: this route cannot read the flash back. The bootloader accepted the UF2 file.",
+            "this route verifies nothing, says so, and credits the check that did run"
         );
     }
 
@@ -1788,17 +1989,11 @@ class Program
             dfu,
             &report(2048, lamella_flash_backend::Verification::ReadBack),
         );
-        assert!(
-            line.contains("verified"),
-            "the bootloader read every byte back: {line}"
-        );
-        assert!(
-            !line.contains("is running it"),
-            "a leave does not show a start: {line}"
-        );
-        assert!(
-            line.contains("reset the board"),
-            "and says what to do when nothing runs: {line}"
+        assert_eq!(
+            line,
+            "Wrote and verified 2048 B. Start was requested, but the bootloader does not report whether the \
+             program started. Reset the board if the program does not run.",
+            "the bootloader read every byte back, and a leave does not show a start"
         );
     }
 
@@ -1807,9 +2002,27 @@ class Program
         for probe in [Programmer::MicrobitV1Daplink, Programmer::MicrobitV2Daplink] {
             let line =
                 completion_line(probe, &report(270, lamella_flash_backend::Verification::ReadBack));
-            assert!(line.contains("verified"), "a probe write reads every word back: {line}");
-            assert!(!line.contains("NOTHING READ"), "and must not disclaim it: {line}");
+            assert_eq!(line, "Wrote and verified 270 B. The board is now running the program.", "a probe write reads every word back");
         }
+    }
+
+    /// **A WRITE OF TWO REGIONS SAYS EACH REGION's OWN STATE**: verified only when both read back,
+    /// and a caveat for the region that did not.
+    #[test]
+    fn a_two_region_write_reports_each_regions_verification() {
+        let set = |window| lamella_flash_backend::SetReport {
+            boot: report(4096, lamella_flash_backend::Verification::ReadBack),
+            window: report(2048, window),
+        };
+        assert_eq!(
+            two_region_completion(&set(lamella_flash_backend::Verification::ReadBack)),
+            "Wrote and verified 4096 B, plus 2048 B of external flash. The board is now running the program."
+        );
+        assert_eq!(
+            two_region_completion(&set(lamella_flash_backend::Verification::Skipped)),
+            "Wrote 4096 B, plus 2048 B of external flash. The board is now running the program.\n\
+             Verification of the external flash skipped at your request; this route can read it back."
+        );
     }
 
     #[test]
@@ -1818,11 +2031,11 @@ class Program
             Programmer::MicrobitV2Daplink,
             &report(64, lamella_flash_backend::Verification::Skipped),
         );
-        assert!(line.contains("SKIPPED"), "the reader has to be told: {line}");
-        assert!(!line.contains("and verified"), "nothing was verified: {line}");
-        assert!(
-            !line.contains("NOTHING READ THE FLASH BACK"),
-            "that sentence belongs to a route that CANNOT read back, not one that was told not to: {line}"
+        assert_eq!(
+            line,
+            "Wrote 64 B. The board is now running the program.\n\
+             Verification skipped at your request; this route can read the flash back.",
+            "nothing was verified, and the reader is told why, not that the route cannot read back"
         );
     }
 
@@ -1862,14 +2075,14 @@ class Program
                     row.board
                 );
                 assert!(
-                    image_for_board(path, BLINK, row.board, true, Tier::Flat, &[]).is_err(),
+                    image_for_board(path, BLINK, row.board, true, Tier::Flat, &[], &Folders::default()).is_err(),
                     "{}: names no target, so building for it must refuse",
                     row.board
                 );
                 continue;
             };
             built += 1;
-            let image = build_image(path, BLINK, row.board, target, true, Tier::Flat, &[], "deploy")
+            let image = build_image(path, BLINK, row.board, target, true, Tier::Flat, &[], "deploy", &Folders::default())
                 .unwrap_or_else(|error| panic!("{}: {error}", row.board));
             assert!(
                 image.len() > 64,
@@ -1943,7 +2156,7 @@ class Program
         }
         let path = Path::new("Blink.cs");
         for (board, target) in [("bbc-micro-bit-v1", "microbit"), ("muselab-nano-ch32v003", "ch32v003")] {
-            let image = build_image(path, BLINK, board, target, true, Tier::Flat, &[], "deploy")
+            let image = build_image(path, BLINK, board, target, true, Tier::Flat, &[], "deploy", &Folders::default())
                 .unwrap_or_else(|error| {
                     panic!("{target}: this build cannot compile for it: {error}")
                 });
@@ -1983,6 +2196,7 @@ class Program
             Tier::Flat,
             &[],
             "build",
+            &Folders::default(),
         )
         .expect_err("the flat tier resolves no call outside the program");
         assert!(
@@ -2013,6 +2227,7 @@ class Program
             Tier::Flat,
             &[],
             "build",
+            &Folders::default(),
         ) else {
             return;
         };
@@ -2045,6 +2260,7 @@ class Program
             Tier::Flat,
             &[],
             "deploy",
+            &Folders::default(),
         )
         .expect("BLINK lowers on the flat tier");
         match build_image(
@@ -2056,6 +2272,7 @@ class Program
             Tier::ClassLibrary,
             &[],
             "deploy",
+            &Folders::default(),
         ) {
             Err(error) => {
                 assert!(
@@ -2084,7 +2301,7 @@ class Program
             return;
         }
         let target = target_to_build_for(board).expect("the board has an ahead-of-time target");
-        if crate::tiers::runtime_archive(board, target).is_err() {
+        if crate::tiers::runtime_archive(board, target, None).is_err() {
             return;
         }
         let table = lamella_wire_host::boards::bus_table(Some(board)).expect("the board has a bus table");
@@ -2098,10 +2315,10 @@ class Program
         };
         let path = Path::new("Buses.cs");
 
-        let (image, _) = image_for_board(path, &program, board, false, Tier::ClassLibrary, &[])
+        let (image, _) = image_for_board(path, &program, board, false, Tier::ClassLibrary, &[], &Folders::default())
             .unwrap_or_else(|error| panic!("the program links: {error}"));
         assert!(image.windows(words.len()).any(|at| at == words.as_slice()), "the image carries the table");
-        let elf = debug_elf_for_board(path, &program, board, false, &[])
+        let elf = debug_elf_for_board(path, &program, board, false, &[], &Folders::default())
             .unwrap_or_else(|error| panic!("the debug ELF links: {error}"));
         assert!(elf.windows(words.len()).any(|at| at == words.as_slice()), "and so does the ELF");
     }
@@ -2146,6 +2363,7 @@ class Program
             Tier::Flat,
             &[],
             "build",
+            &Folders::default(),
         )
         .expect_err("a library is not a program");
         assert!(
@@ -2175,6 +2393,7 @@ class Program
                     Tier::Flat,
                     &[],
                     "build",
+                    &Folders::default(),
                 )
                 .expect_err("the flat tier refuses this call"),
             );
@@ -2197,7 +2416,9 @@ class Program
             verb: "build",
             usage: None,
             values: &["--board", "--format"],
+            repeats: &[],
             flags: &[CLASS_LIBRARY_FLAG, FLAT_FLAG],
+            positional: Positional::Own,
         };
         let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
         let parsed = args::parse(&args, &spec).expect("the command line parses");
@@ -2283,6 +2504,7 @@ class Program
             Tier::Flat,
             &[],
             "deploy",
+            &Folders::default(),
         )
         .expect_err("a library is not a program");
         assert!(
@@ -2325,6 +2547,7 @@ while (true)
             Tier::Flat,
             &[],
             "deploy",
+            &Folders::default(),
         )
         .unwrap_or_else(|error| panic!("the statements build: {error}"));
         assert!(image.len() > 64, "{} B is too small to be a program plus a vector table", image.len());
@@ -2339,7 +2562,7 @@ while (true)
             return;
         }
         if let Err(error) =
-            debug_elf_for_board(Path::new("Blink.cs"), BLINK_STATEMENTS, "rpi-pico2-w", true, &[])
+            debug_elf_for_board(Path::new("Blink.cs"), BLINK_STATEMENTS, "rpi-pico2-w", true, &[], &Folders::default())
         {
             assert!(!error.contains("no static Main"), "the debug build refused the entry contract: {error}");
         }
@@ -2492,6 +2715,7 @@ while (true)
             &broken,
             None,
             "deploy",
+            &Folders::default(),
         ) else {
             panic!("three bytes are not an assembly");
         };
@@ -2502,6 +2726,7 @@ while (true)
             &broken,
             None,
             "build",
+            &Folders::default(),
         ) else {
             panic!("three bytes are not an assembly, compiled plainly either");
         };
@@ -2594,8 +2819,28 @@ while (true)
     /// and says that no bootloader is included.
     #[test]
     fn the_usage_says_a_bootloader_is_kept_unless_replaced() {
-        assert!(USAGE.contains(REPLACE_BOOTLOADER), "{USAGE}");
-        assert!(USAGE.contains("written BEHIND the bootloader"), "{USAGE}");
-        assert!(USAGE.contains("none is included here"), "{USAGE}");
+        let words = USAGE.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(words.contains(REPLACE_BOOTLOADER), "{USAGE}");
+        assert!(words.contains("written behind the bootloader"), "{USAGE}");
+        assert!(words.contains("none is included here"), "{USAGE}");
+    }
+
+    /// `build` NAMES THE HEAP A micro:bit IMAGE's STARTUP SEEDS, read from the image, and names none
+    /// for an image whose startup seeds no heap there. The image here is the v1's linked shape cut to
+    /// what the reading looks at: its initial stack pointer, and the heap's base and end in the two
+    /// words before the text.
+    #[cfg(feature = "class-library")]
+    #[test]
+    fn build_names_the_heap_a_micro_bit_image_seeds() {
+        let mut image = vec![0u8; 0x108];
+        image[0..4].copy_from_slice(&0x2000_4000u32.to_le_bytes());
+        image[0xF8..0xFC].copy_from_slice(&0x2000_06A0u32.to_le_bytes());
+        image[0xFC..0x100].copy_from_slice(&0x2000_2000u32.to_le_bytes());
+        assert_eq!(
+            heap_line("bbc-micro-bit-v1", &image).as_deref(),
+            Some("managed heap at 0x200006a0, 6496 B up to 0x20002000")
+        );
+        image[0xF8..0x100].fill(0);
+        assert_eq!(heap_line("bbc-micro-bit-v1", &image), None, "a flat image seeds no heap");
     }
 }

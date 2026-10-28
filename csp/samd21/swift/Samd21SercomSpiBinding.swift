@@ -2,13 +2,11 @@
 // values, exactly the constants a board's generated *Bindings enum carries. The driver never
 // holds an instance base, a pin register, a mux value or a divisor of its own.
 //
-// THIS SHAPE FOLLOWS THE EMISSION, not the other way round. An earlier version of this file
-// mirrored the USART descriptor and took a COMPOSED pmux pair byte -- but the samd21 spi
-// emission arm states each signal separately, as (pmux register, nibble shift, pincfg
-// register). That is the better shape and the descriptor was wrong to assume otherwise: a
-// SERCOM's three SPI signals need not share a PMUX byte, and on this board they do not (MOSI
-// and SCK are PB10/PB11, an even/odd pair sharing one byte at shifts 0 and 4, while MISO is
-// PA12 in a different PORT group entirely).
+// This shape follows the emission, not the other way round: the samd21 spi emission arm states
+// each signal separately, as (pmux register, nibble shift, pincfg register), rather than as one
+// composed pmux pair byte, because a SERCOM's three SPI signals need not share a PMUX byte. On
+// this board they do not (MOSI and SCK are PB10/PB11, an even/odd pair sharing one byte at
+// shifts 0 and 4, while MISO is PA12 in a different PORT group entirely).
 
 /// The descriptor a SAMD21 SERCOM-SPI driver consumes.
 ///

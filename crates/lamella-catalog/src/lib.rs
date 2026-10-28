@@ -106,9 +106,124 @@ pub fn all_parts() -> Vec<(String, PartRow)> {
     rows
 }
 
+/// Where a program's console and its log go on a board when its project names nowhere else, in the
+/// words a project and a build's record spell it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConsoleChannel {
+    /// The console ring in RAM, which a debug probe reads while the program runs, without halting
+    /// it.
+    Memory,
+    /// The UART the board's own debugger carries to a USB serial port of its own.
+    Probe,
+}
+
+impl ConsoleChannel {
+    /// The channel's word: `memory` or `probe`.
+    #[must_use]
+    pub fn word(self) -> &'static str {
+        match self {
+            ConsoleChannel::Memory => "memory",
+            ConsoleChannel::Probe => "probe",
+        }
+    }
+}
+
+/// The boards whose debugger carries a UART that no image built for them writes: their console
+/// takes the ring, so a default never names a wire nothing writes.
+const DEBUGGER_UART_UNWRITTEN: [&str; 2] = ["bbc-micro-bit-v1", "bbc-micro-bit-v2"];
+
+/// The channel `board`'s console and log take when its project names none.
+///
+/// `probe` where the board's own debugger carries a UART dedicated to it to a USB serial port: the
+/// board has an on-board debugger, a carrier of a debugger's serial-bridge kind (one whose kind
+/// ends in `-vcp`), and the UART binding that carrier rides -- and an image for the board can write
+/// that UART. `memory` everywhere else. The default never takes a UART the board gives a program,
+/// since the program may be using it.
+#[must_use]
+pub fn console_default(board: &BoardTable) -> ConsoleChannel {
+    if debugger_carries_a_uart(board) && !DEBUGGER_UART_UNWRITTEN.contains(&board.board.as_str()) {
+        ConsoleChannel::Probe
+    } else {
+        ConsoleChannel::Memory
+    }
+}
+
+/// Whether `board`'s own debugger carries a UART dedicated to it to a USB serial port, as the
+/// board's facts state it: an on-board debugger, a `-vcp` carrier, and a UART binding for the
+/// carrier's role.
+fn debugger_carries_a_uart(board: &BoardTable) -> bool {
+    let has_debugger = board.debug.as_ref().is_some_and(|debug| !debug.onboard.is_empty() && debug.onboard != "none");
+    has_debugger
+        && board.carriers.iter().any(|carrier| {
+            carrier.kind.ends_with("-vcp")
+                && !carrier.role.is_empty()
+                && board.bindings.iter().any(|binding| binding.role == carrier.role && binding.kind == "uart")
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `id`'s default channel, as its word.
+    fn default_word(id: &str) -> &'static str {
+        console_default(&load_board(id).unwrap_or_else(|| panic!("{id}: board.toml parses"))).word()
+    }
+
+    /// **EVERY BOARD LAMELLA RHU BUILDS FOR TAKES RHU's CHANNEL**: `memory` on the four RP2350
+    /// boards, and `probe`, the UART wired to the on-board ST-LINK's serial port, on the NUCLEO-U5A5
+    /// and the F769 Discovery.
+    #[test]
+    fn the_boards_rhu_builds_for_take_rhus_channel() {
+        for (board, word) in [
+            ("rpi-pico2", "memory"),
+            ("rpi-pico2-w", "memory"),
+            ("pimoroni-pico-plus-2", "memory"),
+            ("pimoroni-pico-plus-2-w", "memory"),
+            ("st-nucleo-u5a5zj-q", "probe"),
+            ("st-stm32f769i-disco", "probe"),
+        ] {
+            assert_eq!(default_word(board), word, "{board}");
+        }
+    }
+
+    /// **A BOARD's OWN DEBUGGER DECIDES**, from its facts: an EDBG, an ST-LINK or a DAPLink whose
+    /// serial bridge rides a stated UART gives `probe`; a USB-serial bridge that is no debugger, a
+    /// chip's own USB, native USB alone, and a debugger whose bridge states no UART give `memory`.
+    #[test]
+    fn a_boards_own_debugger_decides_its_default() {
+        for (board, word) in [
+            ("microchip-samd21-xpro", "probe"),
+            ("st-nucleo-l476rg", "probe"),
+            ("arduino-due", "memory"),
+            ("esp-esp32c6-devkitc", "memory"),
+            ("adafruit-feather-m0-express", "memory"),
+            ("microchip-sam4e-xpro", "memory"),
+        ] {
+            assert_eq!(default_word(board), word, "{board}");
+        }
+    }
+
+    /// **THE micro:bits TAKE THE RING UNTIL AN IMAGE CAN WRITE THEIR DEBUGGER's UART.**
+    #[test]
+    fn the_micro_bits_take_the_ring_until_their_uart_is_written() {
+        let v1 = load_board("bbc-micro-bit-v1").expect("the v1's board.toml");
+        assert!(debugger_carries_a_uart(&v1), "the v1's facts state its DAPLink's UART");
+        assert_eq!(console_default(&v1), ConsoleChannel::Memory);
+        assert_eq!(default_word("bbc-micro-bit-v2"), "memory");
+    }
+
+    /// Every board in the catalog has a default, and only `memory` and `probe` are given.
+    #[test]
+    fn every_board_has_a_default() {
+        let mut probe = 0;
+        for (id, _) in BOARDS {
+            if default_word(id) == "probe" {
+                probe += 1;
+            }
+        }
+        assert!(probe >= 2 && probe < BOARDS.len(), "{probe} of {} boards default to probe", BOARDS.len());
+    }
 
     /// The registry enumerates every family the catalog embeds, and every row parses.
     ///

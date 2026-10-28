@@ -3,8 +3,8 @@
 # Shares the whole L3G register address map with its sibling and differs from it in five places,
 # every one of which is stated below: the identity byte, the I2C slave address, the range each
 # full-scale code names, the rate each output-data-rate code selects, and the field layout of
-# CTRL_REG4. Everything else is inherited from the family base and FLATTENED INTO THE EMITTED
-# TABLE, so a reader of the emitted artifact never has to chase a base to see the whole truth.
+# CTRL_REG4. Everything else is inherited from the family base and flattened into the emitted
+# table, so a reader of the emitted artifact never has to chase a base to see the whole truth.
 
 [table]
 kind = "device"
@@ -34,7 +34,7 @@ evidence = "TWO readings, and the weaker one came first. IDENTIFIED: WHO_AM_I an
 
 # --- identity ------------------------------------------------------------------------------------
 #
-# ONE BIT APART FROM THE SIBLING'S, which is the whole reason an identity is checked as a SET rather
+# One bit apart from the sibling's, which is the whole reason an identity is checked as a SET rather
 # than compared to a constant a driver was written around: 0xD3 and 0xD4 differ in two bit
 # positions and neither is far from the other, so a driver that accepted "close enough" would accept
 # the wrong part.
@@ -72,7 +72,7 @@ high = 0x69
 # bits one part has is a bit the other part reserves, and a driver that carried either across would
 # be writing a reserved bit rather than getting a no-op.
 #
-# BDU APPEARS NOWHERE IN THIS DOCUMENT, which is worth stating as a fact about the part and not as
+# BDU appears nowhere in this document, which is worth stating as a fact about the part and not as
 # an omission here: there is no bit to set that holds the output registers still between the high
 # and low byte of one sample. What replaces it for a burst read is that the burst is one transfer.
 
@@ -98,9 +98,9 @@ notes = "CTRL_REG4's ST field. Code 2 is given as '--' in the document rather th
 "3" = 2000
 notes = "Degrees per second, as the magnitude of a symmetric range: code 0 is plus or minus 245. The sibling's code 0 is plus or minus 250 for the same 8.75 millidegrees per digit, so the two parts name different ranges over an identical LSB. Codes 2 and 3 both select 2000."
 
-# --- output data rate: DIFFERENT FROM THE SIBLING'S, and the document disagrees with itself ---------
+# --- output data rate: different from the sibling's, and the document disagrees with itself ---------
 #
-# THIS DOCUMENT STATES TWO DIFFERENT RATE SETS FOR THE SAME FOUR CODES. The register description
+# This document states two different rate sets for the same four codes. The register description
 # chapter states 100/200/400/800 Hz twice -- table 21, which maps DR and BW to a rate, and table 26,
 # whose four columns are headed with those same four rates -- and the mechanical characteristics
 # table 3 states 105/208/420/840 Hz for the same parameter. The values below are the ones the
@@ -108,7 +108,7 @@ notes = "Degrees per second, as the magnitude of a symmetric range: code 0 is pl
 # the code a driver writes; the other figure is recorded here so nobody later "corrects" this table
 # from that row without knowing it was read.
 #
-# THE GAP IS ABOUT FIVE PERCENT, WHICH IS THE SIZE THAT DOES NOT LOOK WRONG. A gyroscope's output is
+# The gap is about five percent, which is the size that does not look wrong. A gyroscope's output is
 # a rate, and the thing built out of a rate is an angle, so a driver that integrates samples at an
 # assumed period accumulates the whole of that error and reports a plausible number the entire time.
 # Nothing in either document settles it; counting samples over a known interval on a part would, and

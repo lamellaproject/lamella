@@ -124,12 +124,12 @@ source = "DS40001882D Table 7-1 as printed on page 28: column D (SERCOM-ALT) rea
 
 # --- ADC: the COMPLETE pad-to-AIN map for this die ---------------------------------------------
 #
-# EVERY PAD THE CONVERTER CAN SAMPLE IS HERE, for the reason the EIC section below gives for its
+# Every pad the converter can sample is here, for the reason the EIC section below gives for its
 # lines: which AIN a pad carries is a property of the silicon, not of a board, and the set is bounded
 # -- twenty inputs, one pad each -- so completeness costs one transcription. A board still offers
 # only the pads it wires, by naming them in its adc binding.
 #
-# FUNCTION B IS THE ANALOG COLUMN, and it serves several analog peripherals at once: the ADC's
+# Function B is the analog column, and it serves several analog peripherals at once: the ADC's
 # inputs, the analog comparators' (PA04-PA07 also carry AC AIN[0]-AIN[3]), the touch controller's X
 # and Y lines, the references and the DAC output. So the letter does not say which block a pad
 # reaches; the instance does. Only the ADC's cells are transcribed here, and the rest join when a
@@ -284,30 +284,30 @@ source = "DS40001882D Table 7-1 as printed on page 28: the ADC cell of column B 
 
 # --- EIC: the COMPLETE pad-to-EXTINT map for this die ------------------------------------------
 #
-# EVERY PAD ON THE DIE IS HERE, AND THAT IS THE WHOLE POINT OF THE SECTION. Which EXTINT a pad can
+# Every pad on the die is here, and that is the whole point of the section. Which EXTINT a pad can
 # raise is a property of the silicon, so it does not depend on any board and must not be limited to
 # the pads some particular board happens to wire. This part appears on a great many designs -- more
 # than any catalog enumerates -- and an engineer who prototypes on an evaluation kit and then lays
 # out their own hardware needs every pad, not the subset somebody else used first.
 #
 # The rest of this table is grown as bindings appear, because a pin x function map has hundreds of
-# combinations and most are never used. THIS SECTION IS DIFFERENT AND CHEAPLY SO: a pad has exactly
+# combinations and most are never used. This section is different and cheaply so: a pad has exactly
 # one function-A entry and the set is bounded at 52, so completeness costs one transcription and
 # spares every future design a refusal it could do nothing about.
 #
-# FUNCTION A IS THE EIC COLUMN, so a pad raises its EXTINT only with PINCFG.PMUXEN set and PMUX
+# Function A is the EIC column, so a pad raises its EXTINT only with PINCFG.PMUXEN set and PMUX
 # selecting A.
 #
-# THE LINE IS NOT THE PAD AND A DERIVATION IS WRONG ON SIX PADS. For 45 of the 51 the line is the
+# The line is not the pad and a derivation is wrong on six pads. For 45 of the 51 the line is the
 # pad index modulo sixteen, which is exactly enough to make the rule look right; PA24 raises
 # EXTINT[12] where that says 8, PA25 raises 13 for 9, PA27 raises 15 for 11, PA28 raises 8 for 12,
 # PA30 raises 10 for 14 and PA31 raises 11 for 15.
 #
-# PA08 IS NMI AND NOT AN EXTINT, alone on this die. A consumer treating function A as "the external
+# PA08 is NMI and not an EXTINT, alone on this die. A consumer treating function A as "the external
 # interrupt line" arms the non-maskable interrupt there: unmaskable, absent from INTFLAG, and not
 # serviced by the handler the other sixteen share.
 #
-# SIXTEEN LINES ACROSS 51 PADS MEANS PADS SHARE, and only one of a line's pads can be the live
+# Sixteen lines across 51 pads means pads share, and only one of a line's pads can be the live
 # source. Nothing in the chip reports the competition.
 #
 # Every row: DS40001882D Table 7-1 (A/B/C/D variants), column A

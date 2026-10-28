@@ -8,10 +8,11 @@
 //! to, so a run needs nothing more from its caller than the probe: `--probe <serial>`, or
 //! `LAMELLA_PROBE_SERIAL`, or the only probe attached.
 //!
-//! **THE PROGRAM IS FOLLOWED IN THE BOARD'S MEMORY AND NEVER HALTED.** The image's kernel keeps a
-//! console ring in RAM, at the address the image's ELF gives the symbol `__rhu_console_log`: every
-//! byte the board's console carries, and, once the program has ended, how it ended. The run reads it
-//! through the probe while the program runs.
+//! **THE PROGRAM IS FOLLOWED IN THE BOARD'S MEMORY AND NEVER HALTED.** The image keeps a console
+//! ring in RAM, at the address its ELF gives the symbol `__lamella_console_log`, or
+//! `__rhu_console_log` in an image Lamella RHU built: every byte the board's console carries, and,
+//! once the program has ended, how it ended. The run reads it through the probe while the program
+//! runs.
 //!
 //! **STANDARD OUTPUT IS THE BOARD'S CONSOLE, AND NOTHING OF THIS TOOL'S.** The ring holds the
 //! program's output and its kernel's own lines as they were written, interleaved, and all of it goes
@@ -35,6 +36,8 @@ use lamella_elf::symbols::DataObject;
 use lamella_flash_routes::manifest::{self, Manifest};
 use lamella_flash_routes::placement::{BootloaderChoice, Placement, placement_for};
 use lamella_flash_routes::{Programmer, Programming, prepare_image, programmer_for};
+use lamella_probe_console::{END_MAGICS, LAMELLA_RING, NoRing, ProgramEnd, RHU_RING, RingReader, Seen, TargetMemory};
+use lamella_probe_core::selection::serial_named;
 use std::borrow::Cow;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -56,9 +59,6 @@ const PATIENCE: u32 = 500;
 /// read as this one's.
 const SETTLE: Duration = Duration::from_millis(500);
 
-/// The symbol an image's ELF names its console ring by.
-const RING_SYMBOL: &str = "__rhu_console_log";
-
 /// The option that asks for this run, and names the image's manifest.
 pub(crate) const MANIFEST: &str = "--manifest";
 
@@ -72,7 +72,9 @@ pub(crate) fn run_manifest(options: &[String], after: &[String]) -> Ended {
         verb: "run",
         usage: Some(crate::program::RUN_USAGE),
         values: &[MANIFEST, "--probe", "--timeout"],
+        repeats: &[],
         flags: &[],
+        positional: args::Positional::Own,
     };
     let parsed = match args::parse_or_halt(options, &spec) {
         Ok(parsed) => parsed,
@@ -184,6 +186,26 @@ impl Reach {
             )),
         }
     }
+
+    /// The family of the debug probe this reach goes through, as `lamella devices` names a probe's
+    /// family.
+    fn family(self) -> &'static str {
+        match self {
+            Reach::Rp2350 => crate::devices::CMSIS_DAP,
+            Reach::StLink(_) => crate::devices::ST_LINK,
+        }
+    }
+}
+
+/// The families of debug probe a run by an image's manifest writes `board` through and follows its
+/// program through, by the route [`plan`] takes: none for a board this build cannot run that way.
+pub(crate) fn probe_families(board: &str) -> Vec<&'static str> {
+    programmer_for(board)
+        .ok()
+        .and_then(|row| probe_route(row).ok())
+        .and_then(|route| Reach::of(route, board).ok())
+        .map(|reach| vec![reach.family()])
+        .unwrap_or_default()
 }
 
 /// A run of an image, settled from files alone: what is written where, and what is followed.
@@ -241,6 +263,15 @@ fn plan(image: &Path, time_limit: Option<&str>) -> Result<ImagePlan, String> {
             ));
         }
     };
+    if manifest.model == manifest::INTERPRETER {
+        return Err(format!(
+            "{} is an image Lamella's firmware runs (its manifest's model is {}), and a run by its manifest \
+             writes a native image over a probe.\ndotnet run --device <device> runs the program on a board running \
+             the firmware.",
+            image.display(),
+            manifest::INTERPRETER
+        ));
+    }
     let shipped = std::fs::read(image).map_err(|error| {
         format!(
             "read {}: {error}\nThe image a manifest describes is the file beside it, named as the \
@@ -308,22 +339,24 @@ fn ring_of(manifest: &Manifest, image: &Path, shipped: &[u8]) -> Result<DataObje
         })?;
         (path, Cow::Owned(bytes))
     };
-    let Some(ring) = lamella_elf::symbols::object(&bytes, RING_SYMBOL) else {
-        return Err(format!(
-            "{} names no {RING_SYMBOL}, the console ring a run reads the program's output and its \
-             end from, so\nnothing was written.",
+    match lamella_probe_console::ring_in(&bytes) {
+        Ok((_, ring)) => Ok(ring),
+        Err(NoRing::Neither) => Err(format!(
+            "{} names neither {LAMELLA_RING} nor {RHU_RING}, the console ring a run reads the \
+             program's\noutput and its end from, so nothing was written.",
             elf.display()
-        ));
-    };
-    if ring.size != 0 && ring.size <= ring::HEADER {
-        return Err(format!(
-            "{RING_SYMBOL} in {} is {} bytes, too few for a console ring's header, so nothing was \
+        )),
+        Err(NoRing::Both) => Err(format!(
+            "{} names both {LAMELLA_RING} and {RHU_RING}, so which console ring its program \
+             writes\ncannot be told from it, and nothing was written.",
+            elf.display()
+        )),
+        Err(NoRing::TooSmall { symbol, size }) => Err(format!(
+            "{symbol} in {} is {size} bytes, too few for a console ring's header, so nothing was \
              written.",
-            elf.display(),
-            ring.size
-        ));
+            elf.display()
+        )),
     }
-    Ok(ring)
 }
 
 /// A refusal from the flash routes, without the verb they put in front of it.
@@ -383,7 +416,8 @@ pub(crate) struct Chosen {
 
 /// The probe a run was told to use, or the only one it could mean.
 ///
-/// `named` is `--probe`'s value and `environment` is `LAMELLA_PROBE_SERIAL`'s, in that order. A
+/// `named` is `--probe`'s value and `environment` is `LAMELLA_PROBE_SERIAL`'s, in that order, each a
+/// probe's USB serial number or its id as a device list shows it, `probe:<serial>`. A
 /// named serial must be one of `attached`, since a caller such as `dotnet run --device` passes on
 /// whatever it was given without checking it. With none named, the one probe attached is taken --
 /// on a route through a debugger soldered to the board, the one of that kind -- and with several,
@@ -399,19 +433,18 @@ fn choose_probe(
     route: Programmer,
     attached: &[ProbeFound],
 ) -> Result<Chosen, String> {
-    let wanted = match named {
-        Some(serial) if serial.trim().is_empty() => {
+    let wanted = match named.map(serial_named) {
+        Some("") => {
             return Err("--probe was given no serial number. A probe is named by its USB serial \
                         number, as `lamella devices`\nlists it; a caller that passes an empty one \
                         chose no device."
                 .to_owned());
         }
-        Some(serial) => Some(serial.trim()),
-        None => environment.map(str::trim).filter(|serial| !serial.is_empty()),
+        Some(serial) => Some(serial),
+        None => environment.map(serial_named).filter(|serial| !serial.is_empty()),
     };
-    let fits = |probe: &ProbeFound| route.usb_identity().is_none_or(|identity| probe.usb == identity);
     let Some(serial) = wanted else {
-        let candidates: Vec<&ProbeFound> = attached.iter().filter(|probe| fits(probe)).collect();
+        let candidates: Vec<&ProbeFound> = attached.iter().filter(|probe| fits(route, probe)).collect();
         return match candidates.as_slice() {
             [] => Err(format!(
                 "no debug probe that can write {board} is attached. A run writes the image and reads \
@@ -435,6 +468,23 @@ fn choose_probe(
             )),
         };
     };
+    let probe = named_probe(serial, board, route, attached)?;
+    Ok(Chosen { serial: probe.serial.clone().unwrap_or_default(), probe: probe.clone() })
+}
+
+/// The attached probe whose USB serial number is `serial`, in either case, which must be one that
+/// can write `board` through `route`; or why not. A run takes a probe by it, and so does a write
+/// that names one (`crate::flash`).
+///
+/// # Errors
+/// A serial no attached probe has, naming it beside what is attached; and a probe of another kind
+/// than the one `route` writes through.
+pub(crate) fn named_probe<'a>(
+    serial: &str,
+    board: &str,
+    route: Programmer,
+    attached: &'a [ProbeFound],
+) -> Result<&'a ProbeFound, String> {
     let found = attached
         .iter()
         .find(|probe| probe.serial.as_deref().is_some_and(|own| own.eq_ignore_ascii_case(serial)));
@@ -450,14 +500,19 @@ fn choose_probe(
              lists what is attached."
         ));
     };
-    if !fits(probe) {
+    if !fits(route, probe) {
         return Err(format!(
             "{serial} is {}, and {board} is written through {}.",
             probe.description,
             route.description()
         ));
     }
-    Ok(Chosen { serial: probe.serial.clone().unwrap_or_default(), probe: probe.clone() })
+    Ok(probe)
+}
+
+/// Whether `probe` is of the kind `route` writes through.
+fn fits(route: Programmer, probe: &ProbeFound) -> bool {
+    route.usb_identity().is_none_or(|identity| probe.usb == identity)
 }
 
 /// Probes as a list a person reads: each serial number, then what the probe is.
@@ -470,29 +525,6 @@ fn listing(probes: &[&ProbeFound]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
-}
-
-/// How a program on a board ended, as the board reports it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProgramEnd {
-    /// It returned, or exited, with this code.
-    Returned(i32),
-    /// It was aborted -- by an exception nothing caught, by a fail-fast, or by its kernel -- and
-    /// the board gives this code for it.
-    Aborted(i32),
-}
-
-/// What a console reader found since it was last asked.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum Seen {
-    /// Bytes the board's console carried, as the board wrote them.
-    Out(Vec<u8>),
-    /// This many bytes of the console were overwritten on the board before they could be read.
-    Lost(u64),
-    /// The board started again, and the program with it.
-    Restarted,
-    /// The program ended.
-    Ended(ProgramEnd),
 }
 
 /// Reading what a program on a board prints, and learning that it ended.
@@ -543,7 +575,7 @@ impl Writer for FlashWrite {
         say: &mut dyn FnMut(&str),
     ) -> Result<(), String> {
         let window = plan.window.as_ref().map(|half| (plan.board, half));
-        crate::flash::write_image(plan.route, &plan.placement, &plan.bytes, window, Some(serial), say)
+        crate::flash::write_image(plan.route, plan.board, &plan.placement, &plan.bytes, window, Some(serial), say)
     }
 }
 
@@ -553,7 +585,21 @@ struct BoardConsole;
 impl Attach for BoardConsole {
     fn attach(&mut self, plan: &ImagePlan, probe: &Chosen) -> Result<Box<dyn Console>, String> {
         let memory = live::open(plan.reach, &probe.serial)?;
-        Ok(Box::new(ring::RingConsole::new(memory, plan.ring, ring::END_MAGICS, PATIENCE)))
+        Ok(Box::new(RingConsole { memory, reader: RingReader::new(plan.ring, END_MAGICS, PATIENCE) }))
+    }
+}
+
+/// A program's console ring, followed through the probe session that holds its memory.
+struct RingConsole {
+    /// The board's memory, through the probe.
+    memory: Box<dyn TargetMemory>,
+    /// What has been followed of the ring so far.
+    reader: RingReader,
+}
+
+impl Console for RingConsole {
+    fn poll(&mut self) -> Result<Vec<Seen>, String> {
+        self.reader.poll(self.memory.as_mut())
     }
 }
 
@@ -586,6 +632,10 @@ fn run_planned(
     watch: &mut dyn FnMut() -> bool,
     stop: &dyn Fn() -> bool,
 ) -> Ended {
+    say(
+        err,
+        &crate::own_lines::running_through_probe(&plan.board, &chosen.serial),
+    );
     say(err, &plan.attestation);
     say(err, &format!("read {} from {}", plan.read, plan.image.display()));
     say(err, &format!("probe {}: {}", chosen.serial, chosen.probe.description));
@@ -687,7 +737,7 @@ fn follow(
 /// A board's memory, read through a probe while its program runs.
 mod live {
     use super::Reach;
-    use super::ring::TargetMemory;
+    use lamella_probe_console::TargetMemory;
     use lamella_probe_core::TargetAccess;
 
     /// Opens the memory of the board `reach` reaches, through the probe `serial` names, without
@@ -755,221 +805,8 @@ mod live {
     }
 }
 
-/// The console ring a board's kernel keeps in RAM, read over the probe while the program runs.
-///
-/// Its layout, in little-endian words: a magic, the buffer's size, the count of bytes written since
-/// the board started, and the exit code, then the buffer. The magic is `RLOG` while the program runs
-/// and an end magic once it has ended, one for each way it can end, with the program's code beside
-/// it, whole. The kernel lands each byte at the count modulo the size and then moves the count on,
-/// and never waits for a reader: once the count passes the size, the oldest bytes are gone. At every
-/// start it clears the magic first and writes it last, so a ring a reset left behind never reads as
-/// the new run's once the new run has begun.
-pub(crate) mod ring {
-    use super::{Console, ProgramEnd, Seen};
-    use lamella_elf::symbols::DataObject;
-
-    /// `RLOG`, the magic while the program runs, as its four bytes read as a little-endian word.
-    pub(crate) const RUNNING: u32 = 0x474f_4c52;
-
-    /// The magics that take the place of [`RUNNING`] once a program has ended, one for each way it
-    /// can end.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    pub(crate) struct EndMagics {
-        /// The program returned, or exited, with the code beside it.
-        pub(crate) returned: u32,
-        /// The program was aborted, with the code beside it.
-        pub(crate) aborted: u32,
-    }
-
-    /// The end magics the boards' kernel writes: `RRET` when the program returned, and `RABT` when
-    /// it was aborted.
-    pub(crate) const END_MAGICS: EndMagics = EndMagics { returned: 0x5445_5252, aborted: 0x5442_4152 };
-
-    /// The header's length: four words.
-    pub(crate) const HEADER: u32 = 16;
-
-    /// The largest buffer believed of a ring its image gives no size.
-    const LARGEST: u32 = 1 << 20;
-
-    /// Reading a board's memory through a probe, without halting the board.
-    pub(crate) trait TargetMemory {
-        /// Fills `into` from the board's memory at `address`.
-        ///
-        /// # Errors
-        /// A read the probe could not make.
-        fn read(&mut self, address: u32, into: &mut [u8]) -> Result<(), String>;
-    }
-
-    impl<M: TargetMemory + ?Sized> TargetMemory for Box<M> {
-        fn read(&mut self, address: u32, into: &mut [u8]) -> Result<(), String> {
-            (**self).read(address, into)
-        }
-    }
-
-    /// What the magic says of the program.
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-    enum State {
-        /// It is running.
-        Running,
-        /// It has ended, this way.
-        Ended(ProgramEnd),
-    }
-
-    /// The ring's header, as one read found it.
-    struct Header {
-        state: State,
-        size: u32,
-        written: u32,
-    }
-
-    /// A program's console, read from its ring in a board's memory.
-    pub(crate) struct RingConsole<M> {
-        memory: M,
-        /// Where the ring starts.
-        at: u32,
-        /// How many bytes the image gives the ring, its header included; 0 when it does not say.
-        span: u32,
-        /// The magics that say the program ended.
-        ends: EndMagics,
-        /// The count of bytes already delivered.
-        consumed: u32,
-        /// How many more looks may find no ring before that is an error.
-        patience: u32,
-        /// How many looks a missing ring is waited through.
-        patience_at_start: u32,
-    }
-
-    impl<M: TargetMemory> RingConsole<M> {
-        /// A reader of the ring `ring` names, which knows the program ended by `ends` and waits
-        /// through `patience` looks for a ring the board has not set up yet.
-        pub(crate) fn new(memory: M, ring: DataObject, ends: EndMagics, patience: u32) -> Self {
-            RingConsole {
-                memory,
-                at: ring.address,
-                span: ring.size,
-                ends,
-                consumed: 0,
-                patience,
-                patience_at_start: patience,
-            }
-        }
-
-        /// One read of the header: `None` while the board has not set the ring up.
-        fn header(&mut self) -> Result<Option<Header>, String> {
-            let mut bytes = [0u8; HEADER as usize];
-            self.memory.read(self.at, &mut bytes)?;
-            let word = |index: usize| {
-                u32::from_le_bytes([
-                    bytes[index * 4],
-                    bytes[index * 4 + 1],
-                    bytes[index * 4 + 2],
-                    bytes[index * 4 + 3],
-                ])
-            };
-            let code = word(3) as i32;
-            let state = match word(0) {
-                RUNNING => State::Running,
-                magic if magic == self.ends.returned => State::Ended(ProgramEnd::Returned(code)),
-                magic if magic == self.ends.aborted => State::Ended(ProgramEnd::Aborted(code)),
-                _ => return Ok(None),
-            };
-            let size = word(1);
-            let fits = match self.span {
-                0 => size <= LARGEST,
-                span => u64::from(size) + u64::from(HEADER) <= u64::from(span),
-            };
-            if size == 0 || !fits {
-                return Err(format!(
-                    "the console ring at {:#010x} claims a buffer of {size} bytes, which is not the \
-                     ring the image gives it.",
-                    self.at
-                ));
-            }
-            Ok(Some(Header { state, size, written: word(2) }))
-        }
-
-        /// The count of bytes written, read alone.
-        fn written_now(&mut self) -> Result<u32, String> {
-            let mut bytes = [0u8; 4];
-            self.memory.read(self.at.wrapping_add(8), &mut bytes)?;
-            Ok(u32::from_le_bytes(bytes))
-        }
-
-        /// Everything written since the last drain, onto `seen`.
-        fn drain(&mut self, header: &Header, seen: &mut Vec<Seen>) -> Result<(), String> {
-            if header.written < self.consumed {
-                seen.push(Seen::Restarted);
-                self.consumed = 0;
-            }
-            let pending = header.written - self.consumed;
-            if pending == 0 {
-                return Ok(());
-            }
-            let size = header.size;
-            let mut from = self.consumed;
-            let mut lost = 0;
-            if pending > size {
-                lost = pending - size;
-                from = header.written - size;
-            }
-            let length = header.written - from;
-            let mut bytes = vec![0u8; length as usize];
-            let offset = from % size;
-            let first = length.min(size - offset);
-            let buffer = self.at.wrapping_add(HEADER);
-            self.memory.read(buffer.wrapping_add(offset), &mut bytes[..first as usize])?;
-            if first < length {
-                self.memory.read(buffer, &mut bytes[first as usize..])?;
-            }
-            let after = self.written_now()?;
-            let overwritten = after.saturating_sub(size).saturating_sub(from).min(length);
-            lost += overwritten;
-            if lost > 0 {
-                seen.push(Seen::Lost(u64::from(lost)));
-            }
-            bytes.drain(..overwritten as usize);
-            self.consumed = header.written;
-            if !bytes.is_empty() {
-                seen.push(Seen::Out(bytes));
-            }
-            Ok(())
-        }
-    }
-
-    impl<M: TargetMemory> Console for RingConsole<M> {
-        fn poll(&mut self) -> Result<Vec<Seen>, String> {
-            let Some(mut header) = self.header()? else {
-                if self.patience == 0 {
-                    return Err(format!(
-                        "there is no console ring at {:#010x}: the board has not set one up there, so \
-                         it is not running\nthe image that was written, or the ELF the address came \
-                         from is not that image's.",
-                        self.at
-                    ));
-                }
-                self.patience -= 1;
-                return Ok(Vec::new());
-            };
-            self.patience = self.patience_at_start;
-            if let State::Ended(_) = header.state
-                && let Some(again) = self.header()?
-                && matches!(again.state, State::Ended(_))
-            {
-                header = again;
-            }
-            let mut seen = Vec::new();
-            self.drain(&header, &mut seen)?;
-            if let State::Ended(end) = header.state {
-                seen.push(Seen::Ended(end));
-            }
-            Ok(seen)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::ring::{END_MAGICS, EndMagics, RUNNING, RingConsole, TargetMemory};
     use super::*;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
@@ -1005,12 +842,22 @@ mod tests {
     /// with `size` bytes: the null section, then the symbol table, its strings and the section
     /// names.
     fn elf_naming(name: &str, address: u32, size: u32) -> Vec<u8> {
-        let strings = format!("\0{name}\0").into_bytes();
+        elf_naming_each(&[(name, address, size)])
+    }
+
+    /// As [`elf_naming`], with each `(name, address, size)` of `objects` named in turn.
+    fn elf_naming_each(objects: &[(&str, u32, u32)]) -> Vec<u8> {
+        let mut strings = vec![0u8];
         let mut symbols = vec![0u8; 16];
-        for word in [1u32, address, size] {
-            symbols.extend_from_slice(&word.to_le_bytes());
+        for (name, address, size) in objects {
+            let named_at = strings.len() as u32;
+            strings.extend_from_slice(name.as_bytes());
+            strings.push(0);
+            for word in [named_at, *address, *size] {
+                symbols.extend_from_slice(&word.to_le_bytes());
+            }
+            symbols.extend_from_slice(&[0x11, 0, 1, 0]);
         }
-        symbols.extend_from_slice(&[0x11, 0, 1, 0]);
         let names: &[u8] = b"\0.symtab\0.strtab\0.shstrtab\0";
         let mut elf = vec![0u8; 52];
         elf[..4].copy_from_slice(&[0x7F, b'E', b'L', b'F']);
@@ -1046,11 +893,11 @@ mod tests {
     fn image_with_manifest(dir: &Path, name: &str, image: &[u8], board: &str, base: &str, extra: &str) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, image).expect("write the image");
-        std::fs::write(dir.join("app.elf"), elf_naming(RING_SYMBOL, RING_AT, RING_BYTES)).expect("write the ELF");
+        std::fs::write(dir.join("app.elf"), elf_naming(RHU_RING, RING_AT, RING_BYTES)).expect("write the ELF");
         std::fs::write(
             manifest::path_for(&path),
             format!(
-                "{{\"schema\":1,\"kind\":\"flash-image\",\"board\":\"{board}\",\"format\":\"bin\",\
+                "{{\"schema\":1,\"kind\":\"flash-image\",\"model\":\"native\",\"board\":\"{board}\",\"format\":\"bin\",\
                  \"base\":\"{base}\",\"sha256\":\"{}\",\"bytes\":{},\"producer\":\"a test\"{extra}}}",
                 digest(image),
                 image.len()
@@ -1063,6 +910,20 @@ mod tests {
     /// A Pico 2 image with a manifest naming its ELF.
     fn pico2_with_manifest(dir: &Path, extra: &str) -> PathBuf {
         image_with_manifest(dir, "app.bin", &pico2_image(), "rpi-pico2", "0x10000000", &format!(",\"elf\":\"app.elf\"{extra}"))
+    }
+
+    /// **AN IMAGE LAMELLA's FIRMWARE RUNS IS NOT WRITTEN OVER A PROBE**: its record's model is the
+    /// interpreter's, and the refusal says how such an image is run, before anything is read beside it.
+    #[test]
+    fn an_interpreters_image_is_refused_naming_dotnet_run() {
+        let dir = scratch("lmli");
+        let image = dir.join("app.lmli");
+        let bytes = b"a baked image".to_vec();
+        std::fs::write(&image, &bytes).expect("write the image");
+        manifest::write(&image, &manifest::for_lmli("rpi-pico2", &bytes, "a test")).expect("write the manifest");
+        let refusal = plan(&image, None).err().expect("refused");
+        assert!(refusal.contains("an image Lamella's firmware runs") && refusal.contains("dotnet run --device <device>"), "{refusal}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **WITHOUT ITS MANIFEST AN IMAGE IS NOT RUN**, and the refusal names the manifest it looked
@@ -1153,11 +1014,38 @@ mod tests {
 
         std::fs::write(dir.join("app.elf"), elf_naming("other_symbol", RING_AT, RING_BYTES)).expect("an ELF");
         let refusal = plan(&missing, None).err().expect("refused");
-        assert!(refusal.contains("names no __rhu_console_log"), "{refusal}");
+        assert!(refusal.contains("names neither __lamella_console_log nor __rhu_console_log"), "{refusal}");
 
-        std::fs::write(dir.join("app.elf"), elf_naming(RING_SYMBOL, RING_AT, 16)).expect("an ELF");
+        std::fs::write(dir.join("app.elf"), elf_naming(RHU_RING, RING_AT, 16)).expect("an ELF");
         let refusal = plan(&missing, None).err().expect("refused");
         assert!(refusal.contains("too few for a console ring's header"), "{refusal}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **A LAMELLA IMAGE IS FOLLOWED AT ITS OWN RING**: its ELF names `__lamella_console_log`, and
+    /// the ring is taken from there as an RHU image's is taken from `__rhu_console_log`.
+    #[test]
+    fn a_lamella_image_is_followed_at_its_own_ring() {
+        let dir = scratch("lamella-ring");
+        let image = pico2_with_manifest(&dir, "");
+        std::fs::write(dir.join("app.elf"), elf_naming("__lamella_console_log", RING_AT, RING_BYTES))
+            .expect("an ELF");
+        let planned = plan(&image, None).expect("planned");
+        assert_eq!(planned.ring, DataObject { address: RING_AT, size: RING_BYTES });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **AN ELF THAT NAMES BOTH RINGS IS REFUSED**: the file cannot say which one the program
+    /// writes, and following the other would wait on a ring nothing writes.
+    #[test]
+    fn an_elf_naming_both_rings_is_refused() {
+        let dir = scratch("both-rings");
+        let image = pico2_with_manifest(&dir, "");
+        let both = [("__lamella_console_log", RING_AT, RING_BYTES), ("__rhu_console_log", 0x2003_0000, RING_BYTES)];
+        std::fs::write(dir.join("app.elf"), elf_naming_each(&both)).expect("an ELF");
+        let refusal = plan(&image, None).err().expect("refused");
+        assert!(refusal.contains("__lamella_console_log") && refusal.contains("__rhu_console_log"), "{refusal}");
+        assert!(refusal.contains("nothing was written"), "{refusal}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1222,19 +1110,19 @@ mod tests {
     fn bench() -> Vec<ProbeFound> {
         vec![
             ProbeFound {
-                serial: Some("E6614103E7176B2F".to_owned()),
+                serial: Some("E6610000000000B2".to_owned()),
                 description: "Debugprobe on Pico (CMSIS-DAP)".to_owned(),
                 usb: (0x2e8a, 0x000c),
                 ports: vec!["COM12".to_owned()],
             },
             ProbeFound {
-                serial: Some("E6614C311B4C7E2A".to_owned()),
+                serial: Some("E6610000000000C3".to_owned()),
                 description: "Debugprobe on Pico (CMSIS-DAP)".to_owned(),
                 usb: (0x2e8a, 0x000c),
                 ports: Vec::new(),
             },
             ProbeFound {
-                serial: Some("066DFF555051897267143327".to_owned()),
+                serial: Some("066D000000000000000000C1".to_owned()),
                 description: "ST-LINK/V2-1".to_owned(),
                 usb: (lamella_stlink::ST_VENDOR_ID, 0x374b),
                 ports: vec!["COM7".to_owned()],
@@ -1258,12 +1146,12 @@ mod tests {
     /// whatever id it was given; the refusal lists what is attached.
     #[test]
     fn a_named_probe_must_be_attached_and_the_refusal_lists_what_is() {
-        let chosen = choose_probe(Some("e6614103e7176b2f"), None, "rpi-pico2", pico_route(), &bench())
+        let chosen = choose_probe(Some("e6610000000000b2"), None, "rpi-pico2", pico_route(), &bench())
             .expect("named, in any case");
-        assert_eq!(chosen.serial, "E6614103E7176B2F", "the probe's own spelling");
+        assert_eq!(chosen.serial, "E6610000000000B2", "the probe's own spelling");
         let refusal = choose_probe(Some("NOT-A-PROBE"), None, "rpi-pico2", pico_route(), &bench())
             .expect_err("refused");
-        assert!(refusal.contains("NOT-A-PROBE") && refusal.contains("E6614C311B4C7E2A"), "{refusal}");
+        assert!(refusal.contains("NOT-A-PROBE") && refusal.contains("E6610000000000C3"), "{refusal}");
         let none = choose_probe(Some("X"), None, "rpi-pico2", pico_route(), &[]).expect_err("refused");
         assert!(none.contains("No debug probe is attached"), "{none}");
     }
@@ -1277,16 +1165,34 @@ mod tests {
         assert!(refusal.contains("no serial number"), "{refusal}");
     }
 
+    /// **A PROBE'S ID FROM THE DEVICE LIST NAMES IT**, on the command line and in the environment
+    /// alike, since a person pastes the id `dotnet run --list-devices` shows; the id with no serial
+    /// after it is no name.
+    #[test]
+    fn a_probe_is_named_by_the_id_the_device_list_gives_it() {
+        let named = choose_probe(Some("probe:E6610000000000B2"), None, "rpi-pico2", pico_route(), &bench())
+            .expect("named by its id");
+        assert_eq!(named.serial, "E6610000000000B2");
+        let from_environment =
+            choose_probe(None, Some("probe:e6610000000000c3"), "rpi-pico2", pico_route(), &bench()).expect("chosen");
+        assert_eq!(from_environment.serial, "E6610000000000C3", "the probe's own spelling");
+        let empty = choose_probe(Some("probe:"), None, "rpi-pico2", pico_route(), &bench()[..1]).expect_err("refused");
+        assert!(empty.contains("no serial number"), "{empty}");
+        let unknown = choose_probe(Some("probe:NOT-A-PROBE"), None, "rpi-pico2", pico_route(), &bench())
+            .expect_err("refused");
+        assert!(unknown.contains("serial number NOT-A-PROBE."), "the serial it looked for: {unknown}");
+    }
+
     /// The environment names a probe when the command line does not, and the command line wins.
     #[test]
     fn the_environment_names_a_probe_when_the_command_line_does_not() {
         let from_environment =
-            choose_probe(None, Some("E6614C311B4C7E2A"), "rpi-pico2", pico_route(), &bench()).expect("chosen");
-        assert_eq!(from_environment.serial, "E6614C311B4C7E2A");
+            choose_probe(None, Some("E6610000000000C3"), "rpi-pico2", pico_route(), &bench()).expect("chosen");
+        assert_eq!(from_environment.serial, "E6610000000000C3");
         let named =
-            choose_probe(Some("E6614103E7176B2F"), Some("E6614C311B4C7E2A"), "rpi-pico2", pico_route(), &bench())
+            choose_probe(Some("E6610000000000B2"), Some("E6610000000000C3"), "rpi-pico2", pico_route(), &bench())
                 .expect("chosen");
-        assert_eq!(named.serial, "E6614103E7176B2F");
+        assert_eq!(named.serial, "E6610000000000B2");
     }
 
     /// **WITH NONE NAMED, ONE PROBE IS TAKEN AND SEVERAL ARE NEVER GUESSED BETWEEN** -- and on a
@@ -1296,9 +1202,9 @@ mod tests {
         let several = choose_probe(None, None, "rpi-pico2", pico_route(), &bench()).expect_err("refused");
         assert!(several.contains("3 probes") && several.contains("LAMELLA_PROBE_SERIAL"), "{several}");
         let st_link = choose_probe(None, None, "st-stm32f769i-disco", f769_route(), &bench()).expect("the ST-LINK");
-        assert_eq!(st_link.serial, "066DFF555051897267143327");
+        assert_eq!(st_link.serial, "066D000000000000000000C1");
         assert_eq!(st_link.probe.ports, ["COM7"], "and the serial port it carries");
-        let wrong = choose_probe(Some("E6614103E7176B2F"), None, "st-stm32f769i-disco", f769_route(), &bench())
+        let wrong = choose_probe(Some("E6610000000000B2"), None, "st-stm32f769i-disco", f769_route(), &bench())
             .expect_err("refused");
         assert!(wrong.contains("Debugprobe") && wrong.contains("ST-LINK"), "{wrong}");
     }
@@ -1474,7 +1380,7 @@ mod tests {
     fn a_whole_run_writes_then_follows_and_ends_with_the_programs_code() {
         let dir = scratch("whole-run");
         let planned = planned_pico(&dir, "");
-        let chosen = choose_probe(Some("E6614103E7176B2F"), None, "rpi-pico2", planned.route, &bench())
+        let chosen = choose_probe(Some("E6610000000000B2"), None, "rpi-pico2", planned.route, &bench())
             .expect("chosen");
         let steps: Steps = Rc::default();
         let console = scripted(vec![Ok(vec![Seen::Out(b"42\n".to_vec()), Seen::Ended(ProgramEnd::Returned(7))])]);
@@ -1492,11 +1398,16 @@ mod tests {
         assert_eq!(String::from_utf8(out).expect("text"), "42\n", "standard output is the board's alone");
         assert_eq!(
             steps.borrow().as_slice(),
-            ["write 512 B through E6614103E7176B2F", "follow through E6614103E7176B2F", "watch Ctrl+C"]
+            ["write 512 B through E6610000000000B2", "follow through E6610000000000B2", "watch Ctrl+C"]
         );
         let err = String::from_utf8(err).expect("text");
         assert!(err.lines().all(|line| line.starts_with("lamella:")), "every line of ours is marked:\n{err}");
-        assert!(err.contains("lamella: probe E6614103E7176B2F: Debugprobe on Pico (CMSIS-DAP)"), "{err}");
+        assert_eq!(
+            err.lines().next(),
+            Some("lamella: running the native image for rpi-pico2 through probe E6610000000000B2."),
+            "the run says how the program runs first:\n{err}"
+        );
+        assert!(err.contains("lamella: probe E6610000000000B2: Debugprobe on Pico (CMSIS-DAP)"), "{err}");
         assert!(err.contains("lamella: writing over a test's probe..."), "the write's own lines: {err}");
         assert!(!err.contains("console off"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1507,7 +1418,7 @@ mod tests {
     fn a_failed_write_ends_the_run_and_follows_nothing() {
         let dir = scratch("failed-write");
         let planned = planned_pico(&dir, "");
-        let chosen = choose_probe(None, Some("E6614103E7176B2F"), "rpi-pico2", planned.route, &bench())
+        let chosen = choose_probe(None, Some("E6610000000000B2"), "rpi-pico2", planned.route, &bench())
             .expect("chosen");
         let steps: Steps = Rc::default();
         let mut writer = FakeWriter { steps: Rc::clone(&steps), fails: true };
@@ -1527,7 +1438,7 @@ mod tests {
     fn the_ring_is_first_looked_at_a_settle_after_the_write() {
         let dir = scratch("settle");
         let planned = planned_pico(&dir, "");
-        let chosen = choose_probe(Some("E6614103E7176B2F"), None, "rpi-pico2", planned.route, &bench())
+        let chosen = choose_probe(Some("E6610000000000B2"), None, "rpi-pico2", planned.route, &bench())
             .expect("chosen");
         let clock = clock();
         let first = Rc::new(Cell::new(None));
@@ -1553,7 +1464,7 @@ mod tests {
         let dir = scratch("console-off");
         let planned = planned_pico(&dir, ",\"console_channel\":\"off\"");
         assert!(planned.console_off);
-        let chosen = choose_probe(Some("E6614103E7176B2F"), None, "rpi-pico2", planned.route, &bench())
+        let chosen = choose_probe(Some("E6610000000000B2"), None, "rpi-pico2", planned.route, &bench())
             .expect("chosen");
         let steps: Steps = Rc::default();
         let console = scripted(vec![Ok(vec![Seen::Ended(ProgramEnd::Returned(0))])]);
@@ -1568,219 +1479,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A board's RAM holding a console ring, with the kernel's writer.
-    struct Ram {
+    /// A board's RAM as one block at `at`, as a test arranges it before the run follows it.
+    struct Block {
         at: u32,
         bytes: Vec<u8>,
-        /// Text the board writes the moment a read of the buffer (not the header) completes.
-        during_reads: VecDeque<Vec<u8>>,
-        /// A header to hand back, once, in place of the next header read: a read whose words were
-        /// taken across an end's two stores.
-        torn: Option<[u8; 16]>,
     }
 
-    impl Ram {
-        /// A ring of `size` bytes at `at`, armed as a start arms it.
-        fn armed(at: u32, size: u32) -> Ram {
-            let mut ram = Ram { at, bytes: vec![0; 16 + size as usize], during_reads: VecDeque::new(), torn: None };
-            ram.set_word(1, size);
-            ram.set_word(0, RUNNING);
-            ram
-        }
-
-        fn word(&self, index: usize) -> u32 {
-            let at = index * 4;
-            u32::from_le_bytes([self.bytes[at], self.bytes[at + 1], self.bytes[at + 2], self.bytes[at + 3]])
-        }
-
-        fn set_word(&mut self, index: usize, value: u32) {
-            self.bytes[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
-        }
-
-        /// The kernel's tee: each byte lands at the count modulo the size, then the count moves.
-        fn emit(&mut self, text: &[u8]) {
-            let size = self.word(1);
-            for &byte in text {
-                let written = self.word(2);
-                self.bytes[16 + (written % size) as usize] = byte;
-                self.set_word(2, written.wrapping_add(1));
-            }
-        }
-
-        /// The kernel's end: the code, whole, then the end magic in place of `RLOG`.
-        fn end(&mut self, magic: u32, code: i32) {
-            self.set_word(3, code as u32);
-            self.set_word(0, magic);
-        }
-    }
-
-    impl TargetMemory for Rc<RefCell<Ram>> {
+    impl TargetMemory for Block {
         fn read(&mut self, address: u32, into: &mut [u8]) -> Result<(), String> {
-            let mut ram = self.borrow_mut();
-            let start = (address - ram.at) as usize;
-            if start == 0
-                && into.len() == 16
-                && let Some(torn) = ram.torn.take()
-            {
-                into.copy_from_slice(&torn);
-                return Ok(());
-            }
-            into.copy_from_slice(&ram.bytes[start..start + into.len()]);
-            if start >= 16
-                && let Some(text) = ram.during_reads.pop_front()
-            {
-                ram.emit(&text);
-            }
+            let start = (address - self.at) as usize;
+            into.copy_from_slice(&self.bytes[start..start + into.len()]);
             Ok(())
         }
     }
 
-    fn reader_with(ram: &Rc<RefCell<Ram>>, ends: EndMagics) -> RingConsole<Rc<RefCell<Ram>>> {
-        let (at, span) = {
-            let ram = ram.borrow();
-            (ram.at, ram.bytes.len() as u32)
-        };
-        RingConsole::new(Rc::clone(ram), DataObject { address: at, size: span }, ends, 3)
-    }
-
-    fn reader(ram: &Rc<RefCell<Ram>>) -> RingConsole<Rc<RefCell<Ram>>> {
-        reader_with(ram, END_MAGICS)
-    }
-
-    /// **THE RING IS READ AS THE KERNEL WRITES IT**: what is new since the last look, across the
-    /// buffer's end, and the program's end only after its last bytes.
-    #[test]
-    fn the_ring_delivers_what_is_new_across_its_end_and_then_the_programs_end() {
-        let ram = Rc::new(RefCell::new(Ram::armed(0x2000_8000, 8)));
-        let mut console = reader(&ram);
-        assert_eq!(console.poll(), Ok(Vec::new()), "nothing written yet");
-        ram.borrow_mut().emit(b"hello");
-        assert_eq!(console.poll(), Ok(vec![Seen::Out(b"hello".to_vec())]));
-        ram.borrow_mut().emit(b" world");
-        assert_eq!(console.poll(), Ok(vec![Seen::Out(b" world".to_vec())]), "across the buffer's end");
-        ram.borrow_mut().emit(b"!");
-        ram.borrow_mut().end(END_MAGICS.returned, 3);
-        assert_eq!(
-            console.poll(),
-            Ok(vec![Seen::Out(b"!".to_vec()), Seen::Ended(ProgramEnd::Returned(3))]),
-            "the last byte, then the end"
-        );
-    }
-
-    /// **THE CODE COMES BACK WHOLE**, past a byte and past sixteen bits, negative too, for either
-    /// way a program ends.
-    #[test]
-    fn the_code_beside_an_end_magic_is_the_whole_word() {
-        let cases = [
-            (END_MAGICS.returned, 70_000, ProgramEnd::Returned(70_000)),
-            (END_MAGICS.returned, i32::MAX, ProgramEnd::Returned(i32::MAX)),
-            (END_MAGICS.returned, -1, ProgramEnd::Returned(-1)),
-            (END_MAGICS.aborted, 134, ProgramEnd::Aborted(134)),
-            (END_MAGICS.aborted, i32::MIN, ProgramEnd::Aborted(i32::MIN)),
-        ];
-        for (magic, code, end) in cases {
-            let ram = Rc::new(RefCell::new(Ram::armed(0x2000_8000, 32)));
-            ram.borrow_mut().end(magic, code);
-            assert_eq!(reader(&ram).poll(), Ok(vec![Seen::Ended(end)]), "{magic:#x} beside {code}");
-        }
-    }
-
-    /// **A CODE BESIDE `RLOG` IS NO END**: it is the instant between an end's two stores, and the
-    /// program has not ended until the magic says so.
-    #[test]
-    fn a_code_beside_the_running_magic_is_not_an_end() {
-        let ram = Rc::new(RefCell::new(Ram::armed(0x2000_8000, 32)));
-        ram.borrow_mut().emit(b"still going");
-        ram.borrow_mut().set_word(3, 42);
-        assert_eq!(reader(&ram).poll(), Ok(vec![Seen::Out(b"still going".to_vec())]));
-    }
-
-    /// **AN END IS READ AGAIN BEFORE IT IS TAKEN**: a header whose words were read across the end's
-    /// two stores carries an end magic beside an old code and count, and the second read is final.
-    #[test]
-    fn an_end_is_read_again_so_its_code_and_count_are_final() {
-        let ram = Rc::new(RefCell::new(Ram::armed(0x2000_8000, 32)));
-        let mut torn = [0u8; 16];
-        for (index, word) in [END_MAGICS.returned, 32, 2, 0].into_iter().enumerate() {
-            torn[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
-        }
-        ram.borrow_mut().emit(b"done\n");
-        ram.borrow_mut().end(END_MAGICS.returned, 7);
-        ram.borrow_mut().torn = Some(torn);
-        assert_eq!(
-            reader(&ram).poll(),
-            Ok(vec![Seen::Out(b"done\n".to_vec()), Seen::Ended(ProgramEnd::Returned(7))])
-        );
-    }
-
-    /// **THE END MAGICS ARE THE ONES THE READER WAS GIVEN**: under another spelling the board's
-    /// `RRET` is no end, and the given one is.
-    #[test]
-    fn the_end_magics_are_injected() {
-        let other = EndMagics { returned: 0x1111_1111, aborted: 0x2222_2222 };
-        let ram = Rc::new(RefCell::new(Ram::armed(0x2000_8000, 32)));
-        ram.borrow_mut().end(END_MAGICS.returned, 5);
-        assert_eq!(reader_with(&ram, other).poll(), Ok(Vec::new()), "not a ring this reader knows yet");
-        ram.borrow_mut().end(other.aborted, 9);
-        assert_eq!(reader_with(&ram, other).poll(), Ok(vec![Seen::Ended(ProgramEnd::Aborted(9))]));
-    }
-
-    /// **WHAT THE BOARD OVERWROTE BEFORE IT COULD BE READ IS COUNTED, NOT SHOWN** -- whether it was
-    /// gone before the look or went while the look was reading it.
-    #[test]
-    fn bytes_the_board_overwrote_are_counted_rather_than_shown() {
-        let ram = Rc::new(RefCell::new(Ram::armed(0x2000_8000, 8)));
-        let mut console = reader(&ram);
-        ram.borrow_mut().emit(b"0123456789AB");
-        assert_eq!(console.poll(), Ok(vec![Seen::Lost(4), Seen::Out(b"456789AB".to_vec())]));
-
-        ram.borrow_mut().emit(b"CDEFGH");
-        ram.borrow_mut().during_reads.push_back(b"IJKLMN".to_vec());
-        assert_eq!(console.poll(), Ok(vec![Seen::Lost(4), Seen::Out(b"GH".to_vec())]));
-        assert_eq!(console.poll(), Ok(vec![Seen::Out(b"IJKLMN".to_vec())]), "and they are read next");
-    }
-
-    /// **A COUNT THAT GOES BACKWARDS IS A NEW START**, followed from its beginning.
-    #[test]
-    fn a_ring_set_up_again_is_a_new_start() {
-        let ram = Rc::new(RefCell::new(Ram::armed(0x2000_8000, 16)));
-        let mut console = reader(&ram);
-        ram.borrow_mut().emit(b"first boot");
-        assert_eq!(console.poll(), Ok(vec![Seen::Out(b"first boot".to_vec())]));
-        ram.borrow_mut().set_word(2, 0);
-        ram.borrow_mut().emit(b"again");
-        assert_eq!(console.poll(), Ok(vec![Seen::Restarted, Seen::Out(b"again".to_vec())]));
-    }
-
-    /// **A RING NOT SET UP YET IS WAITED FOR, BRIEFLY**, and then reported where it was looked for;
-    /// a header that claims a bigger buffer than the image gives the ring is no ring's.
-    #[test]
-    fn a_ring_that_never_appears_is_reported_where_it_was_looked_for() {
-        let ram = Rc::new(RefCell::new(Ram::armed(0x2000_8000, 8)));
-        ram.borrow_mut().set_word(0, 0);
-        let mut console = reader(&ram);
-        for _ in 0..3 {
-            assert_eq!(console.poll(), Ok(Vec::new()));
-        }
-        let error = console.poll().expect_err("no ring");
-        assert!(error.contains("0x20008000"), "{error}");
-
-        let ram = Rc::new(RefCell::new(Ram::armed(0x2000_8000, 8)));
-        ram.borrow_mut().set_word(1, 9);
-        assert!(reader(&ram).poll().expect_err("no ring").contains("not the ring the image gives it"));
-        ram.borrow_mut().set_word(1, 0x0100_0000);
-        let no_size = DataObject { address: 0x2000_8000, size: 0 };
-        let mut console = RingConsole::new(Rc::clone(&ram), no_size, END_MAGICS, 3);
-        assert!(console.poll().expect_err("no ring").contains("not the ring the image gives it"));
-    }
-
-    /// An aborted program arrives as the run's end like any other.
+    /// **AN ABORTED PROGRAM, READ FROM ITS RING, ENDS THE RUN WITH ONE AND SAYS SO**: the ring's
+    /// text on standard output, and its code in the sentence on standard error.
     #[test]
     fn an_aborted_program_arrives_through_its_end_magic() {
-        let ram = Rc::new(RefCell::new(Ram::armed(0x2000_8000, 32)));
-        let mut console = reader(&ram);
-        ram.borrow_mut().emit(b"Unhandled exception.\n");
-        ram.borrow_mut().end(END_MAGICS.aborted, 134);
+        let text = b"Unhandled exception.\n";
+        let mut bytes = vec![0u8; 16 + 32];
+        for (index, word) in [END_MAGICS.aborted, 32, text.len() as u32, 134].into_iter().enumerate() {
+            bytes[index * 4..index * 4 + 4].copy_from_slice(&word.to_le_bytes());
+        }
+        bytes[16..16 + text.len()].copy_from_slice(text);
+        let ring = DataObject { address: 0x2000_8000, size: bytes.len() as u32 };
+        let memory = Box::new(Block { at: 0x2000_8000, bytes });
+        let mut console = RingConsole { memory, reader: RingReader::new(ring, END_MAGICS, 3) };
         let (ended, out, err) = followed_to_end(&mut console, None, &|| false);
         assert_eq!((ended, out.as_str()), (Ended::Uncaught, "Unhandled exception.\n"));
         assert!(err.contains("code 134"), "{err}");

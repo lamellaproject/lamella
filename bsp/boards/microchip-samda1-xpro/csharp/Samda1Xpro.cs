@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Microchip
 {
-    public sealed class Samda1Xpro
+    internal sealed class Samda1Xpro
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = MicrochipSamda1XproBindings.BOARD_MODEL;
@@ -21,7 +21,7 @@ namespace Lamella.Boards.Microchip
             Samda1GpioDriver.LogicalPin(MicrochipSamda1XproBindings.BUTTON0_PORT_BASE, MicrochipSamda1XproBindings.BUTTON0_PIN);
 
         /// <summary>The mode the user button wants.</summary>
-        /// <remarks>THIS KIT'S GUIDE DOES NOT SAY WHETHER AN EXTERNAL PULL-UP IS FITTED, where the
+        /// <remarks>This kit's guide does not say whether an external pull-up is fitted, where the
         /// Curiosity Nano guides state outright that none is. <see cref="PinMode.InputPullUp"/> is
         /// nevertheless the right answer under BOTH readings, which is why it can be offered without
         /// settling the question: if the board fits no pull-up the internal one is required, and if
@@ -44,7 +44,7 @@ namespace Lamella.Boards.Microchip
         private static GpioDriver MakeGpio() { return new Samda1GpioDriver(); }
 
         /// <summary>The family PORT driver this board bound.</summary>
-        /// <remarks>THE DRIVER SPANS BOTH PORT GROUPS AND THIS PACKAGE BONDS PART OF EACH. A pin
+        /// <remarks>The driver spans both port groups and this package bonds part of each. A pin
         /// number the package does not carry is addressable and connected to nothing, which is why
         /// the constants above name only pads this board's own guide names. Two pads want care if
         /// anything ever binds them: PA24 and PA25 are the USB pair, they have no drive-strength

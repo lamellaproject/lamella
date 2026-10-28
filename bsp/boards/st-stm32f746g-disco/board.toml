@@ -25,7 +25,7 @@ baud = 115200
 plan = "hsi-16mhz"
 default = true
 
-# THE TWO VCP PINS SIT ON DIFFERENT GPIO PORTS -- PA9 transmits, PB7 receives. That is unusual
+# The two VCP pins sit on different GPIO ports -- PA9 transmits, PB7 receives. That is unusual
 # enough to call out: every other uart binding here has both pins on one port, and it is the reason
 # this binding resolves per-pin port facts rather than one shared set.
 [[bindings]]
@@ -36,14 +36,11 @@ function = "AF7"
 tx = { pin = "PA9" }
 rx = { pin = "PB7" }
 
-# THE BOARD MANUAL DISAGREES WITH ITSELF ABOUT THIS BUS, AND SILICON SETTLED IT. Its prose says
-# the audio codec shares a bus with the camera module and the I2C extension connector, which reads
-# as I2C1 -- the extension connector is PB8/PB9. Its own pin table says I2C3_SCL is PH7 and
-# I2C3_SDA is PH8. Both cannot be true.
-#
-# A run walked every address of BOTH buses. I2C1 answered nothing, which is the right answer for a
-# connector with nothing plugged into it; I2C3 answered at 0x1A. THE PIN TABLE WINS, and that is
-# the rule to carry forward for this document rather than a one-off correction.
+# The board manual disagrees with itself about this bus. Its prose says the audio codec shares a
+# bus with the camera module and the I2C extension connector, which reads as I2C1 -- the
+# extension connector is PB8/PB9. Its own pin table says I2C3_SCL is PH7 and I2C3_SDA is PH8.
+# Both cannot be true, and the pin table is right: the codec answers at 0x1A on I2C3. Where this
+# document's prose and its pin table disagree, the pin table wins.
 [[bindings]]
 role = "codec-i2c"
 kind = "i2c"
@@ -52,16 +49,16 @@ function = "AF4"
 scl = { pin = "PH7" }
 sda = { pin = "PH8" }
 
-# THE CODEC DOES NOT HAVE THIS BUS TO ITSELF: PH7 carries both AUDIO_SCL and LCD_SCL, and PH8 both
+# The codec does not have this bus to itself: PH7 carries both AUDIO_SCL and LCD_SCL, and PH8 both
 # AUDIO_SDA and LCD_SDA, so the display's capacitive touch controller sits here too and answers at
 # 0x38. That controller is deliberately not a row below -- this board's manual records the display
 # as changing between board revisions, and an address alone does not identify a part. What a driver
 # needs from it is here: a bus check on this instance meets a second device, and holding the bus
 # for a long codec sequence delays touch reporting.
 
-# THE BOARD IS ITS OWN ORACLE FOR THIS BUS, which is worth stating because almost no board is.
+# The board is its own oracle for this bus, which is worth stating because almost no board is.
 # The codec is soldered on, so a bus check here needs nothing plugged in and nothing wired -- and
-# its register 0 reads back a value that SPELLS ITS OWN PART NUMBER. A value like that cannot be
+# its register 0 reads back a value that spells its own part number. A value like that cannot be
 # matched by accident, so reporting it proves the controller addressed a real device, clocked it,
 # turned the bus around with a repeated start, and read two bytes back. It is a positive control,
 # and a bus scan that has only ever reported nothing cannot tell "empty" from "broken" without one.
@@ -72,14 +69,14 @@ role = "codec-i2c"
 address = 0x1A
 source = "UM1907 Rev 7 section 6.8 (the board carries an audio codec) with its pin assignment table (I2C3_SCL = PH7, I2C3_SDA = PH8), the two read together and the pin table preferred where they conflict. Corroborated by the MB1191 schematic rev B-03, which routes AUDIO_SCL to PH7 and AUDIO_SDA to PH8 and states the part's default address as 00110100, the eight-bit write form of 0x1A. Found on silicon: 100 trials of 100 walked all 112 addresses of both buses, with a device answering at 0x1A whose register 0 reads 0x8994; the negative control disconnected the bus lines and failed 5 times out of 5."
 
-# THIS BUS IS BROUGHT OUT THREE TIMES ON THE SAME TWO PINS, and that is the fact to have before
+# This bus is brought out three times on the same two pins, and that is the fact to have before
 # wiring anything: PB8 carries EXT_SCL, DCMI_SCL and ARD_D15, and PB9 carries EXT_SDA, DCMI_SDA
 # and ARD_D14. So the I2C extension connector, the camera module connector and the Arduino
 # header's dedicated SDA/SCL pair are ONE bus -- a device on any of the three shares an address
 # space with devices on the other two, and none of them can be addressed independently.
 #
-# NOT THE ARDUINO CONVENTION, which is the trap a shield brings with it: on an Uno the ANALOG pins
-# A4 and A5 carry I2C. AS THIS BOARD IS BUILT THEY DO NOT. Each analog pin has a PAIR of solder
+# Not the Arduino convention, which is the trap a shield brings with it: on an Uno the ANALOG pins
+# A4 and A5 carry I2C. As this board is built they do not. Each analog pin has a PAIR of solder
 # bridges and exactly one of each pair is fitted -- A4 takes PF7 (ADC3_IN5) through SB5 and not PB9
 # through SB4, A5 takes PF6 (ADC3_IN4) through SB3 and not PB8 through SB1. A shield driving I2C on
 # its analog pins therefore reaches two ADC inputs. The alternative routing exists as unfitted
@@ -104,29 +101,29 @@ sda = { pin = "PB9" }
 
 # --- the expansion socket -----------------------------------------------------------------------
 #
-# THE SOCKET IS BOARD TRUTH AND WHAT IS PLUGGED INTO IT IS NOT. Four connectors carry one standard
+# The socket is board truth and what is plugged into it is not. Four connectors carry one standard
 # header between them, it is on the schematic, and it is identical on every unit -- so it is stated
 # here. Which shield is in it today is not a property of this board and appears nowhere below.
 #
-# A SOCKET IS NOT ONE PROTOCOL, WHICH IS THE WHOLE REASON THIS ROW HAS TWO KINDS OF LINE. The I2C
+# A socket is not one protocol, which is the whole reason this row has two kinds of line. The I2C
 # pair reaches the header as a bus a binding already serves, so it is named ONCE, by that role: the
 # role states the instance, the pins and the mux function, and restating them here would put one
 # wire in two places. Every other position is a single line, named for the hole a shield plugs into
 # and carrying the pin behind it. Which of them an attached module uses is a property of the module.
 #
-# WHAT THE POSITIONS BELOW DO *NOT* SAY. A position names a pin, never a peripheral: the manual
+# What the positions below do *not* say. A position names a pin, never a peripheral: the manual
 # marks D0/D1 as USART6, D11/D12/D13 as SPI2 and eight positions as timer channels, and none of
 # those is bound here because this family places no usart6 or spi2 instance. A program reaching one
 # of these positions today drives it as a port pin. When those instances land, a serial or SPI row
 # joins this socket the way the I2C one already has, and the positions it covers leave the list
 # below -- one wire, one statement, in whichever form is the stronger.
 #
-# TWO SOCKETS THIS BOARD ALSO HAS ARE DELIBERATELY ABSENT. The I2C extension connector and the
+# Two sockets this board also has are deliberately absent. The I2C extension connector and the
 # camera connector carry the same bus on the same two pins, and both are this vendor's own headers
 # rather than a published standard. A connector row names a standard so that a module can be matched
 # to a socket, and there is no standard to name for either, so they stay in the prose above.
 #
-# THE SUPPLY IS THE ONE THING A SOCKET CANNOT SETTLE FOR WHAT PLUGS INTO IT. The header brings out
+# The supply is the one thing a socket cannot settle for what plugs into it. The header brings out
 # both a 3.3 V and a 5 V rail because the standard requires both, and section 7.3 cautions that this
 # part's I/O are 3.3 V where the standard's original are 5 V. An expansion board that carries a
 # jumper choosing its own logic rail therefore decides, from the far side of this socket, whether
@@ -231,7 +228,7 @@ pin = "PI1"
 
 # --- external memory -----------------------------------------------------------------------
 #
-# THIS BOARD HAS MEMORY OUTSIDE THE CHIP, and it is two regions rather than one.
+# This board has memory outside the chip, and it is two regions rather than one.
 # Both are OPTIONAL: the board boots, serves and runs a program with neither brought up, which is
 # why they are regions a program may enable rather than part of its memory budget.
 #
@@ -239,7 +236,7 @@ pin = "PI1"
 # access before that is a bus fault rather than a wrong value -- so the controller is stated as a
 # fact and not as a comment, and `optional` means "may be absent", never "may be skipped".
 #
-# EACH REGION NAMES THE BLOCK CONSTANT ITS BASE IS A SECOND STATEMENT OF. The base is written here
+# Each region names the block constant its base is a second statement of. The base is written here
 # because it is what every consumer of this file reads; the controller's block states where that
 # controller puts its window. Naming the constant is what turns a citation into a checked fact --
 # generation holds the two equal rather than trusting that a number was copied correctly.
@@ -270,7 +267,7 @@ source = "UM1907 Rev 7 section 6.13: a 128-Mbit SDRAM of which 'only the lowest 
 
 # --- the fitted devices -----------------------------------------------------------------------
 #
-# A CONTROLLER IS BROUGHT UP IN AN ORDER, AND THAT ORDER IS A CHIP FACT: it is written once, in
+# A controller is brought up in an order, and that order is a chip fact: it is written once, in
 # the controller's own block table, and it is the same on every board with this part. What is NOT
 # the same is WHICH DEVICE was soldered on, and that is what these two records carry.
 #
@@ -278,32 +275,30 @@ source = "UM1907 Rev 7 section 6.13: a 128-Mbit SDRAM of which 'only the lowest 
 # to the SDRAM datasheet" for their number -- the settling delay, the auto-refresh burst, and the
 # mode-register word -- and those are exactly the three that appear below rather than there.
 #
-# AND TWO OF THESE NUMBERS ARE NOT CONSTANTS OF ANYTHING, which is the reason this is a stratum
+# And two of these numbers are not constants of anything, which is the reason this is a stratum
 # and not a paragraph. Both are properties of a device AT A CLOCK:
 #
 #   * The SDRAM's REFRESH COUNT is derived, never stated. Its formula belongs to the controller,
 #     its retention specification to the device, and its clock to the plan -- so the record below
 #     states the retention specification and nothing else, and generation does the arithmetic per
 #     plan. Written down as a number it would be wrong the moment this board runs its bus faster.
-#   * The quad-SPI's DUMMY COUNT cannot be derived, and IT IS NOT EVEN REPRODUCIBLE ON THIS BOARD.
-#     One firmware, one board, one interface clock, measured on two days: it answered 6 / 6 / 6 for
-#     the three fast configurations and then 8 / 8 / 10. Both runs read a known payload back byte
-#     for byte a hundred times; neither is a mistake; and no clock changed between them, so the
-#     clock is not what separates them. Whatever does -- a volatile setting inside the device that
-#     another program can write, or margin that moves -- is a property of the part's CURRENT STATE
-#     rather than of the part.
+#   * The quad-SPI's dummy count cannot be derived, and on this board it is not even
+#     reproducible: the same firmware at the same interface clock has read a known payload back
+#     exactly with different counts on different days, so the clock is not what separates them.
+#     Whatever does -- a volatile setting inside the device that another program can write, or
+#     margin that moves -- is a property of the part's current state rather than of the part.
 #
-#     So the counts recorded below are DATED OBSERVATIONS, not values to use. What a driver may
+#     So the counts recorded below are observations, not values to use. What a driver may
 #     rely on is the RANGE, and the walk: try each count and keep the first that reads back a
 #     payload you already know. That is the only check that can tell a right count from a wrong
 #     one, because a wrong count does not fail -- it shifts every byte and returns plausible
-#     garbage. A driver that wrote the observation below instead of walking would have worked in
-#     July and returned garbage in the same month.
+#     garbage. A driver that wrote the observation below instead of walking would work one day and
+#     return garbage the next.
 
 [memory.qspi.device]
 part = "N25Q128A13EF840E"    # the fitted device, named by the board schematic; a 16-Mbyte
                              # quad-SPI NOR, which is what `size` and `address_bits` state.
-identity = 0x20BA18         # the JEDEC identity, read off the wire rather than transcribed.
+identity = 0x20BA18         # the device's JEDEC identity.
 address_bits = 24
 chip_select_high_cycles = 2 # the MINIMUM CYCLE COUNT, not the field: the controller's field is
                             # one less, so this becomes a field value of 1. A device property is
@@ -378,16 +373,15 @@ cas_latency = 2
 sdclk_hclk_periods = 2      # the memory clock's period is twice the bus clock's, so the memory
                             # runs at half the bus. It reads like a multiplier and divides.
 read_burst = 1
-# THE SEVEN TIMINGS, IN NANOSECONDS, because a timing is a minimum in TIME and the controller's
+# The seven timings, in nanoseconds, because a timing is a minimum in TIME and the controller's
 # fields are cycles. Generation converts at this plan's memory clock and ROUNDS UP, which is the
 # only direction that stays safe; a figure that needs more cycles than a field can hold is REFUSED
 # rather than truncated, so a board cannot quietly run this bus faster than its numbers allow.
 #
-# THESE ARE BOUNDS, NOT THE FITTED PART'S DATASHEET FIGURES, and the difference matters to anyone
-# reading them. This board's SDRAM part number has not been transcribed. Every figure below is an
-# order of magnitude longer than any device of this class requires, which puts timing off the list
-# of explanations for a failed bring-up at the cost of throughput nobody is measuring. When the
-# part's own numbers arrive this is a transcription, and every one of them will be smaller.
+# These are bounds, not the fitted part's datasheet figures, and the difference matters to anyone
+# reading them. Every figure below is an order of magnitude longer than any device of this class
+# requires, which puts timing off the list of explanations for a failed bring-up at the cost of
+# throughput.
 tmrd_ns = 250               # load mode register to active
 txsr_ns = 875               # exit self-refresh to active
 tras_ns = 500               # row active time
@@ -404,7 +398,7 @@ mode_register = 0x220       # the word loaded into the DEVICE's own mode registe
                             # sequential, CAS 2, single-location writes. The one value here that
                             # the chip's manual cannot tell you, because it is not the chip's.
 refresh_period_ns = 64000000 # the device holds a row for 64 ms...
-refresh_rows = 4096          # ...across 4096 of them. THE COUNT IS NOT HERE: it follows from
+refresh_rows = 4096          # ...across 4096 of them. The count is not here: it follows from
                              # these two and the plan's memory clock, and stating it would fix
                              # this board at one operating point.
 refresh_burst = 8
@@ -413,22 +407,22 @@ source = "All 8 accessible Mbytes swept word by word, then 100 cold bring-ups ou
 
 # --- discriminators ----------------------------------------------------------------------------
 #
-# WHAT THIS BOARD CAN BE ASKED, so an image built for it can be told at attach time whether the
+# What this board can be asked, so an image built for it can be told at attach time whether the
 # board in front of it is the board it assumed. The chip's identity register cannot answer that:
 # both regions above are soldered OUTSIDE the die, so this board with nothing fitted and this
 # board fully populated answer the same identity.
 #
-# EACH ROW STATES THE CLAIM IT REACHES, and the rung a successful read of its kind establishes.
+# Each row states the claim it reaches, and the rung a successful read of its kind establishes.
 # The rungs are the ones a part table's `[sourcing] validation` already uses -- `identified` (it
 # answered its identity register) and `exercised` (it produced measurements a driver decoded).
 #
-# A REGION'S ACCESSIBLE SIZE IS REACHABLE ONLY AT `exercised`, and the sdram region above is why:
+# A region's accessible size is reachable only at `exercised`, and the sdram region above is why:
 # the fitted part is 16 Mbytes and this board wires 8 of them. An identity read describes the
 # DEVICE, so it is right about the part and wrong about the memory. That region also has no
 # identity to read at all -- an SDRAM carries no such register -- so `identified` is not merely
 # weaker there, it is unavailable.
 #
-# THE QSPI IS DELIBERATELY LEFT SHORT OF ITS CLAIM. Its identity is a real discriminator and it is
+# The QSPI is deliberately left short of its claim. Its identity is a real discriminator and it is
 # stated below, but an identity is not an accessible size, and no NON-DESTRUCTIVE read of this
 # region has been stated that would establish one. A reconciliation therefore reports that region
 # unreached rather than counting the identity as if it settled the size.

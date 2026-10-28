@@ -3,7 +3,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Esp32C6Uart
+internal sealed class Esp32C6Uart
 {
     private readonly uint _fifo;
     private readonly uint _clkdiv;

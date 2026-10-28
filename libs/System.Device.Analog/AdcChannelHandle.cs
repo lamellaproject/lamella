@@ -1,4 +1,4 @@
-// Lamella.Hardware -- Lamella.Hardware.AdcChannelHandle (one channel, with `new` and no heap).
+// Lamella.Hardware -- Lamella.Hardware.AdcChannelHandle (one channel, with `new` and no heap), in the System.Device.Analog assembly.
 namespace Lamella.Hardware
 {
     /// <summary>One channel of the board's analog-to-digital converter.</summary>

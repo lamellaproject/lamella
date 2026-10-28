@@ -326,12 +326,6 @@ fn is_base_type_of(model: &Model, base: &TypeSymbol, derived: &TypeSymbol) -> bo
 /// the ones where the search can otherwise answer with an operator whose return type merely
 /// converts to the target -- and every type converts to `object`.
 ///
-/// **AND A TYPE TO ITSELF, WHICH IS THE IDENTITY CONVERSION AND NEVER AN OPERATOR** (ECMA-334 6th ed
-/// 10.5.2: a user-defined conversion from S to T is considered only when S0 and T0 are different
-/// types). Without it, `(decimal)x` on a decimal searched `System.Decimal`'s operators, accepted
-/// `op_Explicit(decimal) -> long` because `long` converts to `decimal`, and returned the value
-/// truncated to an integer -- where csc emits nothing at all. The nullable-stripped comparison is
-/// not used here: `(int)n` on an `int?` reaches `Nullable<int>`'s own unwrapping operator this way.
 #[must_use]
 pub fn no_conversion_operator_can_exist(
     model: &Model,

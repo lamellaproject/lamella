@@ -5,7 +5,7 @@
 // instance bases live in Rp2350Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Rp2350AdcLayout
+    internal sealed class Rp2350AdcLayout
     {
         private Rp2350AdcLayout() { }
 

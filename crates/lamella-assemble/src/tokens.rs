@@ -133,6 +133,19 @@ pub struct Tokens {
     /// `CustomAttribute` row against the one constructor. Those rows may be added at any time;
     /// `finish` sorts the table by parent.
     pub(crate) pending_is_readonly: Vec<lamella_token::Token>,
+    /// Every `ref struct` this image declares, with whether to give it csc's `[Obsolete]` (its
+    /// declaration carries none of its own). Its marker, `IsByRefLikeAttribute`, may have to be
+    /// synthesized as `IsReadOnlyAttribute` may, so `compile::emit_by_ref_like_attributes` drains
+    /// this at the same point and for the same reason.
+    pub(crate) pending_by_ref_like: Vec<(lamella_token::Token, bool)>,
+    /// Every `GenericParam` row whose parameter has the `unmanaged` constraint, which carries
+    /// `[System.Runtime.CompilerServices.IsUnmanagedAttribute]`. That attribute may have to be
+    /// synthesized as `IsReadOnlyAttribute` may, so `compile::emit_is_unmanaged_attributes` drains
+    /// this at the same point and for the same reason.
+    pub(crate) pending_is_unmanaged: Vec<lamella_token::Token>,
+    /// The one `TypeSpec` every `unmanaged` constraint row names, once minted:
+    /// `modreq(System.Runtime.InteropServices.UnmanagedType) System.ValueType`.
+    pub(crate) unmanaged_constraint_spec: Option<lamella_token::Token>,
     /// Set just before emitting an `init` accessor: its return type is written
     /// `void modreq(System.Runtime.CompilerServices.IsExternalInit)` rather than plain `void`.
     /// CONSUMED (cleared) by the emit that reads it, so a forgotten reset cannot reach the next
@@ -140,9 +153,6 @@ pub struct Tokens {
     /// and for the same reason: `emit_method_body` takes seventeen parameters and an eighteenth
     /// would be `None` at twelve of its thirteen call sites.
     ///
-    /// **THE MODIFIER IS THE FEATURE.** An init-only setter is otherwise an ordinary
-    /// `void set_P(T)`, so a build that drops it emits metadata in which the two are the same
-    /// method -- and any consumer, csc included, will assign the property wherever it likes.
     pub(crate) next_return_is_external_init: bool,
     /// Set just before emitting a member whose return type was written `ref readonly T`: its
     /// return is `T& modreq(System.Runtime.InteropServices.InAttribute)` rather than a plain
@@ -151,11 +161,6 @@ pub struct Tokens {
     /// signature is built from a `TypeSymbol`, and `ref readonly T` and `ref T` are the SAME type.
     /// The difference is a fact about the member's signature, which no symbol can carry.
     ///
-    /// **THE MODIFIER IS THE FEATURE, EXACTLY AS IT IS FOR AN `init` SETTER.** A build that drops
-    /// it emits metadata in which `ref readonly int M()` and `ref int M()` are the same method,
-    /// and any consumer -- csc included -- will then assign through the returned reference.
-    /// Measured: csc reading its own metadata refuses that write at all eight positions a
-    /// `ref readonly` member can occupy, and accepts it against a plain `ref` control at each.
     pub(crate) next_return_is_readonly_ref: bool,
     /// The `MethodImplAttributes` the NEXT method emitted should carry, from a
     /// `[MethodImpl(...)]` on its declaration -- `Synchronized` (0x0020) and the rest of
@@ -200,14 +205,22 @@ pub struct Tokens {
     /// The rows a PREVIOUS emission of the same program measured, which this numbering reserves at
     /// the end of each type's run. Empty on a first numbering.
     instance_rows_expected: InstanceRows,
+    /// The `TypeDef` token each display STRUCT was written with, by type key -- MEASURED by this
+    /// emission. A local function lowered to a method of the enclosing type takes its struct by
+    /// reference, so the method's signature names the struct while the enclosing type's run is
+    /// still open, and the struct is not written until the closure types land after every source
+    /// type. The first emission cannot know the token; this records it for the next.
+    struct_types_written: BTreeMap<String, Token>,
+    /// The tokens a PREVIOUS emission measured, which a signature here names before the struct's
+    /// row exists. Empty on a first emission.
+    struct_types_expected: BTreeMap<String, Token>,
+    /// Whether a signature had to name a display struct neither written nor expected -- so this
+    /// image is a measurement and the program must be written again with the tokens known.
+    struct_type_guessed: bool,
     /// Each member's ORDINAL within its declaring type -- its position in a running count over the
     /// type's members in SOURCE order, which is what csc names a synthesized closure member after
     /// (`<M>b__N_M`). Keyed like `methods`, so an overload pair gets two ordinals rather than one.
     ///
-    /// **IT IS A COUNT OVER MEMBERS, NOT OVER METHODS**, and the difference is most of the rule:
-    /// a field, a nested type and a constructor each advance it by one without being nameable
-    /// here at all. Measured against csc member kind by member kind; see
-    /// `compile::record_member_ordinals`.
     member_ordinals: BTreeMap<String, usize>,
     types: BTreeMap<String, Token>,
     methods: BTreeMap<String, Token>,
@@ -250,10 +263,6 @@ pub struct Tokens {
     /// The `TypeSpec` row minted for each constructed generic type, by type key -- so every member
     /// named through `Box<int>` shares one parent row instead of minting a fresh one each time.
     ///
-    /// A size choice, not a correctness rule: `TypeSpec` is absent from II.24.2.6's sorted-table
-    /// list and duplicate rows with equal blobs are interchangeable. It is taken because csc
-    /// interns them and a generic-heavy program otherwise pays a row per member reference -- for
-    /// `Counter<int>` with one method and one field that is two rows where one does.
     type_specs: BTreeMap<String, Token>,
     /// The `TypeSpec` row naming each type-parameter POSITION (`!0`, `!1`, ...), by index. See
     /// [`Tokens::var_spec`] for why the key is a number.
@@ -488,6 +497,54 @@ impl Tokens {
         self.instance_rows_expected = rows;
     }
 
+    /// Installs the display struct tokens an earlier emission of the same program measured.
+    pub(crate) fn expect_struct_types(&mut self, types: BTreeMap<String, Token>) {
+        self.struct_types_expected = types;
+    }
+
+    /// The `TypeDef` token a signature names display struct `ty` by: the written one, else the one
+    /// an earlier emission measured -- else a stand-in, and this emission is then only a
+    /// measurement (see [`Self::guessed_struct_type`]).
+    pub(crate) fn struct_type_token(&mut self, ty: &TypeSymbol) -> Token {
+        if let Some(token) = self.type_token(ty) {
+            return token;
+        }
+        let key = type_key(&self.canonical(ty));
+        if let Some(token) = self.struct_types_expected.get(&key) {
+            return *token;
+        }
+        self.struct_type_guessed = true;
+        Token::new(0x02, 1)
+    }
+
+    /// Records the token display struct `ty` was written with, refusing one that differs from the
+    /// token an earlier emission measured -- signatures already name that one.
+    pub(crate) fn record_struct_type(&mut self, ty: &TypeSymbol, token: Token) -> Result<(), crate::EmitError> {
+        let key = type_key(&self.canonical(ty));
+        if self
+            .struct_types_expected
+            .get(&key)
+            .is_some_and(|expected| *expected != token)
+        {
+            return Err(crate::EmitError::Unsupported(
+                "a display struct's TypeDef row moved between two emissions of one program",
+            ));
+        }
+        self.struct_types_written.insert(key, token);
+        Ok(())
+    }
+
+    /// Whether a signature named a display struct whose token was not yet known.
+    #[must_use]
+    pub(crate) fn guessed_struct_type(&self) -> bool {
+        self.struct_type_guessed
+    }
+
+    /// The display struct tokens this emission wrote; taken, so they are handed on once.
+    pub(crate) fn take_struct_types_written(&mut self) -> BTreeMap<String, Token> {
+        core::mem::take(&mut self.struct_types_written)
+    }
+
     /// The `this`-capturing lambda rows the pre-pass reserves at the end of `owner`'s method run,
     /// in the order they will be written. Empty on a first numbering.
     #[must_use]
@@ -602,14 +659,6 @@ impl Tokens {
     /// assembly declares) and because a parameter shadows a real type of the same name. Reversing
     /// the two would silently name a global `class T` from inside a `M<T>()` that shadows it.
     ///
-    /// **A CONSTRUCTED GENERIC TYPE IS ANSWERED FROM THE BLOB-KEYED `TypeSpec` MAP, AND THAT IS
-    /// WHY THE CASE BELONGS HERE RATHER THAN AT THE INSTRUCTIONS.** Twenty-eight sites ask this
-    /// question -- `newarr`, `castclass`, `isinst`, `ldtoken`, `box`, `unbox`, `ldelema`,
-    /// `constrained.` and the rest. Let an instantiation reach none of them and each one refuses a
-    /// program csc compiles, with a message about its own opcode, so the single
-    /// missing case reads as eight unrelated unimplemented features. Adding it at one site would
-    /// have fixed one opcode and left the shape of the defect intact
-    /// (`a-rule-with-several-implementations-gains-a-new-case-in-none-of-them`).
     #[must_use]
     pub(crate) fn instruction_type_token(&self, ty: &TypeSymbol) -> Option<Token> {
         self.type_parameter_spec(ty)

@@ -1,7 +1,7 @@
 // The descriptor an RP2350 DW-I2C driver consumes: one i2c
 namespace Lamella.Boards
 {
-    public sealed class Rp2350I2cBinding
+    internal sealed class Rp2350I2cBinding
     {
         /// <summary>The bound DW_apb_i2c instance's base address.</summary>
         public readonly uint I2cBase;

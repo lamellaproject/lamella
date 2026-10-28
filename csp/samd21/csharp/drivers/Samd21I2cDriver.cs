@@ -32,6 +32,27 @@ internal sealed class Samd21I2cDriver : I2cDriver
         _data = block + Samd21SercomI2cMasterLayout.DATA_OFF;
     }
 
+    /// <summary>The standard-mode and fast-mode rates, 100000 and 400000, whose BAUD divisor fits the
+    /// register at the binding's core clock: f_SCL = f_GCLK / (10 + 2*BAUD), BAUD from 0 to 255.</summary>
+    public override int[] Rates
+    {
+        get
+        {
+            bool standard = Fits(100000);
+            bool fast = Fits(400000);
+            int[] rates = new int[(standard ? 1 : 0) + (fast ? 1 : 0)];
+            if (standard) rates[0] = 100000;
+            if (fast) rates[rates.Length - 1] = 400000;
+            return rates;
+        }
+    }
+
+    bool Fits(int busHz)
+    {
+        uint half = _binding.CoreClockHz / (uint)(busHz * 2);
+        return half >= 5 && half - 5 <= Samd21SercomI2cMasterLayout.BAUD_BAUD;
+    }
+
     public override void Configure(int busHz)
     {
         uint apbcMask = Samd21Instances.PM_BASE + Samd21PmLayout.APBCMASK_OFF;

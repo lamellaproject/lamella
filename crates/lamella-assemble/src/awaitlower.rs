@@ -9,9 +9,9 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use lamella_binder::{
-    Accessibility, BoundCatch, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, BoundSwitchArm,
-    FieldReference,
-    MethodReference, SpecialType, TypeSymbol,
+    Accessibility, Binder, BoundCatch, BoundDeclarator, BoundExpr, BoundExprKind, BoundStmt,
+    BoundStmtKind, BoundSwitchArm, FieldReference, MethodReference, SpecialType,
+    TypeInstantiation, TypeSymbol,
 };
 use lamella_syntax::ast::{AssignmentOperator, BinaryOperator, Literal, UnaryOperator};
 use lamella_syntax::token::IntegerSuffix;
@@ -39,21 +39,56 @@ const BUILDER: &str = "<>t__builder";
 const ACTION: &str = "<>t__action";
 const THIS_FIELD: &str = "<>4__this";
 const DONE_LABEL: &str = "<>a__done";
+const RESULT_LOCAL: &str = "<>a__result";
+
+/// What an async method returns (15.15.1), which decides its builder, what a `return` hands
+/// that builder, and what the stub returns.
+#[derive(Debug, Clone)]
+pub enum AsyncReturn {
+    /// `async void`: `AsyncVoidMethodBuilder`, and the stub returns nothing.
+    Void,
+    /// `async Task`: `AsyncTaskMethodBuilder`, and the stub returns its `Task`.
+    Task,
+    /// `async Task<T>`, carrying `T`: `AsyncTaskMethodBuilder<T>`, whose `SetResult(T)` takes the
+    /// value of the `return` that completed the body, and the stub returns its `Task<T>`.
+    TaskOf(TypeSymbol),
+}
+
+impl AsyncReturn {
+    /// Reads a declared return type the binder already accepted for an async method (15.15.1):
+    /// `void`, `Task`, or a constructed `Task<T>`.
+    pub fn of(return_symbol: &TypeSymbol) -> Self {
+        if return_symbol.is_void() {
+            AsyncReturn::Void
+        } else if let Some(result) = lamella_binder::task_result_type(return_symbol) {
+            AsyncReturn::TaskOf(result.clone())
+        } else {
+            AsyncReturn::Task
+        }
+    }
+}
 
 /// Lowers one async method. `enclosing` is the DECLARING type (for `<>4__this`), `machine_name`
-/// the caller-chosen `<M>d__N`, `returns_task` distinguishes `async Task` from `async void`
-/// (which builder, and whether the stub returns), and `bound_body` is the method's body exactly
-/// as `bind_method` produced it.
+/// the caller-chosen `<M>d__N`, `returns` the method's return kind (which builder, what a
+/// `return` hands it, and what the stub returns), `binder` the compilation's binder (for the
+/// builder members' open signatures), and `bound_body` is the method's body exactly as
+/// `bind_method` produced it.
 pub fn lower_async_method(
     enclosing: &TypeSymbol,
     machine_name: &str,
     is_static: bool,
-    returns_task: bool,
+    returns: &AsyncReturn,
+    binder: &Binder,
     parameters: &[(Box<str>, TypeSymbol)],
     bound_body: &BoundStmt,
 ) -> Result<AsyncLowering, EmitError> {
     let machine_symbol = TypeSymbol::Named([Box::from(machine_name)].into());
-    let builder_ty = builder_symbol(returns_task);
+    let builder = Builder::new(returns, binder);
+    let builder_ty = builder.ty.clone();
+    let result_ty = match returns {
+        AsyncReturn::TaskOf(result) => Some(result.clone()),
+        AsyncReturn::Void | AsyncReturn::Task => None,
+    };
 
     let mut hoisted: BTreeMap<Box<str>, TypeSymbol> = BTreeMap::new();
     for (name, ty) in parameters {
@@ -63,7 +98,8 @@ pub fn lower_async_method(
 
     let mut rewriter = Rewriter {
         machine: machine_symbol.clone(),
-        builder_ty: builder_ty.clone(),
+        builder,
+        result_ty: result_ty.clone(),
         is_static,
         hoisted,
         awaiters: Vec::new(),
@@ -74,6 +110,18 @@ pub fn lower_async_method(
 
     let span = bound_body.span;
     let mut move_next: Vec<BoundStmt> = Vec::new();
+    if let Some(result_ty) = &result_ty {
+        move_next.push(stmt(
+            BoundStmtKind::Local {
+                ty: result_ty.clone(),
+                declarators: vec![BoundDeclarator {
+                    name: Box::from(RESULT_LOCAL),
+                    initializer: None,
+                }],
+            },
+            span,
+        ));
+    }
     let exception_name: Box<str> = Box::from("<>a__ex");
     let mut protected: Vec<BoundStmt> = body
         .routes
@@ -85,7 +133,7 @@ pub fn lower_async_method(
     let catch_body = vec![
         rewriter.set_state(-2, span),
         rewriter.builder_call(
-            "SetException",
+            &rewriter.builder.set_exception,
             vec![BoundExpr {
                 kind: BoundExprKind::Local(exception_name.clone()),
                 ty: exception_symbol(),
@@ -116,7 +164,11 @@ pub fn lower_async_method(
         span,
     ));
     move_next.push(rewriter.set_state(-2, span));
-    move_next.push(rewriter.builder_call("SetResult", Vec::new(), span));
+    let result_arguments = match &result_ty {
+        Some(result_ty) => vec![result_local(result_ty)],
+        None => Vec::new(),
+    };
+    move_next.push(rewriter.builder_call(&rewriter.builder.set_result, result_arguments, span));
     move_next.push(stmt(BoundStmtKind::Return(None), span));
 
     let mut fields: Vec<(Box<str>, TypeSymbol)> = vec![
@@ -136,10 +188,9 @@ pub fn lower_async_method(
 
     let stub_body = build_stub(
         &machine_symbol,
-        &builder_ty,
+        &rewriter.builder,
         enclosing,
         is_static,
-        returns_task,
         parameters,
         span,
     );
@@ -155,16 +206,15 @@ pub fn lower_async_method(
 
 /// The stub that replaces the async method's own body (its signature is untouched, so overload
 /// resolution, delegates over it and reflection names never see the rewrite).
-#[allow(clippy::too_many_arguments)]
 fn build_stub(
     machine: &TypeSymbol,
-    builder_ty: &TypeSymbol,
+    builder: &Builder,
     enclosing: &TypeSymbol,
     is_static: bool,
-    returns_task: bool,
     parameters: &[(Box<str>, TypeSymbol)],
     span: Span,
 ) -> BoundStmt {
+    let builder_ty = &builder.ty;
     let sm: Box<str> = Box::from("<>a__sm");
     let sm_local = || BoundExpr {
         kind: BoundExprKind::Local(sm.clone()),
@@ -220,7 +270,7 @@ fn build_stub(
     }
     statements.push(assign(
         field_access(machine, sm_local(), BUILDER, builder_ty),
-        call_static(builder_ty, "Create", builder_ty.clone()),
+        call_static(&builder.create),
         span,
     ));
     statements.push(assign(
@@ -228,6 +278,29 @@ fn build_stub(
         int_expr(-1),
         span,
     ));
+    let task_local: Box<str> = Box::from("<>a__task");
+    if let Some(task) = &builder.task {
+        statements.push(stmt(
+            BoundStmtKind::Local {
+                ty: task.ty.clone(),
+                declarators: vec![BoundDeclarator {
+                    name: task_local.clone(),
+                    initializer: Some(BoundExpr {
+                        kind: BoundExprKind::PropertyAccess {
+                            receiver: Box::new(field_access(machine, sm_local(), BUILDER, builder_ty)),
+                            declaring_type: builder_ty.clone(),
+                            setter_declaring_type: builder_ty.clone(),
+                            getter_instantiation: task.getter_instantiation.clone(),
+                            setter_instantiation: None,
+                            name: Box::from("Task"),
+                        },
+                        ty: task.ty.clone(),
+                    }),
+                }],
+            },
+            span,
+        ));
+    }
     statements.push(stmt(
         BoundStmtKind::Expression(call(
             sm_local(),
@@ -241,23 +314,97 @@ fn build_stub(
         )),
         span,
     ));
-    if returns_task {
+    if let Some(task) = &builder.task {
         statements.push(stmt(
             BoundStmtKind::Return(Some(BoundExpr {
-                kind: BoundExprKind::PropertyAccess {
-                    receiver: Box::new(field_access(machine, sm_local(), BUILDER, builder_ty)),
-                    declaring_type: builder_ty.clone(),
-                    setter_declaring_type: builder_ty.clone(),
-                    getter_instantiation: None,
-                    setter_instantiation: None,
-                    name: Box::from("Task"),
-                },
-                ty: task_symbol(),
+                kind: BoundExprKind::Local(task_local),
+                ty: task.ty.clone(),
             })),
             span,
         ));
     }
     stmt(BoundStmtKind::Block(statements), span)
+}
+
+/// The builder a machine drives, and the members the lowering calls on it.
+///
+/// **EACH MEMBER IS NAMED THROUGH THE BINDER, AS A BOUND CALL'S IS**, so a member of
+/// `AsyncTaskMethodBuilder<int>` carries the open signature its `MemberRef` is written from. The
+/// substituted `SetResult(int)` alone describes a method no builder declares -- the definition's
+/// is `SetResult(!0)` -- and a member of the non-generic builders answers `None` and is unchanged.
+struct Builder {
+    ty: TypeSymbol,
+    create: MethodReference,
+    set_result: MethodReference,
+    set_exception: MethodReference,
+    /// The `Task` property a task builder's stub returns; `None` for the void builder.
+    task: Option<TaskRead>,
+}
+
+/// A task builder's `Task` property: the task type it yields and its getter's open signature.
+struct TaskRead {
+    ty: TypeSymbol,
+    getter_instantiation: Option<Box<TypeInstantiation>>,
+}
+
+impl Builder {
+    fn new(returns: &AsyncReturn, binder: &Binder) -> Self {
+        let ty = match returns {
+            AsyncReturn::Void => compiler_services("AsyncVoidMethodBuilder"),
+            AsyncReturn::Task => compiler_services("AsyncTaskMethodBuilder"),
+            AsyncReturn::TaskOf(result) => TypeSymbol::Instantiation {
+                definition: compiler_services_name("AsyncTaskMethodBuilder"),
+                arguments: [result.clone()].into(),
+            },
+        };
+        let member = |name: &str, parameters: Vec<TypeSymbol>, return_type: TypeSymbol, is_static: bool| {
+            MethodReference {
+                declaring_instantiation: binder.declaring_instantiation_of(&ty, name, &parameters),
+                declaring_type: ty.clone(),
+                name: Box::from(name),
+                parameters,
+                return_type,
+                is_static,
+                is_vararg: false,
+                instantiation: None,
+            }
+        };
+        let void = TypeSymbol::Special(SpecialType::Void);
+        let result_parameters = match returns {
+            AsyncReturn::TaskOf(result) => vec![result.clone()],
+            AsyncReturn::Void | AsyncReturn::Task => Vec::new(),
+        };
+        let task_ty = match returns {
+            AsyncReturn::Void => None,
+            AsyncReturn::Task => Some(task_symbol()),
+            AsyncReturn::TaskOf(result) => Some(TypeSymbol::Instantiation {
+                definition: task_symbol_name(),
+                arguments: [result.clone()].into(),
+            }),
+        };
+        let task = task_ty.map(|task_ty| TaskRead {
+            getter_instantiation: binder
+                .property_accessor_instantiations(&ty, &ty, "Task", &task_ty)
+                .0,
+            ty: task_ty,
+        });
+        Builder {
+            create: member("Create", Vec::new(), ty.clone(), true),
+            set_result: member("SetResult", result_parameters, void.clone(), false),
+            set_exception: member("SetException", vec![exception_symbol()], void, false),
+            task,
+            ty,
+        }
+    }
+}
+
+/// MoveNext's result local, of the task's result type: what a `return e;` stores and the shared
+/// tail's `SetResult` takes.
+fn result_local(result_ty: &TypeSymbol) -> BoundExpr {
+    BoundExpr {
+        kind: BoundExprKind::Local(Box::from(RESULT_LOCAL)),
+        ty: result_ty.clone(),
+    }
 }
 
 fn stmt(kind: BoundStmtKind, span: Span) -> BoundStmt {
@@ -286,36 +433,32 @@ fn int_expr(value: i64) -> BoundExpr {
     }
 }
 
-fn compiler_services(name: &str) -> TypeSymbol {
-    TypeSymbol::Named(
-        [
-            Box::from("System"),
-            Box::from("Runtime"),
-            Box::from("CompilerServices"),
-            Box::from(name),
-        ]
-        .into(),
-    )
+fn compiler_services_name(name: &str) -> Box<[Box<str>]> {
+    [
+        Box::from("System"),
+        Box::from("Runtime"),
+        Box::from("CompilerServices"),
+        Box::from(name),
+    ]
+    .into()
 }
 
-fn builder_symbol(returns_task: bool) -> TypeSymbol {
-    compiler_services(if returns_task {
-        "AsyncTaskMethodBuilder"
-    } else {
-        "AsyncVoidMethodBuilder"
-    })
+fn compiler_services(name: &str) -> TypeSymbol {
+    TypeSymbol::Named(compiler_services_name(name))
+}
+
+fn task_symbol_name() -> Box<[Box<str>]> {
+    [
+        Box::from("System"),
+        Box::from("Threading"),
+        Box::from("Tasks"),
+        Box::from("Task"),
+    ]
+    .into()
 }
 
 fn task_symbol() -> TypeSymbol {
-    TypeSymbol::Named(
-        [
-            Box::from("System"),
-            Box::from("Threading"),
-            Box::from("Tasks"),
-            Box::from("Task"),
-        ]
-        .into(),
-    )
+    TypeSymbol::Named(task_symbol_name())
 }
 
 fn action_symbol() -> TypeSymbol {
@@ -405,33 +548,24 @@ fn call(receiver: BoundExpr, method: MethodReference, arguments: Vec<BoundExpr>)
     }
 }
 
-/// A parameterless STATIC call `Declaring.Name()` returning `return_type`.
-fn call_static(declaring: &TypeSymbol, name: &str, return_type: TypeSymbol) -> BoundExpr {
+/// A parameterless STATIC call through a resolved [`MethodReference`].
+fn call_static(method: &MethodReference) -> BoundExpr {
     BoundExpr {
         kind: BoundExprKind::Call {
             callee: Box::new(BoundExpr {
                 kind: BoundExprKind::MethodGroup {
                     receiver: Box::new(BoundExpr {
-                        kind: BoundExprKind::TypeReference(declaring.clone()),
-                        ty: declaring.clone(),
+                        kind: BoundExprKind::TypeReference(method.declaring_type.clone()),
+                        ty: method.declaring_type.clone(),
                     }),
-                    name: Box::from(name),
+                    name: method.name.clone(),
                 },
                 ty: TypeSymbol::Error,
             }),
             arguments: Vec::new(),
-            method: Some(MethodReference {
-                declaring_type: declaring.clone(),
-                name: Box::from(name),
-                parameters: Vec::new(),
-                return_type: return_type.clone(),
-                is_static: true,
-                is_vararg: false,
-                instantiation: None,
-                declaring_instantiation: None,
-            }),
+            method: Some(method.clone()),
         },
-        ty: return_type,
+        ty: method.return_type.clone(),
     }
 }
 
@@ -813,7 +947,10 @@ struct Rewritten {
 
 struct Rewriter {
     machine: TypeSymbol,
-    builder_ty: TypeSymbol,
+    builder: Builder,
+    /// The task's result type `T` of a `Task<T>` method, whose `return e;` stores into
+    /// [`RESULT_LOCAL`]; `None` for `void` and `Task`.
+    result_ty: Option<TypeSymbol>,
     is_static: bool,
     /// Name -> type of every field-backed variable (parameters, user locals, spill temps).
     hoisted: BTreeMap<Box<str>, TypeSymbol>,
@@ -844,21 +981,11 @@ impl Rewriter {
         assign(self.state_field(), int_expr(value), span)
     }
 
-    fn builder_call(&self, name: &str, arguments: Vec<BoundExpr>, span: Span) -> BoundStmt {
-        let parameter_types: Vec<TypeSymbol> =
-            arguments.iter().map(|argument| argument.ty.clone()).collect();
-        let receiver = field_access(&self.machine, self.machine_this(), BUILDER, &self.builder_ty);
+    /// `this.<>t__builder.M(arguments);` for one of [`Builder`]'s instance members.
+    fn builder_call(&self, method: &MethodReference, arguments: Vec<BoundExpr>, span: Span) -> BoundStmt {
+        let receiver = field_access(&self.machine, self.machine_this(), BUILDER, &self.builder.ty);
         stmt(
-            BoundStmtKind::Expression(call(
-                receiver,
-                instance_method(
-                    &self.builder_ty,
-                    name,
-                    parameter_types,
-                    TypeSymbol::Special(SpecialType::Void),
-                ),
-                arguments,
-            )),
+            BoundStmtKind::Expression(call(receiver, method.clone(), arguments)),
             span,
         )
     }
@@ -913,6 +1040,11 @@ impl Rewriter {
                     out.routes.append(&mut rewritten.routes);
                 }
             }
+            BoundStmtKind::LocalFunction(_) => {
+                return Err(EmitError::Unsupported(
+                    "a local function reached the async lowering before the closure lowering",
+                ));
+            }
             BoundStmtKind::Local { declarators, .. } => {
                 for declarator in declarators {
                     if let Some(initializer) = &declarator.initializer {
@@ -936,10 +1068,17 @@ impl Rewriter {
                 out.statements
                     .push(stmt(BoundStmtKind::Goto(Box::from(DONE_LABEL)), span));
             }
-            BoundStmtKind::Return(Some(_)) => {
-                return Err(EmitError::Unsupported(
-                    "a value-returning return in an async method survived binding",
-                ));
+            BoundStmtKind::Return(Some(value)) => {
+                let Some(result_ty) = self.result_ty.clone() else {
+                    return Err(EmitError::Unsupported(
+                        "a value-returning return in an async method survived binding",
+                    ));
+                };
+                let value = self.expression(value, &mut out.statements, &mut out.routes)?;
+                out.statements
+                    .push(assign(result_local(&result_ty), value, span));
+                out.statements
+                    .push(stmt(BoundStmtKind::Goto(Box::from(DONE_LABEL)), span));
             }
             BoundStmtKind::If {
                 condition,
@@ -1775,7 +1914,7 @@ impl Rewriter {
                 receiver: Box::new(awaiter_field()),
                 declaring_type: is_completed.declaring_type.clone(),
                 setter_declaring_type: is_completed.declaring_type.clone(),
-                getter_instantiation: None,
+                getter_instantiation: is_completed.declaring_instantiation.clone(),
                 setter_instantiation: None,
                 name: Box::from("IsCompleted"),
             },
@@ -2113,7 +2252,53 @@ pub(crate) fn map_expr(expr: &BoundExpr, replace: &mut dyn FnMut(&BoundExpr) -> 
         BoundExprKind::Unchecked(operand) => {
             BoundExprKind::Unchecked(Box::new(map_expr(operand, replace)))
         }
-        other => other.clone(),
+        BoundExprKind::Await {
+            operand,
+            get_awaiter,
+            is_completed,
+            on_completed,
+            get_result,
+        } => BoundExprKind::Await {
+            operand: Box::new(map_expr(operand, replace)),
+            get_awaiter: get_awaiter.clone(),
+            is_completed: is_completed.clone(),
+            on_completed: on_completed.clone(),
+            get_result: get_result.clone(),
+        },
+        BoundExprKind::Throw(operand) => BoundExprKind::Throw(Box::new(map_expr(operand, replace))),
+        BoundExprKind::MakeRef(operand) => {
+            BoundExprKind::MakeRef(Box::new(map_expr(operand, replace)))
+        }
+        BoundExprKind::RefType(operand) => {
+            BoundExprKind::RefType(Box::new(map_expr(operand, replace)))
+        }
+        BoundExprKind::RefValue { reference, target } => BoundExprKind::RefValue {
+            reference: Box::new(map_expr(reference, replace)),
+            target: target.clone(),
+        },
+        BoundExprKind::ArgListLiteral(elements) => BoundExprKind::ArgListLiteral(
+            elements.iter().map(|element| map_expr(element, replace)).collect(),
+        ),
+        BoundExprKind::Dereference { operand } => BoundExprKind::Dereference {
+            operand: Box::new(map_expr(operand, replace)),
+        },
+        BoundExprKind::AddressOf { operand } => BoundExprKind::AddressOf {
+            operand: Box::new(map_expr(operand, replace)),
+        },
+        BoundExprKind::Literal(_)
+        | BoundExprKind::Temp(_)
+        | BoundExprKind::Lambda { .. }
+        | BoundExprKind::CachedDelegate { .. }
+        | BoundExprKind::Local(_)
+        | BoundExprKind::This
+        | BoundExprKind::Base
+        | BoundExprKind::TypeReference(_)
+        | BoundExprKind::NamespaceReference(_)
+        | BoundExprKind::TypeOf(_)
+        | BoundExprKind::SizeOf(_)
+        | BoundExprKind::DefaultValue(_)
+        | BoundExprKind::ArgListValue
+        | BoundExprKind::Error => expr.kind.clone(),
     };
     BoundExpr { kind, ty }
 }

@@ -5,14 +5,14 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Microchip
 {
-    public sealed class Samc21Xpro
+    internal sealed class Samc21Xpro
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = MicrochipSamc21XproBindings.BOARD_MODEL;
 
         /// <summary>The yellow user LED LED0 on PA15, ACTIVE LOW: it lights when driven
         /// <see cref="PinValue.Low"/>.</summary>
-        /// <remarks>THIS PAD IS SHARED WITH EXT3 AND WITH A CRYSTAL FOOTPRINT, which the kit guide
+        /// <remarks>This pad is shared with EXT3 and with a crystal footprint, which the kit guide
         /// states in its own Shared functionality column. The footprint is unpopulated on a stock
         /// board -- the 32.768 kHz crystal that IS mounted is elsewhere -- so nothing contends for
         /// the pad as shipped; a board that populated it would be choosing between the two.</remarks>
@@ -21,12 +21,12 @@ namespace Lamella.Boards.Microchip
 
         /// <summary>The SW0 user button on PA28, ACTIVE LOW: pressing it drives the line to ground,
         /// so a pressed button reads <see cref="PinValue.Low"/>.</summary>
-        /// <remarks>SHARED WITH EXT3 AND AN EDBG GPIO, per the guide's own column.</remarks>
+        /// <remarks>Shared with EXT3 and an EDBG GPIO, per the guide's own column.</remarks>
         public static readonly int ButtonPin =
             Samc21GpioDriver.LogicalPin(MicrochipSamc21XproBindings.BUTTON0_PORT_BASE, MicrochipSamc21XproBindings.BUTTON0_PIN);
 
         /// <summary>The mode the user button wants.</summary>
-        /// <remarks>THIS KIT'S GUIDE DOES NOT SAY WHETHER AN EXTERNAL PULL-UP IS FITTED, where the
+        /// <remarks>This kit's guide does not say whether an external pull-up is fitted, where the
         /// Curiosity Nano guides state outright that none is. <see cref="PinMode.InputPullUp"/> is
         /// nevertheless the right answer under BOTH readings: if the board fits no pull-up the
         /// internal one is required, and if it fits one the internal resistor pulls the same way and
@@ -49,7 +49,7 @@ namespace Lamella.Boards.Microchip
         private static GpioDriver MakeGpio() { return new Samc21GpioDriver(); }
 
         /// <summary>The family PORT driver this board bound.</summary>
-        /// <remarks>THE DRIVER SPANS THREE PORT GROUPS AND THIS PACKAGE BONDS PADS IN TWO. Group C
+        /// <remarks>The driver spans three port groups and this package bonds pads in two. Group C
         /// exists on the die and reaches no pin on a 64-pin part, which is why the constants above
         /// name only pads this board's own guide names. The sibling microchip-samc21n-xpro is the same family
         /// on the 100-pin package and puts its LED in that third group.</remarks>

@@ -19,7 +19,7 @@ notes = [
 #
 # Primary: every fact below is read from this part's own datasheet, the document `sources` cites.
 #
-# WHAT THIS TABLE DELIBERATELY DOES NOT STATE, so a reader can tell a fact from a gap: the output
+# What this table deliberately does not state, so a reader can tell a fact from a gap: the output
 # data rates and their codes, the full-scale ranges and the sensitivity each implies, the low-power
 # and high-resolution mode encodings, the FIFO, the click and activity detection registers, the
 # temperature sensor, and the self-test. All are in the datasheet and none is transcribed.
@@ -38,7 +38,7 @@ evidence = "A physical part answered the identity register on a Raspberry Pi Pic
 # The register map calls this a "Dummy register" and gives its reset value as 00110011. It is the
 # only readable byte that distinguishes this half from anything else at its address.
 #
-# A TRAP THE VENDOR'S OWN TABLES SET, and it is worth naming because the two numbers are IDENTICAL
+# A trap the vendor's own tables set, and it is worth naming because the two numbers are IDENTICAL
 # rather than merely similar: this part's 7-bit address 0011001b composed with the read bit is
 # 00110011, which the datasheet prints as 33h -- the SAME BYTE as the identity value below. One is a
 # bus address with a direction bit appended and the other is the contents of a register. Nothing

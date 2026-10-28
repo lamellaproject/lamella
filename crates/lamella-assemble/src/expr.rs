@@ -630,11 +630,6 @@ fn emit_short_circuit(
 /// Lowers `x is T t`, a DECLARATION PATTERN (C# 7.0): the type test, and the converted value
 /// stored in `name` on the branch where it succeeded.
 ///
-/// **TWO SHAPES, AND WHICH ONE IS DECIDED BY THE TARGET RATHER THAN BY TASTE.** `isinst` yields a
-/// reference or null, which IS the value a reference-typed variable wants -- so the reference case
-/// is `stloc` and a null test, and csc emits exactly what `T t = x as T; t != null` emits, measured
-/// byte for byte. A VALUE-typed variable cannot hold that reference: the boxed value has to be
-/// unboxed, which can only happen where the test already passed, so that case needs a branch.
 ///
 /// ```text
 ///     REFERENCE TARGET                   VALUE TARGET
@@ -1134,6 +1129,27 @@ pub(crate) fn array_int_params(rank: usize) -> Vec<TypeSymbol> {
 }
 
 /// Lowers `a[i]`: the array and index are pushed, then `ldelem.*` for the element.
+/// The address of the pointer element `pointer[index]`, which is the variable `*(pointer + index)`
+/// (18.5.3): the index widened to native width (`conv.i`, or `conv.u` for an unsigned index), scaled
+/// by the element's size and added to the pointer. Reading, writing and addressing a pointer element
+/// all start here.
+fn emit_pointer_element_address(
+    element_ty: &TypeSymbol,
+    pointer: &BoundExpr,
+    index: &BoundExpr,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    emit_expression(pointer, frame, tokens, out)?;
+    emit_expression(index, frame, tokens, out)?;
+    widen_pointer_offset(&index.ty, out);
+    emit_sizeof(element_ty, tokens, out)?;
+    out.push(Instruction::simple(Opcode::Mul));
+    out.push(Instruction::simple(Opcode::Add));
+    Ok(())
+}
+
 fn emit_element_load(
     element_ty: &TypeSymbol,
     receiver: &BoundExpr,
@@ -1157,12 +1173,7 @@ fn emit_element_load(
         return Err(EmitError::Unsupported("element access needs an index"));
     }
     if matches!(receiver.ty, TypeSymbol::Pointer(_)) {
-        emit_expression(receiver, frame, tokens, out)?;
-        emit_expression(&indices[0], frame, tokens, out)?;
-        widen_pointer_offset(&indices[0].ty, out);
-        emit_sizeof(element_ty, tokens, out)?;
-        out.push(Instruction::simple(Opcode::Mul));
-        out.push(Instruction::simple(Opcode::Add));
+        emit_pointer_element_address(element_ty, receiver, &indices[0], frame, tokens, out)?;
         emit_load_indirect(element_ty, tokens, out)?;
         return Ok(());
     }
@@ -1226,11 +1237,7 @@ pub(crate) fn emit_element_store(
         return Err(EmitError::Unsupported("element access needs an index"));
     }
     if matches!(receiver.ty, TypeSymbol::Pointer(_)) {
-        emit_expression(receiver, frame, tokens, out)?;
-        emit_expression(&indices[0], frame, tokens, out)?;
-        emit_sizeof(element_ty, tokens, out)?;
-        out.push(Instruction::simple(Opcode::Mul));
-        out.push(Instruction::simple(Opcode::Add));
+        emit_pointer_element_address(element_ty, receiver, &indices[0], frame, tokens, out)?;
         emit_expression(value, frame, tokens, out)?;
         let kept = keep_assigned(leave, &value.ty, frame, out);
         emit_store_indirect(element_ty, tokens, out)?;
@@ -1264,11 +1271,6 @@ pub(crate) fn emit_element_store(
 /// The `ldelem.*` opcode for reading an element of the given type.
 /// The instruction that READS `array[index]` for an element of this type.
 ///
-/// **A TYPE PARAMETER TAKES THE TOKEN-CARRYING `ldelem` (III.4.7), NOT ONE OF THE WIDTH-SPECIFIC
-/// FORMS.** `T[]` is `int[]` under one instantiation and `string[]` under another, so no opcode
-/// chosen at compile time is right for both -- `ldelem.ref` on a `T` closed over `int` reads the
-/// value as a reference. The token form defers the decision to the instantiation in hand, which is
-/// what csc emits and the only lowering that is correct for either.
 pub(crate) fn ldelem_instruction(
     element_ty: &TypeSymbol,
     tokens: &Tokens,
@@ -1498,10 +1500,6 @@ fn emit_delegate_creation(
 ///   L:
 /// ```
 ///
-/// **THE `dup`/`brtrue`/`pop` IS NOT AN OPTIMIZATION AND NEITHER IS THE CACHE.** Two evaluations
-/// of one non-capturing lambda must yield the SAME delegate -- csc's do, because both read this
-/// field -- so `ReferenceEquals` over them answers `true`. Allocating per evaluation would be a
-/// visible behavior difference, not a slower correct answer.
 ///
 /// The store leaves its value on the stack with a bare `dup` rather than the temp-local round
 /// trip [`keep_assigned`] takes for an assignment written in source: there is no user expression
@@ -2417,9 +2415,6 @@ fn conversion_operand_type(ty: &TypeSymbol, tokens: &Tokens) -> TypeSymbol {
 /// signed source, and any same-or-narrowing integral target, use the plain width-keyed `conv.*`
 /// (III.3.17).
 ///
-/// A `byte`, `ushort` or `char` reaches a floating-point type through the plain `conv.r4` or
-/// `conv.r8`, as csc emits it: the value sits on the stack zero-extended to `int32`, so its sign
-/// bit is clear and the signed reading gives the same number.
 ///
 /// The one rule for a numeric conversion: a cast, an implicit conversion the binder inserts and the
 /// widened right-hand side of a compound assignment all reach it, so the source's signedness is
@@ -2594,14 +2589,6 @@ pub(crate) fn emit_field_receiver(
 /// field is known to belong to another type; a constructor whose owner does not match stays where
 /// it was.
 ///
-/// The evidence is the binder's rule for the same question, clause for clause: the constructor
-/// is of the type that declares the field, compared by DEFINITION (a generic type's fields are
-/// declared on `G<T>` and its constructor belongs to `G`, so an exact comparison copied every
-/// readonly struct field a generic constructor wrote, and the writes were lost); it is the static
-/// constructor for a static field and an instance one for an instance field; and an instance field
-/// is reached through `this`. The binder refuses a WRITE that fails any clause, so what reaches
-/// here failing one is a method called on the field -- `other.counter.Bump()` in a constructor --
-/// and csc calls that on a copy.
 fn addressable_in_place(field: &FieldReference, receiver: &BoundExpr, frame: &Frame) -> bool {
     if !field.is_readonly {
         return true;
@@ -2657,6 +2644,15 @@ pub(crate) fn emit_value_type_receiver(
         BoundExprKind::This | BoundExprKind::Base => {
             out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
             Ok(())
+        }
+        BoundExprKind::ElementAccess {
+            receiver: pointer,
+            indices,
+        } if matches!(pointer.ty, TypeSymbol::Pointer(_)) => {
+            let [index] = &indices[..] else {
+                return Err(EmitError::Unsupported("a pointer element access with more than one index"));
+            };
+            emit_pointer_element_address(&receiver.ty, pointer, index, frame, tokens, out)
         }
         BoundExprKind::ElementAccess {
             receiver: array,
@@ -2877,13 +2873,6 @@ pub(crate) fn emit_store_indirect(
 /// the types THIS MODULE declares: `decimal*` and a pointer to any imported struct reached
 /// `ldind.ref` that way, and the runtime refused the method on entry.
 ///
-/// **A TYPE PARAMETER HAS NO WIDTH EITHER, AND IT IS TESTED FIRST.** It is a reference in some
-/// instantiations and a value in others, so `ldind.ref` is right only in the first kind: at
-/// `T = long` on a 32-bit target it moves four of the eight bytes, and at `T = byte` it overwrites
-/// the three that follow. `ldobj !T` is right for every instantiation -- over a reference type it
-/// moves the reference (III.4.13) -- and it is what csc emits whatever `T`'s constraints are. It
-/// goes first because a parameter shadows a real type of the same name, as it does at
-/// [`Tokens::instruction_type_token`].
 fn whole_referent_token(ty: &TypeSymbol, tokens: &Tokens) -> Result<Option<Token>, EmitError> {
     if tokens.body_type_parameter(ty).is_some() {
         return tokens.type_parameter_spec(ty).map(Some).ok_or(EmitError::Unsupported(
@@ -2941,6 +2930,10 @@ fn emit_literal(
         Literal::Integer { value, .. } => out.push(integer_constant(*value as i64, ty, tokens)),
         Literal::Boolean(value) => out.push(load_i4(i32::from(*value))),
         Literal::Character(value) => out.push(load_i4(i32::from(*value))),
+        Literal::Null if matches!(ty, TypeSymbol::Pointer(_)) => {
+            out.push(load_i4(0));
+            out.push(Instruction::simple(Opcode::ConvU));
+        }
         Literal::Null => out.push(Instruction::simple(Opcode::Ldnull)),
         Literal::String(text) => {
             let token = tokens.string(text).ok_or(EmitError::Unsupported(
@@ -3676,10 +3669,6 @@ pub(crate) fn emit_concat_call(
 /// once, so an n-term concatenation allocates one string rather than n-1. On a part with 64 KB of
 /// RAM that is not cosmetic.
 ///
-/// Adjacent constants merge on the way through, because **THE PIECE COUNT IS THE OVERLOAD**:
-/// `String.Concat` has fixed arities up to four (strings) or three (objects) and a `params` one
-/// past that, so `"a" + "b" + s` left as three pieces would take a different call -- and a
-/// different allocation -- from the two csc uses.
 pub(crate) enum ConcatCall {
     /// Every piece folded to text, so the whole chain is one `ldstr` and no call at all.
     Literal(Box<[u16]>),
@@ -3807,9 +3796,6 @@ enum ConcatPiece {
 
 /// Collects the operands of a string `+` chain, descending through every `+` that yields a string.
 ///
-/// It descends through PARENTHESES for free -- the binder leaves no node for them -- so
-/// `"a" + (s + "b")` flattens to the same three pieces the left-associated spelling gives, which
-/// is csc's answer for both.
 fn flatten_concat<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {
     if let BoundExprKind::Binary {
         operator: BinaryOperator::Add,
@@ -3829,9 +3815,6 @@ fn flatten_concat<'a>(expr: &'a BoundExpr, out: &mut Vec<&'a BoundExpr>) {
 
 /// The UTF-16 text of an operand that is a compile-time string constant, else `None`.
 ///
-/// A non-string constant is deliberately not text: `"a" + 1` renders the `1` at run time (there is
-/// no implicit int-to-string conversion to fold through), and csc refuses that same expression
-/// where a constant is required for exactly that reason.
 fn constant_text(operand: &BoundExpr) -> Option<Box<[u16]>> {
     match lamella_binder::constant_literal_value(operand) {
         Some(Literal::String(text)) => Some(text),
@@ -3856,10 +3839,6 @@ fn concat_reference(parameters: Vec<TypeSymbol>) -> MethodReference {
 
 /// The `String.Concat` call a string (or `object`) `op=` lowers to.
 ///
-/// **THE TARGET'S CURRENT VALUE IS THE FIRST ARGUMENT**, and it is already on the stack when this
-/// is decided -- `s += X` loads `s`, evaluates `X`, concatenates, stores. So a `+=` whose
-/// right-hand side is itself a `+` chain is one concatenation of n+1 pieces, and csc calls
-/// `Concat` once for the whole thing.
 pub(crate) enum CompoundConcat {
     /// `Concat(a, b)`: the target's value and the right-hand side as one value. What a `+=` whose
     /// right-hand side is not a chain gets, and the fallback when a spliced one would not fit.

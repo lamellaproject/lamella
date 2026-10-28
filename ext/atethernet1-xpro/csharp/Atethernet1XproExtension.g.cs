@@ -6,7 +6,7 @@
 // extension binds to any host that offers a socket of this standard.
 namespace Lamella.Generated
 {
-    public sealed class Atethernet1XproExtension
+    internal sealed class Atethernet1XproExtension
     {
         private Atethernet1XproExtension() { }
         public const string EXTENSION = "atethernet1-xpro";

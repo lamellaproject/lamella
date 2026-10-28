@@ -42,7 +42,7 @@ pub const VCP_RX_AFR_VALUE: u32 = 0x70000000;
 pub const VCP_PCLK_HZ: u32 = 16000000;
 pub const VCP_BRR_115200_HSI_16MHZ: u32 = 0x8B;
 
-// -- CODEC_I2C: an st-i2c binding descriptor. BOTH PINS ARE OPEN DRAIN --
+// -- CODEC_I2C: an st-i2c binding descriptor. Both pins are open drain --
 // a push-pull output cannot be pulled low by the device at the other end, so an
 // acknowledge is fought instead of seen and nothing ever answers, with the mux
 // perfectly correct. The timing words are the manual's own compliant points at
@@ -73,7 +73,7 @@ pub const CODEC_I2C_KERNEL_HZ: u32 = 16000000;
 pub const CODEC_I2C_TIMINGR_100K_HSI_16MHZ: u32 = 0x30420F13;
 pub const CODEC_I2C_TIMINGR_400K_HSI_16MHZ: u32 = 0x10320309;
 
-// -- HEADER_I2C: an st-i2c binding descriptor. BOTH PINS ARE OPEN DRAIN --
+// -- HEADER_I2C: an st-i2c binding descriptor. Both pins are open drain --
 // a push-pull output cannot be pulled low by the device at the other end, so an
 // acknowledge is fought instead of seen and nothing ever answers, with the mux
 // perfectly correct. The timing words are the manual's own compliant points at
@@ -135,10 +135,10 @@ pub const MEMORY_QSPI_ADDRESS_BITS: u32 = 24;
 pub const MEMORY_QSPI_FSIZE: u32 = 23;
 pub const MEMORY_QSPI_DCR: u32 = 0x170100;
 
-/// -- read configurations. Each word below is a COMPLETE command EXCEPT two fields, and
+/// -- read configurations. Each word below is a complete command except two fields, and
 /// which two is the point: the functional mode is the driver's choice (indirect or
-/// memory-mapped, both in the block layout), and THE DUMMY COUNT IS THE PART'S ANSWER.
-/// A dummy phase covers the device's internal latency in TIME, so the cycles that cover it
+/// memory-mapped, both in the block layout), and the dummy count is the part's answer.
+/// A dummy phase covers the device's internal latency in time, so the cycles that cover it
 /// fall with the interface clock -- and a wrong count does not fail, it shifts every byte
 /// and returns plausible garbage. Walk the range and keep the first count that reads back a
 /// payload you already know; the anchors below say what this board answered, and at what --

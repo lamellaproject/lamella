@@ -4,7 +4,7 @@
 # they disagree on the two per-instance numbers a driver cannot work without -- see
 # instances.toml, where the generic-clock ids and the NVIC lines are both different.
 #
-# WHAT THIS PART DOES NOT HAVE, stated because a reader arriving from the SAM D21 will look for
+# What this part does not have, stated because a reader arriving from the SAM D21 will look for
 # it: no USB, no DMAC, no TCC, no I2S. Table 11-1 rows eight TCs and no TCC at all, and function
 # columns E and F of Table 6-1 are BOTH TC where the SAM D21 spends F on TCC.
 

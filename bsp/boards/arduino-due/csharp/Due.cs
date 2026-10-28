@@ -3,7 +3,7 @@ using Lamella.Generated;
 
 namespace Lamella.Boards.Arduino
 {
-    public sealed class Due
+    internal sealed class Due
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = ArduinoDueBindings.BOARD_MODEL;

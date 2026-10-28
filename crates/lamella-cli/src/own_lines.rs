@@ -11,6 +11,27 @@ use std::io::{self, Write};
 /// The prefix every line of this tool's own carries.
 const PREFIX: &str = "lamella:";
 
+/// The first line of a run, which says where the program runs and how, before anything else of the
+/// run: on this computer, under Lamella's interpreter.
+pub(crate) const RUNNING_HERE: &str = "running on this computer under the interpreter.";
+
+/// The first line of a run on a board running Lamella's firmware: `on` is the board the run names,
+/// or else the board that answered, as its firmware names it.
+pub(crate) fn running_interpreted(on: &str) -> String {
+    format!("running under the interpreter on {on}.")
+}
+
+/// The first line of a run of a native image written over the debug probe with the USB serial
+/// number `serial`, for `board`.
+pub(crate) fn running_through_probe(board: &str, serial: &str) -> String {
+    format!("running the native image for {board} through probe {serial}.")
+}
+
+/// The first line of a run of a native image in the emulator of the machine `machine`.
+pub(crate) fn running_in_emulator(machine: &str) -> String {
+    format!("running the native image in the {machine} emulator.")
+}
+
 /// Says `text` on `err` as this tool's own words: every line prefixed `lamella:`, a blank one too.
 pub(crate) fn say(err: &mut dyn Write, text: &str) {
     for line in text.lines() {

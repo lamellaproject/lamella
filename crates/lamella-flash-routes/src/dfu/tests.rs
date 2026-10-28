@@ -341,5 +341,6 @@ fn another_vendors_dfu_interface_is_not_a_candidate() {
     let other = attached(VENDOR + 1, Some("CCCC3333"));
     let mixed = [other.clone(), attached(VENDOR, Some("AAAA1111"))];
     assert_eq!(choose_device(&mixed, VENDOR, None).expect("the sole one of this vendor").vendor_id, VENDOR);
-    assert!(choose_device(&[other], VENDOR, Some("CCCC3333")).is_err(), "another vendor's serial");
+    let refusal = choose_device(&[other], VENDOR, Some("CCCC3333")).expect_err("another vendor's serial");
+    assert!(refusal.contains("serial CCCC3333."), "names the serial asked for, with none of this vendor: {refusal}");
 }

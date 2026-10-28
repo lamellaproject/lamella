@@ -2,7 +2,7 @@
 # lives in blocks/*.toml; wiring truth lives in bsp/boards/<board>/board.toml. The record schema is
 # uniform across rows; -1 marks a field that does not apply to a row and emits nothing.
 #
-# SERCOM2's BASE IS 0x42000C00 AND THE PERIPHERALS TABLE SAYS 0x42000A00. The table is wrong; see
+# SERCOM2's base is 0x42000C00 and the peripherals table says 0x42000A00. The table is wrong; see
 # parts.toml, which states the evidence in full. In short: every other SERCOM in Table 12-1 strides
 # by 0x400 and that value would make two consecutive steps 0x200 and 0x600, while Figure 8-1's
 # Bridge C column -- read as a picture -- gives a uniform stride and puts SERCOM3 exactly one

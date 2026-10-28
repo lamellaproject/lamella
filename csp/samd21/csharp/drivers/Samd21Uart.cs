@@ -3,7 +3,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Samd21Uart
+internal sealed class Samd21Uart
 {
     private readonly uint _ctrla;
     private readonly uint _ctrlb;

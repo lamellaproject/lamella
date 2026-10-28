@@ -7,7 +7,10 @@ namespace Lamella.Generated
     internal static class TargetBoardFacts
     {
         /// <summary>The board's id, the name a build selects this board by.</summary>
-        internal const string Name = "st-stm32f429i-disco";
+        internal static string Name
+        {
+            get { return "st-stm32f429i-disco"; }
+        }
 
         /// <summary>Binds the board's buses, and answers the board's wire identity: reading a
         /// static of the board's class runs its type initializer, which binds them the first time

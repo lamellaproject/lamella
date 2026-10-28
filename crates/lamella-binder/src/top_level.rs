@@ -88,9 +88,6 @@ pub fn without_later_top_level_statements(
 /// - `CS7022` (a warning) at every method that would otherwise be an entry point, at its name,
 ///   since it is set aside rather than chosen.
 ///
-/// The warnings come in csc's order, measured over several arrangements: within a namespace, the
-/// methods of its nested namespaces before those of its types, and within a type, its own methods
-/// before its nested types'.
 #[must_use]
 pub fn top_level_entry_point_diagnostics(
     units: &[CompilationUnit],
@@ -249,13 +246,6 @@ fn takes_entry_point_parameters(parameters: &[Parameter]) -> bool {
 /// The names a program's top-level statements declare at their OUTERMOST level -- the local
 /// variables code outside them may not use (`CS8801`), however the name would otherwise resolve.
 ///
-/// A local declared in a block, a loop or a lambda among the statements is not one of them (csc
-/// answers `CS0103` for it, measured): only a declaration directly in the statement list counts,
-/// with the expression variables (`out var x`, `o is T x`) whose scope is that list -- those in
-/// an expression statement, a declaration's initializer, a `return`, a `throw`, and an `if`'s
-/// condition, which csc also leaves in scope after the `if` (measured). A using declaration's
-/// variable is the list's, and so is everything declared after it, which the parser keeps as its
-/// body.
 #[must_use]
 pub fn top_level_local_names(part: &TypeDecl) -> BTreeSet<Box<str>> {
     let mut names = BTreeSet::new();
@@ -297,6 +287,9 @@ fn statement_names(statement: &Stmt, names: &mut BTreeSet<Box<str>>) {
         | StmtKind::Throw(Some(expression)) => expression_variables(expression, names),
         StmtKind::If { condition, .. } => expression_variables(condition, names),
         StmtKind::Labeled { statement, .. } => statement_names(statement, names),
+        StmtKind::LocalFunction(function) => {
+            names.insert(function.name.clone());
+        }
         StmtKind::Using {
             resource,
             body,

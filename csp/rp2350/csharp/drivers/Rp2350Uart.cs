@@ -3,7 +3,7 @@ using Lamella.Boards;
 using Lamella.Generated;
 using Lamella.Hardware;
 
-public sealed class Rp2350Uart
+internal sealed class Rp2350Uart
 {
     private readonly uint _dr;
     private readonly uint _fr;

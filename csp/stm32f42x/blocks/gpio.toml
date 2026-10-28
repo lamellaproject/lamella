@@ -5,12 +5,12 @@
 # sequences ride here, and this block has none -- configuring a pin is a read-modify-write of a
 # shared register, which is a driver's job rather than an ordered sequence.
 #
-# THE FIELD LISTS ARE PARTIAL ON PURPOSE. Each of these registers packs all sixteen pins of a port
+# The field lists are partial on purpose. Each of these registers packs all sixteen pins of a port
 # into one word, so a complete field list would be 16 rows per register saying the same thing at a
 # stride. Only the pins a binding actually mux are stated, and the notes give the stride so the rest
 # is derivable rather than absent.
 #
-# ST CARRIES THIS SAME GPIO DESIGN ON SEVERAL LINES, and its registers do agree across them -- which
+# ST carries this same GPIO design on several lines, and its registers do agree across them -- which
 # is not a safe thing to assume from that alone: the USART on this very part is a case where two ST
 # lines share a peripheral's name and not its register layout. Every offset and encoding below is
 # this part's manual's.

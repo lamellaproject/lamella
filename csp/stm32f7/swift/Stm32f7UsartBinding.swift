@@ -2,7 +2,7 @@
 // wiring resolves to. Every field arrives as a generated literal from a board's *Bindings enum;
 // the driver never holds a base address, a pin register, or a divisor of its own.
 //
-// THE TX AND RX MUX FACTS ARE SEPARATE, one descriptor each, and on this family that is not a
+// The TX and RX mux facts are separate, one descriptor each, and on this family that is not a
 // formality: a board may transmit on port A and receive on port B, and a transmit pin above 7 puts
 // its alternate-function nibble in a different register than the receive pin's.
 // Two pins of one USART may share nothing at all.

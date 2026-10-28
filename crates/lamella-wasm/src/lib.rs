@@ -15,6 +15,8 @@ pub mod compile;
 pub mod dap;
 #[cfg(feature = "probe")]
 pub mod probe;
+#[cfg(feature = "probe-debug")]
+pub mod probe_debug;
 #[cfg(feature = "py")]
 pub mod py;
 #[cfg(feature = "repl")]
@@ -266,5 +268,73 @@ mod tests {
             diagnostics: Vec::new(),
         };
         assert!(to_json(&result).contains(r#""stdout":"a\"b\\c\n""#));
+    }
+
+    /// A program that casts an `int[]` to two interfaces: `IComparable`, which `System.Array` does
+    /// not implement, so .NET throws InvalidCastException, and `IEnumerable`, which it does. It
+    /// prints which way the first cast went, and returns 0 or the number of the first check that
+    /// failed.
+    pub(crate) const CASTS_AN_ARRAY: &str = "\
+using System;
+using System.Collections;
+
+class Program
+{
+    static int Main()
+    {
+        object ints = new int[3];
+        try
+        {
+            object comparable = (IComparable)ints;
+            Console.WriteLine(\"no throw\");
+            return 1;
+        }
+        catch (InvalidCastException)
+        {
+            Console.WriteLine(\"InvalidCastException\");
+        }
+        if (ints is IComparable) return 2;
+        if (!(ints is IEnumerable)) return 3;
+        return 0;
+    }
+}
+";
+
+    /// `source` compiled against the committed corlib, as its image and PDB, for a run that then
+    /// loads it with no corlib. `None` where the corlib fixture is absent.
+    pub(crate) fn compiled_against_the_corlib(source: &str) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+        let corlib = fixture("corlib.dll")?;
+        let references = [lamella_metadata::Assembly::read(&corlib).expect("the corlib parses")];
+        let compilation =
+            lamella_assemble::compile_source(source, "app.cs", "app.dll", "app", &references, true);
+        assert!(
+            compilation.diagnostics.is_empty(),
+            "{:?}",
+            compilation.diagnostics
+        );
+        Some((
+            compilation.image.expect("an assembly image"),
+            compilation.pdb,
+        ))
+    }
+
+    /// **WITH NO CORLIB, AN ARRAY CASTS AS .NET's DOES.** `lamella_run` runs a program the host
+    /// passed no corlib for, and an array's cast to an interface `System.Array` does not implement
+    /// was let through: `(IComparable)new int[3]` succeeded where .NET throws.
+    #[test]
+    fn a_program_run_with_no_corlib_casts_an_array_as_dotnet_does() {
+        let Some((image, _)) = compiled_against_the_corlib(CASTS_AN_ARRAY) else {
+            eprintln!("corlib.dll absent; skipping");
+            return;
+        };
+        let result = run_bytes(&image);
+        let said: Vec<&str> = result
+            .diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect();
+        assert_eq!(result.stdout, "InvalidCastException\n", "{said:?}");
+        assert_eq!(result.exit_code, 0, "the first check that failed");
+        assert!(said.is_empty(), "{said:?}");
     }
 }

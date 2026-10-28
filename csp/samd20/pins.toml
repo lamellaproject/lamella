@@ -15,14 +15,13 @@ notes = [
 
 # ---- the SAM D20 Xplained Pro's EDBG virtual COM port -------------------------------------------
 #
-# THE KIT GUIDE AND THE PART DATASHEET AGREE HERE, AND THE AGREEMENT WAS CHECKED RATHER THAN
-# ASSUMED. Atmel-42102D Table 4-8 gives the virtual COM port as SERCOM3 PAD[2] on PA24 and
-# SERCOM3 PAD[3] on PA25; Table 6-1 gives both pads in column C against SERCOM3. One instance
-# owns both pads and the two documents name the same one.
+# The kit guide and the part datasheet agree here. Atmel-42102D Table 4-8 gives the virtual COM
+# port as SERCOM3 PAD[2] on PA24 and SERCOM3 PAD[3] on PA25; Table 6-1 gives both pads in column
+# C against SERCOM3. One instance owns both pads and the two documents name the same one.
 #
-# The check is run on every kit because the SIBLING KIT FAILED IT: the SAM R21 Xplained Pro's
-# guide puts a UART's two pads on two different SERCOM instances, and csp/samr21/pins.toml
-# carries the correction. A guide agreeing with its datasheet is a result here, not a default.
+# A kit guide does not always agree with its datasheet: the SAM R21 Xplained Pro's guide puts a
+# UART's two pads on two different SERCOM instances, and csp/samr21/pins.toml carries the
+# correction.
 
 [[pins]]
 pin = "PA24"

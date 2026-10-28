@@ -1,7 +1,7 @@
 // The descriptor a SAM3X UART driver consumes: one binding's resolved values, exactly the consts a
 namespace Lamella.Boards
 {
-    public sealed class Sam3xUartBinding
+    internal sealed class Sam3xUartBinding
     {
         /// <summary>The bound UART instance's base address.</summary>
         public readonly uint UartBase;

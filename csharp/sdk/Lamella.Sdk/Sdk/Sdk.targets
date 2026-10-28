@@ -6,13 +6,36 @@
   - the package references, which Lamella provides itself, so NuGet never resolves one;
   - the compile of a build (an editor's design-time build still computes the C# compiler's command
     line, against the same references, so IntelliSense sees exactly what the build compiles against);
-  - the devices dotnet run lists, and the command dotnet run starts.
+  - which of the implicit usings the build keeps: those whose namespace its references define;
+  - the devices dotnet run lists, and the command dotnet run starts, in Lamella.Run.targets;
+  - the image dotnet publish writes for the board the project names, in Lamella.Publish.targets.
+
+  It also checks the board a project names, for every target framework, in Lamella.Boards.targets.
+
+  A net11.0 build is Lamella RHU's, when this SDK pins a release of it: Lamella.Rhu.targets sets what
+  its restore must know before Microsoft.NET.Sdk's targets are read, and RHU's own targets are read
+  after them, at the end of this file.
 
   The tool is the one in the package Lamella.Tools.RID, where RID is the runtime identifier of the
   machine the .NET SDK runs on, at this SDK's own version, which restore downloads; or the file the
-  LamellaToolPath property names. The PATH is never searched.
+  LamellaToolPath property names. The PATH is never searched. This SDK carries the SHA-256 of the
+  tool in each such package, as it was packed, and runs a restored tool only when the file has that
+  hash. A file LamellaToolPath names is the project's own choice, and is run as it is.
 -->
 <Project>
+
+  <!-- The packages this SDK downloads, each with the hash it is checked against: for each machine this
+       SDK has a lamella tool for, the package of that tool, as _LamellaToolPack, and the SHA-256 of the
+       tool it holds, as its ToolSha256; and the release of Lamella RHU it pins, as _LamellaRhuPack and
+       the _LamellaRhu properties, which a net11.0 restore reads. -->
+  <Import Project="$(_LamellaKnownPacksFile)" Condition="'$(_LamellaKnownPacksFile)' != '' and Exists('$(_LamellaKnownPacksFile)')" />
+
+  <!-- The boards Lamella RHU supports, from its release: the board check reads them for every target framework, and a
+       net11.0 build reads their ids and machines before restore. -->
+  <Import Project="$(_LamellaRhuBoardsFile)" Condition="'$(_LamellaRhuBoardsFile)' != '' and Exists('$(_LamellaRhuBoardsFile)')" />
+
+  <!-- Lamella RHU's half of a net11.0 build, before Microsoft.NET.Sdk's targets. -->
+  <Import Project="$(MSBuildThisFileDirectory)Lamella.Rhu.targets" Condition="'$(TargetFramework)' == 'net11.0'" />
 
   <Import Project="Sdk.targets" Sdk="Microsoft.NET.Sdk" />
 
@@ -35,7 +58,15 @@
 
     <_LamellaAllowUnsafe>false</_LamellaAllowUnsafe>
     <_LamellaAllowUnsafe Condition="'$(AllowUnsafeBlocks)' == 'true'">true</_LamellaAllowUnsafe>
+
+    <!-- The builds whose runs this SDK serves, which run the lamella tool: a lamella1.0 build, and a net11.0 build when
+         this SDK pins a release of Lamella RHU, whose program the tool writes to a board over a debug probe. -->
+    <_LamellaServesRun Condition="'$(TargetFrameworkIdentifier)' == 'Lamella' or '$(_LamellaRhuDispatch)' == 'true'">true</_LamellaServesRun>
   </PropertyGroup>
+
+  <!-- The packages the lamella tool provides for lamella1.0, as _LamellaProvidedPackage, written by
+       that tool when this SDK was packed. -->
+  <Import Project="$(_LamellaPackagesFile)" Condition="'$(_LamellaPackagesFile)' != '' and Exists('$(_LamellaPackagesFile)')" />
 
   <!-- The compile. A build's CoreCompile keeps the C# compiler's inputs, outputs and up-to-date check,
        but the compiler itself is skipped and the lamella tool writes the assembly instead, from
@@ -59,40 +90,66 @@
     <Reference Include="System.Net.NetworkInformation" HintPath="$([MSBuild]::NormalizePath('$(LamellaRefDir)', 'System.Net.NetworkInformation.dll'))" Private="false" IsImplicitlyDefined="true" LamellaFramework="true" />
 
     <!-- Package references. Lamella provides System.Device.Gpio and its own Lamella libraries for
-         lamella1.0 inside this SDK, so every PackageReference is taken out of NuGet's hands before
-         restore and kept as a LamellaPackageReference, with its Version. The lamella tool then
-         chooses the assembly each one names, by NuGet's version rules, and reports a package it does
-         not provide. The one PackageReference left to NuGet is to this SDK's own tool package. -->
-    <_LamellaToolPackageReference Include="@(PackageReference->WithMetadataValue('Identity', '$(_LamellaToolPackageId)'))" />
-    <LamellaPackageReference Include="@(PackageReference)" Exclude="@(_LamellaToolPackageReference)" />
+         lamella1.0 inside this SDK, the packages Lamella.Packages.props lists, so a PackageReference
+         to one of them is taken out of NuGet's hands before restore and kept as a
+         LamellaPackageReference, with its Version; the lamella tool then chooses the assembly each
+         one names, by NuGet's version rules. Every other package is NuGet's, as on .NET: a library
+         package built for Lamella references that build itself, with the targets file it carries. -->
+    <_LamellaNuGetPackageReference Include="@(PackageReference)" Exclude="@(_LamellaProvidedPackage)" />
+    <LamellaPackageReference Include="@(PackageReference)" Exclude="@(_LamellaNuGetPackageReference)" />
     <PackageReference Remove="@(LamellaPackageReference)" />
-
-    <!-- dotnet run starts the lamella tool with the RuntimeEnvironmentVariable items in its
-         environment; ComputeRunArguments below adds LAMELLA_REF_DIR and LAMELLA_RUNTIME_SUPPORT_DIR to
-         them. -->
-    <ProjectCapability Include="RuntimeEnvironmentVariableSupport" />
   </ItemGroup>
 
-  <!-- Restore downloads the lamella tool unless the project names one. -->
-  <ItemGroup Condition="'$(TargetFrameworkIdentifier)' == 'Lamella' and '$(LamellaToolPath)' == ''">
+  <!-- Restore downloads the lamella tool for this machine, for a build whose runs this SDK serves, unless
+       the project names one, or this SDK has no tool for this machine and so could not check the one a
+       download would bring. -->
+  <ItemGroup Condition="'$(_LamellaServesRun)' == 'true' and '$(LamellaToolPath)' == '' and '@(_LamellaToolPack->WithMetadataValue('Identity', '$(_LamellaToolPackageId)'))' != ''">
     <PackageDownload Include="$(_LamellaToolPackageId)" Version="[$(LamellaSdkVersion)]" />
   </ItemGroup>
 
-  <!-- Why the lamella tool cannot be run, or nothing when it can. dotnet run evaluates a project
-       before it restores it, so when that same command restores a project for the first time, this
-       evaluation has no package folder; the tool's path then comes from a fresh evaluation of the
-       project, made after the restore. -->
+  <!-- Why the lamella tool cannot be run, or nothing when it can. A tool restored with this SDK is run
+       only when this SDK has a tool for this machine, and only when the restored file's SHA-256 is the
+       one this SDK carries for that tool: a NuGet folder extracts a package once and keeps it, so a
+       file changed there since, or another package under the same id and version, is refused before
+       anything runs it. A file LamellaToolPath names is the project's own choice, and is run as it is.
+       dotnet run evaluates a project before it restores it, so when that same command restores a
+       project for the first time, this evaluation has no package folder; the tool's path then comes
+       from a fresh evaluation of the project, made after the restore. -->
   <Target Name="_LamellaToolFault">
-    <MSBuild Condition="'$(LamellaToolPath)' == '' and '$(_LamellaTool)' == '' and '$(_LamellaToolAfterRestore)' != 'true'"
+    <PropertyGroup Condition="'$(LamellaToolPath)' == ''">
+      <_LamellaToolPinnedSha256>@(_LamellaToolPack->WithMetadataValue('Identity', '$(_LamellaToolPackageId)')->'%(ToolSha256)')</_LamellaToolPinnedSha256>
+      <_LamellaToolMachines>@(_LamellaToolPack->'%(RuntimeIdentifier)', ', ')</_LamellaToolMachines>
+      <_LamellaToolMachines>$([System.Text.RegularExpressions.Regex]::Replace('$(_LamellaToolMachines)', ', ([^,]+)$', ' and $1'))</_LamellaToolMachines>
+    </PropertyGroup>
+    <MSBuild Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolPinnedSha256)' != '' and '$(_LamellaTool)' == '' and '$(_LamellaToolAfterRestore)' != 'true'"
              Projects="$(MSBuildProjectFullPath)"
              Targets="_LamellaToolPathAfterRestore"
              Properties="_LamellaToolAfterRestore=true">
       <Output TaskParameter="TargetOutputs" PropertyName="_LamellaTool" />
     </MSBuild>
     <PropertyGroup>
+      <_LamellaToolFaultCode Condition="'$(LamellaToolPath)' != '' and !Exists('$(_LamellaTool)')">LAMSDK0001</_LamellaToolFaultCode>
       <_LamellaToolFault Condition="'$(LamellaToolPath)' != '' and !Exists('$(_LamellaTool)')">LamellaToolPath names the lamella tool at '$(_LamellaTool)', and there is no file there. Set LamellaToolPath to the full path of a lamella executable, or remove it to use the one restored with this SDK.</_LamellaToolFault>
-      <_LamellaToolFault Condition="'$(LamellaToolPath)' == '' and '$(_LamellaTool)' == ''">The lamella tool comes from the package $(_LamellaToolPackageId) $(LamellaSdkVersion), and this project has not been restored. Restore it (dotnet restore), or set LamellaToolPath to the full path of a lamella executable.</_LamellaToolFault>
-      <_LamellaToolFault Condition="'$(LamellaToolPath)' == '' and '$(_LamellaTool)' != '' and !Exists('$(_LamellaTool)')">The lamella tool was not found at '$(_LamellaTool)', where restore puts the package $(_LamellaToolPackageId) $(LamellaSdkVersion). Restore the project (dotnet restore), or set LamellaToolPath to the full path of a lamella executable.</_LamellaToolFault>
+      <_LamellaToolFaultCode Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolPinnedSha256)' == '' and '$(_LamellaToolMachines)' != ''">LAMSDK0002</_LamellaToolFaultCode>
+      <_LamellaToolFault Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolPinnedSha256)' == '' and '$(_LamellaToolMachines)' != ''">Lamella.Sdk $(LamellaSdkVersion) has no lamella tool for $(_LamellaToolRid), the machine the .NET SDK runs on; it has one for $(_LamellaToolMachines). Intel macOS (osx-x64) is not a supported Lamella.Sdk build or publish host in this release. Set LamellaToolPath to the full path of a lamella executable built for this machine.</_LamellaToolFault>
+      <_LamellaToolFaultCode Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolPinnedSha256)' == '' and '$(_LamellaToolMachines)' == ''">LAMSDK0002</_LamellaToolFaultCode>
+      <_LamellaToolFault Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolPinnedSha256)' == '' and '$(_LamellaToolMachines)' == ''">Lamella.Sdk $(LamellaSdkVersion) has no lamella tool for any machine. Set LamellaToolPath to the full path of a lamella executable built for this machine.</_LamellaToolFault>
+      <_LamellaToolFaultCode Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolPinnedSha256)' != '' and '$(_LamellaTool)' == ''">LAMSDK0003</_LamellaToolFaultCode>
+      <_LamellaToolFault Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolPinnedSha256)' != '' and '$(_LamellaTool)' == ''">The lamella tool comes from the package $(_LamellaToolPackageId) $(LamellaSdkVersion), and this project has not been restored. Restore it (dotnet restore), or set LamellaToolPath to the full path of a lamella executable.</_LamellaToolFault>
+      <_LamellaToolFaultCode Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolPinnedSha256)' != '' and '$(_LamellaTool)' != '' and !Exists('$(_LamellaTool)')">LAMSDK0003</_LamellaToolFaultCode>
+      <_LamellaToolFault Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolPinnedSha256)' != '' and '$(_LamellaTool)' != '' and !Exists('$(_LamellaTool)')">The lamella tool was not found at '$(_LamellaTool)', where restore puts the package $(_LamellaToolPackageId) $(LamellaSdkVersion). Restore the project (dotnet restore), or set LamellaToolPath to the full path of a lamella executable.</_LamellaToolFault>
+    </PropertyGroup>
+    <!-- A file that cannot be read is reported below with the rest, so that listing devices, which
+         warns where building refuses, does not fail. -->
+    <GetFileHash Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolFault)' == ''" Files="$(_LamellaTool)" Algorithm="SHA256" ContinueOnError="true">
+      <Output TaskParameter="Hash" PropertyName="_LamellaToolSha256" />
+    </GetFileHash>
+    <PropertyGroup Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolFault)' == ''">
+      <_LamellaToolPackageDir>$([MSBuild]::NormalizeDirectory('$(_LamellaTool)', '..', '..'))</_LamellaToolPackageDir>
+      <_LamellaToolFaultCode Condition="'$(_LamellaToolSha256)' == ''">LAMSDK0004</_LamellaToolFaultCode>
+      <_LamellaToolFault Condition="'$(_LamellaToolSha256)' == ''">The lamella tool at '$(_LamellaTool)' could not be read to check its SHA-256 against the one Lamella.Sdk $(LamellaSdkVersion) carries for the package $(_LamellaToolPackageId), so it is not run.</_LamellaToolFault>
+      <_LamellaToolFaultCode Condition="'$(_LamellaToolSha256)' != '' and '$(_LamellaToolSha256)' != '$(_LamellaToolPinnedSha256)'">LAMSDK0005</_LamellaToolFaultCode>
+      <_LamellaToolFault Condition="'$(_LamellaToolSha256)' != '' and '$(_LamellaToolSha256)' != '$(_LamellaToolPinnedSha256)'">The lamella tool at '$(_LamellaTool)' is not the one Lamella.Sdk $(LamellaSdkVersion) was packed with: its SHA-256 is $(_LamellaToolSha256.ToLowerInvariant()), and the tool in the package $(_LamellaToolPackageId) $(LamellaSdkVersion) has the SHA-256 $(_LamellaToolPinnedSha256). Delete the folder '$(_LamellaToolPackageDir)' and restore the project again (dotnet restore), or set LamellaToolPath to the full path of a lamella executable.</_LamellaToolFault>
     </PropertyGroup>
   </Target>
 
@@ -108,7 +165,7 @@
   </Target>
 
   <Target Name="_LamellaCheckTool" DependsOnTargets="_LamellaToolFault;_LamellaToolExecutable">
-    <Error Condition="'$(_LamellaToolFault)' != ''" Text="$(_LamellaToolFault)" />
+    <Error Condition="'$(_LamellaToolFault)' != ''" Code="$(_LamellaToolFaultCode)" Text="$(_LamellaToolFault)" />
   </Target>
 
   <!-- The lines both steps of a build give the tool: the project, each package reference as
@@ -147,7 +204,7 @@
           EnvironmentVariables="LAMELLA_REF_DIR=$(LamellaRefDir);LAMELLA_RUNTIME_SUPPORT_DIR=$(LamellaRuntimeSupportDir)"
           StandardOutputImportance="normal"
           StandardErrorImportance="normal" />
-    <Error Condition="!Exists('$(_LamellaReferencesFile)')" Text="The lamella tool chose no references: it wrote nothing at '$(_LamellaReferencesFile)'." />
+    <Error Condition="!Exists('$(_LamellaReferencesFile)')" Code="LAMSDK0009" Text="The lamella tool chose no references: it wrote nothing at '$(_LamellaReferencesFile)'." />
     <MSBuild Projects="$(_LamellaReferencesFile)" Targets="LamellaReferences" Properties="LamellaReferencesStamp=$([System.DateTime]::UtcNow.Ticks)">
       <Output TaskParameter="TargetOutputs" ItemName="_LamellaSelectedReference" />
     </MSBuild>
@@ -156,15 +213,42 @@
     </ItemGroup>
   </Target>
 
+  <!-- The implicit usings of a lamella1.0 build: Microsoft.NET.Sdk's own list, less each namespace
+       that none of the build's references defines, as the lamella tool reports them. A namespace
+       the class library does not provide is simply not imported, never an error; a using the project
+       adds that is not on that list is left as it is. -->
+  <Target Name="_LamellaImplicitUsings"
+          BeforeTargets="GenerateGlobalUsings"
+          DependsOnTargets="_LamellaResolvePackageReferences"
+          Condition="'$(TargetFrameworkIdentifier)' == 'Lamella' and '@(_LamellaImplicitUsing)' != ''">
+    <MSBuild Projects="$(_LamellaReferencesFile)" Targets="LamellaNamespaces" Properties="LamellaNamespacesStamp=$([System.DateTime]::UtcNow.Ticks)">
+      <Output TaskParameter="TargetOutputs" ItemName="_LamellaNamespace" />
+    </MSBuild>
+    <ItemGroup>
+      <_LamellaUnprovidedUsing Include="@(_LamellaImplicitUsing)" Exclude="@(_LamellaNamespace)" />
+      <Using Remove="@(_LamellaUnprovidedUsing)" />
+    </ItemGroup>
+  </Target>
+
   <!-- The compile's inputs, written just before CoreCompile decides whether the assembly is out of
        date: the lines above, then every source, every reference the project itself names (its own
        libraries, resolved by MSBuild; neither the two framework assemblies nor a package's), each
-       defined symbol, the C# version, whether unsafe code is allowed, the output type, the assembly
-       name, and where the assembly goes. A change to any of them builds the assembly again. -->
+       defined symbol, the C# version, whether unsafe code is allowed, the C# compiler's features
+       (FileBasedProgram among them for a file-based app, whose #: directives the compile then
+       takes), the output type, the assembly name, and where the assembly goes. A change to any of
+       them builds the assembly again. -->
   <Target Name="_LamellaWriteCompileInputs"
           BeforeTargets="CoreCompile"
-          DependsOnTargets="_LamellaProjectInputs"
+          DependsOnTargets="_LamellaCompileInputs"
           Condition="'$(_LamellaCompiles)' == 'true'">
+    <ItemGroup>
+      <CustomAdditionalCompileInputs Include="$(_LamellaCompileInputsFile)" />
+    </ItemGroup>
+    <WriteLinesToFile File="$(_LamellaCompileInputsFile)" Lines="@(_LamellaCompileInput)" Overwrite="true" WriteOnlyWhenDifferent="true" />
+  </Target>
+
+  <!-- The compile's inputs as lines, which the publish of a lamella1.0 program hands the tool too. -->
+  <Target Name="_LamellaCompileInputs" DependsOnTargets="_LamellaProjectInputs">
     <ItemGroup>
       <_LamellaOwnReference Include="@(ReferencePath)" Condition="'%(ReferencePath.LamellaFramework)' != 'true' and '%(ReferencePath.PackageId)' == ''" />
       <_LamellaDefine Include="$([MSBuild]::Unescape($(DefineConstants.Replace(',', ';').Replace(' ', ';'))))" Condition="'$(DefineConstants)' != ''" />
@@ -175,13 +259,11 @@
       <_LamellaCompileInput Include="@(_LamellaDefine->Distinct()->'define=%(Identity)')" />
       <_LamellaCompileInput Include="langversion=$([MSBuild]::Escape('$(LangVersion)'))" />
       <_LamellaCompileInput Include="allowunsafe=$(_LamellaAllowUnsafe)" />
+      <_LamellaCompileInput Include="features=$([MSBuild]::Escape('$(Features)'))" />
       <_LamellaCompileInput Include="outputtype=$([MSBuild]::Escape('$(OutputType)'))" />
       <_LamellaCompileInput Include="assemblyname=$([MSBuild]::Escape('$(AssemblyName)'))" />
       <_LamellaCompileInput Include="@(IntermediateAssembly->'out=%(FullPath)')" />
-
-      <CustomAdditionalCompileInputs Include="$(_LamellaCompileInputsFile)" />
     </ItemGroup>
-    <WriteLinesToFile File="$(_LamellaCompileInputsFile)" Lines="@(_LamellaCompileInput)" Overwrite="true" WriteOnlyWhenDifferent="true" />
   </Target>
 
   <Target Name="_LamellaCompile" DependsOnTargets="_LamellaCheckTool" Condition="'$(_LamellaCompiles)' == 'true'">
@@ -191,85 +273,47 @@
           StandardErrorImportance="normal" />
   </Target>
 
-  <!-- The devices dotnet run lists and chooses from. The tool lists them by the USB identity this
-       computer already holds and writes to no device, so listing disturbs no program running on a
-       board and no other session: a board whose USB identity is Lamella firmware's own, and a debug
-       probe's UART bridge (Bridge="true"), whose board is not identified. They go into a small project
-       whose target LamellaDevices returns them.
+  <!-- For a build whose runs this SDK serves, Lamella.Run.targets gives dotnet run its list of devices
+       and the command it starts. -->
+  <Import Project="$(MSBuildThisFileDirectory)Lamella.Run.targets" Condition="'$(_LamellaServesRun)' == 'true'" />
 
-       dotnet run picks a list of one without asking and asks about a longer one, and it takes a
-       device only from its command line: a Device property a project sets does not choose. So the
-       list decides, and a bridge is never alone in it, since a bridge can carry any program. A
-       project that names no board lists this computer first, where the program runs under Lamella's
-       interpreter, then everything found. With nothing found that is a list of one, and the program
-       runs on this computer. With anything found, dotnet run asks, and its first choice is this
-       computer; where it cannot ask, as in a script or a CI job, it refuses with the list, and
-       naming the device local with dotnet run's device option runs the program here. A project
-       that names a board lists only the boards running Lamella firmware, and the tool then
-       sends the program only to the board the project names. A board behind a probe is reached there
-       by naming its bridge with dotnet run's device option, and when bridges alone are attached a
-       warning says so: dotnet run shows a warning beside its own "No devices are available", where
-       its terminal logger would show a message only at a detailed verbosity.
-
-       When the tool cannot list, the reason is a warning and no board is listed, since dotnet run
-       treats a failing list as no list at all and would run the program with no device. -->
-  <Target Name="ComputeAvailableDevices"
-          DependsOnTargets="_LamellaToolFault;_LamellaToolExecutable"
-          Returns="@(_LamellaDevice)"
-          Condition="'$(TargetFrameworkIdentifier)' == 'Lamella'">
-    <Warning Condition="'$(_LamellaToolFault)' != ''" Text="$(_LamellaToolFault) No board is listed." />
-    <MakeDir Condition="'$(_LamellaToolFault)' == ''" Directories="$(_LamellaIntermediateDir)" />
-    <Delete Files="$(_LamellaDevicesFile)" />
-    <Exec Condition="'$(_LamellaToolFault)' == ''"
-          Command="&quot;$(_LamellaTool)&quot; devices --msbuild &quot;$(_LamellaDevicesFile)&quot;"
-          EnvironmentVariables="LAMELLA_REF_DIR=$(LamellaRefDir);LAMELLA_RUNTIME_SUPPORT_DIR=$(LamellaRuntimeSupportDir)"
-          ContinueOnError="true"
-          EchoOff="true"
-          StandardOutputImportance="low" />
-    <MSBuild Condition="Exists('$(_LamellaDevicesFile)')" Projects="$(_LamellaDevicesFile)" Targets="LamellaDevices" Properties="LamellaDevicesStamp=$([System.DateTime]::UtcNow.Ticks)" ContinueOnError="true">
-      <Output TaskParameter="TargetOutputs" ItemName="_LamellaFoundDevice" />
-    </MSBuild>
-    <ItemGroup>
-      <_LamellaFoundBoard Include="@(_LamellaFoundDevice)" Condition="'%(_LamellaFoundDevice.Bridge)' != 'true'" />
-      <_LamellaFoundBridge Include="@(_LamellaFoundDevice)" Condition="'%(_LamellaFoundDevice.Bridge)' == 'true'" />
-    </ItemGroup>
-    <PropertyGroup>
-      <_LamellaFoundBoards>@(_LamellaFoundBoard->Count())</_LamellaFoundBoards>
-    </PropertyGroup>
-    <ItemGroup Condition="'$(LamellaTargetBoard)' == ''">
-      <_LamellaDevice Include="local" Description="this computer, under Lamella's interpreter" Type="Local" />
-      <_LamellaDevice Include="@(_LamellaFoundDevice)" />
-    </ItemGroup>
-    <ItemGroup Condition="'$(LamellaTargetBoard)' != ''">
-      <_LamellaDevice Include="@(_LamellaFoundBoard)" />
-    </ItemGroup>
-    <Warning Condition="'$(LamellaTargetBoard)' != '' and '$(_LamellaFoundBoards)' == '0' and '@(_LamellaFoundBridge)' != ''"
-             Text="A board behind a debug probe is not listed for a project that names a board, because the probe cannot say which board it is. Reach it with dotnet run --device &lt;ID&gt;, where &lt;ID&gt; names the probe's UART bridge: @(_LamellaFoundBridge, ', '). lamella devices lists every device with its ID." />
+  <!-- A program of either product is published for a board, whose processor it is compiled ahead of
+       time for: a lamella1.0 program by the lamella tool, a net11.0 one by Lamella RHU. So a publish of
+       a project that names none is refused, by name: where dotnet publish says it is publishing, before
+       restore, which would download what an ahead-of-time compile needs, and at the first step of the
+       build, before anything is built and before any step of Lamella RHU's (BuildOnlySettings, which
+       also begins a publish of an ahead-of-time program, compiled without a build); and before the
+       publish's own steps otherwise. A publish for any other .NET framework is Microsoft.NET.Sdk's own. -->
+  <PropertyGroup>
+    <_LamellaPublishesForBoard Condition="'$(TargetFrameworkIdentifier)' == 'Lamella' or '$(TargetFramework)' == 'net11.0'">true</_LamellaPublishesForBoard>
+  </PropertyGroup>
+  <Target Name="_LamellaPublishNeedsBoard" Condition="'$(_LamellaPublishesForBoard)' == 'true' and '$(LamellaTargetBoard)' == ''">
+    <Error File="$(MSBuildProjectFullPath)"
+           Code="LAMSDK0008"
+           Text="A $(TargetFramework) program is published for a board, and this project names none. Name the board as LamellaTargetBoard: in the project file, in a publish profile, or with -p:LamellaTargetBoard=&lt;id&gt; on the dotnet publish command line." />
   </Target>
+  <Target Name="_LamellaPublishNeedsBoardFirst" BeforeTargets="CollectPackageReferences;_CheckForInvalidConfigurationAndPlatform;BuildOnlySettings" DependsOnTargets="_LamellaPublishNeedsBoard" Condition="'$(_IsPublishing)' == 'true'" />
+  <Target Name="_LamellaPublishNeedsBoardBeforePublish" BeforeTargets="PrepareForPublish" DependsOnTargets="_LamellaPublishNeedsBoard" />
 
-  <!-- The command dotnet run starts, after the build: the lamella tool, given the built assembly and
-       the device dotnet run chose, if any; the device local is this computer. With a device, the
-       board the project names goes too, and the tool sends the program only when the board that
-       answers is that one: the device list names each device by its USB identity alone, so it cannot
-       say which board is behind a probe. The tool finds the program's own libraries beside the
-       assembly, where the build copies them. The bare double dash ends the tool's arguments, so
-       anything dotnet run appends after it is the program's. -->
-  <Target Name="ComputeRunArguments"
-          DependsOnTargets="_LamellaCheckTool"
-          Condition="'$(TargetFrameworkIdentifier)' == 'Lamella'">
-    <PropertyGroup>
-      <RunCommand>$(_LamellaTool)</RunCommand>
-      <RunArguments>run --built &quot;$(TargetPath)&quot;</RunArguments>
-      <RunArguments Condition="'$(Device)' != '' and '$(Device)' != 'local'">$(RunArguments) --device &quot;$(Device)&quot;</RunArguments>
-      <RunArguments Condition="'$(Device)' != '' and '$(Device)' != 'local' and '$(LamellaTargetBoard)' != ''">$(RunArguments) --board &quot;$(LamellaTargetBoard)&quot;</RunArguments>
-      <RunArguments>$(RunArguments) --</RunArguments>
-    </PropertyGroup>
-    <ItemGroup>
-      <RuntimeEnvironmentVariable Remove="LAMELLA_REF_DIR" />
-      <RuntimeEnvironmentVariable Include="LAMELLA_REF_DIR" Value="$(LamellaRefDir)" />
-      <RuntimeEnvironmentVariable Remove="LAMELLA_RUNTIME_SUPPORT_DIR" />
-      <RuntimeEnvironmentVariable Include="LAMELLA_RUNTIME_SUPPORT_DIR" Value="$(LamellaRuntimeSupportDir)" />
-    </ItemGroup>
-  </Target>
+  <!-- What dotnet publish writes for a lamella1.0 build: the image a board takes. -->
+  <Import Project="$(MSBuildThisFileDirectory)Lamella.Publish.targets" Condition="'$(TargetFrameworkIdentifier)' == 'Lamella'" />
+
+  <!-- What dotnet pack puts in a package for a library's lamella1.0 build (Lamella.Pack.targets).
+       NuGet asks each framework's build for its content only when the build it packs from names a
+       target to ask, so the target is named for every build of a project that targets lamella1.0,
+       and does nothing for another framework. -->
+  <PropertyGroup Condition="'$(TargetFramework)' == 'lamella1.0' or $([System.String]::Copy(';$(TargetFrameworks);').Replace(' ', '').Contains(';lamella1.0;'))">
+    <_LamellaPacksLamellaBuild>true</_LamellaPacksLamellaBuild>
+    <TargetsForTfmSpecificContentInPackage>$(TargetsForTfmSpecificContentInPackage);_LamellaPackageContent</TargetsForTfmSpecificContentInPackage>
+  </PropertyGroup>
+  <Import Project="$(MSBuildThisFileDirectory)Lamella.Pack.targets" />
+
+  <!-- The board the project names, checked for every target framework before restore and build. -->
+  <Import Project="$(MSBuildThisFileDirectory)Lamella.Boards.targets" />
+
+  <!-- Lamella RHU's targets, after Microsoft.NET.Sdk's, so that RHU's definition of each target it
+       replaces, its link above all, is the last one; read only once Lamella.Rhu.targets found RHU's
+       build package restored as this SDK pins it, and of this SDK's contract. -->
+  <Import Project="$(LamellaRhuBuildTargets)" Condition="'$(_LamellaRhuImports)' == 'true'" />
 
 </Project>

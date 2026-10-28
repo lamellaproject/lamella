@@ -248,6 +248,11 @@ const CAST_LEAF_GENERIC_VALUE_TYPE: u32 = 6;
 /// byte, the element's own leaf kind in bits 16-23 and its payload in bits 24-31 -- and an older
 /// runtime, which knows no kind 7, reads the whole record as none.
 const CAST_LEAF_VECTOR_INTERFACE: u32 = 7;
+/// [`CastElem::Named`] for a type every array is an instance of -- `System.Array`, or one of the
+/// interfaces it implements -- which [`Module::cast_names_array_base`] reports. Every other reader
+/// decodes it as plain `Named`; an older runtime, which knows no kind 8, reads the record as none
+/// and matches it leniently.
+const CAST_LEAF_NAMED_ARRAY_BASE: u32 = 8;
 
 impl CastElem {
     /// This shape as a frozen-image record `(shape, token)`: the shape word packs the array depth
@@ -302,7 +307,9 @@ impl CastElem {
             CAST_LEAF_PRIM => CastElem::Prim(CastPrim::from_code(payload as u8)?),
             CAST_LEAF_STRING => CastElem::String,
             CAST_LEAF_OBJECT => CastElem::Object,
-            CAST_LEAF_NAMED => CastElem::Named((u64::from(payload) << 32) | u64::from(token)),
+            CAST_LEAF_NAMED | CAST_LEAF_NAMED_ARRAY_BASE => {
+                CastElem::Named((u64::from(payload) << 32) | u64::from(token))
+            }
             CAST_LEAF_LENIENT => CastElem::Lenient,
             CAST_LEAF_GENERIC_VALUE_TYPE => CastElem::GenericValueType,
             _ => return None,
@@ -753,6 +760,16 @@ impl ManagedBody {
         &self.code
     }
 
+    /// The instruction bytes when they live as long as the program -- a borrow of a flash-resident
+    /// PE -- or `None` for a copy this body owns in RAM.
+    #[cfg(feature = "code-in-place")]
+    fn static_code(&self) -> Option<&'static [u8]> {
+        match &self.code {
+            RawCil::Flash(bytes) => Some(bytes),
+            RawCil::Ram(_) => None,
+        }
+    }
+
     /// The exception clauses, regions in BYTE offsets -- directly comparable to the byte ip.
     #[cfg(feature = "code-in-place")]
     fn eh(&self) -> &[EhClause] {
@@ -993,6 +1010,11 @@ pub struct Module {
     /// `TypeSpec`'s signature blob), consumed by the `castclass`-on-array and `unbox.any`
     /// type checks. A token with no entry is matched leniently.
     cast_elems: BTreeMap<u64, CastElem>,
+    /// The cast-test tokens that name a type every array is an instance of -- `System.Array`, or
+    /// one of the interfaces it implements -- marked by name at load, so a cast of an array to a
+    /// named type is decided with no corlib to ask. Frozen into each token's [`CastElem`] record as
+    /// a leaf kind of its own.
+    array_base_names: BTreeSet<u64>,
     /// A virtual method's vtable slot (only virtual methods appear).
     method_slots: BTreeMap<MethodId, u32>,
     /// A static field token mapped to its storage slot in the [`crate::interp::Vm`].
@@ -2160,6 +2182,15 @@ fn image_word(bytes: &[u8], index: usize) -> Option<u64> {
         .get(at..at + 8)
         .and_then(|word| word.try_into().ok())
         .map(u64::from_le_bytes)
+}
+
+/// Word `index` (0 to 5) of a baked method record, little-endian. The record is a fixed-size array,
+/// so a constant index needs no bounds check and only the words a caller names are read.
+#[cfg(feature = "code-in-place")]
+#[inline]
+fn record_word(record: &[u8; 24], index: usize) -> u32 {
+    let at = index * 4;
+    u32::from_le_bytes([record[at], record[at + 1], record[at + 2], record[at + 3]])
 }
 
 /// CRC-64/ECMA-182 (poly 0x42F0E1EBA9EA3693, init 0, no reflection) over a byte run, updating `crc`.
@@ -3650,7 +3681,16 @@ impl Module {
             let mut records = frozen.cast_elems.entries_of(arena);
             for (handle, elem) in core::mem::take(&mut self.cast_elems) {
                 match elem.frozen_record() {
-                    Some((shape, token)) => records.push((handle, shape, token)),
+                    Some((shape, token)) => {
+                        let shape = if matches!(elem, CastElem::Named(_))
+                            && self.array_base_names.remove(&handle)
+                        {
+                            (shape & !0xFF00) | (CAST_LEAF_NAMED_ARRAY_BASE << 8)
+                        } else {
+                            shape
+                        };
+                        records.push((handle, shape, token));
+                    }
                     None => {
                         self.cast_elems.insert(handle, elem);
                     }
@@ -4022,22 +4062,19 @@ impl Module {
         ))
     }
 
-    /// One 24-byte baked method record's six words, if this module is baked and has one.
+    /// One baked method record, borrowed whole from the image with a single bounds check, if this
+    /// module is baked and has one. Its six words are `[kind, argument count, code offset, code
+    /// length, exception-clause offset, exception-clause count]`; an intrinsic's record (kind not 0)
+    /// holds its registry id and registry-index hint in the code words. Each accessor reads only the
+    /// words it uses, through [`record_word`].
     #[cfg(feature = "code-in-place")]
-    fn baked_record(&self, id: MethodId) -> Option<(u32, u32, u32, u32, u32, u32)> {
+    fn baked_method_record(&self, id: MethodId) -> Option<&'static [u8; 24]> {
         let baked = self.baked.as_ref()?;
         if id as usize >= baked.count {
             return None;
         }
-        let at = baked.table + id as usize * 24;
-        Some((
-            self.arena.read_u32(at)?,
-            self.arena.read_u32(at + 4)?,
-            self.arena.read_u32(at + 8)?,
-            self.arena.read_u32(at + 12)?,
-            self.arena.read_u32(at + 16)?,
-            self.arena.read_u32(at + 20)?,
-        ))
+        let at = (id as usize).checked_mul(24)?.checked_add(baked.table)?;
+        baked.arena_static.get(at..at.checked_add(24)?)?.try_into().ok()
     }
 
     /// The callable form of `id` -- see [`MethodKind`]. The one method-table accessor the
@@ -4046,12 +4083,12 @@ impl Module {
     pub fn method_kind(&self, id: MethodId) -> Option<MethodKind> {
         #[cfg(feature = "code-in-place")]
         if let Some(baked) = &self.baked {
-            let (kind, ..) = self.baked_record(id)?;
-            return if kind == 0 {
+            let record = self.baked_method_record(id)?;
+            return if record_word(record, 0) == 0 {
                 Some(MethodKind::Managed)
             } else if baked.hints_valid {
-                let (_, _, _, hint, ..) = self.baked_record(id)?;
-                crate::intrinsic_registry::intrinsic_at(hint as u16).map(MethodKind::Intrinsic)
+                crate::intrinsic_registry::intrinsic_at(record_word(record, 3) as u16)
+                    .map(MethodKind::Intrinsic)
             } else {
                 baked
                     .intrinsic_index
@@ -4079,13 +4116,12 @@ impl Module {
     pub(crate) fn intrinsic_id(&self, method: MethodId) -> Option<u32> {
         #[cfg(feature = "code-in-place")]
         if let Some(baked) = &self.baked {
-            let (kind, ..) = self.baked_record(method)?;
-            if kind == 0 {
+            let record = self.baked_method_record(method)?;
+            if record_word(record, 0) == 0 {
                 return None;
             }
             let index = if baked.hints_valid {
-                let (_, _, _, hint, ..) = self.baked_record(method)?;
-                hint as u16
+                record_word(record, 3) as u16
             } else {
                 *baked.intrinsic_index.get(method as usize)?
             };
@@ -4102,8 +4138,7 @@ impl Module {
     pub fn method_arg_count(&self, id: MethodId) -> Option<u16> {
         #[cfg(feature = "code-in-place")]
         if self.baked.is_some() {
-            let (_, arg_count, ..) = self.baked_record(id)?;
-            return Some(arg_count as u16);
+            return Some(record_word(self.baked_method_record(id)?, 1) as u16);
         }
         self.methods.get(id as usize).map(Method::arg_count)
     }
@@ -4158,22 +4193,40 @@ impl Module {
     ///
     /// Borrowed from the module rather than `'static`. A flash-resident load's bytes do outlive it,
     /// but a RAM-resident one's (a REPL delta) do not, and demanding `'static` here is what obliged
-    /// such a load to leak its PE. The interpreter re-derives this slice from the module on every
-    /// step, so the shorter lifetime costs it nothing.
+    /// such a load to leak its PE. Where the bytes do outlive the module,
+    /// [`Module::method_code_static`] hands them out for keeping; the interpreter reads a RAM body's
+    /// bytes here on each step instead.
     #[must_use]
     #[cfg(feature = "code-in-place")]
     pub fn method_code_bytes(&self, id: MethodId) -> Option<&[u8]> {
-        if let Some(baked) = &self.baked {
-            let (kind, _, code_offset, code_len, ..) = self.baked_record(id)?;
-            if kind != 0 {
-                return None;
-            }
-            return baked
-                .arena_static
-                .get(code_offset as usize..code_offset as usize + code_len as usize);
+        if self.baked.is_some() {
+            return self.method_code_static(id);
         }
         match self.method(id)? {
             Method::Managed { body, .. } => Some(body.code()),
+            Method::Intrinsic { .. } => None,
+        }
+    }
+
+    /// A managed method's instruction bytes when they outlive this module -- a baked image's, or a
+    /// body borrowed from a flash-resident PE -- so a caller may keep them for as long as it runs the
+    /// method. `None` for an intrinsic, an unknown method, or a body the module owns in RAM, whose
+    /// bytes only [`Module::method_code_bytes`] lends.
+    #[must_use]
+    #[cfg(feature = "code-in-place")]
+    pub fn method_code_static(&self, id: MethodId) -> Option<&'static [u8]> {
+        if let Some(baked) = &self.baked {
+            let record = self.baked_method_record(id)?;
+            if record_word(record, 0) != 0 {
+                return None;
+            }
+            let code_offset = record_word(record, 2) as usize;
+            return baked
+                .arena_static
+                .get(code_offset..code_offset.checked_add(record_word(record, 3) as usize)?);
+        }
+        match self.method(id)? {
+            Method::Managed { body, .. } => body.static_code(),
             Method::Intrinsic { .. } => None,
         }
     }
@@ -4184,11 +4237,14 @@ impl Module {
     #[cfg(feature = "code-in-place")]
     pub fn method_eh(&self, id: MethodId) -> Option<Vec<EhClause>> {
         if self.baked.is_some() {
-            let (kind, _, _, _, eh_offset, eh_count) = self.baked_record(id)?;
-            if kind != 0 {
+            let record = self.baked_method_record(id)?;
+            if record_word(record, 0) != 0 {
                 return None;
             }
-            return Some(self.decode_baked_eh(eh_offset as usize, eh_count as usize));
+            return Some(self.decode_baked_eh(
+                record_word(record, 4) as usize,
+                record_word(record, 5) as usize,
+            ));
         }
         match self.method(id)? {
             Method::Managed { body, .. } => Some(body.eh().to_vec()),
@@ -4202,8 +4258,8 @@ impl Module {
     #[cfg(feature = "code-in-place")]
     pub fn method_eh_count(&self, id: MethodId) -> usize {
         if self.baked.is_some() {
-            return match self.baked_record(id) {
-                Some((0, _, _, _, _, eh_count)) => eh_count as usize,
+            return match self.baked_method_record(id) {
+                Some(record) if record_word(record, 0) == 0 => record_word(record, 5) as usize,
                 _ => 0,
             };
         }
@@ -5113,6 +5169,7 @@ impl Module {
             + self.enum_flags.len()
             + self.enum_unsigned.len()
             + self.cast_elems.len()
+            + self.array_base_names.len()
             + self.object_type_tokens.len()
             + self.string_type_tokens.len())
             * 48;
@@ -5203,6 +5260,7 @@ impl Module {
             ("enum_flags", self.enum_flags.len()),
             ("enum_unsigned", self.enum_unsigned.len()),
             ("cast_elems", self.cast_elems.len()),
+            ("array_base_names", self.array_base_names.len()),
             ("object_type_tokens", self.object_type_tokens.len()),
             ("string_type_tokens", self.string_type_tokens.len()),
             ("call_targets", self.call_targets.len()),
@@ -5247,16 +5305,6 @@ impl Module {
                 self.enum_constants.values().map(BTreeMap::len).sum(),
             ),
         ])
-    }
-
-    /// The type whose full name (`Namespace.Name`) is `full_name`, found by scanning each type's
-    /// recorded name. Those names are in every image, where the reflection index is only in a
-    /// build with `reflection`; the scan is for a lookup made once, at boot.
-    #[must_use]
-    pub fn type_id_by_full_name(&self, full_name: &str) -> Option<TypeId> {
-        (0..self.type_count())
-            .filter_map(|index| TypeId::try_from(index).ok())
-            .find(|&type_id| self.type_full_name(type_id) == Some(full_name))
     }
 
     /// The number of declared reference types in the module -- the global [`TypeId`]
@@ -5505,6 +5553,26 @@ impl Module {
     /// an array operand's element type against an array-typed target.
     pub fn bind_cast_elem(&mut self, asm: u8, token: Token, elem: CastElem) {
         self.cast_elems.insert(asm_key(asm, token.0), elem);
+    }
+
+    /// Records that the cast-test token `token` in assembly `asm` names a type every array is an
+    /// instance of: `System.Array`, or one of the interfaces .NET's `System.Array` implements. The
+    /// loader decides it by the token's name, so it holds with no corlib loaded, where nothing
+    /// resolves the name to a type the cast could ask.
+    pub fn mark_array_base_name(&mut self, asm: u8, token: Token) {
+        self.array_base_names.insert(asm_key(asm, token.0));
+    }
+
+    /// Whether the cast-test token `handle` (asm-folded) names a type every array is an instance
+    /// of, as [`Module::mark_array_base_name`] recorded it.
+    #[must_use]
+    pub fn cast_names_array_base(&self, handle: u64) -> bool {
+        self.array_base_names.contains(&handle)
+            || self
+                .frozen
+                .cast_elems
+                .get(&self.arena, handle)
+                .is_some_and(|(shape, _)| (shape >> 8) & 0xFF == CAST_LEAF_NAMED_ARRAY_BASE)
     }
 
     /// The recorded [`CastElem`] shape of an already-asm-folded type-token handle, or `None`
@@ -7903,6 +7971,93 @@ mod tests {
         assert_eq!(result, Some(Value::Int32(42)));
     }
 
+    /// What every method-record accessor answers for one method: its kind (managed or not), argument
+    /// count, code bytes, exception clauses, clause count and intrinsic id.
+    #[cfg(feature = "code-in-place")]
+    type RecordAnswers = (
+        Option<bool>,
+        Option<u16>,
+        Option<Vec<u8>>,
+        Option<Vec<EhClause>>,
+        usize,
+        Option<u32>,
+    );
+
+    #[cfg(feature = "code-in-place")]
+    fn record_answers(module: &Module, id: MethodId) -> RecordAnswers {
+        (
+            module.method_kind(id).map(|kind| matches!(kind, MethodKind::Managed)),
+            module.method_arg_count(id),
+            module.method_code_bytes(id).map(<[u8]>::to_vec),
+            module.method_eh(id),
+            module.method_eh_count(id),
+            module.intrinsic_id(id),
+        )
+    }
+
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn each_method_record_accessor_reads_the_same_answer_from_a_baked_image() {
+        use lamella_cil::{EhKind, Instruction, InstructionRange, Opcode, Operand};
+        let mut module = Module::new();
+        let guarded = module.add_method_image(
+            0,
+            MethodBodyImage {
+                max_stack: 1,
+                init_locals: false,
+                local_var_sig: None,
+                code: Vec::from([
+                    Instruction::simple(Opcode::LdcI41),
+                    Instruction::simple(Opcode::Pop),
+                    Instruction::new(Opcode::Leave, Operand::Target(4)),
+                    Instruction::simple(Opcode::Endfinally),
+                    Instruction::simple(Opcode::Ret),
+                ])
+                .into_boxed_slice(),
+                handlers: Vec::from([EhClause {
+                    try_range: InstructionRange { start: 0, end: 3 },
+                    handler_range: InstructionRange { start: 3, end: 4 },
+                    kind: EhKind::Finally,
+                }])
+                .into_boxed_slice(),
+            },
+            3,
+        );
+        let plain = module.add_method_image(
+            0,
+            MethodBodyImage {
+                max_stack: 1,
+                init_locals: false,
+                local_var_sig: None,
+                code: Vec::from([Instruction::simple(Opcode::LdcI40), Instruction::simple(Opcode::Ret)])
+                    .into_boxed_slice(),
+                handlers: Vec::new().into_boxed_slice(),
+            },
+            0,
+        );
+        let native = module.add_intrinsic(
+            0,
+            crate::intrinsics::console_write_line_empty,
+            crate::intrinsic_registry::intrinsic_id("console_write_line_empty"),
+            1,
+        );
+        let ids = [guarded, plain, native];
+        let before: Vec<RecordAnswers> = ids.iter().map(|&id| record_answers(&module, id)).collect();
+        assert_eq!(before[0].4, 1, "the guarded body carries its finally clause");
+        assert_ne!(before[0].2, before[1].2, "the two bodies differ, so a crossed record would show");
+
+        let image = module.write_baked(Some(plain)).expect("bake");
+        let (booted, _) = Module::from_baked(Box::leak(image.into_boxed_slice())).expect("boot");
+        for (id, expected) in ids.iter().zip(&before) {
+            assert_eq!(&record_answers(&booted, *id), expected, "method {id}");
+        }
+        assert_eq!(
+            record_answers(&booted, native + 1),
+            (None, None, None, None, 0, None),
+            "an id past the table has no record"
+        );
+    }
+
     #[cfg(feature = "code-in-place")]
     #[test]
     fn a_corrupt_baked_image_fails_the_checksum() {
@@ -8210,6 +8365,35 @@ mod tests {
             CastElem::from_frozen_record(vector, token),
             Some(CastElem::VectorInterface(Box::new(CastElem::Prim(CastPrim::I4))))
         );
+    }
+
+    /// Which named cast targets an array is an instance of survives a bake, and every other
+    /// reader still sees those tokens as plain `Named`. Without it a baked image with no corlib
+    /// could not tell `(IEnumerable)array`, which holds, from `(IComparable)array`, which throws.
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn a_baked_image_keeps_which_names_an_array_is_an_instance_of() {
+        const TYPE_REF: u8 = 0x01;
+        let base = Token::new(TYPE_REF, 4);
+        let other = Token::new(TYPE_REF, 5);
+        let mut module = Module::new();
+        module.bind_cast_elem(2, base, CastElem::Named(asm_key(2, base.0)));
+        module.bind_cast_elem(2, other, CastElem::Named(asm_key(2, other.0)));
+        module.mark_array_base_name(2, base);
+        assert!(module.cast_names_array_base(asm_key(2, base.0)), "live, before any freeze");
+        assert!(!module.cast_names_array_base(asm_key(2, other.0)));
+
+        let image = module.write_baked(None).expect("bake");
+        let leaked: &'static [u8] = Box::leak(image.into_boxed_slice());
+        let (baked, _entry) = Module::from_baked(leaked).expect("the image reads back");
+        for token in [base, other] {
+            let handle = asm_key(2, token.0);
+            assert_eq!(baked.cast_elem(handle), Some(CastElem::Named(handle)));
+        }
+        assert!(baked.cast_names_array_base(asm_key(2, base.0)));
+        assert!(!baked.cast_names_array_base(asm_key(2, other.0)));
+
+        assert!(CAST_LEAF_NAMED_ARRAY_BASE > CAST_LEAF_VECTOR_INTERFACE, "a kind no older runtime knows");
     }
 
     #[cfg(feature = "code-in-place")]

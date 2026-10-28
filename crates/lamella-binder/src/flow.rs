@@ -227,16 +227,7 @@ type Assigned = BTreeSet<Box<str>>;
 /// (12.3.1). `if (o is string s)` assigns `s` on the true branch and nothing on the false one, and
 /// one set cannot say that.
 ///
-/// **THE PAIR IS NOT AN OPTIMIZATION, IT IS THE DIFFERENCE BETWEEN TWO ANSWERS.** Collapsing it to
-/// the union -- which this analyzer did until the declaration pattern needed better -- is never too
-/// strict and sometimes too lax: measured against csc, `if (c || (v = 1) == 1) { } return v;` is
-/// `CS0165` and the union accepts it. Collapsing it to the intersection instead would refuse
-/// `if (c && (v = 1) == 1) { return v; }`, which csc compiles. Only the pair answers both.
 ///
-/// **AND A HALF CAN BE UNREACHABLE, WHICH IS NOT THE SAME AS EMPTY.** `false` never produces
-/// `true`, so its true half assigns *everything* rather than nothing -- the same rule
-/// [`merge`] applies to a branch that never completes. Modelling it as an empty set instead
-/// refuses `if (c ? (d && (v = 1) == 1) : false) { return v; }`, which csc compiles; measured.
 struct BoolState {
     /// What is definitely assigned where the expression produced `true`, or `None` where it
     /// cannot produce `true` at all.
@@ -301,11 +292,16 @@ enum Flow {
 /// "declared but never used" when there is no initializer at all. A local of an unresolved type
 /// already carries CS0246, so it is tracked for scope resolution but never itself warned.
 #[must_use]
-pub fn check_unused_locals(body: &BoundStmt, also_used: &BTreeSet<Box<str>>) -> Vec<Diagnostic> {
+pub fn check_unused_locals(
+    body: &BoundStmt,
+    also_used: &BTreeSet<Box<str>>,
+    unused_functions: &[crate::local_function::LocalFunctionId],
+) -> Vec<Diagnostic> {
     let mut scan = UnusedScan {
         scopes: alloc::vec![BTreeMap::new()],
         declared: Vec::new(),
         used: BTreeSet::new(),
+        unused_functions,
     };
     scan.statement(body);
     let seeded: Vec<usize> = scan
@@ -322,6 +318,12 @@ pub fn check_unused_locals(body: &BoundStmt, also_used: &BTreeSet<Box<str>>) -> 
         .enumerate()
         .filter(|(index, decl)| decl.warnable && !used.contains(index))
         .filter_map(|(_, decl)| {
+            if decl.function {
+                return Some(Diagnostic::new(
+                    DiagnosticKind::LocalFunctionNeverUsed { name: decl.name },
+                    decl.span,
+                ));
+            }
             let kind = match decl.initializer {
                 Some(true) => DiagnosticKind::UnusedLocalValue { name: decl.name },
                 None => DiagnosticKind::UnusedLocal { name: decl.name },
@@ -343,6 +345,9 @@ struct LocalDecl {
     /// CS0246) is tracked for scope resolution -- so a use of its name resolves to it rather than
     /// leaking to an outer local -- but is never itself warned.
     warnable: bool,
+    /// Whether this is a LOCAL FUNCTION nothing refers to (`CS8321`), recorded in declaration
+    /// order among the locals so the warnings come out in csc's order.
+    function: bool,
 }
 
 /// Resolves each local USE to the declaration it reads -- the innermost in-scope local of that name,
@@ -352,16 +357,18 @@ struct LocalDecl {
 /// name-keying on all code without repeated names; it differs only for a shadow (CS0136), a
 /// duplicate (CS0128), or a valid same-name reuse across disjoint scopes -- exactly the cases csc
 /// keys per-declaration.
-struct UnusedScan {
+struct UnusedScan<'a> {
     /// A stack of lexical scopes, innermost last; each maps a local name to the index in `declared`
     /// of the first declaration of that name in the scope.
     scopes: Vec<BTreeMap<Box<str>, usize>>,
     declared: Vec<LocalDecl>,
     /// The indices in `declared` that some use resolves to.
     used: BTreeSet<usize>,
+    /// The local functions nothing refers to, which the binder counted as it resolved names.
+    unused_functions: &'a [crate::local_function::LocalFunctionId],
 }
 
-impl UnusedScan {
+impl UnusedScan<'_> {
     /// The declaration a use of `name` reads: the innermost scope that declares it.
     fn resolve(&self, name: &str) -> Option<usize> {
         self.scopes
@@ -387,6 +394,7 @@ impl UnusedScan {
             span,
             initializer,
             warnable,
+            function: false,
         });
         self.scopes
             .last_mut()
@@ -526,6 +534,23 @@ impl UnusedScan {
             BoundStmtKind::Checked(inner)
             | BoundStmtKind::Unchecked(inner)
             | BoundStmtKind::Labeled { body: inner, .. } => self.statement(inner),
+            BoundStmtKind::LocalFunction(function) => {
+                if self.unused_functions.contains(&function.id) {
+                    self.declared.push(LocalDecl {
+                        name: function.name.clone(),
+                        span: function.name_span,
+                        initializer: None,
+                        warnable: true,
+                        function: true,
+                    });
+                }
+                self.scopes.push(BTreeMap::new());
+                for (name, _) in &function.parameters {
+                    self.declare(name, stmt.span, None, false);
+                }
+                self.statement(&function.body);
+                self.scopes.pop();
+            }
             BoundStmtKind::Empty
             | BoundStmtKind::Error
             | BoundStmtKind::Break
@@ -540,11 +565,6 @@ impl UnusedScan {
 
 /// Whether evaluating `expr` never yields a value because control leaves first.
 ///
-/// A THROW EXPRESSION is the only leaf that does this, and it matters at exactly one place: the
-/// merge after a `?:`, where an arm that throws must not be intersected into the definitely-
-/// assigned set. It recurses through a nested conditional because csc does -- measured on
-/// `c ? (d ? throw a : throw b) : (x = 1)`, which leaves `x` assigned -- and through the
-/// `checked`/`unchecked` wrappers, which change nothing about whether control continues.
 fn never_completes(expr: &BoundExpr) -> bool {
     match &expr.kind {
         BoundExprKind::Throw(_) => true,
@@ -723,14 +743,6 @@ type FieldSet = BTreeSet<(Box<str>, Box<str>)>;
 /// The dotted name of a field's declaring type, the key both a field access and a field
 /// declaration reduce to.
 ///
-/// **AN INSTANTIATION REDUCES TO ITS DEFINITION, BECAUSE A DECLARATION HAS NO OTHER FORM.** The
-/// census walks declarations, where `class Holder<T> { public T A; }` keys as `` Holder`1 ``; an
-/// ACCESS may arrive as `Holder<int>` or -- for a member the type names inside its own body -- as
-/// `` Holder<!0> ``. Answering `None` for those does not merely skip them: a declaration recorded
-/// with no matching access is a field nothing assigns, so the access being untracked is reported as
-/// **`CS0649` "never assigned" on a field the program assigns on the line above**. Measured against
-/// csc on `class Holder<T> { public T A, B; public Holder(T a, T b) { A = a; B = b; } }`, which csc
-/// compiles without a diagnostic.
 ///
 /// Every other form -- an array, a pointer, a type parameter -- still yields `None`, which is
 /// correct rather than merely safe: none of them declares a field.
@@ -787,6 +799,9 @@ pub(crate) fn collect_field_accesses(stmt: &BoundStmt, reads: &mut FieldSet, wri
             for statement in statements {
                 collect_field_accesses(statement, reads, writes);
             }
+        }
+        BoundStmtKind::LocalFunction(function) => {
+            collect_field_accesses(&function.body, reads, writes);
         }
         BoundStmtKind::Expression(expr) => collect_field_uses(expr, reads, writes),
         BoundStmtKind::If {
@@ -949,16 +964,7 @@ fn mark_field_write(expr: &BoundExpr, writes: &mut FieldSet) {
 
 /// Marks every field on the RECEIVER CHAIN of an assignment target as written, not merely read.
 ///
-/// `o.I.V = 40` assigns `V`, but reaching `V` takes the ADDRESS of `o.I`, and mutating a member of
-/// a struct mutates the struct -- so csc counts `I` as assigned too. Walking the receiver as an
-/// ordinary expression records it as a READ only, which made `Outer.I` look never-assigned and
-/// produced a CS0649 on code csc compiles clean. That is the shape this exists to prevent.
 ///
-/// DELIBERATELY IMPRECISE, IN THE SAFE DIRECTION. Whether the receiver field is a value type
-/// decides it -- `c.Obj.Field = 1` through a CLASS-typed `Obj` does NOT assign `Obj` -- and this
-/// walk has no model to ask. So it marks the whole chain, which can only ever SUPPRESS a CS0649
-/// that csc would report: a missed warning, never an invented one. The precise form wants the
-/// field's type resolved, which means threading the model into the flow pass.
 fn mark_target_chain_written(receiver: &BoundExpr, writes: &mut FieldSet) {
     let BoundExprKind::FieldAccess {
         receiver: inner,
@@ -1215,6 +1221,12 @@ impl Unreachable {
                 reachable = true;
             }
             if !reachable {
+                if let BoundStmtKind::LocalFunction(function) = &statement.kind {
+                    self.statement(&function.body);
+                    continue;
+                }
+            }
+            if !reachable {
                 self.diagnostics.push(Diagnostic::new(
                     DiagnosticKind::UnreachableCode,
                     statement.span,
@@ -1298,6 +1310,10 @@ impl Unreachable {
             Kind::Checked(inner) | Kind::Unchecked(inner) | Kind::Labeled { body: inner, .. } => {
                 self.statement(inner)
             }
+            Kind::LocalFunction(function) => {
+                self.statement(&function.body);
+                true
+            }
         }
     }
 }
@@ -1362,7 +1378,8 @@ fn loop_breaks(stmt: &BoundStmt) -> bool {
         | Kind::Expression(_)
         | Kind::Local { .. }
         | Kind::Empty
-        | Kind::Error => false,
+        | Kind::Error
+        | Kind::LocalFunction(_) => false,
     }
 }
 
@@ -1420,12 +1437,6 @@ fn visit_statements<'a>(stmt: &'a BoundStmt, visit: &mut impl FnMut(&'a BoundStm
 /// Whether a switch SECTION's statement list can complete normally -- control reaching the end of
 /// the section, to fall into the next one (`CS0163`) or out of the switch entirely (`CS8070`).
 ///
-/// This cannot reuse [`always_exits`], and the reason is the whole subtlety: a `break` LEAVES A
-/// SWITCH without exiting the method, so it is the commonest way a section legitimately ends and
-/// `exits` deliberately does not count it. `continue` is the same. Everything else defers to
-/// `always_exits`, which is what makes a nested loop or switch behave correctly -- it CAPTURES its
-/// own `break`, so `while (true) { break; }` inside a section lets that section complete (csc
-/// agrees: `CS8070`) while `while (true) { }` does not.
 #[must_use]
 pub fn switch_section_completes(statements: &[BoundStmt]) -> bool {
     !statements.iter().any(section_transfers)
@@ -1497,12 +1508,35 @@ pub fn check_labels(body: &BoundStmt) -> Vec<Diagnostic> {
             }
         }
     });
+    goto_targets.extend(local_function_gotos(body));
     for (label, span) in label_decls {
         if !goto_targets.contains(&label) {
             diagnostics.push(Diagnostic::new(DiagnosticKind::UnreferencedLabel, span));
         }
     }
     diagnostics
+}
+
+/// The label of every `goto` written in a local function's body inside `body`, nested functions
+/// included.
+fn local_function_gotos(body: &BoundStmt) -> BTreeSet<Box<str>> {
+    let mut found = BTreeSet::new();
+    let mut pending: Vec<&BoundStmt> = Vec::new();
+    visit_statements(body, &mut |stmt| {
+        if let BoundStmtKind::LocalFunction(function) = &stmt.kind {
+            pending.push(&function.body);
+        }
+    });
+    while let Some(function_body) = pending.pop() {
+        visit_statements(function_body, &mut |stmt| match &stmt.kind {
+            BoundStmtKind::Goto(label) => {
+                found.insert(label.clone());
+            }
+            BoundStmtKind::LocalFunction(function) => pending.push(&function.body),
+            _ => {}
+        });
+    }
+    found
 }
 
 /// The section indices of a switch that a jump can land in: a `goto case`/`goto default`
@@ -1642,14 +1676,10 @@ pub fn check_definite_assignment(
     parameters: &[Box<str>],
     out_parameters: &[Box<str>],
     model: &Model,
+    functions: &[crate::local_function::BoundLocalFunction],
 ) -> Vec<Diagnostic> {
-    let mut analyzer = Analyzer {
-        diagnostics: Vec::new(),
-        model,
-        break_frames: Vec::new(),
-        out_parameters: out_parameters.iter().cloned().collect(),
-        unassigned_out: BTreeSet::new(),
-    };
+    let summaries = local_function_summaries(functions, model);
+    let mut analyzer = Analyzer::new(model, &summaries, out_parameters);
     let mut assigned: Assigned = parameters.iter().cloned().collect();
     for out in out_parameters {
         assigned.remove(out);
@@ -1668,9 +1698,104 @@ pub fn check_definite_assignment(
     analyzer.diagnostics
 }
 
+/// What a local function does to the variables it captures, as a call to it sees it (9.4.4.33).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct FunctionSummary {
+    /// The captured variables it reads before it assigns them -- through the functions it calls
+    /// too -- each of which must be definitely assigned before every call and conversion.
+    reads: Assigned,
+    /// The captured variables definitely assigned at every point that leaves it normally, which
+    /// a CALL leaves definitely assigned. A conversion to a delegate assigns nothing.
+    writes: Assigned,
+}
+
+/// The parameters a local function's body starts with assigned: every one not passed `out`.
+fn entry_assigned(function: &crate::local_function::BoundLocalFunction) -> Assigned {
+    function
+        .parameters
+        .iter()
+        .zip(&function.parameter_modes)
+        .filter(|(_, mode)| **mode != crate::symbols::ParameterMode::Out)
+        .map(|((name, _), _)| name.clone())
+        .collect()
+}
+
+/// [`FunctionSummary`] for every local function of `body`, computed as 9.4.4.33 describes:
+/// each body analysed with its captures unassigned, a call inside it reading and writing what the
+/// callee's summary says, to a fixpoint -- reads only grow and writes only shrink, from "every
+/// capture", so recursion settles.
+///
+/// The clause's note admits exactly this: an implementation need not re-analyse a body at every
+/// call, provided the results are the same.
+fn local_function_summaries(
+    functions: &[crate::local_function::BoundLocalFunction],
+    model: &Model,
+) -> BTreeMap<crate::local_function::LocalFunctionId, FunctionSummary> {
+    let mut summaries: BTreeMap<_, _> = functions
+        .iter()
+        .map(|function| {
+            let writes = function.captures.iter().map(|capture| capture.name.clone()).collect();
+            (
+                function.id,
+                FunctionSummary {
+                    reads: Assigned::new(),
+                    writes,
+                },
+            )
+        })
+        .collect();
+    for _ in 0..=functions.len() + 1 {
+        let mut changed = false;
+        for function in functions {
+            let captures: Assigned =
+                function.captures.iter().map(|capture| capture.name.clone()).collect();
+            let snapshot = summaries.clone();
+            let mut analyzer = Analyzer::new(model, &snapshot, &[]);
+            analyzer.summary = Some(SummaryState {
+                captures: captures.clone(),
+                reads: Assigned::new(),
+                writes: None,
+            });
+            let flow = analyzer.statement(&function.body, entry_assigned(function));
+            if let Flow::Reaches(at_end) = flow {
+                analyzer.record_summary_exit(&at_end);
+            }
+            let Some(state) = analyzer.summary.take() else {
+                continue;
+            };
+            let summary = FunctionSummary {
+                reads: state.reads,
+                writes: state.writes.unwrap_or(captures),
+            };
+            if summaries.get(&function.id) != Some(&summary) {
+                summaries.insert(function.id, summary);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    summaries
+}
+
+/// The state of an analysis that SUMMARIZES a local function's body rather than reporting on it.
+struct SummaryState {
+    /// The function's captures: a read of one unassigned is recorded, not reported.
+    captures: Assigned,
+    /// The captures read before they are assigned.
+    reads: Assigned,
+    /// The captures assigned at every exit seen so far; `None` before the first.
+    writes: Option<Assigned>,
+}
+
 struct Analyzer<'a> {
     diagnostics: Vec<Diagnostic>,
     model: &'a Model,
+    /// The local functions' summaries, consulted at each call and conversion.
+    functions: &'a BTreeMap<crate::local_function::LocalFunctionId, FunctionSummary>,
+    /// Set while summarizing a local function's body; see [`SummaryState`].
+    summary: Option<SummaryState>,
     /// A stack of break-target frames, one per enclosing `switch`/loop. A `break`
     /// records the definitely-assigned set at that point into the top frame; a `switch`
     /// then intersects its breaks (and fall-throughs) to know what is assigned after it.
@@ -1682,7 +1807,77 @@ struct Analyzer<'a> {
     unassigned_out: BTreeSet<Box<str>>,
 }
 
-impl Analyzer<'_> {
+impl<'a> Analyzer<'a> {
+    fn new(
+        model: &'a Model,
+        functions: &'a BTreeMap<crate::local_function::LocalFunctionId, FunctionSummary>,
+        out_parameters: &[Box<str>],
+    ) -> Analyzer<'a> {
+        Analyzer {
+            diagnostics: Vec::new(),
+            model,
+            functions,
+            summary: None,
+            break_frames: Vec::new(),
+            out_parameters: out_parameters.iter().cloned().collect(),
+            unassigned_out: BTreeSet::new(),
+        }
+    }
+
+    /// A read of `name` with `assigned` definitely assigned: CS0165 when it is not -- or, while a
+    /// local function is being summarized, a read of one of its captures, recorded for its
+    /// callers to answer for.
+    fn read(&mut self, name: &Box<str>, assigned: &Assigned, span: Span) {
+        if assigned.contains(name) {
+            return;
+        }
+        if let Some(state) = &mut self.summary {
+            if state.captures.contains(name) {
+                state.reads.insert(name.clone());
+            }
+            return;
+        }
+        self.diagnostics.push(Diagnostic::new(
+            DiagnosticKind::UseOfUnassignedLocal { name: name.clone() },
+            span,
+        ));
+    }
+
+    /// An exit from the body being summarized, with `assigned` definitely assigned there.
+    fn record_summary_exit(&mut self, assigned: &Assigned) {
+        if let Some(state) = &mut self.summary {
+            let here: Assigned = state.captures.intersection(assigned).cloned().collect();
+            state.writes = Some(match state.writes.take() {
+                Some(earlier) => earlier.intersection(&here).cloned().collect(),
+                None => here,
+            });
+        }
+    }
+
+    /// A call to, or a conversion of, the local function `method` names: what it reads must be
+    /// assigned here, and a call leaves what it writes assigned (9.4.4.33).
+    fn local_function_reference(
+        &mut self,
+        method: &crate::bound::MethodReference,
+        assigned: &mut Assigned,
+        span: Span,
+        call: bool,
+    ) {
+        let Some(id) = crate::local_function::LocalFunctionId::of(method) else {
+            return;
+        };
+        let Some(summary) = self.functions.get(&id) else {
+            return;
+        };
+        let (reads, writes) = (summary.reads.clone(), summary.writes.clone());
+        for name in &reads {
+            self.read(name, assigned, span);
+        }
+        if call {
+            assigned.extend(writes);
+        }
+    }
+
     /// Whether `ty` is a struct, whose fields are assigned in place (12.x).
     fn is_struct(&self, ty: &TypeSymbol) -> bool {
         self.model
@@ -1704,6 +1899,33 @@ impl Analyzer<'_> {
         let span = stmt.span;
         match &stmt.kind {
             BoundStmtKind::Empty | BoundStmtKind::Error => Flow::Reaches(assigned),
+            BoundStmtKind::LocalFunction(function) => {
+                if self.summary.is_none() {
+                    let outs: Vec<Box<str>> = function
+                        .parameters
+                        .iter()
+                        .zip(&function.parameter_modes)
+                        .filter(|(_, mode)| **mode == crate::symbols::ParameterMode::Out)
+                        .map(|((name, _), _)| name.clone())
+                        .collect();
+                    let mut inner = Analyzer::new(self.model, self.functions, &outs);
+                    let mut start = assigned.clone();
+                    start.extend(function.captures.iter().map(|capture| capture.name.clone()));
+                    start.extend(entry_assigned(function));
+                    if let Flow::Reaches(at_end) = inner.statement(&function.body, start) {
+                        inner.record_unassigned_out(&at_end);
+                    }
+                    let unassigned: Vec<Box<str>> = inner.unassigned_out.iter().cloned().collect();
+                    for parameter in unassigned {
+                        inner.diagnostics.push(Diagnostic::new(
+                            DiagnosticKind::OutParameterNotAssigned { parameter },
+                            function.body.span,
+                        ));
+                    }
+                    self.diagnostics.extend(inner.diagnostics);
+                }
+                Flow::Reaches(assigned)
+            }
             BoundStmtKind::Block(statements) => self.block(statements, assigned),
             BoundStmtKind::Local { declarators, .. } => {
                 let mut assigned = assigned;
@@ -1821,6 +2043,7 @@ impl Analyzer<'_> {
                     self.expression(value, &mut assigned, span);
                 }
                 self.record_unassigned_out(&assigned);
+                self.record_summary_exit(&assigned);
                 Flow::Exits
             }
             BoundStmtKind::Throw(value) => {
@@ -2143,14 +2366,7 @@ impl Analyzer<'_> {
 
     fn expression(&mut self, expr: &BoundExpr, assigned: &mut Assigned, span: Span) {
         match &expr.kind {
-            BoundExprKind::Local(name) => {
-                if !assigned.contains(name) {
-                    self.diagnostics.push(Diagnostic::new(
-                        DiagnosticKind::UseOfUnassignedLocal { name: name.clone() },
-                        span,
-                    ));
-                }
-            }
+            BoundExprKind::Local(name) => self.read(name, assigned, span),
             BoundExprKind::Lambda {
                 captures,
                 parameters,
@@ -2158,14 +2374,7 @@ impl Analyzer<'_> {
                 ..
             } => {
                 for capture in captures {
-                    if !assigned.contains(&capture.name) {
-                        self.diagnostics.push(Diagnostic::new(
-                            DiagnosticKind::UseOfUnassignedLocal {
-                                name: capture.name.clone(),
-                            },
-                            span,
-                        ));
-                    }
+                    self.read(&capture.name, assigned, span);
                 }
                 let mut inner = assigned.clone();
                 for (name, _) in parameters {
@@ -2215,11 +2424,16 @@ impl Analyzer<'_> {
                 }
             }
             BoundExprKind::Call {
-                callee, arguments, ..
+                callee,
+                arguments,
+                method,
             } => {
                 self.expression(callee, assigned, span);
                 for argument in arguments {
                     self.expression(argument, assigned, span);
+                }
+                if let Some(method) = method {
+                    self.local_function_reference(method, assigned, span, true);
                 }
             }
             BoundExprKind::ElementAccess { receiver, indices } => {
@@ -2249,10 +2463,13 @@ impl Analyzer<'_> {
                     self.expression(argument, assigned, span);
                 }
             }
-            BoundExprKind::DelegateCreation { receiver, .. } => {
+            BoundExprKind::DelegateCreation {
+                receiver, target, ..
+            } => {
                 if let Some(receiver) = receiver {
                     self.expression(receiver, assigned, span);
                 }
+                self.local_function_reference(target, assigned, span, false);
             }
             BoundExprKind::Binary {
                 operator: BinaryOperator::LogicalAnd | BinaryOperator::LogicalOr,

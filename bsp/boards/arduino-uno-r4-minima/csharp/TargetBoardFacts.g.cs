@@ -7,7 +7,10 @@ namespace Lamella.Generated
     internal static class TargetBoardFacts
     {
         /// <summary>The board's id, the name a build selects this board by.</summary>
-        internal const string Name = "arduino-uno-r4-minima";
+        internal static string Name
+        {
+            get { return "arduino-uno-r4-minima"; }
+        }
 
         /// <summary>Answers the board's wire identity, and binds nothing: this board's package
         /// declares no class that binds its buses.</summary>

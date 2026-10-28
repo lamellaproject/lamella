@@ -5,7 +5,7 @@
 // instance bases live in Saml22Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Saml22MclkLayout
+    internal sealed class Saml22MclkLayout
     {
         private Saml22MclkLayout() { }
 

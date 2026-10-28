@@ -1,0 +1,230 @@
+# BOARD binding: the Adafruit Feather RP2350 with HSTX Port (product 6000), an RP2350A board in the
+# Feather format. Board truth ONLY: role bindings and the wiring. Chip truth lives in csp/rp2350/.
+#
+# The I2C bus is I2C1, not I2C0. The header's SDA and SCL and the STEMMA QT connector are one bus on
+# GP2 and GP3, whose function F3 is I2C1, so a program opens bus 1; a program written for a Pico, whose
+# header bus is I2C0 on GP4 and GP5, asks for a bus this board does not have.
+#
+# The SPI bus has no chip select of the board's. The header's SCK, MOSI and MISO are SPI0 on GP22,
+# GP23 and GP20, and the board labels no select for it, so a device is opened with ChipSelectLine -1
+# and the program drives the select pin it chose.
+#
+# The red LED is on GP7, not on the Pico's GP25. The BOOT button is on no GPIO at all: it pulls the
+# flash chip select low through 1k, which the ROM samples at reset, so a program cannot read it as a
+# pin.
+#
+# The board has a spot for a QSPI PSRAM chip with its select on GP8, and this product leaves it
+# empty: bsp/boards/adafruit-feather-rp2350-hstx-psram is the same board with the part fitted. GP8 is
+# then an ordinary header position, labelled PSRAM_CS and held high through 10k.
+#
+# Also not modeled: the 22-pin HSTX connector, which carries GP12 to GP19 with D10, D11, SDA and SCL
+# and has no standard a connector row can name, the LiPo charger and the regulator's EN pin.
+
+[table]
+kind = "board"
+board = "adafruit-feather-rp2350-hstx"
+vendor = "adafruit"
+family = "rp2350"
+part = "rp2350a"
+product_model = 66          # lamella_wire::product_model::FEATHER_RP2350_HSTX
+sources = [
+    "Adafruit Feather RP2350 schematic: the EAGLE file 'Adafruit Feather RP2350.sch' of the board's published design files. Its parts and nets are read below by designator and net name: X2 is the RP2350 in its QFN60 package, U1 the flash, U4 the PSRAM spot, Y1 the crystal, L the red LED, LED1 the NeoPixel, SW1 and SW2 the reset and boot buttons, CONN1 the STEMMA QT connector, DEBUG the SWD connector, CN2 the HSTX connector, JP1 and JP3 the two Feather headers.",
+    "Adafruit Feather RP2350 pinout diagram ('Adafruit_Feather_RP2350_prettypins 2.pdf', in the same design files): each header position's CircuitPython name and GPIO, the LED on GPIO7, the NEOPIXEL on GPIO21, PSRAM_CS on GPIO8, the STEMMA QT connector's SCL on GPIO3 and SDA on GPIO2, the debug connector's SWCLK, GND and SWDIO, and the HSTX port's 22 pins.",
+    "Adafruit product 6000 (Adafruit Feather RP2350 with HSTX Port): an 8 MB SPI FLASH chip, an optional spot for a SOIC PSRAM chip with chip select line on GPIO 8, a Pin #7 red LED, an RGB NeoPixel, an on-board STEMMA QT connector, Reset and Bootloader select buttons, a Pico Probe 3-pin JST SH connector for SWD debugging, and a 12 MHz crystal.",
+]
+notes = [
+    "The header's SDA and SCL and the STEMMA QT connector are one bus, I2C1. In the schematic the net SDA joins GPIO2, the header (JP3 pin 12), the STEMMA QT connector CONN1's SDA, the HSTX connector CN2's pin 2 and R16 (10K) to 3.3V; the net SCL joins GPIO3, JP3 pin 11, CONN1's SCL, CN2's pin 3 and R17 (10K) to 3.3V. The pinout diagram labels GPIO2 SDA1 and GPIO3 SCL1, and the RP2350 datasheet's GPIO2_CTRL and GPIO3_CTRL give FUNCSEL 0x03 as I2C1_SDA and I2C1_SCL. A device on the connector shares an address space with anything on the header's SDA and SCL and on the HSTX connector's.",
+    "The BOOT button reads on no GPIO. In the schematic SW2 shorts the net USBBOOT to ground, and USBBOOT reaches the flash's chip select QSPI_CS through R11 (1K), which R5 (10K) holds at 3.3V; the RP2350 samples that select at reset. The RESET button SW1 shorts the RUN net to ground, which R21 (10K) holds at 3.3V and the header's RST position carries. Product 6000: hold down the BOOTSEL button while plugging the board into USB, or pull the RUN/Reset pin to ground, and it appears as a USB disk drive.",
+    "The PSRAM spot is empty on this product. In the schematic U4, an eight-pin QSPI part on the flash's clock and four data lines, is marked DNP; its chip select is the net PSRAM_CS, which joins GPIO8, the header position the pinout diagram labels PSRAM_CS (JP1 pin 1), and R15 (10K) to 3.3V. Product 6000 lists an optional spot for a SOIC PSRAM chip with chip select line on GPIO 8.",
+    "The HSTX connector CN2, a 22-pin 0.5 mm FPC socket, carries GPIO12 to GPIO19 on its pins 11, 12, 14, 15, 17, 18, 20 and 21, D10 and D11 (GPIO10 and GPIO11) on pins 5 and 6, SDA and SCL on pins 2 and 3, 3.3V on pin 1, and ground on the rest. GPIO12 to GPIO19 reach no header position.",
+    "Y1 is a 12 MHz crystal. The schematic values it '12MHz/10pF/50ohm' across XIN and XOUT (XOUT through R6, 1K), and product 6000 lists a 12 MHz crystal.",
+]
+
+# --- memory: what the board fits beside the chip. The RP2350A's own SRAM is chip truth, stated in
+#     csp/rp2350/parts.toml. ---
+
+[[memory]]                  # the RP2350 has NO internal flash (chip flash = 0, gate-pinned) --
+name = "flash"              # the 8 MB QSPI chip it XIPs from is BOARD truth.
+kind = "flash"
+size = 0x800000
+source = "The schematic's U1, an eight-pin QSPI flash on the RP2350's QSPI lines with QSPI_CS as its select, is valued '8MB QSPI'. Product 6000: an 8 MB SPI FLASH chip. 8 MB = 0x800000."
+
+# --- the wires, and the peripherals the header names. The pinout diagram labels GPIO0 and GPIO1 TX
+#     and RX, GPIO22, GPIO23 and GPIO20 SCK, MOSI and MISO, and GPIO2 and GPIO3 SDA and SCL. ---
+
+[[carriers]]
+kind = "native-usb"         # the RP2350A's own USB device controller on the USB-C socket -- no
+                            # bridge, and so no board-fixed bridge identity to state.
+plan = "pll-150-48"
+default = true
+
+[[carriers]]
+kind = "uart"               # the second wire: uart0 on GP0/GP1 through an EXTERNAL bridge (a debug
+role = "uart0"              # probe's UART cable, any USB-UART dongle), at the same operating point
+baud = 115200               # as the usb wire.
+plan = "pll-150-48"
+
+# The schematic's net TX joins GPIO0 to the header (JP1 pin 2) and RX joins GPIO1 to JP1 pin 3.
+[[bindings]]
+role = "uart0"
+kind = "uart"
+instance = "uart0"
+function = "F2"
+tx = { pin = "GP0" }
+rx = { pin = "GP1" }
+
+# The schematic's nets SCK, MOSI and MISO join GPIO22, GPIO23 and GPIO20 to the header (JP1 pins 6, 5
+# and 4), and no net joins a select of SPI0's to a position the board labels for one.
+[[bindings]]
+role = "spi0"
+kind = "spi"
+instance = "spi0"
+function = "F1"
+mosi = { pin = "GP23" }
+sck = { pin = "GP22" }
+miso = { pin = "GP20" }
+
+[[bindings]]
+role = "i2c1"
+kind = "i2c"
+instance = "i2c1"
+function = "F3"
+sda = { pin = "GP2" }
+scl = { pin = "GP3" }
+
+[[bindings]]
+role = "adc"
+kind = "adc"
+instance = "adc"
+reference_uv = 3300000
+source = "The schematic: the RP2350's ADC_AVDD pin is the net ADC_AVDD, fed from 3.3V through R1 (200) with C19 (2.2uF) to ground. The pinout diagram labels the header's A0 to A3 ADC0 to ADC3, on GPIO26 to GPIO29."
+
+# --- PWM: each slice on the pair of GPIOs no other line here claims ---------------------------------
+#
+# Each output of slices 0 to 7 appears on two GPIOs, GPn and GPn+16 (datasheet 12.5.2, Table 1130),
+# so which one a slice drives is a board's choice. Each pair below is clear of the uart0, spi0 and
+# i2c1 pins and of the board's own lines, the lower pair where it is clear. PWM3 is not bound: GP6/GP7
+# holds the red LED and GP22/GP23 is the SPI bus. PWM4 is on GP24/GP25 because GP8 is the PSRAM
+# select of the same board with its part fitted, so the two products share one map. GP16 to GP19 are
+# HSTX connector pins. The chip a program passes to PwmChannel.Create is the slice.
+
+[[bindings]]
+role = "pwm0"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 0
+a = { pin = "GP16" }
+b = { pin = "GP17" }
+
+[[bindings]]
+role = "pwm1"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 1
+a = { pin = "GP18" }
+b = { pin = "GP19" }
+
+[[bindings]]
+role = "pwm2"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 2
+a = { pin = "GP4" }
+b = { pin = "GP5" }
+
+[[bindings]]
+role = "pwm4"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 4
+a = { pin = "GP24" }
+b = { pin = "GP25" }
+
+[[bindings]]
+role = "pwm5"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 5
+a = { pin = "GP10" }
+b = { pin = "GP11" }
+
+[[bindings]]
+role = "pwm6"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 6
+a = { pin = "GP12" }
+b = { pin = "GP13" }
+
+[[bindings]]
+role = "pwm7"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 7
+a = { pin = "GP14" }
+b = { pin = "GP15" }
+
+# --- control lines -----------------------------------------------------------------------------
+#
+# The red LED is active high: GP7 reaches the LED's anode through R7 and the cathode is at ground,
+# so the pin sources the current and a one lights it. The NeoPixel's data line carries a timed
+# serial protocol rather than a level, so its row states the pin and no level, and a driver -- not
+# this row -- owns the waveform.
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "GP7"
+active = "high"
+source = "The schematic: the net D7 joins GPIO7, the header position the pinout diagram labels D13 (JP3 pin 4), and R7 (10K), whose other end is the anode of L, a RED LED whose cathode is at ground. A one on the pin lights it. The pinout diagram labels GPIO7 LED, and product 6000 lists a Pin #7 red LED."
+
+[[devices]]
+name = "neopixel"
+kind = "gpio-out"
+pin = "GP21"
+active = "none"
+source = "The schematic: the net NEOPIX joins GPIO21 to the data input DI of LED1, an SK6805-1515 addressable RGB LED on 3.3V. The pinout diagram labels GPIO21 NEOPIXEL, and product 6000 lists an RGB NeoPixel. The line carries the LED's timed serial protocol, which has no asserted level, so none is stated."
+
+# --- the STEMMA QT connector: the I2C1 bus, brought out whole -----------------------------------
+
+[[connectors]]
+name = "qt"
+standard = "stemma-qt"
+source = "The schematic's CONN1, a STEMMA QT connector, carries the nets SDA (GPIO2) and SCL (GPIO3), 3.3V and ground; the pinout diagram draws it with SCL on GPIO3, SDA on GPIO2, 3.3V and GND, and product 6000 lists an on-board STEMMA QT connector."
+
+[[connectors.qt.buses]]
+signal = "i2c"
+role = "i2c1"
+
+# --- the clock plan: Y1 is a 12 MHz crystal, as the schematic and the product page state. ---
+
+[[plans]]
+name = "pll-150-48"         # the operating point: clk_sys 150 MHz off
+default = true              # PLL_SYS, clk_usb/clk_adc 48 MHz off PLL_USB, clk_peri left
+source = "xosc"             # crystal-exact (state-and-verify: generation checks
+xosc_hz = 12000000          # hz == xosc * fbdiv / (postdiv1 * postdiv2) per PLL).
+clk_peri_hz = 12000000
+clk_sys_hz = 150000000
+clk_usb_hz = 48000000
+clk_adc_hz = 48000000
+pll_sys_fbdiv = 125
+pll_sys_postdiv1 = 5
+pll_sys_postdiv2 = 2
+pll_usb_fbdiv = 100
+pll_usb_postdiv1 = 5
+pll_usb_postdiv2 = 5
+
+[debug]
+signals = ["swd"]
+exposure = "header"
+fitted = "yes"
+onboard = "none"
+recovery = "mask-rom"
+source = "The schematic's DEBUG, a three-pin JST SH connector, carries SWCLK on pin 1, ground on pin 2 and SWDIO on pin 3, so a probe cable lands on it with no tools; the pinout diagram draws it with SWCLK, GND and SWDIO, and product 6000 lists a Pico Probe 3-pin JST SH connector for SWD debugging. There is no on-board debug probe. RP2350 datasheet section 4.1: the mask ROM is a physically immutable memory resource, so the recovery path is in silicon and no image written to flash can remove it."

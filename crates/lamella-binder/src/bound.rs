@@ -9,8 +9,8 @@ use crate::resolve::{Shadowed, TypeTable, resolve_type};
 use crate::special::SpecialType;
 use crate::statement::{BoundDeclarator, BoundLambdaBody, BoundStmt, BoundStmtKind};
 use crate::symbols::{
-    Accessibility, EventSymbol, MethodSymbol, Model, ParameterMode, PropertySymbol, TypeInfo,
-    TypeKind, unmangled_type_name,
+    Accessibility, BaseClassChain, EventSymbol, MethodSymbol, Model, ParameterMode,
+    PropertySymbol, TypeInfo, TypeKind, unmangled_type_name,
 };
 use crate::types::TypeSymbol;
 use lamella_syntax::version::{Feature, FeatureGate, LanguageVersion};
@@ -505,15 +505,7 @@ pub enum ConversionKind {
 
 /// A scope's identity, unique within one compilation and increasing with the order scopes OPEN.
 ///
-/// **A DEPTH CANNOT IDENTIFY A SCOPE AND THAT IS NOT A DETAIL.** The scope stack reuses an index
-/// the moment a block closes, so two SIBLING blocks are both "depth 2" -- and csc numbers their
-/// display classes `_1` and `_2`, which a depth cannot tell apart. Measured: two sibling blocks
-/// under one captured outer local produce two distinct types, and giving them one name makes the
-/// second overwrite the first's members.
 ///
-/// Increasing-with-opening is the other half: csc's suffix follows SOURCE order, and the order
-/// scopes are pushed during binding is source order, so sorting by this id is sorting by the
-/// thing csc actually counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ScopeId(pub usize);
 
@@ -550,9 +542,6 @@ pub enum BoundExprKind {
     /// a conditional, a binary, a property access, an object creation. That is why there is one
     /// new node here and not one per operator.
     ///
-    /// The operands are evaluated LEFT TO RIGHT and all of them BEFORE the value, which is the
-    /// order the standard requires and csc emits (measured: `Get() + Get()` calls both, stores
-    /// both, and only then tests `HasValue`).
     ///
     /// **AN OPERAND IS EVALUATED IN THE ENCLOSING SCOPE, so it may name an OUTER sequence's
     /// temporaries and NOT its own sequence's earlier ones.** That is what lets a nested access
@@ -607,6 +596,13 @@ pub enum BoundExprKind {
         /// Whether the body reads `this` -- a capture too, and a different one: it is hoisted as
         /// `<>4__this` rather than by name, and on its own it needs no display class at all.
         captures_this: bool,
+        /// The local functions declared outside the lambda that its body refers to, in first-seen
+        /// order: calling one that captures is capturing what it captures.
+        captured_functions: Vec<crate::local_function::LocalFunctionId>,
+        /// The scope holding the lambda's parameters -- the body's own outermost scope.
+        body_scope: Option<ScopeId>,
+        /// How many of `captures` precede the first read of `this`, when it reads `this`.
+        this_position: Option<usize>,
     },
     /// A delegate over a synthesized method, created ONCE and cached in a static field.
     ///
@@ -615,9 +611,6 @@ pub enum BoundExprKind {
     /// [`BoundExprKind::Temp`] is: a shape the source cannot spell, named here because the emitter
     /// builds bound trees and a node is how it says what it built.
     ///
-    /// **THE CACHE IS OBSERVABLE, NOT AN OPTIMIZATION.** Two evaluations of the same non-capturing
-    /// lambda yield the same delegate, so `ReferenceEquals` over them answers `true` -- which is
-    /// what csc answers, and a lowering that allocated per evaluation would answer `false`.
     CachedDelegate {
         /// The static field the delegate is cached in (`<>9__N_M`).
         cache: Box<FieldReference>,
@@ -850,11 +843,6 @@ pub enum BoundExprKind {
         /// converted operand on the branch where the test succeeded. `None` for a plain `x is T`
         /// and for every `as`.
         ///
-        /// **IT RIDES THE TYPE TEST RATHER THAN BEING A NODE OF ITS OWN** because it IS the type
-        /// test -- the same `isinst` decides the result and fills the variable, and csc's lowering
-        /// says so: `o is string s` and `string s = o as string; if (s != null)` emit byte-identical
-        /// IL, measured. A separate node would have been a second thing to keep in step with the
-        /// first for no distinction anyone makes.
         declares: Option<Box<str>>,
     },
     /// An assignment, simple or compound (14.14); its type is the target's.
@@ -882,11 +870,6 @@ pub enum BoundExprKind {
     /// `left ?? right` (C# 2.0; ECMA-334 4th ed 14.13): the left value when it is not null, the
     /// right one otherwise -- and the right one is evaluated ONLY then.
     ///
-    /// **NOT LOWERED TO A [`BoundExprKind::Conditional`], AND THE REASON IS THE SIDE EFFECT.** The
-    /// obvious desugaring `left != null ? left : right` evaluates `left` TWICE, so
-    /// `Next() ?? fallback` would advance an iterator twice and `list[i++] ?? x` would step the
-    /// index twice. Keeping the node lets emission use the one-evaluation IL (`dup`/`brtrue`/`pop`)
-    /// csc emits, which needs no temporary at all.
     NullCoalescing {
         /// The left operand -- evaluated once, and the result when it is not null.
         left: Box<BoundExpr>,
@@ -1034,13 +1017,19 @@ struct MethodContext {
     out_parameter_names: Vec<Box<str>>,
     /// The member's parameter names, in order.
     ///
-    /// **HELD ONLY SO A `return ref x;` CAN NAME THE RIGHT CODE**, and the two codes are not
-    /// interchangeable: csc answers `CS8168` for an ordinary LOCAL and `CS8166` for a by-value
-    /// PARAMETER, quoting the name either way. Both are refusals for the same reason -- the storage
-    /// dies with the frame -- and a reader who gets the wrong one goes looking for the wrong
-    /// declaration. The scope map cannot tell them apart: `declare_local` puts parameters and
-    /// locals in one table, correctly, because for every other question they behave alike.
     parameter_names: Vec<Box<str>>,
+}
+
+impl MethodContext {
+    /// The type a `return e;` converts `e` to (15.9.4): the declared return type, except in an
+    /// async method returning `Task<T>`, whose `return` hands the builder the task's RESULT and so
+    /// converts to `T` (15.15.2).
+    fn return_value_type(&self) -> &TypeSymbol {
+        match task_result_type(&self.return_type) {
+            Some(result) if self.is_async => result,
+            _ => &self.return_type,
+        }
+    }
 }
 
 /// The result of binding one REPL submission ([`Binder::bind_submission`]): the bound
@@ -1079,6 +1068,15 @@ enum StackBound {
     Local(Box<str>),
 }
 
+/// What a local function's body sets aside while it binds -- see
+/// [`Binder::enter_local_function_body`].
+pub(crate) struct LocalFunctionOuter {
+    handlers: HandlerNesting,
+    method: Option<MethodContext>,
+    loop_depth: u32,
+    switch_depth: u32,
+}
+
 /// The handler and `lock` nesting of the function being bound, set aside while a nested
 /// function's body binds -- see [`Binder::enter_function_body`].
 struct HandlerNesting {
@@ -1093,16 +1091,29 @@ struct HandlerNesting {
 ///
 /// `Default` so the binder that holds a stack of these can stay `#[derive(Default)]`.
 #[derive(Debug, Clone, Default)]
-struct LambdaFrame {
+pub(crate) struct LambdaFrame {
     /// `self.scopes.len()` at the moment the lambda's parameter scope was pushed. A name that
     /// resolves at a depth BELOW this came from the enclosing method and is therefore captured.
     scope_floor: usize,
     /// Captured enclosing locals, in FIRST-SEEN order -- which is the order a display class's
     /// fields are emitted in, so it is part of the answer and not incidental.
-    captures: Vec<Capture>,
+    pub(crate) captures: Vec<Capture>,
+    /// Where each capture was first read, parallel to `captures` -- where csc reports a capture a
+    /// LOCAL FUNCTION may not make (`CS1628`, `CS8175`, `CS8421`), which is at the reference.
+    pub(crate) capture_spans: Vec<Span>,
     /// Whether the body reads `this`. A capture too, and a different one: csc hoists it as
     /// `<>4__this` rather than by name, and on its own it needs no display class at all.
-    captures_this: bool,
+    pub(crate) captures_this: bool,
+    /// How many captures preceded the first read of `this` -- its place among them, which is
+    /// where csc puts `<>4__this` among a display class's fields (first capture first, measured).
+    pub(crate) this_position: Option<usize>,
+    /// The local function this frame binds the body of, or `None` for a lambda.
+    pub(crate) function: Option<crate::local_function::LocalFunctionId>,
+    /// Whether that local function is `static`, so a capture is an error (`CS8421`, `CS8422`).
+    pub(crate) is_static: bool,
+    /// The local functions declared outside this frame that its body refers to, in first-seen
+    /// order: a call to one that captures is a capture of what it captures.
+    pub(crate) captured_functions: Vec<crate::local_function::LocalFunctionId>,
 }
 
 /// Binds expressions, accumulating the semantic diagnostics found. Holds a stack
@@ -1138,10 +1149,6 @@ pub struct Binder {
     scope_spans: BTreeMap<ScopeId, Span>,
     /// The scope that was open when each scope was opened. Absent for an outermost scope.
     ///
-    /// **A CHAIN OF DISPLAY CLASSES IS A WALK OVER CAPTURING SCOPES, AND NOTHING ELSE KNOWS THE
-    /// SHAPE OF THAT WALK.** Measured against csc: a middle scope that captures nothing gets no
-    /// class and is not a link, so the inner class points straight at the outer -- which means
-    /// the emitter has to ask what ENCLOSES a scope, not how deep it is.
     ///
     /// Recorded here because it is free at the point a scope opens and unrecoverable afterwards:
     /// the bound tree has no scope on its statements, and deriving nesting from span containment
@@ -1156,13 +1163,7 @@ pub struct Binder {
     /// decided in the binder, where every other lambda gate already lives, rather than in an
     /// emitter that would report the hole as though the program were at fault.
     ///
-    /// Set once per method and not changed by a lambda body, so a capture inside one measures
-    /// against the method it is written in -- the scope csc counts from too.
     ///
-    /// TWO IDS, because a method body opens a scope for its PARAMETERS and `bind_statement` then
-    /// opens a second for the body BLOCK. They are ONE scope to the language, which forbids a
-    /// local shadowing a parameter (CS0136), and ONE display class to csc: a captured parameter
-    /// and a captured top-level local both produce `<>c__DisplayClass0_0`.
     method_body_scopes: [Option<ScopeId>; 2],
     /// One frame per lambda currently being bound, innermost last.
     ///
@@ -1173,6 +1174,40 @@ pub struct Binder {
     /// same node. Re-deriving the distinction afterwards means re-deriving which names the lambda
     /// introduced, which is a second answer to a question binding already answered.
     lambda_frames: Vec<LambdaFrame>,
+    /// Every local function declared so far, in declaration order; see
+    /// [`crate::local_function`]. A scope's own are those whose `scope` it is.
+    pub(crate) local_functions: Vec<crate::local_function::LocalFunctionSymbol>,
+    /// The declaration statements of local functions that repeat an earlier one's name in their
+    /// block -- CS0128 when each is reached.
+    pub(crate) duplicate_local_functions: Vec<Span>,
+    /// The next local function's id. Never reset, so an id is unique within the compilation.
+    pub(crate) next_local_function_id: u32,
+    /// The local functions of the method being bound, as bound, for the analyses that run over
+    /// the whole method afterwards: definite assignment (9.4.4.33) needs every body's summary
+    /// before it can judge a call, wherever the body is written -- a lambda's included.
+    pub(crate) method_local_functions: Vec<crate::local_function::BoundLocalFunction>,
+    /// The local functions some method-group conversion has made a delegate of. Written from
+    /// [`Binder::bind_delegate_creation`], which every conversion of a group passes through and
+    /// which borrows the binder shared -- hence the cell.
+    pub(crate) converted_local_functions:
+        core::cell::RefCell<alloc::collections::BTreeSet<crate::local_function::LocalFunctionId>>,
+    /// The local functions a lambda's body refers to from outside their own declaration, which
+    /// therefore run wherever that delegate runs.
+    pub(crate) lambda_captured_local_functions:
+        alloc::collections::BTreeSet<crate::local_function::LocalFunctionId>,
+    /// The scopes that hold a function's parameters -- a lambda's or a local function's -- which
+    /// are each a scope of their own to the closure analysis whatever they declare.
+    function_scopes: alloc::collections::BTreeSet<ScopeId>,
+    /// The scopes that declared at least one name, read when each closes.
+    scopes_declaring_names: alloc::collections::BTreeSet<ScopeId>,
+    /// Scopes that are part of the scope that encloses them to C#: the body block of a lambda or
+    /// local function (one scope with its parameters, as a method body is with its own), and the
+    /// two scopes a using DECLARATION opens, whose variable and following statements belong to the
+    /// block it is written in.
+    merged_scopes: alloc::collections::BTreeSet<ScopeId>,
+    /// The outermost scope of the method last bound -- its parameters' -- which the closure
+    /// lowering reads after binding ends, when `method_body_scopes` has been cleared.
+    method_root: Option<ScopeId>,
     /// The type parameters currently in scope, innermost last, each with the constraints its
     /// declaration wrote. Pushed by [`Binder::enter_type_parameters`] and popped by
     /// [`Binder::exit_type_parameters`], so it tracks the SAME scope the type table does.
@@ -1182,6 +1217,19 @@ pub struct Binder {
     /// `TypeSymbol` variant). So "is this name a type parameter, and what was promised about it"
     /// is a question nothing else in the binder could answer, which is what CS0304 needs.
     type_parameters_in_scope: Vec<(Box<str>, crate::symbols::TypeParameterConstraints)>,
+    /// The instantiations whose type arguments [`Binder::check_type_argument_constraints`] is
+    /// checking, outermost first.
+    ///
+    /// A constraint may name the type it constrains, `class C<T> where T : C<T>` (the shape .NET's
+    /// generic math is written in), and checking an argument against it resolves `C<T>`, whose own
+    /// arguments are then checked against the same constraint. A check that meets an instantiation
+    /// already on this stack stands down: the check further out is answering for it.
+    constraint_checks_in_progress: Vec<TypeSymbol>,
+    /// Whether a name is being resolved in a type declaration's HEADER -- its `where` clauses --
+    /// rather than inside its body. The current type is then the declaration, but its own nested
+    /// types and the ones its bases declare are not in scope, because a member's scope is the
+    /// body of the type that declares it; everything that encloses the declaration is.
+    resolving_type_header: bool,
     world: TypeTable,
     model: Model,
     current_type: Option<TypeSymbol>,
@@ -1219,6 +1267,9 @@ pub struct Binder {
     /// The imports every file context sits on: those in force when the caller began walking the
     /// compilation's files -- a session's own, or none. See [`Binder::set_file_context_base`].
     file_context_base: ImportScope,
+    /// The `global using` alias names of the units bound so far, in the order they were bound: a
+    /// second global alias of one name is `CS1537` in the unit that wrote the second.
+    global_aliases_declared: alloc::collections::BTreeSet<Box<str>>,
     imported_namespaces: Vec<Box<str>>,
     /// `using X = N.T;` aliases in scope, each the alias name and its target type, so an
     /// unqualified `X` resolves to the target (16.4.1). Scoped per namespace block alongside
@@ -1381,12 +1432,6 @@ pub struct Binder {
     in_field_initializer: bool,
     /// True while binding the OPERAND of a `nameof`, where nothing is evaluated.
     ///
-    /// **THAT IS THE WHOLE RULE, AND IT IS WHY THE OPERAND IS BOUND AT ALL.** `nameof` wants the
-    /// ordinary lookup failures -- `nameof(nosuch)` is `CS0103` and `nameof(t.NoSuch)` is
-    /// `CS1061`, measured -- and none of the failures that are about USING what was found. So an
-    /// instance member named from a static method is `"Field"` under csc and would be `CS0120`
-    /// here without this flag: the operand resolved perfectly well, and there is no object
-    /// because there is no evaluation.
     in_nameof: bool,
 }
 
@@ -1432,18 +1477,8 @@ struct PrivateField {
 /// Whether an assembly other than this one could ASSIGN a field of `access` declared in `declaring`
 /// -- the condition CS0649 is withheld under.
 ///
-/// **Measured against csc `/langversion:ISO-1`, one compilation per row:**
 ///
-/// | field | enclosing type | csc |
-/// |---|---|---|
-/// | `private` / `internal` | public | CS0649 |
-/// | `protected` / `protected internal` / `public` | public | -- |
-/// | `public` | internal | **CS0649** |
 ///
-/// That last row is the one that separates the two candidate rules. The earlier measurement varied
-/// the field's accessibility while leaving the enclosing type at C#'s default -- which is
-/// `internal` -- so every row warned, "csc reports it at every accessibility" fit the data
-/// perfectly, and the instrument could not tell the two apart.
 fn assignable_from_outside_assembly(model: &Model, declaring: &TypeSymbol, access: Accessibility) -> bool {
     reaches_outside(access) && type_is_externally_visible(model, declaring)
 }
@@ -1663,6 +1698,19 @@ impl Binder {
         for (name, constraint) in names.into_iter().zip(constraints) {
             self.type_parameters_in_scope.push((name, constraint));
         }
+        for slot in first..self.type_parameters_in_scope.len() {
+            let written = core::mem::take(&mut self.type_parameters_in_scope[slot].1.types);
+            let resolved = written.iter().map(|ty| self.canonicalize(ty)).collect();
+            self.type_parameters_in_scope[slot].1.types = resolved;
+        }
+        let unmanaged_type = if self.type_parameters_in_scope[first..]
+            .iter()
+            .any(|(_, constraints)| constraints.unmanaged)
+        {
+            self.unmanaged_names_a_type()
+        } else {
+            None
+        };
         for clause in clauses {
             let Some(offset) = parameters
                 .iter()
@@ -1670,6 +1718,17 @@ impl Binder {
             else {
                 continue;
             };
+            if let Some(named) = &unmanaged_type {
+                let struct_written = clause
+                    .constraints
+                    .iter()
+                    .any(|constraint| {
+                        matches!(constraint, lamella_syntax::ast::TypeParameterConstraint::ValueType(_))
+                    });
+                self.type_parameters_in_scope[first + offset]
+                    .1
+                    .read_unmanaged_as_type(named.clone(), struct_written);
+            }
             if clause
                 .constraints
                 .iter()
@@ -1681,14 +1740,91 @@ impl Binder {
         entered
     }
 
+    /// The type a bare `unmanaged` names in a `where` clause written in the current scope, or
+    /// `None` when no type of that name is found there and it is the `unmanaged` constraint
+    /// (ECMA-334 7th ed, 15.2.5: the name is looked up first, and only a lookup that fails leaves
+    /// the constraint).
+    ///
+    /// **ONE DECISION FOR EVERY READING OF A CLAUSE.** The declaration's diagnostics, the scope its
+    /// bodies bind in, the model's rows and the metadata all ask this, so none of them can take
+    /// the name one way while another takes it the other.
+    pub fn unmanaged_names_a_type(&mut self) -> Option<TypeSymbol> {
+        let name = TypeSymbol::Named(alloc::vec!["unmanaged".into()].into_boxed_slice());
+        let found = self.resolve_named_type_quietly(&name, Span::empty_at(0));
+        (!found.is_error()).then_some(found)
+    }
+
+    /// [`Self::enter_type_parameters`] for the declaration `declaring` itself -- a class, struct,
+    /// interface or delegate -- whose `where` clauses are resolved in its HEADER: the scope that
+    /// encloses the declaration, where neither the types it declares nor the ones it inherits are
+    /// in scope. A method's clauses see its declaring type's members and are entered with the
+    /// plain function.
+    ///
+    /// The scope is the same wherever a declaration is entered, which is what makes every pass
+    /// read one constraint type for one clause.
+    pub fn enter_declared_type_parameters(
+        &mut self,
+        declaring: &TypeSymbol,
+        parameters: &[TypeParameter],
+        clauses: &[TypeParameterConstraintClause],
+    ) -> Vec<(Box<str>, Shadowed)> {
+        let entered = self.in_type_header(declaring, |binder| {
+            binder.enter_type_parameters(parameters, clauses)
+        });
+        let adopted: Vec<(usize, crate::symbols::TypeParameterConstraints)> =
+            match self.model.get_by_symbol(declaring) {
+                Some(info) => {
+                    let first_in_row = info.type_parameters.len().saturating_sub(parameters.len());
+                    parameters
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, parameter)| {
+                            !clauses.iter().any(|clause| *clause.parameter == *parameter.name)
+                        })
+                        .filter_map(|(index, _)| {
+                            info.constraints_on(first_in_row + index)
+                                .filter(|constraints| !constraints.is_empty())
+                                .map(|constraints| (index, constraints.clone()))
+                        })
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+        let first_in_scope = self.type_parameters_in_scope.len() - parameters.len();
+        for (index, constraints) in adopted {
+            self.type_parameters_in_scope[first_in_scope + index].1 = constraints;
+        }
+        entered
+    }
+
+    /// Runs `resolve` with names resolved in the HEADER of the declaration `declaring`, the scope
+    /// its `where` clauses are written in, then restores the scope it found.
+    pub fn in_type_header<T>(
+        &mut self,
+        declaring: &TypeSymbol,
+        resolve: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let outer_type = self.replace_current_type(Some(declaring.clone()));
+        let outer_header = core::mem::replace(&mut self.resolving_type_header, true);
+        let value = resolve(self);
+        self.resolving_type_header = outer_header;
+        self.replace_current_type(outer_type);
+        value
+    }
+
+    /// The constraints of the innermost type parameter in scope named `name`, with their types
+    /// resolved where the parameter is declared, or `None` when no such parameter is in scope.
+    #[must_use]
+    pub fn constraints_in_scope(
+        &self,
+        name: &str,
+    ) -> Option<&crate::symbols::TypeParameterConstraints> {
+        self.type_parameter_in_scope(name)
+    }
+
     /// Whether one written constraint makes its parameter KNOWN to be a non-nullable reference type
     /// (C# 8.0): `class`, or a class type, written without `?` where annotations are enabled.
     ///
-    /// **WHERE IT IS WRITTEN IS HALF OF THE ANSWER.** A `class` constraint in a disabled context is
-    /// OBLIVIOUS -- neither nullable nor not -- and at C# 8.0 `T?` over it is CS8627 exactly as over
-    /// an unconstrained `T`; so is `where T : U` with `U : class`, and `notnull` (all measured
-    /// against csc 10.0.301). `System.Enum` is a class that constrains to enums, so it does not
-    /// make a reference type either.
     fn is_non_nullable_reference_constraint(
         &mut self,
         constraint: &lamella_syntax::ast::TypeParameterConstraint,
@@ -1792,12 +1928,6 @@ impl Binder {
     /// interface constraint is not one, and neither is `where T : class`, which says only that the
     /// argument is a reference type.
     ///
-    /// **`where U : T` GIVES U EVERYTHING T PROMISES, AND NOT FOLLOWING IT WAS THREE REFUSALS OF
-    /// VALID CODE FROM ONE OMISSION** -- under `where U : T where T : Animal`, U's base came out
-    /// `object`, so `u.Legs()` was CS0117, `Animal a = u;` was CS0029, and U did not satisfy a
-    /// `where V : class` parameter. csc compiles all three. The recursion is what 25.7 asks for
-    /// rather than an extra: the clause defines the type-parameter-constraint case in terms of the
-    /// effective base classes OF those constraints.
     ///
     /// **`System.Object` IS DROPPED FROM THE CANDIDATE SET BEFORE THE MOST-ENCOMPASSED CHOICE
     /// (13.4.2), WHICH IS BOTH CORRECT AND THE ROBUST SPELLING.** `object` encompasses every
@@ -1892,11 +2022,16 @@ impl Binder {
     /// A binder that resolves type names and looks members up against `model`.
     #[must_use]
     pub fn with_model(model: Model) -> Binder {
-        Binder {
+        let mut binder = Binder {
             world: model.type_table(),
             model,
             ..Binder::default()
+        };
+        for kind in binder.model.global_usings().to_vec() {
+            binder.import_using(&kind);
         }
+        binder.set_file_context_base();
+        binder
     }
 
     /// Resolves `ty` but DISCARDS any diagnostic the attempt produces. For a check that needs to
@@ -2088,10 +2223,6 @@ impl Binder {
 
     /// A declaring type's name as a DIAGNOSTIC should render it: `Box<T>`, not `` Box`1 ``.
     ///
-    /// The metadata spelling is right for a lookup key and wrong in a message -- it names a type
-    /// the programmer did not write, using a character C# has no meaning for. csc quotes
-    /// `Box<T>.item`, so a message quoting `` Box`1.item `` diverges on the one part of the
-    /// diagnostic a reader searches their own source for.
     ///
     /// A type with no parameters renders exactly as before, so no non-generic message moves.
     fn declaring_display_name(&self, declaring: &TypeSymbol) -> Box<str> {
@@ -2159,13 +2290,6 @@ impl Binder {
     /// Records that an attribute named argument (`[A(F = 1)]`) both READS and WRITES the field it
     /// names, so none of the three unused-field warnings fires for it.
     ///
-    /// BOTH, and neither is padding. It is an assignment, so CS0649 ("never assigned") must not
-    /// fire -- that is the false positive this exists to prevent, and it appeared the moment
-    /// CS0649 stopped being private-only, because an attribute argument is the one assignment
-    /// that lives outside every method body. It is also a USE, so CS0169 ("never used") stays
-    /// silent, matching csc: a private field named only by an attribute draws CS0122 alone.
-    /// Recording only the write would trade one wrong warning for another (CS0414, "assigned but
-    /// never read").
     pub(crate) fn record_attribute_named_argument(&mut self, declaring: &TypeSymbol, field: &str) {
         if let Some(key) = crate::flow::field_type_key(declaring) {
             self.field_reads.insert((key.clone(), field.into()));
@@ -2282,14 +2406,6 @@ impl Binder {
     /// [`resolve_named_type`](Self::resolve_named_type) -- the two-step that nineteen declaration
     /// sites each spelled out -- plus the one thing a `TypeSymbol` cannot carry.
     ///
-    /// **A VERBATIM NAME IS NEVER A CONTEXTUAL KEYWORD, AND THE RESOLVER'S `var` CASE IS A CLAIM
-    /// ABOUT ONE.** An unresolved bare `var` answers CS0825 -- *the contextual keyword 'var' may
-    /// only appear within a local variable declaration* -- which is right for the keyword in a
-    /// position that does not admit it and wrong for `@var`, an ordinary name for a type this
-    /// program does not declare. csc answers CS0246 there, measured. The symbol is `var` under
-    /// both spellings, so the distinction cannot travel with it: it travels on the `TypeRef`
-    /// (`verbatim_name`, recorded by the parser) and is spent here, at the one place every site
-    /// passes through -- rather than at whichever site notices first.
     ///
     /// Only a BARE name takes the second path. `@N.var`, `@var[]` and `@Foo<Bar>` could not have
     /// been the keyword under any reading, and they keep the ordinary path so their inner
@@ -2431,15 +2547,13 @@ impl Binder {
     }
 
     /// [`Self::nullable_underlying`] for the in-scope type parameter at `index`: a value type when
-    /// it carries `struct` or `unmanaged`, or a constraint that is a type parameter known to be
-    /// one; otherwise a type parameter the `?` annotates.
+    /// it carries `struct` or `unmanaged` (which sets the same flag), or a constraint that is a
+    /// type parameter known to be one; otherwise a type parameter the `?` annotates.
     fn type_parameter_nullable_underlying(&self, index: usize) -> NullableUnderlying {
         let constraints = &self.type_parameters_in_scope[index].1;
         let value_type = constraints.value_type
             || constraints.types.iter().any(|constraint| {
-                matches!(constraint, TypeSymbol::Named(parts) if parts.len() == 1 && &*parts[0] == "unmanaged")
-                    || self.nullable_underlying_within(constraint, index)
-                        == NullableUnderlying::ValueType
+                self.nullable_underlying_within(constraint, index) == NullableUnderlying::ValueType
             });
         if value_type {
             return NullableUnderlying::ValueType;
@@ -2479,8 +2593,32 @@ impl Binder {
     /// its control, which is a table rather than an example because "every position" is a claim an
     /// example cannot support -- and which found that exception rather than having it written in.
     pub(crate) fn resolve_named_type(&mut self, ty: &TypeSymbol, span: Span) -> TypeSymbol {
+        self.resolve_named_type_checked_at(ty, span, span)
+    }
+
+    /// [`Self::resolve_named_type`] for the type a `where` clause names, reporting a constraint
+    /// whose own type arguments fail THEIR declaration's constraints at `parameter_span`, the
+    /// declared type parameter it constrains: `class A<T> where T : B<T>` over `class B<T> where
+    /// T : A<T>` is CS0311 at A's `T`. Every other diagnostic is reported where the name is written.
+    pub(crate) fn resolve_constraint_type(
+        &mut self,
+        ty: &TypeSymbol,
+        span: Span,
+        parameter_span: Span,
+    ) -> TypeSymbol {
+        self.resolve_named_type_checked_at(ty, span, parameter_span)
+    }
+
+    /// Resolves `ty` written at `span`, checking its type arguments against their constraints
+    /// with any failure reported at `constraint_span`.
+    fn resolve_named_type_checked_at(
+        &mut self,
+        ty: &TypeSymbol,
+        span: Span,
+        constraint_span: Span,
+    ) -> TypeSymbol {
         let resolved = self.resolve_named_type_unchecked(ty, span);
-        self.check_type_argument_constraints(&resolved, span);
+        self.check_type_argument_constraints(&resolved, constraint_span);
         if !self.check_type_is_accessible(&resolved, span) {
             return TypeSymbol::Error;
         }
@@ -2509,18 +2647,14 @@ impl Binder {
 
     /// Whether a resolved type NAME is reachable from the site currently being bound (10.5.4).
     ///
-    /// Two rules ask this and they must agree: [`Self::check_type_is_accessible`] reports `CS0122`
-    /// for naming the type, and the `CS0050` family SUPPRESSES itself when the answer is no --
-    /// because csc reports one diagnostic there, not two, and the exposure code beside the naming
-    /// one is a false positive.
     ///
     /// The DECLARING scope is the enclosing type for a nested type and the type itself for a
     /// top-level one, which is what makes `internal` mean "this assembly, or one it named a friend"
     /// through the same [`Self::accessible_from`] every member arm uses.
     pub(crate) fn type_is_accessible_here(&self, resolved: &TypeSymbol) -> bool {
-        let TypeSymbol::Named(_) = resolved else {
+        if !matches!(resolved, TypeSymbol::Named(_) | TypeSymbol::Instantiation { .. }) {
             return true;
-        };
+        }
         let definition = definition_of(resolved);
         let Some(info) = self.model.get_by_symbol(&definition) else {
             return true;
@@ -2538,10 +2672,6 @@ impl Binder {
 
     /// Reports `CS0122` for a resolved type NAME the use site may not reach (10.5.4).
     ///
-    /// **THE RULE HAS TWO DIRECTIONS AND BOTH ARE `CS0122` UNDER csc.** Naming a `private` nested
-    /// type from outside its enclosing class is one; naming any non-public type of a REFERENCED
-    /// assembly is the other, and the second is undetectable unless `reference.rs` reads a
-    /// `TypeDef`'s visibility bits.
     ///
     /// It is a different rule from the `CS0050` family: those report EXPOSING a less accessible
     /// type through a more accessible member, and this reports NAMING one at all.
@@ -2558,14 +2688,85 @@ impl Binder {
         let Some(info) = self.model.get_by_symbol(&definition) else {
             return true;
         };
-        let rendered = inaccessible_type_name(&info);
+        let rendered = self.inaccessible_type_display(resolved, &info);
         self.report(Diagnostic::new(
-            DiagnosticKind::Inaccessible {
-                member: rendered.into(),
-            },
+            DiagnosticKind::Inaccessible { member: rendered },
             span,
         ));
         false
+    }
+
+    /// The name a `CS0122` gives an inaccessible TYPE, as csc words it: without its namespace and
+    /// with EVERY type it is nested in, so a nested type reads `Board.Clocks`, two deep
+    /// `O4.Mid.Deep`, and a top-level one `Pico2`.
+    ///
+    fn inaccessible_type_display(&self, resolved: &TypeSymbol, info: &TypeInfo) -> Box<str> {
+        let parameter = |name: &Box<str>| TypeSymbol::Named([name.clone()].into());
+        let TypeSymbol::Named(parts) = definition_of(resolved) else {
+            return info.name.clone();
+        };
+        let Some((own, enclosing)) = parts.split_last() else {
+            return info.name.clone();
+        };
+        let inherited: usize = enclosing
+            .iter()
+            .map(|part| crate::symbols::mangled_arity(part))
+            .sum();
+        let mut arguments: Vec<TypeSymbol> = match resolved {
+            TypeSymbol::Instantiation { arguments, .. } if arguments.len() >= inherited => {
+                arguments[..inherited].to_vec()
+            }
+            _ => {
+                let mut names = Vec::new();
+                for depth in 1..=enclosing.len() {
+                    let arity = crate::symbols::mangled_arity(&enclosing[depth - 1]);
+                    if arity == 0 {
+                        continue;
+                    }
+                    let outer = TypeSymbol::Named(enclosing[..depth].into());
+                    let parameters = self
+                        .model
+                        .get_by_symbol(&outer)
+                        .map(|outer| outer.type_parameters.clone())
+                        .unwrap_or_default();
+                    let skip = parameters.len().saturating_sub(arity);
+                    names.extend(parameters.iter().skip(skip).map(parameter));
+                }
+                names
+            }
+        };
+        let skip = info
+            .type_parameters
+            .len()
+            .saturating_sub(crate::symbols::mangled_arity(own));
+        arguments.extend(info.type_parameters.iter().skip(skip).map(parameter));
+        let mut definition: Vec<Box<str>> = enclosing.to_vec();
+        definition.push(crate::symbols::unmangled_type_name(own));
+        let display = if arguments.is_empty() {
+            TypeSymbol::Named(definition.into())
+        } else {
+            TypeSymbol::Instantiation {
+                definition: definition.into(),
+                arguments: arguments.into(),
+            }
+        };
+        self.short_type_display(&display)
+    }
+
+    /// A type NAMED in an expression, as the type reference it binds to -- the receiver `N.T` of
+    /// `N.T.F`, `Outer.Inner` of `Outer.Inner.X`, or a simple name -- with the `CS0122` naming it
+    /// draws where the site may not reach it (10.5.4).
+    ///
+    /// **EVERY EXPRESSION PATH THAT RESOLVES A WRITTEN NAME TO A TYPE BUILDS ITS REFERENCE HERE**,
+    /// for the reason [`Self::resolve_named_type`]'s wrapper gives for a type position: a rule with
+    /// one home per path gains its next case in a subset of them.
+    ///
+    fn named_type_reference(&mut self, ty: TypeSymbol, span: Span) -> BoundExpr {
+        self.check_type_is_accessible(&ty, span);
+        BoundExpr {
+            kind: BoundExprKind::TypeReference(ty.clone()),
+            ty,
+        }
     }
 
     /// Resolves the operand of `typeof(List<>)` -- an `unbound-type-name` (14.5.11) already bound
@@ -2575,28 +2776,16 @@ impl Binder {
     /// Two things separate this from [`resolve_named_type`](Self::resolve_named_type), and 14.5.11
     /// states both:
     ///
-    /// - **Constraints are ignored.** *Evaluate the resulting type-name, while ignoring all type
-    ///   parameter constraints.* The substituted `object`s satisfy nothing in particular, so
-    ///   checking them would refuse `typeof(Nullable<>)` -- which csc compiles -- for a violation by
-    ///   an argument the programmer did not write. This is the ONE caller outside the wrapper, and
-    ///   it is here rather than at a `skip_constraints` flag so that the exemption is attached to
-    ///   the construct the standard grants it to.
-    /// - **The answer is the DEFINITION, not the instantiation.** *The unbound-type-name resolves to
-    ///   the unbound generic type associated with the resulting constructed type.* So the resolved
-    ///   `` List`1<object> `` becomes plain `` List`1 ``, through
-    ///   [`definition_symbol`](crate::symbols::definition_symbol) -- the one spelling a token table
-    ///   and the model both hold a generic definition under. Emission then needs no case of its own:
-    ///   `ldtoken` of a [`TypeSymbol::Named`] is the `TypeRef`/`TypeDef` row it has always been.
     ///
-    /// **MEASURED AGAINST csc RATHER THAN REASONED ABOUT** (`System.Reflection.Metadata` over csc's
-    /// own output for this program): `typeof(List<>)` is `ldtoken` of the **TypeRef** `` List`1 ``
-    /// and `typeof(Dictionary<,>)` of `` Dictionary`2 ``, while `typeof(List<int>)` beside them is a
-    /// `TypeSpec`. The unbound form names no `TypeSpec` at all.
     ///
     /// A definition that does not resolve has already drawn its own diagnostic (CS0246, or CS0305
     /// where the name is in scope at another arity), and `Error` falls through unchanged.
     pub(crate) fn resolve_unbound_generic_type(&mut self, ty: &TypeSymbol, span: Span) -> TypeSymbol {
-        match self.resolve_named_type_unchecked(ty, span) {
+        let resolved = self.resolve_named_type_unchecked(ty, span);
+        if !self.check_type_is_accessible(&resolved, span) {
+            return TypeSymbol::Error;
+        }
+        match resolved {
             TypeSymbol::Instantiation {
                 definition,
                 arguments,
@@ -2628,18 +2817,10 @@ impl Binder {
     /// A NESTED type named bare from inside its enclosing generic, closed over the enclosing type's
     /// parameters: `Cursor` written inside `Box<T>` is `Box<T>.Cursor`, never the open definition.
     ///
-    /// **A NESTED TYPE HAS THE PARAMETERS OF EVERY TYPE IT IS NESTED IN (ECMA-335 II.9.2), SO
-    /// THERE IS NO SUCH THING AS THE BARE ONE.** The name supplies no arguments and the context
-    /// does: inside `Box<T>` the enclosing argument is `T` itself. Returning the open definition
-    /// instead is what made `Box<int>.Cursor` and `Box<string>.Cursor` one type, sharing one copy
-    /// of any static field -- measured against csc, which prints `1 1` where sharing prints `1 2`.
     ///
     /// Applies to a type whose own arity is ZERO -- a bare name cannot supply its own arguments,
     /// so a nested `Pair<U>` reaches this as an INSTANTIATION and keeps its own path.
     ///
-    /// Every other symbol is returned unchanged, including a non-nested generic named bare, which
-    /// is not this rule's business: `Box` alone is a use of a generic type without its arguments
-    /// and the arity check refuses it with csc's CS0305.
     fn close_over_enclosing_parameters(&self, symbol: &TypeSymbol) -> TypeSymbol {
         let TypeSymbol::Named(parts) = symbol else {
             return symbol.clone();
@@ -2913,7 +3094,7 @@ impl Binder {
     }
 
     /// Whether `namespace` (`""` for the global one) declares a type named `name`, at any arity.
-    fn type_named_in(&self, namespace: &str, name: &str) -> bool {
+    pub(crate) fn type_named_in(&self, namespace: &str, name: &str) -> bool {
         self.model.get(namespace, name).is_some()
             || (1..=MAX_GENERIC_ARITY_PROBED).any(|arity| {
                 self.model
@@ -3080,6 +3261,10 @@ impl Binder {
         };
         let declaration =
             crate::resolve::quote_candidate(name, info.type_parameters.len(), &info.type_parameters);
+        if self.constraint_checks_in_progress.contains(resolved) {
+            return;
+        }
+        self.constraint_checks_in_progress.push(resolved.clone());
         for (index, argument) in arguments.iter().enumerate() {
             if argument.is_error() {
                 continue;
@@ -3088,57 +3273,24 @@ impl Binder {
                 continue;
             };
             let parameter: Box<str> = info.type_parameters[index].clone();
-            self.check_one_type_argument(
-                argument,
-                &constraints.clone(),
-                &parameter,
-                &declaration,
-                span,
-            );
+            let constraints = constraints.substituted(&info.type_parameters, arguments);
+            self.check_one_type_argument(argument, &constraints, &parameter, &declaration, span);
         }
+        self.constraint_checks_in_progress.pop();
     }
 
-    /// The four constraint tests for ONE type argument of a generic TYPE.
+    /// The constraint tests for ONE type argument, in the order they are reported.
+    ///
+    /// **ONE IMPLEMENTATION FOR TYPES AND METHODS.** The rules and the messages are the same for a
+    /// generic type's arguments and a generic method's. Writing the tests twice is how the next
+    /// constraint kind would land on one of them.
+    ///
     fn check_one_type_argument(
         &mut self,
         argument: &TypeSymbol,
         constraints: &crate::symbols::TypeParameterConstraints,
         parameter: &str,
         declaration: &str,
-        span: Span,
-    ) {
-        self.check_one_type_argument_as(
-            argument,
-            constraints,
-            parameter,
-            declaration,
-            GenericMember::Type,
-            span,
-        );
-    }
-
-    /// The four constraint tests for ONE type argument, in csc's reporting order.
-    ///
-    /// **ONE IMPLEMENTATION FOR TYPES AND METHODS.** The rules are identical and only the noun in
-    /// the message differs -- csc says *"in the generic type 'Box<T>'"* and *"in the generic method
-    /// 'C.M<T>()'"* under the SAME four codes. `member` is that noun. Writing the tests twice is
-    /// how the next constraint kind would land on one of them.
-    ///
-    /// **EVERY ONE OF 25.7.1's FOUR BULLETS ENDS IN AN ALTERNATIVE THAT NAMES A TYPE PARAMETER**,
-    /// and each test delegates to the predicate that carries it -- *"A is a type parameter having
-    /// the value type constraint"*, *"A is a type parameter that is known to be a reference type"*,
-    /// *"A is a type parameter having the constructor constraint"*, and the implicit type parameter
-    /// conversion of 25.7.4. Asking the world what KIND of type `A` is answers all four wrongly
-    /// for a type parameter, which has no kind until it is instantiated: a `where T : struct` type
-    /// could not name itself anywhere, a `where T : IThing` one could not either, and the two
-    /// constructor rows went the other way and accepted what csc refuses.
-    fn check_one_type_argument_as(
-        &mut self,
-        argument: &TypeSymbol,
-        constraints: &crate::symbols::TypeParameterConstraints,
-        parameter: &str,
-        declaration: &str,
-        member: GenericMember,
         span: Span,
     ) {
         if self.type_is_by_ref_like(argument) {
@@ -3152,16 +3304,41 @@ impl Binder {
             ));
             return;
         }
+        // A failed `class`, `unmanaged` or `struct` test is the argument's one diagnostic: a type
+        // that cannot be what the parameter's kind requires is not then asked whether it converts
+        // to each constraint type, nor whether it has a constructor.
         if constraints.reference_type && !self.satisfies_reference_type_constraint(argument) {
             self.diagnostics.push(Diagnostic::new(
                 DiagnosticKind::TypeArgumentMustBeReferenceType {
                     argument: alloc::format!("{argument}").into(),
                     parameter: parameter.into(),
                     declaration: declaration.into(),
-                    member,
                 },
                 span,
             ));
+            return;
+        }
+        if constraints.unmanaged {
+            let kind = self.managed_kind(argument);
+            if kind == ManagedKind::Managed || !self.satisfies_value_type_constraint(argument) {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::TypeArgumentMustBeUnmanaged {
+                        argument: alloc::format!("{argument}").into(),
+                        parameter: parameter.into(),
+                        declaration: declaration.into(),
+                    },
+                    span,
+                ));
+                return;
+            }
+            if kind == ManagedKind::UnmanagedWithGenerics
+                && Feature::UnmanagedConstructedTypes
+                    .gate_against(self.language_version)
+                    .is_some()
+            {
+                self.gate_feature(Feature::UnmanagedConstructedTypes, span);
+                return;
+            }
         }
         if constraints.value_type && !self.satisfies_value_type_constraint(argument) {
             self.diagnostics.push(Diagnostic::new(
@@ -3169,10 +3346,27 @@ impl Binder {
                     argument: alloc::format!("{argument}").into(),
                     parameter: parameter.into(),
                     declaration: declaration.into(),
-                    member,
                 },
                 span,
             ));
+            return;
+        }
+        for constraint in &constraints.types {
+            if !self.names_a_known_type(constraint) {
+                continue;
+            }
+            if !self.satisfies_named_constraint(argument, constraint) {
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::TypeArgumentNoConversionToConstraint {
+                        argument: alloc::format!("{argument}").into(),
+                        parameter: parameter.into(),
+                        declaration: declaration.into(),
+                        constraint: alloc::format!("{constraint}").into(),
+                        conversion: self.missing_constraint_conversion(argument, constraint),
+                    },
+                    span,
+                ));
+            }
         }
         if constraints.default_constructor && !self.satisfies_constructor_constraint(argument) {
             self.diagnostics.push(Diagnostic::new(
@@ -3180,28 +3374,38 @@ impl Binder {
                     argument: alloc::format!("{argument}").into(),
                     parameter: parameter.into(),
                     declaration: declaration.into(),
-                    member,
                 },
                 span,
             ));
         }
-        for constraint in &constraints.types {
-            let constraint = self.resolve_named_type_quietly(constraint, span);
-            if constraint.is_error() {
-                continue;
+    }
+
+    /// Which conversion a type argument that fails the named constraint `constraint` lacks, which
+    /// decides the code it is reported under: a reference type -- a type parameter known to be one
+    /// included -- lacks an implicit reference conversion, a nullable value type cannot satisfy a
+    /// class or an interface, another type parameter lacks a boxing or type parameter conversion,
+    /// and any other value type a boxing conversion.
+    fn missing_constraint_conversion(
+        &self,
+        argument: &TypeSymbol,
+        constraint: &TypeSymbol,
+    ) -> crate::diagnostic::ConstraintConversion {
+        use crate::diagnostic::ConstraintConversion;
+        if self.satisfies_reference_type_constraint(argument) {
+            ConstraintConversion::Reference
+        } else if crate::conversion::nullable_underlying(argument).is_some() {
+            if self
+                .type_info_of(constraint)
+                .is_some_and(|info| info.kind == TypeKind::Interface)
+            {
+                ConstraintConversion::NullableToInterface
+            } else {
+                ConstraintConversion::NullableToClass
             }
-            if !self.satisfies_named_constraint(argument, &constraint) {
-                self.diagnostics.push(Diagnostic::new(
-                    DiagnosticKind::TypeArgumentNoConversionToConstraint {
-                        argument: alloc::format!("{argument}").into(),
-                        parameter: parameter.into(),
-                        declaration: declaration.into(),
-                        constraint: alloc::format!("{constraint}").into(),
-                        member,
-                    },
-                    span,
-                ));
-            }
+        } else if self.constraints_of_type_parameter(argument).is_some() {
+            ConstraintConversion::TypeParameter
+        } else {
+            ConstraintConversion::Boxing
         }
     }
 
@@ -3225,11 +3429,6 @@ impl Binder {
     /// 25.7.1's value-type bullet: a NON-NULLABLE struct or enum type, or a type parameter that
     /// itself carries the `struct` constraint.
     ///
-    /// **`is_value_type` IS THE WRONG QUESTION IN BOTH DIRECTIONS HERE, WHICH IS WHY THIS IS NOT
-    /// A CALL TO IT.** It answers `false` for a type parameter, so `struct Box<T> where T : struct`
-    /// could not name `Box<T>` in its own signature or body; and it answers `true` for
-    /// `System.Nullable<int>`, which is a struct and is exactly the one struct the constraint
-    /// exists to exclude -- `Nullable<Nullable<int>>` compiled here and is CS0453 in csc.
     fn satisfies_value_type_constraint(&self, argument: &TypeSymbol) -> bool {
         match self.constraints_of_type_parameter(argument) {
             Some(own) => own.value_type,
@@ -3270,12 +3469,6 @@ impl Binder {
     /// 25.7.1's constructor bullet: a type with an accessible parameterless constructor, or a type
     /// parameter carrying `new()` -- or `struct`, since every value type has one (11.1.2).
     ///
-    /// **THE TYPE-PARAMETER ARM IS THE STRICT ONE, AND IT CLOSES A HOLE RATHER THAN OPENING ONE.**
-    /// [`Binder::has_accessible_parameterless_constructor`] answers `true` for a type the model
-    /// cannot see, deliberately. A type parameter is never in the model, so deferring to it lets an
-    /// unconstrained `T` satisfy `where U : new()` and accepts programs csc reports CS0310 on.
-    /// A parameter's constraints are not "a type we failed to decode" -- they are the whole of
-    /// what is known about it, so the answer is exact.
     fn satisfies_constructor_constraint(&self, argument: &TypeSymbol) -> bool {
         match self.constraints_of_type_parameter(argument) {
             Some(own) => own.requires_default_constructor(),
@@ -3395,14 +3588,6 @@ impl Binder {
     /// in-scope namespace declares stays as written for the normal resolver to diagnose.
     /// Arrays and pointers canonicalize their element type.
     ///
-    /// **SCOPED, NOT WORLD-UNIQUE.** A world-uniqueness rule ("the one type in the whole model
-    /// with this simple name") answers the WRONG type the moment a referenced assembly declares
-    /// the same simple name in a namespace nobody imported: the lookup goes ambiguous, the
-    /// signature stays raw, and one file's `Marker` gets two identities split by syntactic
-    /// position (declaration positions raw, expression positions resolved -- CS0029/CS0115 on
-    /// programs csc compiles). The scope walk is [`Binder::type_namespaces_containing`], shared
-    /// with the use-site resolver, so declaration and use positions answer alike by
-    /// construction.
     pub fn canonicalize(&self, ty: &TypeSymbol) -> TypeSymbol {
         // A name qualified by `global::` or an alias is fully qualified once the qualifier is
         // replaced by the namespace it denotes, and no scope is consulted for it.
@@ -4042,10 +4227,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// `None` leaves the pointer reading to bind it, for an element this build cannot resolve
     /// quietly: that reading reports the name.
     ///
-    /// Where the referenced `Span<T>` declares a `Span<T>(void*, int)` constructor, the block is
-    /// `localloc`'d and that constructor lays the span over it, as csc does; a `ReadOnlySpan<T>` is
-    /// then the span's implicit conversion. Where it declares none, the span is built over
-    /// `new T[count]`: the same values (zeroed, the same `Length`), from a heap allocation.
     fn bind_stackalloc_into_span_gated(
         &mut self,
         expr: &Expr,
@@ -4443,52 +4624,87 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// can be `stackalloc`'d: the block is raw memory, and a reference in it is one the collector
     /// never sees.
     fn is_unmanaged_type(&self, ty: &TypeSymbol) -> bool {
-        self.is_unmanaged_within(ty, &mut Vec::new())
+        self.managed_kind(ty) != ManagedKind::Managed
     }
 
-    fn is_unmanaged_within(&self, ty: &TypeSymbol, open: &mut Vec<TypeSymbol>) -> bool {
+    /// [`Self::is_unmanaged_type`]'s answer, telling apart an unmanaged type that is or holds a
+    /// constructed struct, which C# 7.3 does not count as unmanaged
+    /// ([`Feature::UnmanagedConstructedTypes`]).
+    fn managed_kind(&self, ty: &TypeSymbol) -> ManagedKind {
+        self.managed_kind_within(ty, &mut Vec::new())
+    }
+
+    fn managed_kind_within(&self, ty: &TypeSymbol, open: &mut Vec<TypeSymbol>) -> ManagedKind {
         match ty {
-            TypeSymbol::Special(special) => !matches!(
-                special,
-                SpecialType::Object | SpecialType::String | SpecialType::Void | SpecialType::Null
-            ),
-            TypeSymbol::Pointer(_) | TypeSymbol::Error => true,
-            TypeSymbol::Array { .. } | TypeSymbol::ByRef(_) => false,
+            TypeSymbol::Special(special) => {
+                if matches!(
+                    special,
+                    SpecialType::Object | SpecialType::String | SpecialType::Void | SpecialType::Null
+                ) {
+                    ManagedKind::Managed
+                } else {
+                    ManagedKind::Unmanaged
+                }
+            }
+            TypeSymbol::Pointer(_) | TypeSymbol::Error => ManagedKind::Unmanaged,
+            TypeSymbol::Array { .. } | TypeSymbol::ByRef(_) => ManagedKind::Managed,
             TypeSymbol::Named(parts)
                 if matches!(&parts[..], [name] if self.type_parameter_in_scope(name).is_some()) =>
             {
                 let [name] = &parts[..] else {
-                    return false;
+                    return ManagedKind::Managed;
                 };
-                self.type_parameter_in_scope(name).is_some_and(|constraints| {
-                    constraints.types.iter().any(|constraint| {
-                        matches!(constraint, TypeSymbol::Named(parts)
-                            if matches!(&parts[..], [only] if &**only == "unmanaged"))
-                    })
-                })
+                // `struct` alone admits a value type with references in it, so only `unmanaged`
+                // makes a type parameter unmanaged. It is not constructed, whatever its argument.
+                if self
+                    .type_parameter_in_scope(name)
+                    .is_some_and(|constraints| constraints.unmanaged)
+                {
+                    ManagedKind::Unmanaged
+                } else {
+                    ManagedKind::Managed
+                }
             }
             _ => {
                 let Some(info) = self.type_info_of(ty) else {
-                    return false;
+                    return ManagedKind::Managed;
                 };
                 match info.kind {
-                    TypeKind::Enum => true,
+                    TypeKind::Enum => ManagedKind::Unmanaged,
                     TypeKind::Struct => {
                         if open.contains(ty) {
-                            return true;
+                            return ManagedKind::Unmanaged;
                         }
+                        // A constructed struct, or one nested in a constructed type, has type
+                        // arguments of its own: `O<int>.N` is constructed as `G<int>` is.
+                        let mut kind = if matches!(ty, TypeSymbol::Instantiation { .. }) {
+                            ManagedKind::UnmanagedWithGenerics
+                        } else {
+                            ManagedKind::Unmanaged
+                        };
                         open.push(ty.clone());
-                        let unmanaged = info
+                        for field in info
                             .fields
                             .iter()
                             .filter(|field| !field.is_static)
                             .map(|field| &field.ty)
                             .chain(info.hidden_instance_field_types.iter())
-                            .all(|field| self.is_unmanaged_within(field, open));
+                        {
+                            match self.managed_kind_within(field, open) {
+                                ManagedKind::Managed => {
+                                    kind = ManagedKind::Managed;
+                                    break;
+                                }
+                                ManagedKind::UnmanagedWithGenerics => {
+                                    kind = ManagedKind::UnmanagedWithGenerics;
+                                }
+                                ManagedKind::Unmanaged => {}
+                            }
+                        }
                         open.pop();
-                        unmanaged
+                        kind
                     }
-                    _ => false,
+                    _ => ManagedKind::Managed,
                 }
             }
         }
@@ -4569,11 +4785,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
         let declared_in = self.scope_ids.last().copied();
         self.enter_scope();
-        self.lambda_frames.push(LambdaFrame {
-            scope_floor: self.scopes.len() - 1,
-            captures: Vec::new(),
-            captures_this: false,
-        });
+        let body_scope = self.innermost_scope_id();
+        if let Some(scope) = body_scope {
+            self.mark_function_scope(scope);
+        }
+        self.push_function_frame(None, false);
         for (name, ty) in &bound_parameters {
             self.declare_local(name, ty.clone());
         }
@@ -4607,25 +4823,30 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 let saved = self.current_method.clone();
                 if let Some(context) = self.current_method.as_mut() {
                     context.return_type = invoke.return_type.clone();
+                    context.is_async = false;
                 }
+                self.merge_next_scope_into_current();
                 let bound = self.bind_statement(block);
                 self.current_method = saved;
                 BoundLambdaBody::Block(bound)
             }
         };
         self.exit_function_body(handlers);
-        let frame = self.lambda_frames.pop().unwrap_or_default();
+        let frame = self.pop_function_frame();
         self.exit_scope();
-        let (captures, captures_this) = (frame.captures, frame.captures_this);
+        let (captures, captures_this, captured_functions, this_position) = (
+            frame.captures,
+            frame.captures_this,
+            frame.captured_functions,
+            frame.this_position,
+        );
         if !self.type_parameters_in_scope.is_empty() {
             self.gate_feature(Feature::LambdaInGenericScope, expr.span);
         } else if !captures.is_empty() {
             self.report_unhoistable_captures(&captures, expr.span);
-            let from_body_scope = captures.iter().all(|capture| {
-                self.method_body_scopes
-                    .iter()
-                    .any(|body| *body == Some(capture.scope))
-            });
+            let from_body_scope = captures
+                .iter()
+                .all(|capture| self.is_method_body_scope(capture.scope));
             if from_body_scope {
                 self.gate_feature(Feature::LambdaCapturingLocals, expr.span);
             } else {
@@ -4647,6 +4868,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 captures,
                 captures_this,
                 declared_in,
+                captured_functions,
+                body_scope,
+                this_position,
             },
         }
     }
@@ -4790,13 +5014,13 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     pub(crate) fn current_return_type(&self) -> Option<TypeSymbol> {
         self.current_method
             .as_ref()
-            .map(|method| method.return_type.clone())
+            .map(|method| method.return_value_type().clone())
     }
 
     pub(crate) fn convert_to_return_type(&self, value: BoundExpr) -> BoundExpr {
         match &self.current_method {
             Some(method) => {
-                let target = match &method.return_type {
+                let target = match method.return_value_type() {
                     TypeSymbol::ByRef(_) => return value,
                     other => other.clone(),
                 };
@@ -4857,20 +5081,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Whether two types have a PREDEFINED `==`/`!=` (14.9), asked only after a user-defined
     /// operator has been looked for and not found.
     ///
-    /// **A STRUCT HAS NO PREDEFINED EQUALITY, AND SAYING IT DID WAS A WRONG ANSWER RATHER THAN A
-    /// LOOSE ONE.** csc answers CS0019 for `a == b` on a struct that declares no `operator ==`;
-    /// this said `bool` for any two identical types, so the comparison fell through to the
-    /// reference default and compared something that was not the values. Measured: two
-    /// `System.Nullable<int>` holding 40 and 2 compared EQUAL, because what was actually compared
-    /// was the first field -- `HasValue`.
     ///
     /// Enums keep theirs (14.9.5), the predefined types keep theirs, and a struct that DECLARES
     /// `operator ==` never reaches here -- `bind_binary` resolves that first.
     ///
-    /// **`object` COMPARES ONLY WITH A REFERENCE.** The reference type equality operators take
-    /// "reference-type values or the value null" and "never cause boxing operations to occur for
-    /// their operands" (14.9.6), so `object == int` has no predefined operator: csc reports
-    /// CS0019 for `o == 3`.
     fn equality_comparable(&self, left: &TypeSymbol, right: &TypeSymbol) -> bool {
         if let (Some(left), Some(right)) = (as_special(left), as_special(right)) {
             if left.is_numeric() && right.is_numeric() {
@@ -5000,13 +5214,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Brings a `using static N.T;` import into scope: `T`'s directly declared static members and
     /// nested types become nameable without qualification (13.5.4).
     ///
-    /// **THE SAME TYPE IMPORTED TWICE IS ONE IMPORT.** csc compiles `using static N1.A;` written
-    /// twice and so does 13.5.3, which makes a name ambiguous between *types or members* rather
-    /// than between directives. Without this the second copy collides with the first: a repeated
-    /// directive gave `CS0121` for a method and would have given `CS0104` for a nested type.
-    /// Dropping the duplicate rather than filtering at the lookup keeps both search paths right,
-    /// and it leaves the scope lengths correct -- an inner block that re-imports an outer type adds
-    /// nothing and so truncates to nothing.
     pub fn import_static_type(&mut self, ty: TypeSymbol) {
         if self.imported_static_types.contains(&ty) {
             return;
@@ -5038,7 +5245,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             UsingKind::Static(name) => {
                 self.import_static_type(TypeSymbol::Named(crate::program::qualified_parts(name)));
             }
-            UsingKind::Alias { name, target } => {
+            UsingKind::Alias { name, target, .. } => {
                 self.import_alias(
                     name,
                     TypeSymbol::Named(crate::program::qualified_parts(target)),
@@ -5073,6 +5280,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.imported_namespaces.truncate(scope.namespaces);
         self.aliases.truncate(scope.aliases);
         self.imported_static_types.truncate(scope.static_types);
+    }
+
+    /// Declares a `global using` alias name, answering whether it is the first of that name in the
+    /// units this binder has bound so far.
+    pub(crate) fn declare_global_alias(&mut self, name: &str) -> bool {
+        self.global_aliases_declared.insert(name.into())
     }
 
     /// Records the imports in force now as the base every file context sits on. Call it before
@@ -5216,19 +5429,24 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// construction -- `Cpu.Pin`, `Port.ResistorMode`, `PWM.ScaleFactor` -- so every derived
     /// driver in it names one.
     ///
-    /// **WHICH TYPES CONTRIBUTE IS NOT "EVERYTHING AFTER THE COLON", AND THE DIFFERENCE IS
-    /// MEASURABLE.** A class or struct takes its BASE CLASS chain and nothing else -- an
-    /// interface it implements contributes no scope, so `class C : B, I` can name `B`'s nested
-    /// types and not `I`'s. An INTERFACE takes its base interfaces, which is the whole of its
-    /// base list (20.2.2). Measured against csc, five programs: a class implementing an
-    /// interface with a nested type is `CS0246` there, and so is a struct; an interface
-    /// extending one compiles.
     ///
-    /// The walk is bounded by `seen` rather than by trusting the chain to be acyclic: `CS0146`
-    /// reports a circular base, but name resolution runs against the same model whether or not
-    /// that check has fired, and a cycle here would hang the compiler rather than diagnose
-    /// one.
+    /// Neither walk trusts the inheritance to be acyclic: `CS0146` and `CS0529` report a circular
+    /// base, but name resolution runs against the same model whether or not either check has
+    /// fired. A class's chain is walked by [`BaseClassChain`], which ends at a repeated class, and
+    /// an interface's base list by a worklist that visits each scope once.
     fn inherited_type_scopes(&self, enclosing: &str) -> Vec<Box<str>> {
+        let enclosing_ty = named_symbol_from_dotted(enclosing);
+        let is_interface = self
+            .type_info_of(&enclosing_ty)
+            .is_some_and(|info| info.kind == TypeKind::Interface);
+        if !is_interface {
+            return self
+                .model
+                .base_class_chain(&enclosing_ty)
+                .skip(1)
+                .filter_map(|link| Self::type_scope_key(&link.ty))
+                .collect();
+        }
         let mut scopes: Vec<Box<str>> = Vec::new();
         let mut pending: Vec<Box<str>> = alloc::vec![enclosing.into()];
         let mut seen: Vec<Box<str>> = alloc::vec![enclosing.into()];
@@ -5290,7 +5508,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// the global namespace) unambiguously SHADOWS every less-specific hit (3.8, 10.8).
     fn type_namespaces_containing(&self, name: &str) -> Vec<(Box<str>, bool)> {
         let mut search: Vec<(Box<str>, bool)> = Vec::new();
-        if let Some(TypeSymbol::Named(parts)) = &self.current_type {
+        if let Some(TypeSymbol::Named(parts)) = &self.current_type
+            && !self.resolving_type_header
+        {
             let mut enclosing = String::new();
             for part in parts.iter() {
                 if !enclosing.is_empty() {
@@ -5397,7 +5617,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         is_async: bool,
         body: &lamella_syntax::ast::Stmt,
     ) -> crate::statement::BoundStmt {
-        let returns_value = !return_type.is_void() && !is_async;
+        let mut returns_value = !return_type.is_void() && !is_async;
         let body_span = body.span;
         let diagnostics_before_body = self.diagnostics.len();
         if is_async && self.language_version.supports(Feature::AsyncFunction) {
@@ -5405,6 +5625,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
         let outer_type = core::mem::replace(&mut self.current_type, enclosing_type);
         let return_type = self.canonicalize(&return_type);
+        if is_async && is_system_task_of_t(&return_type) {
+            returns_value = true;
+        }
         self.current_method = Some(MethodContext {
             name: name.into(),
             return_type,
@@ -5430,6 +5653,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.finally_depth = 0;
         self.lock_depth = 0;
         self.finally_floor.clear();
+        self.method_local_functions.clear();
+        let first_local_function = self.next_local_function_id;
         for (parameter, ty, tuple_names) in parameters {
             self.declare_local(parameter, self.canonicalize(ty));
             self.record_local_tuple_names(parameter, tuple_names.clone());
@@ -5439,12 +5664,17 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             matches!(body.kind, lamella_syntax::ast::StmtKind::Block(_))
                 .then_some(ScopeId(self.next_scope_id)),
         ];
+        self.method_root = self.scope_ids.last().copied();
+        if matches!(body.kind, lamella_syntax::ast::StmtKind::Block(_)) {
+            self.merge_next_scope_into_current();
+        }
         self.body_statement_contexts = core::mem::take(&mut self.next_method_statement_contexts);
         self.body_initializer_statements =
             core::mem::take(&mut self.next_method_initializer_statements);
         let bound = self.bind_statement(body);
         self.body_statement_contexts.clear();
         self.body_initializer_statements = 0;
+        self.gate_local_function_closures(first_local_function);
         self.exit_scope();
         if returns_value && !crate::flow::method_body_always_exits(&bound) {
             let method = if name == lamella_syntax::ast::TOP_LEVEL_ENTRY_POINT {
@@ -5468,11 +5698,14 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             &parameter_names,
             out_parameters,
             &self.model,
+            &self.method_local_functions,
         );
         self.diagnostics.extend(unassigned);
+        let unused_functions = self.unused_local_functions(first_local_function);
         self.diagnostics.extend(crate::flow::check_unused_locals(
             &bound,
             &self.case_label_uses,
+            &unused_functions,
         ));
         self.diagnostics
             .extend(crate::flow::check_unreachable(&bound));
@@ -5533,6 +5766,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         });
         self.enter_scope();
         self.method_body_scopes = [self.scope_ids.last().copied(), None];
+        self.method_root = self.scope_ids.last().copied();
         self.case_label_uses.clear();
         self.const_locals.clear();
         self.local_tuple_names.clear();
@@ -5784,16 +6018,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Binds a field initializer in `enclosing`'s context and checks it converts
     /// to the field's type (`CS0029`).
     ///
-    /// `is_const` decides which side of the declaration/body line the initializer falls on, and
-    /// the two cases genuinely differ: a `const` field's value is part of the DECLARATION -- other
-    /// declarations are checked against it -- while an instance field's initializer is code that
-    /// runs in a constructor. csc splits them exactly there, which is measurable: a const
-    /// initializer's type error withholds an unrelated body diagnostic and an instance one does
-    /// not. They look identical in the source, which is why this is a parameter rather than
-    /// something inferred here.
-    /// `constant_required` is `is_const` MINUS the fields already reported as circular: one of
-    /// those binds cleanly and never folds, so it would draw CS0133 on top of the CS0110 that
-    /// already explains it, where csc reports the cycle alone.
     pub fn bind_field_initializer(
         &mut self,
         enclosing: TypeSymbol,
@@ -5941,9 +6165,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// site supplies is the value of the expression validation checked -- the treatment a `const`
     /// field's initializer gets from [`Self::bind_initializer_value`].
     ///
-    /// **NOT UNDER THE FIELD-INITIALIZER RULES.** csc binds a default where an instance member can
-    /// be named, and refuses it afterwards as not constant: `int a = x` and `int a = this.x` over
-    /// an instance field are both CS1736, measured, where those rules would say CS0236 and CS0027.
     pub(crate) fn bind_parameter_default(
         &mut self,
         enclosing: &TypeSymbol,
@@ -6002,8 +6223,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Whether a bound default is one of the two forms 15.6.2 admits beside a constant:
     /// `default(T)` and a value type's parameterless `new S()`, with no initializer.
     ///
-    /// **`default(T)` IS ADMITTED WHATEVER `T` IS**, as csc admits it -- a class, a type parameter
-    /// and a struct alike -- although the clause names value types only.
     fn is_zero_initialization(&self, bound: &BoundExpr) -> bool {
         match &bound.kind {
             BoundExprKind::DefaultValue(_) => true,
@@ -6027,9 +6246,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     ///     CS1770  S? s = default(S)    a nullable parameter of a type with no constants
     /// ```
     ///
-    /// **THE CONVERSION IS ASKED OF THE EXPRESSION, NOT OF ITS FOLDED VALUE.** An enum constant
-    /// folds to its integer, so a test of the value admits `E e = 1` -- which csc refuses, because
-    /// only the literal `0` converts to an enum -- and refuses `E? e = E.B`, which it admits.
     pub(crate) fn parameter_default_problem(
         &self,
         bound: &BoundExpr,
@@ -6336,6 +6552,25 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.constant_value(value).map(AttributeValue::Constant)
     }
 
+    /// A `ref` local, or a local of a ref struct type, in an async method: C# 13's "ref and unsafe
+    /// in async and iterator methods", which is above every dialect this build selects, so it draws
+    /// csc's gate at the dialect being compiled -- measured at 7.3, 10 and 11, where the code names
+    /// that dialect and the message asks for 13.0. The state machine holds every local in a field
+    /// of a class, and no field of a class can hold a ref struct.
+    pub(crate) fn gate_async_ref_local(&mut self, span: Span) {
+        if !self.current_method.as_ref().is_some_and(|method| method.is_async) {
+            return;
+        }
+        self.report(Diagnostic::new(
+            DiagnosticKind::FeatureRequiresLaterVersion {
+                feature: "ref and unsafe in async and iterator methods".into(),
+                required: "13.0".into(),
+                current: self.language_version,
+            },
+            span,
+        ));
+    }
+
     /// Checks a `return` statement against the enclosing method's return type
     /// (15.9.4): `CS0127` for a value in a `void` method, `CS0126` for a missing
     /// value, `CS0029` for a value that does not convert.
@@ -6356,6 +6591,32 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     },
                     span,
                 ));
+            }
+            return;
+        }
+        if method.is_async
+            && let Some(result) = task_result_type(&method.return_type)
+        {
+            match value {
+                None => self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::ReturnValueRequired {
+                        ty: result.to_string().into(),
+                    },
+                    span,
+                )),
+                Some(expr)
+                    if !expr.ty.is_error()
+                        && self.canonicalize(&expr.ty) == method.return_type
+                        && !self.assignable(expr, result) =>
+                {
+                    self.diagnostics.push(Diagnostic::new(
+                        DiagnosticKind::AsyncReturnOfTask {
+                            result: result.to_string().into(),
+                        },
+                        span,
+                    ));
+                }
+                Some(expr) => self.check_assignable(expr, result, span),
             }
             return;
         }
@@ -6384,10 +6645,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// The `ref`-ness half of a `return`, and then the ordinary assignability check against the
     /// type the member actually returns.
     ///
-    /// **THE TWO DIRECTIONS ARE TWO CODES AND csc'S WORDING IS THE REVERSE OF WHAT THE NUMBERS
-    /// SUGGEST**, measured rather than reconstructed: `CS8149` is *By-reference returns may only be
-    /// used in methods that return by reference* -- a `return ref e;` in a by-VALUE member -- and
-    /// `CS8150` is its mirror, a plain `return e;` in a by-REFERENCE one.
     ///
     /// **AND THE COMPARISON IS AGAINST THE REFERENT, NOT THE BYREF.** A member declared `ref int`
     /// has the return type `ByRef(int)` while `ref a[0]` is an `int` at the address of; comparing
@@ -6431,12 +6688,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Whether the storage `operand` names outlives the call, which is the whole of what makes a
     /// `ref` return safe: a caller holding the returned address must not be holding a dead frame.
     ///
-    /// **THE RESTRICTIONS ARE THE FEATURE.** Returning the address of a field, a static, an array
-    /// element or a `ref` parameter is safe because none of that storage belongs to this frame;
-    /// returning an ordinary local's or a by-value parameter's is not, and csc names them
-    /// differently -- `CS8168` quoting the local, `CS8166` quoting the parameter -- which is why
-    /// [`MethodContext::parameter_names`] exists. An expression with no storage at all
-    /// (`return ref 5;`) is `CS8156`.
     ///
     fn check_returnable_by_reference(
         &mut self,
@@ -6525,10 +6776,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Whether the storage `operand` names outlives the current frame -- the SAME question
     /// [`Binder::check_returnable_by_reference`] asks, asked QUIETLY.
     ///
-    /// **A `ref` LOCAL'S DECLARATION MUST ASK IT WITHOUT REPORTING**: `ref int r = ref x;` for an
-    /// ordinary local `x` is a legal declaration that merely cannot be RETURNED, so the CS8168 the
-    /// reporting form would raise there would refuse a program csc compiles. The two share this
-    /// body so a position that becomes returnable becomes returnable in both.
     pub(crate) fn storage_outlives_frame(&self, operand: &BoundExpr) -> bool {
         let BoundExprKind::Local(name) = &operand.kind else {
             return true;
@@ -6550,11 +6797,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// PARAMETER both qualify, measured; and a `ref readonly` local qualifies too, because
     /// rebinding is not writing THROUGH it.
     ///
-    /// **THE TYPE MUST MATCH EXACTLY AND csc'S MESSAGE READS BACKWARDS FROM AN ORDINARY
-    /// CONVERSION**: `CS8173` names the TARGET's type and says the expression must be of it, where
-    /// `CS0029` would name the source's. A reference is not converted on assignment -- there is
-    /// nowhere to put a converted value -- so this is an identity check rather than an
-    /// assignability one.
     fn bind_ref_reassignment(
         &mut self,
         target: BoundExpr,
@@ -6602,11 +6844,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
 
     /// Refuses a `ref`/`out` operand that names no assignable storage, with csc's three codes.
     ///
-    /// **ONE FUNCTION, AT THE ONE PLACE `BoundExprKind::Ref` IS BUILT, BECAUSE THE RULE HAS THREE
-    /// POSITIONS**: a `ref`/`out` ARGUMENT, `return ref e`, and a `ref` LOCAL's initializer. It had
-    /// ZERO implementations before the third position existed -- `M(ref 5)`, `M(ref readonlyField)`
-    /// and `M(ref P)` all compiled here, silently, and csc refuses all three. Writing it at the
-    /// ref-local site alone would have left the older two accepting-invalid while looking fixed.
     ///
     /// The three codes are not interchangeable and each was measured at 7.2:
     ///
@@ -6936,11 +7173,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// than a value (ECMA-334 17.4.2): inside a constructor of the type that declares it -- the
     /// static constructor for a static field -- and, for an instance field, through `this`.
     ///
-    /// **EACH CLAUSE WAS MEASURED, AND EACH ALONE ADMITS A PROGRAM csc REFUSES.** `other.f = 1` in
-    /// `C`'s own constructor is CS0191, because the receiver is not `this`; a derived constructor
-    /// writing its base's field is CS0191, because the declaring type is not this one; an INSTANCE
-    /// constructor writing a static readonly field is CS0198; and a lambda written in a constructor
-    /// is a method of its own, so `() => f = 1` there is CS0191 too.
     ///
     /// The type is compared by DEFINITION ([`crate::symbols::same_type_definition`]), so `C<T>`'s
     /// constructor reaches its own fields -- the comparison the emitter makes for the same rule.
@@ -7013,9 +7245,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
 
     /// The scopes the current method body occupies: its parameters, then its body block.
     ///
-    /// TWO IDS FOR ONE SCOPE. They are one scope to C#, which forbids a local shadowing a
-    /// parameter, and ONE display class to csc -- a captured parameter and a captured top-level
-    /// local both land on the same class, measured.
     #[must_use]
     pub fn method_body_scope_ids(&self) -> [Option<ScopeId>; 2] {
         self.method_body_scopes
@@ -7043,8 +7272,147 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         &self.scope_ids
     }
 
+    /// Appends diagnostics an analysis produced, in order.
+    pub(crate) fn extend_diagnostics(&mut self, diagnostics: Vec<Diagnostic>) {
+        self.diagnostics.extend(diagnostics);
+    }
+
+    /// The innermost open scope's id, or `None` outside any.
+    pub(crate) fn innermost_scope_id(&self) -> Option<ScopeId> {
+        self.scope_ids.last().copied()
+    }
+
+    /// The ids of the scopes currently open, outermost first.
+    pub(crate) fn open_scope_id_list(&self) -> &[ScopeId] {
+        &self.scope_ids
+    }
+
+    /// Records that `scope` holds a lambda's or local function's parameters.
+    pub(crate) fn mark_function_scope(&mut self, scope: ScopeId) {
+        self.function_scopes.insert(scope);
+    }
+
+    /// Records that `scope` is part of the scope that encloses it, to C# -- see `merged_scopes`.
+    pub(crate) fn merge_scope_into_parent(&mut self, scope: ScopeId) {
+        self.merged_scopes.insert(scope);
+    }
+
+    /// Records that the NEXT scope to open is part of the one open now: the block of a function
+    /// body, which opens its scope before it binds anything.
+    pub(crate) fn merge_next_scope_into_current(&mut self) {
+        self.merged_scopes.insert(ScopeId(self.next_scope_id));
+    }
+
+    /// The outermost scope of the method last bound: its parameters'.
+    #[must_use]
+    pub fn method_root_scope(&self) -> Option<ScopeId> {
+        self.method_root
+    }
+
+    /// Whether `scope` holds a lambda's or local function's parameters.
+    #[must_use]
+    pub fn scope_is_function(&self, scope: ScopeId) -> bool {
+        self.function_scopes.contains(&scope)
+    }
+
+    /// Whether `scope` declared any name -- a parameter, a local, a constant or a pattern or `out`
+    /// variable -- by the time it closed.
+    #[must_use]
+    pub fn scope_declares_names(&self, scope: ScopeId) -> bool {
+        self.scopes_declaring_names.contains(&scope)
+    }
+
+    /// Whether `scope` is part of the scope that encloses it, to C#.
+    #[must_use]
+    pub fn scope_is_merged(&self, scope: ScopeId) -> bool {
+        self.merged_scopes.contains(&scope)
+    }
+
+    /// The enclosing type's symbol, or the error type outside any.
+    pub(crate) fn current_type_or_error(&self) -> TypeSymbol {
+        self.current_type.clone().unwrap_or(TypeSymbol::Error)
+    }
+
+    /// Whether any type parameter is in scope -- the enclosing type's, method's or function's.
+    pub(crate) fn has_type_parameters_in_scope(&self) -> bool {
+        !self.type_parameters_in_scope.is_empty()
+    }
+
+    /// Opens the capture frame of a function body: a lambda's (`function` `None`) or a local
+    /// function's. Call after the body's parameter scope is entered, so the parameters sit AT the
+    /// frame's floor and are not captures.
+    pub(crate) fn push_function_frame(
+        &mut self,
+        function: Option<crate::local_function::LocalFunctionId>,
+        is_static: bool,
+    ) {
+        self.lambda_frames.push(LambdaFrame {
+            scope_floor: self.scopes.len() - 1,
+            function,
+            is_static,
+            ..LambdaFrame::default()
+        });
+    }
+
+    /// Closes the innermost capture frame, returning what it recorded.
+    pub(crate) fn pop_function_frame(&mut self) -> LambdaFrame {
+        self.lambda_frames.pop().unwrap_or_default()
+    }
+
+    /// Enters a local function's body: its own return type, `async`-ness and parameters for the
+    /// statements that ask, and none of the enclosing function's `catch`, `finally`, `lock`, loop
+    /// or `switch` -- so a `break` aimed outside the body is `CS0139` and a `goto` is `CS0159`, as
+    /// csc reports them. Returns what [`Self::exit_local_function_body`] restores.
+    pub(crate) fn enter_local_function_body(
+        &mut self,
+        function: &lamella_syntax::ast::LocalFunction,
+        symbol: &crate::local_function::LocalFunctionSymbol,
+    ) -> LocalFunctionOuter {
+        let outer = LocalFunctionOuter {
+            handlers: self.enter_function_body(),
+            method: self.current_method.clone(),
+            loop_depth: core::mem::take(&mut self.loop_depth),
+            switch_depth: core::mem::take(&mut self.switch_depth),
+        };
+        if let Some(context) = self.current_method.as_mut() {
+            use crate::symbols::ParameterMode;
+            let named = |mode: ParameterMode| -> Vec<Box<str>> {
+                symbol
+                    .method
+                    .parameter_info
+                    .iter()
+                    .filter(|info| info.mode == mode)
+                    .map(|info| info.name.clone())
+                    .collect()
+            };
+            context.return_type = symbol.method.return_type.clone();
+            context.is_async = function.modifiers.contains(&lamella_syntax::ast::Modifier::Async);
+            context.is_vararg = false;
+            context.ref_parameter_names = named(ParameterMode::Ref);
+            context.out_parameter_names = named(ParameterMode::Out);
+            context.parameter_names = symbol.parameters.iter().map(|(name, _)| name.clone()).collect();
+        }
+        self.merge_next_scope_into_current();
+        outer
+    }
+
+    /// Leaves a local function's body, restoring what [`Self::enter_local_function_body`] took.
+    pub(crate) fn exit_local_function_body(&mut self, outer: LocalFunctionOuter) {
+        self.exit_function_body(outer.handlers);
+        self.current_method = outer.method;
+        self.loop_depth = outer.loop_depth;
+        self.switch_depth = outer.switch_depth;
+    }
+
     /// Closes the innermost scope.
     pub fn exit_scope(&mut self) {
+        if let (Some(names), Some(id)) = (self.scopes.last(), self.scope_ids.last().copied()) {
+            if !names.is_empty() {
+                let canonical = self.canonical_scope(id);
+                self.scopes_declaring_names.insert(id);
+                self.scopes_declaring_names.insert(canonical);
+            }
+        }
         self.scopes.pop();
         self.scope_ids.pop();
         let depth = self.scopes.len();
@@ -7171,11 +7539,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Declares a variable introduced INSIDE an expression -- an `out` variable declaration, and
     /// the designator of a declaration pattern (C# 7.0) -- in the enclosing block's scope.
     ///
-    /// **THE SCOPE IS THE BLOCK, NOT THE EXPRESSION.** Measured against csc: `M(out int a);`
-    /// followed by `return a;` compiles, and a later `int a;` in the same block is `CS0128`. The
-    /// innermost open scope IS the enclosing block -- a statement opens none of its own -- so
-    /// declaring here is declaring there, and the same `CS0128`/`CS0136` check every other local
-    /// declaration makes applies unchanged.
     pub(crate) fn declare_expression_variable(&mut self, name: &str, ty: TypeSymbol, span: Span) {
         self.check_expression_variable_name(name, span);
         self.declare_local(name, ty);
@@ -7369,6 +7732,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             BoundExprKind::Call { method, .. } => method
                 .as_ref()
                 .and_then(|method| {
+                    if let Some(local) = self.local_function_candidate(&method.name) {
+                        return Some(local.return_tuple_names);
+                    }
                     let info = self.type_info_of(&method.declaring_type)?;
                     info.methods
                         .iter()
@@ -7412,7 +7778,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
 
     /// Reports every capture that cannot become a display-class field (CS1628/CS8175/CS9108).
     ///
-    /// **ONE IDEA, THREE CODES, AND THE SPLIT IS NOT GUESSABLE.** Measured against csc:
     ///
     /// ```text
     ///     ref / out / in PARAMETER        CS1628
@@ -7467,13 +7832,21 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// **EVERY frame, not just the innermost.** A local captured by a nested lambda is captured by
     /// the outer one too -- the inner delegate reaches it through the outer frame, so the outer
     /// lambda's closure has to hold it whether or not its own body ever names it.
-    fn note_capture(&mut self, name: &str, ty: &TypeSymbol, depth: usize) {
+    fn note_capture(&mut self, name: &str, ty: &TypeSymbol, depth: usize, span: Span) {
         let Some(&scope) = self.scope_ids.get(depth) else {
             return;
         };
+        let mut static_reported = false;
         for frame in &mut self.lambda_frames {
             if depth >= frame.scope_floor {
                 continue;
+            }
+            if frame.is_static && !static_reported {
+                static_reported = true;
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::StaticLocalFunctionCapture { name: name.into() },
+                    span,
+                ));
             }
             if frame.captures.iter().any(|seen| &*seen.name == name) {
                 continue;
@@ -7483,13 +7856,80 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 ty: ty.clone(),
                 scope,
             });
+            frame.capture_spans.push(span);
         }
     }
 
     /// Records that `this` was read, in every lambda frame currently open.
-    fn note_this_capture(&mut self) {
+    ///
+    fn note_this_capture(&mut self, span: Span) {
+        let mut reported = false;
+        let in_struct = self.current_type_is_value_type();
         for frame in &mut self.lambda_frames {
             frame.captures_this = true;
+            frame.this_position.get_or_insert(frame.captures.len());
+            if reported || frame.function.is_none() {
+                continue;
+            }
+            if frame.is_static {
+                reported = true;
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::StaticLocalFunctionThis,
+                    span,
+                ));
+            } else if in_struct {
+                reported = true;
+                self.diagnostics.push(Diagnostic::new(
+                    DiagnosticKind::LambdaCapturesStructThis,
+                    span,
+                ));
+            }
+        }
+    }
+
+    /// Records a reference to local function `id`, declared at `depth`, in every frame it is
+    /// declared outside of -- except the function's own, where the reference is a recursive call
+    /// and captures nothing.
+    pub(crate) fn note_function_capture(&mut self, id: crate::local_function::LocalFunctionId, depth: usize) {
+        for frame in &mut self.lambda_frames {
+            if depth >= frame.scope_floor || frame.function == Some(id) {
+                continue;
+            }
+            if frame.function.is_none() {
+                self.lambda_captured_local_functions.insert(id);
+            }
+            if !frame.captured_functions.contains(&id) {
+                frame.captured_functions.push(id);
+            }
+        }
+    }
+
+    /// The scope `scope` is part of, to C#: itself, or the nearest enclosing scope that is not
+    /// merged into its own parent -- see `merged_scopes`.
+    #[must_use]
+    pub fn canonical_scope(&self, scope: ScopeId) -> ScopeId {
+        let mut current = scope;
+        while self.merged_scopes.contains(&current) {
+            match self.scope_parents.get(&current) {
+                Some(parent) => current = *parent,
+                None => break,
+            }
+        }
+        current
+    }
+
+    /// Whether a variable declared in `scope` is one of the method body's own -- a parameter, or
+    /// a local of its outermost block, a using declaration's included.
+    pub(crate) fn is_method_body_scope(&self, scope: ScopeId) -> bool {
+        let canonical = self.canonical_scope(scope);
+        self.method_body_scopes.iter().any(|body| *body == Some(canonical))
+    }
+
+    /// [`Self::report_unhoistable_captures`] for a local function, at each capture's first
+    /// reference -- where csc reports a local function's `CS1628`, `CS8175` and `CS9108`.
+    pub(crate) fn report_unhoistable_captures_at(&mut self, captures: &[Capture], spans: &[Span]) {
+        for (capture, span) in captures.iter().zip(spans) {
+            self.report_unhoistable_captures(core::slice::from_ref(capture), *span);
         }
     }
 
@@ -7524,10 +7964,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// rewritten as an `out` variable no source can name; `None` when the list has none, so an
     /// ordinary call is not copied.
     ///
-    /// csc passes a discard the address of a temporary of the parameter's type, and an `out var`
-    /// under an unspeakable name is exactly that: typed by the overload resolution chooses, as
-    /// `out var a` is, and declared where nothing can read it or collide with it -- so two discards
-    /// in one scope stay two.
     fn rewrite_out_discards(&mut self, arguments: &[Argument]) -> Option<Vec<Argument>> {
         let mut rewritten: Option<Vec<Argument>> = None;
         for (index, argument) in arguments.iter().enumerate() {
@@ -7605,7 +8041,15 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
 
     pub(crate) fn local_in_enclosing_scope(&self, name: &str) -> bool {
         let innermost = self.scopes.len().saturating_sub(1);
-        self.scopes[..innermost]
+        let floor = if self.language_version >= LanguageVersion::CSharp8 {
+            self.lambda_frames
+                .last()
+                .map_or(0, |frame| frame.scope_floor)
+                .min(innermost)
+        } else {
+            0
+        };
+        self.scopes[floor..innermost]
             .iter()
             .any(|scope| scope.contains_key(name))
     }
@@ -7638,7 +8082,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     ));
                     error_expr()
                 } else {
-                    self.note_this_capture();
+                    self.note_this_capture(expr.span);
                     self.this_expr()
                 }
             }
@@ -8194,6 +8638,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 span,
             ));
         }
+        let (left, right) = if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual) {
+            let left_ty = left.ty.clone();
+            (null_as_pointer(left, &right.ty), null_as_pointer(right, &left_ty))
+        } else {
+            (left, right)
+        };
         if matches!(operator, BinaryOperator::Equal | BinaryOperator::NotEqual) {
             if let Some(bound) = self.bind_nullable_null_comparison(operator, &left, &right, span) {
                 return bound;
@@ -9290,11 +9740,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Converts a value with NO TYPE OF ITS OWN -- a conditional or switch expression whose arms
     /// have no type in common -- to `target`, the type its context gives it.
     ///
-    /// Where every arm converts to `target`, that is the conversion: the target-typed conditional
-    /// of C# 9.0 and the switch expression conversion of C# 8.0. Below C# 9.0 a conditional that
-    /// needed it is `CS8957`, as csc reports it. Where some arm does not convert, each such arm
-    /// reports its own failure where it is written -- `int x = c ? 1 : null;` is `CS0037` at the
-    /// `null` -- and the value is an error.
     fn finish_typeless(
         &mut self,
         value: BoundExpr,
@@ -9473,24 +9918,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// `n == null` and `n != null` where `n` is a NULLABLE VALUE TYPE, and their mirrors with the
     /// literal on the left.
     ///
-    /// **THIS IS A PEEPHOLE OVER [`Binder::bind_lifted_binary`], NOT A SEPARATE RULE, AND THE
-    /// EARLIER CLAIM THAT IT WAS ONE RESTED ON A RESULT TYPE THAT WAS NEVER MEASURED.** The null
-    /// literal converts to `T?` (13.7.1), so `n == null` IS the lifted `==` with a constant null
-    /// operand; lifted `==` yields `bool` -- measured, not `bool?` -- so nothing about the result
-    /// type distinguishes the two. What the general form would emit is
-    /// `(n.GetValueOrDefault() == default(T)) & (n.HasValue == false)`, whose first term is dead
-    /// because the second already decides it. Reduced here to `!n.HasValue`, which is what csc
-    /// emits and which names the operand ONCE -- so it needs no temporary, and a side-effecting
-    /// `Get() == null` calls `Get` a single time.
     ///
     /// Returns `None` when this is not the shape, leaving every other `==`/`!=` untouched.
     /// `x is null` (the constant pattern, C# 7.0).
     ///
-    /// **NOT `x == null`.** The pattern never consults a user-defined `operator ==`, so this binds
-    /// the comparison DIRECTLY rather than going through [`Self::bind_binary`], whose whole job at
-    /// that point is to offer the operands to operator resolution. Measured against csc: a type
-    /// whose `operator ==` returns `true` unconditionally emits `ldnull; ceq` for the pattern and
-    /// `call op_Equality` for the comparison, and answers differently at run time.
     ///
     /// A nullable value type tests `HasValue`, which is the same lowering `n == null` needs and is
     /// already factored out. A NON-nullable value type can never be null and is `CS0037` -- at
@@ -9542,11 +9973,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Binds a switch expression that its context converts to `target`: the switch expression
     /// conversion of C# 8.0.
     ///
-    /// **WHERE EVERY ARM CONVERTS TO `target`, EACH ARM IS CONVERTED -- EVEN WHEN THE ARMS HAVE A
-    /// NATURAL TYPE.** That is csc's order, and it is visible: `byte b = x switch { 1 => 1, _ => 2
-    /// };` converts each constant to `byte`, where converting the natural `int` would be
-    /// `CS0266`. Otherwise the natural type is converted to `target`; with neither, each arm that
-    /// does not convert reports its own failure.
     fn bind_switch_toward(
         &mut self,
         governing: &Expr,
@@ -9767,18 +10193,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// `CS8121` for a declaration pattern whose type no run-time test could reach from the
     /// operand's, and a named refusal for the one shape csc accepts and this build does not.
     ///
-    /// **THE QUALIFYING CONVERSIONS ARE IDENTITY, REFERENCE, BOXING AND UNBOXING** -- the ones an
-    /// `isinst`/`unbox.any` can perform. A NUMERIC conversion does not qualify, which is the whole
-    /// content of `int x; x is long v`: `int` converts to `long` at compile time and no `int`
-    /// object is ever a `long` at run time, so csc refuses it and so does this.
     ///
     /// Both directions count, because a pattern narrows as well as widens: `object o is int i`
     /// unboxes and `int x is object o` boxes, and each is legal in exactly one direction.
     ///
-    /// **UNDER-REPORTS RATHER THAN OVER-REPORTS.** An error type, or a type this model cannot
-    /// classify as reference or value (a type parameter), reports nothing -- a false `CS8121`
-    /// refuses a program csc compiles, and the emitter's own fallback is a loud
-    /// `EmitError::Unsupported` rather than a fault.
     fn check_pattern_type_is_reachable(&mut self, operand: &TypeSymbol, target: &TypeSymbol, span: Span) {
         if operand.is_error() || target.is_error() {
             return;
@@ -9820,14 +10238,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
 
     /// Binds a CONSTANT pattern, `operand is <constant>` (12.x).
     ///
-    /// **THE PATTERN'S COMPARISON IS NOT ALWAYS THE `==` OPERATOR'S, AND THE DIFFERENCE IS
-    /// `null`.** `x is null` must ignore a user-defined `operator ==` -- measured, csc emits
-    /// `ldnull; ceq` for the pattern and `call op_Equality` for the comparison -- so the null case
-    /// keeps the lowering it has always had. Every other value a pattern can name is a CONSTANT
-    /// EXPRESSION, which only an integral type, `char`, `bool`, an enum or `string` can have; none
-    /// of those can carry a user-declared `==` except `string`, whose `String::op_Equality` is
-    /// exactly what csc emits for `s is "a"` (measured). So the rest go through the ordinary
-    /// binary binding, and the two cases differ here because the language differs there.
     ///
     /// **AN INPUT THAT HOLDS THE CONSTANT ONLY BOXED IS TESTED BY TYPE FIRST**
     /// ([`Binder::bind_boxed_constant_pattern`]): `o is 3` on an `object` is not `o == 3`, which
@@ -10004,8 +10414,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// property at both positions -- so the parser hands the whole trailing chain in as `access`,
     /// rooted at a placeholder, and this binds it under one test.
     ///
-    /// **THE RESULT GAINS A `?` ONLY WHEN THE CHAIN'S OWN TYPE IS A NON-NULLABLE VALUE TYPE.**
-    /// Measured against csc across the shapes that differ:
     ///
     /// | expression | result |
     /// |---|---|
@@ -10015,10 +10423,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// | `b?.M()` returning `int` | `int?` |
     /// | `s?.Length` | `int?` |
     ///
-    /// **THE RECEIVER IS UNWRAPPED BEFORE THE CHAIN BINDS, WHICH IS WHY `n?.Value` IS `CS1061` AND
-    /// NOT AN `int?`.** For a `T?` receiver the access binds against `T` -- so `int?` offers
-    /// `int`'s members, and `Value` is not one of them. csc agrees; it was worth measuring because
-    /// the obvious reading (bind against `T?`, then test) accepts a program csc refuses.
     ///
     /// A NON-NULLABLE VALUE TYPE receiver has nothing to test and is `CS0023`, the same code a
     /// lifted unary operator gives -- `Operator '?' cannot be applied to operand of type 'int'`.
@@ -10243,9 +10647,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// deliberately does not admit (13.7.2). Lifting on the underlying types is what makes that
     /// omission cost nothing here.
     ///
-    /// **THREE RESULT SHAPES, DUMPED FROM csc RATHER THAN DERIVED, AND TWO OF THE THREE WOULD HAVE
-    /// BEEN GUESSED WRONG.** With the operands spilled to `x` and `y`, and `x.V` for
-    /// `x.GetValueOrDefault()`:
     ///
     /// | operators | result | value |
     /// |---|---|---|
@@ -10263,15 +10664,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// unconditionally in the two `bool` shapes: an unwrap that THREW on a null operand would turn
     /// `a == b` into an exception.
     ///
-    /// **A NON-NULLABLE OPERAND IS KNOWN NON-NULL, so it contributes no presence term and is used
-    /// as it stands** -- `a + 1` tests only `a`. That is a fact about the operand's TYPE, and it is
-    /// the only simplification taken. csc takes a second one that this does not: it folds `a == 5`
-    /// to `a.V == 5` alone, sound only because `5` differs from `default(int)`. For `a == 0` csc
-    /// emits the `& a.HasValue` this always emits, so copying the fold without its condition would
-    /// answer `true` for `((int?)null) == 0`.
     ///
-    /// `None` when there is no lifted form, leaving `bind_binary` to report CS0019 against the
-    /// NULLABLE type names -- which is what csc names too.
     fn bind_lifted_binary(
         &mut self,
         operator: BinaryOperator,
@@ -10960,9 +11353,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             return self.bind_nullable_coalescing(left, &underlying, right, span);
         }
         if let ExprKind::Throw(operand) = &right.kind {
-            // A left operand of a value type that is not nullable is never null, so `??` does not
-            // apply to it: `i ?? throw e` on an `int` is `CS0019`, naming the throw expression
-            // the way csc names it.
             if !left.ty.is_error() && self.is_value_type(&left.ty) {
                 let right = self.bind_throw_expression(operand, throw_marker());
                 self.report(Diagnostic::new(
@@ -11050,14 +11440,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// | `b` converts to `A` | `A` | `a` itself, still wrapped |
     /// | `A0` converts to `B` | `B` | `a` unwrapped, then converted |
     ///
-    /// Asking those in any other order gets the ordinary case wrong: `int? ?? int` would find `int`
-    /// convertible to `int?` and answer `int?`, where both the standard and csc say `int`. The THIRD
-    /// bullet is a conversion from `A0`, not from `A`, which is what types `int? ?? long` as `long`.
     ///
-    /// **THE RIGHT OPERAND RUNS ONLY WHEN `a` IS NULL**, which is what the conditional gives and
-    /// what a `GetValueOrDefault(b)` fold would NOT: that form evaluates its argument first, so
-    /// `a ?? Side()` would call `Side` even for a non-null `a`. csc emits the fold only where the
-    /// right operand cannot have an effect.
     fn bind_nullable_coalescing(
         &mut self,
         left: BoundExpr,
@@ -11184,12 +11567,20 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let mut accessor = String::from(prefix);
         accessor.push_str(&event.name);
         let void = TypeSymbol::Special(SpecialType::Void);
+        let declaring_instantiation = self
+            .declaring_instantiation_of(declaring, &accessor, core::slice::from_ref(&event.ty))
+            .or_else(|| {
+                let (type_parameters, open_ty) =
+                    self.model.open_event_accessor(declaring, &event.name)?;
+                Some(Box::new(TypeInstantiation {
+                    type_parameters,
+                    parameters: alloc::vec![open_ty],
+                    return_type: TypeSymbol::Special(SpecialType::Void),
+                    return_required_modifiers: Vec::new(),
+                }))
+            });
         let method = MethodReference {
-            declaring_instantiation: self.declaring_instantiation_of(
-                &declaring,
-                &accessor,
-                core::slice::from_ref(&event.ty),
-            ),
+            declaring_instantiation,
             declaring_type: declaring.clone(),
             name: accessor.clone().into(),
             parameters: alloc::vec![event.ty.clone()],
@@ -11224,10 +11615,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// would have to be done in each -- and a rule with several implementations gains its next case in
     /// none of them.
     ///
-    /// **AND THE SPLIT IS THE POINT, NOT AN ARTEFACT**: only the assignment's TARGET is redirected
-    /// to the backing field. The compound forms READ through `get_P` inside their value expression,
-    /// which is where csc reads it too -- and it has to be, because a VIRTUAL getter-only
-    /// auto-property's read must dispatch to an override that a `ldfld` would step past.
     fn bind_assignment(
         &mut self,
         operator: AssignmentOperator,
@@ -11425,6 +11812,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             AssignmentOperator::Add | AssignmentOperator::Subtract
         ) {
             if let ExprKind::MemberAccess { receiver, name } = &target_expr.kind {
+                let checkpoint = self.diagnostics.len();
                 let bound_receiver = self.bind_expression(receiver);
                 if let Some((event, declaring)) = self.event_declaration(&bound_receiver.ty, name) {
                     if self.outside_event_declarer(&declaring) {
@@ -11437,6 +11825,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                         );
                     }
                 }
+                self.diagnostics.truncate(checkpoint);
             }
         }
         let target = self.bind_expression(target_expr);
@@ -11719,12 +12108,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// whether the awaiter implements `ICriticalNotifyCompletion`. The await expression's type
     /// is `GetResult`'s return type (12.8.8.3).
     ///
-    /// Every refusal code below is csc's, measured one compilation each: CS1061 when the operand
-    /// type has no `GetAwaiter` at all, CS1986 when it has one and none is suitable, CS4027 for
-    /// a non-`INotifyCompletion` awaiter, CS0117 for a missing `IsCompleted`/`GetResult`, CS4008
-    /// for `void`, CS4001 for the null literal -- and the statement-context rules (CS1985 catch /
-    /// CS1984 finally, both below C# 6 with the LAM refusal above it; CS1996 lock at every rung)
-    /// apply only inside an async method, where the operator is real.
     fn bind_await(&mut self, operand: &Expr, span: Span) -> BoundExpr {
         let bound = self.bind_expression(operand);
         if self.current_method.as_ref().is_some_and(|method| method.is_async) {
@@ -11787,15 +12170,20 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             return error_expr();
         };
         let awaiter_ty = self.resolve_type(&get_awaiter_symbol.return_type);
+        let get_awaiter_declaring = self.declaring_type_in_chain(&operand_ty, "GetAwaiter", &[]);
         let get_awaiter = MethodReference {
-            declaring_type: self.declaring_type_in_chain(&operand_ty, "GetAwaiter", &[]),
+            declaring_instantiation: self.declaring_instantiation_of(
+                &get_awaiter_declaring,
+                "GetAwaiter",
+                &[],
+            ),
+            declaring_type: get_awaiter_declaring,
             name: "GetAwaiter".into(),
             parameters: alloc::vec::Vec::new(),
             return_type: awaiter_ty.clone(),
             is_static: false,
             is_vararg: false,
             instantiation: None,
-            declaring_instantiation: None,
         };
         let interfaces = self.interfaces_including_inherited(&awaiter_ty);
         let implements = |name: &str| {
@@ -11824,6 +12212,14 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 is_static: false,
                 ..
             } => MethodReference {
+                declaring_instantiation: self
+                    .property_accessor_instantiations(
+                        &declaring_type,
+                        &declaring_type,
+                        "IsCompleted",
+                        &TypeSymbol::Special(SpecialType::Boolean),
+                    )
+                    .0,
                 declaring_type,
                 name: "get_IsCompleted".into(),
                 parameters: alloc::vec::Vec::new(),
@@ -11831,7 +12227,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 is_static: false,
                 is_vararg: false,
                 instantiation: None,
-                declaring_instantiation: None,
             },
             _ => {
                 self.report(Diagnostic::new(
@@ -11858,15 +12253,20 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             return error_expr();
         };
         let result_ty = self.resolve_type(&get_result_symbol.return_type);
+        let get_result_declaring = self.declaring_type_in_chain(&awaiter_ty, "GetResult", &[]);
         let get_result = MethodReference {
-            declaring_type: self.declaring_type_in_chain(&awaiter_ty, "GetResult", &[]),
+            declaring_instantiation: self.declaring_instantiation_of(
+                &get_result_declaring,
+                "GetResult",
+                &[],
+            ),
+            declaring_type: get_result_declaring,
             name: "GetResult".into(),
             parameters: alloc::vec::Vec::new(),
             return_type: result_ty.clone(),
             is_static: false,
             is_vararg: false,
             instantiation: None,
-            declaring_instantiation: None,
         };
         let on_completed_name = if critical {
             "UnsafeOnCompleted"
@@ -11874,19 +12274,24 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             "OnCompleted"
         };
         let action = type_symbol_in("System", "Action");
+        let on_completed_declaring = self.declaring_type_in_chain(
+            &awaiter_ty,
+            on_completed_name,
+            core::slice::from_ref(&action),
+        );
         let on_completed = MethodReference {
-            declaring_type: self.declaring_type_in_chain(
-                &awaiter_ty,
+            declaring_instantiation: self.declaring_instantiation_of(
+                &on_completed_declaring,
                 on_completed_name,
                 core::slice::from_ref(&action),
             ),
+            declaring_type: on_completed_declaring,
             name: on_completed_name.into(),
             parameters: alloc::vec![action],
             return_type: TypeSymbol::Special(SpecialType::Void),
             is_static: false,
             is_vararg: false,
             instantiation: None,
-            declaring_instantiation: None,
         };
         BoundExpr {
             kind: BoundExprKind::Await {
@@ -12115,11 +12520,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 if let BoundExprKind::TypeReference(TypeSymbol::Named(parts)) = &receiver.kind {
                     let enclosing = parts.join(".");
                     if self.model.get(&enclosing, name).is_some() {
-                        let ty = type_symbol_in(&enclosing, name);
-                        return BoundExpr {
-                            kind: BoundExprKind::TypeReference(ty.clone()),
-                            ty,
-                        };
+                        return self.named_type_reference(
+                            type_symbol_in(&enclosing, name),
+                            member_name_span(span, name),
+                        );
                     }
                 }
                 let unreadable = self
@@ -12209,31 +12613,14 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
 
     /// Binds `nameof(x)` -- IF that is what this invocation is.
     ///
-    /// **`nameof` IS NOT A KEYWORD, AND EVERY PART OF THAT SHOWS UP HERE.** Measured against csc,
-    /// one compilation each:
     ///
-    /// | source | csc |
-    /// |---|---|
-    /// | `nameof(x)`, nothing named `nameof` in scope | the operator: `"x"` |
-    /// | a local, method or property named `nameof` in scope | the DECLARATION wins -- it is called |
-    /// | `nameof()`, `nameof(a, b)`, `nameof(x: a)` | `CS0103 The name 'nameof' does not exist` |
-    /// | `@nameof(x)`, nothing named `nameof` in scope | `CS0103` -- the `@` is not the operator |
-    /// | `@nameof(x)` where a method `nameof` IS declared | the declaration, called |
     ///
-    /// The last row is why the argument SHAPE is tested before anything else: with the wrong
-    /// number of arguments csc does not report a bad `nameof`, it reports that the word names
-    /// nothing -- which is exactly what falling through to the ordinary call path produces here,
-    /// for free and in csc's own words.
     ///
     /// Whether the word is a declaration is asked by BINDING it rather than by a second copy of
     /// [`Self::bind_name`]'s lookup order -- a rule with two implementations gains its next case
     /// in one of them. The probe's diagnostic is rolled back only on the path where the name
     /// resolved to NOTHING, and on that path the single `CS0103` it appended is its only effect.
     ///
-    /// **THE VERBATIM ROWS COST NOTHING HERE BECAUSE THEY ARE NOT DECIDED HERE.**
-    /// [`Expr::contextual_keyword`] answers `None` for `@nameof`, so both fall straight through to
-    /// the ordinary call path -- which reports csc's own `CS0103` when nothing is declared, and
-    /// calls the declaration when something is.
     fn try_bind_nameof(
         &mut self,
         receiver: &Expr,
@@ -12268,11 +12655,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// which is what makes `nameof(Outer.Inner.Thing)` `"Thing"` and `nameof(Gen<int>)` `"Gen"`:
     /// no qualification and no generic arity, over 29 forms.
     ///
-    /// **THE RESULT IS A CONSTANT, NOT AN `ldstr`**, and that is the half a "returns a string"
-    /// reading would miss: csc admits `nameof` in a `case` label and an attribute argument, both
-    /// of which require a compile-time constant. Producing a `Literal` rather than a node of its
-    /// own is what makes those work here without a line of code anywhere else -- and what leaves
-    /// the emitter untouched.
     fn bind_nameof(&mut self, operand: &Expr, span: Span) -> BoundExpr {
         let string = self.resolve_special_type(SpecialType::String, span);
         if let ExprKind::Name { name, .. } = &operand.kind {
@@ -12615,8 +12997,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// [`default_literal_marker`], which every by-value parameter admits and the conversion to the
     /// chosen one turns into `default(parameter type)`; anything else as itself.
     ///
-    /// Every argument list binds through here -- a call, a `new`, a `: this(...)` chain, an
-    /// indexer -- so the literal is an argument in all of them, as it is in csc.
     fn bind_argument_expression(&mut self, value: &Expr) -> BoundExpr {
         if is_default_literal(value) {
             let marker = default_literal_marker();
@@ -12941,10 +13321,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// | a local or a parameter | CS0149 `Method name expected` | CS0307 `The variable 'x' ...` |
     /// | any other value | CS0149 | CS0149 |
     ///
-    /// A member, a type, and a namespace given type arguments are reported at the last name
-    /// written, and anything else at the start of `target`. A target that failed to bind has
-    /// already said why, so nothing is added to it -- nor to a local whose type failed to bind:
-    /// `var x = missing; x();` is CS0103 alone, as csc reports it.
     fn report_not_invocable(
         &mut self,
         target: &Expr,
@@ -13100,10 +13476,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Returns whether it reported, so a caller on the failure path leaves its own arity message
     /// alone: a call refused because a name matched nothing has nothing to say about counts.
     ///
-    /// **CALLED ON SUCCESS AS WELL AS ON FAILURE, AND THAT IS NOT BELT AND BRACES.** `M(b: 1, 2)`
-    /// against `M(int a, int b)` RESOLVES -- the mapping is total and every argument converts --
-    /// and csc refuses it anyway, because the `2` would have to be argument two by position and
-    /// argument one by what is left. Only a check that runs on a resolved call sees that.
     fn check_named_arguments(
         &mut self,
         method_name: &str,
@@ -13273,16 +13645,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// The argument a call site supplies for an OMITTED optional parameter (12.6.4.2): the
     /// declared default, as an expression of the parameter's own type.
     ///
-    /// **`Literal::Null` DOES NOT ALWAYS MEAN `null` HERE, and that is the whole reason this is a
-    /// function rather than a literal node.** csc stores a `NullReference` constant for four
-    /// different defaults -- `= null` on a reference type, `default(string)`, `int? x = null` and
-    /// `default(S)` on a STRUCT -- so the metadata cannot distinguish them and the parameter's
-    /// TYPE has to. A `null` pushed at a struct parameter would not convert, and the call would
-    /// fail on an argument the programmer never wrote.
     ///
-    /// **A TYPE PARAMETER TAKES `default(T)` TOO**, the fifth shape (`T t = default(T)`): inside a
-    /// generic method the argument's type is the caller's own `U`, which may be a value type, and
-    /// csc zero-initializes it (`initobj !!U`).
     fn default_argument(&mut self, parameter_ty: &TypeSymbol, literal: &Literal) -> BoundExpr {
         let type_parameter = matches!(parameter_ty, TypeSymbol::Named(parts)
             if matches!(&parts[..], [name] if self.type_parameter_in_scope(name).is_some()));
@@ -13350,18 +13713,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Reports `CS1620` for an argument that reached a by-reference parameter under the wrong
     /// modifier -- `Take(out v)` against `Take(ref int)`, or the reverse.
     ///
-    /// THIS RUNS AFTER RESOLUTION, NOT DURING IT, and that is csc's order too: given both
-    /// `T(ref int)` and `T(int)`, `T(out v)` resolves to the BYREF overload and is then faulted
-    /// for its modifier, rather than being told no overload matches. Resolution cannot make this
-    /// call anyway -- `ref x` and `out x` give the argument the same `ByRef` type, so the two are
-    /// indistinguishable until the parameter's recorded mode is consulted.
     ///
-    /// The mode is only consulted where BOTH sides are byref. An argument whose byref-ness does
-    /// not match the parameter at all never gets here: it is not applicable, so the call fails
-    /// resolution and reports `CS1503`. csc says `CS1620`/`CS1615` for those, which is a better
-    /// code on an outcome we already agree about -- tracked, and not fixed here, because closing
-    /// it means making a byref parameter applicable to an unmodified argument, and that is a
-    /// change to overload resolution rather than a diagnostic added beside it.
     fn check_argument_modes(
         &mut self,
         method: &MethodSymbol,
@@ -13405,16 +13757,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// WOULD change resolution, and would make `T(v)` ambiguous wherever `T(int)` also exists),
     /// the candidates are re-examined here with by-reference-ness ignored.
     ///
-    /// THE TEST IS BY-REFERENCE SHAPE ALONE, NOT BY TYPE, which is not the obvious reading. csc
-    /// reports the modifier whenever NO same-arity candidate accepts the argument's byref-ness at
-    /// that position -- even when the type would not convert either. `Take(ref s)` with a `string`
-    /// against `Take(int)` is `CS1615`, not the conversion complaint: the keyword is wrong at every
-    /// candidate, so it is the first thing to fix. Only when SOME candidate does accept that shape
-    /// does the conversion get reported instead, which is why `Take(ref s)` against a group holding
-    /// `Take(ref int)` stays `CS1503` -- there the modifier was fine and the type was not.
     ///
-    /// Positions are examined left to right, so a good first argument and a bad second reports the
-    /// second, as csc does.
     fn modifier_mismatch(
         &self,
         candidates: &[MethodSymbol],
@@ -13472,9 +13815,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// BOTH lists -- a renderer that omitted it would differ from csc in a message a user compares
     /// character by character against a search result.
     ///
-    /// The declaring type is named as the receiver's static type. That is the type the call was
-    /// WRITTEN through, which is what csc quotes; naming the type that actually declares an
-    /// inherited method would be more precise and would not match.
     ///
     /// A method with no declared parameter names still renders its angle brackets, from the arity:
     /// same rule as [`crate::resolve::quote_candidate`]'s, and for the same reason -- inventing
@@ -13505,13 +13845,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// The candidate set for a call, once the site's explicit type arguments are taken into
     /// account -- ECMA-334 4th ed **14.5.5.1**, whose three bullets this implements directly:
     ///
-    /// * *"If F is non-generic, F is a candidate when M has no type argument list"* -- so a
-    ///   non-generic method is NOT a candidate for `M<int>(x)`. Measured against csc: CS0308.
-    /// * *"If F is generic and M includes a type argument list, F is a candidate when F has the
-    ///   same number of method type parameters as were supplied"*, and then the parameter list is
-    ///   applicable **after substitution**. Measured against csc: a count mismatch is CS0305.
-    /// * *"If F is generic and M has no type argument list"*, F is a candidate when type INFERENCE
-    ///   (25.6.4) succeeds for it -- see [`infer_method_type_arguments`].
     ///
     /// **THE SUBSTITUTION IS THE POINT, NOT THE FILTERING.** Returning the matching candidates
     /// unsubstituted would still pick the right method and would still type-check the arguments
@@ -13529,11 +13862,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     ///
     /// Reports the constraints a generic METHOD call's explicit type arguments fail (25.7.1).
     ///
-    /// **Only when ONE definition survived the arity filter.** With several, the call is an
-    /// overload set and the winner is not known here; reporting against each would produce a
-    /// message per candidate for a call that resolves fine. csc checks the chosen overload, which
-    /// this cannot see -- so the single-candidate case is checked and the ambiguous one is left,
-    /// deliberately under-reporting rather than guessing.
     ///
     /// **An imported method's constraints are ABSENT rather than empty** -- `reference.rs` does
     /// not decode `GenericParamConstraint` -- so this is silent for a call into a referenced
@@ -13558,15 +13886,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 continue;
             };
             let parameter: Box<str> = definition.type_parameters[index].clone();
-            let constraints = constraints.clone();
-            self.check_one_type_argument_as(
-                argument,
-                &constraints,
-                &parameter,
-                &declaration,
-                GenericMember::Method,
-                span,
-            );
+            let constraints = constraints.substituted(&definition.type_parameters, type_arguments);
+            self.check_one_type_argument(argument, &constraints, &parameter, &declaration, span);
         }
     }
 
@@ -13723,8 +14044,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// [`Binder::resolve_call`], except that a failure with nothing better to say about it is
     /// reported as `CS0411` when a generic candidate's type inference is what actually went wrong.
     ///
-    /// **THE BOUNDARY IS csc's, MEASURED, AND IT IS NARROWER THAN "INFERENCE FAILED".** Four shapes
-    /// pin it:
     ///
     /// ```text
     ///     only `T Id<T>(T)`, called Id(1, 2)            CS1501   wrong ARITY, not inference
@@ -13733,10 +14052,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     ///     plus `int M(string, string)`, called M(1,"x") CS1503   the other candidate takes 2
     /// ```
     ///
-    /// So CS0411 is what a call gets when the ordinary machinery would fall all the way through to
-    /// a bare count complaint. A same-arity candidate has a real conversion failure to report and
-    /// csc reports THAT -- naming the argument that could not convert is more use than naming a
-    /// type parameter that could not be inferred for a different overload.
     fn resolve_call_or_uninferable(
         &mut self,
         name: &str,
@@ -13779,21 +14094,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Resolves a call some of whose arguments are IMPLICITLY TYPED OUT VARIABLES (`M(out var x)`),
     /// whose types are the winning candidate's parameters and so cannot be inputs to the choice.
     ///
-    /// **IT RESOLVES ONCE PER DISTINCT FILL RATHER THAN RELAXING THE RULES.** An `out var` position
-    /// admits any by-reference parameter, so the obvious implementation -- take the candidates it
-    /// admits and require exactly one -- throws away overload resolution's betterness rules along
-    /// with the type it could not supply. Measured, that is not a theoretical loss:
-    /// `int.TryParse(s, out var v)` admits BOTH `TryParse(string, out int)` and
-    /// `TryParse(ReadOnlySpan<char>, out int)`, because a string converts to both, and reports
-    /// `CS0121` on a call csc resolves without hesitating.
     ///
     /// So each distinct tuple of by-reference parameter types at those positions is FILLED IN and
     /// the ordinary resolution runs against it, betterness and all. A candidate whose own
     /// parameters disagree with the fill is not applicable under it and drops out by itself, which
     /// is why every fill is offered the whole candidate set.
     ///
-    /// One winner across all fills is the answer; several is `CS0121`, and csc agrees at both ends
-    /// -- measured:
     ///
     /// ```text
     ///     M(out int) / M(out string)              M(out var a)      CS0121  -- nothing else decides
@@ -14164,12 +14470,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Shared by the indexer read ([`Self::bind_indexer_call`]) and write
     /// ([`Self::bind_indexer_store`]) paths.
     ///
-    /// **AN INDEXER IS OVERLOADED ON ITS INDICES, AND FOR A SETTER THAT IS NOT ITS WHOLE PARAMETER
-    /// LIST.** `this[int a, params int[] r]` synthesizes `get_Item(int, int[])` and
-    /// `set_Item(int, int[], int value)`, so the setter's parameter ARRAY IS NOT ITS LAST
-    /// PARAMETER -- a shape C# forbids anyone to write and therefore one that every applicability
-    /// rule here, and the standard's own wording for the expanded form, assumes cannot occur.
-    /// Measured: csc emits exactly that signature, `ParamArrayAttribute` and all, and so do we.
     ///
     /// So a setter resolves over its INDEX LIST -- its parameters with the trailing value removed,
     /// which is precisely what the source wrote inside the brackets -- and the value is converted
@@ -14464,18 +14764,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
 
     /// Binds an object or collection initializer against the type being created.
     ///
-    /// **MEASURED, and it decides the whole shape: csc reports these member diagnostics EVEN WHEN
-    /// the language-version gate has already refused the initializer.** `new C { Nope = 1 }` under
-    /// `/langversion:ISO-1` draws CS8022 *and* CS0117. So binding is unconditional and the gate is
-    /// additive -- an initializer is never left unbound merely because the dialect forbids it.
     ///
-    /// | mistake | csc |
-    /// |---|---|
-    /// | no such member | `CS0117` |
-    /// | a `readonly` field | `CS0191` |
-    /// | a property with no setter | `CS0200` |
-    /// | a `static` field or property | `CS1914` |
-    /// | a value of the wrong type | `CS0029`, from binding the value against the member's type |
     ///
     /// Only `CS1914` is specific to initializers; the rest are the ordinary assignment rules
     /// reached through a different syntax, which is why four of the five needed no new diagnostic.
@@ -14560,10 +14849,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// declare several -- `Add(int)` and `Add(string)` -- and `new C { 1, "x" }` calls a different
     /// one per element, so this is per element and not per initializer.
     ///
-    /// It goes through [`Self::resolve_call`] rather than calling `resolve_overload` directly, so
-    /// a failure reports what csc reports: `CS1501` for a braced element of two against a
-    /// one-argument `Add`, `CS7036` for a bare element against a two-argument one. Both measured.
-    /// Duplicating that reporting here would be a second place for those rules to drift.
     ///
     /// `declaring_instantiation_of` is what makes a REFERENCED generic collection work: the row
     /// for `List<int>::Add` needs a `TypeSpec` parent and the open signature, and neither can be
@@ -14742,15 +15027,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Whether `ty` implements `System.Collections.IEnumerable`, the condition a collection
     /// initializer requires (csc CS1922).
     ///
-    /// **The interface is required but never CALLED** -- a collection initializer emits `Add`, not
-    /// an enumeration. csc demands it anyway as the marker that the type is a collection at all,
-    /// which is why this is a separate check from having an `Add` and gets its own diagnostic.
     ///
-    /// **THE INTERFACE, NOT A `GetEnumerator` METHOD, AND THE DIFFERENCE IS OBSERVABLE.** Asking
-    /// whether a `GetEnumerator` is reachable looks equivalent, on the reasoning that the
-    /// interface's only content is that method. csc disagrees: a class with a
-    /// public `IEnumerator GetEnumerator()` and an `Add`, but no `: IEnumerable`, is still CS1922.
-    /// The check is nominal, so duck-typing it would ACCEPT a program csc rejects.
     ///
     /// Answers `true` for a type outside the model: refusing something we cannot inspect would
     /// invent a diagnostic, and the permissive direction here cannot.
@@ -14784,27 +15061,13 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
 
     /// Whether the property `name` declared on `declaring_type` has a `set` accessor.
     ///
-    /// Looked up rather than carried on [`MemberResolution::Property`], which records what a READ
-    /// needs; assignability is a question only an assignment asks.
-    /// Every `required` member of `ty` and of its base classes, as
-    /// `(declaring type's simple name, member name)` -- the pair csc's `CS9035` renders as `B.P`,
-    /// naming the type that DECLARED the member rather than the one being constructed.
     ///
-    /// The walk is bounded against a malformed cyclic base, exactly as
-    /// [`Self::base_property_match`]'s is, and stops at an unresolvable base: a type we cannot see
-    /// might declare a required member, and inventing one would be a false diagnostic.
+    /// The walk is [`BaseClassChain`]'s, so a malformed cyclic base ends it, and it stops at an
+    /// unresolvable base: a type we cannot see might declare a required member, and inventing one
+    /// would be a false diagnostic.
     fn required_members_in_chain(&self, ty: &TypeSymbol) -> Vec<(Box<str>, Box<str>)> {
         let mut found: Vec<(Box<str>, Box<str>)> = Vec::new();
-        let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut current = Some(ty.clone());
-        while let Some(at) = current.take() {
-            if visited.contains(&at) {
-                break;
-            }
-            visited.push(at.clone());
-            let Some(info) = self.model.get_by_symbol(&at) else {
-                break;
-            };
+        for (_, info) in self.model.base_class_chain(ty).resolved() {
             for field in &info.fields {
                 if field.is_required {
                     found.push((info.name.clone(), field.name.clone()));
@@ -14815,7 +15078,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     found.push((info.name.clone(), property.name.clone()));
                 }
             }
-            current = info.base.clone();
         }
         found
     }
@@ -14823,13 +15085,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Whether `ty` or any base class declares a `required` member -- the condition for guarding a
     /// constructor with `[Obsolete(.., error: true)]` + `[CompilerFeatureRequired("RequiredMembers")]`.
     ///
-    /// **THIS IS A DIFFERENT QUESTION FROM THE ONE THE TYPE-LEVEL `RequiredMemberAttribute`
-    /// ANSWERS, and measuring csc is what separated them.** That marker goes on a type that
-    /// DECLARES a required member; this guard goes on every constructor of a type that has one
-    /// ANYWHERE IN ITS CHAIN. A derived type declaring nothing required carries no type-level
-    /// marker and still carries the guard on its constructors -- symmetry gets that backwards, and
-    /// the cost of getting it backwards is a down-level consumer constructing an object with unset
-    /// required members.
     ///
     /// Shares [`Self::required_members_in_chain`] rather than re-walking, so the emitter and
     /// `CS9035` cannot disagree about which types have required members.
@@ -14904,11 +15159,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Whether the member being bound is one an init-only property may be assigned from: an
     /// INSTANCE constructor, or another `init` accessor.
     ///
-    /// **THE ACCESSOR CASE IS DERIVED RATHER THAN FLAGGED, AND THE DERIVATION IS THE POINT.** The
-    /// enclosing member is known only by name here (`set_Q`), and an ORDINARY setter must NOT
-    /// qualify -- csc reports CS8852 for `P = 1` inside a plain `set`. So the property that owns
-    /// the accessor is looked up and asked whether IT is init-only, rather than the name being
-    /// taken as evidence on its own.
     fn in_init_context(&self) -> bool {
         let Some(context) = self.current_method.as_ref() else {
             return false;
@@ -14930,11 +15180,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
 
     /// Whether the property `name` reached through `declaring_type` has a `set` accessor.
     ///
-    /// **THE BASE CHAIN IS WALKED, AND ASKING ONE TYPE MISSED EVERY INHERITED PROPERTY.**
-    /// `TypeInfo::find_property` looks only at the members a type declares, so a getter-only
-    /// property inherited from a base answered "has a setter" by default and its assignment reached
-    /// the emitter, which refused it with no diagnostic code. Measured against csc, which reports
-    /// CS0200 there and names the BASE as the declaring type.
     ///
     /// Unknown -- a type outside the model, or a name the chain does not declare -- stays `true`:
     /// refusing an assignment we cannot check would invent a diagnostic, so this is permissive in
@@ -14952,25 +15197,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Walking up from `from`, the first type in the base chain that DECLARES a property called
     /// `name` -- or `None` when no type in the chain does, or the chain leaves the model.
     ///
-    /// **`TypeInfo::find_property` LOOKS ONLY AT WHAT A TYPE DECLARES**, so every question about an
-    /// INHERITED property has to walk, and both of this function's callers were getting the wrong
-    /// answer without it: a getter-only property inherited from a base read as having a setter, and
-    /// the diagnostic that finally reported it named the derived type csc does not name.
     fn property_declaring_type(&self, from: &TypeSymbol, name: &str) -> Option<TypeSymbol> {
-        let mut current = Some(from.clone());
-        let mut seen: Vec<TypeSymbol> = Vec::new();
-        while let Some(ty) = current {
-            if seen.contains(&ty) {
-                return None;
-            }
-            seen.push(ty.clone());
-            let info = self.type_info_of(&ty)?;
-            if info.find_property(name).is_some() {
-                return Some(ty);
-            }
-            current = info.base.clone();
-        }
-        None
+        self.model
+            .base_class_chain(from)
+            .resolved()
+            .find(|(_, info)| info.find_property(name).is_some())
+            .map(|(ty, _)| ty)
     }
 
     /// A TUPLE EXPRESSION `(e1, e2, ...)` (C# 7.0), as the construction of the `System.ValueTuple`
@@ -15017,19 +15249,36 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             .iter()
             .map(|element| Argument::positional(element.value.clone()))
             .collect();
+        let mut kept: Vec<Option<(BoundExpr, Vec<Diagnostic>)>> =
+            elements.iter().map(|_| None).collect();
         let tuple_ty = match target {
             Some(target) => target.clone(),
             None => {
-                let mark = self.diagnostics.len();
-                let natural: Vec<TypeSymbol> = elements
-                    .iter()
-                    .map(|element| self.bind_expression(&element.value).ty)
-                    .collect();
-                self.diagnostics.truncate(mark);
+                let mut natural: Vec<TypeSymbol> = Vec::with_capacity(elements.len());
+                for (slot, element) in kept.iter_mut().zip(elements) {
+                    let mark = self.diagnostics.len();
+                    let bound = self.bind_expression(&element.value);
+                    let reported = self.diagnostics.split_off(mark);
+                    natural.push(bound.ty.clone());
+                    if names_a_tuple(&element.value) {
+                        *slot = Some((bound, reported));
+                    }
+                }
                 crate::bind::value_tuple_exact(&natural)
             }
         };
-        self.bind_object_creation_of(tuple_ty, &arguments, None, span)
+        let bound: Vec<BoundExpr> = kept
+            .into_iter()
+            .zip(&arguments)
+            .map(|(kept, argument)| match kept {
+                Some((bound, reported)) => {
+                    self.diagnostics.extend(reported);
+                    bound
+                }
+                None => self.bind_argument_value(&argument.value),
+            })
+            .collect();
+        self.bind_object_creation_from(tuple_ty, &arguments, bound, None, None, span)
     }
 
     /// `new T(args) { init }` -- the WRITTEN form, which resolves its type and then does what the
@@ -15088,6 +15337,31 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             .iter()
             .map(|argument| self.bind_argument_value(&argument.value))
             .collect();
+        self.bind_object_creation_from(
+            target_ty,
+            argument_exprs,
+            arguments,
+            initializer,
+            bound_initializer,
+            span,
+        )
+    }
+
+    /// [`Self::bind_object_creation_of`] once its arguments are bound, each beside the syntax it
+    /// was bound from: the delegate and type-parameter arms, `CS0144`, overload resolution and
+    /// `CS9035`.
+    ///
+    /// **A TUPLE LITERAL COMES IN HERE WITH ITS ELEMENTS ALREADY BOUND**, because with no target
+    /// it binds them to learn its own type first: see [`Self::bind_tuple`].
+    fn bind_object_creation_from(
+        &mut self,
+        target_ty: TypeSymbol,
+        argument_exprs: &[Argument],
+        arguments: Vec<BoundExpr>,
+        initializer: Option<&Initializer>,
+        bound_initializer: Option<BoundInitializer>,
+        span: Span,
+    ) -> BoundExpr {
         let names = argument_names(argument_exprs);
         let mut ctor_spill: Vec<BoundExpr> = Vec::new();
         if self
@@ -15290,9 +15564,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// binder because it exists only in a delegate-creation-expression -- there is no implicit
     /// conversion between distinct delegate types, so the conversion probes must not see it.
     ///
-    /// When neither form applies, this reports the csc-matching diagnostic (all probed):
-    /// `CS1729` for no arguments, `CS0149` for an argument that is neither form (or extras after
-    /// it), `CS0123` for a method group or delegate value with no signature match.
     fn bind_delegate_creation_new(
         &mut self,
         delegate_ty: &TypeSymbol,
@@ -15418,6 +15689,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         } else {
             Some(receiver.clone())
         };
+        if let Some(id) = crate::local_function::LocalFunctionId::from_reference_name(name) {
+            self.converted_local_functions.borrow_mut().insert(id);
+        }
         BoundExpr {
             kind: BoundExprKind::DelegateCreation {
                 delegate_type: delegate_ty.clone(),
@@ -15466,11 +15740,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Resolves `new T(args)` against `T`'s constructors, reporting the diagnostic
     /// for a failed resolution. The created type is the result regardless.
     ///
-    /// **TWO PASSES, AND THE SECOND IS WHAT MAKES THE DIAGNOSTIC csc's.** `accessible` is the
-    /// subset that participates in overload resolution (7.4); `all` is every constructor the type
-    /// declares. When no accessible one fits but an inaccessible one does, csc reports `CS0122`
-    /// NAMING THAT CONSTRUCTOR rather than the accessible set's own failure. Measured, one program
-    /// per shape:
     ///
     /// ```text
     /// protected T(int)                      new T(1)  ->  CS0122 on T.T(int)
@@ -15599,11 +15868,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Whether a constructor of `target` with this accessibility participates in a
     /// `new target(...)` written here -- [`Self::is_accessible`] MINUS the derivation vantage.
     ///
-    /// **DERIVING FROM A CLASS DOES NOT LET YOU `new` IT.** 10.5.3 grants a derived class its
-    /// base's `protected` members *on an instance of the derived class*, and `new B(...)` makes a
-    /// `B`, not a `D` -- so the only spelling that reaches a `protected` constructor from `D` is
-    /// the constructor initializer `: base(...)`, which is a different rule checked elsewhere.
-    /// Measured against csc in four positions, and the split is exactly derivation vs nesting:
     ///
     /// ```text
     /// class D : A { void M() { new A(1); } }          CS0122   -- derived, and refused
@@ -15635,9 +15899,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// adds the types derived from the declaring type; `internal` and `protected internal` are the
     /// declaring assembly, plus any assembly it named with `[assembly: InternalsVisibleTo]`.
     ///
-    /// A referenced assembly's UNGRANTED `internal` member never reaches this question, because
-    /// `reference.rs` does not import one -- so the diagnostic for naming it is "there is no such
-    /// member", which is csc's, and not the `CS0122` this rule would produce.
     fn is_accessible(&self, declaring: &TypeSymbol, accessibility: Accessibility) -> bool {
         let Some(current) = self.current_type.clone() else {
             return match accessibility {
@@ -15685,11 +15946,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// must therefore be an instance of (10.5.3). `None` when no enclosing type derives, so the
     /// member is simply out of reach.
     ///
-    /// THE ENCLOSING WALK IS THE POINT, not a refinement. A nested type is written inside its
-    /// enclosing class's program text, so it reaches that class's inherited protected members
-    /// exactly as the class itself does. Asking only whether `from` derives refused correct code
-    /// the moment an access was written in a nested helper -- `class D : B { class N { ... } }`
-    /// drew CS0122 where csc compiles it -- and the walk is transitive because the nesting can be.
     fn protected_vantage(&self, from: &TypeSymbol, declaring: &TypeSymbol) -> Option<TypeSymbol> {
         let mut current = Some(from.clone());
         while let Some(ty) = current {
@@ -15751,19 +16007,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
 
     /// Whether `from` derives (directly or transitively) from `declaring`.
     fn derives_from(&self, from: &TypeSymbol, declaring: &TypeSymbol) -> bool {
-        let mut info = self.type_info_of(from);
-        let mut seen: Vec<TypeSymbol> = Vec::new();
-        while let Some(base) = info.and_then(|type_info| type_info.base.clone()) {
-            if &base == declaring {
-                return true;
-            }
-            if seen.contains(&base) {
-                return false;
-            }
-            seen.push(base.clone());
-            info = self.type_info_of(&base);
-        }
-        false
+        self.model
+            .base_class_chain(from)
+            .skip(1)
+            .any(|link| link.ty == *declaring)
     }
 
     /// Reports `CS0122` when a member is not accessible from the current context.
@@ -15793,30 +16040,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// some unrelated subclass's instance. Runs only where [`Self::check_accessible`] found the
     /// member reachable, so the two never both fire.
     ///
-    /// EVERY SILENCE HERE IS MEASURED AGAINST csc, and each one is load-bearing -- this rule makes
-    /// lcsc stricter, so a missing exemption refuses correct code:
-    /// - `this.m` / `base.m` and an unqualified `m` are not qualified accesses at all;
-    /// - a STATIC protected member named through its type is a different rule, not this one;
-    /// - inside the declaring type's own program text the member is in private scope and the
-    ///   qualifier is unconstrained (`B` itself may reach `d.m` through any `B`);
-    /// - `protected internal` reached from the SAME assembly is accessible AS INTERNAL, so the
-    ///   protected clause never governs it. That is the exemption most likely to bite: the two
-    ///   spellings are mutually exclusive across an assembly boundary, and same-assembly code
-    ///   spells it `protected internal` precisely to be reachable without derivation.
     ///
-    /// The message names `current_type` -- for an access written in a nested class, the NESTED
-    /// type, though a qualifier of the ENCLOSING class is what actually satisfies the rule. That
-    /// is csc's own wording and it was measured rather than inferred: `class D : B { class N { ...
-    /// } }` reports "must be of type 'D.N'" while accepting a `D` qualifier.
     ///
-    /// TWO LIMITS, both measured and neither papered over. An OVERLOADED protected method is named
-    /// differently: csc reports during member LOOKUP and so names the FIRST-DECLARED overload,
-    /// while this reports after resolution and names the one the call actually binds to. Matching
-    /// would mean quoting a signature the call does not use, so the divergence is deliberate.
-    /// And a protected INDEXER is not covered at all -- `resolve_indexer_accessor` returns a
-    /// `MethodReference`, which carries no accessibility, so the check has nothing to test. That
-    /// is an UNDER-report: it accepts what csc rejects, which blocks nobody and reads as a gap
-    /// rather than as a compiler that refuses correct code.
     fn check_protected_qualifier(
         &mut self,
         declaring: &TypeSymbol,
@@ -15865,22 +16090,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// which of three diagnostics it draws. csc separates them because the repairs differ: rename
     /// it, widen it, or pick a different member.
     ///
-    /// THE SPLIT IS MEASURED, and it does not follow the CS0617 message. That message says named
-    /// arguments must be "fields which are not readonly, static, or const, or read-write properties
-    /// which are public and not static" -- it mentions `public` only for properties. csc requires
-    /// it of fields too: an `internal` field draws CS0617, while a `private` or `protected` one
-    /// draws CS0122 instead, because that one is not reachable at all. Reachable-but-unusable and
-    /// unreachable are different answers, so they are different variants here.
     pub(crate) fn named_attribute_argument_target(
         &self,
         attribute_type: &TypeSymbol,
         name: &str,
     ) -> NamedArgumentTarget {
-        let mut current = Some(attribute_type.clone());
-        while let Some(ty) = current {
-            let Some(info) = self.type_info_of(&ty) else {
-                return NamedArgumentTarget::Missing;
-            };
+        for (ty, info) in self.model.base_class_chain(attribute_type).resolved() {
             if let Some(field) = info.fields.iter().find(|field| &*field.name == name) {
                 return if !self.is_accessible(&ty, field.accessibility) {
                     NamedArgumentTarget::Inaccessible(ty.clone())
@@ -15913,7 +16128,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             if self.model.get(&ty.to_string(), name).is_some() {
                 return NamedArgumentTarget::NotAValidTarget(ty.clone());
             }
-            current = self.type_info_of(&ty).and_then(|info| info.base.clone());
         }
         NamedArgumentTarget::Missing
     }
@@ -16006,64 +16220,89 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.diagnostics.push(Diagnostic::new(kind, span));
     }
 
-    /// Looks a member up on a type, walking the base-class chain (14.3, 14.5.4).
     /// If `name` is a field-like event reachable on `ty` (itself or a base), returns the
     /// event and the symbol of the type that declares it. `+=`/`-=` route through its
     /// accessors from outside that type (17.7), and any other use there is CS0070.
     fn event_declaration(&self, ty: &TypeSymbol, name: &str) -> Option<(EventSymbol, TypeSymbol)> {
         let lookup = self.lookup_type_of(ty);
-        let mut current = self.type_info_of(&lookup);
-        while let Some(info) = current {
-            if let Some(event) = info.find_event(name) {
-                return Some((event.clone(), type_symbol_in(&info.namespace, &info.name)));
-            }
-            current = info.base.as_ref().and_then(|base| self.type_info_of(base));
+        if self
+            .type_info_of(&lookup)
+            .is_some_and(|info| info.kind == TypeKind::Interface)
+        {
+            return self
+                .member_lookup_walk(&lookup, false)
+                .find_map(|(declaring, info)| Some((info.find_event(name)?.clone(), declaring)));
         }
-        None
+        self.model
+            .base_class_chain(&lookup)
+            .resolved()
+            .find_map(|(walked, info)| {
+                let event = info.find_event(name)?;
+                let declaring = if matches!(walked, TypeSymbol::Instantiation { .. }) {
+                    walked
+                } else {
+                    type_symbol_in(&info.namespace, &info.name)
+                };
+                Some((event.clone(), declaring))
+            })
     }
 
     /// Whether code currently being bound is outside the type that declares `event_owner`
     /// (so `+=`/`-=` must route through accessors and other uses are CS0070).
+    ///
+    /// The scope is the DEFINITION's: inside `C<T>`, the event of a `C<int>` is still the field.
     fn outside_event_declarer(&self, declaring: &TypeSymbol) -> bool {
-        !self.in_private_scope_of(declaring)
+        let definition = match declaring {
+            TypeSymbol::Instantiation { .. } => self
+                .type_info_of(declaring)
+                .map_or_else(|| declaring.clone(), |info| type_symbol_in(&info.namespace, &info.name)),
+            _ => declaring.clone(),
+        };
+        !self.in_private_scope_of(&definition)
     }
 
+    /// The walk member lookup makes from `lookup`, a receiver's lookup type: see
+    /// [`MemberLookupWalk`]. `object_last` searches `System.Object` after an interface's base
+    /// interfaces, for the lookups that reach `object`'s members through a value of interface type
+    /// (`GetType`, `ToString`, `Equals`, `GetHashCode`); a same-named interface member still wins.
+    fn member_lookup_walk(&self, lookup: &TypeSymbol, object_last: bool) -> MemberLookupWalk<'_> {
+        let is_interface = self
+            .type_info_of(lookup)
+            .is_some_and(|info| info.kind == TypeKind::Interface);
+        if !is_interface {
+            return MemberLookupWalk::Classes(self.model.base_class_chain(lookup));
+        }
+        let mut pending: Vec<TypeSymbol> = Vec::new();
+        if object_last {
+            pending.push(type_symbol_in("System", "Object"));
+        }
+        pending.push(lookup.clone());
+        MemberLookupWalk::Interfaces {
+            model: &self.model,
+            pending,
+            visited: Vec::new(),
+        }
+    }
+
+    /// Looks a member up on a type, walking the base-class chain -- or, for an interface, the base
+    /// interfaces and then `object` -- most derived first (14.3, 14.5.4).
     pub(crate) fn resolve_member(&self, ty: &TypeSymbol, name: &str) -> MemberResolution {
         let lookup = self.lookup_type_of(ty);
-        let Some(is_interface) = self
-            .type_info_of(&lookup)
-            .map(|info| info.kind == TypeKind::Interface)
-        else {
-            return MemberResolution::Unknown;
-        };
-        let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut pending = alloc::vec![lookup.clone()];
-        if is_interface {
-            pending.insert(0, type_symbol_in("System", "Object"));
-        }
         let mut inaccessible: Option<MemberResolution> = None;
-        while let Some(current_ty) = pending.pop() {
-            if visited.contains(&current_ty) {
-                continue;
-            }
-            visited.push(current_ty.clone());
-            let Some(info) = self.type_info_of(&current_ty) else {
-                continue;
-            };
+        let mut reached_any = false;
+        for (current_ty, info) in self.member_lookup_walk(&lookup, true) {
+            reached_any = true;
             let Some((resolution, accessible)) = self.member_declared_in(&current_ty, &info, name)
             else {
-                for base in member_lookup_bases(&info) {
-                    pending.push(base);
-                }
                 continue;
             };
             if accessible {
                 return resolution;
             }
             inaccessible.get_or_insert(resolution);
-            for base in member_lookup_bases(&info) {
-                pending.push(base);
-            }
+        }
+        if !reached_any {
+            return MemberResolution::Unknown;
         }
         inaccessible.unwrap_or(MemberResolution::NoSuchMember(ty.to_string()))
     }
@@ -16162,12 +16401,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// `type_hits` is what [`Binder::type_namespaces_containing`] answered for the same name, and
     /// it is a parameter rather than a second lookup because the two answers INTERACT:
     ///
-    /// * a type found in a more specific scope than an import -- the enclosing type, the current
-    ///   namespace, the global namespace -- SHADOWS the imported member, so this answers `None`
-    ///   and the caller takes the type. Measured: a nested `T` in the enclosing class wins over a
-    ///   `using static` that also offers `T`.
-    /// * a type found in an IMPORTED scope shares the member's precedence level, and csc calls
-    ///   that `CS0229` -- *"Ambiguity between 'C0.A' and 'A'"* -- rather than picking either.
     ///
     /// Reports and yields an error expression for the ambiguous and inaccessible cases, because
     /// both are answers: falling through to `CS0103` would say the name does not exist when the
@@ -16331,8 +16564,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Whether `ty` names a type this compilation can see -- a predefined type, a type in scope as
     /// a type parameter, or a definition the model holds -- asked without reporting anything.
     ///
-    /// A check that a type is the WRONG type has nothing to say about one that does not exist: the
-    /// name's own diagnostic (`CS0246`, `CS0308`) is the whole report, and csc adds nothing to it.
     pub(crate) fn names_a_known_type(&self, ty: &TypeSymbol) -> bool {
         match ty {
             TypeSymbol::Error => false,
@@ -17098,11 +17329,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// struct itself as the count. The permitted set is the caller's, because a `string`'s indexer
     /// is `char this[int]` and admits `int` alone where an array admits all four.
     ///
-    /// **The four types are tried in the standard's own order,** so a type offering both an `int`
-    /// and a `long` conversion takes the `int` one, which is what csc does. An operand that is
-    /// ALREADY one of the accepted types is returned untouched rather than wrapped in an identity
-    /// conversion, so the ordinary `a[i]` keeps the code it always had. Only when none of them
-    /// accepts the value is it reported, against the first -- the type csc names.
     fn coerce_index_or_length(
         &mut self,
         value: BoundExpr,
@@ -17214,10 +17440,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// `sealed` closed is `CS0239`, a changed accessibility is `CS0507`, and a differing delegate
     /// type is `CS1715` -- every code and every message measured against csc.
     ///
-    /// **IT MUST HOLD IN EVERY POSITION -- against a source base AND a referenced one.** An
-    /// `override` event matching a non-virtual base member, a sealed one, or nothing at all is
-    /// refused by csc, so a compiler without this check accepts all three: the accepts-invalid
-    /// direction, which compiles clean and is discovered by whoever consumes the assembly.
     ///
     /// **The two rules above are stated ONCE PER MEMBER KIND in this compiler**, so a kind with
     /// no statement is not missing a case -- it is missing the whole rule, which is the form of
@@ -17301,25 +17523,20 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         class_ty: &TypeSymbol,
         name: &str,
     ) -> (Option<(EventSymbol, Box<str>)>, bool) {
-        let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut current = self
-            .model
-            .get_by_symbol(class_ty)
-            .and_then(|info| info.base.clone());
-        while let Some(ty) = current.take() {
-            if visited.contains(&ty) {
-                break;
-            }
-            visited.push(ty.clone());
-            let Some(info) = self.model.get_by_symbol(&ty) else {
+        let mut chain = self.model.base_class_chain(class_ty);
+        chain.next();
+        for link in chain.by_ref() {
+            let Some(info) = link.info else {
                 return (None, false);
             };
             if let Some(event) = info.find_event(name) {
-                if self.accessible_from(class_ty, &ty, event.accessibility) {
+                if self.accessible_from(class_ty, &link.ty, event.accessibility) {
                     return (Some((event.clone(), info.name.clone())), true);
                 }
             }
-            current = info.base.clone();
+        }
+        if chain.is_circular() {
+            return (None, false);
         }
         if self
             .model
@@ -17343,28 +17560,23 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         class_ty: &TypeSymbol,
         name: &str,
     ) -> (Option<(PropertySymbol, Box<str>, bool)>, bool) {
-        let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut current = self
-            .model
-            .get_by_symbol(class_ty)
-            .and_then(|info| info.base.clone());
-        while let Some(ty) = current.take() {
-            if visited.contains(&ty) {
-                break;
-            }
-            visited.push(ty.clone());
-            let Some(info) = self.model.get_by_symbol(&ty) else {
+        let mut chain = self.model.base_class_chain(class_ty);
+        chain.next();
+        for link in chain.by_ref() {
+            let Some(info) = link.info else {
                 return (None, false);
             };
             if let Some(property) = info.find_property(name) {
-                if self.accessible_from(class_ty, &ty, property.accessibility) {
+                if self.accessible_from(class_ty, &link.ty, property.accessibility) {
                     return (
                         Some((property.clone(), info.name.clone(), info.is_external)),
                         true,
                     );
                 }
             }
-            current = info.base.clone();
+        }
+        if chain.is_circular() {
+            return (None, false);
         }
         if self.model.get_by_symbol(&type_symbol_in("System", "Object")).is_none() {
             return (None, false);
@@ -17401,15 +17613,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
         let mut slots: Vec<(Box<str>, Vec<TypeSymbol>, Box<str>, bool, bool)> = Vec::new();
         let mut accessor_slots: Vec<(Box<str>, Vec<TypeSymbol>, bool, bool, Box<str>)> = Vec::new();
-        let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut current = Some(class_ty.clone());
-        while let Some(ty) = current.take() {
-            if visited.contains(&ty) {
-                break;
-            }
-            let declared_here = ty == *class_ty;
-            visited.push(ty.clone());
-            let Some(info) = self.model.get_by_symbol(&ty) else {
+        let mut chain = self.model.base_class_chain(class_ty);
+        for (position, link) in chain.by_ref().enumerate() {
+            let declared_here = position == 0;
+            let Some(info) = link.info else {
                 break;
             };
             let declaring = info.name.clone();
@@ -17497,7 +17704,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     );
                 }
             }
-            current = info.base.clone();
+        }
+        if chain.is_circular() {
+            return;
         }
         for (name, params, declaring, is_abstract, declared_here) in &slots {
             if *is_abstract && !declared_here {
@@ -17542,16 +17751,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         query: &[TypeSymbol],
     ) -> (Option<(MethodSymbol, Box<str>, bool)>, bool) {
         let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut current = self
-            .model
-            .get_by_symbol(class_ty)
-            .and_then(|info| info.base.clone());
-        while let Some(ty) = current.take() {
-            if visited.contains(&ty) {
-                break;
-            }
+        let mut chain = self.model.base_class_chain(class_ty);
+        chain.next();
+        for link in chain.by_ref() {
+            let ty = link.ty;
             visited.push(ty.clone());
-            let Some(info) = self.model.get_by_symbol(&ty) else {
+            let Some(info) = link.info else {
                 return (None, false);
             };
             if let Some(method) = self.matching_method(&info, name, query) {
@@ -17562,7 +17767,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     );
                 }
             }
-            current = info.base.clone();
+        }
+        if chain.is_circular() {
+            return (None, false);
         }
         for root in ["Object", "ValueType"] {
             let root_ty = type_symbol_in("System", root);
@@ -17714,10 +17921,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// the method path uses -- so `IEnumerator<T>` under a `using` and its fully qualified spelling
     /// are one interface, and the NON-generic `IEnumerator` is a different one.
     ///
-    /// An earlier draft asked only "is there a non-public property of this name" and was caught by
-    /// the 12-pair flag sweep on the canonical generic enumerator: `public T Current` for
-    /// `IEnumerator<T>` beside `object IEnumerator.Current` for the non-generic interface, where
-    /// crediting the second against the first strips a slot csc emits.
     fn property_is_explicitly_implemented(
         &self,
         class_ty: &TypeSymbol,
@@ -17950,20 +18153,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// whereas `methods_in_chain` would also surface the interface's own abstract method.
     fn methods_in_class_chain(&self, ty: &TypeSymbol, name: &str) -> Vec<MethodSymbol> {
         let mut methods: Vec<MethodSymbol> = Vec::new();
-        let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut current = Some(self.lookup_type_of(ty));
-        while let Some(cur) = current {
-            if visited.contains(&cur) {
-                break;
-            }
-            visited.push(cur.clone());
-            let Some(info) = self.type_info_of(&cur) else {
-                break;
-            };
+        for (_, info) in self.model.base_class_chain(&self.lookup_type_of(ty)).resolved() {
             for method in info.methods_named(name) {
                 methods.push(method.clone());
             }
-            current = info.base.clone();
         }
         methods
     }
@@ -18001,16 +18194,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         if property.is_none() && event.is_none() {
             return false;
         }
-        let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut current = Some(self.lookup_type_of(class_ty));
-        while let Some(cur) = current {
-            if visited.contains(&cur) {
-                break;
-            }
-            visited.push(cur.clone());
-            let Some(info) = self.type_info_of(&cur) else {
-                break;
-            };
+        for (_, info) in self.model.base_class_chain(&self.lookup_type_of(class_ty)).resolved() {
             if let Some((name, need_getter)) = property {
                 if info.properties.iter().any(|candidate| {
                     &*candidate.name == name
@@ -18028,35 +18212,28 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     return true;
                 }
             }
-            current = info.base.clone();
         }
         false
     }
 
-    /// Reports `CS0146` if `class_ty`'s base-class chain is circular (A : B, B : A). The
-    /// chain walk is bounded by a visited set, so a cycle is detected, not looped on.
+    /// Reports `CS0146` if `class_ty` depends on itself through its base class (14.2.4.2):
+    /// `class A : B { }` beside `class B : A { }`, and `class A<T> : A<A<T>> { }`, whose chain
+    /// repeats no constructed type at all.
+    ///
     pub(crate) fn check_base_cycle(
         &mut self,
         class_ty: &TypeSymbol,
         declaration: &lamella_syntax::ast::TypeDecl,
     ) {
-        let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut current = Some(class_ty.clone());
-        while let Some(ty) = current.take() {
-            if visited.contains(&ty) {
-                self.diagnostics.push(Diagnostic::new(
-                    DiagnosticKind::CircularBase {
-                        type_name: declaration.name.clone(),
-                    },
-                    declaration.span,
-                ));
-                return;
-            }
-            visited.push(ty.clone());
-            current = self
-                .model
-                .get_by_symbol(&ty)
-                .and_then(|info| info.base.clone());
+        let mut chain = self.model.base_class_chain(class_ty);
+        chain.by_ref().for_each(drop);
+        if chain.returned_to_start() {
+            self.diagnostics.push(Diagnostic::new(
+                DiagnosticKind::CircularBase {
+                    type_name: declaration.name.clone(),
+                },
+                declaration.name_span,
+            ));
         }
     }
 
@@ -18237,16 +18414,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// so the walk stops on it.
     fn introducing_conditional(&self, method: &MethodReference) -> Vec<Box<str>> {
         let mut conditional: Vec<Box<str>> = Vec::new();
-        let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut current = Some(self.lookup_type_of(&method.declaring_type));
-        while let Some(ty) = current.take() {
-            if visited.contains(&ty) {
-                break;
-            }
-            visited.push(ty.clone());
-            let Some(info) = self.type_info_of(&ty) else {
-                break;
-            };
+        let declaring = self.lookup_type_of(&method.declaring_type);
+        for (_, info) in self.model.base_class_chain(&declaring).resolved() {
             let found = info
                 .methods_named(&method.name)
                 .find(|candidate| candidate.parameters == method.parameters);
@@ -18256,7 +18425,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     break;
                 }
             }
-            current = info.base.clone();
         }
         conditional
     }
@@ -18285,23 +18453,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// (read = indices, write = indices + the value) finds the indexer, not a plain property. The
     /// first match walking the chain (most-derived first) wins.
     fn indexer_accessor(&self, ty: &TypeSymbol, prefix: &str, arity: usize) -> Option<Box<str>> {
-        let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut pending = alloc::vec![self.lookup_type_of(ty)];
-        while let Some(current_ty) = pending.pop() {
-            if visited.contains(&current_ty) {
-                continue;
-            }
-            visited.push(current_ty.clone());
-            let Some(info) = self.type_info_of(&current_ty) else {
-                continue;
-            };
+        for (_, info) in self.member_lookup_walk(&self.lookup_type_of(ty), false) {
             for method in &info.methods {
                 if method.accepts_argument_count(arity) && method.name.starts_with(prefix) {
                     return Some(method.name.clone());
                 }
-            }
-            for base in member_lookup_bases(&info) {
-                pending.push(base);
             }
         }
         None
@@ -18361,27 +18517,15 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     }
 
     fn methods_in_chain_walk(&self, ty: &TypeSymbol, name: &str) -> Vec<Vec<MethodSymbol>> {
+        if let Some(method) = self.local_function_candidate(name) {
+            return alloc::vec![alloc::vec![method]];
+        }
         let mut walked: Vec<(Vec<MethodSymbol>, Vec<MethodSymbol>)> = Vec::new();
         let mut held: Vec<(usize, bool, MethodSymbol)> = Vec::new();
         let mut seen: Vec<MethodSymbol> = Vec::new();
         let mut seen_inaccessible: Vec<MethodSymbol> = Vec::new();
-        let mut visited: Vec<TypeSymbol> = Vec::new();
         let lookup = self.lookup_type_of(ty);
-        let mut pending = alloc::vec![lookup.clone()];
-        if self
-            .type_info_of(&lookup)
-            .is_some_and(|info| info.kind == TypeKind::Interface)
-        {
-            pending.insert(0, type_symbol_in("System", "Object"));
-        }
-        while let Some(current_ty) = pending.pop() {
-            if visited.contains(&current_ty) {
-                continue;
-            }
-            visited.push(current_ty.clone());
-            let Some(info) = self.type_info_of(&current_ty) else {
-                continue;
-            };
+        for (_, info) in self.member_lookup_walk(&lookup, true) {
             let declaring = type_symbol_in(&info.namespace, &info.name);
             let position = walked.len();
             let mut tier: Vec<MethodSymbol> = Vec::new();
@@ -18415,9 +18559,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 tier_bucket.push(candidate);
             }
             walked.push((tier, inaccessible_tier));
-            for base in member_lookup_bases(&info) {
-                pending.push(base);
-            }
         }
         for (position, accessible, method) in held {
             let (tier, inaccessible_tier) = &mut walked[position];
@@ -18463,7 +18604,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// walk this pairs with had four copies and was repaired in two of them; writing the
     /// instantiation lookup three times here would set the same trap one layer up. `property_ty` is
     /// the SUBSTITUTED property type, which is what the setter takes as its value parameter.
-    fn property_accessor_instantiations(
+    ///
+    /// Public for the lowerings that synthesize a property read of their own -- the async state
+    /// machine's `<>t__builder.Task` -- so they name the accessor through this one implementation
+    /// too.
+    pub fn property_accessor_instantiations(
         &self,
         getter_declaring: &TypeSymbol,
         setter_declaring: &TypeSymbol,
@@ -18495,16 +18640,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let fallback = self.lookup_type_of(receiver_ty);
         let mut getter: Option<TypeSymbol> = None;
         let mut setter: Option<TypeSymbol> = None;
-        let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut pending = alloc::vec![fallback.clone()];
-        while let Some(ty) = pending.pop() {
-            if visited.contains(&ty) {
-                continue;
-            }
-            visited.push(ty.clone());
-            let Some(info) = self.type_info_of(&ty) else {
-                continue;
-            };
+        for (ty, info) in self.member_lookup_walk(&fallback, false) {
             if let Some(property) = info.find_property(name) {
                 let declaring = type_symbol_in(&info.namespace, &info.name);
                 let named = member_declaring_type(&ty, &info);
@@ -18519,9 +18655,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             }
             if getter.is_some() && setter.is_some() {
                 break;
-            }
-            for base in member_lookup_bases(&info) {
-                pending.push(base);
             }
         }
         (
@@ -18559,23 +18692,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         parameters: &[TypeSymbol],
     ) -> TypeSymbol {
         let lookup = self.lookup_type_of(ty);
-        let mut visited: Vec<TypeSymbol> = Vec::new();
-        let mut pending = alloc::vec![lookup.clone()];
-        if self
-            .type_info_of(&lookup)
-            .is_some_and(|info| info.kind == TypeKind::Interface)
-        {
-            pending.insert(0, type_symbol_in("System", "Object"));
-        }
         let mut inaccessible_match: Option<TypeSymbol> = None;
-        while let Some(current_ty) = pending.pop() {
-            if visited.contains(&current_ty) {
-                continue;
-            }
-            visited.push(current_ty.clone());
-            let Some(info) = self.type_info_of(&current_ty) else {
-                continue;
-            };
+        for (current_ty, info) in self.member_lookup_walk(&lookup, true) {
             let declaring = type_symbol_in(&info.namespace, &info.name);
             let mut declares = false;
             let mut accessible = false;
@@ -18594,9 +18712,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             if declares && inaccessible_match.is_none() {
                 inaccessible_match = Some(named);
             }
-            for base in member_lookup_bases(&info) {
-                pending.push(base);
-            }
         }
         inaccessible_match.unwrap_or(lookup)
     }
@@ -18607,7 +18722,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     ///
     /// Takes the SUBSTITUTED parameters, because those are what overload resolution chose and what
     /// the caller has in hand; the model substitutes each candidate back to find the match.
-    fn declaring_instantiation_of(
+    ///
+    /// Public for the lowerings that synthesize calls of their own -- the async state machine's
+    /// builder members -- so a member of `AsyncTaskMethodBuilder<int>` is named through this one
+    /// implementation, as every bound call's is.
+    pub fn declaring_instantiation_of(
         &self,
         declaring: &TypeSymbol,
         name: &str,
@@ -18658,9 +18777,17 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 ty: ty.clone(),
             };
         }
+        if let Some((depth, id)) = self.local_function_in_scope(name) {
+            let shadowed = self
+                .lookup_local_depth(name)
+                .is_some_and(|(local_depth, _)| local_depth > depth);
+            if !shadowed {
+                return self.local_function_group(id, depth);
+            }
+        }
         if let Some((depth, ty)) = self.lookup_local_depth(name) {
             let ty = ty.clone();
-            self.note_capture(name, &ty, depth);
+            self.note_capture(name, &ty, depth, span);
             return BoundExpr {
                 kind: BoundExprKind::Local(name.into()),
                 ty,
@@ -18710,7 +18837,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     return BoundExpr {
                         ty: field.ty.clone(),
                         kind: BoundExprKind::FieldAccess {
-                            receiver: Box::new(self.implicit_receiver(is_instance)),
+                            receiver: Box::new(self.implicit_receiver(is_instance, span)),
                             name: name.into(),
                             field: Some(field),
                         },
@@ -18733,7 +18860,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                             ty: current.clone(),
                         }
                     } else {
-                        self.implicit_receiver(true)
+                        self.implicit_receiver(true, span)
                     };
                     let (getter_declaring, setter_declaring) =
                         self.property_accessor_declarers(&current, name);
@@ -18761,7 +18888,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                         .any(|method| !method.is_static);
                     return BoundExpr {
                         kind: BoundExprKind::MethodGroup {
-                            receiver: Box::new(self.implicit_receiver(is_instance)),
+                            receiver: Box::new(self.implicit_receiver(is_instance, span)),
                             name: name.into(),
                         },
                         ty: TypeSymbol::Error,
@@ -18799,12 +18926,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         if let Some((namespace, imported)) = hits.first() {
             let ambiguous_import = *imported && hits.get(1).is_some_and(|(_, other)| *other);
             if !ambiguous_import {
-                let ty = type_symbol_in(namespace, name);
-                self.check_type_is_accessible(&ty, span);
-                return BoundExpr {
-                    kind: BoundExprKind::TypeReference(ty.clone()),
-                    ty,
-                };
+                return self.named_type_reference(type_symbol_in(namespace, name), span);
             }
             self.diagnostics.push(Diagnostic::new(
                 DiagnosticKind::AmbiguousReference {
@@ -18839,11 +18961,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// `namespace` is the global one, `""`, which only `global::` names.
     fn bind_qualified_name(&mut self, namespace: &str, name: &str, span: Span) -> BoundExpr {
         if self.model.get(namespace, name).is_some() {
-            let ty = type_symbol_in(namespace, name);
-            return BoundExpr {
-                kind: BoundExprKind::TypeReference(ty.clone()),
-                ty,
-            };
+            return self.named_type_reference(
+                type_symbol_in(namespace, name),
+                member_name_span(span, name),
+            );
         }
         let nested = namespace_member(namespace, name);
         if self.model.is_namespace(&nested) {
@@ -18867,12 +18988,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// The enclosing type AS AN EXPRESSION'S TYPE: `current_type`, SELF-INSTANTIATED where it is
     /// generic -- so `this` inside `Box<T>` is `Box<T>` and never the bare definition `` Box`1 ``.
     ///
-    /// **A GENERIC TYPE COULD NOT REFER TO ITSELF BY NAME, AND THIS IS WHY.** `current_type` holds
-    /// the DECLARING symbol, whose last part is arity-mangled (II.10.7.2). Handing that out as an
-    /// expression's type makes `Box<T> b = this;` compare `` Box`1 `` against `Box<T>` and report
-    /// **CS0029**, on a program csc compiles -- and likewise `public Box<T> Self() { return this; }`
-    /// and a `Box<T>` field assigned `this`. Every linked list, tree, `Clone()` and fluent method
-    /// that names its own type is written this way.
     ///
     /// **CALL THIS; DO NOT WRITE THE MATCH AGAIN.** Every site that answers "the enclosing type, as
     /// a value" goes through here -- `this`, the REPL session receiver, and the session-field read
@@ -18916,7 +19031,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// arrives here -- the emitter ignores the receiver for one -- and treating those as captures
     /// would move a lambda that needs no instance onto the enclosing type, or, inside a static
     /// method, ask for a `this` that does not exist.
-    fn implicit_receiver(&mut self, instance_member: bool) -> BoundExpr {
+    fn implicit_receiver(&mut self, instance_member: bool, span: Span) -> BoundExpr {
         if let Some(name) = self.session_receiver.clone() {
             return BoundExpr {
                 kind: BoundExprKind::Local(name),
@@ -18924,7 +19039,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             };
         }
         if instance_member && !self.in_static_method() && !self.in_field_initializer {
-            self.note_this_capture();
+            self.note_this_capture(span);
         }
         self.this_expr()
     }
@@ -18996,6 +19111,17 @@ fn pointer_binary_result(
         ) => Some(TypeSymbol::Special(SpecialType::Boolean)),
         _ => None,
     }
+}
+
+/// `expr` typed as `pointer` when it is the `null` literal and `pointer` is a pointer type, else
+/// `expr` as it is: the null literal's implicit conversion to a pointer type.
+fn null_as_pointer(mut expr: BoundExpr, pointer: &TypeSymbol) -> BoundExpr {
+    if matches!(expr.kind, BoundExprKind::Literal(Literal::Null))
+        && matches!(pointer, TypeSymbol::Pointer(_))
+    {
+        expr.ty = pointer.clone();
+    }
+    expr
 }
 
 /// The result type of a binary operator on operand types, or `None` if the
@@ -19168,19 +19294,6 @@ fn qualified_member(declaring: &TypeSymbol, member: &str) -> Box<str> {
 /// than papered over, and it moves the day parameter modes join the symbol table.
 /// A type's own name without its namespace or enclosing types -- `Inner` for `C.Inner`. A
 /// constructor's display name is the type's simple name, so `C.Inner`'s reads `C.Inner.Inner(...)`.
-/// How csc names an inaccessible TYPE in `CS0122`: its `CSharpErrorMessageFormat` keeps enclosing
-/// TYPES and drops the namespace, so a nested type reads `Outer.Buried` and a top-level one reads
-/// `Hidden`. Measured.
-fn inaccessible_type_name(info: &TypeInfo) -> String {
-    match &info.enclosing {
-        Some(enclosing) => {
-            let outer = enclosing.rsplit('.').next().unwrap_or(enclosing);
-            alloc::format!("{outer}.{}", info.name)
-        }
-        None => info.name.to_string(),
-    }
-}
-
 fn simple_type_name(ty: &TypeSymbol) -> String {
     match ty {
         TypeSymbol::Named(parts) => parts.last().map(|part| part.to_string()).unwrap_or_default(),
@@ -19196,13 +19309,6 @@ fn simple_type_name(ty: &TypeSymbol) -> String {
 /// its callers are at parity today. Once every one of them holds a `MethodSymbol` they should
 /// collapse into this.
 ///
-/// KNOWN GAP, measured: csc qualifies the type MINIMALLY FOR THE ERROR SITE, so a method in
-/// `namespace N { class C }` reported from inside `C` reads `C.M(int)` where this renders
-/// `N.C.M(int)`. Enclosing TYPES are kept by both (`C.Inner.Inner(int, int)`) -- it is only the
-/// namespace that csc drops, and only when the site can see the type without it. Closing this
-/// needs the using-scope at the report site, not a different string builder, so it is written
-/// down rather than approximated: dropping the namespace unconditionally would be wrong for a
-/// type the site could NOT have named unqualified.
 fn qualified_method_with_modes(
     declaring: &TypeSymbol,
     member: &str,
@@ -19420,7 +19526,7 @@ pub(crate) fn is_system_task(ty: &TypeSymbol) -> bool {
 }
 
 /// Whether `ty` is a constructed `System.Threading.Tasks.Task<T>` -- 15.15.1's third return
-/// type, refused by name in phase 1 (`Feature::AsyncTaskOfT`).
+/// type (`Feature::AsyncTaskOfT`).
 pub(crate) fn is_system_task_of_t(ty: &TypeSymbol) -> bool {
     matches!(ty, TypeSymbol::Instantiation { definition, arguments }
         if arguments.len() == 1
@@ -19429,6 +19535,14 @@ pub(crate) fn is_system_task_of_t(ty: &TypeSymbol) -> bool {
             && &*definition[1] == "Threading"
             && &*definition[2] == "Tasks"
             && &*definition[3] == "Task")
+}
+
+/// The `T` of a constructed `System.Threading.Tasks.Task<T>`, and `None` for any other type.
+pub fn task_result_type(ty: &TypeSymbol) -> Option<&TypeSymbol> {
+    match ty {
+        TypeSymbol::Instantiation { arguments, .. } if is_system_task_of_t(ty) => arguments.first(),
+        _ => None,
+    }
 }
 
 /// The full dotted name of a type in a namespace (the bare name when global).
@@ -19492,9 +19606,6 @@ enum InterpolationPiece {
     /// Literal text as UTF-16 code units, braces already decoded (so a `{` here means one brace,
     /// not an escape).
     ///
-    /// **UNITS, NOT A `String`, BECAUSE A C# STRING IS NOT ALWAYS VALID UNICODE.** `$"\ud800"` is
-    /// one lone surrogate, and a Rust `String` cannot hold it: decoding through one replaced it
-    /// with U+FFFD, in the literal text and in a folded constant hole alike, where csc keeps it.
     Text(Vec<u16>),
     /// A value to render, with the alignment and format specifier that go with it.
     Value {
@@ -19509,10 +19620,6 @@ enum InterpolationPiece {
 
 /// Joins runs of adjacent text pieces into one.
 ///
-/// **THE PIECE COUNT IS THE LOWERING**, so this is not tidiness: `String.Concat` has fixed
-/// overloads up to four arguments and a `params` one past that, so two texts left side by side
-/// after a constant fold would push a three-piece string onto the array overload -- a different
-/// call, a different allocation, and a difference from csc that no diagnostic would report.
 fn merge_adjacent_text(pieces: Vec<InterpolationPiece>) -> Vec<InterpolationPiece> {
     let mut merged: Vec<InterpolationPiece> = Vec::with_capacity(pieces.len());
     for piece in pieces {
@@ -19531,10 +19638,6 @@ fn merge_adjacent_text(pieces: Vec<InterpolationPiece>) -> Vec<InterpolationPiec
 
 /// The FINAL IDENTIFIER of a `nameof` operand, or `None` when the operand has no name.
 ///
-/// Measured over 29 forms against csc, and the rule really is this short: the last identifier,
-/// with no qualification and no generic arity. `Outer.Inner.Thing` is `"Thing"`, `Gen<int>` is
-/// `"Gen"`, `Color.Red` is `"Red"`, `Console.WriteLine` is `"WriteLine"`, and an overloaded
-/// method name is its own name without an ambiguity complaint.
 fn nameof_identifier(operand: &Expr) -> Option<Box<str>> {
     match &operand.kind {
         ExprKind::Name { name, .. } => Some(name.clone()),
@@ -19577,6 +19680,15 @@ fn lambda_through_parentheses(expr: &Expr) -> Option<&Expr> {
         ExprKind::Lambda { .. } => Some(expr),
         ExprKind::Parenthesized(inner) => lambda_through_parentheses(inner),
         _ => None,
+    }
+}
+
+/// Whether `expr` is a tuple literal, looking through any parentheses around it.
+fn names_a_tuple(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Tuple { .. } => true,
+        ExprKind::Parenthesized(inner) => names_a_tuple(inner),
+        _ => false,
     }
 }
 
@@ -20227,11 +20339,6 @@ fn user_implicit_converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> 
 /// for, a name naming a parameter some other argument already filled, or a parameter left out that
 /// has no default to fall back on.
 ///
-/// **THE MAPPING IS PART OF APPLICABILITY AND NOT A CHECK BESIDE IT, WHICH IS WHAT MAKES THE
-/// DIAGNOSTICS COME OUT RIGHT.** csc reports `M(a: 1, a: 2)` against `M(int a, int b)` as CS7036 --
-/// a required parameter with no argument -- and not as a duplicate name, because the duplicate is
-/// only ever visible as a candidate that does not apply. Measured; a separate duplicate check
-/// would have invented a diagnostic csc does not give.
 ///
 /// A method with no parameter facts at all (the invariant on [`MethodSymbol::parameter_info`]:
 /// empty means NOT KNOWN) can be mapped positionally and never by name, which is the honest
@@ -20262,11 +20369,6 @@ fn map_arguments(method: &MethodSymbol, names: &[Option<(&str, Span)>]) -> Optio
 
 /// The first parameter a named call leaves unfilled with nothing to fall back on.
 ///
-/// **THIS IS WHAT csc REPORTS FOR A DUPLICATE NAME, AND IT NEVER MENTIONS THE DUPLICATE.**
-/// `M(a: 1, a: 2)` against `M(int a, int b)` is CS7036 -- "no argument given that corresponds to
-/// the required parameter 'b'" -- because the second `a` does not add an argument, it fails to
-/// supply one, and `b` is what went short. Measured. A diagnostic about the repetition would name
-/// the symptom and leave the reader to work out the consequence.
 ///
 /// Shares the placement rule with [`map_arguments`] and stops where it does; the difference is
 /// that this reports which parameter went short instead of only that one did.
@@ -20327,14 +20429,6 @@ fn reorder_for(
 /// `M(int a, int b)` and does not map at all onto `M(int x, int y)`. A candidate whose mapping
 /// fails is not a candidate, which is where CS1739 and CS1744 come from.
 ///
-/// Betterness is then judged on each candidate's own reordered list rather than per source
-/// argument as 12.6.4.3 words it. **THE TWO READINGS CAN ONLY DIVERGE FOR A CANDIDATE SET THAT
-/// MAPS ONE CALL TWO WAYS, AND C# MAKES THAT SET HARD TO BUILD:** overloads may not differ only in
-/// parameter NAMES (csc CS0111), so the names have to be permuted across parameters whose TYPES
-/// differ too -- and then the two mappings are mirror images and the call is ambiguous. Probed
-/// four ways, including that one; csc and this agree on every row, ambiguity included, and no case
-/// where the readings part was found. `renamed-positions` in `tools/named-arguments.ps1` keeps the
-/// nearest shape under measurement rather than leaving the claim to rest on this paragraph.
 fn resolve_overload_named(
     model: &Model,
     candidates: &[MethodSymbol],
@@ -20926,11 +21020,6 @@ fn definition_of(ty: &TypeSymbol) -> TypeSymbol {
 /// The instantiation a generic DEFINITION names its own members through -- `H<!0, !1>` for
 /// `class H<T, U>` -- or `None` when `declaring` is not a plain name or the type is not generic.
 ///
-/// **A DEFINITION REACHED IN ITS OWN BODY IS STILL AN INSTANTIATION, AND NAMING IT AS THE BARE
-/// DEFINITION LOSES DATA RATHER THAN METADATA.** A member named on the definition reaches its own
-/// field through a `FieldDef`, where csc names it through a `TypeSpec` over the type's own
-/// parameters and emits a `MemberRef` parented by that -- which is why csc's images for a generic
-/// type carry a second `TypeSpec` that ours did not.
 ///
 /// **THE FIRST FIELD SURVIVES THE WRONG FORM AND EVERY LATER ONE DOES NOT.** A one-field type
 /// passes, and so does a write from outside the type, so the shapes that would show it are exactly
@@ -21246,8 +21335,6 @@ fn system_array() -> TypeSymbol {
 /// interface -- an EXPLICIT implementation (13.4.1), whose name the class deliberately records
 /// QUALIFIED (`I.Get`) so that it is unreachable unqualified.
 ///
-/// **FOLLOWING INTERFACES FROM EVERY TYPE ACCEPTS PROGRAMS csc REJECTS**, and it does so silently
-/// -- there is no refusal to notice, only a call that binds. Measured, with no generics in it:
 ///
 /// ```text
 ///     class Impl : I { void I.Take(object o) { } public void Take(int i) { } }
@@ -21273,6 +21360,66 @@ fn member_lookup_bases(info: &TypeInfo) -> Vec<TypeSymbol> {
         return info.bases.clone();
     }
     info.base.iter().cloned().collect()
+}
+
+/// The types member lookup searches from a receiver's lookup type, most derived first, each beside
+/// its model entry -- made by [`Binder::member_lookup_walk`], and continuing from each type into
+/// what [`member_lookup_bases`] names.
+///
+/// **A CLASS RECEIVER SEARCHES ITS BASE-CLASS CHAIN, SO IT WALKS ONE.** A class, a struct and a
+/// type parameter's effective base class continue into their base class alone, and that walk is
+/// [`BaseClassChain`]'s, which ends at a class it has already walked -- including one reached again
+/// through ever-larger type arguments, which no comparison of the types themselves would catch.
+///
+/// **AN INTERFACE RECEIVER SEARCHES A GRAPH, NOT A CHAIN**: its base interfaces depth first, the
+/// last listed first, then `System.Object` when the caller asks for it -- an interface does not
+/// derive from `object`, but a value of interface type exposes `object`'s members to lookup. That
+/// walk visits each type once, compared whole: `I<int>` and `I<string>` are two interfaces, and a
+/// type may inherit both.
+enum MemberLookupWalk<'model> {
+    /// A non-interface receiver's base-class chain.
+    Classes(BaseClassChain<'model>),
+    /// An interface receiver's base interfaces.
+    Interfaces {
+        /// The model the walk is read from.
+        model: &'model Model,
+        /// The types still to visit, the next on top.
+        pending: Vec<TypeSymbol>,
+        /// The types already visited.
+        visited: Vec<TypeSymbol>,
+    },
+}
+
+impl<'model> Iterator for MemberLookupWalk<'model> {
+    type Item = (TypeSymbol, alloc::borrow::Cow<'model, TypeInfo>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            MemberLookupWalk::Classes(chain) => {
+                let link = chain.next()?;
+                Some((link.ty, link.info?))
+            }
+            MemberLookupWalk::Interfaces {
+                model,
+                pending,
+                visited,
+            } => {
+                let model: &'model Model = *model;
+                while let Some(ty) = pending.pop() {
+                    if visited.contains(&ty) {
+                        continue;
+                    }
+                    visited.push(ty.clone());
+                    let Some(info) = model.get_by_symbol(&ty) else {
+                        continue;
+                    };
+                    pending.extend(member_lookup_bases(&info));
+                    return Some((ty, info));
+                }
+                None
+            }
+        }
+    }
 }
 
 /// The type whose members a receiver of type `ty` resolves against: `System.Array`
@@ -21577,6 +21724,18 @@ pub(crate) enum NullableUnderlying {
     /// Nothing can be said -- an error type, or a name that resolves to nothing -- and the `?` is
     /// left as `System.Nullable<T>`, so the name's own diagnostic is the one reported.
     Unknown,
+}
+
+/// Whether a type holds a reference anywhere in it -- see [`Binder::managed_kind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManagedKind {
+    /// It is a reference type, or holds one at some depth of its fields.
+    Managed,
+    /// It holds no reference, and neither it nor any field's type is a constructed struct.
+    Unmanaged,
+    /// It holds no reference, and it or a field's type at some depth is a constructed struct:
+    /// unmanaged from C# 8.0 ([`Feature::UnmanagedConstructedTypes`]), managed before.
+    UnmanagedWithGenerics,
 }
 
 /// The `?` that ends a `T?` node, where an annotation's diagnostics point (csc's position).
@@ -22062,15 +22221,7 @@ mod tests {
     /// at anything else. Measured against csc: `@nameof(abc)` with nothing declared is `CS0103`,
     /// and with a method called `nameof` in scope it calls that method.
     ///
-    /// **THE PLAIN HALF IS HALF THE TEST.** A guard that declined every spelling would pass the
-    /// verbatim row on its own, and the feature would be gone.
-    /// 9.4.4.2's special negations, over every spelling and both positions. Each row was scored
-    /// against csc one compilation at a time; see
-    /// [`negated_integer_min_literal`](crate::declaration::negated_integer_min_literal).
     ///
-    /// **THE REFUSALS ARE HALF THE TEST AND THE HARDER HALF.** A rule that admitted every suffix
-    /// would pass all three accepting rows on its own -- and `-9223372036854775808UL` is `CS0023`
-    /// under csc, because a `u` forces `ulong` and the clause does not reach it.
     #[test]
     fn the_two_minimum_value_literals_negate_by_a_special_rule() {
         assert!(!codes("-9223372036854775808").contains(&23));
@@ -22879,9 +23030,6 @@ mod tests {
     /// A DECLARATION PATTERN's variable is in scope for the whole block and definitely assigned
     /// only where the test answered TRUE.
     ///
-    /// **THE TWO HALVES ARE DIFFERENT DIAGNOSTICS AND THAT IS THE CLAIM.** Reading it in the
-    /// `else` is `CS0165` -- unassigned -- and NOT `CS0103`, which is what a variable scoped to
-    /// the true branch would give. Measured against csc, both codes.
     #[test]
     fn a_declaration_pattern_assigns_its_variable_only_where_the_test_succeeded() {
         use lamella_syntax::parser::parse_statement;
@@ -22921,8 +23069,6 @@ mod tests {
 
     /// An OUT VARIABLE's scope is the enclosing BLOCK, not the argument list.
     ///
-    /// Measured against csc, both directions: `M(out int a); return a;` compiles, and a second
-    /// `a` in the same block is `CS0128`.
     #[test]
     fn an_out_variable_is_declared_in_the_enclosing_block() {
         use lamella_syntax::parser::parse_statement;
@@ -23321,9 +23467,6 @@ mod tests {
     /// An explicit implementation must be credited to ITS OWN interface, and to a member with the
     /// same parameter list.
     ///
-    /// The first row is the program that showed it was not: a class implementing only `IA.M()`,
-    /// credited with `IB`'s unrelated `M(int)` by a check that compared name SUFFIXES. csc reports
-    /// CS0535 for `IB.M(int)`.
     ///
     /// **THE OTHER FOUR ROWS ARE THE FALSE-POSITIVE CONTROLS, AND THEY ARE WHY THE LENIENT CLAUSE
     /// EXISTED.** One member has two legal qualifier spellings -- written through a `using`, and
@@ -23471,10 +23614,6 @@ mod tests {
     /// against a source base and a referenced one alike, which is the accepts-invalid direction
     /// rather than the safe one.
     ///
-    /// Every code AND every message here was measured against csc(ISO-1) on the same program,
-    /// including the two forms an event can take: the field-like `event H E;` and the
-    /// custom-accessor `event H E { add ... remove ... }` reach the same rule, because the emitter
-    /// half of this same defect needed both arms fixed and one arm is how it hid.
     #[test]
     fn an_override_event_is_checked_like_an_override_method() {
         use lamella_syntax::parser::parse_compilation_unit;
@@ -23573,11 +23712,6 @@ mod tests {
     /// `abstract` member may not declare a body) was method-only and `CS0238` (a `sealed` member
     /// that is not an `override` has nothing to seal) reached methods, properties and fields.
     ///
-    /// The gap was not cosmetic on the `abstract` side: the accessor took its `Abstract` flag from
-    /// the declaration and its RVA from the body it was allowed to keep, and an abstract method
-    /// with a non-zero RVA is invalid by II.22.26 -- the runtime refuses the whole type at load.
-    /// So an accepted program produced an artifact that could not run, which ilverify passes and a
-    /// bit-for-bit flag comparison against csc calls clean.
     #[test]
     fn an_abstract_body_or_a_pointless_sealed_is_refused_at_every_member_kind() {
         use lamella_syntax::parser::parse_compilation_unit;
@@ -24181,9 +24315,6 @@ mod tests {
     /// it asserted was one the defect could also produce. Declaring the type in the source is what
     /// puts the shipping branch under the assertion.
     ///
-    /// **THE RUNG IS NAMED, BECAUSE THE ANSWER DEPENDS ON IT**: `CS0155` is csc's answer below C#
-    /// 8.0 and the conversion diagnostic is its answer from 8.0 on (the test after this one). The
-    /// default rung is derived from the features this build implements and sits above 8.0.
     #[test]
     fn a_throw_against_a_declared_system_exception_is_still_cs0155() {
         use lamella_syntax::parser::parse_compilation_unit;
@@ -24801,10 +24932,6 @@ mod tests {
     }
     /// A scope records what ENCLOSES it, which is the second thing a depth cannot express.
     ///
-    /// The chain of display classes is a walk over CAPTURING scopes only -- measured against csc,
-    /// a middle scope that captures nothing gets no class and is not a link, so the inner class
-    /// points straight at the outer. Answering that needs the enclosing scope of each scope, and
-    /// the bound tree carries no scope identity to recover it from afterwards.
     #[test]
     fn a_scope_records_what_encloses_it_and_siblings_share_one_parent() {
         let mut binder = Binder::new();

@@ -3,10 +3,10 @@
 # Function ids are the ST alternate-function numbers (AF0..AF15) that the
 # AFRL/AFRH nibbles select.
 #
-# THE ALTERNATE-FUNCTION TABLE IS SIXTEEN FUNCTION COLUMNS WIDE, and a cell means nothing without
+# The alternate-function table is sixteen function columns wide, and a cell means nothing without
 # its column header: the header is the only thing that says which AF NUMBER the signal belongs to.
 #
-# AND THE NUMBER IS NOT UNIFORM PER PERIPHERAL, WHICH IS WHY THAT MATTERS HERE. The quad-SPI
+# And the number is not uniform per peripheral, which is why that matters here. The quad-SPI
 # interface appears in TWO function columns on this part: AF9 carries its clock and its four data
 # lines, and AF10 carries its chip select. Muxing all six at AF9 leaves chip select on a CAN
 # transmit function instead -- a pin that drives, so nothing is obviously dead, and the flash is

@@ -1,14 +1,14 @@
 # BLOCK: the STM32L0x3 flash controller as category 5 carries it, stated only as far as the facts
 # consumers outside the controller need. The controller itself is not described here.
 #
-# THIS FILE IS THE REASON csp/stm32l053 AND csp/stm32l073 ARE TWO FAMILIES RATHER THAN ONE. The
+# This file is the reason csp/stm32l053 and csp/stm32l073 are two families rather than one. The
 # gpio and exti blocks beside it are twins on purpose -- RM0367 states those registers once for
 # the whole book. This one is not, and it does not merely differ in a number: it declares no
 # registers at all and exists to carry exactly what varies per family, so a fold would replace a
 # 6-Kbyte two-bank array with a 2-Kbyte single-bank one and lose the bank boundary entirely.
 # A reader tidying this directory finds three files that look alike and one that is not. This is it.
 #
-# THIS FAMILY ERASES TO ZERO, WHICH INVERTS THE USUAL BLANK CHECK. A correctly erased part reads as
+# This family erases to zero, which inverts the usual blank check. A correctly erased part reads as
 # full and a full part reads as erased.
 #
 

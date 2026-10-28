@@ -3,7 +3,7 @@
 # record schema is uniform across rows; -1 marks a field that does not apply to a row and emits
 # nothing.
 #
-# THE SHAPE MATCHES `csp/samd21` AND THE VALUES ARE NOT ITS VALUES. The two families clock and gate
+# The shape matches `csp/samd21` and the values are not its values. The two families clock and gate
 # the same way -- a GCLK core-clock id, a PM APBC mask bit and an NVIC line per instance -- and that
 # is where the resemblance stops. The clearest case is SERCOM0's generic-clock id: it is 14 here and
 # 0x14 (20) on the SAMD21. A row copied across would be off by six and would clock nothing.

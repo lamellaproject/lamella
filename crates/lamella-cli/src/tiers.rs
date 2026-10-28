@@ -65,6 +65,13 @@ pub fn covers(aot_target: &str) -> bool {
         .any(|row| row.aot_target == aot_target)
 }
 
+/// Whether `aot_target`'s runtime support archive carries a board's own half, so that each board
+/// links an archive of its own rather than one several boards share.
+#[must_use]
+pub fn per_board(aot_target: &str) -> bool {
+    row_for(aot_target).is_some_and(|row| row.per_board)
+}
+
 /// Every `aot_target` the tier covers, for a refusal that has to list them.
 pub fn targets() -> impl Iterator<Item = &'static str> {
     LINKED_TARGETS.iter().map(|row| row.aot_target)
@@ -113,20 +120,32 @@ fn machine_for(triple: &str) -> Option<lamella_elf::Machine> {
 /// `board` is the `--board` id the image is for. It decides which archive is looked for only on a
 /// target whose archive carries the board's own half; elsewhere one archive serves every board.
 ///
+/// `given` is the folder of archives a command line names ([`crate::folders::RUNTIME_SUPPORT_DIR`]),
+/// which is read in place of the one [`FOLDER_ENV`] names.
+///
 /// # Errors
 /// No archive found, a file that is not an `ar` archive, or one built for another instruction set.
 /// Each names the path it is talking about.
-pub fn runtime_archive(board: &str, aot_target: &str) -> Result<(PathBuf, Vec<u8>), String> {
+pub fn runtime_archive(board: &str, aot_target: &str, given: Option<&Path>) -> Result<(PathBuf, Vec<u8>), String> {
     named_runtime_archive(
         board,
         aot_target,
         std::env::var_os(ARCHIVE_ENV).map(PathBuf::from),
-        std::env::var_os(FOLDER_ENV).map(PathBuf::from),
+        named_folder(given, std::env::var_os(FOLDER_ENV)),
     )
 }
 
+/// The folder of archives a build is named, with the name that named it: `given`, the folder a
+/// command line names, or else `variable`, what [`FOLDER_ENV`] holds.
+fn named_folder(given: Option<&Path>, variable: Option<std::ffi::OsString>) -> Option<(PathBuf, &'static str)> {
+    match given {
+        Some(folder) => Some((folder.to_path_buf(), crate::folders::RUNTIME_SUPPORT_DIR)),
+        None => variable.map(|folder| (PathBuf::from(folder), FOLDER_ENV)),
+    }
+}
+
 /// [`runtime_archive`] with the overrides handed in rather than read from the environment: `named`
-/// an archive, `folder` a folder of them.
+/// an archive, `folder` a folder of them with the option or variable that named it.
 ///
 /// **THE ENVIRONMENT IS READ IN ONE PLACE AND THE RULE IS TESTED IN ANOTHER.** A process-wide
 /// variable is shared by every test in the binary at once, so a test that set one would be deciding
@@ -138,7 +157,7 @@ fn named_runtime_archive(
     board: &str,
     aot_target: &str,
     named: Option<PathBuf>,
-    folder: Option<PathBuf>,
+    folder: Option<(PathBuf, &str)>,
 ) -> Result<(PathBuf, Vec<u8>), String> {
     let Some(row) = row_for(aot_target) else {
         return Err(format!(
@@ -159,12 +178,12 @@ fn named_runtime_archive(
         return check(path, bytes, triple);
     }
     let board = row.per_board.then_some(board);
-    if let Some(folder) = folder {
+    if let Some((folder, named_by)) = folder {
         let path = in_folder(&folder, triple, board);
         return match std::fs::read(&path) {
             Ok(bytes) => check(path, bytes, triple),
             Err(error) => Err(format!(
-                "no runtime support archive for {} ({triple}) in the folder {FOLDER_ENV} names: \
+                "no runtime support archive for {} ({triple}) in the folder {named_by} names: \
                  {} cannot be read: {error}\n\n\
                  Nothing else was looked at. An override that a default can silence is not an \
                  override, so\nthe folder named here is the answer or there is none.",
@@ -232,7 +251,8 @@ fn no_archive_refusal(
     let Some(root) = checkout() else {
         return format!(
             "{refused}Name one with {ARCHIVE_ENV}, or the folder that holds one for each board with \
-             {FOLDER_ENV}."
+             {} or {FOLDER_ENV}.",
+            crate::folders::RUNTIME_SUPPORT_DIR
         );
     };
     let dev_crate = development_crate(&root);
@@ -666,6 +686,44 @@ mod tests {
         }
     }
 
+    /// **A BOARD WHOSE CONSOLE IS THE RING BUILDS THE RING AS ITS ONLY CONSOLE.** Each `board-<id>`
+    /// feature of the runtime archive names the board it builds, and where that board's catalog
+    /// default is `memory`, the feature selects `console-memory` and neither `console-board` nor
+    /// `console-semihosting`: a board's own UART would take pins the program may be using, and
+    /// semihosting stops a board that has no debugger attached.
+    #[test]
+    fn a_board_whose_console_is_the_ring_builds_it_as_its_only_console() {
+        let manifest = include_str!("../../../tools/runtime/runtime-support/Cargo.toml");
+        let mut checked = Vec::new();
+        for line in manifest.lines().map(str::trim) {
+            let Some((name, value)) = line.split_once(" = [") else {
+                continue;
+            };
+            let Some(board) = name.strip_prefix("board-") else {
+                continue;
+            };
+            assert!(value.ends_with(']'), "{name} is one line, so this test reads all of it: {line}");
+            let features: Vec<&str> =
+                value.trim_end_matches(']').split(',').map(|feature| feature.trim().trim_matches('"')).collect();
+            let table = lamella_catalog::load_board(board)
+                .unwrap_or_else(|| panic!("{name} names a board the catalog has: {board}"));
+            if lamella_catalog::console_default(&table) != lamella_catalog::ConsoleChannel::Memory {
+                continue;
+            }
+            assert!(features.contains(&"console-memory"), "{name} keeps the ring: {features:?}");
+            for other in ["console-board", "console-semihosting"] {
+                assert!(!features.contains(&other), "{name} writes its console nowhere but the ring: {features:?}");
+            }
+            checked.push(board);
+        }
+        checked.sort_unstable();
+        assert_eq!(
+            checked,
+            ["pimoroni-pico-plus-2", "pimoroni-pico-plus-2-w", "rpi-pico2", "rpi-pico2-w"],
+            "the four RP2350 boards take a board build, and each one's console is the ring"
+        );
+    }
+
     /// **THE SDK'S FOLDER IS THE ANSWER OR THERE IS NONE.** It names the archives that belong with
     /// its class library, so a board it holds no archive for is refused naming the path, rather than
     /// linked against an archive found elsewhere, which may be from another commit.
@@ -677,16 +735,38 @@ mod tests {
         let archive = board_dir.join(ARCHIVE_NAME);
         std::fs::write(&archive, archive_of(lamella_elf::Machine::Arm)).expect("write the archive");
 
-        let (found, _) = named_runtime_archive("rpi-pico2", "rp2350", None, Some(folder.clone()))
+        let (found, _) = named_runtime_archive("rpi-pico2", "rp2350", None, Some((folder.clone(), FOLDER_ENV)))
             .expect("the board's archive in the folder");
         assert_eq!(found, archive, "it is found under the triple and the board");
 
-        let error = named_runtime_archive("rpi-pico2-w", "rp2350", None, Some(folder.clone()))
+        let error = named_runtime_archive("rpi-pico2-w", "rp2350", None, Some((folder.clone(), FOLDER_ENV)))
             .expect_err("no archive for this board in the folder");
         let missing = folder.join("thumbv8m.main-none-eabi").join("rpi-pico2-w").join(ARCHIVE_NAME);
-        assert!(error.contains(FOLDER_ENV), "it names the variable: {error}");
+        assert!(error.contains(&format!("in the folder {FOLDER_ENV} names")), "it names the variable: {error}");
         assert!(error.contains(&missing.display().to_string()), "and the path: {error}");
         assert!(error.contains("Nothing else was looked at"), "and looks nowhere else: {error}");
+
+        let named_by_option = crate::folders::RUNTIME_SUPPORT_DIR;
+        let error = named_runtime_archive("rpi-pico2-w", "rp2350", None, Some((folder.clone(), named_by_option)))
+            .expect_err("no archive for this board in the folder");
+        assert!(
+            error.contains(&format!("in the folder {named_by_option} names")),
+            "a folder a command line names is named by its option: {error}"
+        );
+    }
+
+    /// **THE FOLDER A COMMAND LINE NAMES OUTRANKS THE ONE THE VARIABLE NAMES**, and the variable
+    /// still names one when no folder is given. Each comes with the name a refusal gives it.
+    #[test]
+    fn the_folder_a_command_line_names_outranks_the_variables() {
+        let given = Path::new("given");
+        let variable = || Some(std::ffi::OsString::from("variable"));
+        assert_eq!(
+            named_folder(Some(given), variable()),
+            Some((given.to_path_buf(), crate::folders::RUNTIME_SUPPORT_DIR))
+        );
+        assert_eq!(named_folder(None, variable()), Some((PathBuf::from("variable"), FOLDER_ENV)));
+        assert_eq!(named_folder(None, None), None);
     }
 
     /// **ONE LAYOUT.** The folder the SDK names and the one beside the executable are read by the

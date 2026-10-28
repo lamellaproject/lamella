@@ -148,14 +148,19 @@ $Assemblies = @(
     # converges on that shape and folding Analog would be a deviation dressed as convergence.
     # References only corlib: these sources name `System.IDisposable` and nothing else.
     @{ name = 'System.Device.Analog';                  references = @() },
-    # It references System.Device.Analog and not the other way round: the analog controller it offers
-    # over the ADC seam is a System.Device.Analog.AnalogController, and the dotnet/iot-shaped surface
-    # a portable program references depends on nothing of ours.
-    @{ name = 'Lamella.Hardware';                      references = @('System.Device.Analog') },
     # `System.Device.Pwm`'s sources build INTO this assembly and it gets no assembly of its own:
     # upstream ships `PwmChannel` inside `System.Device.Gpio.dll`. The namespace is unchanged;
     # only the assembly is.
     @{ name = 'System.Device.Gpio';                    references = @(); extraSources = @('System.Device.Pwm') },
+    # The boardless facts: what `Lamella.Hardware.TargetBoard` asks of the board a program was built
+    # for, in a build that names none. Every board's facts assembly has this same name and these same
+    # members, and a build for a board takes the board's in this one's place, as it takes the board's
+    # family build of System.Device.Gpio. References only corlib.
+    @{ name = 'Lamella.Hardware.Facts';                references = @() },
+    # `TargetBoard`, compiled once against the facts' fixed name. It hands out the standard GPIO, I2C,
+    # SPI and analog classes, so it references both of their assemblies, and neither references it:
+    # the dotnet/iot-shaped surface a portable program references depends on nothing of ours.
+    @{ name = 'Lamella.Hardware';                      references = @('System.Device.Gpio', 'System.Device.Analog', 'Lamella.Hardware.Facts') },
     @{ name = 'System.Device.Model';                   references = @() },
     @{ name = 'System.Net.NetworkInformation';         references = @() },
     # Full .NET's own assembly name, bare and unprefixed, because these are full .NET's types in full
@@ -372,7 +377,7 @@ foreach ($familyFile in $familyFiles) {
     $dir = Join-Path $out "families/$family"
     New-Item -ItemType Directory -Force $dir | Out-Null
     $dll = Join-Path $dir 'System.Device.Gpio.dll'
-    $refs = @("/reference:$corlibDll", "/reference:$(Join-Path $out 'Lamella.Hardware.dll')")
+    $refs = @("/reference:$corlibDll")
     Write-Host "System.Device.Gpio for $family ($($src.Count) sources) -> $dll"
     Invoke-Lcsc $src @langArg @familyDefineArg @refs /target:library "/out:$dll" /debug-
     $exit = $LASTEXITCODE
@@ -407,4 +412,4 @@ Write-Host ''
 # What this RUN produced, not what the directory holds: the two differ whenever a previous run
 # wrote something this one does not, so a count over the directory can report a stale file as a
 # fresh one.
-Write-Host "Done. $($built.Count) assemblies built into $out ($((Get-ChildItem $out -Filter *.dll).Count) .dll files there, board assemblies included)"
+Write-Host "Done. $($built.Count) assemblies built into $out ($((Get-ChildItem $out -Filter *.dll).Count) .dll files there)"

@@ -4,13 +4,13 @@
 # channel as an ARRAY ELEMENT rather than through one indexed register. Its PORT sits at
 # 0x41000000 where theirs sit at 0x41004400. Nothing about it can be read off a D21.
 #
-# THE TWO ROSTER BOARDS ARE DIFFERENT PACKAGES AND THEIR DOCUMENTS ARE DIFFERENT TABLES.
+# The two roster boards are different packages and their documents are different tables.
 # DS60001479 splits its tables on TWO axes -- C20 against C21, and N against E/G/J -- so it carries
 # four peripheral summaries and four mux tables. The J board reads Table 12-3 and Table 6-2; the N
 # board reads Table 12-1 and Table 6-1. Reading the first table of each kind gives the N's map and
 # would apply it to the J.
 #
-# AND THE TWO PACKAGES DO NOT CARRY THE SAME SILICON. Compared row by row rather than spot-checked:
+# And the two packages do not carry the same silicon. Compared row by row rather than spot-checked:
 #
 #     the two tables AGREE on   MCLK, GCLK, PORT, and SERCOM0..5 in every column
 #     they DISAGREE on          the N has SERCOM6 and SERCOM7 -- EIGHT instances, not six, on a

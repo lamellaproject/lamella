@@ -1,17 +1,17 @@
 # The SAMG55 Power Management Controller: the peripheral clock gates. Offsets are PMC-base-relative;
 # the base lives in ../instances.toml.
 #
-# ONE NUMBER GATES AND INTERRUPTS. On this architecture the peripheral id from Table 9-1 is both
+# One number gates and interrupts. On this architecture the peripheral id from Table 9-1 is both
 # the bit position in PMC_PCER0 and the NVIC line, which is why ../instances.toml carries a single
 # `pid` field where the SAM D/L families carry a mask register, a bit and an IRQ separately.
 #
-# TWO BANKS, AND THIS PART ONLY NEEDS THE FIRST. PCER0/PCDR0/PCSR0 cover ids 0..31 and
+# Two banks, and this part only needs the first. PCER0/PCDR0/PCSR0 cover ids 0..31 and
 # PCER1/PCDR1/PCSR1 cover 32..63. The highest id this part defines is 29 (ADC), so every gate a
 # consumer here will ever set is in bank 0. Bank 1 is transcribed because it is part of the offset
 # set a reader checks an address against, and because a family that later adds an id above 31 would
 # otherwise find the register undeclared.
 #
-# A FLEXCOM's GATE CANNOT BE SET FROM THIS TABLE TODAY, AND THAT IS DELIBERATE. The bit is
+# A FLEXCOM's gate cannot be set from this table today, and that is deliberate. The bit is
 # the peripheral id, and this datasheet gives two different ids for six of the eight FLEXCOM
 # instances -- see ../instances.toml, which states both readings and withholds the field. PIOA,
 # PIOB and the rest are unaffected: their ids are agreed by both sources.

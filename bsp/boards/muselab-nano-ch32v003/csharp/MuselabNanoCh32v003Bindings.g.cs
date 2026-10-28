@@ -6,7 +6,7 @@
 // lines, and the carrier identity. The board's facts are stated in board.toml.
 namespace Lamella.Generated
 {
-    public sealed class MuselabNanoCh32v003Bindings
+    internal sealed class MuselabNanoCh32v003Bindings
     {
         private MuselabNanoCh32v003Bindings() { }
 

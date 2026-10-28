@@ -5,10 +5,10 @@
 #     SAM D20/DA1/HA1/R21   0x41004400      SAM C21   0x41000000
 #     SAM L21               0x40002800      SAM L22   0x41006000
 #
-# WARNING: THIS DATASHEET MISPRINTS ONE SERCOM BASE, AND IT IS THE KIND THAT FAILS SILENTLY.
+# Warning: this datasheet misprints one SERCOM base, and it is the kind that fails silently.
 # Table 12-1 gives SERCOM2 as 0x42000A00. Every other SERCOM in that table strides by 0x400 --
 # 0x42000400, 0x42000800, then 0x42000A00, then 0x42001000 -- which is a 0x200 step followed by a
-# 0x600 one. Figure 8-1 (Product Mapping), READ AS A PICTURE, gives Bridge C as SERCOM0 0x42000400,
+# 0x600 one. Figure 8-1 (Product Mapping), read as a picture, gives Bridge C as SERCOM0 0x42000400,
 # SERCOM1 0x42000800, SERCOM2 0x42000C00, SERCOM3 0x42001000: a uniform 0x400 stride, and the only
 # value that puts SERCOM3 exactly one stride above SERCOM2. instances.toml takes 0x42000C00.
 #

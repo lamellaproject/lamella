@@ -792,6 +792,7 @@ pub fn write_executable_arm_thumb_with_heap(
 /// No `.symtab` is emitted. DWARF already carries the function names and addresses a source-level
 /// debugger needs, and a PARTIAL symbol table would be worse than none on ARM: correct disassembly
 /// depends on the `$t`/`$a` mapping symbols, which are per-object locals the linker does not retain.
+/// [`write_debuggable_executable_with_objects`] names data objects, and only those.
 pub fn write_debuggable_executable(
     machine: Machine,
     text: &[u8],
@@ -799,6 +800,42 @@ pub fn write_debuggable_executable(
     text_addr: u32,
     entry_thumb: bool,
     debug: &[(&str, &[u8])],
+) -> Vec<u8> {
+    write_debuggable_executable_with_objects(machine, text, entry_offset, text_addr, entry_thumb, debug, &[])
+}
+
+/// A data object a debuggable executable names: its symbol, the section that describes the memory
+/// it lives in, where that memory is, and how many bytes the object covers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NamedObject<'a> {
+    /// The symbol's name, as a reader looks it up.
+    pub name: &'a str,
+    /// The name of the section that describes its memory, a section of its own.
+    pub section: &'a str,
+    /// The address of its first byte in the target's memory.
+    pub address: u32,
+    /// How many bytes it covers; 0 where its producer gave it no size.
+    pub size: u32,
+}
+
+/// [`write_debuggable_executable`], naming `objects` as well: each is a global `STT_OBJECT` in a
+/// `.symtab`, defined in a `SHT_NOBITS` section of its own that describes its memory, so a reader
+/// takes its address and size from the file as it would from any other linker's
+/// ([`symbols::object`]).
+///
+/// The loaded image is unaffected: no program header is added, so the load segment is still
+/// `.text` alone, and an object's section carries no bytes in the file. The table names the objects
+/// and nothing else, and each lives in memory `.text` does not cover, so no instruction gains a
+/// symbol that would change how it is disassembled. With no objects the file is exactly the one
+/// [`write_debuggable_executable`] writes.
+pub fn write_debuggable_executable_with_objects(
+    machine: Machine,
+    text: &[u8],
+    entry_offset: u32,
+    text_addr: u32,
+    entry_thumb: bool,
+    debug: &[(&str, &[u8])],
+    objects: &[NamedObject<'_>],
 ) -> Vec<u8> {
     const PHDR_SIZE: u32 = 32;
     let text_off = EHDR_SIZE + PHDR_SIZE;
@@ -810,7 +847,13 @@ pub fn write_debuggable_executable(
         .iter()
         .map(|(n, _)| add_name(&mut shstrtab, n))
         .collect();
+    let object_names: Vec<u32> = objects.iter().map(|object| add_name(&mut shstrtab, object.section)).collect();
+    let table_names =
+        (!objects.is_empty()).then(|| (add_name(&mut shstrtab, ".symtab"), add_name(&mut shstrtab, ".strtab")));
     let shstrtab_name = add_name(&mut shstrtab, ".shstrtab");
+    let first_object = 2 + debug.len();
+    let symtab_index = first_object + objects.len();
+    let section_count = symtab_index + if table_names.is_some() { 2 } else { 0 } + 1;
 
     let mut out: Vec<u8> = Vec::new();
     out.extend_from_slice(&[0x7f, b'E', b'L', b'F']);
@@ -828,8 +871,8 @@ pub fn write_debuggable_executable(
     push_u16(&mut out, PHDR_SIZE as u16);
     push_u16(&mut out, 1);
     push_u16(&mut out, SHDR_SIZE);
-    push_u16(&mut out, debug.len() as u16 + 3);
-    push_u16(&mut out, debug.len() as u16 + 2);
+    push_u16(&mut out, section_count as u16);
+    push_u16(&mut out, (section_count - 1) as u16);
     push_u32(&mut out, 1);
     push_u32(&mut out, text_off);
     push_u32(&mut out, text_addr);
@@ -847,6 +890,20 @@ pub fn write_debuggable_executable(
         debug_at.push(at);
         out.extend_from_slice(data);
     }
+    let mut symtab: Vec<u8> = alloc::vec![0u8; SYM_SIZE];
+    let mut strtab: Vec<u8> = alloc::vec![0];
+    for (i, object) in objects.iter().enumerate() {
+        let st_name = add_name(&mut strtab, object.name);
+        symtab.extend_from_slice(&sym_entry(st_name, object.address, object.size, 0x11, (first_object + i) as u16));
+    }
+    let tables_at = table_names.map(|_| {
+        let symtab_off = align4(out.len() as u32);
+        pad_to(&mut out, symtab_off);
+        out.extend_from_slice(&symtab);
+        let strtab_off = out.len() as u32;
+        out.extend_from_slice(&strtab);
+        (symtab_off, strtab_off)
+    });
     let shstrtab_off = align4(out.len() as u32);
     pad_to(&mut out, shstrtab_off);
     out.extend_from_slice(&shstrtab);
@@ -880,6 +937,55 @@ pub fn write_debuggable_executable(
                 addr: 0,
                 offset: debug_at[i],
                 size: data.len() as u32,
+                link: 0,
+                info: 0,
+                addralign: 1,
+                entsize: 0,
+            },
+        );
+    }
+    if let (Some((symtab_name, strtab_name)), Some((symtab_off, strtab_off))) = (table_names, tables_at) {
+        for (i, object) in objects.iter().enumerate() {
+            push_shdr(
+                &mut out,
+                &Shdr {
+                    name: object_names[i],
+                    typ: 8,
+                    flags: 0x1 | 0x2,
+                    addr: object.address,
+                    offset: symtab_off,
+                    size: object.size,
+                    link: 0,
+                    info: 0,
+                    addralign: 4,
+                    entsize: 0,
+                },
+            );
+        }
+        push_shdr(
+            &mut out,
+            &Shdr {
+                name: symtab_name,
+                typ: 2,
+                flags: 0,
+                addr: 0,
+                offset: symtab_off,
+                size: symtab.len() as u32,
+                link: (symtab_index + 1) as u32,
+                info: 1,
+                addralign: 4,
+                entsize: SYM_SIZE as u32,
+            },
+        );
+        push_shdr(
+            &mut out,
+            &Shdr {
+                name: strtab_name,
+                typ: 3,
+                flags: 0,
+                addr: 0,
+                offset: strtab_off,
+                size: strtab.len() as u32,
                 link: 0,
                 info: 0,
                 addralign: 1,
@@ -2293,6 +2399,85 @@ mod tests {
             read_archive(b"not an ar").unwrap_err(),
             ElfError::NotArchive
         );
+    }
+
+    /// FNV-1a over `bytes`, 64 bits: enough to pin a file's every byte in a test.
+    fn fnv1a64(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, byte| (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3))
+    }
+
+    /// **A DEBUGGABLE EXECUTABLE NAMING NO OBJECT IS THE FILE IT WAS BEFORE OBJECTS COULD BE NAMED**,
+    /// byte for byte: the length and the hash are this writer's output on `main` `e25fd9d984`, so
+    /// every debug ELF built without a named object, and every gate comparing two of them, is
+    /// unchanged.
+    #[test]
+    fn a_debuggable_executable_naming_no_object_is_unchanged() {
+        let text = [0x2a, 0x20, 0x70, 0x47, 0x00, 0xBF];
+        let info = [0x11u8; 7];
+        let line = [0x33u8; 10];
+        let exe = write_debuggable_executable(
+            Machine::Arm,
+            &text,
+            2,
+            0x1000_0000,
+            true,
+            &[(".debug_info", &info), (".debug_line", &line)],
+        );
+        assert_eq!((exe.len(), fnv1a64(&exe)), (356, 0x7648_998f_e6cd_4c7f));
+        let same = write_debuggable_executable_with_objects(
+            Machine::Arm,
+            &text,
+            2,
+            0x1000_0000,
+            true,
+            &[(".debug_info", &info), (".debug_line", &line)],
+            &[],
+        );
+        assert_eq!(same, exe, "naming nothing writes the same file");
+    }
+
+    /// **A NAMED OBJECT IS FOUND WHERE IT LIVES, AND THE IMAGE IS UNCHANGED**: a reader takes its
+    /// address and size from the symbol table, its section describes its memory and carries no bytes,
+    /// the flattened image is the one written without it, and no function symbol appears for a
+    /// debugger to name a frame by.
+    #[test]
+    fn a_named_object_is_found_where_it_lives_and_the_image_is_unchanged() {
+        let text = [0x2a, 0x20, 0x70, 0x47, 0x00, 0xBF];
+        let info = [0x11u8; 7];
+        let debug: &[(&str, &[u8])] = &[(".debug_info", &info)];
+        let ring = NamedObject { name: "__lamella_console_log", section: ".lamella_console_log", address: 0x2000_8000, size: 16 + 64 };
+        let plain = write_debuggable_executable(Machine::Arm, &text, 0, 0x1000_0000, true, debug);
+        let named = write_debuggable_executable_with_objects(Machine::Arm, &text, 0, 0x1000_0000, true, debug, &[ring]);
+
+        assert_eq!(
+            symbols::object(&named, "__lamella_console_log"),
+            Some(symbols::DataObject { address: 0x2000_8000, size: 80 })
+        );
+        assert_eq!(symbols::object(&plain, "__lamella_console_log"), None);
+        let section = section_headers(&named)
+            .into_iter()
+            .find(|header| header.name == Some(".lamella_console_log"))
+            .expect("the object's own section");
+        assert_eq!((section.kind, section.flags, section.address, section.size), (8, 0x3, 0x2000_8000, 80));
+
+        let (image, before) = (flat_image(&named).expect("flattens"), flat_image(&plain).expect("flattens"));
+        assert_eq!((image.base, &image.bytes), (before.base, &before.bytes), "the loaded bytes are unchanged");
+        assert_eq!(load_segments(&named).expect("segments").len(), 1);
+        assert!(symbols::functions(&named).is_empty(), "no function symbol for a debugger to take");
+    }
+
+    /// Several objects are each named, each in a section of its own.
+    #[test]
+    fn several_named_objects_are_each_found() {
+        let objects = [
+            NamedObject { name: "first", section: ".first", address: 0x2000_0000, size: 4 },
+            NamedObject { name: "second", section: ".second", address: 0x2000_0100, size: 0 },
+        ];
+        let named = write_debuggable_executable_with_objects(Machine::Arm, &[0u8; 4], 0, 0, true, &[], &objects);
+        assert_eq!(symbols::object(&named, "first"), Some(symbols::DataObject { address: 0x2000_0000, size: 4 }));
+        assert_eq!(symbols::object(&named, "second"), Some(symbols::DataObject { address: 0x2000_0100, size: 0 }));
+        let names: Vec<_> = section_headers(&named).into_iter().filter_map(|header| header.name).collect();
+        assert_eq!(names, ["", ".text", ".first", ".second", ".symtab", ".strtab", ".shstrtab"]);
     }
 
     #[test]

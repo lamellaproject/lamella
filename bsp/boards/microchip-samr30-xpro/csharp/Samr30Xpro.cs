@@ -5,7 +5,7 @@ using Lamella.Hardware;
 
 namespace Lamella.Boards.Microchip
 {
-    public sealed class Samr30Xpro
+    internal sealed class Samr30Xpro
     {
         /// <summary>The wire identity this board advertises (lamella_wire::product_model).</summary>
         public static readonly int BoardModel = MicrochipSamr30XproBindings.BOARD_MODEL;
@@ -26,7 +26,7 @@ namespace Lamella.Boards.Microchip
             Samr30GpioDriver.LogicalPin(MicrochipSamr30XproBindings.BUTTON0_PORT_BASE, MicrochipSamr30XproBindings.BUTTON0_PIN);
 
         /// <summary>The mode the user button wants.</summary>
-        /// <remarks>REQUIRED HERE RATHER THAN MERELY SAFE, WHICH IS NOT TRUE OF THE SIBLING KITS.
+        /// <remarks>Required here rather than merely safe, which is not true of the sibling kits.
         /// The SAM R21 and SAM L21 Xplained Pro guides state the button's polarity and stop, leaving
         /// an external pull-up an open question that <see cref="PinMode.InputPullUp"/> happens to
         /// answer correctly either way. THIS guide closes it: "There is no pull-up resistor connected
@@ -50,7 +50,7 @@ namespace Lamella.Boards.Microchip
         private static GpioDriver MakeGpio() { return new Samr30GpioDriver(); }
 
         /// <summary>The family PORT driver this board bound.</summary>
-        /// <remarks>THE DRIVER SPANS ALL THREE PORT GROUPS AND THIS PACKAGE BONDS PART OF TWO. A pin
+        /// <remarks>The driver spans all three port groups and this package bonds part of two. A pin
         /// number the package does not carry is addressable and connected to nothing, which is why
         /// the constants above name only pads this board's own guide names. Four of the part's pads
         /// -- PA10, PA11, PB16 and PB17 -- are wired to the transceiver's control inputs and cannot

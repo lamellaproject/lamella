@@ -6,7 +6,7 @@
 // lines, and the carrier identity. The board's facts are stated in board.toml.
 namespace Lamella.Generated
 {
-    public sealed class ArduinoPortentaH7Bindings
+    internal sealed class ArduinoPortentaH7Bindings
     {
         private ArduinoPortentaH7Bindings() { }
 

@@ -5,7 +5,7 @@
 // instance bases live in Same54Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Same54SercomI2cMasterLayout
+    internal sealed class Same54SercomI2cMasterLayout
     {
         private Same54SercomI2cMasterLayout() { }
 

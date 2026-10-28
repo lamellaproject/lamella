@@ -4,21 +4,21 @@
 #
 # Two facts, and each `sources` entry names the one it backs.
 #
-# WHY THE ERASED VALUE IS A BLOCK FACT AND NOT A PART FACT. It is a property of the CONTROLLER, not
+# Why the erased value is a block fact and not a part fact. It is a property of the CONTROLLER, not
 # of a die: every STM32L0 category erases to zero -- 1, 2, 3 and 5, L0x1 and L0x3 alike -- and it
 # never varies by package, density or ordering code, which is what a parts row is for. Stated once
 # per block, a part inherits it by naming its block; and if the family ever splits, that is a NEW
 # block rather than a per-part override, so the split is visible rather than hidden in one row of
 # six.
 #
-# AND IT IS REQUIRED RATHER THAN DEFAULTED. Most flash controllers erase to ones, so a default of
+# And it is required rather than defaulted. Most flash controllers erase to ones, so a default of
 # `0xffffffff` would be silently wrong on exactly the families where the value matters. The reader
 # refuses a flash block that omits it.
 #
-# THIS FAMILY ERASES TO ZERO, WHICH INVERTS THE USUAL BLANK CHECK. A correctly erased part reads as
+# This family erases to zero, which inverts the usual blank check. A correctly erased part reads as
 # full and a full part reads as erased.
 #
-# THE WRITE UNIT IS ONE 32-BIT WORD, AND THE HALF-PAGE MODE DOES NOT CHANGE IT. RM0377 offers two
+# The write unit is one 32-bit word, and the half-page mode does not change it. RM0377 offers two
 # ways to program this array -- a word at a time, or sixteen words as one half-page -- and the
 # half-page is a THROUGHPUT mode with conditions attached: the address must be half-page aligned and
 # all sixteen words must fall in the same half-page. A consumer placing a value that has to appear

@@ -4,17 +4,17 @@
 # EXTICR bank, because that is what an interrupt binding needs and a partial table that says which
 # part it is beats a complete one nobody checked.
 #
-# IT IS A SEPARATE PERIPHERAL FROM EXTI AND THAT IS THE WHOLE REASON IT HAS ITS OWN FILE. EXTI
+# It is a separate peripheral from EXTI and that is the whole reason it has its own file. EXTI
 # decides what counts as an edge and which vector it reaches; SYSCFG decides WHICH PORT'S pin drives
 # the line. They sit at adjacent base addresses, 0x40013800 and 0x40013C00, which makes them easy to
 # conflate and gives a wrong guess a plausible-looking address.
 #
-# ONLY THIS ONE IS CLOCKED. EXTI has no enable bit in RCC; SYSCFG is gated at RCC_APB2ENR bit 14.
+# Only this one is clocked. EXTI has no enable bit in RCC; SYSCFG is gated at RCC_APB2ENR bit 14.
 # Writing EXTICR with that clock off loses the write silently, and because the reset value of every
 # EXTICR field is zero -- which selects port A rather than nothing -- the line stays bound to a port
 # A pin. The failure presents as an interrupt from the wrong pin, not as no interrupt.
 #
-# FOUR REGISTERS, FOUR LINES EACH, FOUR BITS PER LINE. EXTICR1 covers lines 0 to 3, EXTICR2 lines 4
+# Four registers, four lines each, four bits per line. EXTICR1 covers lines 0 to 3, EXTICR2 lines 4
 # to 7, EXTICR3 lines 8 to 11, EXTICR4 lines 12 to 15. Only the sixteen GPIO lines are selectable;
 # EXTI's remaining lines are internal sources and reach it without passing through here.
 

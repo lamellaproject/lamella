@@ -4,18 +4,18 @@
 # Xplained Pro standard extension header on any Xplained Pro MCU board". Which pad a signal reaches
 # is the HOST's fact and lives in that host's `[[connectors]]` row.
 #
-# SPI IS THE ONLY HOST INTERFACE, and the guide says so outright. The UART and I2C lines this
+# SPI is the only host interface, and the guide says so outright. The UART and I2C lines this
 # connector carries are development and debug paths, not the way a program talks to the radio -- and
 # both can be physically separated from the host by removing resistors (R117/R118 for the UART,
 # R107/R108 for the I2C). A driver that reached for the UART would be using a debug connector.
 #
-# THE TWO LEDS HAVE NO HOST PIN AT ALL. There is one dual green/red LED and the MODULE drives it,
+# The two LEDs have no host pin at all. There is one dual green/red LED and the MODULE drives it,
 # from its own GPIO 5 and GPIO 6. Nothing on the extension header reaches it, so no row here offers
 # one and no constant is emitted for it -- the same treatment the Pico W's LED and the Opta's four
 # faceplate LEDs have, and for the same reason: a property that compiles and does nothing is worse
 # than one that does not compile.
 #
-# AND THERE IS A SECOND SLAVE ON THIS BOARD THAT IS NOT THE RADIO. An ATECC508A CryptoAuthentication
+# And there is a second slave on this board that is not the radio. An ATECC508A CryptoAuthentication
 # device sits on the SAME I2C lines as the module, with the host as master. Reaching it is a
 # resistor change rather than a software choice on a stock board, which is why it is recorded and
 # not bound.
@@ -42,7 +42,7 @@ notes = [
 
 # --- the bus -----------------------------------------------------------------------------------
 #
-# ONE SPI BUS, AND IT TAKES THE PREFERRED SELECT. The standard asks that SPI_SS_A preferably not be
+# One SPI bus, and it takes the preferred select. The standard asks that SPI_SS_A preferably not be
 # connected to anything else, and this board honors that: its SPI_SSN is on pin 15, leaving
 # SPI_SS_B free -- which is exactly why CHIP_EN can have it.
 

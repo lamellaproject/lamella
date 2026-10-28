@@ -1,7 +1,7 @@
 # BLOCK layout: the RP2040 single-cycle IO block's user-bank GPIO registers -- the CPU's direct
 # pin drive. Offsets are instance-base-relative (the `sio` instance row at 0xd0000000).
 #
-# THESE OFFSETS ARE NOT THE RP2350's AND THE TWO MUST NEVER BE SHARED. The RP2350 interleaves a
+# These offsets are not the RP2350's and the two must never be shared. The RP2350 interleaves a
 # second bank (GP32..47) into the same map, which moves every register after GPIO_IN: its GPIO_OE
 # is at 0x30 where this part's is at 0x20, and this part's 0x30 is GPIO_HI_OUT -- the QSPI bank.
 # A driver built on the sibling's offsets would drive the flash pins while asking for an output

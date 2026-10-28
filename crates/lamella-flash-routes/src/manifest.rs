@@ -13,11 +13,14 @@ pub struct Manifest {
     pub schema: u64,
     /// `"flash-image"`. The sidecar carrier holds other kinds; this reads one.
     pub kind: String,
+    /// The execution model the image runs under: [`NATIVE`] for a linked image, [`INTERPRETER`] for
+    /// one an interpreter runs. Required in schema 1, written third.
+    pub model: String,
     /// The catalog row the image was built for.
     pub board: String,
-    /// `"elf"` or `"bin"`.
+    /// `"elf"` or `"bin"`, or Lamella's own `"lmli"`, the image its firmware runs.
     pub format: String,
-    /// The address the bytes belong at -- present for `bin`, absent for `elf`.
+    /// The address the bytes belong at -- present for `bin`, absent for `elf` and `lmli`.
     pub base: Option<u32>,
     /// The digest of the artifact bytes as shipped, lowercase hex.
     pub sha256: String,
@@ -43,6 +46,13 @@ pub struct Manifest {
 /// were absent is how a tool honors half a contract. The refusal names the number so the reader can
 /// tell "too new" from "malformed".
 pub(crate) const SCHEMA: u64 = 1;
+
+/// The execution model of an image whose code was compiled ahead of time and linked: every image
+/// Lamella RHU writes, and every one `lamella build --format` writes.
+pub const NATIVE: &str = "native";
+
+/// The execution model of an image an interpreter runs.
+pub const INTERPRETER: &str = "interpreter";
 
 /// Where the sidecar for `image` lives.
 ///
@@ -72,6 +82,102 @@ pub fn read(image: &Path) -> Result<Option<Manifest>, String> {
     parse(&text).map(Some).map_err(|why| format!("{}: {why}", path.display()))
 }
 
+/// The record for a linked ELF a toolchain wrote: `shipped` is the file as written, and `producer`
+/// names what wrote it. It carries no `base`, because an ELF states its own addresses.
+#[must_use]
+pub fn for_elf(board: &str, shipped: &[u8], producer: &str) -> Manifest {
+    of_artifact(board, "elf", None, shipped, producer)
+}
+
+/// The record for flat bytes a toolchain wrote, which belong at `base`: `shipped` is the file as
+/// written, and `producer` names what wrote it.
+#[must_use]
+pub fn for_bin(board: &str, base: u32, shipped: &[u8], producer: &str) -> Manifest {
+    of_artifact(board, "bin", Some(base), shipped, producer)
+}
+
+/// The record for an image Lamella's firmware runs, a `.lmli`, which `dotnet publish` writes for a
+/// `lamella1.0` program when `LamellaPublishAot` is false: `shipped` is the file as written, and
+/// `producer` names what wrote it. Lamella's own format: the firmware places the image, so it
+/// carries no `base`, and its model is [`INTERPRETER`].
+#[must_use]
+pub fn for_lmli(board: &str, shipped: &[u8], producer: &str) -> Manifest {
+    Manifest { model: INTERPRETER.to_owned(), ..of_artifact(board, LMLI, None, shipped, producer) }
+}
+
+/// The format word of an image Lamella's firmware runs.
+pub const LMLI: &str = "lmli";
+
+/// The record for `shipped` in `format`, the one shape every format shares.
+fn of_artifact(board: &str, format: &str, base: Option<u32>, shipped: &[u8], producer: &str) -> Manifest {
+    Manifest {
+        schema: SCHEMA,
+        kind: "flash-image".to_owned(),
+        model: NATIVE.to_owned(),
+        board: board.to_owned(),
+        format: format.to_owned(),
+        base,
+        sha256: hex(lamella_pe::sha256::sha256(shipped)),
+        bytes: shipped.len() as u64,
+        producer: Some(producer.to_owned()),
+        elf: None,
+        console_channel: None,
+        log_channel: None,
+    }
+}
+
+/// `manifest` as the text a reader parses: one JSON object, its fields in the record's order and
+/// each optional one only when it is present, with `base` spelled as eight hex digits.
+#[must_use]
+pub fn render(manifest: &Manifest) -> String {
+    let quoted = |text: &str| serde_json::Value::String(text.to_owned()).to_string();
+    let mut fields = vec![
+        ("schema", manifest.schema.to_string()),
+        ("kind", quoted(&manifest.kind)),
+        ("model", quoted(&manifest.model)),
+        ("board", quoted(&manifest.board)),
+        ("format", quoted(&manifest.format)),
+    ];
+    if let Some(base) = manifest.base {
+        fields.push(("base", quoted(&format!("{base:#010x}"))));
+    }
+    fields.push(("sha256", quoted(&manifest.sha256)));
+    fields.push(("bytes", manifest.bytes.to_string()));
+    for (key, value) in [
+        ("producer", &manifest.producer),
+        ("elf", &manifest.elf),
+        ("console_channel", &manifest.console_channel),
+        ("log_channel", &manifest.log_channel),
+    ] {
+        if let Some(value) = value {
+            fields.push((key, quoted(value)));
+        }
+    }
+    let lines: Vec<String> = fields.iter().map(|(key, value)| format!("  \"{key}\": {value}")).collect();
+    format!("{{\n{}\n}}\n", lines.join(",\n"))
+}
+
+/// Writes `manifest` beside `image`, where [`read`] finds it, and returns where that is.
+///
+/// The text goes to a file of its own first and then takes the record's name, so a write that
+/// stops part way leaves no half record: a present record that does not parse stops every write of
+/// the image beside it.
+///
+/// # Errors
+/// A file that could not be written or renamed, naming the path.
+pub fn write(image: &Path, manifest: &Manifest) -> Result<PathBuf, String> {
+    let path = path_for(image);
+    let mut partial = path.clone().into_os_string();
+    partial.push(".partial");
+    let partial = PathBuf::from(partial);
+    std::fs::write(&partial, render(manifest)).map_err(|error| format!("write {}: {error}", partial.display()))?;
+    std::fs::rename(&partial, &path).map_err(|error| {
+        let _ = std::fs::remove_file(&partial);
+        format!("write {}: {error}", path.display())
+    })?;
+    Ok(path)
+}
+
 /// The record `text` states.
 ///
 /// # Errors
@@ -99,10 +205,24 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
              of another kind is not this verb's to act on."
         ));
     }
+    let model = object.get("model").and_then(serde_json::Value::as_str).ok_or(
+        "no `model` string. A schema 1 record states the execution model its image runs under, \
+         `native` or `interpreter`.",
+    )?;
+    if model != NATIVE && model != INTERPRETER {
+        return Err(format!("model {model:?}, and the record defines `{NATIVE}` and `{INTERPRETER}`"));
+    }
+    let model = model.to_owned();
 
     let format = string(object, "format")?;
-    if format != "elf" && format != "bin" {
-        return Err(format!("format {format:?}, and the record defines `elf` and `bin` only"));
+    if format != "elf" && format != "bin" && format != LMLI {
+        return Err(format!("format {format:?}, and the record defines `elf`, `bin` and `{LMLI}` only"));
+    }
+    if format == LMLI && model != INTERPRETER {
+        return Err(format!(
+            "format `{LMLI}` with model {model:?}. A `{LMLI}` image is the one Lamella's firmware runs, so its \
+             model is `{INTERPRETER}`."
+        ));
     }
 
     let base = match object.get("base") {
@@ -127,6 +247,12 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
                     .to_owned(),
             );
         }
+        (LMLI, Some(_)) => {
+            return Err(format!(
+                "format `{LMLI}` with a `base`. Lamella's firmware places the image it runs, so an address \
+                 beside it is a claim nothing reads."
+            ));
+        }
         _ => {}
     }
 
@@ -142,6 +268,7 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
     Ok(Manifest {
         schema,
         kind,
+        model,
         board: string(object, "board")?,
         format,
         base,
@@ -278,14 +405,78 @@ fn hex(digest: [u8; 32]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        attestation, check_board, check_identity, hex, parse, path_for, read, Manifest,
+        attestation, check_board, check_identity, for_bin, for_elf, hex, parse, path_for, read,
+        render, write, for_lmli, Manifest, INTERPRETER, NATIVE,
     };
     use std::path::Path;
+
+    /// **A RECORD THIS TREE WRITES READS BACK AS IT WAS WRITTEN**, through the reader every consumer
+    /// uses, and the bytes it describes pass the identity check a write makes.
+    #[test]
+    fn an_elf_record_this_tree_writes_reads_back_and_checks() {
+        let shipped = b"\x7fELF and the rest of an image";
+        let written = render(&for_elf("rpi-pico2", shipped, "lamella 0.2.0"));
+        let manifest = parse(&written).expect("the written record parses");
+        assert_eq!(manifest.board, "rpi-pico2");
+        assert_eq!(manifest.format, "elf");
+        assert_eq!(manifest.base, None);
+        assert_eq!(manifest.bytes, shipped.len() as u64);
+        assert_eq!(manifest.sha256, hex(lamella_pe::sha256::sha256(shipped)));
+        assert_eq!(manifest.producer.as_deref(), Some("lamella 0.2.0"));
+        assert_eq!(manifest.elf, None);
+        assert!(!written.contains("\"base\""), "{written}");
+        check_identity(&manifest, shipped, Some("elf")).expect("the bytes it describes");
+        assert!(check_identity(&manifest, b"other bytes", Some("elf")).is_err());
+    }
+
+    /// **A `bin` RECORD CARRIES ITS BASE**, spelled as eight hex digits as the other producer spells
+    /// it, and it reads back as the address it was given.
+    #[test]
+    fn a_bin_record_this_tree_writes_carries_its_base() {
+        let shipped = [0u8; 512];
+        let written = render(&for_bin("rpi-pico2", 0x1000_0000, &shipped, "lamella 0.2.0"));
+        assert!(written.contains("\"base\": \"0x10000000\""), "{written}");
+        let manifest = parse(&written).expect("the written record parses");
+        assert_eq!(manifest.format, "bin");
+        assert_eq!(manifest.base, Some(0x1000_0000));
+        check_identity(&manifest, &shipped, Some("bin")).expect("the bytes it describes");
+        let low = parse(&render(&for_bin("bbc-micro-bit-v2", 0, &shipped, "lamella 0.2.0"))).expect("parses");
+        assert_eq!(low.base, Some(0));
+    }
+
+    /// What the record quotes is escaped, so a name holding a quote or a backslash reads back whole.
+    #[test]
+    fn the_written_record_escapes_what_it_quotes() {
+        let producer = r#"lamella "dev" C:\tools"#;
+        let manifest = parse(&render(&for_elf("rpi-pico2", b"x", producer))).expect("parses");
+        assert_eq!(manifest.producer.as_deref(), Some(producer));
+    }
+
+    /// **THE RECORD IS WRITTEN WHERE IT IS READ FROM**, beside the image under the whole file name,
+    /// and a second write replaces the first rather than leaving either half behind.
+    #[test]
+    fn write_puts_the_record_where_read_finds_it() {
+        let dir = std::env::temp_dir().join(format!("lamella-manifest-write-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let image = dir.join("app.elf");
+        std::fs::write(&image, b"first").expect("the image");
+        let path = write(&image, &for_elf("rpi-pico2", b"first", "lamella 0.2.0")).expect("written");
+        assert_eq!(path, path_for(&image));
+        let first = read(&image).expect("readable").expect("present");
+        assert_eq!(first.bytes, 5);
+        write(&image, &for_elf("rpi-pico2-w", b"second!", "lamella 0.2.0")).expect("written again");
+        let second = read(&image).expect("readable").expect("present");
+        assert_eq!((second.board.as_str(), second.bytes), ("rpi-pico2-w", 7));
+        let left: Vec<_> = std::fs::read_dir(&dir).expect("listed").map(|entry| entry.expect("an entry").file_name()).collect();
+        assert_eq!(left.len(), 2, "the image and its record, nothing partial: {left:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A record for `bytes`, correct in every field, so a test can spoil exactly one.
     fn record_for(bytes: &[u8], format: &str, base: &str) -> String {
         format!(
-            "{{\"schema\":1,\"kind\":\"flash-image\",\"board\":\"bbc-micro-bit-v2\",\
+            "{{\"schema\":1,\"kind\":\"flash-image\",\"model\":\"native\",\"board\":\"bbc-micro-bit-v2\",\
              \"format\":\"{format}\",\"base\":{base},\"sha256\":\"{}\",\"bytes\":{},\
              \"producer\":\"lamella-aot\"}}",
             hex(lamella_pe::sha256::sha256(bytes)),
@@ -347,6 +538,39 @@ mod tests {
         assert!(why.contains("schema 2"), "{why}");
     }
 
+    /// **`model` IS REQUIRED, AND IT IS ONE OF TWO WORDS**: a record without it is refused rather
+    /// than read as either model, and the writer puts it third, after `kind`.
+    #[test]
+    fn the_model_is_required_and_written_third() {
+        let without = record_for(b"image", "elf", "null").replace("\"model\":\"native\",", "");
+        let why = parse(&without).unwrap_err();
+        assert!(why.contains("no `model`"), "{why}");
+        let other = record_for(b"image", "elf", "null").replace("\"native\"", "\"jit\"");
+        assert!(parse(&other).unwrap_err().contains("model \"jit\""));
+        let interpreted = record_for(b"image", "elf", "null").replace("\"native\"", "\"interpreter\"");
+        assert_eq!(parse(&interpreted).expect("an interpreter's record").model, INTERPRETER);
+        let rendered = render(&for_elf("rpi-pico2", b"image", "lamella 0.2.0"));
+        let keys: Vec<&str> = rendered.lines().filter_map(|line| line.trim().strip_prefix('"')?.split('"').next()).collect();
+        assert_eq!(&keys[..4], ["schema", "kind", "model", "board"], "{rendered}");
+        assert_eq!(parse(&rendered).expect("reads back").model, NATIVE);
+    }
+
+    /// **A `.lmli` HAS ITS RECORD TOO**, Lamella's own format: no base, since the firmware places it,
+    /// and the interpreter's model, which a record of that format may not deny.
+    #[test]
+    fn an_lmli_record_is_the_interpreters_and_carries_no_base() {
+        let rendered = render(&for_lmli("rpi-pico2", b"baked", "lamella 0.2.0"));
+        let manifest = parse(&rendered).expect("an lmli record reads");
+        assert_eq!((manifest.format.as_str(), manifest.model.as_str(), manifest.base), ("lmli", INTERPRETER, None));
+        assert!(!rendered.contains("\"base\""), "{rendered}");
+        let interpreted = record_for(b"image", "lmli", "null").replace("\"native\"", "\"interpreter\"");
+        assert!(parse(&interpreted).is_ok(), "{interpreted}");
+        let based = record_for(b"image", "lmli", "\"0x10000000\"").replace("\"native\"", "\"interpreter\"");
+        assert!(parse(&based).unwrap_err().contains("with a `base`"));
+        let native = record_for(b"image", "lmli", "null");
+        assert!(parse(&native).unwrap_err().contains("model \"native\""));
+    }
+
     #[test]
     fn a_record_of_another_kind_is_not_this_verbs_to_act_on() {
         let text = record_for(b"image", "elf", "null").replace("flash-image", "bundle");
@@ -386,6 +610,7 @@ mod tests {
         let text = r#"{
   "schema": 1,
   "kind": "flash-image",
+  "model": "native",
   "board": "mps2-an500",
   "format": "bin",
   "base": "0x00000000",

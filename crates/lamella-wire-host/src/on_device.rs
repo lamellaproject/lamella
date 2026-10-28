@@ -364,6 +364,24 @@ pub fn run_scheduled(
     watch: Watch,
 ) -> Result<RunEnd, String> {
     store_image(transport, session, target, image, say)?;
+    start_scheduled(transport, target, say, out, err, watch)
+}
+
+/// The second half of [`run_scheduled`], for a program [`store_image`] has stored on the board at
+/// the other end of `transport`: started under the board's scheduler without a reset, and followed
+/// as [`run_scheduled`] follows it. A front end that says something of its own once the program is
+/// on the board says it between the two.
+///
+/// # Errors
+/// A start the board did not make, in a sentence that names no command.
+pub fn start_scheduled(
+    transport: &mut impl Transport,
+    target: &str,
+    say: &mut dyn Write,
+    out: &mut dyn Write,
+    err: &mut dyn Write,
+    watch: Watch,
+) -> Result<RunEnd, String> {
     if let Err(failure) = start_execution(
         transport,
         RUN_SEQ,

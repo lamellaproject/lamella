@@ -3,7 +3,7 @@
 # The newer of the two members. It adds a third operating mode, a shared heater wait register, a
 # variant identifier, and THREE banks of measurement results where the BME680 holds one.
 #
-# WHAT A READER SHOULD TAKE FROM THIS FILE BEFORE ANY OTHER FACT IN IT: the identity value below is
+# What a reader should take from this file before any other fact in it: the identity value below is
 # the SAME value the BME680 answers, at the same register, in the same two-address range. Every
 # difference recorded in this file is invisible to the register this catalog identifies parts by.
 
@@ -24,7 +24,7 @@ notes = [
 #
 # Primary: every fact below is read from this part's own datasheet, the document `sources` cites.
 #
-# WHAT THIS TABLE DELIBERATELY DOES NOT STATE, so that a reader can tell a fact from a gap:
+# What this table deliberately does not state, so that a reader can tell a fact from a gap:
 #   - the temperature, pressure and humidity trimming parameters and their compensation arithmetic;
 #   - the gas resistance conversion and the heater resistance calculation;
 #   - the parallel-mode scheduling rules that decide which bank a result lands in;
@@ -40,7 +40,7 @@ validation = "none"
 
 # --- identity: the value this part shares with its sibling ----------------------------------------
 #
-# THE SET HAS ONE MEMBER AND IT IS THE SIBLING'S MEMBER. A reading of 0x61 at 0xD0 on an address in
+# The set has one member and it is the sibling's member. A reading of 0x61 at 0xD0 on an address in
 # this range establishes that the part is a BME688 OR a BME680, and no further read of this register
 # will ever separate the two. Everything below that differs between them is reachable only after
 # something other than the identity register has decided which part is being talked to.
@@ -57,7 +57,7 @@ notes = "The BME680 answers this same value at this same register. What separate
 # register, and this catalog's identity model has no way to say that a second register is what
 # settles a part's type.
 #
-# TWO REASONS IT IS A WEAKER DISCRIMINATOR THAN IT LOOKS, both from the vendor's own text:
+# Two reasons it is a weaker discriminator than it looks, both from the vendor's own text:
 #   - the BME680 datasheet describes no register at this address, so the value that would mean
 #     "a BME680" is not stated anywhere by the part it would name;
 #   - this datasheet records that early engineering samples, marked 688E HR1, shipped WITHOUT a
@@ -74,7 +74,7 @@ notes = "Answers 0x01 on this part. Early engineering samples marked 688E HR1 ha
 
 # --- the gas enable bit, which is NOT where the sibling puts it -----------------------------------
 #
-# THE SHARPEST DIFFERENCE IN THE FAMILY AND THE ONE WITH THE QUIETEST FAILURE. Both members put
+# The sharpest difference in the family and the one with the quietest failure. Both members put
 # this register at 0x71 and both spell the field `run_gas`. This part places it at bit 5 and the
 # BME680 places it at bit 4. The datasheets give the two bits different names, `run_gas_h` here and
 # `run_gas_l` there, which is the vendor acknowledging the move.

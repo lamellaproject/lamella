@@ -2,14 +2,14 @@
 # that are not registers at all -- which NVIC vector a line is delivered on, and how a line is
 # bound to a port.
 #
-# THE REGISTERS ARE A TWIN OF csp/stm32l053's AND THE PORT CODES ARE NOT, which is why this file
+# The registers are a twin of csp/stm32l053's and the port codes are not, which is why this file
 # exists rather than being shared. RM0367 states the EXTI registers once for the whole book, so
 # every offset here was re-read from it and agrees with the category 3 family's. The
 # SYSCFG_EXTICR encoding is where the two part: code 0100 selects PE[x], and category 3 has no
 # port E for it to select. A shared file would hand a category 3 consumer a port code it cannot
 # use, which is the quiet half of the same mistake as omitting it here.
 #
-# WHY A LINE IS NOT A PAD, AND WHY THAT IS THE WHOLE DIFFICULTY. On this vendor a line is chosen by
+# Why a line is not a pad, and why that is the whole difficulty. On this vendor a line is chosen by
 # the PIN INDEX and the port is chosen separately: RM0367 10.2.7 spells the encoding out in its own
 # words -- "select the source input for the EXTIx external interrupt: 0000: PA[x] pin, 0001: PB[x]
 # pin, 0010: PC[x] pin". So PC13 raises line 13 and PA13 raises line 13 too, and only SYSCFG_EXTICR
@@ -17,7 +17,7 @@
 # per-pad ALTERNATE FUNCTION whose number does not follow the pad number -- so the two families
 # cannot share a derivation, and neither may be inferred from the other.
 #
-# LINES ARE NOT DELIVERED ONE PER VECTOR. Three vectors cover sixteen lines on this part, so an ISR
+# Lines are not delivered one per vector. Three vectors cover sixteen lines on this part, so an ISR
 # is entered without yet knowing which pad fired and must read the pending register to find out.
 # That is why an interrupt seam needs the line AND the vector as separate facts.
 #
@@ -113,7 +113,7 @@ EXTICR_PORT_A = 0
 EXTICR_PORT_B = 1
 EXTICR_PORT_C = 2
 EXTICR_PORT_D = 3
-# THE CODE CATEGORY 3 CANNOT USE, because it has no port E to select. RM0367 10.2.4 lists the
+# The code category 3 cannot use, because it has no port E to select. RM0367 10.2.4 lists the
 # encoding once for the whole book -- 0100: PE[x] pin -- so the code is present in the manual for
 # both categories and is only reachable on this one.
 EXTICR_PORT_E = 4

@@ -1,7 +1,7 @@
 # BOARD binding: the Arduino Due. Board truth ONLY: the role binding,
 # the carrier, and the clock plan. Chip truth lives in csp/sam3x/.
 #
-# THIS BOARD'S PERIPHERAL CLOCK IS NOT ITS BARE OSCILLATOR. The crystal reaches the UART only
+# This board's peripheral clock is not its bare oscillator. The crystal reaches the UART only
 # through PLLA, so mck_hz is a STATED rate rather than one the generator can cross-check against
 # xtal_hz -- see the plan note below. Nothing here is a divisor: the BRGR CD derives from mck_hz
 # and the block's baud formula.

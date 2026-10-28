@@ -2,7 +2,7 @@
 # rows exist for every binding a board package uses, each with its source; grow the table with
 # the boards, never from recall. A binding whose (pin, function) row is missing REFUSES.
 #
-# BOTH ROSTER BOARDS BIND THE SAME TWO PADS AND THEY READ FROM DIFFERENT TABLES. The J's pads come
+# Both roster boards bind the same two pads and they read from different tables. The J's pads come
 # from Table 6-2 and the N's from Table 6-1; the two tables agree on PB10 and PB11, and that
 # agreement was checked rather than assumed, because on this family the two tables disagree
 # elsewhere -- the N carries SERCOM6 and SERCOM7 and the E/G/J does not.

@@ -8,8 +8,8 @@ use lamella_cil::{Opcode, Operand};
 use lamella_ir::{Function, MirType, StaticOwner, TypeHandle};
 use lamella_metadata::tables::table;
 use lamella_metadata::{
-    Assembly, CharSet, Method, MethodKind, MethodSig, ResolvedMethod, SigType, TargetLayout,
-    TypeDef, TypeLayout, TypeName, exception_tag_for_name, fnv1a32, layout_value_type,
+    Assembly, CharSet, Method, MethodKind, MethodOwners, MethodSig, ResolvedMethod, SigType,
+    TargetLayout, TypeDef, TypeLayout, TypeName, exception_tag_for_name, fnv1a32, layout_value_type,
 };
 use lamella_token::Token;
 
@@ -78,7 +78,7 @@ pub(crate) fn qualified_handle_across<'x>(
     if argument_world_token(token).is_none() && token.table() == table::TYPE_REF {
         if let Some((namespace, name)) = assembly.type_token_full_name(token) {
             if let Some((ordinal, ref_td)) =
-                Assembly::find_in_references(references, &namespace, &name)
+                Assembly::find_in_references_identified(references, &namespace, &name)
             {
                 return reference_handle(ordinal, ref_td.token().0);
             }
@@ -312,6 +312,38 @@ pub(crate) fn qualified_type_name(namespace: &str, name: &str) -> alloc::boxed::
     }
 }
 
+/// The type `token` names, spelled by the pair it is IDENTIFIED by ([`Assembly::type_token_full_name`])
+/// in [`qualified_type_name`]'s form: `Ns.Name` for a top-level type, exactly as its own row spells
+/// it, and the enclosing chain in place of the namespace for a nested one, `Ns.Outer.Name`. `None`
+/// for a token that names no type.
+fn identified_type_name(assembly: &Assembly<'_>, token: Token) -> Option<String> {
+    let (namespace, name) = assembly.type_token_full_name(token)?;
+    Some(if namespace.is_empty() {
+        name
+    } else {
+        alloc::format!("{namespace}.{name}")
+    })
+}
+
+/// Whether the type tokens `a` and `b`, two `TypeDef` or `TypeRef` rows of `assembly`'s tables, name
+/// one type.
+///
+/// **BY THE PAIR EACH IS IDENTIFIED BY, NOT BY EACH ROW's OWN NAME.** A nested type's own namespace
+/// is empty (II.22.32, II.22.38), so the rows of `A.Node` and `B.Node` carry one pair, and compared
+/// that way the two are one type. [`Assembly::type_token_full_name`] carries each one's enclosing
+/// chain. It is read only when the rows' own names already agree, and for two top-level types it then
+/// agrees too: the comparison of rows' names is the whole answer for them, as it always was.
+fn same_type(assembly: &Assembly<'_>, a: Token, b: Token) -> bool {
+    if a == b {
+        return true;
+    }
+    let (Some(a_name), Some(b_name)) = (assembly.type_token_name(a), assembly.type_token_name(b))
+    else {
+        return false;
+    };
+    a_name == b_name && assembly.type_token_full_name(a) == assembly.type_token_full_name(b)
+}
+
 /// Resolves an assembly's `call` and `ldstr` tokens against its metadata.
 ///
 /// `Clone` so one monomorphized body can be lowered under its own instantiation without rebuilding
@@ -319,6 +351,11 @@ pub(crate) fn qualified_type_name(namespace: &str, name: &str) -> alloc::boxed::
 #[derive(Clone)]
 pub struct MetadataResolver<'a> {
     assembly: &'a Assembly<'a>,
+    /// The type owning each `MethodDef` of [`Self::assembly`], read once. Resolving a method token
+    /// reads a definition's declaring type from it, where [`Assembly::resolve_method`] walks the
+    /// TypeDef table for each one -- which, asked for every call in a class library, was the larger
+    /// part of lowering it.
+    method_owners: MethodOwners<'a>,
     /// The REFERENCED assemblies, in reference order, for cross-assembly vtable-slot agreement:
     /// with them, a type extending a referenced base numbers its slots INCLUDING the base's
     /// inherited virtuals (as the referenced assembly itself numbers them), and a `callvirt` on a
@@ -471,6 +508,7 @@ impl<'a> MetadataResolver<'a> {
     pub fn new(assembly: &'a Assembly<'a>) -> MetadataResolver<'a> {
         MetadataResolver {
             assembly,
+            method_owners: assembly.method_owners(),
             references: Vec::new(),
             rid_to_index: Vec::new(),
             type_arguments: Vec::new(),
@@ -518,6 +556,7 @@ impl<'a> MetadataResolver<'a> {
         let owner = *self.references.get(usize::from(ordinal))?;
         Some(MetadataResolver {
             assembly: owner,
+            method_owners: owner.method_owners(),
             references: self.references[..usize::from(ordinal)].to_vec(),
             rid_to_index: Vec::new(),
             type_arguments: Vec::new(),
@@ -665,7 +704,7 @@ impl<'a> MetadataResolver<'a> {
                         return None;
                     }
                 } else {
-                    let resolved = self.assembly.resolve_method(token)?;
+                    let resolved = self.method_owners.resolve_method(token)?;
                     let is_static = resolved.signature.as_ref().is_some_and(|sig| !sig.has_this);
                     if resolved.name != Some(".ctor") && !is_static {
                         return None;
@@ -825,7 +864,7 @@ impl<'a> MetadataResolver<'a> {
         }
         let declaring = self.type_token_of(token)?;
         let name = self.instantiation_in_force(declaring)?;
-        let method = self.assembly.resolve_method(token)?;
+        let method = self.method_owners.resolve_method(token)?;
         let index = self
             .mono
             .index_of(&name, method.name?, &signature.parameters)?;
@@ -999,7 +1038,7 @@ impl<'a> MetadataResolver<'a> {
         };
         let definition = self.assembly.method_spec_method(token)?;
         let arguments = self.assembly.method_spec_instantiation(token)?;
-        let signature = self.assembly.resolve_method(definition)?.signature?;
+        let signature = self.method_owners.resolve_method(definition)?.signature?;
         let has_result = !matches!(signature.return_type, SigType::Void);
         let result_type = if has_result {
             let closed =
@@ -1106,16 +1145,25 @@ impl<'a> MetadataResolver<'a> {
     /// comparing raw tokens would answer "no explicit implementation" for the second -- the exact
     /// false negative this exists to prevent.
     fn has_explicit_implementation(&self, declaration: Token) -> bool {
-        let Some(target) = self.assembly.resolve_method(declaration) else {
+        let Some(target) = self.method_owners.resolve_method(declaration) else {
             return true;
         };
         self.assembly.type_defs().any(|type_def| {
             type_def.method_impls().any(|(_, declared)| {
-                self.assembly
+                self.method_owners
                     .resolve_method(declared)
                     .is_some_and(|other| {
                         other.name == target.name
                             && other.declaring_type == target.declaring_type
+                            && match (
+                                self.type_token_of(declared),
+                                self.type_token_of(declaration),
+                            ) {
+                                (Some(a), Some(b)) if other.declaring_type.is_some() => {
+                                    same_type(self.assembly, a, b)
+                                }
+                                _ => true,
+                            }
                     })
             })
         })
@@ -1153,17 +1201,84 @@ impl<'a> MetadataResolver<'a> {
         &self.references
     }
 
-    /// The first attached reference declaring `namespace.name`, with its ordinal and `TypeDef` --
-    /// the one cross-assembly name-resolution rule every consumer shares. Reference ORDER is the
-    /// tie-break (a name declared by two references resolves to the earlier one, exactly as the
-    /// build was handed them).
+    /// The first attached reference declaring the type IDENTIFIED by `namespace.name`, with its
+    /// ordinal and `TypeDef` -- the one cross-assembly name-resolution rule every consumer shares.
+    /// Reference ORDER is the tie-break (a name declared by two references resolves to the earlier
+    /// one, exactly as the build was handed them).
+    ///
+    /// **THE PAIR IS THE IDENTIFYING ONE** ([`Assembly::type_token_full_name`]), in which a nested
+    /// type's enclosing chain stands where its namespace would be. A type token's own row names every
+    /// nested type of one simple name alike, so a caller holding a TOKEN asks
+    /// [`Self::reference_type_of`], which reads the identifying pair for it.
     fn find_reference_type(
         &self,
         namespace: &str,
         name: &str,
     ) -> Option<(usize, &'a Assembly<'a>, TypeDef<'a>)> {
-        Assembly::find_in_references(&self.references, namespace, name)
+        Assembly::find_in_references_identified(&self.references, namespace, name)
             .map(|(ordinal, type_def)| (ordinal, self.references[ordinal], type_def))
+    }
+
+    /// The reference declaring the type the `TypeRef` `type_ref` names, where `type_ref` is a row of
+    /// `assembly`'s tables: [`Self::find_reference_type`] over its identifying pair. `None` for a token
+    /// that is not a `TypeRef`, or one no attached reference declares.
+    fn reference_type_of(
+        &self,
+        assembly: &Assembly<'_>,
+        type_ref: Token,
+    ) -> Option<(usize, &'a Assembly<'a>, TypeDef<'a>)> {
+        if type_ref.table() != table::TYPE_REF {
+            return None;
+        }
+        let (namespace, name) = assembly.type_token_full_name(type_ref)?;
+        self.find_reference_type(&namespace, &name)
+    }
+
+    /// Where the type `type_token` names is declared, `type_token` being a `TypeDef` or `TypeRef` row
+    /// of `assembly`'s tables: the declaring assembly's ordinal among the references (`None` for
+    /// `assembly` itself), that assembly, and the type's `TypeDef` there. `None` for any other table.
+    fn type_home(
+        &self,
+        assembly: &'a Assembly<'a>,
+        type_token: Token,
+    ) -> Option<(Option<usize>, &'a Assembly<'a>, TypeDef<'a>)> {
+        match type_token.table() {
+            table::TYPE_DEF => Some((None, assembly, assembly.type_def(type_token.row())?)),
+            table::TYPE_REF => {
+                let (ordinal, owner, type_def) = self.reference_type_of(assembly, type_token)?;
+                Some((Some(ordinal), owner, type_def))
+            }
+            _ => None,
+        }
+    }
+
+    /// [`Self::type_home`] for the type declaring the method `method` names, `method` being a
+    /// `MethodDef` or `MemberRef` row of `assembly`'s tables: a definition's owner read from its ROW,
+    /// a reference's from its parent. `None` for any other table, and for a member of an
+    /// instantiation, whose parent is a `TypeSpec`.
+    ///
+    /// **NEVER THROUGH [`ResolvedMethod::declaring_type`]**, which is a name: a nested type's
+    /// namespace is empty, so `A.Node` and `B.Node` answer one pair, and finding a type by it finds
+    /// whichever of the two comes first in the table.
+    fn method_home(
+        &self,
+        assembly: &'a Assembly<'a>,
+        method: Token,
+    ) -> Option<(Option<usize>, &'a Assembly<'a>, TypeDef<'a>)> {
+        match method.table() {
+            table::METHOD_DEF => {
+                let owner = if core::ptr::eq(assembly, self.assembly) {
+                    self.method_owners.owner_of(method)
+                } else {
+                    assembly.method_def_owner(method)
+                };
+                Some((None, assembly, owner?))
+            }
+            table::MEMBER_REF => {
+                self.type_home(assembly, assembly.member_ref(method.row())?.parent())
+            }
+            _ => None,
+        }
     }
 
     /// The IDENTITY handle for a type token: a this-assembly TypeDef keeps its raw token, and a
@@ -1193,6 +1308,7 @@ impl<'a> MetadataResolver<'a> {
             .collect();
         MetadataResolver {
             assembly,
+            method_owners: assembly.method_owners(),
             references: Vec::new(),
             rid_to_index,
             type_arguments: Vec::new(),
@@ -1223,17 +1339,18 @@ impl<'a> MetadataResolver<'a> {
     }
 
     /// The type token a metadata token names: a type token as-is (`TypeRef`/`TypeDef`/
-    /// `TypeSpec`), or the declaring type of a constructor token -- a `MemberRef`'s parent (an
-    /// external type like `System.Exception`), or a `MethodDef`'s owning type resolved by name
-    /// (a this-module exception). `None` for any other token.
+    /// `TypeSpec`), or the declaring type of a method token -- a `MemberRef`'s parent (an
+    /// external type like `System.Exception`), or the `TypeDef` that owns a `MethodDef` row.
+    /// `None` for any other token.
+    ///
+    /// **THE OWNER IS READ FROM THE ROW, AND A NAME WOULD ANSWER FOR THE WRONG TYPE.** A nested
+    /// type's namespace is empty (II.22.32), so `A.Node` and `B.Node` share the pair a lookup by name
+    /// asks with, and the first of them in the table answers for both.
     fn type_token_of(&self, token: Token) -> Option<Token> {
         match token.table() {
             table::TYPE_REF | table::TYPE_DEF | table::TYPE_SPEC => Some(token),
             table::MEMBER_REF => Some(self.assembly.member_ref(token.row())?.parent()),
-            table::METHOD_DEF => {
-                let name = self.assembly.resolve_method(token)?.declaring_type?;
-                Some(self.assembly.find_type(name.namespace, name.name)?.token())
-            }
+            table::METHOD_DEF => Some(self.method_owners.owner_of(token)?.token()),
             _ => None,
         }
     }
@@ -2254,12 +2371,8 @@ impl<'a> MetadataResolver<'a> {
         } else if extends.table() == table::TYPE_DEF {
             Some(reference_handle(ordinal, extends.0))
         } else {
-            reference.type_token_name(extends).and_then(|base_name| {
-                self.find_reference_type(base_name.namespace, base_name.name)
-                    .map(|(base_ordinal, _, base_td)| {
-                        reference_handle(base_ordinal, base_td.token().0)
-                    })
-            })
+            self.reference_type_of(reference, extends)
+                .map(|(base_ordinal, _, base_td)| reference_handle(base_ordinal, base_td.token().0))
         };
         Some(TypeMeta {
             handle,
@@ -2556,20 +2669,13 @@ impl<'a> MetadataResolver<'a> {
             return self.constructed_interface_dispatch(assembly, declaration, &declared, arguments);
         }
         let interface = declared.declaring_type?;
-        let is_interface = match assembly.find_type(interface.namespace, interface.name) {
-            Some(td) => td.is_interface(),
-            None => {
-                self.find_reference_type(interface.namespace, interface.name)?
-                    .2
-                    .is_interface()
-            }
-        };
-        if !is_interface {
+        let (_, home, interface_def) = self.method_home(assembly, declaration)?;
+        if !interface_def.is_interface() {
             return None;
         }
         let signature = declared.signature.as_ref()?;
         let tag = interface_method_tag(assembly, &interface, declared.name?, &signature.parameters)?;
-        Some((joined_full_name(&interface), tag))
+        Some((identified_type_name(home, interface_def.token())?, tag))
     }
 
     /// [`Self::explicit_interface_dispatch`]'s CONSTRUCTED-INTERFACE arm: the `MethodImpl`
@@ -2681,8 +2787,8 @@ impl<'a> MetadataResolver<'a> {
                 }
             }
             for token in type_def.interfaces() {
-                if let Some(name) = assembly.type_token_name(token) {
-                    reimplemented.push(joined_full_name(&name));
+                if let Some(name) = identified_type_name(assembly, token) {
+                    reimplemented.push(name);
                 }
             }
         }
@@ -2719,8 +2825,7 @@ impl<'a> MetadataResolver<'a> {
                 Some((link_assembly, type_def, InterfaceIdentity::Named(name)))
             }
             table::TYPE_REF => {
-                let name = link_assembly.type_token_name(iface_token)?;
-                let (_, owner, type_def) = self.find_reference_type(name.namespace, name.name)?;
+                let (_, owner, type_def) = self.reference_type_of(link_assembly, iface_token)?;
                 let owner_name = owner.type_token_name(type_def.token())?;
                 Some((owner, type_def, InterfaceIdentity::Named(owner_name)))
             }
@@ -2734,17 +2839,7 @@ impl<'a> MetadataResolver<'a> {
                     SigType::Class(token) | SigType::ValueType(token) => *token,
                     _ => return None,
                 };
-                let name = link_assembly.type_token_name(definition_token)?;
-                let (owner, type_def) = if definition_token.table() == table::TYPE_DEF {
-                    (
-                        link_assembly,
-                        link_assembly.type_def(definition_token.row())?,
-                    )
-                } else {
-                    let (_, owner, type_def) =
-                        self.find_reference_type(name.namespace, name.name)?;
-                    (owner, type_def)
-                };
+                let (_, owner, type_def) = self.type_home(link_assembly, definition_token)?;
                 let identity = InterfaceIdentity::instantiated(link_assembly, &closed)?;
                 Some((owner, type_def, identity))
             }
@@ -3178,11 +3273,7 @@ pub fn decodable_signature(
 fn param_key(assembly: &Assembly, generic_arity: u32, params: &[SigType]) -> String {
     let mut key = alloc::format!("{generic_arity}#");
     for p in params {
-        encode_type(
-            p,
-            &|token| assembly.type_token_name(token).map(|n| joined_full_name(&n)),
-            &mut key,
-        );
+        encode_type(p, &|token| identified_type_name(assembly, token), &mut key);
     }
     key
 }
@@ -3536,14 +3627,8 @@ fn reference_vtable_slots_seeded<'x>(
         if let Some(root) = chain.last() {
             let base = root.type_def.extends();
             if base.row() != 0 && base.table() != table::TYPE_DEF {
-                if let Some(base_name) = assembly.type_token_name(base) {
-                    if let Some((owner, base_td)) = references.iter().find_map(|reference| {
-                        reference
-                            .find_type(base_name.namespace, base_name.name)
-                            .map(|td| (*reference, td))
-                    }) {
-                        slots = reference_vtable_slots_seeded(references, owner, base_td, depth + 1);
-                    }
+                if let Some((owner, base_td)) = referenced_definition(references, assembly, base) {
+                    slots = reference_vtable_slots_seeded(references, owner, base_td, depth + 1);
                 }
             }
         }
@@ -3647,13 +3732,30 @@ fn reference_declared_virtual<'x>(
     if base.row() == 0 || base.table() == table::TYPE_DEF {
         return None;
     }
-    let base_name = assembly.type_token_name(base)?;
-    let (owner, base_td) = references.iter().find_map(|reference| {
-        reference
-            .find_type(base_name.namespace, base_name.name)
-            .map(|td| (*reference, td))
-    })?;
+    let (owner, base_td) = referenced_definition(references, assembly, base)?;
     reference_declared_virtual(references, owner, base_td, name, key, depth + 1)
+}
+
+/// The definition of the type the `TypeRef` `type_ref`, a row of `assembly`'s tables, names: the
+/// first of `references` declaring the type the reference IDENTIFIES
+/// ([`Assembly::find_in_references_identified`]), with that reference. `None` for a token that is not
+/// a `TypeRef`, or one no reference declares.
+///
+/// The free-standing form of [`MetadataResolver::reference_type_of`], for the walks that hold a
+/// reference list and no resolver: both reference-side chain walks, so a base's slots and the search
+/// for a declaration along it read one table, and the value-type resolution.
+fn referenced_definition<'x>(
+    references: &[&'x Assembly<'x>],
+    assembly: &Assembly<'_>,
+    type_ref: Token,
+) -> Option<(&'x Assembly<'x>, TypeDef<'x>)> {
+    if type_ref.table() != table::TYPE_REF {
+        return None;
+    }
+    let (namespace, name) = assembly.type_token_full_name(type_ref)?;
+    let (ordinal, type_def) =
+        Assembly::find_in_references_identified(references, &namespace, &name)?;
+    Some((*references.get(ordinal)?, type_def))
 }
 
 /// Where a dispatched method's implementation lives -- a vtable slot's or an itable entry's emitted
@@ -3957,18 +4059,15 @@ impl<'a> MetadataResolver<'a> {
         &self,
         token: Token,
     ) -> Option<(Option<usize>, &'a Assembly<'a>, TypeDef<'a>, Vec<SigType>)> {
-        let (name, arguments) = match self.assembly.resolve_method(token)?.declaring_type {
-            Some(name) => (name, Vec::new()),
-            None => {
-                if token.table() != table::MEMBER_REF {
-                    return None;
-                }
-                let parent = self.assembly.member_ref(token.row())?.parent();
-                if parent.table() != table::TYPE_SPEC {
-                    return None;
-                }
+        let spec = match token.table() {
+            table::MEMBER_REF => Some(self.assembly.member_ref(token.row())?.parent())
+                .filter(|parent| parent.table() == table::TYPE_SPEC),
+            _ => None,
+        };
+        let ((ordinal, owner, type_def), arguments) = match spec {
+            Some(spec) => {
                 let SigType::GenericInst { definition, arguments } =
-                    self.assembly.type_spec_signature(parent)?
+                    self.assembly.type_spec_signature(spec)?
                 else {
                     return None;
                 };
@@ -3976,16 +4075,9 @@ impl<'a> MetadataResolver<'a> {
                 else {
                     return None;
                 };
-                (self.assembly.type_token_name(*generic)?, arguments)
+                (self.type_home(self.assembly, *generic)?, arguments)
             }
-        };
-        let (ordinal, owner, type_def) = match self.assembly.find_type(name.namespace, name.name) {
-            Some(type_def) => (None, self.assembly, type_def),
-            None => {
-                let (ordinal, owner, type_def) =
-                    self.find_reference_type(name.namespace, name.name)?;
-                (Some(ordinal), owner, type_def)
-            }
+            None => (self.method_home(self.assembly, token)?, Vec::new()),
         };
         is_delegate_type_of(owner, &type_def).then_some((ordinal, owner, type_def, arguments))
     }
@@ -4032,7 +4124,7 @@ impl<'a> MetadataResolver<'a> {
             if declaring.namespace == "System" && declaring.name == "Exception" {
                 return true;
             }
-            let Some((owner, type_def)) = self.type_def_named(world, declaring) else {
+            let Some((_, owner, type_def)) = self.method_home(world, current) else {
                 return false;
             };
             let Some(body) = type_def
@@ -4059,8 +4151,11 @@ impl<'a> MetadataResolver<'a> {
         false
     }
 
-    /// The `TypeDef` a name refers to, with the assembly that declares it: `world`'s own table
-    /// first, then the reference list. `None` for a name this build cannot open.
+    /// The `TypeDef` a TOP-LEVEL type's name refers to, with the assembly that declares it: `world`'s
+    /// own table first, then the reference list. `None` for a name this build cannot open.
+    ///
+    /// A nested type is not found by a name, because its own row's namespace is empty: a type a token
+    /// names is found from the token ([`Self::type_home`], [`Self::method_home`]).
     fn type_def_named(
         &self,
         world: &'a Assembly<'a>,
@@ -4138,11 +4233,7 @@ impl<'a> MetadataResolver<'a> {
                     None => break,
                 },
                 table::TYPE_REF => {
-                    let Some(name) = assembly.type_token_name(current) else {
-                        break;
-                    };
-                    let Some((_, base_owner, base)) =
-                        self.find_reference_type(name.namespace, name.name)
+                    let Some((_, base_owner, base)) = self.reference_type_of(assembly, current)
                     else {
                         break;
                     };
@@ -4171,10 +4262,7 @@ impl<'a> MetadataResolver<'a> {
                     let resolved = if token.table() == table::TYPE_DEF {
                         assembly.type_def(token.row())
                     } else {
-                        match assembly
-                            .type_token_name(*token)
-                            .and_then(|name| self.find_reference_type(name.namespace, name.name))
-                        {
+                        match self.reference_type_of(assembly, *token) {
                             Some((_, base_owner, base)) => {
                                 assembly = base_owner;
                                 Some(base)
@@ -4584,18 +4672,8 @@ impl<'a> MetadataResolver<'a> {
             SigType::Class(token) | SigType::ValueType(token) => *token,
             _ => return None,
         };
-        let name = self.assembly.type_token_name(definition)?;
-        match definition.table() {
-            table::TYPE_DEF => Some((
-                self.assembly,
-                self.assembly.type_def(definition.row())?,
-                arguments,
-            )),
-            _ => {
-                let (_, owner, type_def) = self.find_reference_type(name.namespace, name.name)?;
-                Some((owner, type_def, arguments))
-            }
-        }
+        let (_, owner, type_def) = self.type_home(self.assembly, definition)?;
+        Some((owner, type_def, arguments))
     }
 
     /// The signature of the field a `Field` or field `MemberRef` token names, closed over the
@@ -5159,7 +5237,7 @@ impl CallResolver for MetadataResolver<'_> {
         if let Some(info) = self.monomorphized_method_call(*token) {
             return Some(info);
         }
-        let method = self.assembly.resolve_method(*token)?;
+        let method = self.method_owners.resolve_method(*token)?;
         let signature = method.signature.as_ref()?;
         if let Some(info) = self.monomorphized_call(*token, signature) {
             return Some(info);
@@ -5260,10 +5338,8 @@ impl CallResolver for MetadataResolver<'_> {
                             + *layout.field_offsets.get(index)?,
                     );
                 }
-                let parent = self.assembly.type_token_name(member.parent())?;
                 let field_name = member.name()?;
-                let (_, owner, type_def) =
-                    self.find_reference_type(parent.namespace, parent.name)?;
+                let (_, owner, type_def) = self.reference_type_of(self.assembly, member.parent())?;
                 let field = type_def
                     .fields()
                     .find(|f| f.name() == Some(field_name))
@@ -5434,9 +5510,7 @@ impl CallResolver for MetadataResolver<'_> {
                         &[],
                     ),
                     _ => {
-                        let name = self.assembly.type_token_name(parent)?;
-                        let (_, owner, type_def) =
-                            self.find_reference_type(name.namespace, name.name)?;
+                        let (_, owner, type_def) = self.reference_type_of(self.assembly, parent)?;
                         self.unlaid_chain_field(owner, type_def, &[])
                     }
                 }
@@ -5485,11 +5559,9 @@ impl CallResolver for MetadataResolver<'_> {
                 .map(|m| m.parent())
                 .and_then(|parent| match parent.table() {
                     table::TYPE_DEF => Some((self.assembly, self.assembly.type_def(parent.row())?)),
-                    table::TYPE_REF => {
-                        let name = self.assembly.type_token_name(parent)?;
-                        self.find_reference_type(name.namespace, name.name)
-                            .map(|(_, owner, type_def)| (owner, type_def))
-                    }
+                    table::TYPE_REF => self
+                        .reference_type_of(self.assembly, parent)
+                        .map(|(_, owner, type_def)| (owner, type_def)),
                     _ => None,
                 }),
             table::FIELD => self
@@ -5528,20 +5600,11 @@ impl CallResolver for MetadataResolver<'_> {
                 &TargetLayout::ilp32(),
             );
         }
-        let declaring = self.assembly.resolve_method(*token)?.declaring_type?;
-        let (handle, owner, type_def) =
-            match self.assembly.find_type(declaring.namespace, declaring.name) {
-                Some(type_def) => (TypeHandle(type_def.token().0), self.assembly, type_def),
-                None => {
-                    let (ordinal, reference, type_def) =
-                        self.find_reference_type(declaring.namespace, declaring.name)?;
-                    (
-                        reference_handle(ordinal, type_def.token().0),
-                        reference,
-                        type_def,
-                    )
-                }
-            };
+        let (ordinal, owner, type_def) = self.method_home(self.assembly, *token)?;
+        let handle = match ordinal {
+            Some(ordinal) => reference_handle(ordinal, type_def.token().0),
+            None => TypeHandle(type_def.token().0),
+        };
         if !type_def.is_value_type() {
             return None;
         }
@@ -5565,14 +5628,11 @@ impl CallResolver for MetadataResolver<'_> {
         {
             return self.instantiated_reference_layout(member.parent());
         }
-        let declaring = self.assembly.resolve_method(*token)?.declaring_type?;
-        if let Some(type_def) = self.assembly.find_type(declaring.namespace, declaring.name) {
-            return self.reference_layout_of(self.assembly, type_def);
+        let (ordinal, owner, type_def) = self.method_home(self.assembly, *token)?;
+        let mut layout = self.reference_layout_of(owner, type_def)?;
+        if let Some(ordinal) = ordinal {
+            layout.handle = reference_handle(ordinal, type_def.token().0);
         }
-        let (ordinal, reference, type_def) =
-            self.find_reference_type(declaring.namespace, declaring.name)?;
-        let mut layout = self.reference_layout_of(reference, type_def)?;
-        layout.handle = reference_handle(ordinal, type_def.token().0);
         Some(layout)
     }
 
@@ -5598,7 +5658,7 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return None;
         };
-        let method = self.assembly.resolve_method(*token)?;
+        let method = self.method_owners.resolve_method(*token)?;
         if method.name != Some(".ctor") {
             return None;
         }
@@ -5613,7 +5673,7 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return None;
         };
-        let method = self.assembly.resolve_method(*token)?;
+        let method = self.method_owners.resolve_method(*token)?;
         if method.name != Some("Invoke") {
             return None;
         }
@@ -5640,7 +5700,7 @@ impl CallResolver for MetadataResolver<'_> {
             return None;
         }
         let import = self.assembly.pinvoke_import(token.row())?;
-        let sig = self.assembly.resolve_method(*token)?.signature?;
+        let sig = self.method_owners.resolve_method(*token)?.signature?;
         let result_type = if sig.return_type == SigType::Void {
             None
         } else {
@@ -5679,9 +5739,7 @@ impl CallResolver for MetadataResolver<'_> {
                 .type_def(token.row())
                 .map(|type_def| (self.assembly, type_def)),
             table::TYPE_REF => self
-                .assembly
-                .type_token_name(*token)
-                .and_then(|name| self.find_reference_type(name.namespace, name.name))
+                .reference_type_of(self.assembly, *token)
                 .map(|(_, owner, type_def)| (owner, type_def)),
             _ => None,
         };
@@ -5838,10 +5896,9 @@ impl CallResolver for MetadataResolver<'_> {
                 if !member.is_field() {
                     return None;
                 }
-                let parent = self.assembly.type_token_name(member.parent())?;
                 let field_name = member.name()?;
                 let (ordinal, owner, type_def) =
-                    self.find_reference_type(parent.namespace, parent.name)?;
+                    self.reference_type_of(self.assembly, member.parent())?;
                 let field_row = type_def
                     .fields()
                     .find(|f| f.name() == Some(field_name))?
@@ -5893,15 +5950,14 @@ impl CallResolver for MetadataResolver<'_> {
                     if !member.is_field() {
                         return None;
                     }
-                    let parent = self.assembly.type_token_name(member.parent())?;
                     let (_, owner, type_def) =
-                        self.find_reference_type(parent.namespace, parent.name)?;
+                        self.reference_type_of(self.assembly, member.parent())?;
                     NamedType::Reference(owner, type_def)
                 }
                 _ => return None,
             },
             InitTrigger::Method => {
-                let resolved = self.assembly.resolve_method(*token)?;
+                let resolved = self.method_owners.resolve_method(*token)?;
                 let is_ctor = resolved.name == Some(".ctor");
                 let is_static = if token.table() == table::METHOD_DEF {
                     self.assembly.method(token.row()).is_some_and(|m| m.is_static())
@@ -5911,25 +5967,15 @@ impl CallResolver for MetadataResolver<'_> {
                 if !is_ctor && !is_static {
                     return None;
                 }
-                let declaring = resolved.declaring_type?;
-                match self
-                    .assembly
-                    .type_defs()
-                    .find(|td| td.name().is_some_and(|n| n == declaring))
-                {
-                    Some(type_def) => NamedType::Own(type_def.token().row()),
-                    None => {
-                        let (_, owner, type_def) =
-                            self.find_reference_type(declaring.namespace, declaring.name)?;
-                        NamedType::Reference(owner, type_def)
-                    }
+                match self.method_home(self.assembly, *token)? {
+                    (None, _, type_def) => NamedType::Own(type_def.token().row()),
+                    (Some(_), owner, type_def) => NamedType::Reference(owner, type_def),
                 }
             }
             InitTrigger::ValueTypeCall => match token.table() {
                 table::TYPE_DEF => NamedType::Own(self.assembly.type_def(token.row())?.token().row()),
                 table::TYPE_REF => {
-                    let name = self.assembly.type_token_name(*token)?;
-                    let (_, owner, type_def) = self.find_reference_type(name.namespace, name.name)?;
+                    let (_, owner, type_def) = self.reference_type_of(self.assembly, *token)?;
                     NamedType::Reference(owner, type_def)
                 }
                 _ => return None,
@@ -6022,10 +6068,10 @@ impl CallResolver for MetadataResolver<'_> {
                     current = definition;
                     continue;
                 }
-                let Some(name) = self.assembly.type_token_name(current) else {
+                if self.assembly.type_token_name(current).is_none() {
                     break;
-                };
-                if name.namespace == catch_name.namespace && name.name == catch_name.name {
+                }
+                if same_type(self.assembly, current, catch_token) {
                     let tag = self.assembly.exception_tag(type_def.token());
                     if tag != 0 && !tags.contains(&tag) {
                         tags.push(tag);
@@ -6087,7 +6133,7 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return None;
         };
-        let method = self.assembly.resolve_method(*token)?;
+        let method = self.method_owners.resolve_method(*token)?;
         if method.name != Some(".ctor") {
             return None;
         }
@@ -6120,8 +6166,7 @@ impl CallResolver for MetadataResolver<'_> {
             let type_def = self.assembly.type_def(target.row())?;
             return self.reference_layout_of(self.assembly, type_def);
         }
-        let name = self.assembly.type_token_name(target)?;
-        let (ordinal, reference, type_def) = self.find_reference_type(name.namespace, name.name)?;
+        let (ordinal, reference, type_def) = self.reference_type_of(self.assembly, target)?;
         let mut layout = self.reference_layout_of(reference, type_def)?;
         layout.handle = reference_handle(ordinal, type_def.token().0);
         Some(layout)
@@ -6137,9 +6182,9 @@ impl CallResolver for MetadataResolver<'_> {
         if target.table() == table::TYPE_SPEC {
             return self.constructed_cast_subtype_handles(target);
         }
-        let Some(target_name) = self.assembly.type_token_name(target) else {
+        if self.assembly.type_token_name(target).is_none() {
             return Vec::new();
-        };
+        }
         let mut handles = Vec::new();
         handles.push(self.qualified_type_handle(target));
         for type_def in self.assembly.type_defs() {
@@ -6155,10 +6200,10 @@ impl CallResolver for MetadataResolver<'_> {
                     current = definition;
                     continue;
                 }
-                let Some(name) = self.assembly.type_token_name(current) else {
+                if self.assembly.type_token_name(current).is_none() {
                     break;
-                };
-                if name.namespace == target_name.namespace && name.name == target_name.name {
+                }
+                if same_type(self.assembly, current, target) {
                     let handle = TypeHandle(type_def.token().0);
                     if !handles.contains(&handle) {
                         handles.push(handle);
@@ -6201,14 +6246,7 @@ impl CallResolver for MetadataResolver<'_> {
             });
         }
         let name = self.assembly.type_token_name(target)?;
-        let (interface_assembly, interface): (&Assembly, TypeDef) =
-            match self.assembly.find_type(name.namespace, name.name) {
-                Some(td) => (self.assembly, td),
-                None => {
-                    let (_, owner, td) = self.find_reference_type(name.namespace, name.name)?;
-                    (owner, td)
-                }
-            };
+        let (_, interface_assembly, interface) = self.type_home(self.assembly, target)?;
         if !interface.is_interface() {
             return None;
         }
@@ -6474,7 +6512,7 @@ impl CallResolver for MetadataResolver<'_> {
                     .position(|slot| matches!(&slot.impl_, SlotImpl::Rid(r) if *r == rid))
             }
             table::MEMBER_REF => {
-                let method = self.assembly.resolve_method(*token)?;
+                let method = self.method_owners.resolve_method(*token)?;
                 let signature = method.signature.as_ref()?;
                 let key = param_key(
                     self.assembly,
@@ -6509,9 +6547,8 @@ impl CallResolver for MetadataResolver<'_> {
                     };
                     return call_site_slot(&slots, name, &key, declared_virtual);
                 }
-                let declaring = method.declaring_type.as_ref()?;
-                let (_, reference, ref_td) =
-                    self.find_reference_type(declaring.namespace, declaring.name)?;
+                let parent = self.assembly.member_ref(token.row())?.parent();
+                let (_, reference, ref_td) = self.reference_type_of(self.assembly, parent)?;
                 if ref_td.is_interface() {
                     return None;
                 }
@@ -6593,7 +6630,7 @@ impl CallResolver for MetadataResolver<'_> {
                     }
                     let closed = self.closed_spec_signature(member.parent())?;
                     let identity = InterfaceIdentity::instantiated(self.assembly, &closed)?;
-                    let method = self.assembly.resolve_method(*token)?;
+                    let method = self.method_owners.resolve_method(*token)?;
                     let signature = method.signature.as_ref()?;
                     return interface_method_tag(
                         self.assembly,
@@ -6602,10 +6639,9 @@ impl CallResolver for MetadataResolver<'_> {
                         &signature.parameters,
                     );
                 }
-                let method = self.assembly.resolve_method(*token)?;
+                let method = self.method_owners.resolve_method(*token)?;
                 let declaring = method.declaring_type?;
-                let (_, _, ref_td) =
-                    self.find_reference_type(declaring.namespace, declaring.name)?;
+                let (_, _, ref_td) = self.reference_type_of(self.assembly, member.parent())?;
                 if !ref_td.is_interface() {
                     return None;
                 }
@@ -6634,7 +6670,7 @@ impl CallResolver for MetadataResolver<'_> {
             return None;
         }
         let type_def = self.assembly.type_def(type_token.row())?;
-        let target = self.assembly.resolve_method(*method_token)?;
+        let target = self.method_owners.resolve_method(*method_token)?;
         let name = target.name?;
         let signature = target.signature.as_ref()?;
         let key = param_key(
@@ -7119,11 +7155,11 @@ pub(crate) fn generic_static_slots<'x>(
                 (assembly, references, type_def)
             }
             table::TYPE_REF => {
-                let Some(type_name) = assembly.type_token_name(*token) else {
+                let Some((namespace, name)) = assembly.type_token_full_name(*token) else {
                     continue;
                 };
                 let Some((ordinal, type_def)) =
-                    Assembly::find_in_references(references, type_name.namespace, type_name.name)
+                    Assembly::find_in_references_identified(references, &namespace, &name)
                 else {
                     continue;
                 };
@@ -7346,14 +7382,7 @@ fn resolve_value_type_def<'x>(
 ) -> Option<(&'x Assembly<'x>, TypeDef<'x>)> {
     match token.table() {
         table::TYPE_DEF => Some((assembly, assembly.type_def(token.row())?)),
-        table::TYPE_REF => {
-            let name = assembly.type_token_name(token)?;
-            references.iter().find_map(|reference| {
-                reference
-                    .find_type(name.namespace, name.name)
-                    .map(|type_def| (*reference, type_def))
-            })
-        }
+        table::TYPE_REF => referenced_definition(references, assembly, token),
         _ => None,
     }
 }
@@ -9531,6 +9560,71 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), used.len(), "two parameter kinds share one byte");
+    }
+
+    /// Every method of each of the corlib's six nested `Enumerator`s is declared by its OWN type, as
+    /// the resolver answers it: the method's type token, its home, and, for a virtual one, its slot.
+    ///
+    /// **SIX TYPES OF ONE NAME, WHICH IS WHAT MAKES THE CORLIB THE TEST.** A nested type's namespace
+    /// is empty, so `Dictionary<,>.Enumerator`, the `Enumerator`s of its key and value collections and
+    /// those of `HashSet<T>`, `Queue<T>` and `Stack<T>` all carry `("", "Enumerator")`. A lookup by
+    /// that pair answers one of the six for all of them, so under one this fails for the other five.
+    #[test]
+    fn each_nested_enumerator_s_methods_are_declared_by_their_own_type() {
+        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures");
+        if !std::path::Path::new(directory).is_dir() {
+            eprintln!("{directory} absent (a stripped drop); skipping");
+            return;
+        }
+        let path = alloc::format!("{directory}/corlib.dll");
+        let bytes = std::fs::read(&path).unwrap_or_else(|error| {
+            panic!("the fixture directory exists but {path} does not read: {error}")
+        });
+        let corlib = Assembly::read(&bytes).expect("the corlib fixture parses");
+        let resolver = MetadataResolver::new(&corlib);
+        let enumerators: Vec<TypeDef> = corlib
+            .type_defs()
+            .filter(|type_def| {
+                type_def.enclosing_type().is_some()
+                    && type_def.name().is_some_and(|name| name.name == "Enumerator")
+            })
+            .collect();
+        assert_eq!(enumerators.len(), 6, "the corlib's nested `Enumerator`s");
+        let by_name = corlib
+            .find_type("", "Enumerator")
+            .expect("the bare pair names a nested type")
+            .token();
+        assert_eq!(enumerators.iter().filter(|e| e.token() != by_name).count(), 5);
+        let mut virtuals = 0;
+        for enumerator in &enumerators {
+            let owner = crate::generics::type_def_full_name(&corlib, enumerator.token())
+                .expect("each enumerator spells its own name");
+            let methods: Vec<_> = enumerator.methods().collect();
+            assert!(!methods.is_empty(), "{owner} declares methods");
+            for method in methods {
+                let what = alloc::format!("{owner}::{}", method.name().unwrap_or("?"));
+                assert_eq!(
+                    resolver.type_token_of(method.token()),
+                    Some(enumerator.token()),
+                    "{what}: its type token"
+                );
+                assert_eq!(
+                    resolver
+                        .method_home(&corlib, method.token())
+                        .map(|(ordinal, _, type_def)| (ordinal, type_def.token())),
+                    Some((None, enumerator.token())),
+                    "{what}: its home"
+                );
+                if method.is_virtual() {
+                    virtuals += 1;
+                    assert!(
+                        resolver.virtual_slot(&Operand::Token(method.token())).is_some(),
+                        "{what}: a slot in its own type's vtable"
+                    );
+                }
+            }
+        }
+        assert!(virtuals > 0, "the enumerators' virtual methods were asked about");
     }
 }
 

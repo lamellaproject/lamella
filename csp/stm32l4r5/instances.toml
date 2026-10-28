@@ -1,12 +1,12 @@
 # INSTANCE map for the STM32L4R5: where each block copy sits, plus its RCC clock-enable routing.
 # `-1` = the row gates nothing (the RCC itself).
 #
-# THREE DIFFERENT ENABLE REGISTERS GATE THE ROWS BELOW, AND THEY SIT FOUR BYTES APART. The GPIO
+# Three different enable registers gate the rows below, and they sit four bytes apart. The GPIO
 # ports are gated in RCC_AHB2ENR at 0x4C, PWR in RCC_APB1ENR1 at 0x58, and LPUART1 in RCC_APB1ENR2
 # at 0x5C. A transposed offset lands on a real neighboring register and enables something else, so
 # each gate below is stated as the pair [offset, bit] and read from that register's own section.
 #
-# THE PWR ROW IS HERE FOR PORT G. PG2 to PG15 are isolated at reset until IOSV in PWR_CR2 is set
+# The PWR row is here for port G. PG2 to PG15 are isolated at reset until IOSV in PWR_CR2 is set
 # (see ../parts.toml), and PWR_CR2 cannot be written until PWR's own clock is enabled. So a board
 # that uses a pin in that range needs this gate before it needs the pin's port.
 

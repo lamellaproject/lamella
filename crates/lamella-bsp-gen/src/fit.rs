@@ -33,7 +33,7 @@ pub struct Budget {
 
 /// Whether the image fits the budget.
 ///
-/// **`Unknown` IS A THIRD ANSWER AND IT IS NOT `Exceeds`.** A part row that declares no flash
+/// **`Unknown` is a third answer and it is not `Exceeds`.** A part row that declares no flash
 /// (an XIP chip) on a board that declares no region gives a budget of ZERO -- and rendering zero as
 /// a comparison would answer "your program does not fit" to a question nobody could answer. That is
 /// the same failure as a gate reporting green over a population it enumerated away: the arithmetic
@@ -165,7 +165,7 @@ pub fn fit(board: &BoardTable, part: &PartRow, image_bytes: i64) -> FitVerdict {
 /// against the board's flash region that a controller brings up, or `None` when the board states
 /// no such region.
 ///
-/// **THE OTHER HALF OF A TWO-REGION IMAGE, JUDGED SEPARATELY.** [`fit`] judges the part of an
+/// **The other half of a two-region image, judged separately.** [`fit`] judges the part of an
 /// image the part boots from, against the flash the part maps at reset; a region behind a
 /// controller is never that budget. A program laid out across both is two questions, and a single
 /// total would answer neither.
@@ -227,7 +227,7 @@ mod tests {
         PartRow { part: String::from("rp2040"), flash: 0, ram: 0x0004_2000, ..PartRow::default() }
     }
 
-    /// THE CASE THE TWO-SOURCE JOIN EXISTS FOR. The part row says `flash = 0` because the chip
+    /// The case the two-source join exists for. The part row says `flash = 0` because the chip
     /// has none; the board says 2 MB because that is what is soldered on. Reading the PART alone
     /// answers "nothing fits" for every XIP board in the v1 set -- confidently, and wrongly.
     #[test]
@@ -261,7 +261,7 @@ mod tests {
         assert_eq!(verdict.flash.source, BudgetSource::Part);
     }
 
-    /// AN ABSENT BUDGET IS `Unknown`, NEVER `Exceeds`. Both sources silent is the one input
+    /// An absent budget is `Unknown`, never `Exceeds`. Both sources silent is the one input
     /// where the arithmetic would otherwise produce a confident refusal out of nothing: budget 0,
     /// image > 0, "does not fit". A reader cannot tell that from a real overflow.
     #[test]

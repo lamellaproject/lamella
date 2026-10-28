@@ -20,7 +20,7 @@ pub const CARRIER_USB_PID: u16 = 0x2111;
 pub const EXT1_I2C_DRIVER_FAMILY: &str = "same54-sercom";
 pub const EXT1_ADC_P_DRIVER_FAMILY: &str = "same54-adc";
 
-//  -- EXT1_ADC_P: a same54 adc binding descriptor. A PRESCALER, a CALIBRATION ADDRESS and a PMUX MASK --
+//  -- EXT1_ADC_P: a same54 adc binding descriptor. A prescaler, a calibration address and a PMUX mask --
 pub const EXT1_ADC_P_ADC_BASE: u32 = 0x43002000;
 pub const EXT1_ADC_P_GCLK_PCHCTRL_REG: u32 = 0x40001D24;
 pub const EXT1_ADC_P_GCLK_PCHCTRL_VALUE: u32 = 0x40;

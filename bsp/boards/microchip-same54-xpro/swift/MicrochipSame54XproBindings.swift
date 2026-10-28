@@ -21,7 +21,7 @@ public enum MicrochipSame54XproBindings {
     public static let EXT1_I2C_DRIVER_FAMILY: String = "same54-sercom"
     public static let EXT1_ADC_P_DRIVER_FAMILY: String = "same54-adc"
 
-    // -- EXT1_ADC_P: a same54 adc binding descriptor. A PRESCALER, a CALIBRATION ADDRESS and a PMUX MASK --
+    // -- EXT1_ADC_P: a same54 adc binding descriptor. A prescaler, a calibration address and a PMUX mask --
     public static let EXT1_ADC_P_ADC_BASE: UInt32 = 0x43002000
     public static let EXT1_ADC_P_GCLK_PCHCTRL_REG: UInt32 = 0x40001D24
     public static let EXT1_ADC_P_GCLK_PCHCTRL_VALUE: UInt32 = 0x40

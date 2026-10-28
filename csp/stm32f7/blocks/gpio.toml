@@ -7,7 +7,7 @@
 # function (4 bits per pin). Setting one without the other leaves the pin either driving nothing or
 # driving the wrong peripheral.
 #
-# THREE MORE REGISTERS SHAPE THE PIN ITSELF rather than route it, and a bus can need them as much
+# Three more registers shape the pin itself rather than route it, and a bus can need them as much
 # as it needs the mux. An I2C line must be OPEN DRAIN: a push-pull output cannot be pulled low by
 # the other device, so a target's acknowledge is fought rather than seen, and the controller reads
 # a bus that never answers. A memory signal wants the fastest EDGE the pad can drive. Neither is

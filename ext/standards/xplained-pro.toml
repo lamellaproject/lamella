@@ -2,7 +2,7 @@
 # meaning per pin. This file is the JOIN VOCABULARY between an extension board and a host board,
 # and it is the reason an extension can be described without naming a host.
 #
-# WHAT EACH SIDE STATES, AND WHY NEITHER STATES THE OTHER'S FACT:
+# What each side states, and why neither states the other's fact:
 #
 #   an extension   names the SIGNAL it uses -- "my reset line is on gpio1" -- and never a host pad.
 #                  Its own document is written that way: every extension user guide gives a 20-row
@@ -12,18 +12,18 @@
 #   the join       the signal name below, and nothing else. One extension file therefore binds to
 #                  every host that declares a header, and adding a host adds no extension work.
 #
-# EVERY SIGNAL IS OPTIONAL ON BOTH SIDES. The standard says so in words -- "all pins are not always
+# Every signal is optional on both sides. The standard says so in words -- "all pins are not always
 # connected on all extension headers" -- so an absent signal is a fact rather than an omission, on
 # a host and on an extension alike.
 #
-# THE DOCUMENTS DISAGREE WITH THEMSELVES ABOUT TWO OF THESE NAMES AND IT WOULD BREAK A JOIN.
+# The documents disagree with themselves about two of these names and it would break a join.
 # DS70005321A's own standard table calls pins 11 and 12 I2C_SDA and I2C_SCL; its per-header tables
 # three pages later call the same two pins TWI_SDA and TWI_SCL, and the older extension guides use
 # TWI throughout. One document, one connector, two spellings. The canonical name here is the
 # `signal` column and it is the only one a file may use; `aka` records the other spelling so a
 # reader checking against a manual is not left wondering whether they have the wrong row.
 #
-# PIN 1 IS NOT NECESSARILY THE TARGET'S TO READ, WHICH IS EASY TO ASSUME AND WRONG. It reaches an
+# Pin 1 is not necessarily the target's to read, which is easy to assume and wrong. It reaches an
 # identification chip on the extension, and on a kit with an embedded debugger the line goes to the
 # DEBUGGER rather than to an MCU pad -- so a host tool can identify a fitted extension over the
 # probe while a program running on the target cannot. Which of the two a given host does is that

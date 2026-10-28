@@ -487,6 +487,15 @@ pub fn parse_type(blob: &[u8]) -> Result<SigType, SigError> {
     read_type(&mut Reader::new(blob))
 }
 
+/// [`parse_type`], and the type's REQUIRED custom modifiers beside it. A `TypeSpec` carries them
+/// where a generic constraint is modified: `where T : unmanaged` is recorded as the constraint
+/// `modreq(System.Runtime.InteropServices.UnmanagedType) System.ValueType`.
+pub fn parse_type_with_modifiers(blob: &[u8]) -> Result<(SigType, Vec<Token>), SigError> {
+    let mut required = Vec::new();
+    let sig = read_type_collecting_required(&mut Reader::new(blob), &mut required)?;
+    Ok((sig, required))
+}
+
 /// Decodes a field-signature blob (II.23.2.4): the FIELD byte then the type.
 pub fn parse_field(blob: &[u8]) -> Result<SigType, SigError> {
     Ok(parse_field_with_modifiers(blob)?.0)

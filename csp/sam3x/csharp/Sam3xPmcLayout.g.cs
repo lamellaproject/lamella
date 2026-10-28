@@ -5,7 +5,7 @@
 // instance bases live in Sam3xInstances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Sam3xPmcLayout
+    internal sealed class Sam3xPmcLayout
     {
         private Sam3xPmcLayout() { }
 

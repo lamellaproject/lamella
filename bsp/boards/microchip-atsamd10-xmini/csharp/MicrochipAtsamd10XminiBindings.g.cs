@@ -6,7 +6,7 @@
 // lines, and the carrier identity. The board's facts are stated in board.toml.
 namespace Lamella.Generated
 {
-    public sealed class MicrochipAtsamd10XminiBindings
+    internal sealed class MicrochipAtsamd10XminiBindings
     {
         private MicrochipAtsamd10XminiBindings() { }
 

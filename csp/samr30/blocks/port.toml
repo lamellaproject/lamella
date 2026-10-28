@@ -5,14 +5,14 @@
 #   PINCFG[p] = group_base + 0x40 + p        (p = the pin index within the group)
 # The generator owns those derivations; drivers receive resolved addresses through their bindings.
 #
-# THE REGISTER LAYOUT IS SHARED ACROSS THE WHOLE SAM LINE AND THE BASE IS THIS FAMILY'S ALONE.
+# The register layout is shared across the whole SAM line and the base is this family's alone.
 # Every offset below matches the samd20, samda1, samha1, samr21, samc21, saml21 and saml22 blocks
 # value for value. What differs is where the block sits, and this part puts it where its host die
 # does: 0x40002800, behind AHB-APB Bridge A, where the SAM D21 line puts it at 0x41004400 behind
 # Bridge B and the SAM C21 at 0x41000000, also behind B. The bridge is why this family's PORT is
 # gated from APBAMASK rather than an APBC bit.
 #
-# THREE GROUPS ON THE DIE, AND THIS DOCUMENT BOUNDS THE COUNT NOWHERE. The SAM R21's register
+# Three groups on the die, and this document bounds the count nowhere. The SAM R21's register
 # descriptions print '0x00 + x*0x80 [x=0..2]', which states the stride AND the bound; this one
 # prints no such formula at all and states the stride in prose -- "Each PORT group has its own set
 # of PORT registers with offset 0x80. The available number of PORT groups may depend on the
@@ -91,7 +91,7 @@ fields = { PMUXEN = [0, 1], INEN = [1, 1], PULLEN = [2, 1], DRVSTR = [6, 1] }
 notes = "Element 0 of the per-pin config array; see the block header for the element derivation."
 
 # Function-letter values for PMUX nibbles (family-wide; the pin-map rows name letters).
-# NOTE: THIS TABLE RUNS TO I AND THE SAM D21 LINE'S STOPS AT H. The values are still 0..n in
+# Note: this table runs to I and the SAM D21 line's stops at H. The values are still 0..n in
 # letter order; what is new is that there is a ninth column at all. A pin-map row carries the
 # letter and this table turns it into a nibble; what the letter SELECTS is Table 7-1's business.
 [constants]

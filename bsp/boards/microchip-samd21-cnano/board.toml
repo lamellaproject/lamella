@@ -1,26 +1,26 @@
 # BOARD binding: the SAM D21 Curiosity Nano (SAMD21-CNANO). Board truth only: the identity, the
 # carrier, and the two control lines a program can reach.
 #
-# IT SHARES A FAMILY AND A PACKAGE WITH THE XPLAINED PRO BOARDS AND NOT A PART. Every block table
+# It shares a family and a package with the Xplained Pro boards and not a part. Every block table
 # in csp/samd21 describes silicon this board and the SAM D21 Xplained Pro have in common, and this
 # is the same 48-pin G package the SAMW25 module's host uses. What differs is the memory: 128 KB of
 # flash and 16 KB of SRAM against the ATSAMD21G18A's 256 KB and 32 KB, which is why the part row
 # rather than the family says so.
 #
-# BOTH CONTROL LINES ARE ACTIVE LOW AND THE GUIDE STATES BOTH IN WORDS, as its E51 sibling's does.
+# Both control lines are active low and the guide states both in words, as its E51 sibling's does.
 # The LED lights when its line is driven to ground; the switch drives its line to ground when
-# pressed. AND THE SWITCH HAS NO EXTERNAL PULL-UP -- the guide's own Note says so and says what to
+# pressed. And the switch has no external pull-up -- the guide's own Note says so and says what to
 # do about it, so a program opening that pin as a plain input reads a floating pad.
 #
-# THE CRYSTAL IS THE OPPOSITE OF THE E51 CURIOSITY NANO'S, AND THAT INVERSION IS THE THING TO GET
-# RIGHT. The E51 Nano populates its 32.768 kHz crystal by default. This board fits the footprint but
+# The crystal is the opposite of the E51 Curiosity Nano's, and that inversion is the thing to get
+# right. The E51 Nano populates its 32.768 kHz crystal by default. This board fits the footprint but
 # does NOT connect the crystal as it ships, because both of its pads are routed out to the edge
 # connector instead; the guide says using it takes hardware modification, and that the two edge
 # lines have to be disconnected first to avoid contention and excess capacitance. So PA00 and PA01
 # are ordinary I/O on a stock board here and are not on the E51 Nano, and a clock plan that assumed
 # the sibling's answer would wait on an oscillator that is not attached.
 #
-# THE DEBUGGER IS AN nEDBG, as the E51 Curiosity Nano's is. Its SWD lines reach PA31 and PA30 and
+# The debugger is an nEDBG, as the E51 Curiosity Nano's is. Its SWD lines reach PA31 and PA30 and
 # it has an nRESET line to the target, all of which are ALSO on the edge connector.
 
 [table]
@@ -52,7 +52,7 @@ default = true
 
 # --- the clock plan -------------------------------------------------------------------------------
 #
-# THE RESET PLAN, STATED RATHER THAN CONFIGURED, and it is the family's rather than this board's:
+# The reset plan, stated rather than configured, and it is the family's rather than this board's:
 # the part comes out of reset with the calibrated OSC8M enabled and used as the main clock source
 # running UNDIVIDED at 8 MHz, so generator 0 carries 8 MHz until something configures a source.
 # This board attaches no external oscillator to change that -- see the crystal note above, which is

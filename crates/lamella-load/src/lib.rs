@@ -6422,6 +6422,9 @@ fn classify_type_test_tokens(
                 *token,
                 cast_elem_of_name(asm, name.namespace, name.name, *token),
             );
+            if is_array_base_name(name.namespace, name.name) {
+                module.mark_array_base_name(asm, *token);
+            }
         } else if let Some(sig) = assembly.type_spec_signature(*token) {
             module.bind_cast_elem(asm, *token, cast_elem_of_sig(asm, &sig));
             bind_signature_elements(assembly, module, asm, type_index, &sig);
@@ -6449,6 +6452,20 @@ fn bind_signature_elements(
         }
         _ => {}
     }
+}
+
+/// Whether `namespace.name` is a type every array is an instance of: `System.Array`, or one of the
+/// six interfaces .NET's `System.Array` implements. A cast of an array to any other named type
+/// fails, so with no corlib to resolve the name against, the name alone decides the cast.
+fn is_array_base_name(namespace: &str, name: &str) -> bool {
+    matches!(
+        (namespace, name),
+        ("System", "Array" | "ICloneable")
+            | (
+                "System.Collections",
+                "IList" | "ICollection" | "IEnumerable" | "IStructuralComparable" | "IStructuralEquatable"
+            )
+    )
 }
 
 /// The [`CastElem`] shape a NAMED cast-test token denotes: the exact `System` primitive /

@@ -133,41 +133,37 @@ const DWARF_LR: u8 = 14;
 /// The stack a function builds and gives back, accumulated as the instructions that move it are
 /// encoded.
 ///
-/// # WHY THIS IS RECORDED HERE AND NOT COMPUTED BY THE CALLER
+/// # Why this is recorded here and not computed by the caller
 ///
-/// The frame is a fact about the emitted instructions, and there is more than one lowering that
-/// emits them. A rule reimplemented once per lowering gains a new case in none of them: the one that
-/// was edited gets it right and the others go on silently describing a frame they no longer build.
-/// Recording it where the instruction is ENCODED means every lowering contributes by construction,
-/// including one written later that nobody thinks to update.
+/// The frame is a fact about the emitted instructions, and more than one lowering emits them.
+/// Recording it where each instruction is encoded means every lowering contributes to it by
+/// construction, including one written later.
 ///
 /// It is deliberately not the safepoint records the collector uses. Those exist only where a call
 /// exists to create one, so a function that calls nothing has no record at all, and the width they
 /// state includes the link register whether or not this function saved it.
 ///
-/// # EVERY MOVEMENT, NOT JUST THE PROLOGUE'S
+/// # Every movement, not just the prologue's
 ///
 /// A frame recorded once is wrong from the next stack instruction onward, and functions move the
 /// stack in three places: the prologue builds it, a body that spills around a call takes more and
-/// gives it back, and the epilogue returns all of it. The epilogue is the end that matters. Once
-/// the stack is restored, a frame address stated from the prologue points into the CALLER's frame,
-/// so a saved return address read through it comes out of a word belonging to somebody else -- and
-/// unlike a stale link register, nothing about that word says so. It reports a caller the program
-/// never had, confidently.
+/// gives it back, and the epilogue returns all of it. Once the epilogue has restored the stack, a
+/// frame address stated from the prologue points into the caller's frame, and a saved return
+/// address read through it would come from a word of the caller's.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct FrameTrack {
-    /// The registers the PROLOGUE pushed, in the order the pushes named them -- ascending, in DWARF
+    /// The registers the prologue pushed, in the order the pushes named them -- ascending, in DWARF
     /// numbering with 14 for the link register, which is the order a push stores them in.
     ///
     /// Their rules are stated relative to the frame address rather than the stack pointer, so they
     /// hold for as long as the registers are on the stack however far the stack pointer moves.
     pub saved: Vec<u8>,
-    /// Where the caller's stack pointer stands after each instruction that moved it, as a LABEL
+    /// Where the caller's stack pointer stands after each instruction that moved it, as a label
     /// id and the frame in force from there: `(label, bytes above this function's stack pointer)`.
     ///
-    /// # A LABEL AND NOT AN OFFSET, BECAUSE `finish` MOVES CODE
+    /// # A label and not an offset, because `finish` moves code
     ///
-    /// Branch relaxation and far-branch veneers both INSERT bytes, and a veneer is spliced into the
+    /// Branch relaxation and far-branch veneers both insert bytes, and a veneer is spliced into the
     /// middle of a function. A position captured while encoding is therefore stale for everything
     /// after the splice, and stale in a way with no symptom: the rows still parse, still sit in the
     /// right function, and land on ordinary instructions and on literal-pool words. Resolving a
@@ -223,13 +219,17 @@ pub struct Encoder {
     /// entry relative to its type descriptor, so the image works wherever it is loaded).
     diffs: Vec<(u32, u32, u32)>,
     relocs: Vec<Reloc>,
-    /// Label ids of literal-pool words emitted via [`Encoder::pool_word`] /
-    /// [`Encoder::pool_word_symbol`] -- each a self-contained 4-byte datum a PC-relative `ldr`
-    /// loads. If such a word ends up beyond its load's ~1 KB reach, [`Encoder::finish`] relocates a
-    /// copy into a nearer branch-over island (see [`Encoder::island_far_literal`]). Other
-    /// `ThumbLdrLit8` targets -- an `adr` to a string or a multi-word descriptor -- are NOT listed
-    /// here and are never split this way.
-    pool_literals: Vec<u32>,
+    /// Which labels name literal-pool words emitted via [`Encoder::pool_word`] /
+    /// [`Encoder::pool_word_symbol`]: `pool_literals[i]` is set for label `i` (an index past the end
+    /// is unset). Each such word is a self-contained 4-byte datum a PC-relative `ldr` loads. If it
+    /// ends up beyond its load's ~1 KB reach, [`Encoder::finish`] relocates a copy into a nearer
+    /// branch-over island (see [`Encoder::island_far_literal`]). Other `ThumbLdrLit8` targets -- an
+    /// `adr` to a string or a multi-word descriptor -- are NOT marked here and are never split this
+    /// way.
+    ///
+    /// Indexed by label rather than listed, because relaxation asks the question once per literal
+    /// load on every pass: a list made each answer a search of every pool word in the object.
+    pool_literals: Vec<bool>,
     /// Marked data BLOBs: `(label id, byte length)` for each self-contained datum registered via
     /// [`Encoder::mark_blob`] -- a string laid at its function's end, referenced by an `adr`. On a
     /// Mainline target, a marked blob beyond even the widened `ADR.W`'s +/-4 KB reach relocates a
@@ -1264,7 +1264,7 @@ impl Encoder {
     /// large function's early loads still reach their constants instead of hard-erroring.
     pub fn pool_word(&mut self, label: Label, value: u32) {
         self.bind_label(label);
-        self.pool_literals.push(label.0);
+        self.mark_pool_literal(label);
         self.emit_word(value);
     }
 
@@ -1280,7 +1280,7 @@ impl Encoder {
     /// Islanding copies the whole relocation, addend included.
     pub fn pool_word_symbol_addend(&mut self, label: Label, symbol: u32, addend: i32) {
         self.bind_label(label);
-        self.pool_literals.push(label.0);
+        self.mark_pool_literal(label);
         let at = self.position();
         self.relocs.push(Reloc {
             at,
@@ -1289,6 +1289,20 @@ impl Encoder {
             addend,
         });
         self.bytes.extend_from_slice(&[0; 4]);
+    }
+
+    /// Records that `label` names an islandable literal-pool word (see [`Encoder::pool_word`]).
+    fn mark_pool_literal(&mut self, label: Label) {
+        let index = label.0 as usize;
+        if self.pool_literals.len() <= index {
+            self.pool_literals.resize(index + 1, false);
+        }
+        self.pool_literals[index] = true;
+    }
+
+    /// Whether the label with id `label_id` names an islandable literal-pool word.
+    fn is_pool_literal(&self, label_id: u32) -> bool {
+        self.pool_literals.get(label_id as usize).copied().unwrap_or(false)
     }
 
     /// Marks `label` as the start of a self-contained data BLOB of `len` bytes -- a string laid at
@@ -1344,45 +1358,387 @@ impl Encoder {
         }
     }
 
-    /// Runs branch relaxation and literal-pool islanding to a JOINT fixpoint before the fixups are
+    /// Runs branch relaxation and literal-pool islanding to a joint fixpoint before the fixups are
     /// resolved. Each grows the image -- a widened conditional branch splices a halfword-pair, an
     /// islanded literal splices a branch-over datum -- which shifts later references and can push
     /// another branch or load out of reach, so the steps co-iterate until nothing must move. Each
     /// conditional branch widens at most once (it then has the wider reach), each pool word islands
     /// at most once (its copy then sits a few bytes from the load), and each far blob islands at
     /// most once per referencing `adr` (its copy then sits beside the `ADR.W`), so this terminates.
+    ///
+    /// # One stretch at a time, in the order of one change at a time
+    ///
+    /// The fixpoint is the one [`Encoder::relax_one`] steps towards: relax the first out-of-reach
+    /// reference of the first kind that has one, then look again from the top. Run over a whole
+    /// object, that rescans every fixup and shifts every later label, fixup and relocation for each
+    /// single change, so its cost grows with the square of the object's size.
+    ///
+    /// A change moves only what lies past it, and moves all of that alike, so it can push a
+    /// reference out of reach only if the reference spans the change. The image therefore falls
+    /// into stretches: runs of bytes, each covering the span of every reference in it, that no
+    /// reference crosses. Nothing that happens in one stretch changes whether a reference in another
+    /// is in reach, so each stretch relaxes on its own copy of its bytes, by the same rule and in
+    /// the same order, at the cost of its own size per change.
+    ///
+    /// What the stretches cannot decide alone is the order of what their changes append -- the
+    /// labels they mint, the relocations their islands copy, the fixups and veneers they add -- and
+    /// that order reaches the caller, because the relocations come out in it. So each stretch
+    /// records its steps, and the steps of all stretches are merged in the order the whole-image
+    /// loop takes them: an earlier kind of relaxation first, then the earlier fixup. The image is
+    /// then rebuilt once. The result is the whole-image loop's, byte for byte and in every list.
+    ///
+    /// An encoder the stretches cannot reproduce exactly -- a relaxable reference to an unbound
+    /// label, or a step that fails -- is relaxed one change at a time over the whole image instead,
+    /// so its error is the one that loop meets first.
     fn relax(&mut self) -> Result<(), AssembleError> {
-        loop {
-            if self.widen_far_conditional_branch()? {
-                continue;
-            }
-            if self.wide && self.widen_far_unconditional_branch()? {
-                continue;
-            }
-            if !self.wide && self.veneer_far_unconditional_branch()? {
-                continue;
-            }
-            if self.wide && self.widen_far_adr()? {
-                continue;
-            }
-            if !self.wide && self.veneer_far_adr()? {
-                continue;
-            }
-            if self.wide && self.island_far_blob()? {
-                continue;
-            }
-            if self.island_far_literal()? {
-                continue;
-            }
+        if self.relax_by_stretch() {
             return Ok(());
         }
+        while self.relax_one()?.is_some() {}
+        Ok(())
+    }
+
+    /// One step towards the fixpoint [`Encoder::relax`] reaches: relaxes the first out-of-reach
+    /// reference of the first [`Relaxation`] kind that has one. Returns that kind and the index the
+    /// relaxed fixup had, or `None` once every reference is in reach.
+    fn relax_one(&mut self) -> Result<Option<(Relaxation, usize)>, AssembleError> {
+        if let Some(index) = self.widen_far_conditional_branch()? {
+            return Ok(Some((Relaxation::ConditionalBranch, index)));
+        }
+        let branch = if self.wide {
+            self.widen_far_unconditional_branch()?
+        } else {
+            self.veneer_far_unconditional_branch()?
+        };
+        if let Some(index) = branch {
+            return Ok(Some((Relaxation::Branch, index)));
+        }
+        let adr = if self.wide {
+            self.widen_far_adr()?
+        } else {
+            self.veneer_far_adr()?
+        };
+        if let Some(index) = adr {
+            return Ok(Some((Relaxation::Adr, index)));
+        }
+        if self.wide
+            && let Some(index) = self.island_far_blob()?
+        {
+            return Ok(Some((Relaxation::BlobIsland, index)));
+        }
+        Ok(self
+            .island_far_literal()?
+            .map(|index| (Relaxation::LiteralIsland, index)))
+    }
+
+    /// Relaxes the image stretch by stretch, as [`Encoder::relax`] describes, and returns `true`;
+    /// or returns `false`, having changed nothing, when the stretches cannot reproduce the
+    /// whole-image loop exactly.
+    fn relax_by_stretch(&mut self) -> bool {
+        let Some(stretches) = self.independent_stretches() else {
+            return false;
+        };
+        let mut runs = self.stretch_runs(&stretches);
+        for run in &mut runs {
+            if !run.replay() {
+                return false;
+            }
+        }
+        runs.retain(|run| !run.steps.is_empty());
+        if !runs.is_empty() {
+            self.merge_stretch_runs(&runs);
+        }
+        true
+    }
+
+    /// The stretches [`Encoder::relax`] relaxes apart, in ascending order. Each covers, widened out
+    /// to whole words, the site and target of every reference in it that relaxation can change,
+    /// the pool word or blob such a reference's island would copy, and the four bytes past its site
+    /// that its relaxations splice at. `None` when such a reference names an unbound label.
+    fn independent_stretches(&self) -> Option<Vec<Stretch>> {
+        let mut blobs = self.blobs.clone();
+        blobs.sort_unstable_by_key(|&(label, ..)| label);
+        let mut spans = Vec::new();
+        for &(at, kind, label_id) in &self.fixups {
+            if !relaxable(kind) {
+                continue;
+            }
+            let target = self.labels.get(label_id as usize).copied().flatten()?;
+            let (mut first, mut last) = (at.min(target), at.max(target));
+            if matches!(kind, RelocKind::ThumbLdrLit8 | RelocKind::ThumbAdrWide) {
+                let from = blobs.partition_point(|&(label, ..)| label < label_id);
+                for &(_, prefix, len) in blobs[from..].iter().take_while(|&&(label, ..)| label == label_id) {
+                    first = first.min(target.saturating_sub(prefix));
+                    last = last.max(target.saturating_add(len));
+                }
+                if self.is_pool_literal(label_id) {
+                    last = last.max(target.saturating_add(4));
+                }
+            }
+            spans.push(Stretch {
+                start: first & !3,
+                end: last.saturating_add(4 + 3) & !3,
+            });
+        }
+        spans.sort_unstable_by_key(|span| span.start);
+        let mut stretches: Vec<Stretch> = Vec::new();
+        for span in spans {
+            match stretches.last_mut() {
+                Some(last) if span.start <= last.end => last.end = last.end.max(span.end),
+                _ => stretches.push(span),
+            }
+        }
+        Some(stretches)
+    }
+
+    /// Copies each stretch into an encoder of its own, with positions relative to the stretch's
+    /// start: its bytes, the labels bound in it, the relaxable fixups sited in it, the relocations
+    /// in it, and its blobs and pool words. A fixup or diff sited there that relaxation does not
+    /// rewrite is followed by a label bound at its site, so its final position can be read back.
+    fn stretch_runs(&self, stretches: &[Stretch]) -> Vec<StretchRun> {
+        let containing = |position: u32| -> Option<usize> {
+            let after = stretches.partition_point(|stretch| stretch.start <= position);
+            after.checked_sub(1).filter(|&i| position < stretches[i].end)
+        };
+        let length = self.bytes.len() as u32;
+        let mut runs: Vec<StretchRun> = stretches
+            .iter()
+            .map(|&stretch| {
+                let mut encoder = Encoder::new();
+                encoder.wide = self.wide;
+                encoder.bytes = self.bytes[stretch.start as usize..stretch.end.min(length) as usize].to_vec();
+                StretchRun {
+                    stretch,
+                    encoder,
+                    copied_labels: Vec::new(),
+                    minted_from: 0,
+                    members: Vec::new(),
+                    origins: Vec::new(),
+                    created: 0,
+                    copied_relocs: Vec::new(),
+                    followed_fixups: Vec::new(),
+                    followed_diffs: Vec::new(),
+                    steps: Vec::new(),
+                }
+            })
+            .collect();
+        let mut local = alloc::vec![u32::MAX; self.labels.len()];
+        for (id, label) in self.labels.iter().enumerate() {
+            if let Some(position) = *label
+                && let Some(i) = containing(position)
+            {
+                let run = &mut runs[i];
+                local[id] = run.copied_labels.len() as u32;
+                run.copied_labels.push(id as u32);
+                run.encoder.labels.push(Some(position - run.stretch.start));
+                run.encoder.pool_literals.push(self.is_pool_literal(id as u32));
+            }
+        }
+        for (index, &(at, kind, label_id)) in self.fixups.iter().enumerate() {
+            let Some(i) = containing(at) else { continue };
+            let run = &mut runs[i];
+            let site = at - run.stretch.start;
+            if relaxable(kind) {
+                run.encoder.fixups.push((site, kind, local[label_id as usize]));
+                run.members.push(index as u32);
+                run.origins.push(FixupOrigin::Recorded(index as u32));
+            } else {
+                run.followed_fixups.push((index as u32, run.encoder.labels.len() as u32));
+                run.encoder.labels.push(Some(site));
+            }
+        }
+        for (index, &(at, ..)) in self.diffs.iter().enumerate() {
+            if let Some(i) = containing(at) {
+                let run = &mut runs[i];
+                run.followed_diffs.push((index as u32, run.encoder.labels.len() as u32));
+                run.encoder.labels.push(Some(at - run.stretch.start));
+            }
+        }
+        for (index, reloc) in self.relocs.iter().enumerate() {
+            if let Some(i) = containing(reloc.at) {
+                let run = &mut runs[i];
+                run.copied_relocs.push(index as u32);
+                run.encoder.relocs.push(Reloc {
+                    at: reloc.at - run.stretch.start,
+                    ..*reloc
+                });
+            }
+        }
+        for &(label_id, prefix, len) in &self.blobs {
+            if let Some(position) = self.labels.get(label_id as usize).copied().flatten()
+                && let Some(i) = containing(position)
+            {
+                runs[i].encoder.blobs.push((local[label_id as usize], prefix, len));
+            }
+        }
+        for run in &mut runs {
+            run.minted_from = run.encoder.labels.len() as u32;
+        }
+        runs
+    }
+
+    /// Merges the stretches' relaxations into this encoder (see [`Encoder::relax`]): their steps in
+    /// the whole-image loop's order, which numbers the labels they minted and orders the
+    /// relocations, fixups and veneers they appended; then every position; then the bytes, rebuilt
+    /// once.
+    fn merge_stretch_runs(&mut self, runs: &[StretchRun]) {
+        let mut minted: Vec<Vec<u32>> = runs.iter().map(|_| Vec::new()).collect();
+        let mut created_rank: Vec<Vec<u32>> = runs.iter().map(|_| Vec::new()).collect();
+        let mut carried: Vec<(usize, u32)> = Vec::new();
+        let mut created_order: Vec<(usize, u32)> = Vec::new();
+        let mut veneer_order: Vec<(usize, u32)> = Vec::new();
+        let mut next_label = self.labels.len() as u32;
+        let mut next_rank = 0u32;
+        let order = |i: usize, step: &StretchStep, created_rank: &[Vec<u32>]| match step.fixup {
+            FixupOrigin::Recorded(index) => (step.relaxation, false, index, i),
+            FixupOrigin::Created(number) => (step.relaxation, true, created_rank[i][number as usize], i),
+        };
+        let mut queue: alloc::collections::BTreeSet<(Relaxation, bool, u32, usize)> = runs
+            .iter()
+            .enumerate()
+            .map(|(i, run)| order(i, &run.steps[0], &created_rank))
+            .collect();
+        let mut taken = alloc::vec![0usize; runs.len()];
+        while let Some((.., i)) = queue.pop_first() {
+            let run = &runs[i];
+            let step = run.steps[taken[i]];
+            let (labels, relocs, veneers, created) = match taken[i].checked_sub(1) {
+                Some(previous) => {
+                    let previous = run.steps[previous];
+                    (previous.labels, previous.relocs, previous.veneers, previous.created)
+                }
+                None => (run.minted_from, run.copied_relocs.len() as u32, 0, 0),
+            };
+            for _ in labels..step.labels {
+                minted[i].push(next_label);
+                next_label += 1;
+            }
+            carried.extend((relocs..step.relocs).map(|local| (i, local)));
+            veneer_order.extend((veneers..step.veneers).map(|local| (i, local)));
+            for number in created..step.created {
+                created_rank[i].push(next_rank);
+                next_rank += 1;
+                created_order.push((i, number));
+            }
+            taken[i] += 1;
+            if let Some(next) = run.steps.get(taken[i]) {
+                queue.insert(order(i, next, &created_rank));
+            }
+        }
+
+        let length = self.bytes.len() as u32;
+        let mut placed = Vec::with_capacity(runs.len());
+        let mut grown_before = Vec::with_capacity(runs.len() + 1);
+        let mut grown = 0u32;
+        for run in runs {
+            placed.push(run.stretch.start + grown);
+            grown_before.push(grown);
+            grown += run.encoder.bytes.len() as u32 - (run.stretch.end.min(length) - run.stretch.start);
+        }
+        grown_before.push(grown);
+        let moved = |position: u32| position + grown_before[runs.partition_point(|run| run.stretch.end <= position)];
+        let global_label = |i: usize, label: u32| -> u32 {
+            let run = &runs[i];
+            match run.copied_labels.get(label as usize) {
+                Some(&id) => id,
+                None => minted[i]
+                    .get(label.wrapping_sub(run.minted_from) as usize)
+                    .copied()
+                    .unwrap_or(u32::MAX),
+            }
+        };
+
+        let mut bytes = Vec::with_capacity((length + grown) as usize);
+        let mut from = 0;
+        for run in runs {
+            bytes.extend_from_slice(&self.bytes[from..run.stretch.start as usize]);
+            bytes.extend_from_slice(&run.encoder.bytes);
+            from = run.stretch.end.min(length) as usize;
+        }
+        bytes.extend_from_slice(&self.bytes[from..]);
+
+        let mut labels: Vec<Option<u32>> = self.labels.iter().map(|label| label.map(moved)).collect();
+        labels.resize(next_label as usize, None);
+        let mut recorded: Vec<Option<(u32, RelocKind, u32)>> = self
+            .fixups
+            .iter()
+            .map(|&(at, kind, label)| Some((moved(at), kind, label)))
+            .collect();
+        let mut created: Vec<Vec<Option<(u32, RelocKind, u32)>>> =
+            runs.iter().map(|run| alloc::vec![None; run.created as usize]).collect();
+        let mut relocs: Vec<Reloc> = self
+            .relocs
+            .iter()
+            .map(|reloc| Reloc {
+                at: moved(reloc.at),
+                ..*reloc
+            })
+            .collect();
+        let mut diffs: Vec<(u32, u32, u32)> =
+            self.diffs.iter().map(|&(at, from, to)| (moved(at), from, to)).collect();
+        for (i, run) in runs.iter().enumerate() {
+            let start = placed[i];
+            let local = &run.encoder;
+            for (label, &id) in run.copied_labels.iter().enumerate() {
+                labels[id as usize] = local.labels[label].map(|position| position + start);
+            }
+            for (k, &id) in minted[i].iter().enumerate() {
+                labels[id as usize] = local.labels[run.minted_from as usize + k].map(|position| position + start);
+            }
+            for &(index, follower) in &run.followed_fixups {
+                if let (Some(fixup), Some(position)) = (&mut recorded[index as usize], local.labels[follower as usize]) {
+                    fixup.0 = position + start;
+                }
+            }
+            for &(index, follower) in &run.followed_diffs {
+                if let Some(position) = local.labels[follower as usize] {
+                    diffs[index as usize].0 = position + start;
+                }
+            }
+            for &index in &run.members {
+                recorded[index as usize] = None;
+            }
+            for (&(at, kind, label), &origin) in local.fixups.iter().zip(&run.origins) {
+                let fixup = Some((at + start, kind, global_label(i, label)));
+                match origin {
+                    FixupOrigin::Recorded(index) => recorded[index as usize] = fixup,
+                    FixupOrigin::Created(number) => created[i][number as usize] = fixup,
+                }
+            }
+            for (k, &index) in run.copied_relocs.iter().enumerate() {
+                relocs[index as usize].at = local.relocs[k].at + start;
+            }
+        }
+        relocs.extend(carried.iter().map(|&(i, k)| {
+            let reloc = runs[i].encoder.relocs[k as usize];
+            Reloc {
+                at: reloc.at + placed[i],
+                ..reloc
+            }
+        }));
+        let mut fixups: Vec<(u32, RelocKind, u32)> = recorded.into_iter().flatten().collect();
+        fixups.extend(created_order.iter().filter_map(|&(i, number)| created[i][number as usize]));
+        let veneers: Vec<(u32, u32, u32, bool)> = veneer_order
+            .iter()
+            .map(|&(i, k)| {
+                let (word, add, target, thumb) = runs[i].encoder.veneers[k as usize];
+                (global_label(i, word), global_label(i, add), global_label(i, target), thumb)
+            })
+            .collect();
+        self.bytes = bytes;
+        self.labels = labels;
+        self.fixups = fixups;
+        self.relocs = relocs;
+        self.diffs = diffs;
+        self.veneers.extend(veneers);
     }
 
     /// Grows the first far unconditional branch (`ThumbBranch11`, its +/-2 KB reach exceeded) into a
     /// 32-bit `B.W` (+/-16 MB) -- a Mainline-only relaxation. Splices the second halfword and re-kinds
-    /// the fixup; the caller re-checks from the top because the spliced halfword shifts later refs.
-    /// (An ARMv6-M target, which has no wide branch, would instead need a literal-pool veneer.)
-    fn widen_far_unconditional_branch(&mut self) -> Result<bool, AssembleError> {
+    /// the fixup, and returns its index; the caller re-checks from the top because the spliced
+    /// halfword shifts later refs. (An ARMv6-M target, which has no wide branch, would instead need a
+    /// literal-pool veneer.)
+    fn widen_far_unconditional_branch(&mut self) -> Result<Option<usize>, AssembleError> {
         for idx in 0..self.fixups.len() {
             let (at, kind, label_id) = self.fixups[idx];
             if kind != RelocKind::ThumbBranch11 {
@@ -1398,9 +1754,9 @@ impl Encoder {
             }
             self.splice_in(at + 2, &[0x00, 0x00, 0x00, 0xBF]);
             self.fixups[idx].1 = RelocKind::ThumbBranch24;
-            return Ok(true);
+            return Ok(Some(idx));
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Splices a literal-pool-indirect veneer in place of the first far unconditional branch
@@ -1424,10 +1780,11 @@ impl Encoder {
     /// register form, which would need a register the encoder cannot know is free. The delta is
     /// position-independent (a same-image relative reference, like [`Encoder::data_word_diff`]), so no
     /// link-step relocation is needed; [`Encoder::finish`] fills it once relaxation fixes the layout.
-    /// Returns whether one was spliced; the caller re-checks from the top because the splice shifts
-    /// every later reference. Each far branch veneers at most once (the `ThumbBranch11` fixup is
-    /// removed and the veneer's own `ldr` sits a few bytes from its word), so the fixpoint terminates.
-    fn veneer_far_unconditional_branch(&mut self) -> Result<bool, AssembleError> {
+    /// Returns the index the branch's fixup had: the veneer removes it and appends its own load's.
+    /// The caller re-checks from the top because the splice shifts every later reference. Each far
+    /// branch veneers at most once (the `ThumbBranch11` fixup is removed and the veneer's own `ldr`
+    /// sits a few bytes from its word), so the fixpoint terminates.
+    fn veneer_far_unconditional_branch(&mut self) -> Result<Option<usize>, AssembleError> {
         for idx in 0..self.fixups.len() {
             let (at, kind, label_id) = self.fixups[idx];
             if kind != RelocKind::ThumbBranch11 {
@@ -1465,9 +1822,9 @@ impl Encoder {
             self.labels[add_label.0 as usize] = Some(add_site);
             self.fixups.push((ldr_site, RelocKind::ThumbLdrLit8, word_label.0));
             self.veneers.push((word_label.0, add_label.0, label_id, true));
-            return Ok(true);
+            return Ok(Some(idx));
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Splices a literal-pool veneer in place of the first far `adr` (a `ThumbLdrLit8` fixup whose
@@ -1486,8 +1843,9 @@ impl Encoder {
     /// veneer needs no save/restore (unlike the branch veneer). Unlike `ADR.W`'s +/-4 KB the computed
     /// address has unbounded reach, so no blob copy is needed. The `adr` FALLS THROUGH (it is not a
     /// branch), so the delta word cannot sit in the instruction stream: a short `b over` skips it,
-    /// exactly as [`Encoder::island_far_literal`] skips its copied datum. Returns whether one spliced.
-    fn veneer_far_adr(&mut self) -> Result<bool, AssembleError> {
+    /// exactly as [`Encoder::island_far_literal`] skips its copied datum. Returns the `adr`'s fixup
+    /// index.
+    fn veneer_far_adr(&mut self) -> Result<Option<usize>, AssembleError> {
         for idx in 0..self.fixups.len() {
             let (at, kind, label_id) = self.fixups[idx];
             if kind != RelocKind::ThumbLdrLit8 {
@@ -1533,16 +1891,17 @@ impl Encoder {
             self.fixups[idx].2 = word_label.0;
             self.fixups.push((b_site, RelocKind::ThumbBranch11, over_label.0));
             self.veneers.push((word_label.0, add_label.0, label_id, false));
-            return Ok(true);
+            return Ok(Some(idx));
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Grows the first far `adr` (a `ThumbLdrLit8` fixup whose instruction is an `ADR`, its ~1 KB
     /// reach exceeded) into a 32-bit `ADR.W` (+/-4 KB) -- a Mainline-only relaxation, the alternative
     /// to blob-islanding a far string on a v6-M target. Only the `ADR` opcode (`0xA0xx`) grows here; a
     /// pool WORD (an `LDR` literal, `0x48xx`) still relocates through [`Encoder::island_far_literal`].
-    fn widen_far_adr(&mut self) -> Result<bool, AssembleError> {
+    /// Returns the index of the fixup it widened.
+    fn widen_far_adr(&mut self) -> Result<Option<usize>, AssembleError> {
         for idx in 0..self.fixups.len() {
             let (at, kind, label_id) = self.fixups[idx];
             if kind != RelocKind::ThumbLdrLit8 {
@@ -1565,15 +1924,16 @@ impl Encoder {
             }
             self.splice_in(at + 2, &[0x00, 0x00, 0x00, 0xBF]);
             self.fixups[idx].1 = RelocKind::ThumbAdrWide;
-            return Ok(true);
+            return Ok(Some(idx));
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Grows the first conditional branch whose +/-256-byte reach is exceeded into the two-halfword
     /// inverted-skip form (ARMv6-M has no wide `B<c>`): `B<!cond>` over a following `B`, which
-    /// reaches +/-2 KB. Returns whether one grew; the caller re-checks from the top because the
-    /// spliced halfword shifts every later reference and can push another branch out of range.
+    /// reaches +/-2 KB. Returns the index of the fixup that grew; the caller re-checks from the top
+    /// because the spliced halfword shifts every later reference and can push another branch out of
+    /// range.
     ///
     /// The grown form is left as the TWO ORDINARY REFERENCES it is made of -- a conditional branch
     /// to a skip label just past the pair, and a plain `ThumbBranch11` to the real target -- rather
@@ -1586,7 +1946,7 @@ impl Encoder {
     ///
     /// The emitted bytes are unchanged for a branch that already fitted: the skip label sits at
     /// `at + 6`, so the conditional's resolved immediate is 1, exactly what the fused form baked in.
-    fn widen_far_conditional_branch(&mut self) -> Result<bool, AssembleError> {
+    fn widen_far_conditional_branch(&mut self) -> Result<Option<usize>, AssembleError> {
         for idx in 0..self.fixups.len() {
             let (at, kind, label_id) = self.fixups[idx];
             if kind != RelocKind::ThumbBranchCond8 {
@@ -1613,15 +1973,15 @@ impl Encoder {
             self.fixups[idx].2 = skip.0;
             self.fixups
                 .push((at + 2, RelocKind::ThumbBranch11, label_id));
-            return Ok(true);
+            return Ok(Some(idx));
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Relocates the first islandable literal-pool word (see [`Encoder::pool_word`]) that lies
     /// beyond its PC-relative load's ~1 KB reach into a branch-over island placed right after the
     /// load -- a point execution reaches, from which the copy is a few bytes ahead and so back in
-    /// range -- and re-points the load's label at the copy. Returns whether one moved.
+    /// range -- and re-points the load's label at the copy. Returns the load's fixup index.
     ///
     /// The island is `B over` (which skips the datum), word-align padding, then the 4-byte copy.
     /// The original word is left where it was as harmless dead data: no load reaches it, because
@@ -1629,10 +1989,10 @@ impl Encoder {
     /// copy while the orphaned one merely patches unread bytes. Only marked words move -- an `adr` to a
     /// string or multi-word descriptor is never split this way and still hard-errors in
     /// [`Encoder::finish`] if it is out of reach.
-    fn island_far_literal(&mut self) -> Result<bool, AssembleError> {
+    fn island_far_literal(&mut self) -> Result<Option<usize>, AssembleError> {
         for idx in 0..self.fixups.len() {
             let (at, kind, label_id) = self.fixups[idx];
-            if kind != RelocKind::ThumbLdrLit8 || !self.pool_literals.contains(&label_id) {
+            if kind != RelocKind::ThumbLdrLit8 || !self.is_pool_literal(label_id) {
                 continue;
             }
             let target = match self.labels.get(label_id as usize) {
@@ -1667,9 +2027,9 @@ impl Encoder {
                 r.at = word_site;
                 self.relocs.push(r);
             }
-            return Ok(true);
+            return Ok(Some(idx));
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Relocates the first marked blob (see [`Encoder::mark_blob`]) that lies beyond its widened
@@ -1677,7 +2037,7 @@ impl Encoder {
     /// the multi-byte twin of [`Encoder::island_far_literal`], and Mainline-only: it fires on a
     /// [`RelocKind::ThumbAdrWide`] fixup, which only [`Encoder::widen_far_adr`] mints (widening is
     /// tried first, so the 4-byte `ADR.W` rescues the 1 KB..4 KB band and a copy is spliced only
-    /// past that). Returns whether one moved.
+    /// past that). Returns the `ADR.W`'s fixup index.
     ///
     /// The island is `B over` (which skips the datum), word-align padding, the blob copy, then
     /// trailing padding to a MULTIPLE OF 4 -- the splice preserves every later `ldr [pc, #imm*4]`
@@ -1687,7 +2047,7 @@ impl Encoder {
     /// orphaned one merely patches unread bytes. A blob longer than the skip branch's +/-2 KB reach
     /// pushes `B over` out of range; the joint fixpoint then widens that skip to `B.W` on a later
     /// pass (`wide` is always set when this fires).
-    fn island_far_blob(&mut self) -> Result<bool, AssembleError> {
+    fn island_far_blob(&mut self) -> Result<Option<usize>, AssembleError> {
         for idx in 0..self.fixups.len() {
             let (at, kind, label_id) = self.fixups[idx];
             if kind != RelocKind::ThumbAdrWide {
@@ -1736,9 +2096,9 @@ impl Encoder {
                 r.at = copy_site + (r.at - from);
                 self.relocs.push(r);
             }
-            return Ok(true);
+            return Ok(Some(idx));
         }
-        Ok(false)
+        Ok(None)
     }
 
     /// Resolves every internal label reference and returns the finished image
@@ -1918,6 +2278,122 @@ impl Encoder {
             .iter()
             .map(|l| self.labels.get(l.0 as usize).copied().flatten())
             .collect())
+    }
+}
+
+/// Whether relaxation can change a reference of this kind.
+fn relaxable(kind: RelocKind) -> bool {
+    matches!(
+        kind,
+        RelocKind::ThumbBranchCond8 | RelocKind::ThumbBranch11 | RelocKind::ThumbLdrLit8 | RelocKind::ThumbAdrWide
+    )
+}
+
+/// The relaxations [`Encoder::relax_one`] applies, in the order it tries them: while any reference
+/// needs an earlier kind, that kind goes first, wherever in the image the reference is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum Relaxation {
+    /// A conditional branch grows into an inverted skip over an unconditional branch.
+    ConditionalBranch,
+    /// An unconditional branch widens to `B.W`, or on a Baseline target is replaced by a veneer.
+    Branch,
+    /// An `adr` widens to `ADR.W`, or on a Baseline target is replaced by a veneer.
+    Adr,
+    /// A marked blob is copied into an island beside its `ADR.W`.
+    BlobIsland,
+    /// A literal-pool word is copied into an island beside its load.
+    LiteralIsland,
+}
+
+/// Where a fixup came from, which is how the whole-image relaxation loop orders its fixups: every
+/// fixup recorded before relaxation, by index, then every fixup relaxation created, by when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FixupOrigin {
+    /// The fixup at this index of the encoder being relaxed.
+    Recorded(u32),
+    /// The fixup a stretch's relaxation created with this number, counting within the stretch.
+    Created(u32),
+}
+
+/// A run of the image, `[start, end)`, that relaxes independently of everything outside it; see
+/// [`Encoder::relax`].
+#[derive(Debug, Clone, Copy)]
+struct Stretch {
+    start: u32,
+    end: u32,
+}
+
+/// One step of a stretch's relaxation: which relaxation, of which fixup, and how long the stretch
+/// encoder's labels, relocations, veneers and created fixups were after it -- so that what each step
+/// appended can be placed when the steps of every stretch are merged.
+#[derive(Debug, Clone, Copy)]
+struct StretchStep {
+    relaxation: Relaxation,
+    fixup: FixupOrigin,
+    labels: u32,
+    relocs: u32,
+    veneers: u32,
+    created: u32,
+}
+
+/// A stretch relaxed on its own copy of the image, with what [`Encoder::relax`] needs to merge it
+/// back.
+#[derive(Debug)]
+struct StretchRun {
+    /// The bytes it covers.
+    stretch: Stretch,
+    /// The stretch's own encoder: its bytes, and what lies inside it at positions relative to the
+    /// stretch's start.
+    encoder: Encoder,
+    /// The relaxed encoder's id of each label copied in, in local id order. Local ids past these
+    /// are the labels that follow fixup and diff sites, then the labels relaxation mints.
+    copied_labels: Vec<u32>,
+    /// The first local id relaxation mints.
+    minted_from: u32,
+    /// The relaxed encoder's index of each relaxable fixup copied in, in local order.
+    members: Vec<u32>,
+    /// Where each of the stretch encoder's fixups came from, kept parallel to them.
+    origins: Vec<FixupOrigin>,
+    /// How many fixups the stretch's relaxation has created.
+    created: u32,
+    /// The relaxed encoder's index of each relocation copied in, in local order.
+    copied_relocs: Vec<u32>,
+    /// Each fixup sited in the stretch that relaxation does not rewrite: its index, and the local
+    /// label that follows its site.
+    followed_fixups: Vec<(u32, u32)>,
+    /// Each diff sited in the stretch: its index, and the local label that follows its site.
+    followed_diffs: Vec<(u32, u32)>,
+    /// What each step of the stretch's relaxation did, in order.
+    steps: Vec<StretchStep>,
+}
+
+impl StretchRun {
+    /// Relaxes the stretch to its fixpoint by the whole-image rule, recording each step. Returns
+    /// `false` if a step fails, which [`Encoder::relax`] leaves to the whole-image loop to report.
+    fn replay(&mut self) -> bool {
+        loop {
+            let (relaxation, index) = match self.encoder.relax_one() {
+                Ok(Some(step)) => step,
+                Ok(None) => return true,
+                Err(_) => return false,
+            };
+            let fixup = self.origins[index];
+            if relaxation == Relaxation::Branch && !self.encoder.wide {
+                self.origins.remove(index);
+            }
+            while self.origins.len() < self.encoder.fixups.len() {
+                self.origins.push(FixupOrigin::Created(self.created));
+                self.created += 1;
+            }
+            self.steps.push(StretchStep {
+                relaxation,
+                fixup,
+                labels: self.encoder.labels.len() as u32,
+                relocs: self.encoder.relocs.len() as u32,
+                veneers: self.encoder.veneers.len() as u32,
+                created: self.created,
+            });
+        }
     }
 }
 
@@ -3134,5 +3610,286 @@ mod tests {
             .expect("the label survives the splice") as usize;
         let before = u16::from_le_bytes([out.bytes[at - 2], out.bytes[at - 1]]);
         assert_eq!(before, 0xB082, "SUB SP, #8 -- the instruction this transition is about");
+    }
+
+    /// A deterministic xorshift32 sequence, so a synthetic object is the same on every run and host.
+    struct Xorshift(u32);
+
+    impl Xorshift {
+        fn below(&mut self, n: u32) -> u32 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            self.0 = x;
+            x % n
+        }
+    }
+
+    /// A literal load or an `adr` in a synthetic object, with what it must reach once laid out.
+    enum Reference {
+        /// An `ldr` of a pool word holding a plain value, or `symbol + addend` through a relocation.
+        Word(Label, u32, Option<(u32, i32)>),
+        /// An `adr` of a string blob holding these bytes.
+        Blob(Label, Vec<u8>),
+    }
+
+    /// Lays out `functions` synthetic functions end to end, the way an object build does: each starts
+    /// word-aligned with a frame, runs a random body of literal loads, conditional and unconditional
+    /// branches, `adr`s, calls, marks and filler, then lays its literal pool (plain and relocated
+    /// words) and its string blobs (each behind a relocated header word that travels with it). The
+    /// bodies run `shortest` instructions and up to `spread` more, long enough at the defaults that
+    /// relaxation has to island literals and blobs and widen or veneer branches and `adr`s, many times
+    /// over and in every combination. Returns each reference with the mark bound on its instruction.
+    fn synthetic_object(
+        wide: bool,
+        seed: u32,
+        functions: usize,
+        (shortest, spread): (u32, u32),
+    ) -> (Encoder, Vec<(Label, Reference)>) {
+        let mut rng = Xorshift(seed);
+        let mut enc = Encoder::new();
+        enc.set_wide_thumb2(wide);
+        let mut references = Vec::new();
+        let entries: Vec<Label> = (0..functions).map(|_| enc.new_label()).collect();
+        for &entry in &entries {
+            enc.align_to_word();
+            enc.bind_label(entry);
+            enc.begin_function();
+            enc.push_registers(0b1111_0000, true);
+            let blocks: Vec<Label> = (0..48).map(|_| enc.new_label()).collect();
+            let mut bound = [false; 48];
+            let mut pool = Vec::new();
+            let mut strings = Vec::new();
+            for _ in 0..shortest + rng.below(spread) {
+                let reg = Reg::new(rng.below(8) as u8).unwrap();
+                match rng.below(100) {
+                    0..=24 => {
+                        let (site, word) = (enc.new_label(), enc.new_label());
+                        enc.bind_mark(site);
+                        enc.ldr_literal(reg, word).unwrap();
+                        let relocated =
+                            (rng.below(3) == 0).then(|| (rng.below(40), rng.below(64) as i32 * 4));
+                        let value = rng.below(u32::MAX) | 0x100;
+                        pool.push((word, value, relocated));
+                        references.push((site, Reference::Word(word, value, relocated)));
+                    }
+                    25..=39 => {
+                        let cond = [Cond::Eq, Cond::Ne, Cond::CarrySet, Cond::LessThan, Cond::GreaterThan]
+                            [rng.below(5) as usize];
+                        enc.b_cond(cond, blocks[rng.below(48) as usize]);
+                    }
+                    40..=45 => enc.b(blocks[rng.below(48) as usize]),
+                    46..=48 => {
+                        let (site, blob) = (enc.new_label(), enc.new_label());
+                        enc.bind_mark(site);
+                        enc.adr(reg, blob).unwrap();
+                        let text: Vec<u8> = (0..1 + rng.below(40)).map(|_| rng.below(256) as u8).collect();
+                        strings.push((blob, text.clone()));
+                        references.push((site, Reference::Blob(blob, text)));
+                    }
+                    49..=52 => enc.bl_symbol(100 + rng.below(20)),
+                    53..=58 => {
+                        let block = rng.below(48) as usize;
+                        if !bound[block] {
+                            enc.bind_label(blocks[block]);
+                            bound[block] = true;
+                        }
+                    }
+                    59..=61 => {
+                        let mark = enc.new_label();
+                        enc.bind_mark(mark);
+                    }
+                    62..=63 => enc.sub_sp(8).unwrap(),
+                    _ => enc.movs_imm(reg, rng.below(256) as u8).unwrap(),
+                }
+            }
+            for (block, &label) in blocks.iter().enumerate() {
+                if !bound[block] {
+                    enc.bind_label(label);
+                }
+            }
+            enc.pop_registers(0b1111_0000, true);
+            enc.align_to_word();
+            for (word, value, relocated) in pool {
+                match relocated {
+                    Some((symbol, addend)) => enc.pool_word_symbol_addend(word, symbol, addend),
+                    None => enc.pool_word(word, value),
+                }
+            }
+            for (blob, text) in strings {
+                enc.align_to_word();
+                enc.data_word_symbol_addend(7, 0);
+                enc.bind_label(blob);
+                enc.emit_bytes(&text);
+                enc.mark_blob_with_prefix(blob, 4, text.len() as u32);
+            }
+        }
+        enc.align_to_word();
+        for &entry in &entries[1..] {
+            enc.data_word_diff(entries[0], entry);
+        }
+        (enc, references)
+    }
+
+    /// FNV-1a over everything a caller can observe of a finished image: its bytes, its relocations in
+    /// order, and the final position of every label the caller minted before `finish`.
+    fn image_digest(out: &Assembled, caller_labels: usize) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        let mut eat = |bytes: &[u8]| {
+            for &byte in bytes {
+                hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        };
+        eat(&out.bytes);
+        for reloc in &out.relocs {
+            eat(&reloc.at.to_le_bytes());
+            eat(&[reloc.kind as u8]);
+            eat(&reloc.symbol.to_le_bytes());
+            eat(&reloc.addend.to_le_bytes());
+        }
+        for label in &out.labels[..caller_labels] {
+            eat(&label.unwrap_or(u32::MAX).to_le_bytes());
+        }
+        hash
+    }
+
+    /// The address a resolved `adr` at `site` forms: a 16-bit `ADR`, an `ADR.W`, or the Baseline
+    /// veneer that rebuilds it from a delta word.
+    fn adr_address(bytes: &[u8], site: usize) -> usize {
+        let hw = |o: usize| u16::from_le_bytes([bytes[o], bytes[o + 1]]);
+        match hw(site) & 0xF800 {
+            0xA000 => ((site + 4) & !3) + usize::from(hw(site) & 0xFF) * 4,
+            0x4800 => decode_adr_veneer(bytes, site).1 as usize,
+            _ => {
+                assert_eq!(hw(site) & 0xFB0F, 0xF20F & 0xFB0F, "an ADR.W at {site:#x}");
+                let imm = (usize::from((hw(site) >> 10) & 1) << 11)
+                    | (usize::from((hw(site + 2) >> 12) & 7) << 8)
+                    | usize::from(hw(site + 2) & 0xFF);
+                if hw(site) & 0x00A0 == 0x00A0 {
+                    ((site + 4) & !3) - imm
+                } else {
+                    ((site + 4) & !3) + imm
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn many_far_references_lay_out_exactly_as_pinned() {
+        let pins = [
+            (true, (36_968u32, 1_275u32, 0xda48_ea16_95ea_f4a3u64)),
+            (false, (45_272, 1_188, 0xd9e6_9fc2_7a84_ff2b)),
+        ];
+        for (wide, pinned) in pins {
+            let (enc, references) = synthetic_object(wide, 0x5EED_0001, 4, (500, 1300));
+            let caller_labels = enc.labels.len();
+            let out = enc.finish().expect("every far reference relaxes");
+            let minted = out.labels.len() - caller_labels;
+            assert!(minted > 1_500, "relaxation minted only {minted} labels");
+            let digest = image_digest(&out, caller_labels);
+            for (site, reference) in &references {
+                let site = out.label_position(*site).unwrap() as usize;
+                match reference {
+                    Reference::Word(word, value, relocated) => {
+                        let at = ldr_literal_target(&out.bytes, site);
+                        assert_eq!(Some(at as u32), out.label_position(*word), "the load reads its word");
+                        match relocated {
+                            None => assert_eq!(&out.bytes[at..at + 4], &value.to_le_bytes()),
+                            Some((symbol, addend)) => assert!(
+                                out.relocs.iter().any(|r| r.at == at as u32
+                                    && r.symbol == *symbol
+                                    && r.addend == *addend
+                                    && r.kind == RelocKind::Abs32),
+                                "the word the load reads carries its relocation"
+                            ),
+                        }
+                    }
+                    Reference::Blob(blob, text) => {
+                        let at = adr_address(&out.bytes, site);
+                        assert_eq!(Some(at as u32), out.label_position(*blob), "the adr forms its address");
+                        assert_eq!(&out.bytes[at..at + text.len()], text.as_slice(), "and reaches its text");
+                        assert!(
+                            out.relocs.iter().any(|r| r.at as usize == at - 4 && r.symbol == 7),
+                            "the blob's header word travels with it"
+                        );
+                    }
+                }
+            }
+            assert_eq!(
+                (out.bytes.len() as u32, out.relocs.len() as u32, digest),
+                pinned,
+                "the layout moved (wide {wide})"
+            );
+        }
+    }
+
+    /// The fixpoint [`Encoder::relax`] reaches, approached over the whole image one change at a time.
+    fn relax_one_at_a_time(enc: &mut Encoder) -> Result<(), AssembleError> {
+        while enc.relax_one()?.is_some() {}
+        Ok(())
+    }
+
+    /// Asserts two relaxed encoders agree in every list relaxation touches.
+    fn assert_relaxed_alike(by_stretch: &Encoder, one_at_a_time: &Encoder, case: &str) {
+        assert_eq!(by_stretch.bytes, one_at_a_time.bytes, "{case}: bytes");
+        assert_eq!(by_stretch.labels, one_at_a_time.labels, "{case}: labels");
+        assert_eq!(by_stretch.fixups, one_at_a_time.fixups, "{case}: fixups");
+        assert_eq!(by_stretch.relocs, one_at_a_time.relocs, "{case}: relocations");
+        assert_eq!(by_stretch.diffs, one_at_a_time.diffs, "{case}: diffs");
+        assert_eq!(by_stretch.veneers, one_at_a_time.veneers, "{case}: veneers");
+    }
+
+    #[test]
+    fn relaxing_stretch_by_stretch_reproduces_the_whole_image_loop_exactly() {
+        for seed in 1..=4u32 {
+            for wide in [true, false] {
+                let functions = 2 + seed as usize;
+                let (enc, _) = synthetic_object(wide, 0xC0DE_0000 + seed, functions, (500, 1300));
+                let case = alloc::format!("seed {seed}, wide {wide}");
+                let mut by_stretch = enc.clone();
+                assert!(by_stretch.relax_by_stretch(), "{case}: the stretches took it");
+                let mut one_at_a_time = enc;
+                relax_one_at_a_time(&mut one_at_a_time).expect("the whole-image loop relaxes it");
+                assert_relaxed_alike(&by_stretch, &one_at_a_time, &case);
+            }
+        }
+    }
+
+    #[test]
+    fn an_unbound_branch_target_fails_as_the_whole_image_loop_fails() {
+        let (mut enc, _) = synthetic_object(false, 0xC0DE_0101, 2, (150, 900));
+        let dangling = enc.new_label();
+        enc.b(dangling);
+        let mut by_stretch = enc.clone();
+        assert!(!by_stretch.relax_by_stretch(), "the stretches decline it");
+        assert_relaxed_alike(&by_stretch, &enc, "declined, it changed nothing");
+        let mut one_at_a_time = enc.clone();
+        let expected = relax_one_at_a_time(&mut one_at_a_time);
+        assert_eq!(expected, Err(AssembleError::UnboundLabel(dangling)));
+        assert_eq!(enc.relax(), expected);
+    }
+
+    #[test]
+    fn a_pool_word_that_cannot_be_read_fails_as_the_whole_image_loop_fails() {
+        let (mut enc, _) = synthetic_object(true, 0xC0DE_0202, 2, (150, 900));
+        let word = enc.new_label();
+        enc.ldr_literal(Reg::R0, word).unwrap();
+        for _ in 0..600 {
+            enc.nop();
+        }
+        enc.align_to_word();
+        enc.pool_word(word, 0xDEAD_BEEF);
+        enc.bind_label(word);
+        let mut by_stretch = enc.clone();
+        assert!(!by_stretch.relax_by_stretch(), "the stretches decline it");
+        assert_relaxed_alike(&by_stretch, &enc, "declined, it changed nothing");
+        let mut one_at_a_time = enc.clone();
+        let expected = relax_one_at_a_time(&mut one_at_a_time);
+        assert!(matches!(
+            expected,
+            Err(AssembleError::BranchOutOfRange { kind: RelocKind::ThumbLdrLit8, .. })
+        ));
+        assert_eq!(enc.relax(), expected);
     }
 }

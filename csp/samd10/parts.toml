@@ -3,7 +3,7 @@
 # The 13 ordering codes in ch 2 collapse onto these 7: the trailing letters are carrier and
 # temperature grade (`T` = tape and reel, `U` = -40..85C, `N` = -40..105C) and buy the same die.
 #
-# THE NAME IS A CANDIDATE SET AND NOT A PART, TWICE OVER ON THIS FAMILY. The ch 2 decoder reads
+# The name is a candidate set and not a part, twice over on this family. The ch 2 decoder reads
 # `D = 20/24 pins` -- one letter, two package sizes -- and `14 = 16KB, 13 = 8KB`, so "ATSAMD10D14A"
 # still names three packages, and "ATSAMD10D" names six variants across two flash densities.
 #

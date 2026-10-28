@@ -5,7 +5,7 @@
 // instance bases live in Same54Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Same54PortLayout
+    internal sealed class Same54PortLayout
     {
         private Same54PortLayout() { }
 

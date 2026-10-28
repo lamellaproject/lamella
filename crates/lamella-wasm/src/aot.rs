@@ -8,6 +8,10 @@
 //! program linked with corlib, the libraries it references and the board's runtime-support
 //! archive, with the board's bus table laid in, through the entry point the command line calls
 //! (`lamella_aot::build::build_linked_cortex_m_with_board`).
+//!
+//! `lamella_aot_build_linked_debug` is that build for a program compiled for a debugger: the same
+//! link, returning with the image the linked ELF that carries the program's debug information from
+//! its Portable PDB (`lamella_aot::build::build_linked_cortex_m_debug_with_board`).
 
 #![allow(unsafe_code)]
 
@@ -71,6 +75,68 @@ fn build_linked_payload(
     }))
     .unwrap_or_default();
     envelope(&json, &image)
+}
+
+/// Builds the payload the class-library debug ABI returns: [`build_linked_payload`]'s envelope, its
+/// JSON `{ error, busTable, base }`, followed by `[u32 elf_len][ELF bytes]`.
+///
+/// The ELF is the linked program with its debug information, from the program's Portable PDB, and
+/// the image is that ELF's loaded bytes, flattened from `base`: the image a board is written with
+/// for a debug session is the one the ELF describes, because both come from one link. The ELF
+/// also names what the image keeps in RAM for a host to find, the console ring among it.
+///
+/// The archive is refused as in [`build_linked_payload`], and debug information that does not read
+/// back is refused before anything is lowered.
+#[allow(clippy::too_many_arguments)]
+fn build_linked_debug_payload(
+    cil: &[u8],
+    pdb: &[u8],
+    corlib: &[u8],
+    libraries: &[&[u8]],
+    archive: &[u8],
+    target: &str,
+    board: &str,
+) -> Vec<u8> {
+    let board_buses = if board.is_empty() {
+        None
+    } else {
+        lamella_catalog::bus_table(board)
+    };
+    let built = (|| {
+        lamella_elf::read_archive(archive).map_err(|error| {
+            format!("the runtime-support archive given is not an archive: {error:?}")
+        })?;
+        let pdb = lamella_metadata::PortablePdb::read(pdb).map_err(|error| {
+            format!("the debug information the compiler wrote does not read back: {error:?}")
+        })?;
+        let elf = lamella_aot::build::build_linked_cortex_m_debug_with_board(
+            cil,
+            &pdb,
+            corlib,
+            libraries,
+            archive,
+            target,
+            board_buses,
+        )
+        .map_err(|e| format!("{e}"))?;
+        let flat = lamella_elf::flat_image(&elf)
+            .map_err(|error| format!("the linked ELF has no image to write: {error:?}"))?;
+        Ok::<_, String>((flat, elf))
+    })();
+    let (image, base, elf, error) = match built {
+        Ok((flat, elf)) => (flat.bytes, Some(flat.base), elf, None),
+        Err(error) => (Vec::new(), None, Vec::new(), Some(error)),
+    };
+    let json = serde_json::to_vec(&serde_json::json!({
+        "error": error,
+        "busTable": board_buses.is_some(),
+        "base": base,
+    }))
+    .unwrap_or_default();
+    let mut payload = envelope(&json, &image);
+    payload.extend_from_slice(&(elf.len() as u32).to_le_bytes());
+    payload.extend_from_slice(&elf);
+    payload
 }
 
 /// `[u32 json_len][json][u32 image_len][image]`, the layout both builds return.
@@ -171,6 +237,58 @@ pub unsafe extern "C" fn lamella_aot_build_linked(
     ))
 }
 
+/// [`lamella_aot_build_linked`] for a program compiled for a debugger: the same link, and with it
+/// the linked ELF carrying the program's debug information from the Portable PDB at
+/// `pdb_ptr..pdb_ptr + pdb_len` -- the ELF a debugger is given for the program, and the one a host
+/// finds the program's console ring in.
+///
+/// Returns `[u32 json_len][JSON][u32 image_len][image bytes][u32 elf_len][ELF bytes]` (free the
+/// whole buffer with `lamella_dealloc(result, 4 + json_len + 4 + image_len + 4 + elf_len)`). The
+/// JSON is `{ error, busTable, base }`. The image is the ELF's loaded bytes, from `base`, so it is
+/// the image the ELF describes; both are empty when the build failed, and `error` says why.
+///
+/// # Safety
+/// Each pointer/length pair must be a buffer the host filled via a prior `lamella_alloc`
+/// (zero-length `libs` and `board` are allowed).
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn lamella_aot_build_linked_debug(
+    cil_ptr: *const u8,
+    cil_len: usize,
+    pdb_ptr: *const u8,
+    pdb_len: usize,
+    corlib_ptr: *const u8,
+    corlib_len: usize,
+    libs_ptr: *const u8,
+    libs_len: usize,
+    archive_ptr: *const u8,
+    archive_len: usize,
+    target_ptr: *const u8,
+    target_len: usize,
+    board_ptr: *const u8,
+    board_len: usize,
+) -> *mut u8 {
+    let read = |ptr: *const u8, len: usize| -> &[u8] {
+        if len == 0 {
+            &[]
+        } else {
+            unsafe { core::slice::from_raw_parts(ptr, len) }
+        }
+    };
+    let libraries = crate::abi::split_refs(read(libs_ptr, libs_len));
+    let target = core::str::from_utf8(read(target_ptr, target_len)).unwrap_or("");
+    let board = core::str::from_utf8(read(board_ptr, board_len)).unwrap_or("");
+    result_buffer(build_linked_debug_payload(
+        read(cil_ptr, cil_len),
+        read(pdb_ptr, pdb_len),
+        read(corlib_ptr, corlib_len),
+        &libraries,
+        read(archive_ptr, archive_len),
+        target,
+        board,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,6 +348,66 @@ mod tests {
     }
 
     const EMPTY_ARCHIVE: &[u8] = b"!<arch>\n";
+
+    /// Reads the debug payload's head, its image length and the trailing ELF's length.
+    fn parse_debug(payload: &[u8]) -> (serde_json::Value, usize, usize) {
+        let (json, image_len) = parse(payload);
+        let json_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+        let elf_at = 8 + json_len + image_len;
+        let elf_len = u32::from_le_bytes(payload[elf_at..elf_at + 4].try_into().unwrap()) as usize;
+        assert_eq!(
+            payload.len(),
+            elf_at + 4 + elf_len,
+            "the ELF ends the payload"
+        );
+        (json, image_len, elf_len)
+    }
+
+    /// **DEBUG INFORMATION THAT DOES NOT READ BACK IS REFUSED BEFORE ANYTHING IS LOWERED**, by what
+    /// failed, and a failed debug build carries neither an image nor an ELF.
+    #[test]
+    fn a_linked_debug_build_refuses_debug_information_that_does_not_read_back() {
+        let (json, image_len, elf_len) = parse_debug(&build_linked_debug_payload(
+            b"not a managed assembly",
+            b"not a portable pdb",
+            b"",
+            &[],
+            EMPTY_ARCHIVE,
+            "rp2350",
+            "rpi-pico2",
+        ));
+        let error = json["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("the debug information the compiler wrote does not read back"),
+            "got {error}"
+        );
+        assert_eq!((image_len, elf_len), (0, 0));
+        assert_eq!(json["base"], serde_json::Value::Null);
+        assert_eq!(
+            json["busTable"], true,
+            "the board's table is reported as for a product build"
+        );
+    }
+
+    /// The debug build refuses an archive that is not one, as the product build does, and first.
+    #[test]
+    fn a_linked_debug_build_refuses_an_archive_that_is_not_one() {
+        let (json, image_len, elf_len) = parse_debug(&build_linked_debug_payload(
+            b"not a managed assembly",
+            b"not a portable pdb",
+            b"",
+            &[],
+            b"<!doctype html>",
+            "rp2350",
+            "rpi-pico2",
+        ));
+        assert_eq!((image_len, elf_len), (0, 0));
+        let error = json["error"].as_str().unwrap();
+        assert!(
+            error.starts_with("the runtime-support archive given is not an archive"),
+            "got {error}"
+        );
+    }
 
     #[test]
     fn a_linked_build_refuses_an_archive_that_is_not_one() {

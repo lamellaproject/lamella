@@ -1,6 +1,6 @@
 //! `lamella deploy`: take a program and put it on a board.
 
-use crate::args::{self, Spec};
+use crate::args::{self, Positional, Spec};
 use lamella_wire::Capabilities;
 use lamella_wire_host::on_device::{self, capitalized, describe_refusal, host_caps, the_board};
 use lamella_wire_host::{AnyTransport, TransferAck, board_name, hello_blocking, open_target};
@@ -31,7 +31,17 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 const SPEC: Spec<'static> = Spec {
     verb: "deploy",
     usage: Some(USAGE),
-    values: &["--device", "--board", "--probe", "--volume", "--dfu", "--via"],
+    values: &[
+        "--device",
+        "--board",
+        "--probe",
+        "--volume",
+        "--dfu",
+        "--via",
+        crate::folders::REF_DIR,
+        crate::folders::RUNTIME_SUPPORT_DIR,
+    ],
+    repeats: &[],
     flags: &[
         "--no-run",
         "--unsafe",
@@ -39,6 +49,7 @@ const SPEC: Spec<'static> = Spec {
         crate::flash::FLAT_FLAG,
         ERASE_FLAG,
     ],
+    positional: Positional::One("source file"),
 };
 
 pub fn deploy_command(args: &[String]) -> ExitCode {
@@ -58,8 +69,8 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
     let after = if parsed.flag("--no-run") { AfterDeploy::Store } else { AfterDeploy::Start };
     let path = match parsed.only_positional("deploy", "source file") {
         Ok(path) => Path::new(path).to_path_buf(),
-        Err(error) => {
-            eprintln!("{error}\n\n{USAGE}");
+        Err(refusal) => {
+            eprintln!("{refusal}");
             return ExitCode::FAILURE;
         }
     };
@@ -68,12 +79,36 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
         eprintln!(
             "lamella deploy: {} is an image for a CHIP, and this verb sends a program to firmware.\n\n\
              To write it to the chip:\n\
-             \x20   lamella flash {} --board <id>",
+             \x20   lamella flash {} --board <board>",
             path.display(),
             path.display()
         );
         return ExitCode::FAILURE;
     }
+    let destination = match destination(&parsed) {
+        Ok(destination) => destination,
+        Err(refusal) => {
+            eprintln!("{refusal}");
+            return ExitCode::FAILURE;
+        }
+    };
+    if parsed.flag("--unsafe") && matches!(destination, Destination::Device(_)) {
+        eprintln!(
+            "{}",
+            args::refusal(
+                "deploy",
+                "--unsafe is taken with --board alone; a program sent to a --device is compiled with unsafe code off"
+            )
+        );
+        return ExitCode::FAILURE;
+    }
+    let folders = match crate::folders::Folders::from_options(&parsed, "deploy") {
+        Ok(folders) => folders,
+        Err(refusal) => {
+            eprintln!("{refusal}");
+            return ExitCode::FAILURE;
+        }
+    };
 
     let tier = match crate::flash::Tier::from_options(&parsed, "deploy") {
         Ok(tier) => tier,
@@ -92,7 +127,7 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
                 flag,
                 "--device sends firmware that is already running an image baked with the corlib \
                  the program\nwas compiled against, and nothing is linked on the way.",
-                "Use --board <id> to compile and write the chip, which is the route that links.",
+                "Use --board <board> to compile and write the chip, which is the route that links.",
                 "Nothing was sent.",
             )
         );
@@ -100,28 +135,19 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
     }
     let libraries: Vec<crate::flash::Library> = Vec::new();
 
-    match (parsed.value("--board"), parsed.value("--device")) {
-        (Some(_), Some(_)) => {
-            eprintln!(
-                "lamella deploy: --board and --device name different destinations, so give one.\n\n\
-                 \x20   --board <id>      compile and write the CHIP, over a probe (nothing needs \
-                 to be on it)\n\
-                 \x20   --device <d>      compile and send it to firmware ALREADY running there"
-            );
-            ExitCode::FAILURE
-        }
-        (Some(_), None) if kind == lamella_flash_routes::artifact::Kind::WirePayload => {
+    match destination {
+        Destination::Board(_) if kind == lamella_flash_routes::artifact::Kind::WirePayload => {
             eprintln!(
                 "lamella deploy: {} is loaded by firmware already on the board, so it needs a \
                  --device rather\nthan a --board. Writing it to a bare chip would leave the board \
                  resetting into a file format.\n\n\
-                 \x20   lamella deploy {} --device <d>",
+                 \x20   lamella deploy {} --device <device>",
                 path.display(),
                 path.display()
             );
             ExitCode::FAILURE
         }
-        (Some(board_id), None) => {
+        Destination::Board(board_id) => {
             if let Err(error) = crate::project::board_for_build("deploy", &path, Some(board_id)) {
                 eprintln!("{error}");
                 return ExitCode::FAILURE;
@@ -136,20 +162,37 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
                 parsed.flag("--unsafe"),
                 tier,
                 &libraries,
+                &folders,
             )
         }
-        (None, Some(target)) if kind == lamella_flash_routes::artifact::Kind::WirePayload => {
+        Destination::Device(target) if kind == lamella_flash_routes::artifact::Kind::WirePayload => {
             send_payload(&path, target, after)
         }
-        (None, Some(target)) => to_running_firmware(&path, target, after),
-        (None, None) => {
-            eprintln!(
-                "lamella deploy: name where it goes.\n\n{USAGE}\n\
-                 `lamella devices` lists what is attached and prints the --device for each one;\n\
-                 `lamella boards` lists every --board this build knows."
-            );
-            ExitCode::FAILURE
+        Destination::Device(target) => to_running_firmware(&path, target, after, &folders),
+    }
+}
+
+/// Where a deploy's command line sends the program.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Destination<'a> {
+    /// A board model, by its id: the chip is written over a probe or a volume.
+    Board(&'a str),
+    /// A live connection to the firmware on a board.
+    Device(&'a str),
+}
+
+/// The one destination `parsed` names, or the refusal of its command line.
+///
+/// # Errors
+/// Both destinations or neither, and a board this build does not know.
+fn destination<'a>(parsed: &'a args::Options) -> Result<Destination<'a>, String> {
+    match (parsed.value("--board"), parsed.value("--device")) {
+        (Some(_), Some(_)) => {
+            Err(args::refusal("deploy", "--board and --device name different destinations, so give one"))
         }
+        (None, None) => Err(args::refusal("deploy", "name where it goes")),
+        (Some(board), None) => args::known_board("deploy", board).map(Destination::Board),
+        (None, Some(device)) => Ok(Destination::Device(device)),
     }
 }
 
@@ -164,20 +207,18 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
 /// A program named, an option an erase has no use for, or no `--device`.
 fn erase_target(parsed: &args::Options) -> Result<&str, String> {
     if let Some(program) = parsed.positionals().first() {
-        return Err(format!(
-            "lamella deploy: {ERASE_FLAG} takes no program: it erases the one the board already \
-             stores.\n\n\
-             To replace that program with {program} instead, deploy it -- the board then runs \
-             {program}:\n\
-             \x20   lamella deploy {program} --device <d>"
+        return Err(args::refusal(
+            "deploy",
+            &format!(
+                "{ERASE_FLAG} takes no program: it erases the one the board stores, and deploying \
+                 {program} replaces it"
+            ),
         ));
     }
     if parsed.value("--board").is_some() {
-        return Err(format!(
-            "lamella deploy: {ERASE_FLAG} asks the firmware on a board to erase the program it \
-             stores, so it needs a live\nconnection to that firmware -- a --device, as `lamella \
-             devices` prints it -- rather than a --board.\n\n\
-             \x20   lamella deploy {ERASE_FLAG} --device <d>"
+        return Err(args::refusal(
+            "deploy",
+            &format!("{ERASE_FLAG} asks a board's firmware to erase its program, so it takes a --device, not a --board"),
         ));
     }
     let unused: Vec<&str> = ["--probe", "--volume", "--dfu", "--via"]
@@ -195,20 +236,15 @@ fn erase_target(parsed: &args::Options) -> Result<&str, String> {
         )
         .collect();
     if !unused.is_empty() {
-        return Err(format!(
-            "lamella deploy: {ERASE_FLAG} sends nothing, so it takes only --device, and {} would \
-             have no effect.\n\n\
-             \x20   lamella deploy {ERASE_FLAG} --device <d>",
-            unused.join(" and ")
+        return Err(args::refusal(
+            "deploy",
+            &format!(
+                "{ERASE_FLAG} sends nothing, so it takes only --device, and {} would have no effect",
+                unused.join(" and ")
+            ),
         ));
     }
-    parsed.value("--device").ok_or_else(|| {
-        format!(
-            "lamella deploy: name the board to erase.\n\n\
-             \x20   lamella deploy {ERASE_FLAG} --device <d>\n\n\
-             `lamella devices` lists what is attached and prints the --device for each one."
-        )
-    })
+    parsed.value("--device").ok_or_else(|| args::refusal("deploy", "name the board to erase with --device"))
 }
 
 #[cfg(test)]
@@ -245,59 +281,77 @@ mod source_refusal_tests {
 }
 
 const USAGE: &str = "\
-usage: lamella deploy <file.cs|file.csproj> --device <d>      into firmware on the board
-                               [--no-run]
-       lamella deploy --erase --device <d>                    stop and erase its stored program
-       lamella deploy <file.cs|file.csproj> --board <id> [--via probe|volume]   onto the bare chip
-                               [--probe <serial>] [--volume <name>] [--dfu <serial>]
-                               [--nostdlib]
+Usage:
+  lamella deploy <file> (--device <device> | --board <board>)
+  lamella deploy --erase --device <device>
 
---device is a live connection (what `lamella devices` prints); --board is a board model (what
-`lamella boards` lists). The first keeps the board's firmware and writes only the program; the
-second replaces everything on the chip and needs nothing there first.
+Build a program and put it on a board.
 
-Over a --device, the program is written to the board's flash, where it stays, and the board then
-starts it from a reset, as it starts it at every power-up. A board that already stores exactly
-this program is sent nothing. The write is reported a quarter of the image at a time, and each
-part is checked against what the board reads back from its flash. Over a Pico 2 W's own USB a
-326 KB program is written in about 2 seconds, or 3 when a larger one has to be erased first; a
-serial line takes 256 bytes at a time, and far longer.
+Arguments:
+  <file>  The program: a .cs file or a .csproj project, or, with --device, a .lmli image that
+          `lamella build` wrote.
 
---no-run stores the program without starting it. To start it and watch what it prints, use
-`lamella run <file> --device <d>`, which deploys it the same way.
+Options:
+  --device <device>               The board's resident interpreter firmware, at a run target ID
+                                  that `lamella devices` prints. Only the program is written.
+  --board <board>                 The board's chip, by board ID. The native image written there
+                                  replaces everything on the chip.
+  --no-run                        With --device: store the program without starting it.
+  --erase                         With --device alone: stop and erase the stored program.
+  --via probe|volume              With --board: how the chip is written. Default: the route the
+                                  board takes without extra hardware.
+  --probe <serial>                With --board: which probe, when several are attached.
+  --volume <name>                 With --board: which bootloader drive, when several are attached.
+  --dfu <serial>                  With --board: which USB DFU bootloader, when several are attached.
+  --nostdlib                      With --board: build the flat tier, the program alone.
+  --unsafe                        With --board: allow C# unsafe code.
+  --ref-dir <folder>              The class library's folder. Default: LAMELLA_REF_DIR.
+  --runtime-support-dir <folder>  With --board: the runtime support archives' folder. Default:
+                                  LAMELLA_RUNTIME_SUPPORT_DIR.
 
---erase stops the program the board is running and erases the one it stores, so at each reset the
-board starts no program and waits for a deploy. Deploying a program replaces the stored one.
+What happens:
+  The program is compiled and written to the board, where it stays and starts at every reset. The
+  board then starts it, and this tool returns: exit code 0 once the board has the program, or 1
+  with the reason on standard error. To see its output, use `lamella run <file> --device <device>`.
 
---via chooses how the chip is written, on a board offering both routes. `volume` copies to the
-bootloader drive and needs no probe; `probe` writes over an attached SWD probe and reads every
-byte back to check it. The default is whatever the board takes without extra hardware. With more
-than one probe attached, `--via probe` refuses until you name one with --probe <serial>.
+Examples:
+  lamella deploy Program.cs --device COM8
+  lamella deploy Program.cs --board rpi-pico2
+  lamella deploy --erase --device COM8
 
---probe, --volume and --dfu name which probe, which drive and which USB DFU bootloader when
-several are attached, each on its own route, as `lamella flash` takes them.
+Details:
+  --device is a live connection (what `lamella devices` prints); --board is a board model (what
+  `lamella boards` lists). The first keeps the board's firmware and writes only the program; the
+  second replaces everything on the chip and needs nothing there first.
 
-A .csproj builds every .cs beside it as ONE program and links the assemblies its <Reference>
-elements name, each by a <HintPath>. Nothing is available to a build that its project does not
-name. A single .cs file names no references and binds against the class library alone.
+  Over a --device, a board that already stores exactly this program is sent nothing. The write is
+  reported a quarter of the image at a time, and each part is checked against what the board reads
+  back from its flash. --no-run stores the program, and the board starts it at its next reset.
 
---device sends an image baked with the corlib and the libraries the program was compiled against
--- the class library's own, System.Device.Gpio among them, and the ones a project's <Reference>
-elements name -- keeping only what Main reaches. A library the program reaches through another is
-carried only when the program was compiled against it too, and otherwise the deploy is refused,
-naming it.
+  --device sends a .lmli image for the resident interpreter: the program with the corlib and the
+  libraries it was compiled against, System.Device.Gpio among them, keeping only what Main
+  reaches. A library the program reaches through another is carried only when the program was
+  compiled against it too; otherwise the deploy is refused, naming it.
 
---board links the program with the class library and the runtime support archive, so it may
-allocate, use floating point and call into System.*. That tier's collector reclaims an object
-without finalizing it, so a finalizer (a class's ~destructor) never runs there. It covers fewer
-boards than the flat tier, and a board it has no plan for is refused, naming the ones there are.
---nostdlib builds the flat tier instead, which is linker-free and resolves no call outside the
-program. Every build says which tier produced it.
+  --erase stops the program the board is running and erases the one it stores, so at each reset
+  the board starts no program and waits for a deploy. Deploying a program replaces the stored one.
 
-A class-library image is compiled as a debug build is, with the debug information set aside, so
-`lamella build <file> --board <id> --format elf` for the same program describes exactly the image
-deployed, and a debugger can attach to the board with it. The flat tier is compiled without debug
-information.
+  With --board, the volume route copies the image to the bootloader drive and needs no probe; the
+  probe route writes over an attached SWD probe and reads every byte back to check it. With more
+  than one probe attached, --via probe is refused until you name one with --probe <serial>. The
+  last line says whether the image was read back.
+
+  --board links the program with the class library and the runtime support archive, so it may
+  allocate, use floating point and call into System.*. On that tier a finalizer (a class's
+  ~destructor) never runs. It covers fewer boards than the flat tier, and a board it has no plan
+  for is refused, naming the boards there are.
+
+  A class-library image is compiled as a debug build is, so
+  `lamella build <file> --board <board> --format elf` describes exactly the image deployed, and a
+  debugger can attach to the board with it. The flat tier has no debug information.
+
+  A .csproj builds every .cs beside it as one program and links the assemblies its <Reference>
+  elements name, each by its <HintPath>. A single .cs file binds against the class library alone.
 ";
 
 /// Send a payload that is ALREADY built to firmware running at `target`.
@@ -375,7 +429,7 @@ pub fn deploy_refusal(path: &Path, what: &Uncompilable) -> String {
 
 /// Compile `path` and send it to Lamella firmware already running at `target`.
 #[cfg(feature = "bake")]
-fn to_running_firmware(path: &Path, target: &str, after: AfterDeploy) -> ExitCode {
+fn to_running_firmware(path: &Path, target: &str, after: AfterDeploy, folders: &crate::folders::Folders) -> ExitCode {
     let board = match crate::project::BoardCheck::for_file("deploy", path) {
         Ok(board) => board,
         Err(error) => {
@@ -391,7 +445,7 @@ fn to_running_firmware(path: &Path, target: &str, after: AfterDeploy) -> ExitCod
         return ExitCode::FAILURE;
     };
     let answered = lamella_wire_host::boards::board_answering(session.identity.product_model);
-    let image = match crate::bake::image_for_firmware(path, "deploy", deploy_refusal, answered.as_deref()) {
+    let image = match crate::bake::image_for_firmware(path, "deploy", deploy_refusal, answered.as_deref(), folders) {
         Ok(image) => image,
         Err(error) => {
             eprintln!("{error}");
@@ -416,7 +470,7 @@ pub(crate) fn connect(
     caps: Capabilities,
     board: Option<&crate::project::BoardCheck>,
 ) -> Option<(AnyTransport, lamella_wire::Negotiated)> {
-    let mut transport = open(verb, target)?;
+    let mut transport = open(verb, target, effect_of(verb))?;
     match hello_on(&mut transport, 0, verb, target, caps) {
         Ok(session) => match board.map(|board| board.against(verb, target, session.identity.product_model)) {
             Some(Err(refusal)) => {
@@ -433,18 +487,23 @@ pub(crate) fn connect(
 }
 
 /// Open `target`, or say why not and answer `None`.
-fn open(verb: &str, target: &str) -> Option<AnyTransport> {
+fn open(verb: &str, target: &str, effect: &str) -> Option<AnyTransport> {
     match open_named(target, TIMEOUT) {
         Ok(transport) => Some(transport),
         Err(why) => {
-            eprintln!("lamella {verb}: {why}");
             eprintln!(
-                "\nthis build can open: {}.\n\
-                 `lamella devices` lists what is attached and what to write here.",
-                lamella_wire_host::available_carriers().join(", ")
+                "lamella {verb}: {why} Run `lamella devices` to list attached boards and their target names.\n\n{effect}"
             );
             None
         }
+    }
+}
+
+/// What a command line that names a device to `verb` says when the device cannot be opened.
+fn effect_of(verb: &str) -> &'static str {
+    match verb {
+        "run" => "Nothing was run.",
+        _ => "Nothing was sent.",
     }
 }
 
@@ -461,22 +520,64 @@ fn open(verb: &str, target: &str) -> Option<AnyTransport> {
 /// Every other target goes through `open_target`, the one place that knows the target syntax.
 pub(crate) fn open_named(target: &str, timeout: Duration) -> Result<AnyTransport, String> {
     if lamella_wire_host::classify_target(target) != lamella_wire_host::TargetKind::Serial {
-        return open_target(target, BAUD, timeout).map_err(|error| {
-            format!("cannot open {target}: {error:?}. A device another program holds cannot be opened until it lets go.")
-        });
+        return open_target(target, BAUD, timeout).map_err(|error| format!("cannot open {target}: {error:?}."));
     }
     let ports = crate::ports::attached();
-    let port = crate::ports::resolve(target, &ports).map_err(|why| format!("cannot open {target}: {why}"))?;
+    let port = crate::ports::resolve(target, &ports)?;
     let usb = ports
         .iter()
         .find(|listed| listed.port.eq_ignore_ascii_case(&port))
         .and_then(|listed| listed.vid.zip(listed.pid));
-    open_quietly(&port, crate::devices::raises_lines(usb)).map_err(|error| {
-        format!(
-            "cannot open {target} ({port}): {error}. A port another program holds cannot be opened, \
-             and this tool does not take it from that program."
-        )
-    })
+    open_quietly(&port, crate::devices::raises_lines(usb)).map_err(|error| cannot_open_port(target, &port, &error))
+}
+
+/// Why the port `port`, which `target` names, could not be opened, from what the operating system
+/// said, once: that no port of that name is attached, that another program holds it, or the
+/// system's own words.
+///
+/// Windows answers an open of a port another program holds as a denied access, and Linux and macOS
+/// answer it as a busy device, so each is read as held on that system alone.
+fn cannot_open_port(target: &str, port: &str, error: &lamella_serial_port::Error) -> String {
+    let named = if target.eq_ignore_ascii_case(port) { target.to_owned() } else { format!("{target} ({port})") };
+    let held = match error.kind() {
+        std::io::ErrorKind::NotFound => return format!("{target} is not attached."),
+        std::io::ErrorKind::ResourceBusy => true,
+        std::io::ErrorKind::PermissionDenied => cfg!(windows),
+        _ => false,
+    };
+    if held {
+        return format!("cannot open {named}: another program holds it, and this tool does not take it from that program.");
+    }
+    let cause = error
+        .os_code()
+        .and_then(|code| i32::try_from(code).ok())
+        .map_or_else(|| error.to_string(), |code| std::io::Error::from_raw_os_error(code).to_string());
+    format!("cannot open {named}: {cause}.")
+}
+
+#[cfg(test)]
+mod port_refusal_tests {
+    use super::cannot_open_port;
+    use lamella_serial_port::Error;
+
+    /// **A PORT THAT IS NOT THERE IS SAID NOT TO BE ATTACHED, AND ONLY A HELD ONE TO BE HELD**, and a
+    /// port named by its own name is named once.
+    #[test]
+    fn a_missing_port_is_not_called_busy() {
+        let missing = Error::Open { name: "COM999".to_owned(), code: 2 };
+        assert_eq!(cannot_open_port("COM999", "COM999", &missing), "COM999 is not attached.");
+        assert_eq!(
+            cannot_open_port("usb-serial:SERIAL0000000001", "COM9", &missing),
+            "usb-serial:SERIAL0000000001 is not attached."
+        );
+        let held = Error::Open { name: "COM8".to_owned(), code: if cfg!(windows) { 5 } else { 16 } };
+        assert_eq!(
+            cannot_open_port("COM8", "COM8", &held),
+            "cannot open COM8: another program holds it, and this tool does not take it from that program."
+        );
+        let other = cannot_open_port("COM8", "COM8", &Error::Open { name: "COM8".to_owned(), code: 87 });
+        assert!(other.starts_with("cannot open COM8: ") && !other.contains("holds"), "{other}");
+    }
 }
 
 /// Opens the serial port `name`. With `raise` false, DTR and RTS are deasserted, so that no edge on
@@ -605,7 +706,7 @@ fn running_now(
 /// Stop the program the firmware at `target` is running, erase the one it stores, and say what the
 /// board reported at each step.
 fn erase_stored(target: &str) -> ExitCode {
-    let Some(mut transport) = open("deploy", target) else {
+    let Some(mut transport) = open("deploy", target, "Nothing was erased.") else {
         return ExitCode::FAILURE;
     };
     let erased = erase_on(&mut transport, target);
@@ -764,7 +865,12 @@ fn size(bytes: u32) -> String {
 /// Only the wire route needs a baked image, so a default build deploys to a chip perfectly well and
 /// a reader must not be told that `deploy` is unavailable when half of it is not.
 #[cfg(not(feature = "bake"))]
-fn to_running_firmware(_path: &Path, _target: &str, _after: AfterDeploy) -> ExitCode {
+fn to_running_firmware(
+    _path: &Path,
+    _target: &str,
+    _after: AfterDeploy,
+    _folders: &crate::folders::Folders,
+) -> ExitCode {
     eprintln!(
         "lamella deploy: this build cannot deploy over a --device.\n\n\
          Sending a program to firmware already on the board bakes it into a flash image first, \
@@ -772,7 +878,7 @@ fn to_running_firmware(_path: &Path, _target: &str, _after: AfterDeploy) -> Exit
          \x20   cargo build -p lamella-cli --features bake\n\n\
          The feature is off by default because the baking code is not additive -- reaching the \
          shared\nloader would stop other crates in this workspace compiling.\n\n\
-         `lamella deploy <file> --board <id>` works in this build: it writes the chip over a probe."
+         `lamella deploy <file> --board <board>` works in this build: it writes the chip over a probe."
     );
     ExitCode::FAILURE
 }
@@ -789,7 +895,7 @@ fn no_answer() -> String {
      a board is not born with any.\n\n\
      A --device sends a program to firmware that is ALREADY on the board. To put a program on a \
      board\nthat has none, write the chip instead:\n\
-     \x20   lamella deploy <file> --board <id>\n"
+     \x20   lamella deploy <file> --board <board>\n"
         .to_owned()
 }
 
@@ -860,22 +966,26 @@ mod tests {
         assert!(!USAGE.contains("--follow"), "and the usage does not offer it");
     }
 
-    /// **AN ERASE TAKES A CONNECTION AND NOTHING ELSE**, and each refusal names what to type.
+    /// **AN ERASE TAKES A CONNECTION AND NOTHING ELSE**, and each refusal says what is wrong, above
+    /// the syntax of a deploy and of an erase.
     #[test]
     fn an_erase_takes_a_target_and_nothing_else() {
         assert_eq!(erase_target(&parsed(&[ERASE_FLAG, "--device", "usb"])), Ok("usb"));
         let program = erase_target(&parsed(&[ERASE_FLAG, "--device", "usb", "App.cs"]))
             .expect_err("an erase sends nothing");
-        assert!(program.contains("takes no program"), "{program}");
-        assert!(program.contains("lamella deploy App.cs --device <d>"), "and how to replace it: {program}");
+        assert!(
+            program.starts_with("lamella deploy: --erase takes no program: it erases the one the board stores, and deploying App.cs replaces it.\n"),
+            "and how to replace it: {program}"
+        );
+        assert!(program.contains("\n       lamella deploy --erase --device <device>\nTry: lamella deploy --help"), "{program}");
         let board = erase_target(&parsed(&[ERASE_FLAG, "--board", "rpi-pico2"]))
             .expect_err("a board model has no firmware to ask");
-        assert!(board.contains("--device"), "{board}");
+        assert!(board.starts_with("lamella deploy: --erase asks a board's firmware to erase its program, so it takes a --device, not a --board.\n"), "{board}");
         let extra = erase_target(&parsed(&[ERASE_FLAG, "--device", "usb", "--no-run", "--unsafe"]))
             .expect_err("options an erase has no use for are refused, not ignored");
         assert!(extra.contains("--no-run and --unsafe would have no effect"), "names both: {extra}");
         let nowhere = erase_target(&parsed(&[ERASE_FLAG])).expect_err("no board was named");
-        assert!(nowhere.contains("lamella devices"), "{nowhere}");
+        assert!(nowhere.starts_with("lamella deploy: name the board to erase with --device.\n"), "{nowhere}");
     }
 
     /// **WHAT THE BOARD STORED BEFORE AND AFTER DECIDES THE LINE**, and a board still reporting a

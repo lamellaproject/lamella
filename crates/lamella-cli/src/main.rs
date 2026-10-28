@@ -10,8 +10,10 @@ mod attach;
 mod bake;
 mod deploy;
 mod devices;
+mod emulator_run;
 mod ending;
 mod flash;
+mod folders;
 mod image_run;
 mod msbuild;
 mod own_lines;
@@ -30,33 +32,69 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let rest = args.get(1..).unwrap_or_default();
     match args.first().map(String::as_str) {
-        Some("devices") => devices::devices_command(rest),
-        Some("run") => program::run_command(rest).finish(),
-        Some("board-module-run") => program::board_module_run_command(rest),
-        Some("build") => program::build_command(rest),
-        Some("flash") => flash::flash_command(rest),
-        Some("deploy") => deploy::deploy_command(rest),
-        Some("boards") => verdicts::boards_command(rest),
-        Some("fit") => verdicts::fit_command(rest),
-        Some("reconcile") => verdicts::reconcile_command(rest),
-        Some("--version" | "-V" | "version") => {
-            if let Some(extra) = rest.first() {
-                eprintln!("lamella version: takes no arguments, and got {extra:?}");
-                return ExitCode::FAILURE;
-            }
-            print!("{}", lamella_flash_routes::contracts::Contracts::of(TOOL_VERSION).describe());
-            ExitCode::SUCCESS
-        }
-        Some("--help" | "-h" | "help") | None => {
+        Some("--help" | "-h" | "help") => help_command(rest),
+        None => {
             print!("{USAGE}");
             ExitCode::SUCCESS
         }
-        Some(other) => {
-            eprintln!("lamella: unknown command {other:?}\n");
-            eprint!("{USAGE}");
+        Some(verb) => command(verb, rest).unwrap_or_else(|| {
+            eprintln!("lamella: unknown command \"{verb}\".\nTry: lamella --help");
+            ExitCode::FAILURE
+        }),
+    }
+}
+
+/// Runs the command `verb` names with `rest`, or answers `None` for a word that names no command.
+fn command(verb: &str, rest: &[String]) -> Option<ExitCode> {
+    Some(match verb {
+        "devices" => devices::devices_command(rest),
+        "run" => program::run_command(rest).finish(),
+        "board-module-run" => program::board_module_run_command(rest),
+        "build" => program::build_command(rest),
+        "flash" => flash::flash_command(rest),
+        "deploy" => deploy::deploy_command(rest),
+        "boards" => verdicts::boards_command(rest),
+        "fit" => verdicts::fit_command(rest),
+        "reconcile" => verdicts::reconcile_command(rest),
+        "--version" | "-V" | "version" => version_command(rest),
+        _ => return None,
+    })
+}
+
+/// `lamella help [<command>]`: the tool's usage, or the help `lamella <command> --help` prints.
+fn help_command(rest: &[String]) -> ExitCode {
+    match rest {
+        [] => {
+            print!("{USAGE}");
+            ExitCode::SUCCESS
+        }
+        [verb] => command(verb, &["--help".to_owned()]).unwrap_or_else(|| {
+            eprintln!("lamella help: unknown command \"{verb}\".\nTry: lamella --help");
+            ExitCode::FAILURE
+        }),
+        [_, extra, ..] => {
+            eprintln!("lamella help: unexpected argument \"{extra}\".\nTry: lamella --help");
             ExitCode::FAILURE
         }
     }
+}
+
+/// `lamella version` and `lamella --version`: this build's version, and the versions of what it
+/// reads and speaks.
+fn version_command(rest: &[String]) -> ExitCode {
+    let spec = args::Spec {
+        verb: "version",
+        usage: Some(VERSION_USAGE),
+        values: &[],
+        repeats: &[],
+        flags: &[],
+        positional: args::Positional::None,
+    };
+    if let Err(halt) = args::parse_or_halt(rest, &spec) {
+        return halt.code();
+    }
+    print!("{}", lamella_flash_routes::contracts::Contracts::of(TOOL_VERSION).describe());
+    ExitCode::SUCCESS
 }
 
 /// This binary's own package version.
@@ -65,54 +103,58 @@ fn main() -> ExitCode {
 /// this build carries and can pin to it; refusing to answer would tell them nothing.
 const TOOL_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// What `lamella version --help` prints.
+const VERSION_USAGE: &str = "\
+Usage: lamella version
+
+Print the Lamella build version and compatibility versions.
+`lamella --version` prints the same text.";
+
+/// What `lamella --help` prints: every command's syntax, which of them puts a program where, and
+/// where each command's own help is.
 const USAGE: &str = "\
-usage:
-  lamella devices [--identify <d>] [--all-devices]   what is attached, and how to name it
-  lamella run <file> [--device <d>]                  run it here, or ON a board with output here
-  lamella build <file> [--board <id>] [--format f]   make an artifact; nothing is written
-  lamella deploy <file> --device <d> | --board <id>  compile it and put it on a board
-  lamella deploy --erase --device <d>                stop and erase the program a board stores
-  lamella flash <image> --board <id> [--probe <s>]   write bytes that are ALREADY an image
-  lamella boards                                     every board this build knows
-  lamella fit --board <id> --image-bytes <n>         does an image of <n> bytes fit?
-  lamella reconcile --board <id> [--read <name>=<v>] is the attached board the one assumed?
-  lamella version | --version                        this build, and the contracts it speaks
+Usage:
+  lamella devices [--identify <device>] [--all-devices] [--json]
+  lamella run <file> [--device <device>] [-- <args>...]
+  lamella build <file> [--board <board>] [--format <format>] [--out <path>]
+  lamella deploy <file> (--device <device> | --board <board>)
+  lamella deploy --erase --device <device>
+  lamella flash <image> [--board <board>] [--via probe|volume]
+  lamella boards
+  lamella fit --board <board> --image-bytes <bytes>
+  lamella reconcile --board <board> [--read <name>=<value>...]
+  lamella version
 
-THREE VERBS PUT A PROGRAM SOMEWHERE, AND THEY DIFFER IN WHAT THEY TAKE AND WHERE IT LANDS.
+Where should the program go?
+  run     Build and run it on this computer or on a connected board,
+          staying connected to its output.
+  build   Build it and write the output to a file.
+  deploy  Build it and put it on a board.
+  flash   Write an already-built image file to a board.
 
-  run <file>            SOURCE -> here, or a board.   ATTACHES: its output appears here, and it waits.
-  build <file>          SOURCE -> a file on disk.     No board, no hardware, nothing written to one.
-  deploy <file>         SOURCE -> a board.            Puts it there and RETURNS YOU TO YOUR SHELL.
-  flash <image>         AN IMAGE -> a board's chip.   Writes bytes somebody already built.
+Local `run`, `build`, `boards`, `fit` and `reconcile` do not require
+attached hardware. For `reconcile`, you provide the board readings to
+compare.
 
-`run` and `deploy` differ only in whether the tool stays. Both put the program on the board, where
-it stays and runs at every reset. `run --device` then runs it under the board's scheduler --
-threads, locks and blocking calls included -- and prints what it prints, as it prints it, until it
-ends, which for a program written to loop forever means until you stop the tool. `deploy` starts
-it and leaves, which is what a production push wants.
-
-`build` is how you get an image WITHOUT deploying it -- `--format hex` or `bin` writes the
-bare-metal image for `--board`, which is exactly what `flash` then takes. So `build` produces what
-`flash` consumes, and `deploy` is the two of them in one step.
-
-`deploy` takes ONE of two destinations, and the option chooses the route. `--device <d>` is a live
-connection (what `devices` prints): the board's firmware stays put, only the program crosses, and a
-cycle takes seconds. `--board <id>` is a board model (what `boards` lists): it writes the chip
-over a probe and needs nothing on the board first, which is where a new board begins.
-
-NOTHING HERE NEEDS HARDWARE EXCEPT `devices`, `deploy`, `flash` AND `run --device`. `run` without a
-target executes on this machine. `build` and `fit` answer from the board file and the part row; an
-attached board contributes nothing to the arithmetic.
-
-`build <file> --board <id>` also answers `fit` about what it just produced, which is the way to
-obtain the <n> that `fit` asks for.
-
-`reconcile` compares readings taken from an attached board against what that board declares it
-can be asked. With no --read it reports what attaching the board WOULD settle, and what nothing
-declared can reach. Readings are <discriminator>=<value>, decimal or 0x-prefixed.
-
-Files are read by extension: .cs is C#, .py is Python.
+Run `lamella <command> --help` for that command's options, effects, and
+examples. `lamella --version` prints the same build and compatibility
+versions as `lamella version`.
 ";
+
+/// The `Usage:` lines a refusal of `verb`'s command line shows: its lines of [`USAGE`], or `None`
+/// for a word [`USAGE`] gives no syntax for.
+///
+/// **READ FROM THE USAGE, NOT WRITTEN BESIDE IT**, so the syntax a refusal shows is the one
+/// `lamella --help` shows.
+fn syntax(verb: &str) -> Option<String> {
+    let lines: Vec<&str> = USAGE
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.strip_prefix("lamella ").and_then(|rest| rest.split(' ').next()) == Some(verb))
+        .collect();
+    let (first, rest) = lines.split_first()?;
+    Some(rest.iter().fold(format!("Usage: {first}"), |text, line| format!("{text}\n       {line}")))
+}
 
 #[cfg(test)]
 mod tests {
@@ -166,7 +208,27 @@ mod tests {
     /// The usage has to say the thing that stops somebody buying hardware to try Lamella.
     #[test]
     fn the_usage_says_which_verbs_need_no_hardware() {
-        assert!(super::USAGE.contains("NEEDS HARDWARE"), "the usage buries the best property");
+        assert!(
+            super::USAGE.contains("Local `run`, `build`, `boards`, `fit` and `reconcile` do not require\nattached hardware."),
+            "the usage buries the best property"
+        );
+    }
+
+    /// **A REFUSAL SHOWS THE SYNTAX THE USAGE SHOWS**, every line of it for a verb with two, and none
+    /// for a word the usage gives no syntax for.
+    #[test]
+    fn a_refusal_shows_the_usages_own_syntax() {
+        assert_eq!(super::syntax("fit").as_deref(), Some("Usage: lamella fit --board <board> --image-bytes <bytes>"));
+        assert_eq!(
+            super::syntax("deploy").as_deref(),
+            Some(
+                "Usage: lamella deploy <file> (--device <device> | --board <board>)\n       \
+                 lamella deploy --erase --device <device>"
+            )
+        );
+        assert_eq!(super::syntax("boards").as_deref(), Some("Usage: lamella boards"));
+        assert_eq!(super::syntax("board-module-run"), None);
+        assert_eq!(super::syntax("help"), None);
     }
 
     /// **EVERY VERB ANSWERS `--help`, INCLUDING ONE THAT TAKES NO OPTIONS.** A verb reading no
@@ -190,7 +252,8 @@ mod tests {
 
         let help = vec!["--help".to_owned()];
         let junk = vec!["--surely-no-verb-takes-this".to_owned()];
-        let verbs: [(&str, fn(&[String]) -> std::process::ExitCode); 8] = [
+        let verbs: [(&str, fn(&[String]) -> std::process::ExitCode); 9] = [
+            ("version", super::version_command),
             ("boards", super::verdicts::boards_command),
             ("fit", super::verdicts::fit_command),
             ("reconcile", super::verdicts::reconcile_command),

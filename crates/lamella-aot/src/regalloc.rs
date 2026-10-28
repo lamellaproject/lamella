@@ -207,7 +207,7 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                         mark(&mut lo, &mut hi, &mut defined, *arg, ip);
                     }
                 }
-                Inst::VirtualFuncAddr { object, .. } => {
+                Inst::VirtualFuncAddr { object, .. } | Inst::InterfaceFuncAddr { object, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *object, ip);
                 }
                 Inst::InvokeDelegate { delegate, args, .. } => {
@@ -677,7 +677,7 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         Inst::FieldAddr { base, .. } => f(*base),
         Inst::LoadTypeDesc { object } => f(*object),
         Inst::InterfaceHasTag { descriptor, .. } | Inst::TypeName { descriptor } => f(*descriptor),
-        Inst::VirtualFuncAddr { object, .. } => f(*object),
+        Inst::VirtualFuncAddr { object, .. } | Inst::InterfaceFuncAddr { object, .. } => f(*object),
         Inst::TypeDescAddr { .. } => {}
         Inst::TypeDescLiteral { .. } => {}
         Inst::CopyStruct { src } => f(*src),

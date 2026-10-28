@@ -5,7 +5,7 @@
 // Layout offsets live in the *Layout classes; wiring lives in the per-board *Bindings.
 namespace Lamella.Generated
 {
-    public sealed class Samr21Instances
+    internal sealed class Samr21Instances
     {
         private Samr21Instances() { }
 

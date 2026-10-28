@@ -169,9 +169,6 @@ impl LanguageVersion {
     /// A single hard-coded code is therefore right for exactly one language version and wrong for
     /// every other, which is the shape this method exists to prevent.
     ///
-    /// MEASURED, not read from a standard: a gating diagnostic is not described by ECMA-334 at all,
-    /// so csc is the only oracle there is. One compilation per row against
-    /// `csc /langversion:<v>`:
     ///
     /// | version | code | | version | code |
     /// |---|---|---|---|---|
@@ -192,9 +189,6 @@ impl LanguageVersion {
     /// shelf life exactly as long as the input space stays fixed.** Two arms in this file were
     /// wrong that way in one afternoon -- this one and [`Self::message_name`]'s C# 7 rendering.
     ///
-    /// The 7.x point releases are here too -- 7.1 `CS8302`, 7.2 `CS8320`, 7.3 `CS8370` -- because a
-    /// LEADING digit separator (`0x_FF`) is a csc feature introduced at 7.2, and gating it needs a
-    /// version to name.
     #[must_use]
     pub fn feature_gate_code(self) -> u16 {
         match self {
@@ -217,9 +211,6 @@ impl LanguageVersion {
 
     /// How csc spells this version inside a diagnostic message: `C# 1`, not `C# 1.0`.
     ///
-    /// Measured from the message text, which reads "is not available in C# 1." A trailing `.0`
-    /// would differ from csc's for a diagnostic whose whole purpose is to be searched for
-    /// verbatim.
     #[must_use]
     pub fn message_name(self) -> &'static str {
         match self {
@@ -250,9 +241,6 @@ impl LanguageVersion {
     /// implementations ask for "8.0" and parameterless struct constructors for "10.0". The boundary
     /// is real and it sits between 6 and 7.
     ///
-    /// Deliberately a different rendering from [`Self::message_name`], which is the CURRENT version
-    /// in the same sentence: "not available in C# 1. Please use language version 7.0 or greater."
-    /// The asymmetry is csc's; matching it is the point, because the message is a search key.
     #[must_use]
     pub fn required_name(self) -> &'static str {
         match self {
@@ -361,8 +349,6 @@ impl LanguageVersion {
     /// A human-readable name such as `C# 1.0`, for this compiler's own prose (driver errors,
     /// help text).
     ///
-    /// Not for a csc-matched diagnostic: csc spells the same version two other ways depending on
-    /// where in the sentence it lands. See [`Self::message_name`] and [`Self::required_name`].
     #[must_use]
     pub fn display_name(self) -> &'static str {
         match self {
@@ -431,10 +417,6 @@ pub enum Feature {
     DefaultOperator,
     /// The null-coalescing operator `??` (`a ?? b`). Introduced in C# 2.0.
     ///
-    /// **The one feature in this table whose name could not be measured**, because csc's ISO-1 is
-    /// lenient about `??` and accepts it at every selectable dialect -- so it never emits a gate to
-    /// read a name off. lcsc is deliberately stricter here; the description is therefore OURS,
-    /// written in csc's style rather than copied from it.
     NullCoalescing,
     /// An EXCEPTION FILTER -- `catch (E e) when (cond)`. Introduced in C# 6.0.
     ///
@@ -445,33 +427,16 @@ pub enum Feature {
     /// (!cond) throw; }` unwinds first and rethrows from the wrong place, which is why the feature
     /// exists at all rather than being sugar.
     ///
-    /// The type test moves INTO the filter block: `isinst E; dup; brtrue bind; pop; ldc.i4.0; br
-    /// done; bind: stloc v; <cond>; done: endfilter`, and the handler that follows begins by
-    /// popping the exception the runtime pushes -- because the variable was already stored in the
-    /// filter. csc's shape, measured for all three spellings (typed and named, typed and unnamed,
-    /// and a general `catch when`, which has no type test).
     ExceptionFilter,
     /// A GETTER-ONLY automatically implemented property, `int P { get; }`. Introduced in C# 6.0.
     ///
-    /// **A DIFFERENT FEATURE FROM [`Feature::AutoProperties`], AND csc NAMES IT DIFFERENTLY** --
-    /// *readonly automatically implemented properties*, measured. The backing field is `initonly`
-    /// and only a constructor may assign it, which is a rule the C# 3.0 form does not have; a
-    /// compiler that treated the two as one feature would either refuse the common form or emit a
-    /// writable field for the readonly one.
     ReadonlyAutoProperty,
     /// A PARTIAL TYPE -- `partial class C` written more than once, the declarations merging into
     /// one type (ECMA-334 4th ed 17.1.4). Introduced in C# 2.0.
     ///
-    /// **THE TYPE, NOT THE METHOD.** A partial METHOD (`partial void OnThing();` with its
-    /// implementation in another part) is a C# 3.0 feature and csc gates it separately -- measured,
-    /// *Feature 'partial method' is not available in C# 2. Please use language version 3 or
-    /// greater.* One `partial` token, two features, three years apart.
     PartialTypes,
     /// A `#pragma` directive (`#pragma warning disable 649`). Introduced in C# 2.0.
     ///
-    /// **csc NAMES IT `#pragma`, WITH THE HASH** -- measured, `Feature '#pragma' is not available
-    /// in C# 1` -- which is why this description is punctuation rather than a noun phrase like
-    /// every other entry in the table.
     PragmaDirective,
     /// The namespace alias qualifier `::` (`global::System`). Introduced in C# 2.0.
     NamespaceAlias,
@@ -480,16 +445,9 @@ pub enum Feature {
     AccessorAccessibility,
     /// A lambda expression, `x => x`. Introduced in C# 3.0.
     ///
-    /// **NOT the same feature as an expression-bodied member, though both are spelled `=>`.**
-    /// This variant covers the LAMBDA only: csc gates the two separately and THREE VERSIONS APART
-    /// -- see [`Feature::ExpressionBodiedMethod`].
     LambdaExpression,
     /// An expression-bodied method, `int M() => 1;`. Introduced in **C# 6.0**.
     ///
-    /// **A separate feature from `LambdaArrow`, whose token it shares**: csc reports
-    /// `'expression-bodied method' ... Please use language version 6 or greater` -- three releases
-    /// after the lambda. Folded into one variant, a dialect of C# 3, 4 or 5 would PERMIT an
-    /// expression-bodied member that csc rejects: the accepts-invalid column.
     ///
     /// **A lexer cannot make this distinction** -- `=>` is one token and which feature it belongs
     /// to is a question about the enclosing declaration. So the lexer keeps gating
@@ -498,25 +456,14 @@ pub enum Feature {
     ExpressionBodiedMethod,
     /// An expression-bodied property, `int P => 1;`. Introduced in **C# 6.0**.
     ///
-    /// A separate variant because csc names the MEMBER KIND in the message -- `'expression-bodied
-    /// property'`, not `'expression-bodied method'` -- and this message is a search key. Measured
-    /// beside the method form. (csc has further kinds, notably expression-bodied constructors and
-    /// accessors at C# 7.0; they get variants when there is a site to raise them from.)
     ExpressionBodiedProperty,
     /// An expression-bodied INDEXER, `int this[int i] => 1;`. Introduced in **C# 6.0**.
     ///
-    /// **csc gives an indexer its OWN noun rather than calling it a property**, measured at ISO-1:
-    /// *'expression-bodied indexer'*. Everywhere else in this compiler an indexer is a property
-    /// with parameters (17.8), and here it is not -- the message is a search key, so the name is
-    /// copied rather than derived from the member kind.
     ExpressionBodiedIndexer,
     /// An expression-bodied ACCESSOR, `get => 1;`. Introduced in **C# 7.0** -- a rung LATER than
     /// the member forms that share the token, which is why it is a fourth variant rather than a
     /// spelling of the other three.
     ///
-    /// Its name is not spelled like the other three: csc says *'expression body property accessor'*
-    /// -- no hyphens on "expression body", and the noun is *property* even for an indexer's
-    /// accessor.
     ExpressionBodiedAccessor,
     /// An expression-bodied CONSTRUCTOR, static constructor or destructor. Introduced in
     /// **C# 7.0**, a rung later than the method and property forms.
@@ -524,27 +471,12 @@ pub enum Feature {
     /// The body is a statement expression rather than a returned value -- none of these three
     /// members returns anything -- so it desugars to `{ e; }` and not to `{ return e; }`.
     ///
-    /// csc gates all three under one name, which this variant copies. An OPERATOR is not among
-    /// them: csc counts an expression-bodied operator as part of `expression-bodied method` and
-    /// admits it at 6.0, so it belongs to [`Feature::ExpressionBodiedMethod`].
     ExpressionBodiedConstructor,
     /// A CONSTANT pattern: `x is null`, `x is 3`, `s is "a"`, `c is 'x'`. Introduced in
     /// **C# 7.0**.
     ///
-    /// **IT IS NOT `x == null`.** The pattern ignores a user-defined `operator ==`: measured, a
-    /// type whose `==` returns `true` unconditionally still tests FALSE against `is null`, because
-    /// csc emits `ldnull; ceq` for the pattern and `call op_Equality` for the comparison. Binding
-    /// one as the other is a wrong answer no diagnostic reports.
     ///
-    /// **A STRING CONSTANT IS THE EXCEPTION AND csc MEASURES IT: `s is "a"` emits
-    /// `call String::op_Equality`.** String equality IS the built-in one for `string`, so the
-    /// pattern uses it; what the pattern refuses is a `==` a USER declared on some other type,
-    /// and no user type can have a constant to be matched against.
     ///
-    /// **THE NAME IS WIDER THAN THIS VARIANT AND THAT IS DELIBERATE.** csc gates every pattern
-    /// form under one name, `pattern matching`; the name is what the diagnostic renders, so it is
-    /// csc's. The C# 9 combinators (`or`, `and`, `not`), relational patterns and recursive
-    /// patterns remain refused, each as its own form.
     ConstantPattern,
     /// An OUT VARIABLE DECLARATION, `M(out int x)` and `M(out var x)`. Introduced in **C# 7.0**.
     ///
@@ -553,56 +485,24 @@ pub enum Feature {
     /// expression, whose scope is the enclosing block rather than the argument list. `ref` has no
     /// such form at any version -- `M(ref int x)` is `CS1525`, measured -- so this is `out` alone.
     ///
-    /// **THE DISCARD IS A DIFFERENT FEATURE AND csc SAYS SO.** `M(out _)` at `/langversion:6` is
-    /// `Feature 'discards'`, not this name, so it is not admitted by this variant.
     OutVariableDeclaration,
     /// A TUPLE type or expression -- `(int, string)`, `(1, "x")`, `(a: 1, b: 2)`. Introduced in
     /// **C# 7.0**.
     ///
-    /// **csc's NOUN IS PLURAL AND THE DIAGNOSTIC RENDERS IT**, so this is `tuples` and not
-    /// `tuple`: measured at `/langversion:6`, which answers *Feature 'tuples' is not available in
-    /// C# 6*. The neighbouring `ref structs` carries the same warning for the same reason.
     ///
-    /// **DECONSTRUCTION SHARES THE BRACKETS AND SHARES THIS GATE.** `(a, b) = t`,
-    /// `(int a, int b) = t` and `var (a, b) = t` are a different FEATURE -- the census counts
-    /// them as their own row -- but csc does not give them their own NAME: at
-    /// `/langversion:6` all three answer *Feature 'tuples' is not available in C# 6*, reported
-    /// at the opening bracket of the target list, measured on one program apiece. Only the `_`
-    /// has a name of its own, [`Feature::Discards`]. So the bracket is gated here wherever it is
-    /// written, and there is deliberately no `Feature::Deconstruction`: a variant whose name
-    /// csc never prints could only make a diagnostic that is not csc's.
     ///
     Tuples,
     /// A DISCARD, `_`, in a deconstruction target list. Introduced in **C# 7.0**.
     ///
-    /// **THE ONE PART OF A DECONSTRUCTION csc NAMES SEPARATELY.** `int a; (a, _) = (40, 2);` at
-    /// `/langversion:6` draws three gates: `tuples` at each bracket and *Feature 'discards' is
-    /// not available in C# 6* at the `_` itself, measured. Everything else about the construct
-    /// is [`Feature::Tuples`].
     ///
-    /// **NARROWER THAN THE NAME IT PRINTS**, like the pattern features above it: csc's
-    /// `discards` also covers `_` as a standalone assignment target and as an `out` argument,
-    /// neither of which is gated here yet.
     Discards,
     /// A DECLARATION PATTERN, `x is T t`. Introduced in **C# 7.0**.
     ///
-    /// **THE OPERATOR IS C# 1.0 AND THE DESIGNATOR IS NOT**, which is the whole of the gate:
-    /// `x is T` compiles at every version and `x is T t` at 7.0 and later. csc prints one name for
-    /// every pattern form, so this variant renders the same `pattern matching` as
-    /// [`Feature::ConstantPattern`] and is, like it, narrower than the name it prints.
     DeclarationPattern,
     /// A SWITCH EXPRESSION, `governing switch { pattern => value, ... }`. Introduced in
     /// **C# 8.0**.
     ///
-    /// **csc CALLS IT `recursive patterns` AND SO DOES THIS.** Measured at `/langversion:7.3`:
-    /// `x switch { _ => 0 }` is *"Feature 'recursive patterns' is not available in C# 7.3"*,
-    /// twice -- once for the switch and once for the discard, which arrived in the same csc
-    /// feature. The name is what the diagnostic renders, so it is csc's however oddly it reads for
-    /// a construct with no recursion in it.
     ///
-    /// **THE DISCARD PATTERN GATES UNDER THIS NAME TOO**, for the same reason: csc admits `_` as a
-    /// pattern at 8.0 and not before, under this one feature. It is not a variant of its own
-    /// because csc does not gate it as one.
     ///
     /// **WHAT IS BUILT IS THE CONSTANT / DISCARD / DECLARATION ARM WITH AN OPTIONAL `when`.**
     /// Measured on dotnet/iot: 130 of its 172 switch expressions use only those forms and are
@@ -631,10 +531,6 @@ pub enum Feature {
     /// A THROW EXPRESSION, `s ?? throw new ArgumentNullException(nameof(s))`. Introduced in
     /// **C# 7.0**.
     ///
-    /// **WHERE it may stand is the whole feature**, and it is a shorter list than the name
-    /// suggests: the right operand of `??`, and either arm of `?:`. Anywhere else that an
-    /// expression may appear, csc refuses it as `CS8115` -- including a PARENTHESIZED one,
-    /// `s ?? (throw e)`, which is measured and refused.
     ///
     /// `int M() => throw e;` needs none of this: an expression body already desugars to the block
     /// it means, and the block a throw expression means is `{ throw e; }` -- the STATEMENT, which
@@ -642,10 +538,6 @@ pub enum Feature {
     ThrowExpression,
     /// A `ref struct` declaration, `ref struct S { }`. Introduced in **C# 7.2**.
     ///
-    /// The type is BY-REF-LIKE: it may live only on the stack, so it cannot be a field of a
-    /// class or of an ordinary struct, an array element, a type argument, or boxed. csc encodes
-    /// it in metadata as `IsByRefLikeAttribute`, plus an `ObsoleteAttribute` that makes an older
-    /// compiler refuse the type rather than silently heap-allocate it.
     ///
     /// **THE RESTRICTIONS ARE THE FEATURE.** Declaring one is a parser change of a few lines;
     /// what makes it correct is refusing every position that would put it on the heap.
@@ -660,9 +552,6 @@ pub enum Feature {
     /// A by-reference local or return: `ref T M()`, `ref T this[int i]`, `ref T P { get; }` and
     /// `ref T r = ref x;`. Introduced in C# 7.0.
     ///
-    /// **ONE FEATURE COVERS BOTH HALVES BECAUSE csc TREATS THEM AS ONE**, measured: a ref return
-    /// and a ref local at `/langversion:6` both report *Feature 'byref locals and returns'*. Two
-    /// variants here would be two names, and the name is what the diagnostic prints.
     ///
     /// The declaring half is what a device corlib needs: `System.Span<T>`'s indexer is
     /// `ref T this[int index]`, and a board has no .NET to consume such a member from, so being
@@ -670,11 +559,6 @@ pub enum Feature {
     ByRefLocalsAndReturns,
     /// The `readonly` of a `ref readonly T` return. Introduced in C# 7.2.
     ///
-    /// **A SEPARATE GATE FROM [`Feature::ByRefLocalsAndReturns`], AT A SEPARATE TOKEN, AND csc
-    /// REPORTS BOTH FOR ONE DECLARATION.** Measured at `/langversion:6`, `ref readonly int M()`
-    /// draws CS8059 twice: *byref locals and returns* at the `ref` and *readonly references* at the
-    /// `readonly`, four columns apart. At 7.0 only the second fires. Folding them into one gate
-    /// would drop a diagnostic csc emits and name the wrong rung for the one it kept.
     ///
     /// It is a real signature difference and not a spelling: `ref readonly T` is `T&` plus a
     /// `modreq` on `System.Runtime.InteropServices.InAttribute`, which is why `ReadOnlySpan<T>`'s
@@ -683,9 +567,6 @@ pub enum Feature {
     /// Ref REASSIGNMENT -- `r = ref a[1];`, rebinding a `ref` local or `ref` parameter to different
     /// storage. Introduced in C# 7.3.
     ///
-    /// **A SEPARATE FEATURE FROM [`Feature::ByRefLocalsAndReturns`], ONE RUNG HIGHER**, with its own
-    /// name in csc's message: measured at 7.2, `r = ref a[1]` reports *ref reassignment* and version
-    /// 7.3, where the declaration that created `r` is admitted at 7.0.
     ///
     /// It REBINDS rather than writes: `r = ref x` points `r` at `x`, where `r = x` writes through
     /// `r` into whatever it already points at. Both are legal on the same local and they are
@@ -698,11 +579,6 @@ pub enum Feature {
     /// setter to call) and what keeps a virtual setter from being invoked before the derived
     /// constructor has run.
     ///
-    /// **IT LOWERS EXACTLY WHERE A FIELD INITIALIZER DOES**, and shares the walk: the instance form
-    /// becomes `this.<P>k__BackingField = value` at the head of every constructor that does not
-    /// chain to `this(...)`, and the static form becomes a `.cctor` store. The two kinds interleave
-    /// in declaration order, measured on csc's own `.ctor` -- so one walk over the members produces
-    /// both rather than one appending to the other.
     ///
     /// **AN INITIALIZER ON A PROPERTY THAT IS NOT AUTOMATICALLY IMPLEMENTED IS `CS8050`, AND ON
     /// AN INTERFACE'S INSTANCE PROPERTY IT IS `CS8053`.** Both are rules about where an initializer
@@ -721,16 +597,9 @@ pub enum Feature {
     RefFields,
     /// An object initializer, `new C { F = 1 }`. Introduced in C# 3.0.
     ///
-    /// **csc names the two initializer forms differently and this one is the DEFAULT**: an empty
-    /// `new C { }` is reported as an object initializer, measured. See
-    /// [`Feature::CollectionInitializer`].
     ObjectInitializer,
     /// A collection initializer, `new ArrayList { 1, 2 }`. Introduced in C# 3.0.
     ///
-    /// Same version as [`Feature::ObjectInitializer`] and a different NOUN, which is the whole
-    /// reason the two are separate variants: one enum entry could carry the right version and only
-    /// ever half the right message. csc tells them apart by whether the first element is an
-    /// assignment, and so does lcsc.
     CollectionInitializer,
     /// An anonymous object creation `new { A = 1, ... }`, producing an instance of a
     /// compiler-synthesized anonymous type. Introduced in C# 3.0.
@@ -738,10 +607,6 @@ pub enum Feature {
     /// An implicitly typed local variable -- `var x = 5;`, whose type is inferred from the
     /// initializer. Introduced in C# 3.0 (C# 3.0 spec, 8.5.1).
     ///
-    /// **ONE variant covers the `foreach` iteration variable too** (8.8.4), because csc gates both
-    /// under this single name -- measured, `foreach (var v in a)` at ISO-1 reports `Feature
-    /// 'implicitly typed local variable'`, naming a LOCAL VARIABLE for an iteration variable. A
-    /// second variant would produce a message no csc user ever sees.
     ///
     /// **`var` is a CONTEXTUAL keyword and this feature does not own the word.** A type genuinely
     /// named `var` takes precedence (C# 3.0 spec, 8.5.1: *"and no type named var is in scope"*), so
@@ -761,10 +626,6 @@ pub enum Feature {
     /// nullable analysis has nothing for it to suppress, so parsing it and discarding it is the
     /// whole implementation -- and refusing it would refuse ordinary modern C#.
     ///
-    /// **A SEPARATE VARIANT FROM THE `T?` ANNOTATION HALF**, [`Feature::NullableReferenceTypes`],
-    /// even though csc gates both as one feature and prints one name for both: the two are found
-    /// by different parts of the compiler, the operator by the parser and the annotation only once
-    /// the binder knows whether `T` is a reference type.
     NullForgivingOperator,
     /// A nullable reference type annotation, `string?`, and the `#nullable` directive that sets
     /// where annotations and nullable warnings apply. Introduced in **C# 8.0**.
@@ -784,6 +645,19 @@ pub enum Feature {
     /// csc records it only in the nullable metadata this compiler does not produce -- so what it
     /// constrains is checked by nullable analysis alone, which is not built either.
     NotNullConstraint,
+    /// The `unmanaged` constraint, `where T : unmanaged`: the argument must be a non-nullable value
+    /// type holding no reference at any depth of its fields (ECMA-334 7th ed, 15.2.5). Introduced
+    /// in **C# 7.3**.
+    UnmanagedConstraint,
+    /// A constructed struct as an unmanaged type: `G<int>` over `struct G<T> { T F; }`, a struct
+    /// nested in a generic type, or a struct holding one. Before **C# 8.0** only a struct that is
+    /// not constructed was unmanaged.
+    UnmanagedConstructedTypes,
+    /// `System.Enum` as a constraint type, `where T : System.Enum`. Introduced in **C# 7.3**.
+    EnumConstraint,
+    /// `System.Delegate` or `System.MulticastDelegate` as a constraint type. Introduced in
+    /// **C# 7.3**.
+    DelegateConstraint,
     /// A `using static` directive (`using static System.Math;`), importing a type's static
     /// members into scope. Introduced in C# 6.0.
     UsingStatic,
@@ -809,6 +683,11 @@ pub enum Feature {
     /// syntax: no metadata, no runtime, no binder change, so it is the highest ratio of
     /// files-unblocked to work on the compatibility list.
     FileScopedNamespaces,
+    /// A `global using` directive -- `global using N;`, `global using static T;` or
+    /// `global using A = T;` -- in scope in every file of the compilation. Introduced in C# 10.0.
+    /// **What a .NET project's generated `GlobalUsings.g.cs` is made of**, so a program built the
+    /// way the SDK builds one needs it before its first line binds.
+    GlobalUsingDirective,
     /// A `required` member -- an initializer the caller MUST supply. Introduced in C# 11.0.
     ///
     /// **The one C# 11 feature both compatibility targets adopted**: 64 uses in dotnet/iot, 56 in
@@ -820,21 +699,11 @@ pub enum Feature {
     /// A digit separator IMMEDIATELY AFTER a base prefix -- `0x_FF`, `0b_1010`. Introduced in
     /// C# 7.2, a full release AFTER separators themselves.
     ///
-    /// **csc treats this as its own feature and rejects it at C# 7.0** ("Feature ''leading digit
-    /// separator'' is not available in C# 7.0"), measured. So a compiler that implemented C# 7.0
-    /// separators and allowed a leading one would ACCEPT what csc rejects -- the serious column.
     LeadingDigitSeparator,
     /// A record CLASS -- `record R(int X);` and `record R { ... }` -- with its generated value
     /// equality, `<Clone>$`, `ToString`/`PrintMembers` and `Deconstruct`. C# 9.0.
     ///
-    /// **`record class` AND `record struct` ARE A DIFFERENT csc GATE AT C# 10, AND csc CALLS BOTH
-    /// `'record structs'`** -- plural, for the CLASS form too. Measured one compilation per rung,
-    /// 7.3 through 12; this variant is the C# 9 form and does not cover the keyword pair.
     ///
-    /// **csc DOES NOT GATE `record R(int X);` BY NAME BELOW C# 9**: it fails to recognize the
-    /// syntax and reports `CS0106`, so there is no `Feature '...'` sentence to copy from that
-    /// spelling. The name `records` does exist -- a `with` expression is the only spelling that
-    /// surfaces it, `CS8370`/`CS8400 Feature 'records'` at 7.3 and 8.0.
     ///
     /// **Ordered after generics**: a record is a code generator whose output binds
     /// `IEquatable<T>`, so it cannot land before the thing it generates against. 92 files and 93
@@ -843,36 +712,16 @@ pub enum Feature {
     /// The `record class` / `record struct` KEYWORD forms -- C# 10, and a csc feature separate
     /// from [`Feature::Records`].
     ///
-    /// **csc CALLS BOTH `'record structs'`, PLURAL, INCLUDING THE CLASS FORM**, which is not what
-    /// either name suggests: `record class R(int X);` at C# 9 reports *Feature 'record structs' is
-    /// not available in C# 9.0*. Measured one compilation per rung, and `readonly record struct`
-    /// reports the same.
     ///
-    /// **Gated by name rather than implemented**, so a program using the keyword pair is refused
-    /// in csc's own words instead of being silently miscompiled. Across the pinned dotnet/iot
-    /// corpus the pair unlocks a single file, so the gate alone carries nearly all of its value.
     RecordStructs,
     /// A record that INHERITS -- `record D(int Y) : B(X)` -- C# 9.0, and gated separately from
     /// [`Feature::Records`] because the members csc generates for it are not the ones it generates
     /// for a base record.
     ///
-    /// **THE DIFFERENCE IS NOT COSMETIC AND IT CANNOT BE DECIDED WHERE THE DESUGAR RUNS.** A
-    /// derived record OVERRIDES `EqualityContract`, `ToString`, `PrintMembers` and `GetHashCode`
-    /// where a base one introduces them, seals `Equals(Base)` beside a NEW `Equals(Derived)`, and
-    /// returns the BASE type from `<Clone>$` -- measured against csc's own inventory. Whether a
-    /// base name IS a record is a question about a RESOLVED type, and the record desugar runs in
-    /// the parser, where a base list is a list of names.
     ///
-    /// **Gated by name rather than implemented**, so such a program is refused instead of getting
-    /// a second `virtual` slot for a member its base already declares -- a silent dispatch failure
-    /// rather than a diagnostic. csc has no separate name for it, so the refusal borrows `records`.
     RecordInheritance,
     /// An `init` accessor in place of a property or indexer `set` -- C# 9.0.
     ///
-    /// **csc's OWN FEATURE, GATED SEPARATELY FROM `records`**, and named `'init-only setters'`.
-    /// Measured one compilation per rung: CS8370 at 7.3, CS8400 at 8.0, clean at 9. A record needs
-    /// it -- a positional record's properties are `{ get; init; }` -- but it stands on its own and
-    /// a program may use it with no record in sight.
     InitOnlySetters,
     /// TARGET-TYPED OBJECT CREATION, `C c = new();` -- C# 9.0, and csc's own name for it is
     /// `'target-typed object creation'`, measured at 7.3 (CS8370) and 8.0 (CS8400).
@@ -894,56 +743,31 @@ pub enum Feature {
     /// An async function -- the `async` modifier and the `await` operator (ECMA-334 5th ed,
     /// 12.8.8 and 15.15). Introduced in C# 5.0, and unlike `var` this rung IS ECMA-standardized.
     ///
-    /// **ONE variant covers the modifier and the operator**, because csc gates both under this
-    /// single name -- measured, one compilation each: the `async` modifier below 5 reports
-    /// `Feature 'async function'`, and an `await` OPERATOR in a non-async method below 5 reports
-    /// the same gate at the `await` token (beside CS4033). Inside an async method the modifier's
-    /// gate is the only one raised -- an `await` in the body adds nothing below 5, also measured.
     ///
-    /// **Both words are CONTEXTUAL.** `async` is a modifier only by lookahead (a program may
-    /// declare `class async` and a method `async async()` returning it -- both compile in csc);
-    /// `await` is reserved only inside a method whose modifiers include `async`, and the verbatim
-    /// `@await` is an ordinary identifier even there (12.8.8.1).
     AsyncFunction,
     /// The `default` LITERAL (C# 7.1): `default` with no type, which takes the type its context
     /// converts it to -- `x = default;`, `return default;`, `CancellationToken token = default`.
     /// `default(T)` is [`Feature::DefaultOperator`], six releases earlier.
     DefaultLiteral,
     /// An async entry point -- `static async Task Main()`. Introduced in **C# 7.1**, two rungs
-    /// after async functions themselves, and gated separately by csc under its own name --
-    /// measured: at `/langversion:5` an async `Task Main` reports `Feature 'async main' is not
-    /// available in C# 5. Please use language version 7.1 or greater.` alongside CS5001, while
-    /// `static async void Main` is CS4009 at every version (an entry point can never be
-    /// async-void). Without this variant the 7.1 rung would have nothing to name.
+    /// after async functions themselves. `static async void Main` is CS4009 at every version: an
+    /// entry point can never be async-void.
+    ///
     AsyncMain,
     /// An async method returning `Task<T>` -- one of the three return types 15.15.1 admits, and
-    /// the one that is generic. csc has no separate gate (it is simply part of async functions);
-    /// the variant exists so lcsc's PHASE SPLIT can refuse it by name: `Task<T>` and its builder
-    /// sit behind the generics-costed corlib work, so `void` and `Task` land first
-    /// (the phase-1 design records the split). The description is OURS, in csc's style, because
-    /// there is no csc message to copy.
+    /// the one that is generic.
+    ///
     AsyncTaskOfT,
-    /// A GENERIC async method -- `async Task M<T>(...)`. Also csc-gateless and also a phase
-    /// split: the state machine for a generic method is a synthesized generic type, which lands
-    /// beside `Task<T>` (in real code the two populations are nearly the same methods).
+    /// A GENERIC async method -- `async Task M<T>(...)`.
+    ///
     AsyncGenericMethod,
-    /// A lambda whose body reads `this` and nothing else from around it -- lowered by csc to a
-    /// private INSTANCE METHOD of the enclosing type, with no synthesized type at all.
+    /// A lambda whose body reads `this` and nothing else from around it.
     ///
-    /// csc has no gate for this (it is simply part of lambda expressions); the variant exists so
-    /// lcsc's PHASE SPLIT can refuse it by name. The three capture shapes are three lowerings, not
-    /// three degrees of one, and the non-capturing shape is the one that is built -- so
-    /// [`Feature::LambdaExpression`] cannot stand for all three without claiming two it lacks.
-    /// The description is OURS, in csc's style, because there is no csc message to copy.
+    ///
     LambdaCapturingThis,
-    /// A lambda whose body reads an enclosing LOCAL or PARAMETER -- lowered by csc to a
-    /// `<>c__DisplayClass` the enclosing method allocates, holding one field per capture (and
-    /// `<>4__this` as well, when the body reads `this` too).
+    /// A lambda whose body reads an enclosing LOCAL or PARAMETER.
     ///
-    /// Also csc-gateless and also a phase split: a display class has to be allocated at the right
-    /// point in the enclosing method's flow, and every read of a captured name in that method
-    /// becomes a field access on it. That rewrite is the whole feature and it is separate from
-    /// [`Feature::LambdaCapturingThis`], which needs no type at all.
+    ///
     ///
     /// **THIS VARIANT IS THE METHOD-BODY SCOPE ONLY**; a capture from anywhere else is
     /// [`Feature::LambdaCapturingNestedScope`]. The two are one construct to a reader and two
@@ -966,12 +790,6 @@ pub enum Feature {
     LambdaCapturingNestedScope,
     /// A lambda written inside a GENERIC type or a generic method.
     ///
-    /// Not a capture question and not csc's gate either -- a third phase split, and the widest of
-    /// the three. A lambda in a generic context needs its closure type to be generic as well
-    /// whenever anything the lambda's signature or body names reaches a type parameter, because
-    /// the synthesized fields and methods live on that type and a signature there spells `!0`, not
-    /// a name. A lambda inside a generic METHOD needs the method's own `!!n` scope restored around
-    /// its deferred body as well.
     ///
     /// **REFUSED MORE BROADLY THAN THE DEFECT STRICTLY REQUIRES.** A lambda in a generic type
     /// that touches no type parameter would lower correctly, and is refused anyway: the safe
@@ -986,47 +804,23 @@ pub enum Feature {
     /// built.
     ///
     ///
-    /// csc has no gate to copy -- the attributes are ordinary BCL types and it never reports a
-    /// feature message for them -- so the description below is OURS, in csc's style.
     CallerInfoAttribute,
     /// The `nameof` operator -- `nameof(x)`, whose value is the FINAL IDENTIFIER of its operand
     /// as a compile-time constant string. Introduced in **C# 6.0**.
     ///
-    /// **`nameof` IS NOT A KEYWORD AND THIS FEATURE DOES NOT OWN THE WORD.** A declaration named
-    /// `nameof` in scope WINS -- measured against csc one compilation each for a local, a method
-    /// and a property, and in all three the user's declaration was called. So the gate is raised
-    /// from the BINDER, after resolution has been tried, exactly as
-    /// [`Feature::ImplicitlyTypedLocalVariable`]'s is and for the same reason.
     ///
-    /// It is also not the operator unless the invocation has EXACTLY ONE positional argument:
-    /// `nameof()`, `nameof(a, b)` and `nameof(x: a)` are all `CS0103 The name 'nameof' does not
-    /// exist in the current context` -- csc falls back to reading the word as an ordinary
-    /// identifier rather than reporting a bad `nameof`. Measured.
     NameOf,
     /// An INTERPOLATED STRING -- `$"a{b}c"` and its verbatim form `$@"a{b}c"`. Introduced in
     /// **C# 6.0**.
     ///
-    /// **`$"..."` IS FOUR csc FEATURES AT FOUR RUNGS, and this variant is only the first**, the
-    /// same shape as `=>` (see [`Feature::ExpressionBodiedMethod`]). Measured one compilation per
-    /// rung:
     ///
-    /// | construct | rung | how csc refuses it below that |
-    /// |---|---|---|
-    /// | `$"..."`, `$@"..."` | C# 6.0 | `Feature 'interpolated strings'` -- this variant |
-    /// | `@$"..."` | C# 8.0 | **`CS8401`, which is not the `Feature '...'` family at all** |
-    /// | a CONSTANT one | C# 10.0 | `Feature 'constant interpolated strings'` -- [`Feature::ConstantInterpolatedStrings`] |
-    /// | `"""..."""` | C# 11.0 | `Feature 'raw string literals'` -- a separate lexical form, unbuilt |
     ///
-    /// PLURAL, unlike most of this table: csc says *'interpolated strings'* for one occurrence.
     InterpolatedStrings,
     /// An interpolated string used where a CONSTANT is required -- a `const` initializer, a
     /// `case` label, an attribute argument. Introduced in **C# 10.0**, four rungs after the
     /// interpolated string itself.
     ///
     ///
-    /// Gated and not built: lcsc folds the same way csc does but does not admit the result where a
-    /// constant is required, so the refusal is `LAM0001` at C# 10 and up and the version gate
-    /// below it. Both are honest; neither claims the other's cause.
     ConstantInterpolatedStrings,
     /// An `await` inside a `catch` or `finally` block -- introduced in **C# 6.0**. Below 6 the
     /// refusal is csc's own CS1985/CS1984 (measured, and the two texts are asymmetric); at 6 and
@@ -1037,8 +831,6 @@ pub enum Feature {
     /// An IMPLICITLY TYPED ARRAY, `new[] { 1, 2, 3 }`, whose element type is the best common type
     /// of its elements. Introduced in **C# 3.0**.
     ///
-    /// csc reports the gate at the `new`, not at the `[` that makes the form implicit. The
-    /// explicit form `new int[] { 1, 2, 3 }` is C# 1.0 and is a different construct.
     ImplicitlyTypedArray,
     /// An EXTENSION METHOD -- a static method whose first parameter carries `this`, so that
     /// `3.Twice()` binds to `E.Twice(3)`. Introduced in **C# 3.0**, and csc's gate is at the
@@ -1047,9 +839,6 @@ pub enum Feature {
     /// An ITERATOR -- a method body containing `yield return` or `yield break`, which the compiler
     /// rewrites into an enumerator class. Introduced in **C# 2.0**.
     ///
-    /// csc reports the gate once per `yield` statement, at the `yield`. The word is contextual:
-    /// only `yield return` and `yield break` are the statement, and `yield` alone stays an
-    /// ordinary identifier.
     Iterators,
     /// A LOCAL FUNCTION -- a method declared inside a block, `int Sq(int a) { return a * a; }`.
     /// Introduced in **C# 7.0**, and csc's gate is at the function's NAME rather than at its
@@ -1061,11 +850,6 @@ pub enum Feature {
     /// A PATTERN in a `switch` statement's `case` label -- `case int n:`, or any label with a
     /// `when` clause. Introduced in **C# 7.0**.
     ///
-    /// **csc gates it under its one pattern name, at the `case`**, so below C# 7 this variant
-    /// renders `pattern matching` exactly as [`Feature::DeclarationPattern`] does. The refusal
-    /// above the rung names the case label rather than pattern matching as a whole: patterns
-    /// after `is` and in a switch EXPRESSION are built, and a message saying pattern matching is
-    /// missing would send the reader away from the forms that work.
     PatternCaseLabel,
     /// A TYPE PATTERN -- a type with no designation, `o switch { int => .., _ => .. }`.
     /// Introduced in **C# 9.0**, where it is csc's `type pattern`, reported at the type.
@@ -1076,9 +860,6 @@ pub enum Feature {
     /// A `with` EXPRESSION, `p with { Y = 5 }`, which copies a record and then assigns the named
     /// members. Introduced in **C# 9.0**.
     ///
-    /// **csc gates it under `records`, at the `with`**, which is the name this variant renders
-    /// below C# 9. Above it the refusal says `with expression`: records themselves are built, and
-    /// a message naming `records` would say the opposite.
     WithExpression,
     /// The `record class` spelling of a record. Introduced in **C# 10.0**, where csc gates it --
     /// and `record struct` beside it -- as `record structs`, the class form included.
@@ -1104,6 +885,33 @@ pub enum Feature {
     /// constraint is a second root for member lookup, beside the base class, rather than a
     /// replacement for it.
     InterfaceConstraintMember,
+    /// A GENERIC local function -- one declaring type parameters of its own, `T Id<T>(T x)`. Part
+    /// of local functions, **C# 7.0**, and refused by name until its lowering, a generic
+    /// synthesized method, is built.
+    GenericLocalFunction,
+    /// A local function written inside a generic type or method, whose lowered method and display
+    /// struct would carry the enclosing type parameters. **C# 7.0**.
+    LocalFunctionInGenericScope,
+    /// An `async` local function, whose state machine is named for the function. **C# 7.0**.
+    AsyncLocalFunction,
+    /// An `extern` local function, `static extern int F();`, whose body P/Invoke supplies.
+    /// Introduced in **C# 9.0**, with the attributes it needs.
+    ExternLocalFunction,
+    /// An ATTRIBUTE on a local function or one of its parameters, `[Conditional("DEBUG")] void
+    /// Log() { }`, which csc writes on the synthesized method. **C# 9.0**; csc gates it at the
+    /// `[`.
+    LocalFunctionAttributes,
+    /// A local function returning `ref readonly`, whose return csc marks with
+    /// `modreq(InAttribute)` and `[IsReadOnlyAttribute]`. **C# 7.2**.
+    ReadOnlyRefLocalFunction,
+    /// An ATTRIBUTE on a type parameter of a type, method or delegate, `class C<[A] T>`, which csc
+    /// writes on the `GenericParam` row. Part of generics, **C# 2.0**.
+    TypeParameterAttributes,
+    /// A local function converted to a delegate -- or reached from a lambda -- that captures a
+    /// local of a NESTED scope, itself or through a function it calls. Its captures need a display
+    /// class in that scope and a chain to the enclosing one: lambdas' unbuilt shape
+    /// ([`Feature::LambdaCapturingNestedScope`]), reached another way. **C# 7.0**.
+    LocalFunctionDelegateNestedCapture,
 }
 
 impl Feature {
@@ -1127,6 +935,7 @@ impl Feature {
         match self {
             Feature::StaticClasses | Feature::BinaryLiterals | Feature::DigitSeparators => true,
             Feature::FileScopedNamespaces => true,
+            Feature::GlobalUsingDirective => true,
             Feature::ObjectInitializer | Feature::CollectionInitializer => true,
             Feature::ImplicitlyTypedLocalVariable => true,
             Feature::Generics => true,
@@ -1159,6 +968,10 @@ impl Feature {
             Feature::NullableReferenceTypes => true,
             Feature::UnconstrainedTypeParameterAnnotation => true,
             Feature::NotNullConstraint => true,
+            Feature::UnmanagedConstraint
+            | Feature::UnmanagedConstructedTypes
+            | Feature::EnumConstraint
+            | Feature::DelegateConstraint => true,
             Feature::UsingStatic => true,
             Feature::DefaultParameterValues => true,
             Feature::AutoPropertyInitializer | Feature::ReadonlyAutoProperty => true,
@@ -1184,8 +997,8 @@ impl Feature {
             Feature::PartialTypes => true,
             Feature::AsyncMain => false,
             Feature::DefaultLiteral => true,
-            Feature::AsyncTaskOfT
-            | Feature::AsyncGenericMethod
+            Feature::AsyncTaskOfT => true,
+            Feature::AsyncGenericMethod
             | Feature::AwaitInCatchOrFinally
             | Feature::CallerInfoAttribute => false,
             Feature::LambdaCapturingThis => true,
@@ -1196,15 +1009,22 @@ impl Feature {
             Feature::ConstantInterpolatedStrings => true,
             Feature::RecordClass => true,
             Feature::PatternCaseLabel => true,
+            Feature::LocalFunctions | Feature::StaticLocalFunctions => true,
             Feature::ImplicitlyTypedArray
             | Feature::ExtensionMethod
             | Feature::Iterators
-            | Feature::LocalFunctions
-            | Feature::StaticLocalFunctions
             | Feature::TypePattern
             | Feature::WithExpression
             | Feature::LambdaArgument
-            | Feature::InterfaceConstraintMember => false,
+            | Feature::InterfaceConstraintMember
+            | Feature::GenericLocalFunction
+            | Feature::LocalFunctionInGenericScope
+            | Feature::AsyncLocalFunction
+            | Feature::ExternLocalFunction
+            | Feature::LocalFunctionAttributes
+            | Feature::ReadOnlyRefLocalFunction
+            | Feature::TypeParameterAttributes
+            | Feature::LocalFunctionDelegateNestedCapture => false,
         }
     }
 
@@ -1220,7 +1040,7 @@ impl Feature {
     /// Two things keep this honest and they are both compiler-enforced, not remembered: the
     /// exhaustive `match` in `every_feature_is_in_all` fails to compile when a variant is added,
     /// and the length assertion beside it fails until the variant is added HERE too.
-    pub const ALL: [Feature; 86] = [
+    pub const ALL: [Feature; 99] = [
         Feature::Generics,
         Feature::StaticClasses,
         Feature::AnonymousMethods,
@@ -1257,6 +1077,10 @@ impl Feature {
         Feature::NullableReferenceTypes,
         Feature::UnconstrainedTypeParameterAnnotation,
         Feature::NotNullConstraint,
+        Feature::UnmanagedConstraint,
+        Feature::UnmanagedConstructedTypes,
+        Feature::EnumConstraint,
+        Feature::DelegateConstraint,
         Feature::ExpressionBodiedConstructor,
         Feature::ConstantPattern,
         Feature::OutVariableDeclaration,
@@ -1272,6 +1096,7 @@ impl Feature {
         Feature::DigitSeparators,
         Feature::TopLevelStatements,
         Feature::FileScopedNamespaces,
+        Feature::GlobalUsingDirective,
         Feature::RequiredMembers,
         Feature::LeadingDigitSeparator,
         Feature::Records,
@@ -1307,6 +1132,14 @@ impl Feature {
         Feature::RecordClass,
         Feature::LambdaArgument,
         Feature::InterfaceConstraintMember,
+        Feature::GenericLocalFunction,
+        Feature::LocalFunctionInGenericScope,
+        Feature::AsyncLocalFunction,
+        Feature::ExternLocalFunction,
+        Feature::LocalFunctionAttributes,
+        Feature::ReadOnlyRefLocalFunction,
+        Feature::TypeParameterAttributes,
+        Feature::LocalFunctionDelegateNestedCapture,
     ];
 
     /// The first language version in which this feature is available.
@@ -1342,6 +1175,10 @@ impl Feature {
             Feature::AutoPropertyInitializer => LanguageVersion::CSharp6,
             Feature::ByRefLocalsAndReturns => LanguageVersion::CSharp7,
             Feature::RefReassignment => LanguageVersion::CSharp7_3,
+            Feature::UnmanagedConstraint
+            | Feature::EnumConstraint
+            | Feature::DelegateConstraint => LanguageVersion::CSharp7_3,
+            Feature::UnmanagedConstructedTypes => LanguageVersion::CSharp8,
             Feature::ReadOnlyReferences => LanguageVersion::CSharp7_2,
             Feature::RefFields => LanguageVersion::CSharp11,
             Feature::ExpressionBodiedConstructor => LanguageVersion::CSharp7,
@@ -1371,6 +1208,7 @@ impl Feature {
             Feature::InitOnlySetters => LanguageVersion::CSharp9,
             Feature::TargetTypedNew => LanguageVersion::CSharp9,
             Feature::FileScopedNamespaces => LanguageVersion::CSharp10,
+            Feature::GlobalUsingDirective => LanguageVersion::CSharp10,
             Feature::RequiredMembers => LanguageVersion::CSharp11,
             Feature::DefaultInterfaceImplementation => LanguageVersion::CSharp8,
             Feature::ParameterlessStructConstructor => LanguageVersion::CSharp10,
@@ -1383,11 +1221,20 @@ impl Feature {
             | Feature::LambdaInGenericScope => LanguageVersion::CSharp3,
             Feature::CallerInfoAttribute => LanguageVersion::CSharp5,
             Feature::AwaitInCatchOrFinally => LanguageVersion::CSharp6,
-            Feature::Iterators | Feature::InterfaceConstraintMember => LanguageVersion::CSharp2,
+            Feature::Iterators
+            | Feature::InterfaceConstraintMember
+            | Feature::TypeParameterAttributes => LanguageVersion::CSharp2,
             Feature::ImplicitlyTypedArray
             | Feature::ExtensionMethod
             | Feature::LambdaArgument => LanguageVersion::CSharp3,
-            Feature::LocalFunctions | Feature::PatternCaseLabel => LanguageVersion::CSharp7,
+            Feature::LocalFunctions
+            | Feature::PatternCaseLabel
+            | Feature::GenericLocalFunction
+            | Feature::LocalFunctionInGenericScope
+            | Feature::AsyncLocalFunction
+            | Feature::LocalFunctionDelegateNestedCapture => LanguageVersion::CSharp7,
+            Feature::ExternLocalFunction | Feature::LocalFunctionAttributes => LanguageVersion::CSharp9,
+            Feature::ReadOnlyRefLocalFunction => LanguageVersion::CSharp7_2,
             Feature::StaticLocalFunctions => LanguageVersion::CSharp8,
             Feature::TypePattern | Feature::WithExpression => LanguageVersion::CSharp9,
             Feature::RecordClass => LanguageVersion::CSharp10,
@@ -1396,26 +1243,8 @@ impl Feature {
 
     /// The noun phrase csc quotes in `Feature '<name>' is not available in C# N`.
     ///
-    /// **EVERY STRING HERE IS csc's, MEASURED one compilation each**, because the message is a
-    /// search key: a user who pastes it into a search engine has to land on the same results a csc
-    /// user does.
     ///
-    /// | plausible description | csc says |
-    /// |---|---|
-    /// | nullable value types | **nullable types** |
-    /// | the namespace alias qualifier `'::'` | **namespace alias qualifier** |
-    /// | accessor access modifiers | **access modifiers on properties** |
-    /// | lambda and expression-bodied members (`'=>'`) | **lambda expression** *and* **expression-bodied method** / **expression-bodied property**, separately |
-    /// | object and collection initializers | **object initializer** *and* **collection initializer**, separately |
-    /// | optional parameters | **optional parameter** (singular) |
-    /// | named arguments | **named argument** (singular) |
-    /// | null-conditional operators (`'?.'` and `'?['`) | **null propagating operator** (one name, both operators -- measured) |
     ///
-    /// **THE PATTERN IS THAT A DESCRIPTION OF THE LANGUAGE IS NOT csc's NAME FOR THE CONSTRUCT**:
-    /// a parenthesized operator spelling, a plural where csc reports one occurrence,
-    /// and two features merged where the message has to pick one noun. The last kind is the one
-    /// that takes a VERSION error with it -- see [`Feature::ExpressionBodiedMethod`], where
-    /// merging the two would put the member forms on the accessor form's rung.
     ///
     /// **Do NOT add quotes here.** The renderers supply them, and a string carrying its own
     /// would nest.
@@ -1474,7 +1303,12 @@ impl Feature {
             Feature::TopLevelStatements => "top-level statements",
             Feature::UnconstrainedTypeParameterAnnotation => "default type parameter constraints",
             Feature::NotNullConstraint => "notnull generic type constraint",
+            Feature::UnmanagedConstraint => "unmanaged generic type constraints",
+            Feature::UnmanagedConstructedTypes => "unmanaged constructed types",
+            Feature::EnumConstraint => "enum generic type constraints",
+            Feature::DelegateConstraint => "delegate generic type constraints",
             Feature::FileScopedNamespaces => "file-scoped namespace",
+            Feature::GlobalUsingDirective => "global using directive",
             Feature::RequiredMembers => "required members",
             Feature::Records => "records",
             Feature::RecordStructs => "record structs",
@@ -1511,19 +1345,22 @@ impl Feature {
             Feature::RecordClass => "record structs",
             Feature::LambdaArgument => "lambda expression",
             Feature::InterfaceConstraintMember => "generics",
+            Feature::TypeParameterAttributes => "attributes on type parameters",
+            Feature::GenericLocalFunction => "generic local function",
+            Feature::LocalFunctionInGenericScope => "local function in a generic type or method",
+            Feature::AsyncLocalFunction => "async local function",
+            Feature::ExternLocalFunction => "extern local function",
+            Feature::LocalFunctionAttributes => "local function attributes",
+            Feature::ReadOnlyRefLocalFunction => "local function returning ref readonly",
+            Feature::LocalFunctionDelegateNestedCapture => {
+                "local function converted to a delegate that captures a local from a nested scope"
+            }
         }
     }
 
     /// The noun `LAM0001` quotes when the dialect permits this feature and this build lacks it.
     ///
-    /// **USUALLY [`Self::description`], AND DIFFERENT EXACTLY WHERE csc's NOUN IS WIDER THAN THE
-    /// MISSING PART.** csc names a `with` expression `records` and a pattern in a `case` label
-    /// `pattern matching`, and both of those are built here. Quoting csc's noun in a refusal would
-    /// tell the reader that records, or pattern matching, is unavailable -- the opposite of the
-    /// truth -- so the refusal names the construct they actually wrote.
     ///
-    /// The version gate keeps csc's noun regardless: below the rung csc's message is the right
-    /// one, and it is a search key.
     #[must_use]
     pub fn refusal_description(self) -> &'static str {
         match self {
@@ -1552,9 +1389,19 @@ impl Feature {
                 Some("Declare it without 'this' and call it as a static method instead.")
             }
             Feature::Iterators => Some("Build and return a collection instead."),
-            Feature::LocalFunctions | Feature::StaticLocalFunctions => {
+            Feature::LocalFunctions
+            | Feature::StaticLocalFunctions
+            | Feature::GenericLocalFunction
+            | Feature::LocalFunctionInGenericScope
+            | Feature::AsyncLocalFunction
+            | Feature::ExternLocalFunction
+            | Feature::LocalFunctionAttributes
+            | Feature::ReadOnlyRefLocalFunction => {
                 Some("Declare it as a method of the enclosing type instead.")
             }
+            Feature::LocalFunctionDelegateNestedCapture => Some(
+                "Declare the variables it captures in the method's outermost block instead.",
+            ),
             Feature::PatternCaseLabel => {
                 Some("Use a switch expression, or an 'if' with an 'is' pattern, instead.")
             }
@@ -1574,10 +1421,6 @@ impl Feature {
     /// reader: raising `/langversion` fixes the first and cannot touch the second.
     ///
     ///
-    /// **THE GATE CARRIES THE NOUN ITS MESSAGE QUOTES, SO NO RENDERER CHOOSES ONE.** The version
-    /// half quotes csc's [`Self::description`] and the build half quotes
-    /// [`Self::refusal_description`]; three renderers (lexer, parser, binder) print whichever the
-    /// gate hands them.
     #[must_use]
     pub fn gate_against(self, version: LanguageVersion) -> Option<FeatureGate> {
         if !version.supports(self) {
@@ -1784,6 +1627,10 @@ mod tests {
                 | Feature::NullableReferenceTypes
                 | Feature::UnconstrainedTypeParameterAnnotation
                 | Feature::NotNullConstraint
+                | Feature::UnmanagedConstraint
+                | Feature::UnmanagedConstructedTypes
+                | Feature::EnumConstraint
+                | Feature::DelegateConstraint
                 | Feature::ExpressionBodiedConstructor
                 | Feature::ConstantPattern
                 | Feature::OutVariableDeclaration
@@ -1799,6 +1646,7 @@ mod tests {
                 | Feature::DigitSeparators
                 | Feature::TopLevelStatements
                 | Feature::FileScopedNamespaces
+                | Feature::GlobalUsingDirective
                 | Feature::RequiredMembers
                 | Feature::LeadingDigitSeparator
                 | Feature::Records
@@ -1833,12 +1681,20 @@ mod tests {
                 | Feature::WithExpression
                 | Feature::RecordClass
                 | Feature::LambdaArgument
-                | Feature::InterfaceConstraintMember => {}
+                | Feature::InterfaceConstraintMember
+                | Feature::GenericLocalFunction
+                | Feature::LocalFunctionInGenericScope
+                | Feature::AsyncLocalFunction
+                | Feature::ExternLocalFunction
+                | Feature::LocalFunctionAttributes
+                | Feature::ReadOnlyRefLocalFunction
+                | Feature::TypeParameterAttributes
+                | Feature::LocalFunctionDelegateNestedCapture => {}
             }
         }
         assert_eq!(
             Feature::ALL.len(),
-            86,
+            99,
             "a Feature variant was added without being added to Feature::ALL"
         );
     }

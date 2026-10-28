@@ -5,7 +5,7 @@
 // instance bases live in Esp32c6Instances. Widths are access widths.
 namespace Lamella.Generated
 {
-    public sealed class Esp32c6UartLayout
+    internal sealed class Esp32c6UartLayout
     {
         private Esp32c6UartLayout() { }
 

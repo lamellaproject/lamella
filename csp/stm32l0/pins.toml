@@ -4,7 +4,7 @@
 #
 #
 #
-# THE MAP LISTS ONLY THE CELLS A BINDING USES. The family's full
+# The map lists only the cells a binding uses. The family's full
 # alternate-function matrix is table 14 of the datasheet and is larger than this.
 
 [table]

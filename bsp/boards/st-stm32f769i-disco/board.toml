@@ -1,18 +1,18 @@
 # BOARD binding: the 32F769IDISCOVERY (STM32F769I-DISCO), an STM32F769NI carrier.
 #
-# BOTH USER LEDS DRIVE, AND UM2033 SAYS THE OPPOSITE IN WORDS. The manual's section 5.16 reads "to
+# Both user LEDs drive, and UM2033 says the opposite in words. The manual's section 5.16 reads "to
 # light a LED, a zero low-logic state must be written in the corresponding GPIO register", and that
 # sentence is wrong for this board. The MB1225 schematic settles it: LD_USER1 leaves the pin,
 # passes through R62 and LD1, and the LED's cathode goes to GROUND -- and LD_USER2 through R63 and
 # LD2 to the same ground node. A pin that reaches an anode through a resistor sources the current,
 # so a ONE lights these LEDs.
 #
-# THE MANUAL IS RIGHT IN ITS TABLES AND WRONG IN ITS PROSE, TWICE IN THE SAME SECTION. Table 4's
+# The manual is right in its tables and wrong in its prose, twice in the same section. Table 4's
 # port assignment (PJ13, PJ5) is confirmed by the schematic ball-for-ball, and so are Table 4's LED
 # colors -- while the prose beside both gets the colors wrong and the polarity wrong. A later
 # reader of UM2033 5.16 should take its tables and verify its sentences.
 #
-# THE USER BUTTON READS THE SAME WAY AND THE MANUAL IS RIGHT ABOUT IT: "when the button is
+# The user button reads the same way and the manual is right about it: "when the button is
 # depressed the logic state is 1, otherwise, the logic state is 0". So every control line on this
 # board is active high.
 
@@ -54,11 +54,11 @@ rx = { pin = "PA10" }
 
 # --- external memory -----------------------------------------------------------------------
 #
-# THE QUAD-SPI FLASH DOES NOT EXIST AT RESET. It appears at its base once the quadspi controller is
+# The quad-SPI flash does not exist at reset. It appears at its base once the quadspi controller is
 # configured, and an access before that is a bus fault rather than a wrong value -- so the region
 # names its controller, and `optional` says the board runs a program without it.
 #
-# TWO PARTS FIT THE FOOTPRINT, SO THE REGION NAMES NO DEVICE. The board's schematic draws a Micron
+# Two parts fit the footprint, so the region names no device. The board's schematic draws a Micron
 # MT25QL512ABB1EW9 and a Macronix MX25L51245GZ2I-08G on the same six nets, so a unit may carry
 # either. They answer different JEDEC identities and take different fast-read frames, which is
 # why a bring-up reads the identity before it uses the part at all.
@@ -74,7 +74,7 @@ source = "UM2033 Rev 5 section 5.14: a 512-Mbit Quad-SPI NOR flash memory is con
 
 # --- the operating point ----------------------------------------------------------------------
 #
-# THE PART'S OWN RESET STATE, deliberately. This part can reach 216 MHz through its PLL, and every
+# The part's own reset state, deliberately. This part can reach 216 MHz through its PLL, and every
 # route there is a configuration a program performs rather than a fact the board states. The
 # internal oscillator is running at reset on every unit, so a plan naming it holds regardless of
 # what the board's crystals are populated with -- and the divisor below is then a fact about the
@@ -92,14 +92,14 @@ pclk_hz = 16000000          # APB2, where USART1 sits. Equal to HSI under reset 
 # STATE-AND-VERIFY: this row states the divisors AND the rates they produce, and generation
 # refuses unless the vendor's arithmetic holds and every range the manual sets is satisfied.
 #
-# THE 48 MHz DOMAIN IS THE REASON THIS ROW IS WORTH STATING RATHER THAN LEAVING TO A BRING-UP.
+# The 48 MHz domain is the reason this row is worth stating rather than leaving to a bring-up.
 # It is a second output of the SAME VCO that produces the system clock, and it is what the SD/MMC
 # controllers are clocked from -- so a program that raises the core clock moves the card clock
 # with it. Stated here, the pair is checked together; left to code, they are two places to get
 # right and only one of them fails loudly.
 #
-# THE TWO APB CEILINGS BELOW ARE THE DATASHEET'S, AND THE VENDOR'S TWO DOCUMENTS DISAGREE ABOUT
-# THEM. The reference manual's prescaler-field cautions give 90 MHz for APB2 and 45 MHz for APB1;
+# The two APB ceilings below are the datasheet's, and the vendor's two documents disagree about
+# them. The reference manual's prescaler-field cautions give 90 MHz for APB2 and 45 MHz for APB1;
 # the datasheet's block diagram for this part gives 108 MHz and 54 MHz. The part-specific document
 # is the one taken, since the manual covers a range of parts and its figures are the range's. A
 # design following the manual's pair would halve both buses and lose nothing but speed.
@@ -124,7 +124,7 @@ pclk1_hz = 54000000         # APB1 = sysclk / 4.
 
 # --- control lines ---------------------------------------------------------------------------
 #
-# BOTH USER LEDS ARE ACTIVE HIGH, read off the MB1225 schematic rather than off UM2033's sentence,
+# Both user LEDs are active high, read off the MB1225 schematic rather than off UM2033's sentence,
 # which says the opposite and is wrong. Confirmed on the board as well as on the schematic: PJ13
 # driven low leaves LD1 dark and driven high lights it. Read backwards, this board's LEDs are dark
 # from reset until a program drives them. A manual sentence about polarity is a claim; the net is

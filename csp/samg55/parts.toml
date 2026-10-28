@@ -1,6 +1,6 @@
-# The SAMG55 parts table. THIS IS NOT A SAM D/L PART AND SHARES NO BLOCK WITH THAT LINE.
-# The classification was measured by censusing the datasheet rather than inferred from the SAM
-# name, and it is not close:
+# The SAMG55 parts table. This is not a SAM D/L part and shares no block with that line.
+# The classification comes from the datasheet's own vocabulary rather than from the SAM name,
+# and it is not close:
 #
 #     block census over Atmel-11289F     SERCOM 0    NVMCTRL 0    MCLK 5    GCLK 4
 #                                        PIO 721     PMC 523      USART 473  EEFC 186
@@ -10,12 +10,12 @@
 # as both the PMC clock-enable bit and the NVIC line, which is why ../instances.toml uses the
 # sam3x record shape (`base`, `pid`) rather than the SAM D/L one.
 #
-# THE SERIAL PERIPHERAL IS A FLEXCOM AND NOT A BARE USART. Each of the eight instances is a
+# The serial peripheral is a FLEXCOM and not a bare USART. Each of the eight instances is a
 # Flexible Serial Communication Controller that can be a USART, an SPI or a TWI; Table 9-1 rows
 # them as "USARTn, SPIn, TWIn" sharing one identifier. The USART register file sits at the
 # FLEXCOM base PLUS 0x200, which the register descriptions state instance by instance.
 #
-# THE SRAM IS 160 KB PLUS UP TO 16 KB THAT IS NOT THE SAME KIND OF MEMORY. Table 1-1's SRAM cell
+# The SRAM is 160 KB plus up to 16 KB that is not the same kind of memory. Table 1-1's SRAM cell
 # reads "160 Kbytes + up to 16 Kbytes (Cache + I/D RAM)". The `ram` field below is the 160 KB
 # alone -- the span at 0x20000000 that a linker can believe -- and the 16 KB is Cache and
 # tightly-coupled I/D RAM whose availability depends on how much of it the CMCC is using. Summing

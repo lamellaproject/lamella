@@ -324,4 +324,67 @@ class Program
         assert!(ran.contains("Hello, World!"), "reply was {ran}");
         dispose(handle);
     }
+
+    /// Runs the session `handle` names from its start to the program's end, then disposes of it.
+    /// Returns what the program printed and the exit code the session reported.
+    fn run_to_the_end(handle: u32) -> (String, Option<i64>) {
+        reply_text(
+            handle,
+            br#"{"type":"request","seq":1,"command":"initialize"}"#,
+        );
+        reply_text(handle, br#"{"type":"request","seq":2,"command":"launch"}"#);
+        let ran = reply_text(
+            handle,
+            br#"{"type":"request","seq":3,"command":"configurationDone"}"#,
+        );
+        dispose(handle);
+        let replies: Vec<serde_json::Value> = serde_json::from_str(&ran).expect("a JSON array");
+        let printed = replies
+            .iter()
+            .filter(|reply| reply["event"] == "output" && reply["body"]["category"] == "stdout")
+            .filter_map(|reply| reply["body"]["output"].as_str())
+            .collect();
+        let exit = replies
+            .iter()
+            .find(|reply| reply["event"] == "exited")
+            .and_then(|reply| reply["body"]["exitCode"].as_i64());
+        (printed, exit)
+    }
+
+    /// **A DEBUG SESSION WITH NO CORLIB CASTS AN ARRAY AS .NET's DOES**, through
+    /// `lamella_dap_create`, which loads the program alone: `(IComparable)new int[3]` throws.
+    #[test]
+    fn a_program_debugged_with_no_corlib_casts_an_array_as_dotnet_does() {
+        let Some((image, _)) =
+            crate::tests::compiled_against_the_corlib(crate::tests::CASTS_AN_ARRAY)
+        else {
+            eprintln!("corlib.dll absent; skipping");
+            return;
+        };
+        let handle = unsafe { lamella_dap_create(image.as_ptr(), image.len()) };
+        assert_ne!(handle, 0);
+        let (printed, exit) = run_to_the_end(handle);
+        assert_eq!(printed, "InvalidCastException\n");
+        assert_eq!(exit, Some(0), "the first check that failed");
+    }
+
+    /// **AND THROUGH `lamella_dap_create_with_pdb`**, the page's path, which loads the program
+    /// alone beside its PDB.
+    #[test]
+    fn a_program_debugged_from_its_pdb_with_no_corlib_casts_an_array_as_dotnet_does() {
+        let Some((image, pdb)) =
+            crate::tests::compiled_against_the_corlib(crate::tests::CASTS_AN_ARRAY)
+        else {
+            eprintln!("corlib.dll absent; skipping");
+            return;
+        };
+        let pdb = pdb.expect("a PDB");
+        let handle = unsafe {
+            lamella_dap_create_with_pdb(image.as_ptr(), image.len(), pdb.as_ptr(), pdb.len())
+        };
+        assert_ne!(handle, 0);
+        let (printed, exit) = run_to_the_end(handle);
+        assert_eq!(printed, "InvalidCastException\n");
+        assert_eq!(exit, Some(0), "the first check that failed");
+    }
 }

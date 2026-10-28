@@ -108,6 +108,20 @@ internal sealed class Rp2350I2cDriver : I2cDriver
             | (Rp2350IoBank0Layout.OEOVER_DISABLE << (int)Rp2350IoBank0Layout.GPIO0_CTRL_OEOVER_LSB);
     }
 
+    /// <summary>The rates the block runs its bus at: 100000 (standard mode), 400000 (fast mode) and
+    /// 1000000 (fast mode plus).</summary>
+    public override int[] Rates
+    {
+        get
+        {
+            int[] rates = new int[3];
+            rates[0] = 100000;
+            rates[1] = 400000;
+            rates[2] = 1000000;
+            return rates;
+        }
+    }
+
     /// <summary>Brings the bound DW up as a 7-bit master at <paramref name="busHz"/>: 100000
     /// (standard mode), 400000 (fast mode) or 1000000 (fast mode plus). The block is reset and
     /// its pads prepared (de-isolated, input buffered, internally pulled up, schmitt kept for the
@@ -121,7 +135,7 @@ internal sealed class Rp2350I2cDriver : I2cDriver
     /// <exception cref="System.IO.IOException">The block did not come out of reset.</exception>
     public override void Configure(int busHz)
     {
-        if (busHz != 100000 && busHz != 400000 && busHz != 1000000)
+        if (!Serves(busHz))
         {
             throw new ArgumentOutOfRangeException("busHz",
                 "the RP2350's I2C runs at 100000, 400000 or 1000000 Hz");
