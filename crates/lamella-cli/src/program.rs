@@ -131,7 +131,7 @@ pub(crate) fn refuses_arguments_on_a_board(program_args: &[String]) -> bool {
         return false;
     }
     let given: Vec<&String> = program_args.iter().collect();
-    crate::own_lines::say(&mut std::io::stderr(), &crate::image_run::arguments_refusal(&given));
+    crate::own_lines::fail(&mut std::io::stderr(), &crate::image_run::arguments_refusal(&given));
     true
 }
 
@@ -168,7 +168,9 @@ pub fn run_command(args: &[String]) -> Ended {
         flags: &[],
         positional: Positional::One("source file"),
     };
-    let parsed = match args::parse_or_halt(options, &spec) {
+    let parsed = match args::parse_or_halt_with(options, &spec, |error| {
+        crate::own_lines::full_failure(&mut std::io::stderr(), error);
+    }) {
         Ok(parsed) => parsed,
         Err(args::Halt::Help) => return Ended::Program(0),
         Err(args::Halt::Bad) => return Ended::Failed,
@@ -176,19 +178,19 @@ pub fn run_command(args: &[String]) -> Ended {
     let folders = match Folders::from_options(&parsed, "run") {
         Ok(folders) => folders,
         Err(refusal) => {
-            eprintln!("{refusal}");
+            crate::own_lines::full_failure(&mut std::io::stderr(), &refusal);
             return Ended::Failed;
         }
     };
     let path = match parsed.only_positional("run", "source file") {
         Ok(path) => Path::new(path).to_path_buf(),
         Err(refusal) => {
-            eprintln!("{refusal}");
+            crate::own_lines::full_failure(&mut std::io::stderr(), &refusal);
             return Ended::Failed;
         }
     };
     if parsed.value("--board").is_some() {
-        eprintln!("lamella run: {BOTH_MODES}");
+        crate::own_lines::full_failure(&mut std::io::stderr(), BOTH_MODES);
         return Ended::Failed;
     }
     if let Some(target) = parsed.value("--device") {
@@ -197,6 +199,7 @@ pub fn run_command(args: &[String]) -> Ended {
         }
         return run_on_target(&path, target, &folders);
     }
+    let _interrupt = crate::ending::watch_local_run();
     if crate::flash::is_project(&path) {
         return run_project(&path, program_args, &folders);
     }
@@ -204,12 +207,12 @@ pub fn run_command(args: &[String]) -> Ended {
     let (language, source) = match read(&path) {
         Ok(read) => read,
         Err(error) => {
-            eprintln!("lamella run: {error}");
+            crate::own_lines::full_failure(&mut std::io::stderr(), &error.to_string());
             return Ended::Failed;
         }
     };
     if language != Language::CSharp && !program_args.is_empty() {
-        eprintln!("{}", arguments_refused_here(language, program_args));
+        crate::own_lines::full_failure(&mut std::io::stderr(), &arguments_refused_here(language, program_args));
         return Ended::Failed;
     }
     match language {
@@ -336,6 +339,7 @@ pub(crate) fn run_built_on_target(
         board,
         |answered| Some(first_line(answered)),
         |answered| crate::bake::image_of_built(path, "run", answered, folders),
+        lamella_wire_host::on_device::Wording::Brief,
     )
 }
 
@@ -417,7 +421,7 @@ pub(crate) fn run_here(
 
 /// The compiler's diagnostics, and a word on the one a reader of this verb meets most.
 fn refuse_diagnostics(text: &str) -> Ended {
-    eprintln!("{text}");
+    crate::own_lines::full_failure(&mut std::io::stderr(), text);
     if text.contains("CS0227") {
         eprintln!(
             "\nunsafe code is off by default, as it is in csc without /unsafe -- and this \
@@ -445,7 +449,7 @@ fn run_project(path: &Path, program_args: &[String], folders: &Folders) -> Ended
     match project_run(path, program_args, folders) {
         Ok(run) => report(run),
         Err(refusal) => {
-            eprintln!("{refusal}");
+            crate::own_lines::full_failure(&mut std::io::stderr(), &refusal);
             Ended::Failed
         }
     }
@@ -533,7 +537,7 @@ pub(crate) fn report(run: Result<HostRun, ReplError>) -> Ended {
     match run {
         Ok(run) => print_host_run(&run, &mut std::io::stdout(), &mut std::io::stderr()),
         Err(error) => {
-            eprintln!("lamella run: {error}");
+            crate::own_lines::full_failure(&mut std::io::stderr(), &error.to_string());
             Ended::Failed
         }
     }
@@ -550,10 +554,9 @@ fn print_host_run(run: &HostRun, out: &mut dyn std::io::Write, err: &mut dyn std
     let _ = out.flush();
     let _ = write!(err, "{}", run.stderr);
     if run.ended == Ended::Failed {
-        let _ = writeln!(
+        crate::own_lines::fail(
             err,
-            "lamella run: the run ended without the program's exit code, so how the program ended is \
-             not known."
+            "The run ended without the program's exit code, so how the program ended is not known."
         );
     }
     run.ended
@@ -565,7 +568,7 @@ fn run_python(path: &Path, source: &str, board: Option<&str>) -> Ended {
     match python_run(path, source, board) {
         Ok(run) => print_host_run(&run, &mut std::io::stdout(), &mut std::io::stderr()),
         Err(error) => {
-            eprintln!("lamella run: {error}");
+            crate::own_lines::full_failure(&mut std::io::stderr(), &error);
             Ended::Failed
         }
     }
@@ -1041,7 +1044,7 @@ Options:
   --board <board>                 The board ID to build for, as `lamella boards` lists it. Output
                                   too large for the board is refused, and a .lmli or .lpyc build
                                   ends with a Fit line.
-  --format <format>               Write a native image for --board, in one of these formats:{formats}
+  --format <format>               Write an AOT image for --board, in one of these formats:{formats}
                                   Default: a .lmli image for the resident interpreter firmware, or
                                   a .lpyc bundle for a Python program.
   --out <path>                    The file to write. Default: <file> with the output's extension.
@@ -1058,11 +1061,11 @@ What happens:
   names each file it wrote. A build that is refused exits 1 and leaves the folder as it found it.
 
 Examples:
-  lamella build Program.cs --board rpi-pico2
-  lamella build Program.cs --board rpi-pico2 --format uf2
+  lamella build Program.cs --board raspberrypi-pico-2
+  lamella build Program.cs --board raspberrypi-pico-2 --format uf2
 
 Details:
-  With --format, the build is a native image: the program linked with the class library and the
+  With --format, the build is an AOT image: the program linked with the class library and the
   runtime support archive, so it may allocate, use floating point and call into System.*. That is
   exactly what `lamella flash` takes. The class-library tier covers fewer boards than the flat
   tier, and a board it has no plan for is refused, naming the boards there are. The output says
@@ -2169,7 +2172,6 @@ fn host_sleep_ns(nanos: i64) {
 mod tests {
     use super::*;
     use lamella_flash_routes::manifest;
-    use lamella_wire_host::engine::ReplCompiler;
 
     /// A scratch directory of the test's own.
     fn scratch(name: &str) -> std::path::PathBuf {
@@ -2186,15 +2188,15 @@ mod tests {
         let dir = scratch("manifest-written");
         let elf = dir.join("app.elf");
         std::fs::write(&elf, b"elf bytes").expect("the ELF");
-        write_manifest_beside(&elf, &manifest::for_elf("rpi-pico2", b"elf bytes", &producer())).expect("written");
+        write_manifest_beside(&elf, &manifest::for_elf("raspberrypi-pico-2", b"elf bytes", &producer())).expect("written");
         let read = manifest::read(&elf).expect("readable").expect("present");
         manifest::check_identity(&read, b"elf bytes", Some("elf")).expect("it describes the bytes");
-        assert_eq!(read.board, "rpi-pico2");
+        assert_eq!(read.board, "raspberrypi-pico-2");
         assert_eq!(read.producer, Some(format!("lamella {}", crate::TOOL_VERSION)));
 
         let bin = dir.join("app.bin");
         std::fs::write(&bin, [0u8; 64]).expect("the bin");
-        write_manifest_beside(&bin, &manifest::for_bin("rpi-pico2", 0x1000_0000, &[0u8; 64], &producer()))
+        write_manifest_beside(&bin, &manifest::for_bin("raspberrypi-pico-2", 0x1000_0000, &[0u8; 64], &producer()))
             .expect("written");
         let read = manifest::read(&bin).expect("readable").expect("present");
         manifest::check_identity(&read, &[0u8; 64], Some("bin")).expect("it describes the bytes");
@@ -2220,7 +2222,7 @@ mod tests {
         let ring = elf_naming(&[(lamella_probe_console::LAMELLA_RING, 0x2000_8000, 16 + 16384)]);
         let rhu = elf_naming(&[(lamella_probe_console::RHU_RING, 0x2000_8000, 16 + 16384)]);
         let neither = elf_naming(&[]);
-        for board in ["rpi-pico2", "rpi-pico2-w", "pimoroni-pico-plus-2", "pimoroni-pico-plus-2-w"] {
+        for board in ["raspberrypi-pico-2", "raspberrypi-pico-2-w", "pimoroni-pico-plus-2", "pimoroni-pico-plus-2-w"] {
             assert_eq!(record_channel(board, &ring), Some("memory"), "{board}");
             assert_eq!(record_channel(board, &neither), None, "{board}: no ring");
             assert_eq!(record_channel(board, &rhu), None, "{board}: RHU's ring");
@@ -2239,7 +2241,7 @@ mod tests {
         for name in ["app.uf2", "app.hex", "app.s19", "app.img", "app.elf"] {
             let out = dir.join(name);
             std::fs::write(&out, b"bytes").expect("the file");
-            let record = manifest::for_bin("rpi-pico2", 0x1000_0000, b"bytes", &producer());
+            let record = manifest::for_bin("raspberrypi-pico-2", 0x1000_0000, b"bytes", &producer());
             write_manifest_beside(&out, &record).expect("nothing to write");
             assert!(!manifest::path_for(&out).exists(), "{name} got a record");
         }
@@ -2297,36 +2299,7 @@ mod tests {
         }
         let (ended, _, err) = printed(Ended::Failed);
         assert_eq!(ended, Ended::Failed);
-        assert!(err.starts_with("lamella run: the run ended without the program's exit code"), "{err}");
-    }
-
-    /// A program compiled from `source`, run on this machine, or `None` where this build has no
-    /// reference assemblies to compile against.
-    fn ran_here(source: &str) -> Option<HostRun> {
-        ran_here_with(source, &[])
-    }
-
-    /// [`ran_here`], with `args` as the program's own arguments.
-    fn ran_here_with(source: &str, args: &[&str]) -> Option<HostRun> {
-        let compiler = LcscCompiler::discover().ok()?;
-        let corlib = compiler.references().first().cloned().expect("a corlib");
-        let assembly = compiler.compile(source).unwrap_or_else(|_| panic!("compiles: {source}"));
-        let args: Vec<String> = args.iter().map(|arg| (*arg).to_owned()).collect();
-        Some(run_here(corlib, &assembly, &args).expect("runs"))
-    }
-
-    /// **WHAT FOLLOWS `--` IS THE PROGRAM'S**, each argument whole and in the order given, as
-    /// `dotnet run` passes it: a `Main(string[] args)` receives it, and an empty array when nothing
-    /// follows.
-    #[test]
-    fn the_arguments_after_the_double_dash_reach_the_program() {
-        let source = "class P { static int Main(string[] args) { System.Console.WriteLine(args.Length); \
-                      for (int i = 0; i < args.Length; i++) { System.Console.WriteLine(\"[\" + args[i] + \"]\"); } \
-                      return 42; } }";
-        let Some(given) = ran_here_with(source, &["one", "two words"]) else { return };
-        assert_eq!((given.ended, given.stdout.as_str()), (Ended::Program(42), "2\n[one]\n[two words]\n"));
-        let none = ran_here_with(source, &[]).expect("compiles");
-        assert_eq!((none.ended, none.stdout.as_str()), (Ended::Program(42), "0\n"));
+        assert!(err.starts_with("The run ended without the program's exit code"), "{err}");
     }
 
     /// A `run` command line's options end at its first `--`, and everything after it, a second `--`
@@ -2345,34 +2318,9 @@ mod tests {
 
     /// The `Main` of [`a_source_file_and_a_project_hand_main_the_arguments_after_the_double_dash`]:
     /// 42 when it was handed exactly what that test gives it, and 10 plus the count otherwise.
-    const TAKES_ARGUMENTS: &str = "class Program { static int Main(string[] args) { \
+    pub(super) const TAKES_ARGUMENTS: &str = "class Program { static int Main(string[] args) { \
         return args.Length == 3 && args[0] == \"one\" && args[1] == \"two words\" \
         && args[2] == \"--help\" ? 42 : 10 + args.Length; } }";
-
-    /// **`lamella run <file> -- <arguments>` TAKES `dotnet run`'s GRAMMAR.** A source file and a
-    /// project alike hand what follows the `--` to `Main(string[] args)`, a `--help` among it
-    /// included, which is the program's and not a request for this verb's help.
-    #[test]
-    fn a_source_file_and_a_project_hand_main_the_arguments_after_the_double_dash() {
-        if LcscCompiler::discover().is_err() {
-            return;
-        }
-        let line = |items: &[&str]| items.iter().map(|item| (*item).to_owned()).collect::<Vec<String>>();
-        let project = project_at("arguments", "Exe", "", TAKES_ARGUMENTS);
-        let alone = std::env::temp_dir().join(format!("lamella-cli-{}-arguments-file", std::process::id()));
-        let _ = std::fs::remove_dir_all(&alone);
-        std::fs::create_dir_all(&alone).expect("a scratch directory");
-        let file = alone.join("Program.cs");
-        std::fs::write(&file, TAKES_ARGUMENTS).expect("write the program");
-        for path in [&project, &file] {
-            let path = path.to_string_lossy().into_owned();
-            let given = run_command(&line(&[&path, "--", "one", "two words", "--help"]));
-            assert_eq!(given, Ended::Program(42), "{path}: the arguments, whole and in order");
-            assert_eq!(run_command(&line(&[&path, "--"])), Ended::Program(10), "{path}: none");
-        }
-        let _ = std::fs::remove_dir_all(project.parent().expect("its directory"));
-        let _ = std::fs::remove_dir_all(&alone);
-    }
 
     /// **A RUN THAT CANNOT GIVE A PROGRAM ITS ARGUMENTS IS REFUSED, NOT RUN WITHOUT THEM:** a run on
     /// a board, from a source file as from `dotnet run`'s built assembly, before the board is
@@ -2407,26 +2355,6 @@ mod tests {
         assert!(refusal.contains("a JavaScript program cannot take arguments yet"), "{refusal}");
         assert!(refusal.contains("(given: \"one\", \"two words\")"), "{refusal}");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// **A C# PROGRAM'S CODE COMES BACK UNCHANGED, 70 INCLUDED, AND AN EXCEPTION NOTHING CAUGHT IS
-    /// 1.** The runner ends both with 70, and only its stop tells them apart.
-    #[test]
-    fn a_csharp_programs_code_comes_back_and_an_uncaught_exception_is_one() {
-        let Some(returned) = ran_here("class P { static int Main() { return 70; } }") else { return };
-        assert_eq!(returned.ended, Ended::Program(70));
-        assert!(returned.stderr.is_empty(), "{}", returned.stderr);
-        let three = ran_here("class P { static int Main() { System.Console.WriteLine(\"three\"); return 3; } }")
-            .expect("compiles");
-        assert_eq!((three.ended, three.stdout.as_str()), (Ended::Program(3), "three\n"));
-        let thrown = ran_here(
-            "class P { static int Main() { System.Console.WriteLine(\"before\"); \
-             throw new System.InvalidOperationException(\"boom\"); } }",
-        )
-        .expect("compiles");
-        assert_eq!(thrown.ended, Ended::Uncaught);
-        assert_eq!(thrown.stdout, "before\n", "the program's output stays on its own stream");
-        assert!(thrown.stderr.starts_with("TRAP: ") && thrown.stderr.contains("boom"), "{}", thrown.stderr);
     }
 
     /// A Python program run on this machine from `source`.
@@ -2503,125 +2431,8 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A project directory of the test's own: `App.csproj` of `output_type` with `items` inside its
-    /// `<Project>` element, and `Program.cs` beside it holding `program`.
-    fn project_at(name: &str, output_type: &str, items: &str, program: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("lamella-cli-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        std::fs::write(
-            dir.join("App.csproj"),
-            format!(
-                "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    \
-                 <OutputType>{output_type}</OutputType>\n    \
-                 <TargetFramework>lamella1.0</TargetFramework>\n  </PropertyGroup>\n{items}</Project>\n"
-            ),
-        )
-        .expect("write the project");
-        std::fs::write(dir.join("Program.cs"), program).expect("write the program");
-        dir.join("App.csproj")
-    }
-
-    const PRINTS: &str = "class Program\n{\n    static void Main()\n    {\n        \
+    pub(super) const PRINTS: &str = "class Program\n{\n    static void Main()\n    {\n        \
                           System.Console.WriteLine(\"from the project\");\n    }\n}\n";
-
-    /// **A PROJECT THAT NAMES ITS BOARD BUILDS FOR IT WITH NO `--board`**, and writes the image
-    /// `--board` would have: `<LamellaTargetBoard>` is the project's spelling of the option.
-    #[test]
-    fn a_project_naming_its_board_builds_its_image_with_no_board_option() {
-        if LcscCompiler::discover().is_err() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("lamella-cli-{}-named-board", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        std::fs::write(dir.join("Program.cs"), "class Program { static void Main() { } }\n")
-            .expect("write the program");
-        let write_project = |board: &str| {
-            std::fs::write(
-                dir.join("App.csproj"),
-                format!(
-                    "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    \
-                     <TargetFramework>lamella1.0</TargetFramework>\n    {board}\n  \
-                     </PropertyGroup>\n</Project>\n"
-                ),
-            )
-            .expect("write the project");
-        };
-        let build = |extra: &[&str], out: &str| {
-            let mut args = vec![dir.join("App.csproj").display().to_string()];
-            args.extend(["--format", "bin", "--nostdlib", "--out"].map(str::to_owned));
-            args.push(dir.join(out).display().to_string());
-            args.extend(extra.iter().map(|arg| (*arg).to_owned()));
-            build_command(&args)
-        };
-
-        write_project("<LamellaTargetBoard>rpi-pico2-w</LamellaTargetBoard>");
-        let named = build(&[], "named.bin");
-        write_project("");
-        let flagged = build(&["--board", "rpi-pico2-w"], "flagged.bin");
-        assert_eq!(format!("{named:?}"), format!("{:?}", ExitCode::SUCCESS), "the property alone");
-        assert_eq!(format!("{flagged:?}"), format!("{:?}", ExitCode::SUCCESS), "the option alone");
-        assert_eq!(
-            std::fs::read(dir.join("named.bin")).expect("the image the property built"),
-            std::fs::read(dir.join("flagged.bin")).expect("the image the option built"),
-            "one board, one image, however it was named"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// **A PROJECT RUNS AS `build` COMPILES IT.** `run` compiled the project file's own text, which
-    /// holds no source, and reported a project with a perfectly good `Main` as having no entry point.
-    #[test]
-    fn a_project_runs_on_this_machine_as_build_compiles_it() {
-        if LcscCompiler::discover().is_err() {
-            return;
-        }
-        let project = project_at("runs", "Exe", "", PRINTS);
-        assert_eq!(run_command(&[project.to_string_lossy().into_owned()]), Ended::Program(0));
-        match project_run(&project, &[], &Folders::default()) {
-            Ok(Ok(run)) => {
-                assert_eq!(run.stdout, "from the project\n", "the program's own output");
-                assert_eq!(run.ended, Ended::Program(0));
-            }
-            Ok(Err(error)) => panic!("the run failed: {error:?}"),
-            Err(refusal) => panic!("refused: {refusal}"),
-        }
-        let _ = std::fs::remove_dir_all(project.parent().expect("its directory"));
-    }
-
-    /// **A PROJECT WINDOWS TOOLS WROTE RUNS AS ONE WRITTEN PLAINLY.** `Out-File` writes the project
-    /// file and its source alike, so both carry the byte-order mark here, and the source is read by
-    /// the rule the project file is: a reader that took one and refused the other would move the
-    /// refusal one file along.
-    #[test]
-    fn a_project_and_its_source_saved_with_a_byte_order_mark_run() {
-        if LcscCompiler::discover().is_err() {
-            return;
-        }
-        let project_text = "<Project Sdk=\"Microsoft.NET.Sdk\">\n  <PropertyGroup>\n    \
-                            <TargetFramework>lamella1.0</TargetFramework>\n  \
-                            </PropertyGroup>\n</Project>\n";
-        let projects = crate::text::as_windows_tools_save(project_text);
-        let sources = crate::text::as_windows_tools_save(PRINTS);
-        for (index, ((what, project_bytes), (_, source_bytes))) in
-            projects.into_iter().zip(sources).enumerate()
-        {
-            let project = project_at(&format!("marked-{index}"), "Exe", "", "");
-            std::fs::write(&project, project_bytes).expect("write the project");
-            let directory = project.parent().expect("its directory").to_path_buf();
-            std::fs::write(directory.join("Program.cs"), source_bytes).expect("write the program");
-            match project_run(&project, &[], &Folders::default()) {
-                Ok(Ok(run)) => {
-                    assert_eq!(run.stdout, "from the project\n", "{what}: the program's own output");
-                    assert_eq!(run.ended, Ended::Program(0), "{what}");
-                }
-                Ok(Err(error)) => panic!("{what}: the run failed: {error:?}"),
-                Err(refusal) => panic!("{what}: refused: {refusal}"),
-            }
-            let _ = std::fs::remove_dir_all(directory);
-        }
-    }
 
     /// **A SOURCE IS READ AS lcsc READS IT:** a byte-order mark names UTF-8 or UTF-16, and it is not
     /// part of the program. A UTF-16 source was refused here before any compiler saw it, while
@@ -2639,40 +2450,6 @@ mod tests {
             assert_eq!(text, PRINTS, "{what}: the text, without the mark");
         }
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A class library has nothing to run, and a project that names libraries of its own would run
-    /// here without them, so both are refused -- each saying what does work, in prose that renders.
-    #[test]
-    fn a_library_project_and_one_naming_libraries_are_refused_by_run() {
-        let library = project_at("library", "Library", "", PRINTS);
-        let refusal = project_run(&library, &[], &Folders::default()).expect_err("a class library has no entry point");
-        assert!(
-            refusal.contains("builds a class library") && refusal.contains("<Reference>"),
-            "{refusal}"
-        );
-        crate::rendered::assert_renders_cleanly(&refusal, crate::rendered::four_space_sample);
-
-        let gpio = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../lamella-load/tests/fixtures/System.Device.Gpio.dll");
-        let items = format!(
-            "  <ItemGroup>\n    <Reference Include=\"System.Device.Gpio\">\n      \
-             <HintPath>{}</HintPath>\n    </Reference>\n  </ItemGroup>\n",
-            gpio.display()
-        );
-        let referencing = project_at("referencing", "Exe", &items, PRINTS);
-        let refusal = project_run(&referencing, &[], &Folders::default()).expect_err("its libraries are not linked here");
-        assert!(
-            refusal.contains("references libraries of its own")
-                && refusal.contains("System.Device.Gpio.dll")
-                && refusal.contains("--board <board> --format <format>")
-                && !refusal.contains("--class-library"),
-            "{refusal}"
-        );
-        crate::rendered::assert_renders_cleanly(&refusal, crate::rendered::four_space_sample);
-        for project in [library, referencing] {
-            let _ = std::fs::remove_dir_all(project.parent().expect("its directory"));
-        }
     }
 
     /// Builds a `Compilation` carrying diagnostics and no image, which is the only state the two
@@ -2761,7 +2538,7 @@ mod tests {
     /// The arithmetic was right and the question was the wrong one.
     #[test]
     fn a_board_with_no_carrier_cannot_be_asked_whether_a_loaded_artifact_fits() {
-        let Ok((board, _)) = catalog::resolve("muselab-nano-ch32v003") else {
+        let Ok((board, _)) = catalog::resolve("muselab-nanoch32v003") else {
             return;
         };
         assert!(
@@ -2769,13 +2546,13 @@ mod tests {
             "this board is the no-carrier case; the fixture moved"
         );
         let refusal = no_carrier_refusal(
-            "muselab-nano-ch32v003",
+            "muselab-nanoch32v003",
             &board,
             &artifact("baked flash image", true),
         )
         .expect("a board with no carrier cannot hold a loaded artifact");
         assert!(
-            refusal.contains("muselab-nano-ch32v003"),
+            refusal.contains("muselab-nanoch32v003"),
             "it names the board: {refusal}"
         );
         assert!(
@@ -2792,7 +2569,7 @@ mod tests {
         );
         assert!(
             refusal.starts_with(
-                "lamella build: muselab-nano-ch32v003 cannot run this baked flash image."
+                "lamella build: muselab-nanoch32v003 cannot run this baked flash image."
             ),
             "the first line is a sentence: {refusal}"
         );
@@ -2844,12 +2621,12 @@ mod tests {
     /// wire is exactly where it belongs -- that is how this part is reached.
     #[test]
     fn an_artifact_that_is_not_loaded_into_firmware_is_not_refused_for_a_missing_wire() {
-        let Ok((board, _)) = catalog::resolve("muselab-nano-ch32v003") else {
+        let Ok((board, _)) = catalog::resolve("muselab-nanoch32v003") else {
             return;
         };
         assert!(
             no_carrier_refusal(
-                "muselab-nano-ch32v003",
+                "muselab-nanoch32v003",
                 &board,
                 &artifact("bare-metal image", false)
             )
@@ -3250,5 +3027,5 @@ mod tests {
             );
         }
     }
-
 }
+

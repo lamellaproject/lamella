@@ -20,6 +20,7 @@ package = "QFN-60"
 flash = 0
 ram = 0x80000
 pins = ["GP0-GP29"]
+pins_complete = true
 # Two processor sockets, and each one runs either architecture. This is why the field below lists
 # architectures per socket rather than naming one: the ARCHSEL register "has one bit for each
 # processor socket", so which core sits in a socket is SELECTED rather than fixed, and the part
@@ -42,6 +43,7 @@ package = "QFN-80"
 flash = 0
 ram = 0x80000
 pins = ["GP0-GP47"]
+pins_complete = true
 # The same two sockets as the A row, and for the same reason: the package changes how many pads are
 # bonded out, not what is behind them.
 cores = { core0 = ["cortex-m33", "hazard3"], core1 = ["cortex-m33", "hazard3"] }

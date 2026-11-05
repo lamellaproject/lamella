@@ -120,6 +120,12 @@ base = 0x40108000
 reset_bit = -1
 
 [[instances]]
+name = "sysinfo"
+block = "sysinfo"
+base = 0x40000000
+reset_bit = -1
+
+[[instances]]
 name = "trng"
 block = "trng"
 base = 0x400f0000

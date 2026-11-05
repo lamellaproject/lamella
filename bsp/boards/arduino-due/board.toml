@@ -10,6 +10,8 @@
 kind = "board"
 board = "arduino-due"
 vendor = "arduino"
+maker = "Arduino"
+product = "Due"
 family = "sam3x"
 part = "atsam3x8e"
 product_model = 15          # lamella_wire::product_model::ARDUINO_DUE

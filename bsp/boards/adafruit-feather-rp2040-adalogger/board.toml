@@ -12,6 +12,8 @@
 kind = "board"
 board = "adafruit-feather-rp2040-adalogger"
 vendor = "adafruit"
+maker = "Adafruit"
+product = "Feather RP2040 Adalogger"
 family = "rp2040"
 part = "rp2040"
 product_model = 18          # lamella_wire::product_model::FEATHER_RP2040_ADALOGGER

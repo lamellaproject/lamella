@@ -257,7 +257,9 @@ impl Sessions {
         }
         let backend = match WireHostBackend::open_target(target, crate::BAUD, Vec::new(), Duration::from_secs(20)) {
             Ok(b) => b,
-            Err(e) => return text_result(format!("cannot open {target} for debug: {e:?}"), true),
+            Err(e) => {
+                return text_result(format!("cannot open {target} for debug: {}.", lamella_wire_host::open_failure(e)), true);
+            }
         };
         if let Err(why) = scope.permits_link_board(backend.identity().product_model) {
             return text_result(why, true);
@@ -456,57 +458,3 @@ impl Sessions {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use lamella_wire_host::engine::LcscCompiler;
-
-    /// A program that opens a pin, then prints from a method of its own.
-    const OPENS_A_PIN: &str = "using System;\nusing System.Device.Gpio;\n\npublic static class Program\n{\n    \
-        public static void Main()\n    {\n        GpioController controller = new GpioController();\n        \
-        controller.OpenPin(15, PinMode.Output);\n        Say(\"gpio opened\");\n    }\n\n    \
-        static void Say(string what)\n    {\n        Console.WriteLine(what);\n    }\n}\n";
-
-    /// **THE SOURCE MAP NAMES THE METHODS THE BOARD RUNS.** The image carries the corlib and
-    /// `System.Device.Gpio` before the program, so the program's methods are not where a program
-    /// baked alone put them. Every method the map names is one of the program's in the image, with
-    /// code, and the map's entry point is the image's.
-    #[test]
-    fn the_source_map_names_the_programs_methods_as_the_image_numbers_them() {
-        let Ok(check) = LcscCompiler::discover() else {
-            return;
-        };
-        let built = compile_bake_srcmap(&check, Some("rpi-pico2-w"), &["System.Device.Gpio".to_owned()], OPENS_A_PIN)
-            .unwrap_or_else(|refusal| panic!("it builds: {refusal}"));
-        assert!(built.carried.contains("System.Device.Gpio: referenced, the rp2350 chip family's build"), "{}", built.carried);
-
-        let image: &'static [u8] = Box::leak(built.image.into_boxed_slice());
-        let (module, entry) = lamella_cil_runtime::Module::from_baked(image).expect("it boots");
-        let entry = entry.expect("it records its entry point");
-        let program = module.method_asm(entry);
-        assert!(program > 0, "the program comes after the corlib");
-
-        let map: Value = serde_json::from_slice(&built.srcmap).expect("the map is JSON");
-        assert_eq!(map["entryPoint"], json!(entry), "the map's entry point is the image's: {map}");
-        let methods = map["methods"].as_object().expect("the map names methods");
-        let named: Vec<&str> = methods.values().filter_map(|method| method["name"].as_str()).collect();
-        assert!(named.contains(&"Program.Main") && named.contains(&"Program.Say"), "{named:?}");
-        for (id, method) in methods {
-            let id: lamella_cil_runtime::MethodId = id.parse().expect("an id");
-            assert_eq!(module.method_asm(id), program, "{} is the program's", method["name"]);
-            assert!(module.method_code_bytes(id).is_some_and(|code| !code.is_empty()), "{} has code", method["name"]);
-        }
-    }
-
-    /// A program using a library it does not name is refused before a board is opened, naming the
-    /// reference to add.
-    #[test]
-    fn a_launch_names_a_reference_the_program_is_missing() {
-        let Ok(check) = LcscCompiler::discover() else {
-            return;
-        };
-        let refusal = compile_bake_srcmap(&check, Some("rpi-pico2-w"), &[], OPENS_A_PIN).err().expect("no reference");
-        assert!(refusal.starts_with("compile failed:\n"), "{refusal}");
-        assert!(refusal.contains("add \"System.Device.Gpio\" to `references`"), "{refusal}");
-    }
-}

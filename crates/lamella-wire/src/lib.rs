@@ -1519,7 +1519,7 @@ pub mod product_model {
 
     /// Microchip SAM L11 Xplained Pro (ATSAML11-XPRO, ATSAML11E16A, Cortex-M23, 64 KB flash plus a
     /// separate 2 KB Data Flash array / 16 KB SRAM). Its strata are `csp/saml1x`, shared with the
-    /// SAM L10, and this board is wired identically to `microchip-saml10-xpro` -- the kit guide documents both
+    /// SAM L10, and this board is wired identically to `microchip-sam-l10-xplained-pro` -- the kit guide documents both
     /// and heads its pin column "SAML10/SAML11 pin". What the fitted part adds is TrustZone for
     /// ARMv8-M, Secure Boot, a second MPU and secure pin multiplexing, none of which moves a
     /// peripheral: it is security behavior on the same silicon map.
@@ -1570,9 +1570,10 @@ pub mod product_model {
     /// The display name for a `product_model` wire value, or `None` for an unrecognized code. This is the one
     /// canonical value -> name map: every surface that displays a board name derives from it rather than
     /// keeping a table of its own. Add a board => one `const` above plus one arm here, and each of those
-    /// surfaces picks it up.
+    /// surfaces picks it up. A `const fn`, because a firmware's USB product string is built from it
+    /// at compile time ([`crate::link_product_string`]).
     #[must_use]
-    pub fn name(model: u16) -> Option<&'static str> {
+    pub const fn name(model: u16) -> Option<&'static str> {
         Some(match model {
             UNKNOWN => "custom board",
             MICROBIT_V1 => "BBC micro:bit v1",
@@ -1640,8 +1641,8 @@ pub mod product_model {
             NUCLEO_L4R5ZI => "NUCLEO-L4R5ZI",
             PICO_LIPO_2 => "Pimoroni Pico LiPo 2",
             PICO_LIPO_2_XL_W => "Pimoroni Pico LiPo 2 XL W",
-            FEATHER_RP2350_HSTX => "Adafruit Feather RP2350 with HSTX Port",
-            FEATHER_RP2350_HSTX_PSRAM => "Adafruit Feather RP2350 with HSTX Port and 8MB PSRAM",
+            FEATHER_RP2350_HSTX => "Adafruit Feather RP2350 with HSTX",
+            FEATHER_RP2350_HSTX_PSRAM => "Adafruit Feather RP2350 with HSTX and PSRAM",
             _ => return None,
         })
     }
@@ -2081,6 +2082,11 @@ pub enum TransportError {
         /// that supports exactly one, which every in-tree firmware does today.
         target_max: u16,
     },
+    /// The carrier would not take the frame in time: the far end is there and is not draining it.
+    ///
+    /// Distinct from [`Carrier`](Self::Carrier) because the session is not over: a board busy enough
+    /// to stop reading its USB may read again, and one that has gone away says so with another error.
+    Stalled,
 }
 
 /// The carrier seam, at the FRAME level: a byte carrier (USB-CDC / UART) implements it over the

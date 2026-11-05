@@ -1278,27 +1278,6 @@ fn current_instance(vm: &Vm, slot: usize) -> Result<ObjectRef, String> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn evaluates_stateless_expressions() {
-        if Toolchain::discover().is_err() {
-            eprintln!("skipping: .NET reference pack not found on this host");
-            return;
-        }
-        assert_eq!(eval("1 + 2 * 3").as_deref(), Ok("7\n"));
-        assert_eq!(eval("\"hello\".Length").as_deref(), Ok("5\n"));
-        assert_eq!(eval("System.Math.Max(3, 7)").as_deref(), Ok("7\n"));
-    }
-
-    #[test]
-    fn reports_compile_errors_as_err() {
-        if Toolchain::discover().is_err() {
-            eprintln!("skipping: .NET reference pack not found on this host");
-            return;
-        }
-        assert!(eval("nonexistent + 1").is_err());
-    }
-
-
     fn expect_declaration(submission: Submission, message: &str) -> (Vec<(String, String)>, String) {
         match submission {
             Submission::Declaration { decls, body } => (
@@ -1423,67 +1402,6 @@ mod tests {
     }
 
     #[test]
-    fn stateful_session_persists_declarations() {
-        let mut session = match ReplSession::new() {
-            Ok(session) => session,
-            Err(_) => {
-                eprintln!("skipping: .NET reference pack not found on this host");
-                return;
-            }
-        };
-        assert_eq!(session.submit("int x = 5;").as_deref(), Ok(""));
-        assert_eq!(session.submit("x * 2").as_deref(), Ok("10\n"));
-        assert_eq!(session.submit("int y = x + 3;").as_deref(), Ok(""));
-        assert_eq!(session.submit("y").as_deref(), Ok("8\n"));
-    }
-
-    #[test]
-    fn redefinition_replaces_the_existing_field() {
-        let mut session = match ReplSession::new() {
-            Ok(session) => session,
-            Err(_) => {
-                eprintln!("skipping: .NET reference pack not found on this host");
-                return;
-            }
-        };
-        assert_eq!(session.submit("int x = 5;").as_deref(), Ok(""));
-        assert_eq!(session.submit("int x = 9;").as_deref(), Ok(""));
-        assert_eq!(session.submit("x").as_deref(), Ok("9\n"));
-        assert_eq!(session.fields.len(), 1);
-        assert_eq!(session.fields[0].name, "x");
-    }
-
-    #[test]
-    fn redefinition_with_a_new_type_resets_the_slot() {
-        let mut session = match ReplSession::new() {
-            Ok(session) => session,
-            Err(_) => {
-                eprintln!("skipping: .NET reference pack not found on this host");
-                return;
-            }
-        };
-        assert_eq!(session.submit("int v = 7;").as_deref(), Ok(""));
-        assert_eq!(session.submit("long v;").as_deref(), Ok(""));
-        assert_eq!(session.submit("v").as_deref(), Ok("0\n"));
-        assert_eq!(session.fields.len(), 1);
-        assert_eq!(session.fields[0].type_text, "long");
-    }
-
-    #[test]
-    fn multi_variable_declaration_persists_both_fields() {
-        let mut session = match ReplSession::new() {
-            Ok(session) => session,
-            Err(_) => {
-                eprintln!("skipping: .NET reference pack not found on this host");
-                return;
-            }
-        };
-        assert_eq!(session.submit("int a = 1, b = 2;").as_deref(), Ok(""));
-        assert_eq!(session.fields.len(), 2);
-        assert_eq!(session.submit("a + b").as_deref(), Ok("3\n"));
-    }
-
-    #[test]
     fn emitted_class_has_no_main_entry_point() {
         let session = ReplSession {
             tools: Toolchain {
@@ -1517,3 +1435,4 @@ mod tests {
         );
     }
 }
+

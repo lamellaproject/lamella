@@ -234,6 +234,7 @@ INSTANCES = {
     "adc": {"block": "adc", "base": 0x400A0000, "reset_bit": 0x0},
     "timer0": {"block": "timer", "base": 0x400B0000, "reset_bit": 0x17},
     "ticks": {"block": "ticks", "base": 0x40108000},
+    "sysinfo": {"block": "sysinfo", "base": 0x40000000},
     "trng": {"block": "trng", "base": 0x400F0000, "reset_bit": 0x19},
     "pwm": {"block": "pwm", "base": 0x400A8000, "reset_bit": 0x10},
     "qmi": {"block": "qmi", "base": 0x400D0000},

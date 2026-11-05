@@ -10,6 +10,8 @@
 kind = "board"
 board = "adafruit-feather-m0-adalogger"
 vendor = "adafruit"
+maker = "Adafruit"
+product = "Feather M0 Adalogger"
 family = "samd21"
 part = "atsamd21g18a"
 product_model = 19          # lamella_wire::product_model::FEATHER_M0_ADALOGGER

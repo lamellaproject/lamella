@@ -760,12 +760,15 @@ enum DescShape {
     /// reads. That check lives in `cil.rs` and is written against the ratified offsets, so an array
     /// descriptor here has to be laid at them or the check reads two unrelated words and compares them.
     Array {
+        /// Word 0's rank.
+        rank: u32,
         /// Word 1: what one element IS, for a consumer that must stride or trace the payload.
         element_kind: u32,
         /// The ELEMENT type's handle, whose descriptor `element_desc@16` names. `None` lays the
         /// word `0`, the ABSENT value the store check refuses to check against rather than guess.
         element: Option<u32>,
-        /// Word 5: ECMA-335 III.4.3's array-element cast class, `0` where only the element's own
+        /// Word 5: ECMA-335 III.4.3's array-element cast class, or an interface element's method
+        /// tag -- see [`crate::resolver::ARRAY_CAST_CLASS_OFFSET`] -- and `0` where only the element's own
         /// identity will do. It is carried HERE rather than derived from `element_kind` because the
         /// kind answers a WIDTH question and names two types per code.
         element_cast_class: u32,
@@ -812,6 +815,7 @@ fn layout_descriptors(
             &mut handles,
             handle,
             DescShape::Array {
+                rank: 1,
                 element_kind: crate::resolver::string_descriptor_words(0)[1],
                 element: None,
                 element_cast_class: crate::resolver::ARRAY_CAST_CLASS_NONE,
@@ -837,6 +841,7 @@ fn layout_descriptors(
                     &mut handles,
                     handle.0,
                     DescShape::Array {
+                        rank: 1,
                         element_kind: *element_kind,
                         element: element.map(|e| e.0),
                         element_cast_class: *element_cast_class,
@@ -846,8 +851,48 @@ fn layout_descriptors(
                     note_descriptor(&mut handles, element.0, DescShape::Class);
                 }
             }
-            Inst::AllocArray2D { handle, .. } | Inst::AllocArrayMD { handle, .. } => {
-                note_descriptor(&mut handles, handle.0, DescShape::Class);
+            Inst::AllocArray2D {
+                handle,
+                element,
+                element_kind,
+                element_cast_class,
+                ..
+            } => {
+                note_descriptor(
+                    &mut handles,
+                    handle.0,
+                    DescShape::Array {
+                        rank: 2,
+                        element_kind: *element_kind,
+                        element: element.map(|e| e.0),
+                        element_cast_class: *element_cast_class,
+                    },
+                );
+                if let Some(element) = element {
+                    note_descriptor(&mut handles, element.0, DescShape::Class);
+                }
+            }
+            Inst::AllocArrayMD {
+                handle,
+                dims,
+                element,
+                element_kind,
+                element_cast_class,
+                ..
+            } => {
+                note_descriptor(
+                    &mut handles,
+                    handle.0,
+                    DescShape::Array {
+                        rank: u32::try_from(dims.len()).unwrap_or(1),
+                        element_kind: *element_kind,
+                        element: element.map(|e| e.0),
+                        element_cast_class: *element_cast_class,
+                    },
+                );
+                if let Some(element) = element {
+                    note_descriptor(&mut handles, element.0, DescShape::Class);
+                }
             }
             _ => continue,
         }
@@ -912,11 +957,12 @@ fn layout_descriptors(
                 }
             }
             DescShape::Array {
+                rank,
                 element_kind,
                 element,
                 element_cast_class,
             } => {
-                blob.extend_from_slice(&(crate::resolver::ARRAY_DESC_MARK | 1).to_le_bytes());
+                blob.extend_from_slice(&(crate::resolver::ARRAY_DESC_MARK | rank).to_le_bytes());
                 blob.extend_from_slice(&element_kind.to_le_bytes());
                 blob.extend_from_slice(&element.map_or_else(|| tag_of(handle), tag_of).to_le_bytes());
                 blob.extend_from_slice(&0u32.to_le_bytes());
@@ -2293,7 +2339,7 @@ fn lower_inst(
             dim0,
             dim1,
             element_size,
-            element_kind: _,
+            ..
         } => {
             let desc = ctx
                 .desc_addr
@@ -2391,49 +2437,27 @@ fn lower_inst(
             }
         }
         Inst::InterfaceHasTag { descriptor, tag } => {
-            let ptr = body.add_local(ValType::I32);
-            let count = body.add_local(ValType::I32);
-            let present = body.add_local(ValType::I32);
-            body.i32_const(0);
-            body.local_set(present);
-            body.local_get(local(*descriptor));
-            body.if_(BlockType::Empty);
-            emit_itable_base(body, local(*descriptor));
-            body.local_set(ptr);
-            body.local_get(ptr);
-            body.i32_load(MemArg::new(4, 0));
-            body.local_set(count);
-            body.local_get(ptr);
-            body.i32_const(4);
-            body.i32_add();
-            body.local_set(ptr);
-            body.loop_(BlockType::Empty);
-            body.local_get(count);
-            body.i32_eqz();
-            body.if_(BlockType::Empty);
-            body.else_();
-            body.local_get(ptr);
-            body.i32_load(MemArg::new(4, 0));
-            body.i32_const(*tag as i32);
-            body.i32_eq();
-            body.if_(BlockType::Empty);
-            body.i32_const(1);
-            body.local_set(present);
-            body.else_();
-            body.local_get(ptr);
-            body.i32_const(8);
-            body.i32_add();
-            body.local_set(ptr);
-            body.local_get(count);
-            body.i32_const(1);
-            body.i32_sub();
-            body.local_set(count);
-            body.br(2);
-            body.end();
-            body.end();
-            body.end();
-            body.end();
+            let present = emit_interface_type_test(body, local(*descriptor), |body| {
+                body.i32_const(*tag as i32);
+            });
             body.local_get(present);
+            body.local_set(local(result));
+        }
+        Inst::InterfaceHasArrayElementTag {
+            descriptor,
+            array_descriptor,
+        } => {
+            let array_descriptor = local(*array_descriptor);
+            let present = emit_interface_type_test(body, local(*descriptor), |body| {
+                body.local_get(array_descriptor);
+                body.i32_load(MemArg::new(4, crate::resolver::ARRAY_CAST_CLASS_OFFSET));
+            });
+            body.local_get(present);
+            body.local_set(local(result));
+        }
+        Inst::DescriptorWord { descriptor, offset } => {
+            body.local_get(local(*descriptor));
+            body.i32_load(MemArg::new(4, *offset));
             body.local_set(local(result));
         }
         Inst::CallInterface {
@@ -2606,7 +2630,7 @@ fn lower_inst(
             handle,
             dims,
             element_size,
-            element_kind: _,
+            ..
         } => {
             let desc = ctx
                 .desc_addr
@@ -2887,6 +2911,60 @@ fn emit_interface_target(body: &mut Func, receiver: u32, tag: u32) -> u32 {
     body.end();
     body.end();
     found
+}
+
+/// An interface type test: returns a new local holding 1 when the itable of the descriptor in the
+/// local `descriptor` holds the tag `push_sought` pushes, and 0 when it does not.
+///
+/// A null reference's descriptor is 0 and implements nothing, so nothing is read for one.
+fn emit_interface_type_test(
+    body: &mut Func,
+    descriptor: u32,
+    push_sought: impl Fn(&mut Func),
+) -> u32 {
+    let ptr = body.add_local(ValType::I32);
+    let count = body.add_local(ValType::I32);
+    let present = body.add_local(ValType::I32);
+    body.i32_const(0);
+    body.local_set(present);
+    body.local_get(descriptor);
+    body.if_(BlockType::Empty);
+    emit_itable_base(body, descriptor);
+    body.local_set(ptr);
+    body.local_get(ptr);
+    body.i32_load(MemArg::new(4, 0));
+    body.local_set(count);
+    body.local_get(ptr);
+    body.i32_const(4);
+    body.i32_add();
+    body.local_set(ptr);
+    body.loop_(BlockType::Empty);
+    body.local_get(count);
+    body.i32_eqz();
+    body.if_(BlockType::Empty);
+    body.else_();
+    body.local_get(ptr);
+    body.i32_load(MemArg::new(4, 0));
+    push_sought(body);
+    body.i32_eq();
+    body.if_(BlockType::Empty);
+    body.i32_const(1);
+    body.local_set(present);
+    body.else_();
+    body.local_get(ptr);
+    body.i32_const(8);
+    body.i32_add();
+    body.local_set(ptr);
+    body.local_get(count);
+    body.i32_const(1);
+    body.i32_sub();
+    body.local_set(count);
+    body.br(2);
+    body.end();
+    body.end();
+    body.end();
+    body.end();
+    present
 }
 
 /// Pushes the ADDRESS of a descriptor's itable COUNT word, for EITHER shape.
@@ -4692,6 +4770,8 @@ mod tests {
                             dim1: ValueId(1),
                             element_size: 4,
                             element_kind: 5,
+                            element: None,
+                            element_cast_class: 0,
                         },
                     ),
                     (
@@ -4770,6 +4850,8 @@ mod tests {
                             dims: alloc::vec![n(0), n(1), n(2)].into_boxed_slice(),
                             element_size: 4,
                             element_kind: 5,
+                            element: None,
+                            element_cast_class: 0,
                         },
                     ),
                     (n(4), c(1)),
@@ -4994,13 +5076,10 @@ mod tests {
         );
     }
 
-    /// A rank-2+ array is HEADED but NOT marked as an array, and that is a recorded gap rather than
-    /// an accident: `AllocArray2D`/`AllocArrayMD` carry no element KIND, and word 1 of the array form
-    /// is exactly that. Marking one and guessing the kind would tell a consumer to stride or trace by
-    /// a width that is not the element's. The ARM backend makes the same choice; this pins it so that
-    /// closing it is deliberate on both rather than silent on one.
+    /// A rectangular array's descriptor is the array form with its rank in word 0, as on ARM and RISC-V,
+    /// so a cast's shared check can read it: on the class form a valid `(int[,])o` was refused.
     #[test]
-    fn a_rank_2_array_is_headed_but_not_marked_as_an_array() {
+    fn a_rank_2_array_is_marked_with_its_rank() {
         let handle = lamella_ir::TypeHandle(0x0500_0009);
         let program = alloc::vec![Function {
             params: Vec::new(),
@@ -5025,6 +5104,8 @@ mod tests {
                             dim1: ValueId(0),
                             element_size: 4,
                             element_kind: 5,
+                            element: None,
+                            element_cast_class: 7,
                         },
                     ),
                 ],
@@ -5032,13 +5113,10 @@ mod tests {
             }],
         }];
         let (segments, map, _end) = layout_descriptors(&program, &[], None, 0x400, 0);
-        let words = descriptor_words(&segments, map[&handle.0] as u32, 3);
-        assert_eq!(words[0], handle.0, "word 0 is the type id -- the class form");
-        assert_ne!(
-            words[0] & crate::resolver::ARRAY_DESC_MARK_MASK,
-            crate::resolver::ARRAY_DESC_MARK,
-            "and it carries no array MARK, so no consumer strides it"
-        );
+        let words = descriptor_words(&segments, map[&handle.0] as u32, 6);
+        assert_eq!(words[0], crate::resolver::ARRAY_DESC_MARK | 2, "word 0 is the mark and the rank");
+        assert_eq!(words[1], 5, "word 1 is the element kind");
+        assert_eq!(words[5], 7, "the cast class is at @20");
     }
 
     /// Every reader of a CLASS descriptor's words guards on the MARK before reading one. The guard is

@@ -415,9 +415,9 @@ mod tests {
     #[test]
     fn an_elf_record_this_tree_writes_reads_back_and_checks() {
         let shipped = b"\x7fELF and the rest of an image";
-        let written = render(&for_elf("rpi-pico2", shipped, "lamella 0.2.0"));
+        let written = render(&for_elf("raspberrypi-pico-2", shipped, "lamella 0.2.0"));
         let manifest = parse(&written).expect("the written record parses");
-        assert_eq!(manifest.board, "rpi-pico2");
+        assert_eq!(manifest.board, "raspberrypi-pico-2");
         assert_eq!(manifest.format, "elf");
         assert_eq!(manifest.base, None);
         assert_eq!(manifest.bytes, shipped.len() as u64);
@@ -434,7 +434,7 @@ mod tests {
     #[test]
     fn a_bin_record_this_tree_writes_carries_its_base() {
         let shipped = [0u8; 512];
-        let written = render(&for_bin("rpi-pico2", 0x1000_0000, &shipped, "lamella 0.2.0"));
+        let written = render(&for_bin("raspberrypi-pico-2", 0x1000_0000, &shipped, "lamella 0.2.0"));
         assert!(written.contains("\"base\": \"0x10000000\""), "{written}");
         let manifest = parse(&written).expect("the written record parses");
         assert_eq!(manifest.format, "bin");
@@ -448,7 +448,7 @@ mod tests {
     #[test]
     fn the_written_record_escapes_what_it_quotes() {
         let producer = r#"lamella "dev" C:\tools"#;
-        let manifest = parse(&render(&for_elf("rpi-pico2", b"x", producer))).expect("parses");
+        let manifest = parse(&render(&for_elf("raspberrypi-pico-2", b"x", producer))).expect("parses");
         assert_eq!(manifest.producer.as_deref(), Some(producer));
     }
 
@@ -461,13 +461,13 @@ mod tests {
         std::fs::create_dir_all(&dir).expect("a scratch directory");
         let image = dir.join("app.elf");
         std::fs::write(&image, b"first").expect("the image");
-        let path = write(&image, &for_elf("rpi-pico2", b"first", "lamella 0.2.0")).expect("written");
+        let path = write(&image, &for_elf("raspberrypi-pico-2", b"first", "lamella 0.2.0")).expect("written");
         assert_eq!(path, path_for(&image));
         let first = read(&image).expect("readable").expect("present");
         assert_eq!(first.bytes, 5);
-        write(&image, &for_elf("rpi-pico2-w", b"second!", "lamella 0.2.0")).expect("written again");
+        write(&image, &for_elf("raspberrypi-pico-2-w", b"second!", "lamella 0.2.0")).expect("written again");
         let second = read(&image).expect("readable").expect("present");
-        assert_eq!((second.board.as_str(), second.bytes), ("rpi-pico2-w", 7));
+        assert_eq!((second.board.as_str(), second.bytes), ("raspberrypi-pico-2-w", 7));
         let left: Vec<_> = std::fs::read_dir(&dir).expect("listed").map(|entry| entry.expect("an entry").file_name()).collect();
         assert_eq!(left.len(), 2, "the image and its record, nothing partial: {left:?}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -549,7 +549,7 @@ mod tests {
         assert!(parse(&other).unwrap_err().contains("model \"jit\""));
         let interpreted = record_for(b"image", "elf", "null").replace("\"native\"", "\"interpreter\"");
         assert_eq!(parse(&interpreted).expect("an interpreter's record").model, INTERPRETER);
-        let rendered = render(&for_elf("rpi-pico2", b"image", "lamella 0.2.0"));
+        let rendered = render(&for_elf("raspberrypi-pico-2", b"image", "lamella 0.2.0"));
         let keys: Vec<&str> = rendered.lines().filter_map(|line| line.trim().strip_prefix('"')?.split('"').next()).collect();
         assert_eq!(&keys[..4], ["schema", "kind", "model", "board"], "{rendered}");
         assert_eq!(parse(&rendered).expect("reads back").model, NATIVE);
@@ -559,7 +559,7 @@ mod tests {
     /// and the interpreter's model, which a record of that format may not deny.
     #[test]
     fn an_lmli_record_is_the_interpreters_and_carries_no_base() {
-        let rendered = render(&for_lmli("rpi-pico2", b"baked", "lamella 0.2.0"));
+        let rendered = render(&for_lmli("raspberrypi-pico-2", b"baked", "lamella 0.2.0"));
         let manifest = parse(&rendered).expect("an lmli record reads");
         assert_eq!((manifest.format.as_str(), manifest.model.as_str(), manifest.base), ("lmli", INTERPRETER, None));
         assert!(!rendered.contains("\"base\""), "{rendered}");
@@ -698,8 +698,8 @@ mod tests {
     fn the_wrong_board_is_refused_and_both_are_named() {
         let manifest = parse(&record_for(b"image", "elf", "null")).unwrap();
         assert!(check_board(&manifest, "bbc-micro-bit-v2").is_ok());
-        let why = check_board(&manifest, "rpi-pico2").unwrap_err();
-        assert!(why.contains("bbc-micro-bit-v2") && why.contains("rpi-pico2"), "{why}");
+        let why = check_board(&manifest, "raspberrypi-pico-2").unwrap_err();
+        assert!(why.contains("bbc-micro-bit-v2") && why.contains("raspberrypi-pico-2"), "{why}");
         assert!(why.contains("Nothing was written"), "{why}");
     }
 
@@ -732,7 +732,7 @@ mod tests {
         let manifest = parse(&record_for(b"image", "elf", "null")).unwrap();
         let rendered = [
             attestation(&manifest),
-            check_board(&manifest, "rpi-pico2").unwrap_err(),
+            check_board(&manifest, "raspberrypi-pico-2").unwrap_err(),
             check_identity(&manifest, b"image", Some("bin")).unwrap_err(),
             check_identity(&manifest, b"imagf", Some("elf")).unwrap_err(),
             check_identity(&manifest, b"imag", Some("elf")).unwrap_err(),

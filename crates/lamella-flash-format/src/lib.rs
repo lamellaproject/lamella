@@ -5,6 +5,9 @@
 //! vendor tool, no driver install. DAPLink boards such as the micro:bit take [Intel HEX](hex);
 //! an RP2040 or RP2350 held in BOOTSEL takes [UF2](uf2).
 //!
+//! A UF2 is also read back, by [`uf2::image_for_family`], into the image it holds for one chip:
+//! what a writer that reaches the chip over a debug probe takes from a published UF2.
+//!
 //! ```no_run
 //! # fn main() -> Result<(), lamella_flash_format::EmitError> {
 //! let image = std::fs::read("firmware.bin").unwrap();

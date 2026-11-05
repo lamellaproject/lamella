@@ -32,6 +32,8 @@
 kind = "board"
 board = "arduino-uno-r4-minima"
 vendor = "arduino"
+maker = "Arduino"
+product = "UNO R4 Minima"
 family = "ra4m1"
 part = "r7fa4m1ab3cfm"
 product_model = 34          # lamella_wire::product_model::ARDUINO_UNO_R4_MINIMA

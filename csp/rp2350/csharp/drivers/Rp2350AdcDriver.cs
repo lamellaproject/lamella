@@ -11,8 +11,6 @@ internal sealed class Rp2350AdcDriver : AdcDriver
     private readonly uint _clkAdcCtrl;
     private readonly uint _resetsClr;
     private readonly uint _resetsDone;
-    private readonly uint _ioCtrl0;
-    private readonly uint _pads0;
     private readonly int _channelCount;
     private readonly int _resolutionBits;
     private readonly int _minValue;
@@ -40,8 +38,6 @@ internal sealed class Rp2350AdcDriver : AdcDriver
         _clkAdcCtrl = Rp2350Instances.CLOCKS_BASE + Rp2350ClocksLayout.CLK_ADC_CTRL_OFF;
         _resetsClr = Rp2350Instances.RESETS_CLR_BASE + Rp2350ResetsLayout.RESET_OFF;
         _resetsDone = Rp2350Instances.RESETS_BASE + Rp2350ResetsLayout.RESET_DONE_OFF;
-        _ioCtrl0 = Rp2350Instances.IO_BANK0_BASE + Rp2350IoBank0Layout.GPIO0_CTRL_OFF;
-        _pads0 = Rp2350Instances.PADS_BANK0_BASE + Rp2350PadsBank0Layout.GPIO0_OFF;
         _channelCount = binding.ChannelCount;
         _resolutionBits = (int)Rp2350AdcLayout.ResolutionBits;
         _minValue = (int)Rp2350AdcLayout.MinValue;
@@ -132,10 +128,11 @@ internal sealed class Rp2350AdcDriver : AdcDriver
 
     /// <summary>Pin channels get the pad_analog prep (digital receiver off, output disabled,
     /// pulls off, no digital function), and so does a second GPIO the board wires to the same
-    /// header pin, so it cannot load or drive what the channel reads. The temperature channel
+    /// header pin if nothing holds it, so it cannot load what the channel reads. A second GPIO in
+    /// use is left as it is, and the channel reads what it does to the net. The temperature channel
     /// needs none -- its bias rides CS.TS_EN from init.</summary>
     /// <exception cref="InvalidOperationException">The channel's pin belongs to another line on
-    /// this board; nothing is written.</exception>
+    /// this board, or is driving: the prep would cut it off. No pin register is written.</exception>
     public override void OpenChannel(int channel)
     {
         int pin = ChannelPin(channel);
@@ -146,18 +143,15 @@ internal sealed class Rp2350AdcDriver : AdcDriver
         }
         EnsureUp();
         if (pin < 0) return;
-        PrepareAnalogPad(_ioCtrl0 + Rp2350IoBank0Layout.GPIO_CTRL_STRIDE * (uint)pin,
-            _pads0 + Rp2350PadsBank0Layout.GPIO_STRIDE * (uint)pin);
+        if (Rp2350TwinPads.Drives(pin))
+        {
+            Rp2350Refusal.Refuse("ADC channel # reads GP@, which is driving; set it to an input or close it first", channel, pin, 0, ' ');
+        }
+        Rp2350TwinPads.Park(pin);
         if (_binding.TwinPads[channel] != 0u)
         {
-            PrepareAnalogPad(_binding.TwinIoCtrl[channel], _binding.TwinPads[channel]);
+            Rp2350TwinPads.ParkIfIdle(Rp2350TwinPads.PadOf(_binding.TwinIoCtrl[channel]));
         }
-    }
-
-    static void PrepareAnalogPad(uint ioCtrl, uint pads)
-    {
-        Mmio.Write32(ioCtrl, Rp2350IoBank0Layout.FUNCSEL_NULL);
-        Mmio.Write32(pads, Rp2350PadsBank0Layout.GPIO0_OD);
     }
 
     public override void CloseChannel(int channel)

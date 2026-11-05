@@ -15,7 +15,7 @@ workspace = true
 default = []
 # Also discover CMSIS-DAP v2 probes (a WinUSB vendor-bulk interface) via lamella-usbbulk, not only
 # v1 HID. Off by default: the v1-HID path needs no extra transport.
-usbbulk = ["dep:lamella-usbbulk"]
+usbbulk = ["dep:lamella-usbbulk", "dep:lamella-wire"]
 
 [dependencies]
 # The probe-neutral seam: examples drive a target through `TargetAccess` rather than through the
@@ -26,3 +26,6 @@ lamella-probe-core = { path = "../lamella-probe-core" }
 lamella-cmsis-dap = { path = "../lamella-cmsis-dap", default-features = false }
 lamella-usbhid = { path = "../lamella-usbhid" }
 lamella-usbbulk = { path = "../lamella-usbbulk", optional = true }
+# The one definition of what a Lamella Link's USB ids are. A board's own Link is vendor-bulk too, and
+# it is no debug probe.
+lamella-wire = { path = "../lamella-wire", optional = true }

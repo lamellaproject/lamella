@@ -2966,7 +2966,7 @@ mod tests {
 
     /// TypeDef rows whose `MethodList` columns are `method_lists`, over a MethodDef table that
     /// claims `claimed` rows and holds `present` of them.
-    fn methods_owned_by(method_lists: &[u16], claimed: u32, present: u32) -> Vec<u8> {
+    pub(super) fn methods_owned_by(method_lists: &[u16], claimed: u32, present: u32) -> Vec<u8> {
         let mut types = Vec::new();
         for list in method_lists {
             types.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0]);
@@ -3006,53 +3006,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn the_method_owner_index_resolves_every_method_token_as_the_assembly_does() {
-        let cases: [(&[u16], u32, u32); 5] = [
-            (&[1, 1, 3, 3, 6], 7, 7),
-            (&[1, 4, 2, 6], 7, 7),
-            (&[0, 9, 3], 5, 5),
-            (&[1, 3, 5], 10, 4),
-            (&[], 3, 3),
-        ];
-        for (method_lists, claimed, present) in cases {
-            let root = methods_owned_by(method_lists, claimed, present);
-            let assembly =
-                Assembly::from_image(MetadataImage::parse_metadata_root(&root).unwrap()).unwrap();
-            let owners = assembly.method_owners();
-            for row in 0..=claimed + 2 {
-                for token in [Token::new(table::METHOD_DEF, row), Token::new(table::MEMBER_REF, row)] {
-                    assert_eq!(
-                        owners.resolve_method(token),
-                        assembly.resolve_method(token),
-                        "lists {method_lists:?}, {claimed} rows claimed and {present} present: {token:?}"
-                    );
-                }
-            }
-        }
-        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures/corlib.dll");
-        let Ok(bytes) = std::fs::read(fixture) else {
-            return;
-        };
-        let assembly = Assembly::read(std::boxed::Box::leak(bytes.into_boxed_slice()))
-            .expect("the committed corlib fixture reads");
-        let owners = assembly.method_owners();
-        let mut resolved = 0;
-        for (table, rows) in [
-            (table::METHOD_DEF, assembly.tables.row_count(table::METHOD_DEF)),
-            (table::MEMBER_REF, assembly.tables.row_count(table::MEMBER_REF)),
-            (table::TYPE_DEF, 2),
-        ] {
-            for row in 0..=rows + 1 {
-                let token = Token::new(table, row);
-                let answer = owners.resolve_method(token);
-                assert_eq!(answer, assembly.resolve_method(token), "{token:?}");
-                resolved += usize::from(answer.is_some_and(|method| method.declaring_type.is_some()));
-            }
-        }
-        assert!(resolved > 1000, "the fixture's methods resolve with their types: {resolved}");
     }
 
     #[test]
@@ -3101,102 +3054,5 @@ mod tests {
         );
         assert_eq!(constants.len(), 2, "{constants:?}");
     }
-
-    #[test]
-    fn both_indexes_answer_as_their_scans_over_a_whole_corlib() {
-        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures/corlib.dll");
-        let Ok(bytes) = std::fs::read(fixture) else {
-            return;
-        };
-        let assembly = Assembly::read(std::boxed::Box::leak(bytes.into_boxed_slice()))
-            .expect("the committed corlib fixture reads");
-        let owners = MethodOwners::new(assembly);
-        let methods = assembly.tables.row_count(table::METHOD_DEF);
-        assert!(methods > 1000, "the fixture has methods to ask about: {methods}");
-        for method_index in 0..=methods + 1 {
-            assert_eq!(
-                owners.owner(method_index).map(|owner| owner.token()),
-                assembly.method_owner(method_index).map(|owner| owner.token()),
-                "MethodDef row {method_index}"
-            );
-        }
-        let constants = assembly.constants();
-        let same = |a: Option<&ConstantValue>, b: Option<&ConstantValue>| match (a, b) {
-            (Some(ConstantValue::R4(x)), Some(ConstantValue::R4(y))) => x.to_bits() == y.to_bits(),
-            (Some(ConstantValue::R8(x)), Some(ConstantValue::R8(y))) => x.to_bits() == y.to_bits(),
-            _ => a == b,
-        };
-        let mut answered = 0;
-        for parent_table in [table::FIELD, table::PARAM, table::PROPERTY] {
-            for row in 1..=assembly.tables.row_count(parent_table) {
-                let parent = Token::new(parent_table, row);
-                let scanned = assembly.constant(parent);
-                answered += usize::from(scanned.is_some());
-                let indexed = constants.get(&parent);
-                assert!(
-                    same(indexed, scanned.as_ref()),
-                    "{parent:?}: {indexed:?} != {scanned:?}"
-                );
-            }
-        }
-        assert!(answered > 100, "the fixture's constants: {answered}");
-        assert_eq!(constants.len(), answered);
-    }
-
-    #[test]
-    fn every_type_is_found_by_the_pair_that_identifies_it_and_a_nested_one_by_no_other() {
-        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures/corlib.dll");
-        let Ok(bytes) = std::fs::read(fixture) else {
-            return;
-        };
-        let assembly = Assembly::read(std::boxed::Box::leak(bytes.into_boxed_slice()))
-            .expect("the committed corlib fixture reads");
-        let owners = assembly.method_owners();
-        let mut nested = 0;
-        for type_def in assembly.type_defs() {
-            let (namespace, name) = assembly
-                .type_token_full_name(type_def.token())
-                .expect("every type of the fixture names itself");
-            assert_eq!(
-                assembly.find_type_identified(&namespace, &name).map(|found| found.token()),
-                Some(type_def.token()),
-                "{namespace} {name}"
-            );
-            assert_eq!(
-                Assembly::find_in_references_identified(&[&assembly], &namespace, &name)
-                    .map(|(ordinal, found)| (ordinal, found.token())),
-                Some((0, type_def.token())),
-                "{namespace} {name} among references"
-            );
-            if type_def.enclosing_type().is_some() {
-                nested += 1;
-                assert_ne!(
-                    assembly.find_type_identified("", &name).map(|found| found.token()),
-                    Some(type_def.token()),
-                    "{namespace} {name} by its row's own pair"
-                );
-            } else {
-                assert_eq!(
-                    assembly.find_type(&namespace, &name).map(|found| found.token()),
-                    Some(type_def.token()),
-                    "{namespace} {name} by its row's own pair"
-                );
-            }
-            for method in type_def.methods() {
-                assert_eq!(
-                    owners.owner_of(method.token()).map(|owner| owner.token()),
-                    Some(type_def.token()),
-                    "{namespace} {name}: a method's owner, from the index"
-                );
-                assert_eq!(
-                    assembly.method_def_owner(method.token()).map(|owner| owner.token()),
-                    Some(type_def.token()),
-                    "{namespace} {name}: a method's owner, from the walk"
-                );
-            }
-        }
-        assert!(nested >= 6, "the fixture's nested types: {nested}");
-        assert!(owners.owner_of(Token::new(table::MEMBER_REF, 1)).is_none());
-        assert!(assembly.method_def_owner(Token::new(table::TYPE_DEF, 1)).is_none());
-    }
 }
+

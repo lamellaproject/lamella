@@ -22,6 +22,8 @@
 kind = "board"
 board = "st-nucleo-f439zi"
 vendor = "st"
+maker = "STMicroelectronics"
+product = "NUCLEO-F439ZI"
 family = "stm32f42x"
 part = "stm32f439zi"
 product_model = 29          # lamella_wire::product_model::NUCLEO_F439ZI

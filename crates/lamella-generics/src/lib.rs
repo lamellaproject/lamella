@@ -762,25 +762,34 @@ pub struct Program<'a> {
     /// Full name -> (assembly index, TypeDef row). Built once; a definition is looked up by NAME
     /// because that is the only identity that crosses an assembly boundary.
     definitions: BTreeMap<Box<str>, (usize, u32)>,
+    /// Each later declaration of a name [`definitions`](Self::definitions) already holds: a name two
+    /// assemblies declare is two types, and an instantiation of it reaches what either's body names.
+    later_declarations: BTreeMap<Box<str>, Vec<(usize, u32)>>,
 }
 
 impl<'a> Program<'a> {
     /// Indexes `assemblies` by type name. Index 0 is the program; the rest are its references.
     #[must_use]
     pub fn new(assemblies: &'a [Assembly<'a>]) -> Program<'a> {
-        let mut definitions = BTreeMap::new();
+        let mut definitions: BTreeMap<Box<str>, (usize, u32)> = BTreeMap::new();
+        let mut later_declarations: BTreeMap<Box<str>, Vec<(usize, u32)>> = BTreeMap::new();
         for (index, assembly) in assemblies.iter().enumerate() {
             for type_def in assembly.type_defs() {
                 if let Some(name) = type_def_full_name(assembly, type_def.token()) {
-                    definitions
-                        .entry(name.into_boxed_str())
-                        .or_insert((index, type_def.token().row()));
+                    let declared = (index, type_def.token().row());
+                    let name = name.into_boxed_str();
+                    if definitions.contains_key(&name) {
+                        later_declarations.entry(name).or_default().push(declared);
+                    } else {
+                        definitions.insert(name, declared);
+                    }
                 }
             }
         }
         Program {
             assemblies,
             definitions,
+            later_declarations,
         }
     }
 
@@ -1177,9 +1186,8 @@ impl Walk<'_, '_> {
         outcome
     }
 
-    /// Every instantiation reachable from `definition` once its type parameters are `arguments`:
-    /// its base type and interfaces, its fields, its methods' signatures and locals, and the
-    /// `TypeSpec` / `MethodSpec` tokens its method bodies name.
+    /// Every instantiation reachable from `definition` once its type parameters are `arguments`, in
+    /// every declaration of that name.
     fn expand(
         &mut self,
         definition: &str,
@@ -1189,6 +1197,24 @@ impl Walk<'_, '_> {
         let Some(&(index, row)) = self.program.definitions.get(definition) else {
             return Ok(());
         };
+        self.expand_declaration(index, row, arguments, path)?;
+        let program = self.program;
+        for &(index, row) in program.later_declarations.get(definition).into_iter().flatten() {
+            self.expand_declaration(index, row, arguments, path)?;
+        }
+        Ok(())
+    }
+
+    /// Every instantiation reachable from one declaration once its type parameters are `arguments`:
+    /// its base type and interfaces, its fields, its methods' signatures and locals, and the
+    /// `TypeSpec` / `MethodSpec` tokens its method bodies name.
+    fn expand_declaration(
+        &mut self,
+        index: usize,
+        row: u32,
+        arguments: &[TypeArg],
+        path: &mut Vec<(Box<str>, u32)>,
+    ) -> Result<(), Refusal> {
         let assembly = &self.program.assemblies[index];
         let Some(type_def) = assembly.type_def(row) else {
             return Ok(());
@@ -2828,7 +2854,7 @@ mod tests {
     /// BOTH candidates, since a value argument is not what the shortcut collapses.
     ///
     /// **The half that asserts the INTERFACE TAG consumes this spelling lives in `lamella-aot`**
-    /// (`resolver::tests::an_instantiations_interface_tag_takes_the_canonical_spelling`), because
+    /// (`resolver::fixture_tests::an_instantiations_interface_tag_takes_the_canonical_spelling`), because
     /// `interface_method_tag` is that crate's. The claim spans two crates, so it takes two tests,
     /// and each names the other.
     #[test]

@@ -1,4 +1,5 @@
 // Lamella.Hardware.TargetBoard -- the board a program was built for, one class on every board.
+using System.Collections.Generic;
 using System.Device.Analog;
 using System.Device.Gpio;
 using System.Device.I2c;
@@ -23,6 +24,8 @@ namespace Lamella.Hardware
         /// program asks for another.</summary>
         public const int StandardI2cFrequency = 100000;
 
+        private BoardPins _pins;
+
         /// <summary>The board the program was built for, with its buses bound.</summary>
         /// <exception cref="System.InvalidOperationException">The program was built for no
         /// board.</exception>
@@ -37,11 +40,114 @@ namespace Lamella.Hardware
             TargetBoardFacts.Arm();
         }
 
-        /// <summary>The board's id, the name the build selected it by: "rpi-pico2-w" on a Raspberry Pi
+        /// <summary>The board's id, the name the build selected it by: "raspberrypi-pico-2-w" on a Raspberry Pi
         /// Pico 2 W.</summary>
         public string Name
         {
             get { return TargetBoardFacts.Name; }
+        }
+
+        /// <summary>The board's maker, as the board names it: "Raspberry Pi".</summary>
+        public string Maker
+        {
+            get { return TargetBoardFacts.Maker; }
+        }
+
+        /// <summary>The board's product name, as its maker names it: "Pico 2 W".</summary>
+        public string Product
+        {
+            get { return TargetBoardFacts.Product; }
+        }
+
+        /// <summary>The board's chip: "RP2350A".</summary>
+        public string Chip
+        {
+            get { return TargetBoardFacts.Chip; }
+        }
+
+        /// <summary>The frequency in hertz the board's image runs the chip's processor at.</summary>
+        /// <exception cref="System.NotSupportedException">The board's facts do not state it. The message
+        /// names the board and the fact.</exception>
+        public int ClockFrequency
+        {
+            get
+            {
+                int clock = TargetBoardFacts.ClockFrequency;
+                if (clock == 0) throw new System.NotSupportedException(NotStated("clock frequency"));
+                return clock;
+            }
+        }
+
+        /// <summary>The pins of the board's chip, by the numbers <c>GpioController.OpenPin</c> takes and
+        /// by the labels the board prints.</summary>
+        /// <exception cref="System.NotSupportedException">The board's facts do not state its pins. The
+        /// message names the board and the fact.</exception>
+        public BoardPins Pins
+        {
+            get
+            {
+                if (TargetBoardFacts.PinCount == 0) throw new System.NotSupportedException(NotStated("pins"));
+                BoardPins pins = _pins;
+                if ((object)pins == null)
+                {
+                    pins = new BoardPins();
+                    _pins = pins;
+                }
+                return pins;
+            }
+        }
+
+        /// <summary>The I2C buses the board serves, with the rates each serves.</summary>
+        /// <exception cref="System.NotSupportedException">The board's facts do not state its buses. The
+        /// message names the board and the fact.</exception>
+        public IReadOnlyList<I2cBusInfo> I2cBuses
+        {
+            get
+            {
+                if (TargetBoardFacts.PinCount == 0) throw new System.NotSupportedException(NotStated("I2C buses"));
+                return FactsTable.I2cBuses;
+            }
+        }
+
+        /// <summary>The SPI buses the board serves, with the slowest and fastest rate each
+        /// makes.</summary>
+        /// <exception cref="System.NotSupportedException">The board's facts do not state its buses. The
+        /// message names the board and the fact.</exception>
+        public IReadOnlyList<SpiBusInfo> SpiBuses
+        {
+            get
+            {
+                if (TargetBoardFacts.PinCount == 0) throw new System.NotSupportedException(NotStated("SPI buses"));
+                return FactsTable.SpiBuses;
+            }
+        }
+
+        /// <summary>Why a member answers nothing: the board, and the fact its facts do not state.</summary>
+        private static string NotStated(string fact)
+        {
+            return Board() + ": this board's facts do not state its " + fact + ".";
+        }
+
+        /// <summary>One line naming the board, its chip and clock, how many pins it numbers and the buses
+        /// it serves: "Raspberry Pi Pico 2 (raspberrypi-pico-2), RP2350A at 150000000 Hz, 30 pins, I2C 0, SPI
+        /// 0". A fact the board's facts do not state is named as such.</summary>
+        public override string ToString()
+        {
+            string line = Board() + ", " + TargetBoardFacts.Chip;
+            int clock = TargetBoardFacts.ClockFrequency;
+            if (clock == 0) line = line + ", clock not stated";
+            else line = line + " at " + FactsTable.Decimal(clock) + " Hz";
+            if (TargetBoardFacts.PinCount == 0) return line + ", pins and buses not stated";
+            line = line + ", " + FactsTable.Decimal(TargetBoardFacts.PinCount);
+            line = line + " pins, I2C " + FactsTable.ServedI2cNumbers();
+            return line + ", SPI " + FactsTable.ServedSpiNumbers();
+        }
+
+        /// <summary>The board as a refusal names it: its maker, its product and its id.</summary>
+        private static string Board()
+        {
+            string named = TargetBoardFacts.Maker + " " + TargetBoardFacts.Product;
+            return named + " (" + TargetBoardFacts.Name + ")";
         }
 
         /// <summary>The standard controller over the board's pins.</summary>
@@ -104,24 +210,27 @@ namespace Lamella.Hardware
             {
                 if (clockFrequency != StandardI2cFrequency)
                 {
-                    throw new System.NotSupportedException(TargetBoardFacts.Name + ": this board's I2C driver for bus "
-                        + busId.ToString() + " sets no clock frequency, so the bus runs at its default rate and "
-                        + clockFrequency.ToString() + " Hz cannot be set.");
+                    string unclocked = Board() + ": this board's I2C driver for bus " + FactsTable.Decimal(busId);
+                    unclocked = unclocked + " sets no clock frequency, so the bus runs at its default rate and "
+                        + FactsTable.Decimal(clockFrequency);
+                    throw new System.NotSupportedException(unclocked + " Hz cannot be set.");
                 }
             }
             else if (!driver.Serves(clockFrequency))
             {
-                throw new System.NotSupportedException(TargetBoardFacts.Name + ": an I2C rate of "
-                    + clockFrequency.ToString() + " Hz on bus " + busId.ToString()
-                    + " is not served by this board. The bus serves " + Listed(rates) + " Hz.");
+                string unserved = Board() + ": an I2C rate of " + FactsTable.Decimal(clockFrequency);
+                unserved = unserved + " Hz on bus " + FactsTable.Decimal(busId);
+                unserved = unserved + " is not served by this board. The bus serves " + Listed(rates);
+                throw new System.NotSupportedException(unserved + " Hz.");
             }
             int running = Buses.RunI2c(busId, clockFrequency);
             if (running != clockFrequency)
             {
-                throw new System.InvalidOperationException(TargetBoardFacts.Name + ": I2C bus " + busId.ToString()
-                    + " already runs at " + running.ToString() + " Hz for this program's run; a bus has one rate"
-                    + " per run, set by the first device created on it, and " + clockFrequency.ToString()
-                    + " Hz was asked.");
+                string busy = Board() + ": I2C bus " + FactsTable.Decimal(busId);
+                busy = busy + " already runs at " + FactsTable.Decimal(running);
+                busy = busy + " Hz for this program's run; a bus has one rate per run, set by the first device created"
+                    + " on it, and " + FactsTable.Decimal(clockFrequency);
+                throw new System.InvalidOperationException(busy + " Hz was asked.");
             }
             return I2cDevice.Create(connectionSettings);
         }
@@ -129,10 +238,10 @@ namespace Lamella.Hardware
         /// <summary><paramref name="rates"/>, in order and separated by commas.</summary>
         private static string Listed(int[] rates)
         {
-            string listed = rates.Length == 0 ? "no rate" : rates[0].ToString();
+            string listed = rates.Length == 0 ? "no rate" : FactsTable.Decimal(rates[0]);
             for (int index = 1; index < rates.Length; index++)
             {
-                listed = listed + ", " + rates[index].ToString();
+                listed = listed + ", " + FactsTable.Decimal(rates[index]);
             }
             return listed;
         }
@@ -173,29 +282,112 @@ namespace Lamella.Hardware
         {
             if (!AdcControllers.IsBound())
             {
-                throw new System.NotSupportedException(TargetBoardFacts.Name + " serves no analog input.");
+                throw new System.NotSupportedException(Board() + " serves no analog input.");
             }
             if (chip != 0)
             {
-                throw new System.NotSupportedException(TargetBoardFacts.Name + " has no analog controller "
-                    + chip.ToString() + "; its one controller is chip 0.");
+                throw new System.NotSupportedException(Board() + " has no analog controller "
+                    + FactsTable.Decimal(chip) + "; its one controller is chip 0.");
             }
             return AdcControllers.CreateAnalogController();
         }
+
+#if LAMELLA_SURFACE_FLOAT
+        /// <summary>A PWM channel the board drives a pin with, not yet started.</summary>
+        /// <param name="chip">The PWM chip, the <see cref="BoardPin.PwmChip"/> of the pin to drive.</param>
+        /// <param name="channel">The channel on that chip, the <see cref="BoardPin.PwmChannelNumber"/> of
+        /// the pin to drive.</param>
+        /// <param name="frequency">The frequency in hertz.</param>
+        /// <param name="dutyCyclePercentage">The duty cycle, from 0 to 1.</param>
+        /// <exception cref="System.NotSupportedException">No pin of the board carries the chip and
+        /// channel, or the board keeps that pin for a part of its own. The message names the board and
+        /// what was asked.</exception>
+        /// <exception cref="System.InvalidOperationException">The chip's output that drives the pin is
+        /// already open, or its other output runs at another frequency.</exception>
+        /// <exception cref="System.ArgumentOutOfRangeException">The board's facts state no pin table, so
+        /// the numbers are the ones <c>PwmChannel.Create</c> takes, and the board binds no such chip or
+        /// channel.</exception>
+        public System.Device.Pwm.PwmChannel CreatePwmChannel(int chip, int channel, int frequency = 400,
+            double dutyCyclePercentage = 0.5)
+        {
+            if (TargetBoardFacts.PinCount == 0)
+            {
+                return System.Device.Pwm.PwmChannel.Create(chip, channel, frequency, dutyCyclePercentage);
+            }
+            return TargetBoardFacts.CreatePwmOn(FindPwm(chip, channel), frequency, dutyCyclePercentage);
+        }
+
+        /// <summary>A PWM channel on the pin <paramref name="pin"/> names, not yet started: a channel drives
+        /// one pin of the board, so another pin is refused.</summary>
+        /// <param name="chip">The PWM chip, the <see cref="BoardPin.PwmChip"/> of the pin to drive.</param>
+        /// <param name="channel">The channel on that chip, the <see cref="BoardPin.PwmChannelNumber"/> of
+        /// the pin to drive.</param>
+        /// <param name="frequency">The frequency in hertz.</param>
+        /// <param name="dutyCyclePercentage">The duty cycle, from 0 to 1.</param>
+        /// <param name="pin">The pin the channel drives, by the number <c>GpioController.OpenPin</c>
+        /// takes.</param>
+        /// <exception cref="System.NotSupportedException">No pin of the board carries the chip and
+        /// channel, the board keeps that pin for a part of its own, they drive another pin than
+        /// <paramref name="pin"/>, or the board's facts do not state its pins. The message names the
+        /// board and what was asked.</exception>
+        /// <exception cref="System.InvalidOperationException">The chip's output that drives the pin is
+        /// already open, or its other output runs at another frequency.</exception>
+        public System.Device.Pwm.PwmChannel CreatePwmChannel(int chip, int channel, int frequency,
+            double dutyCyclePercentage, int pin)
+        {
+            if (TargetBoardFacts.PinCount == 0) throw new System.NotSupportedException(NotStated("pins"));
+            int carrier = FindPwm(chip, channel);
+            if (pin != carrier)
+            {
+                string elsewhere = Board() + ": PWM chip " + FactsTable.Decimal(chip);
+                elsewhere = elsewhere + ", channel " + FactsTable.Decimal(channel);
+                elsewhere = elsewhere + " drives " + FactsTable.FirstLabel(carrier);
+                elsewhere = elsewhere + " alone on this board, so it cannot be created on pin " + FactsTable.Decimal(pin);
+                throw new System.NotSupportedException(elsewhere + ".");
+            }
+            return TargetBoardFacts.CreatePwmOn(carrier, frequency, dutyCyclePercentage);
+        }
+
+        /// <summary>The number of the pin that carries PWM <paramref name="chip"/>,
+        /// <paramref name="channel"/>, refused where no pin carries it or the board keeps the pin.</summary>
+        private static int FindPwm(int chip, int channel)
+        {
+            int count = TargetBoardFacts.PinCount;
+            for (int pin = 0; pin < count; pin++)
+            {
+                int storedChip = FactsTable.StoredPwmChip(pin);
+                int storedChannel = FactsTable.StoredPwmChannel(pin);
+                if (storedChip != 0 && storedChannel != 0 && storedChip - 1 == chip && storedChannel - 1 == channel)
+                {
+                    if (TargetBoardFacts.IsPinReserved(pin))
+                    {
+                        string kept = Board() + ": the board keeps " + FactsTable.FirstLabel(pin);
+                        throw new System.NotSupportedException(kept + " for a part of its own, so no PWM channel can drive it.");
+                    }
+                    return pin;
+                }
+            }
+            string uncarried = Board() + ": no pin carries PWM chip " + FactsTable.Decimal(chip);
+            uncarried = uncarried + ", channel " + FactsTable.Decimal(channel);
+            throw new System.NotSupportedException(uncarried + " on this board, so no PWM channel can be created there.");
+        }
+#endif
 
         /// <summary>Why the board has no <paramref name="kind"/> bus <paramref name="busId"/>: the
         /// board, the bus asked for, and the buses of that kind it has.</summary>
         private static string NoSuchBus(string kind, int busId, bool i2c)
         {
-            string message = TargetBoardFacts.Name + " has no " + kind + " bus " + busId.ToString();
+            string message = Board() + " has no " + kind;
+            message = message + " bus " + FactsTable.Decimal(busId);
             string listed = null;
             for (int candidate = 0; candidate < Buses.BusCount; candidate++)
             {
                 if (!(i2c ? Buses.ServesI2c(candidate) : Buses.ServesSpi(candidate))) continue;
-                listed = (object)listed == null ? candidate.ToString() : listed + ", " + candidate.ToString();
+                listed = (object)listed == null ? FactsTable.Decimal(candidate) : listed + ", " + FactsTable.Decimal(candidate);
             }
             if ((object)listed == null) return message + "; it has no " + kind + " bus.";
-            return message + "; its " + kind + " buses: " + listed + ".";
+            message = message + "; its " + kind;
+            return message + " buses: " + listed + ".";
         }
     }
 }

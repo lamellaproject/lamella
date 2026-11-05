@@ -5,9 +5,9 @@ much of each one Lamella's C# compiler supports. It is regenerated from the comp
 for every release, so a feature moves from "not yet" to "in progress" to "complete" here as it lands.
 
 Lamella's C# compiler, `lcsc`, against every named feature of C# 1.0 through C# 15.0:
-439 features, of which 67 are complete, 2 require more tests, 205 are in progress, 18 are not yet supported and 147 have no tests yet.
+439 features, of which 69 are complete, 2 require more tests, 204 are in progress, 17 are not yet supported and 147 have no tests yet.
 
-**No C# version is complete yet.** C# 1.0 has 53 of its 169 features complete. Each of
+**No C# version is complete yet.** C# 1.0 has 56 of its 169 features complete. Each of
 the others is listed below with the share of its conformance tests that pass.
 
 ## How each feature is measured
@@ -38,16 +38,16 @@ example, a C# 2.0 feature is scored at `/langversion:2`.
 
 The results on this page:
 
-- **Suite:** `ecma-334-conformance-tests` commit `e7fe658131d1`.
-- **Compiler:** `lcsc` at public commit `595b6d7843`.
-- **Runs:** 2026-10-11, at C# 1, C# 2, C# 3, C# 4, C# 5, C# 6, C# 7, C# 7.1, C# 7.2, C# 7.3 and C# 11.
+- **Suite:** `ecma-334-conformance-tests` commit `f3d3a7809ac8a273eee1e38d8ca08110a0b1fca0`.
+- **Compiler:** `lcsc` as of 2026-10-28.
+- **Runs:** 2026-10-31, at C# 1, C# 2, C# 3, C# 4, C# 5, C# 6, C# 7, C# 7.1, C# 7.2, C# 7.3, C# 8, C# 9, C# 10 and C# 11.
 - **Platform:** the suite's programs run on .NET (Windows x64, .NET 11.0.0-rc.1.26425.128).
+
+The .NET harness could not execute 74 test/language-level pairs; those pairs are excluded.
+Compiler feature refusals count as failures.
 
 Running on a microcontroller, through Lamella's interpreter or its ahead-of-time compiler, is measured
 separately.
-
-The suite has no run at C# 8.0, C# 9.0 and C# 10.0. Features of those versions are
-scored at the next version it was run at, C# 11.
 
 The suite was not run at C# 12.0 or later, so every feature of those versions has no tests yet.
 
@@ -55,20 +55,20 @@ The suite was not run at C# 12.0 or later, so every feature of those versions ha
 
 | C# version | features | complete | in progress | not yet | no tests yet | suite tests passed at this version |
 |---|---:|---:|---:|---:|---:|---|
-| [C# 1.0](#c-10) | 169 | 53 | 109 | 2 | 5 | 4,622 of 5,847, 79% |
-| [C# 2.0](#c-20) | 38 | 2 | 23 | 4 | 9 | 6,775 of 9,806, 69% |
-| [C# 3.0](#c-30) | 11 | 1 | 7 | 3 | 0 | 7,429 of 11,075, 67% |
-| [C# 4.0](#c-40) | 4 | 0 | 4 | 0 | 0 | 7,499 of 11,310, 66% |
-| [C# 5.0](#c-50) | 2 | 0 | 1 | 1 | 0 | 7,543 of 11,402, 66% |
-| [C# 6.0](#c-60) | 18 | 0 | 15 | 0 | 3 | 7,684 of 11,592, 66% |
-| [C# 7.0](#c-70) | 19 | 2 | 15 | 2 | 0 | 7,874 of 11,899, 66% |
-| [C# 7.1](#c-71) | 4 | 0 | 4 | 0 | 0 | 7,878 of 11,919, 66% |
-| [C# 7.2](#c-72) | 11 | 1 | 9 | 1 | 0 | 7,952 of 12,083, 65% |
-| [C# 7.3](#c-73) | 12 | 0 | 12 | 0 | 0 | 7,984 of 12,162, 65% |
-| [C# 8.0](#c-80) | 30 | 5 | 0 | 0 | 25 | 8,240 of 13,639, 60% (at C# 11) |
-| [C# 9.0](#c-90) | 25 | 2 | 2 | 1 | 20 | 8,240 of 13,639, 60% (at C# 11) |
-| [C# 10.0](#c-100) | 21 | 1 | 2 | 1 | 17 | 8,240 of 13,639, 60% (at C# 11) |
-| [C# 11.0](#c-110) | 22 | 0 | 4 | 3 | 15 | 8,240 of 13,639, 60% |
+| [C# 1.0](#c-10) | 169 | 56 | 106 | 2 | 5 | 4,686 of 5,851, 80% |
+| [C# 2.0](#c-20) | 38 | 2 | 23 | 4 | 9 | 6,855 of 9,812, 69% |
+| [C# 3.0](#c-30) | 11 | 1 | 7 | 3 | 0 | 7,523 of 11,080, 67% |
+| [C# 4.0](#c-40) | 4 | 0 | 4 | 0 | 0 | 7,593 of 11,315, 67% |
+| [C# 5.0](#c-50) | 2 | 0 | 1 | 1 | 0 | 7,655 of 11,407, 67% |
+| [C# 6.0](#c-60) | 18 | 0 | 15 | 0 | 3 | 7,797 of 11,597, 67% |
+| [C# 7.0](#c-70) | 19 | 2 | 16 | 1 | 0 | 8,034 of 11,909, 67% |
+| [C# 7.1](#c-71) | 4 | 0 | 4 | 0 | 0 | 8,038 of 11,929, 67% |
+| [C# 7.2](#c-72) | 11 | 2 | 8 | 1 | 0 | 8,119 of 12,093, 67% |
+| [C# 7.3](#c-73) | 12 | 0 | 12 | 0 | 0 | 8,156 of 12,172, 67% |
+| [C# 8.0](#c-80) | 30 | 4 | 1 | 0 | 25 | 8,204 of 12,261, 66% |
+| [C# 9.0](#c-90) | 25 | 1 | 3 | 1 | 20 | 8,546 of 13,866, 61% |
+| [C# 10.0](#c-100) | 21 | 1 | 2 | 1 | 17 | 8,570 of 13,930, 61% |
+| [C# 11.0](#c-110) | 22 | 0 | 4 | 3 | 15 | 8,577 of 13,943, 61% |
 | [C# 12.0](#c-120) | 12 | 0 | 0 | 0 | 12 |  |
 | [C# 13.0](#c-130) | 12 | 0 | 0 | 0 | 12 |  |
 | [C# 14.0](#c-140) | 17 | 0 | 0 | 0 | 17 |  |
@@ -82,15 +82,15 @@ The last column counts every suite test that runs at that version, whichever fea
 |---|---|---|---|---|
 | Abstract classes | In progress | 19 of 20, 95% | Declare classes that cannot be instantiated directly. | ECMA-334 7th edition, clause 15.2.2 |
 | Abstract methods | In progress | 6 of 10, 60% | Require derived classes to provide method implementations. | ECMA-334 7th edition, clause 15.6.7 |
-| Access modifiers | In progress | 34 of 35, 97% | Control declared accessibility with public, protected, internal, private, and protected internal. | ECMA-334 7th edition, clause 7.5.2 |
+| Access modifiers | Complete | 35 of 35, 100% | Control declared accessibility with public, protected, internal, private, and protected internal. | ECMA-334 7th edition, clause 7.5.2 |
 | Address-of operator | In progress | 4 of 7, 57% | Obtain a variable's address using & in unsafe code. | ECMA-334 7th edition, clause 23.6.5 |
-| Application entry point | In progress | 17 of 19, 89% | Start an executable with a permitted static Main signature. | ECMA-334 7th edition, clause 7.1 |
-| Arithmetic operators | In progress | 89 of 321, 27% | Add, subtract, multiply, divide, or calculate numeric remainders. | ECMA-334 7th edition, clause 12.10 |
+| Application entry point | In progress | 18 of 19, 94% | Start an executable with a permitted static Main signature. | ECMA-334 7th edition, clause 7.1 |
+| Arithmetic operators | In progress | 97 of 321, 30% | Add, subtract, multiply, divide, or calculate numeric remainders. | ECMA-334 7th edition, clause 12.10 |
 | Array covariance | In progress | 3 of 4, 75% | Convert reference-element arrays to compatible base-element array types. | ECMA-334 7th edition, clause 17.6 |
 | Array initializers | In progress | 10 of 13, 76% | Initialize array elements with a brace-delimited list. | ECMA-334 7th edition, clause 17.7 |
 | As operator | In progress | 2 of 4, 50% | Attempt a reference conversion, returning null when unsuccessful. | ECMA-334 7th edition, clause 12.12.13 |
-| Attribute targets | In progress | 16 of 31, 51% | Select the declaration or generated entity receiving an attribute. | ECMA-334 7th edition, clause 22.3 |
-| Attributes | In progress | 33 of 59, 55% | Attach metadata using positional and named attribute arguments. | ECMA-334 7th edition, clauses 22.2, 22.3 |
+| Attribute targets | In progress | 19 of 31, 61% | Select the declaration or generated entity receiving an attribute. | ECMA-334 7th edition, clause 22.3 |
+| Attributes | In progress | 44 of 59, 74% | Attach metadata using positional and named attribute arguments. | ECMA-334 7th edition, clauses 22.2, 22.3 |
 | AttributeUsage attribute | Not yet | 0 of 1, 0% | Control permitted attribute targets, inheritance, and repeated application. | ECMA-334 7th edition, clause 22.5.2 |
 | Automatic memory management | Complete | 5 of 5, 100% | Allow the runtime to reclaim unreachable managed objects. | ECMA-334 7th edition, clause 7.9 |
 | Base access | In progress | 3 of 10, 30% | Access inherited implementations explicitly using base. | ECMA-334 7th edition, clause 12.8.14 |
@@ -100,7 +100,7 @@ The last column counts every suite test that runs at that version, whichever fea
 | Boolean literals | Complete | 1 of 1, 100% | Write true and false Boolean values. | ECMA-334 7th edition, clause 6.4.5.2 |
 | Boolean type | In progress | 3 of 4, 75% | Represent logical truth values using bool. | ECMA-334 7th edition, clause 8.3.9 |
 | Boxing conversions | Complete | 2 of 2, 100% | Wrap value-type values as object or interface references. | ECMA-334 7th edition, clause 10.2.9 |
-| Break statement | In progress | 5 of 6, 83% | Exit the nearest enclosing loop or switch. | ECMA-334 7th edition, clause 13.10.2 |
+| Break statement | Complete | 6 of 6, 100% | Exit the nearest enclosing loop or switch. | ECMA-334 7th edition, clause 13.10.2 |
 | Cast expressions | Complete | 5 of 5, 100% | Request explicit conversions using a parenthesized target type. | ECMA-334 7th edition, clause 12.9.7 |
 | Character literals | Complete | 4 of 4, 100% | Write individual characters, including escaped characters. | ECMA-334 7th edition, clause 6.4.5.5 |
 | Character type | In progress | 23 of 32, 71% | Represent UTF-16 code units using char. | ECMA-334 7th edition, clause 8.3.6 |
@@ -110,7 +110,7 @@ The last column counts every suite test that runs at that version, whichever fea
 | Classes | In progress | 37 of 45, 82% | Declare reference types containing state and behavior. | ECMA-334 7th edition, clause 15.2 |
 | Comments | Complete | 13 of 13, 100% | Annotate source with single-line or delimited comments. | ECMA-334 7th edition, clause 6.3.3 |
 | Comparison operators | In progress | 79 of 151, 52% | Compare numeric or enumeration values using ordering operators. | ECMA-334 7th edition, clauses 12.12.2, 12.12.3, 12.12.4, 12.12.6 |
-| Compound assignment | In progress | 1 of 4, 25% | Combine an operation with assignment to its left operand. | ECMA-334 7th edition, clause 12.21.4 |
+| Compound assignment | In progress | 2 of 4, 50% | Combine an operation with assignment to its left operand. | ECMA-334 7th edition, clause 12.21.4 |
 | Conditional compilation directives | Complete | 10 of 10, 100% | Include source selectively using #if, #elif, #else, and #endif. | ECMA-334 7th edition, clause 6.5.5 |
 | Conditional compilation symbols | Complete | 9 of 9, 100% | Define or undefine symbols used by preprocessing conditions. | ECMA-334 7th edition, clause 6.5.2 |
 | Conditional logical operators | In progress | 2 of 4, 50% | Evaluate Boolean && or \|\| with short-circuiting. | ECMA-334 7th edition, clause 12.14.2 |
@@ -128,10 +128,10 @@ The last column counts every suite test that runs at that version, whichever fea
 | Delegates | In progress | 10 of 11, 90% | Declare callable reference types with a specific signature. | ECMA-334 7th edition, clause 20.2 |
 | Diagnostic directives | In progress | 13 of 37, 35% | Issue explicit compiler errors or warnings using #error and #warning. | ECMA-334 7th edition, clause 6.5.6 |
 | Do statement | Complete | 7 of 7, 100% | Repeat a statement, testing its condition after each iteration. | ECMA-334 7th edition, clause 13.9.3 |
-| Element access | In progress | 14 of 18, 77% | Read or write array elements and indexer values. | ECMA-334 7th edition, clause 12.8.11 |
+| Element access | In progress | 15 of 18, 83% | Read or write array elements and indexer values. | ECMA-334 7th edition, clause 12.8.11 |
 | Empty statement | Complete | 1 of 1, 100% | Use a semicolon as a statement that performs no action. | ECMA-334 7th edition, clause 13.4 |
 | Enumeration conversions | Complete | 1 of 1, 100% | Cast between enumeration types and numeric types. | ECMA-334 7th edition, clause 10.3.3 |
-| Enums | In progress | 18 of 23, 78% | Declare named integral constants in a distinct value type. | ECMA-334 7th edition, clauses 19.2, 19.4 |
+| Enums | In progress | 20 of 23, 86% | Declare named integral constants in a distinct value type. | ECMA-334 7th edition, clauses 19.2, 19.4 |
 | Equality operators | In progress | 93 of 170, 54% | Compare numbers, Booleans, enumerations, references, strings, or delegates for equality. | ECMA-334 7th edition, clause 12.12 |
 | Event assignment | Complete | 1 of 1, 100% | Subscribe or unsubscribe delegate handlers using += or -=. | ECMA-334 7th edition, clause 12.21.5 |
 | Explicit interface implementation | In progress | 5 of 13, 38% | Qualify implementations with interface names to separate conflicting contracts. | ECMA-334 7th edition, clause 18.6.2 |
@@ -143,19 +143,19 @@ The last column counts every suite test that runs at that version, whichever fea
 | External properties | In progress | 67 of 84, 79% | Declare properties whose accessors are implemented externally. | ECMA-334 7th edition, clause 15.7 |
 | Field initializers | In progress | 26 of 28, 92% | Initialize fields as part of instance or static initialization. | ECMA-334 7th edition, clauses 15.5.5, 15.5.6 |
 | Field-like events | In progress | 1 of 3, 33% | Declare events whose delegate storage and accessors are synthesized. | ECMA-334 7th edition, clause 15.8.2 |
-| Fields | In progress | 113 of 132, 85% | Declare instance or static storage inside classes and structs. | ECMA-334 7th edition, clause 15.5 |
+| Fields | In progress | 122 of 132, 92% | Declare instance or static storage inside classes and structs. | ECMA-334 7th edition, clause 15.5 |
 | Finalizers | In progress | 20 of 25, 80% | Declare cleanup invoked by the runtime when objects become eligible. | ECMA-334 7th edition, clause 15.13 |
 | Finally clauses | In progress | 21 of 24, 87% | Run cleanup when control leaves a try statement. | ECMA-334 7th edition, clause 13.11 |
-| Fixed statement | In progress | 8 of 19, 42% | Pin movable managed storage while using its address. | ECMA-334 7th edition, clause 23.7 |
+| Fixed statement | In progress | 10 of 19, 52% | Pin movable managed storage while using its address. | ECMA-334 7th edition, clause 23.7 |
 | Floating-point types | Complete | 5 of 5, 100% | Represent approximate real numbers using float and double. | ECMA-334 7th edition, clause 8.3.7 |
 | For statement | Complete | 12 of 12, 100% | Repeat with initialization, condition, and iteration expressions. | ECMA-334 7th edition, clause 13.9.4 |
-| Foreach statement | In progress | 16 of 33, 48% | Enumerate arrays or collections using the enumeration pattern or interfaces. | ECMA-334 7th edition, clause 13.9.5 |
+| Foreach statement | In progress | 20 of 33, 60% | Enumerate arrays or collections using the enumeration pattern or interfaces. | ECMA-334 7th edition, clause 13.9.5 |
 | Goto statement | In progress | 6 of 12, 50% | Transfer control to a label or switch section. | ECMA-334 7th edition, clause 13.10.4 |
 | If statement | In progress | 6 of 7, 85% | Execute branches according to a Boolean condition. | ECMA-334 7th edition, clause 13.8.2 |
 | Implicit constant expression conversions | In progress | 57 of 71, 80% | Convert representable constant integers to permitted smaller integral types. | ECMA-334 7th edition, clause 10.2.11 |
 | Implicit enumeration conversions | Complete | 1 of 1, 100% | Convert the integer constant zero to an enumeration type. | ECMA-334 7th edition, clause 10.2.4 |
 | Implicit numeric conversions | Complete | 671 of 671, 100% | Convert numeric values without casts when permitted by the language. | ECMA-334 7th edition, clause 10.2.3 |
-| Increment and decrement operators | In progress | 17 of 31, 54% | Increase or decrease variables with prefix or postfix operators. | ECMA-334 7th edition, clauses 12.8.15, 12.9.6 |
+| Increment and decrement operators | In progress | 18 of 31, 58% | Increase or decrease variables with prefix or postfix operators. | ECMA-334 7th edition, clauses 12.8.15, 12.9.6 |
 | Indexer overloading | No tests yet |  | Declare indexers with different parameter signatures. | ECMA-334 1st edition, clause 17.8.1 |
 | IndexerName attribute | Complete | 1 of 1, 100% | Choose an indexer's metadata name through a compiler-recognized attribute. | ECMA-334 7th edition, clause 22.6 |
 | Indexers | In progress | 36 of 44, 81% | Expose get and set accessors indexed by one or more parameters. | ECMA-334 7th edition, clause 15.9 |
@@ -177,10 +177,10 @@ The last column counts every suite test that runs at that version, whichever fea
 | Logical negation operator | No tests yet |  | Invert a Boolean value using !. | ECMA-334 7th edition, clause 12.9.4 |
 | Member access | In progress | 40 of 41, 97% | Select members with qualified names and the dot operator. | ECMA-334 7th edition, clause 12.8.7 |
 | Member hiding | In progress | 1 of 4, 25% | Hide inherited members explicitly using new. | ECMA-334 7th edition, clause 15.3.5 |
-| Method overloading | In progress | 49 of 54, 90% | Declare methods sharing a name with distinct signatures. | ECMA-334 7th edition, clauses 7.6, 12.6.4 |
+| Method overloading | In progress | 50 of 54, 92% | Declare methods sharing a name with distinct signatures. | ECMA-334 7th edition, clauses 7.6, 12.6.4 |
 | Methods | In progress | 148 of 166, 89% | Declare callable instance or static members with bodies. | ECMA-334 7th edition, clause 15.6 |
-| Module attributes | In progress | 16 of 31, 51% | Attach metadata attributes to the current module using the module target. | ECMA-334 7th edition, clause 22.3 |
-| Multicast delegates | In progress | 47 of 129, 36% | Combine or remove delegate targets using addition and subtraction. | ECMA-334 7th edition, clauses 12.10.5, 12.10.6 |
+| Module attributes | In progress | 19 of 31, 61% | Attach metadata attributes to the current module using the module target. | ECMA-334 7th edition, clause 22.3 |
+| Multicast delegates | In progress | 55 of 129, 42% | Combine or remove delegate targets using addition and subtraction. | ECMA-334 7th edition, clauses 12.10.5, 12.10.6 |
 | Multidimensional arrays | Complete | 10 of 10, 100% | Store elements indexed by multiple dimensions. | ECMA-334 7th edition, clause 17.2 |
 | Namespaces | In progress | 4 of 5, 80% | Organize type declarations within named or nested namespaces. | ECMA-334 7th edition, clause 14.3 |
 | Nested types | In progress | 27 of 30, 90% | Declare types within other types. | ECMA-334 7th edition, clause 15.3.9 |
@@ -201,7 +201,7 @@ The last column counts every suite test that runs at that version, whichever fea
 | Pointer member access | In progress | 3 of 4, 75% | Access pointed-to struct members using ->. | ECMA-334 7th edition, clause 23.6.3 |
 | Pointer types | In progress | 20 of 28, 71% | Represent addresses of unmanaged values using typed or void pointers. | ECMA-334 7th edition, clause 23.3 |
 | Properties | In progress | 67 of 84, 79% | Expose instance or static values through get and set accessors. | ECMA-334 7th edition, clause 15.7 |
-| Readonly fields | In progress | 16 of 25, 64% | Restrict field assignments to declarations and appropriate constructors. | ECMA-334 7th edition, clause 15.5.3 |
+| Readonly fields | Complete | 25 of 25, 100% | Restrict field assignments to declarations and appropriate constructors. | ECMA-334 7th edition, clause 15.5.3 |
 | Real literals | Complete | 9 of 9, 100% | Write floating-point or decimal constants with optional exponents and suffixes. | ECMA-334 7th edition, clause 6.4.5.4 |
 | Reference conversions | Complete | 2 of 2, 100% | Convert compatible class, interface, array, and delegate references. | ECMA-334 7th edition, clauses 10.2.8, 10.3.5 |
 | Reference parameters | In progress | 53 of 54, 98% | Pass writable variable references using ref. | ECMA-334 7th edition, clause 15.6.2 |
@@ -213,7 +213,7 @@ The last column counts every suite test that runs at that version, whichever fea
 | Shift operators | In progress | 18 of 20, 90% | Shift integral bits left or right. | ECMA-334 7th edition, clause 12.11 |
 | Simple assignment | Complete | 2 of 2, 100% | Store a computed value in a variable, property, or indexer. | ECMA-334 7th edition, clause 12.21.2 |
 | Single-dimensional arrays | Complete | 10 of 10, 100% | Store indexed elements in a single dimension. | ECMA-334 7th edition, clause 17.2 |
-| Sizeof operator | In progress | 2 of 4, 50% | Obtain a value type's storage size. | ECMA-334 7th edition, clause 23.6.9 |
+| Sizeof operator | In progress | 3 of 4, 75% | Obtain a value type's storage size. | ECMA-334 7th edition, clause 23.6.9 |
 | Stack allocation | In progress | 1 of 2, 50% | Allocate unmanaged storage on the stack using stackalloc. | ECMA-334 7th edition, clause 23.9 |
 | Static constructors | In progress | 27 of 38, 71% | Initialize type-level state before its prescribed first use. | ECMA-334 7th edition, clause 15.12 |
 | String concatenation | In progress | 24 of 61, 39% | Join string values using addition. | ECMA-334 7th edition, clause 12.10.5 |
@@ -237,7 +237,7 @@ The last column counts every suite test that runs at that version, whichever fea
 | User-defined unary operators | In progress | 13 of 37, 35% | Declare overloads for unary operations on user-defined types. | ECMA-334 7th edition, clause 15.10.2 |
 | Using alias directives | In progress | 5 of 7, 71% | Give a namespace or named type a local alias. | ECMA-334 7th edition, clause 14.5.2 |
 | Using namespace directives | In progress | 5 of 6, 83% | Import namespace members for unqualified type references. | ECMA-334 7th edition, clause 14.5.3 |
-| Using statement | In progress | 11 of 17, 64% | Dispose a resource when control leaves its protected statement. | ECMA-334 7th edition, clause 13.14 |
+| Using statement | In progress | 15 of 17, 88% | Dispose a resource when control leaves its protected statement. | ECMA-334 7th edition, clause 13.14 |
 | Value parameters | In progress | 53 of 54, 98% | Pass parameter values by copying. | ECMA-334 7th edition, clause 15.6.2 |
 | Verbatim identifiers | In progress | 196 of 198, 98% | Prefix identifiers with @ to use keywords as names. | ECMA-334 7th edition, clause 6.4.3 |
 | Verbatim string literals | Complete | 4 of 4, 100% | Write multiline strings that preserve backslashes and escape quotes by doubling. | ECMA-334 7th edition, clause 6.4.5.6 |
@@ -264,13 +264,13 @@ The last column counts every suite test that runs at that version, whichever fea
 | Delegate covariance and contravariance | In progress | 2 of 9, 22% | Bind delegate targets with compatible reference return and parameter types. | ECMA-334 7th edition, clause 10.8 |
 | Extern aliases | In progress | 1 of 4, 25% | Disambiguate namespaces from separately aliased referenced assemblies. | ECMA-334 7th edition, clause 14.4 |
 | Fixed-size buffers | In progress | 18 of 39, 46% | Embed fixed-length primitive buffers inside unsafe structs. | ECMA-334 7th edition, clause 23.8 |
-| Generic classes | In progress | 27 of 42, 64% | Declare classes parameterized by one or more types. | ECMA-334 7th edition, clauses 15.2.3, 8.4 |
+| Generic classes | In progress | 28 of 42, 66% | Declare classes parameterized by one or more types. | ECMA-334 7th edition, clauses 15.2.3, 8.4 |
 | Generic delegates | No tests yet |  | Declare callable types parameterized by one or more types. | ECMA-334 3rd edition, clause 25.4 |
 | Generic interfaces | No tests yet |  | Declare contracts parameterized by one or more types. | ECMA-334 3rd edition, clause 25.3 |
 | Generic method type inference | In progress | 11 of 17, 64% | Infer generic method arguments from supplied argument types. | ECMA-334 7th edition, clause 12.6.3 |
 | Generic methods | No tests yet |  | Declare methods with their own type parameters. | ECMA-334 3rd edition, clause 25.6 |
 | Generic structs | No tests yet |  | Declare value types parameterized by one or more types. | ECMA-334 3rd edition, clause 25.2 |
-| Generic type constraints | In progress | 47 of 106, 44% | Restrict type arguments by base types, interfaces, class, struct, or new(). | ECMA-334 7th edition, clauses 15.2.5, 8.4.5 |
+| Generic type constraints | In progress | 57 of 106, 53% | Restrict type arguments by base types, interfaces, class, struct, or new(). | ECMA-334 7th edition, clauses 15.2.5, 8.4.5 |
 | Hidden line directives | In progress | 11 of 35, 31% | Hide debugger sequence points using #line hidden. | ECMA-334 7th edition, clause 6.5.8 |
 | Iterators | In progress | 2 of 67, 2% | Produce enumerable sequences incrementally using yield return and yield break. | ECMA-334 7th edition, clauses 15.14, 13.15 |
 | Lifted operators | In progress | 2 of 4, 50% | Apply supported operators to nullable value operands. | ECMA-334 7th edition, clause 12.4.8 |
@@ -285,7 +285,7 @@ The last column counts every suite test that runs at that version, whichever fea
 | Partial types | Complete | 9 of 9, 100% | Split class, struct, or interface declarations across source locations. | ECMA-334 7th edition, clause 15.2.7 |
 | Pragma checksum directives | More tests required | 2 of 2, 100% | Specify external source-document checksums with #pragma checksum. | ECMA-334 7th edition, clause 6.5.9 |
 | Pragma warning directives | Complete | 2 of 2, 100% | Disable or restore compiler warnings with #pragma warning. | ECMA-334 7th edition, clause 6.5.9 |
-| Sizeof in safe code | In progress | 2 of 4, 50% | Use sizeof for predefined unmanaged types outside unsafe contexts. | ECMA-334 7th edition, clause 23.6.9 |
+| Sizeof in safe code | In progress | 3 of 4, 75% | Use sizeof for predefined unmanaged types outside unsafe contexts. | ECMA-334 7th edition, clause 23.6.9 |
 | Static classes | In progress | 9 of 22, 40% | Declare types containing only static members and prohibit instantiation. | ECMA-334 7th edition, clause 15.2.2.4 |
 | Switch on Boolean values | In progress | 14 of 15, 93% | Use true and false as switch case labels. | ECMA-334 7th edition, clause 13.8.3 |
 | Switch on nullable values | In progress | 14 of 15, 93% | Use nullable switch operands and match null with a case label. | ECMA-334 7th edition, clause 13.8.3 |
@@ -303,8 +303,8 @@ The last column counts every suite test that runs at that version, whichever fea
 | Expression trees | Not yet | 0 of 1, 0% | Convert supported lambdas into inspectable expression-tree objects. | ECMA-334 7th edition, clause 8.6 |
 | Extension methods | Not yet | 0 of 9, 0% | Invoke static methods as instance-style calls through a this parameter. | ECMA-334 7th edition, clause 15.6.10 |
 | Implicitly typed arrays | In progress | 19 of 28, 67% | Infer an array's element type from its initializer values. | ECMA-334 7th edition, clause 12.8.16.5 |
-| Implicitly typed local variables | In progress | 41 of 63, 65% | Infer local variable types using var and an initializer. | ECMA-334 7th edition, clauses 13.6.2, 13.9.5 |
-| Lambda expressions | In progress | 24 of 51, 47% | Write anonymous functions using =>. | ECMA-334 7th edition, clause 12.19 |
+| Implicitly typed local variables | In progress | 45 of 63, 71% | Infer local variable types using var and an initializer. | ECMA-334 7th edition, clauses 13.6.2, 13.9.5 |
+| Lambda expressions | In progress | 25 of 51, 49% | Write anonymous functions using =>. | ECMA-334 7th edition, clause 12.19 |
 | Object initializers | In progress | 6 of 9, 66% | Assign accessible members when constructing an object. | ECMA-334 7th edition, clause 12.8.16.3 |
 | Partial methods | In progress | 27 of 34, 79% | Declare optional private void hooks whose unused calls can disappear. | ECMA-334 7th edition, clause 15.6.9 |
 | Query expressions | In progress | 8 of 33, 24% | Express filtering, projection, ordering, grouping, joins, and continuations with query syntax. | ECMA-334 7th edition, clause 12.20 |
@@ -313,7 +313,7 @@ The last column counts every suite test that runs at that version, whichever fea
 
 | feature | status | suite tests passed | what it is | specification |
 |---|---|---|---|---|
-| Dynamic binding | In progress | 7 of 14, 50% | Resolve selected operations at runtime using dynamic. | ECMA-334 7th edition, clauses 8.7, 12.3.3 |
+| Dynamic binding | In progress | 9 of 14, 64% | Resolve selected operations at runtime using dynamic. | ECMA-334 7th edition, clauses 8.7, 12.3.3 |
 | Generic covariance and contravariance | In progress | 35 of 44, 79% | Permit compatible conversions between variant generic interfaces and delegates. | ECMA-334 7th edition, clauses 18.2.3, 20.2 |
 | Named arguments | In progress | 19 of 22, 86% | Identify call arguments by their parameter names. | ECMA-334 7th edition, clause 12.6.2 |
 | Optional parameters | In progress | 63 of 86, 73% | Declare default parameter values used when arguments are omitted. | ECMA-334 7th edition, clause 15.6.2 |
@@ -322,7 +322,7 @@ The last column counts every suite test that runs at that version, whichever fea
 
 | feature | status | suite tests passed | what it is | specification |
 |---|---|---|---|---|
-| Asynchronous functions | In progress | 39 of 70, 55% | Suspend async methods or anonymous functions using await. | ECMA-334 7th edition, clauses 15.15, 12.9.8 |
+| Asynchronous functions | In progress | 51 of 70, 72% | Suspend async methods or anonymous functions using await. | ECMA-334 7th edition, clauses 15.15, 12.9.8 |
 | Caller information attributes | Not yet | 0 of 28, 0% | Supply caller member names, file paths, or line numbers to optional parameters. | ECMA-334 7th edition, clause 22.5.5 |
 
 ## C# 6.0
@@ -335,7 +335,7 @@ The last column counts every suite test that runs at that version, whichever fea
 | Exception filters | In progress | 24 of 31, 77% | Select catch clauses using when expressions before stack unwinding. | ECMA-334 7th edition, clause 13.11 |
 | Expression-bodied conversion operators | No tests yet |  | Define conversion bodies with a single expression. | ECMA-334 6th edition, clause 14.10.1 |
 | Expression-bodied indexers | In progress | 62 of 78, 79% | Define indexer getters directly using =>. | ECMA-334 7th edition, clause 15.9 |
-| Expression-bodied methods | In progress | 66 of 90, 73% | Define method bodies with a single expression. | ECMA-334 7th edition, clause 15.6.1 |
+| Expression-bodied methods | In progress | 68 of 90, 75% | Define method bodies with a single expression. | ECMA-334 7th edition, clause 15.6.1 |
 | Expression-bodied operators | No tests yet |  | Define operator bodies with a single expression. | ECMA-334 6th edition, clause 14.10.1 |
 | Expression-bodied read-only properties | In progress | 25 of 31, 80% | Define property getters directly using =>. | ECMA-334 7th edition, clause 15.7.1 |
 | Extension Add methods in collection initializers | In progress | 6 of 8, 75% | Use extension Add methods when processing collection initializer elements. | ECMA-334 7th edition, clause 12.8.16.4 |
@@ -353,7 +353,7 @@ The last column counts every suite test that runs at that version, whichever fea
 | feature | status | suite tests passed | what it is | specification |
 |---|---|---|---|---|
 | Binary integer literals | Complete | 43 of 43, 100% | Write integers in base two using a 0b prefix. | ECMA-334 7th edition, clause 6.4.5.3 |
-| Constant patterns | In progress | 3 of 7, 42% | Match values against constants, including null. | ECMA-334 7th edition, clause 11.2.3 |
+| Constant patterns | In progress | 5 of 7, 71% | Match values against constants, including null. | ECMA-334 7th edition, clause 11.2.3 |
 | Declaration patterns | In progress | 10 of 11, 90% | Test a value's type and introduce a typed variable. | ECMA-334 7th edition, clause 11.2.2 |
 | Deconstruction | In progress | 5 of 7, 71% | Extract tuple or Deconstruct results into separately assigned variables. | ECMA-334 7th edition, clause 12.7 |
 | Digit separators | Complete | 53 of 53, 100% | Separate digits in numeric literals with underscores. | ECMA-334 7th edition, clauses 6.4.5.3, 6.4.5.4 |
@@ -362,11 +362,11 @@ The last column counts every suite test that runs at that version, whichever fea
 | Expression-bodied constructors | In progress | 66 of 82, 80% | Define instance or static constructor bodies using =>. | ECMA-334 7th edition, clauses 15.11.1, 15.12 |
 | Expression-bodied finalizers | In progress | 21 of 28, 75% | Define finalizer bodies using =>. | ECMA-334 7th edition, clause 15.13 |
 | Generalized async return types | In progress | 15 of 24, 62% | Return task-like types implementing the async builder pattern. | ECMA-334 7th edition, clause 15.15.2 |
-| Local functions | Not yet | 0 of 28, 0% | Declare named functions inside another function body. | ECMA-334 7th edition, clause 13.6.4 |
+| Local functions | In progress | 19 of 28, 67% | Declare named functions inside another function body. | ECMA-334 7th edition, clause 13.6.4 |
 | Out variable declarations | In progress | 10 of 11, 90% | Declare explicitly or implicitly typed variables within out arguments. | ECMA-334 7th edition, clause 12.17 |
 | Pattern matching in switch statements | In progress | 26 of 34, 76% | Select switch sections using patterns and optional when guards. | ECMA-334 7th edition, clause 13.8.3 |
-| Ref locals | In progress | 3 of 6, 50% | Keep references to existing storage in local variables. | ECMA-334 7th edition, clause 13.6.2.4 |
-| Ref returns | In progress | 169 of 229, 73% | Return references to storage from methods, delegates, properties, or indexers. | ECMA-334 7th edition, clauses 15.6.1, 15.7.1, 15.9.1, 20.2, 12.19.1 |
+| Ref locals | In progress | 4 of 6, 66% | Keep references to existing storage in local variables. | ECMA-334 7th edition, clause 13.6.2.4 |
+| Ref returns | In progress | 171 of 229, 74% | Return references to storage from methods, delegates, properties, or indexers. | ECMA-334 7th edition, clauses 15.6.1, 15.7.1, 15.9.1, 20.2, 12.19.1 |
 | Throw expressions | In progress | 6 of 9, 66% | Use throw within supported expression contexts. | ECMA-334 7th edition, clause 12.16 |
 | Tuple conversions | In progress | 5 of 7, 71% | Convert tuples element by element between compatible tuple types. | ECMA-334 7th edition, clauses 10.2.13, 10.3.6 |
 | Tuple types and expressions | In progress | 22 of 27, 81% | Represent ordered heterogeneous values with optional element names. | ECMA-334 7th edition, clauses 8.3.11, 12.8.6 |
@@ -376,7 +376,7 @@ The last column counts every suite test that runs at that version, whichever fea
 
 | feature | status | suite tests passed | what it is | specification |
 |---|---|---|---|---|
-| Async Main | In progress | 20 of 30, 66% | Use task-returning Main methods as executable entry points. | ECMA-334 7th edition, clause 7.1 |
+| Async Main | In progress | 21 of 27, 77% | Use task-returning Main methods as executable entry points. | ECMA-334 7th edition, clause 7.1 |
 | Default literal expressions | In progress | 5 of 7, 71% | Infer the type of a default value from its context. | ECMA-334 7th edition, clause 12.8.20 |
 | Inferred tuple element names | In progress | 7 of 14, 50% | Infer tuple element names from source variables or member accesses. | ECMA-334 7th edition, clause 12.8.6 |
 | Pattern matching with generic type parameters | In progress | 10 of 12, 83% | Match values whose static type is a generic type parameter. | ECMA-334 7th edition, clause 11.2.2 |
@@ -389,29 +389,29 @@ The last column counts every suite test that runs at that version, whichever fea
 | In parameters | In progress | 13 of 17, 76% | Pass values by readonly reference using in. | ECMA-334 7th edition, clause 15.6.2.3 |
 | Leading digit separators | Complete | 45 of 45, 100% | Place underscores after binary or hexadecimal integer prefixes. | ECMA-334 7th edition, clause 6.4.5.3 |
 | Non-trailing named arguments | In progress | 10 of 11, 90% | Allow positional arguments after correctly positioned named arguments. | ECMA-334 7th edition, clause 12.6.2.2 |
-| Private protected access | In progress | 37 of 38, 97% | Permit member access only to derived types within the assembly. | ECMA-334 7th edition, clause 7.5.2 |
+| Private protected access | Complete | 38 of 38, 100% | Permit member access only to derived types within the assembly. | ECMA-334 7th edition, clause 7.5.2 |
 | Readonly structs | In progress | 7 of 12, 58% | Declare structs whose instance fields and behavior preserve readonly semantics. | ECMA-334 7th edition, clause 16.2.2 |
 | Ref extension methods | Not yet | 0 of 14, 0% | Pass struct extension-method receivers by writable or readonly reference. | ECMA-334 7th edition, clause 15.6.10 |
-| Ref readonly locals | In progress | 4 of 9, 44% | Keep readonly references to existing storage in local variables. | ECMA-334 7th edition, clause 13.6.2.4 |
-| Ref readonly returns | In progress | 167 of 217, 76% | Return readonly references from methods, delegates, properties, or indexers. | ECMA-334 7th edition, clauses 15.6.1, 15.7.1, 15.9.1, 20.2 |
-| Ref structs | In progress | 9 of 17, 52% | Declare stack-confined structs that cannot become ordinary heap objects. | ECMA-334 7th edition, clause 16.2.3 |
+| Ref readonly locals | In progress | 6 of 9, 66% | Keep readonly references to existing storage in local variables. | ECMA-334 7th edition, clause 13.6.2.4 |
+| Ref readonly returns | In progress | 169 of 217, 77% | Return readonly references from methods, delegates, properties, or indexers. | ECMA-334 7th edition, clauses 15.6.1, 15.7.1, 15.9.1, 20.2 |
+| Ref structs | In progress | 12 of 17, 70% | Declare stack-confined structs that cannot become ordinary heap objects. | ECMA-334 7th edition, clause 16.2.3 |
 | Stackalloc to Span | In progress | 1 of 2, 50% | Convert stackalloc storage to Span<T> without exposing pointers. | ECMA-334 7th edition, clause 23.9 |
 
 ## C# 7.3
 
 | feature | status | suite tests passed | what it is | specification |
 |---|---|---|---|---|
-| Attributes on backing fields | In progress | 20 of 53, 37% | Apply field-targeted attributes to auto-property backing fields. | ECMA-334 7th edition, clause 22.3 |
-| Delegate constraints | In progress | 38 of 106, 35% | Allow System.Delegate or MulticastDelegate as generic base-type constraints. | ECMA-334 7th edition, clause 15.2.5 |
-| Enum constraints | In progress | 38 of 106, 35% | Allow System.Enum as a generic base-type constraint. | ECMA-334 7th edition, clause 15.2.5 |
-| Expression variables in initializers and queries | In progress | 61 of 97, 62% | Allow out variables and patterns in additional initialization and query contexts. | ECMA-334 7th edition, clauses 7.3, 12.20 |
-| Pattern-based fixed statements | In progress | 15 of 41, 36% | Pin types exposing a suitable GetPinnableReference method. | ECMA-334 7th edition, clause 23.7 |
-| Ref for-loop variables | In progress | 40 of 46, 86% | Declare reference variables in a for loop's initializer. | ECMA-334 7th edition, clauses 13.9.4, 13.6.2 |
-| Ref foreach iteration variables | In progress | 26 of 55, 47% | Iterate using writable or readonly references to collection elements. | ECMA-334 7th edition, clause 13.9.5 |
+| Attributes on backing fields | In progress | 23 of 53, 43% | Apply field-targeted attributes to auto-property backing fields. | ECMA-334 7th edition, clause 22.3 |
+| Delegate constraints | In progress | 52 of 106, 49% | Allow System.Delegate or MulticastDelegate as generic base-type constraints. | ECMA-334 7th edition, clause 15.2.5 |
+| Enum constraints | In progress | 52 of 106, 49% | Allow System.Enum as a generic base-type constraint. | ECMA-334 7th edition, clause 15.2.5 |
+| Expression variables in initializers and queries | In progress | 64 of 97, 65% | Allow out variables and patterns in additional initialization and query contexts. | ECMA-334 7th edition, clauses 7.3, 12.20 |
+| Pattern-based fixed statements | In progress | 17 of 41, 41% | Pin types exposing a suitable GetPinnableReference method. | ECMA-334 7th edition, clause 23.7 |
+| Ref for-loop variables | In progress | 43 of 46, 93% | Declare reference variables in a for loop's initializer. | ECMA-334 7th edition, clauses 13.9.4, 13.6.2 |
+| Ref foreach iteration variables | In progress | 30 of 55, 54% | Iterate using writable or readonly references to collection elements. | ECMA-334 7th edition, clause 13.9.5 |
 | Ref reassignment | In progress | 6 of 10, 60% | Rebind a ref local to reference different storage. | ECMA-334 7th edition, clause 12.21.3 |
 | Stackalloc initializers | In progress | 6 of 7, 85% | Initialize stack-allocated storage using explicit or inferred element lists. | ECMA-334 7th edition, clause 23.9 |
 | Tuple equality operators | In progress | 3 of 9, 33% | Compare tuples element by element with == and !=. | ECMA-334 7th edition, clause 12.12.11 |
-| Unmanaged constraints | In progress | 38 of 106, 35% | Require generic type arguments to be unmanaged types. | ECMA-334 7th edition, clause 15.2.5 |
+| Unmanaged constraints | In progress | 52 of 106, 49% | Require generic type arguments to be unmanaged types. | ECMA-334 7th edition, clause 15.2.5 |
 | Unpinned fixed buffer indexing | In progress | 6 of 11, 54% | Index fixed buffers through movable receivers without a fixed statement. | ECMA-334 7th edition, clause 23.8.3 |
 
 ## C# 8.0
@@ -431,20 +431,20 @@ The last column counts every suite test that runs at that version, whichever fea
 | Null constant patterns on pointers | No tests yet |  | Test pointer values for null using a constant pattern. | [compiler source](https://github.com/dotnet/roslyn/blob/67ebca858d83d631030cb1b17d97ae96f7c6a5e8/src/Compilers/CSharp/Portable/Errors/MessageID.cs) |
 | Null-coalescing assignment | No tests yet |  | Assign a fallback value only when the destination is null. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/null-coalescing-assignment.md) |
 | Null-coalescing with unconstrained type parameters | No tests yet |  | Use unconstrained generic values as the left operand of ??. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/unconstrained-null-coalescing.md) |
-| Null-forgiving operator | Complete | 1 of 1, 100% | Suppress nullable flow warnings for an expression using postfix !. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/nullable-reference-types-specification.md) |
+| Null-forgiving operator | Complete | 2 of 2, 100% | Suppress nullable flow warnings for an expression using postfix !. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/nullable-reference-types-specification.md) |
 | Nullable analysis attributes | No tests yet |  | Describe parameter and return nullability contracts recognized by compiler flow analysis. | [Microsoft Learn](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/attributes/nullable-analysis) |
 | Nullable directives | No tests yet |  | Control nullable annotation and warning contexts within source files. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/nullable-reference-types-specification.md) |
-| Nullable reference type constraints | Complete | 1 of 1, 100% | Use class? to allow nullable reference type arguments. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/nullable-reference-types-specification.md) |
-| Nullable reference types | Complete | 1 of 1, 100% | Express reference nullability and receive warnings for potentially unsafe null uses. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/nullable-reference-types-specification.md) |
+| Nullable reference type constraints | Complete | 2 of 2, 100% | Use class? to allow nullable reference type arguments. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/nullable-reference-types-specification.md) |
+| Nullable reference types | Complete | 2 of 2, 100% | Express reference nullability and receive warnings for potentially unsafe null uses. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/nullable-reference-types-specification.md) |
 | Obsolete property accessors | No tests yet |  | Mark individual property accessors obsolete without marking the entire property. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/obsolete-accessor.md) |
 | Pattern-based disposal | No tests yet |  | Dispose ref structs through a suitable Dispose method without implementing IDisposable. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/using.md) |
 | Positional patterns | No tests yet |  | Match values obtained through a type's Deconstruct method. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/patterns.md) |
 | Property patterns | No tests yet |  | Match an object's accessible properties or fields against nested patterns. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/patterns.md) |
 | Ranges | No tests yet |  | Use .. to describe contiguous slices of supported collections. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/ranges.md) |
 | Readonly members | No tests yet |  | Mark individual struct members readonly to prevent changes to instance state. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/readonly-instance-members.md) |
-| Stackalloc in nested expressions | Complete | 1 of 1, 100% | Use stackalloc expressions within additional expression contexts. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/nested-stackalloc.md) |
+| Stackalloc in nested expressions | Complete | 7 of 7, 100% | Use stackalloc expressions within additional expression contexts. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/nested-stackalloc.md) |
 | Static local functions | No tests yet |  | Declare local functions that cannot capture enclosing variables or instance state. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/static-local-functions.md) |
-| Switch expressions | Complete | 3 of 3, 100% | Select an expression result using ordered pattern arms and optional guards. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/patterns.md) |
+| Switch expressions | In progress | 10 of 11, 90% | Select an expression result using ordered pattern arms and optional guards. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/patterns.md) |
 | Tuple patterns | No tests yet |  | Match tuple elements positionally using nested patterns. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/patterns.md) |
 | Unmanaged constructed types | No tests yet |  | Treat suitable constructed generic structs as unmanaged types. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/constructed-unmanaged.md) |
 | Using declarations | No tests yet |  | Dispose local resources when control leaves their containing scope. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/using.md) |
@@ -466,17 +466,17 @@ The last column counts every suite test that runs at that version, whichever fea
 | Logical patterns | No tests yet |  | Combine patterns using and, or, and not. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/patterns3.md) |
 | MemberNotNull attributes | No tests yet |  | Declare member initialization postconditions recognized by nullable flow analysis. | [Microsoft Learn](https://learn.microsoft.com/en-us/dotnet/csharp/language-reference/attributes/nullable-analysis#helper-methods-membernotnull-and-membernotnullwhen) |
 | Module initializers | No tests yet |  | Run designated static methods before other code in their module. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/module-initializers.md) |
-| Native-sized integers | In progress | 288 of 1,479, 19% | Use nint and nuint for integer arithmetic matching the platform pointer size. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/native-integers.md) |
+| Native-sized integers | In progress | 294 of 1,495, 19% | Use nint and nuint for integer arithmetic matching the platform pointer size. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/native-integers.md) |
 | Parenthesized patterns | No tests yet |  | Group patterns explicitly to control combinator precedence. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/patterns3.md) |
 | Record classes | No tests yet |  | Declare reference types with synthesized equality, printing, and optional positional members. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/records.md) |
 | Relational patterns | No tests yet |  | Match values against ordered comparisons with constants. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/patterns3.md) |
 | SkipLocalsInit attribute | No tests yet |  | Request omission of automatic local-storage initialization through a compiler-recognized attribute. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/skip-localsinit.md) |
 | Static anonymous functions | No tests yet |  | Prevent lambdas and anonymous methods from capturing surrounding state. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/static-anonymous-functions.md) |
-| Target-typed conditional expressions | Complete | 4 of 4, 100% | Convert conditional branches using a shared target type. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/target-typed-conditional-expression.md) |
-| Target-typed new expressions | In progress | 5 of 7, 71% | Omit constructed type names when the target provides the type. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/target-typed-new.md) |
+| Target-typed conditional expressions | Complete | 12 of 12, 100% | Convert conditional branches using a shared target type. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/target-typed-conditional-expression.md) |
+| Target-typed new expressions | In progress | 6 of 11, 54% | Omit constructed type names when the target provides the type. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/target-typed-new.md) |
 | Top-level statements | No tests yet |  | Write an executable entry point directly at compilation-unit scope. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/top-level-statements.md) |
 | Type patterns | No tests yet |  | Match a type without declaring a pattern variable. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/patterns3.md) |
-| Unconstrained type parameter annotations | Complete | 1 of 1, 100% | Annotate unconstrained generic parameters with ? to describe nullable values. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/unconstrained-type-parameter-annotations.md) |
+| Unconstrained type parameter annotations | In progress | 2 of 3, 66% | Annotate unconstrained generic parameters with ? to describe nullable values. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/unconstrained-type-parameter-annotations.md) |
 | With expressions on records | No tests yet |  | Create modified copies of record values using with initializers. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-9.0/records.md) |
 
 ## C# 10.0
@@ -485,7 +485,7 @@ The last column counts every suite test that runs at that version, whichever fea
 |---|---|---|---|---|
 | Attributes on lambdas | No tests yet |  | Attach attributes to lambdas, their parameters, or their return values. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/lambda-improvements.md) |
 | CallerArgumentExpression attribute | Not yet | 0 of 2, 0% | Capture a caller's argument source expression as an optional string parameter. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/caller-argument-expression.md) |
-| Constant interpolated strings | Complete | 1 of 1, 100% | Use interpolation consisting of constant strings in constant expressions. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/constant_interpolated_strings.md) |
+| Constant interpolated strings | Complete | 10 of 10, 100% | Use interpolation consisting of constant strings in constant expressions. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/constant_interpolated_strings.md) |
 | Enhanced line directives | No tests yet |  | Map generated code spans to source line and character positions. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/enhanced-line-directives.md) |
 | Explicit lambda return types | No tests yet |  | Specify a lambda's return type before its parameter list. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/lambda-improvements.md) |
 | Explicit record class declarations | No tests yet |  | Spell record class explicitly when declaring a reference record. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/record-structs.md) |
@@ -493,10 +493,10 @@ The last column counts every suite test that runs at that version, whichever fea
 | File-scoped namespaces | No tests yet |  | Declare a namespace covering the rest of a file using a semicolon. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/file-scoped-namespaces.md) |
 | Global using directives | No tests yet |  | Apply namespace imports, aliases, or static imports throughout a compilation. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/GlobalUsingDirective.md) |
 | Implicit implementation of nonpublic interface members | No tests yet |  | Implement accessible nonpublic interface members without explicit interface qualification. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-8.0/default-interface-methods.md) |
-| Interpolated string handlers | In progress | 6 of 9, 66% | Build interpolated values through compiler-recognized handler constructors and append methods. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/improved-interpolated-strings.md) |
+| Interpolated string handlers | In progress | 12 of 27, 44% | Build interpolated values through compiler-recognized handler constructors and append methods. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/improved-interpolated-strings.md) |
 | Method-level async builders | No tests yet |  | Override the async builder type for an individual method. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/async-method-builders.md) |
 | Mixed deconstruction declarations and assignments | No tests yet |  | Combine newly declared and existing variables in one deconstruction. | [Microsoft Learn](https://learn.microsoft.com/en-us/dotnet/csharp/whats-new/csharp-version-history#c-version-10) |
-| Natural delegate types | In progress | 2 of 7, 28% | Infer delegate types for lambdas and unambiguous method groups without explicit targets. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/lambda-improvements.md) |
+| Natural delegate types | In progress | 4 of 13, 30% | Infer delegate types for lambdas and unambiguous method groups without explicit targets. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/lambda-improvements.md) |
 | Parameterless struct constructors | No tests yet |  | Declare public parameterless instance constructors on structs. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/parameterless-struct-constructors.md) |
 | Record positional fields | No tests yet |  | Use existing fields to represent matching positional record parameters. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/record-structs.md) |
 | Record structs | No tests yet |  | Declare value types with synthesized equality, printing, and optional positional members. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-10.0/record-structs.md) |
@@ -526,7 +526,7 @@ The last column counts every suite test that runs at that version, whichever fea
 | Scoped references and values | In progress | 1 of 3, 33% | Limit parameter or local reference lifetimes explicitly using scoped. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-11.0/low-level-struct-improvements.md) |
 | Slice patterns | No tests yet |  | Match variable-length portions inside list patterns using two dots. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-11.0/list-patterns.md) |
 | Span character constant patterns | No tests yet |  | Match Span<char> or ReadOnlySpan<char> values against constant string patterns. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-11.0/pattern-match-span-of-char-on-string.md) |
-| Static abstract interface members | In progress | 1 of 3, 33% | Declare static contracts callable through constrained type parameters. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-11.0/static-abstracts-in-interfaces.md) |
+| Static abstract interface members | In progress | 6 of 20, 30% | Declare static contracts callable through constrained type parameters. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-11.0/static-abstracts-in-interfaces.md) |
 | Static virtual interface members | No tests yet |  | Provide overridable default static implementations in interfaces. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-11.0/static-abstracts-in-interfaces.md) |
 | UnscopedRef attribute | No tests yet |  | Override default reference escape restrictions on supported members or parameters. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-11.0/low-level-struct-improvements.md) |
 | Unsigned right shift | No tests yet |  | Shift integer bits right with zero extension using >>> or >>>=. | [proposal](https://github.com/dotnet/csharplang/blob/0df79080bfbd3d0120ad1904ed0a662fd69be6b9/proposals/csharp-11.0/unsigned-right-shift-operator.md) |

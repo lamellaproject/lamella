@@ -7,6 +7,8 @@
 kind = "board"
 board = "arduino-zero"
 vendor = "arduino"
+maker = "Arduino"
+product = "Zero"
 family = "samd21"
 part = "atsamd21g18a"
 product_model = 12

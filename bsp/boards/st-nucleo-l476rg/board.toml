@@ -5,6 +5,8 @@
 kind = "board"
 board = "st-nucleo-l476rg"
 vendor = "st"
+maker = "STMicroelectronics"
+product = "NUCLEO-L476RG"
 family = "stm32l476"
 part = "stm32l476rg"
 product_model = 8           # lamella_wire::product_model::STM32L476

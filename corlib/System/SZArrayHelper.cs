@@ -27,6 +27,16 @@ namespace System
             return true;
         }
 
+        internal static T get_Item(T[] array, int index)
+        {
+            T[] vector = Vector(array);
+            if ((uint)index >= (uint)vector.Length)
+            {
+                throw new ArgumentOutOfRangeException("index", "Index was out of range. Must be non-negative and less than the size of the collection.");
+            }
+            return vector[index];
+        }
+
         internal static void Add(T[] array, T item)
         {
             throw new NotSupportedException("Collection was of a fixed size.");

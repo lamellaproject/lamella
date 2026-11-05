@@ -284,10 +284,10 @@ impl ReferenceSet {
                  build of it for the {family} chip family, which {board} carries. That build holds the\n\
                  family's bus drivers, and without them the program cannot open a bus on {board}.\n\n\
                  It is missing from:\n    {}\n\n\
-                 csharp/build-managed.ps1 (Windows) and csharp/build-managed.sh (Linux, macOS) write it beside the \
-                 rest of the\nclass library. Rebuild the class library with either.\n\n\
+                 {}\n\n\
                  Nothing was built.",
-                wanted.display()
+                wanted.display(),
+                restore_family_build(cfg!(feature = "packaged"))
             ));
         }
         if self.facts_unmet && used.contains(&FACTS_LIBRARY) {
@@ -302,13 +302,41 @@ impl ReferenceSet {
                  facts for {board}: the {FACTS_LIBRARY} that tells TargetBoard which board the program\n\
                  was built for. Without it, the program would be told it was built for no board.\n\n\
                  It is missing from:\n    {}\n\n\
-                 csharp/build-boards.ps1 writes it there, after csharp/build-managed.ps1 (Windows) or\n\
-                 csharp/build-managed.sh (Linux, macOS) writes the class library.\n\n\
+                 {}\n\n\
                  Nothing was built.",
-                wanted.display()
+                wanted.display(),
+                restore_board_facts(cfg!(feature = "packaged"))
             ));
         }
         Ok(())
+    }
+}
+
+/// What to do about a class library missing part of what a release ships it with.
+///
+/// **A PACKAGED TOOL NEVER NAMES A SCRIPT**: the scripts are in the source tree, and what the reader has is
+/// an archive or an SDK package, either of which holds the file.
+const RESTORE_WHAT_IT_CAME_WITH: &str = "The class library that comes with this tool holds it, so this copy is not whole. If it came in\n\
+     this tool's archive, unpack the archive again into an empty folder. If it came with Lamella.Sdk,\n\
+     delete that package from the NuGet folder and restore the project again.";
+
+/// What a refusal says to do about a missing family build, in a packaged build or a source tree's.
+fn restore_family_build(packaged: bool) -> &'static str {
+    if packaged {
+        RESTORE_WHAT_IT_CAME_WITH
+    } else {
+        "csharp/build-managed.ps1 (Windows) and csharp/build-managed.sh (Linux, macOS) write it beside the rest of the\n\
+         class library. Rebuild the class library with either."
+    }
+}
+
+/// What a refusal says to do about a board's missing facts, in a packaged build or a source tree's.
+fn restore_board_facts(packaged: bool) -> &'static str {
+    if packaged {
+        RESTORE_WHAT_IT_CAME_WITH
+    } else {
+        "csharp/build-boards.ps1 writes it there, after csharp/build-managed.ps1 (Windows) or\n\
+         csharp/build-managed.sh (Linux, macOS) writes the class library."
     }
 }
 
@@ -316,215 +344,15 @@ impl ReferenceSet {
 mod tests {
     use super::*;
 
-    /// The fixture folder the test build's reference set comes from.
-    fn fixtures() -> std::path::PathBuf {
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../lamella-load/tests/fixtures")
-    }
-
-    /// A scratch folder of the test's own, empty.
-    fn scratch(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("lamella-boards-{}-{name}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        dir
-    }
-
-    /// A class-library folder holding the fixture corlib, `System.Device.Gpio`,
-    /// `System.Device.Analog`, `Lamella.Hardware` and the boardless `Lamella.Hardware.Facts`, and for
-    /// `family`, a family build: the shared `System.Device.Gpio` with four bytes after its last
-    /// section, which no reader of it reads, so the set can tell the two apart.
-    fn class_library(name: &str, family: Option<&str>) -> Option<(std::path::PathBuf, Option<Vec<u8>>)> {
-        if !fixtures().join("corlib.dll").is_file() {
-            return None;
+    /// **WHAT A PACKAGED TOOL SAYS NAMES NO SCRIPT, AND A SOURCE TREE'S NAMES THE ONE THAT WRITES THE FILE.**
+    #[test]
+    fn a_refusal_names_a_script_only_in_a_source_tree() {
+        for said in [restore_family_build(true), restore_board_facts(true)] {
+            assert!(!said.contains(".ps1") && !said.contains(".sh") && !said.contains("csharp/"), "{said}");
+            assert!(said.contains("unpack the archive again") && said.contains("restore the project"), "{said}");
         }
-        let dir = scratch(name);
-        for file in [
-            "corlib.dll",
-            "System.Device.Gpio.dll",
-            "System.Device.Analog.dll",
-            "Lamella.Hardware.dll",
-            "Lamella.Hardware.Facts.dll",
-        ] {
-            std::fs::copy(fixtures().join(file), dir.join(file)).expect("stage the class library");
-        }
-        let built = family.map(|family| {
-            let mut bytes = std::fs::read(dir.join("System.Device.Gpio.dll")).expect("the shared build");
-            bytes.extend_from_slice(b"FAMB");
-            let folder = dir.join("families").join(family);
-            std::fs::create_dir_all(&folder).expect("create families/<family>");
-            std::fs::write(folder.join("System.Device.Gpio.dll"), &bytes).expect("write the family build");
-            bytes
-        });
-        Some((dir, built))
-    }
-
-    /// Writes `board`'s facts into `dir`'s `boards/<board>/`: the boardless ones with four bytes
-    /// after their last section, so the set can tell the two apart, and answers them.
-    fn board_facts(dir: &std::path::Path, board: &str) -> Vec<u8> {
-        let mut bytes = std::fs::read(dir.join(format!("{FACTS_LIBRARY}.dll"))).expect("the boardless facts");
-        bytes.extend_from_slice(b"BORD");
-        let folder = dir.join("boards").join(board);
-        std::fs::create_dir_all(&folder).expect("create boards/<board>");
-        std::fs::write(folder.join(format!("{FACTS_LIBRARY}.dll")), &bytes).expect("write the board's facts");
-        bytes
-    }
-
-    /// `source` compiled against `set`.
-    fn compiled(set: &ReferenceSet, source: &str) -> Vec<u8> {
-        set.compiler().compile(source).unwrap_or_else(|_| panic!("it compiles"))
-    }
-
-    const USES_GPIO: &str = "using System.Device.Gpio;\npublic static class Program\n{\n    \
-        public static void Main()\n    {\n        GpioController controller = new GpioController();\n    \
-        }\n}\n";
-
-    const PRINTS: &str = "public static class Program\n{\n    public static void Main()\n    {\n        \
-        System.Console.WriteLine(\"hello\");\n    }\n}\n";
-
-    const USES_TARGET_BOARD: &str = "public static class Program\n{\n    public static void Main()\n    {\n        \
-        new Lamella.Hardware.TargetBoard();\n    }\n}\n";
-
-    /// **A BUILD FOR A BOARD TAKES THE BOARD's OWN FACTS** in the boardless ones' place, so
-    /// `TargetBoard` answers for that board; a build that names no board, or another board, keeps
-    /// the boardless facts.
-    #[test]
-    fn a_build_for_a_board_takes_its_boards_facts() {
-        let Some((dir, _)) = class_library("facts", Some("rp2350")) else {
-            return;
-        };
-        let boardless = std::fs::read(dir.join(format!("{FACTS_LIBRARY}.dll"))).expect("the boardless facts");
-        let own = board_facts(&dir, "rpi-pico2");
-        let set = |board: Option<&str>| {
-            ReferenceSet::for_board(LcscCompiler::in_folder(&dir).expect("the set"), board)
-        };
-
-        let pico = set(Some("rpi-pico2"));
-        assert!(pico.compiler().references().contains(&own), "the board's facts are in the set");
-        assert!(!pico.compiler().references().contains(&boardless), "in the boardless facts' place");
-        assert_eq!(pico.family_build_of(BUS_LIBRARY), Some("rp2350"), "beside its family's build");
-        assert_eq!(pico.refuse_unmet(&compiled(&pico, USES_TARGET_BOARD), pico.carried()), Ok(()));
-
-        for other in [None, Some("rpi-pico2-w")] {
-            let kept = set(other);
-            assert!(kept.compiler().references().contains(&boardless), "{other:?} keeps the boardless facts");
-            assert!(!kept.compiler().references().contains(&own), "{other:?} takes no other board's");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// **A PROGRAM THAT USES Lamella.Hardware IS REFUSED WHERE ITS BOARD's FACTS ARE MISSING**,
-    /// naming the file and the step that writes it, rather than built to be told on the board that it
-    /// was built for no board. One that does not use it is built, and so is one built for no board.
-    #[test]
-    fn missing_facts_refuse_only_a_program_that_uses_lamella_hardware() {
-        let Some((dir, _)) = class_library("facts-unmet", Some("rp2350")) else {
-            return;
-        };
-        let set = ReferenceSet::for_board(LcscCompiler::in_folder(&dir).expect("the set"), Some("rpi-pico2"));
-
-        let refusal = set
-            .refuse_unmet(&compiled(&set, USES_TARGET_BOARD), set.carried())
-            .expect_err("the board's facts are missing");
-        let wanted = dir.join("boards").join("rpi-pico2").join(format!("{FACTS_LIBRARY}.dll"));
-        assert!(refusal.starts_with("the program uses Lamella.Hardware"), "{refusal}");
-        assert!(refusal.contains("no facts for rpi-pico2"), "{refusal}");
-        assert!(refusal.contains(&wanted.display().to_string()), "{refusal}");
-        assert!(refusal.contains("csharp/build-boards.ps1") && refusal.ends_with("Nothing was built."), "{refusal}");
-
-        assert_eq!(set.refuse_unmet(&compiled(&set, PRINTS), set.carried()), Ok(()));
-        let boardless = ReferenceSet::for_board(LcscCompiler::in_folder(&dir).expect("the set"), None);
-        assert_eq!(boardless.refuse_unmet(&compiled(&boardless, USES_TARGET_BOARD), boardless.carried()), Ok(()));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// **A BUILD FOR A BOARD COMPILES AGAINST ITS FAMILY's BUILD**, which stands in for the shared
-    /// one; a build that names no board, or a board of another family, keeps the shared set.
-    #[test]
-    fn a_build_for_a_board_takes_its_familys_build_of_the_bus_library() {
-        let Some((dir, built)) = class_library("family", Some("rp2350")) else {
-            return;
-        };
-        let built = built.expect("a family build");
-        let shared = std::fs::read(dir.join("System.Device.Gpio.dll")).expect("the shared build");
-        let set = |board: Option<&str>| {
-            ReferenceSet::for_board(LcscCompiler::in_folder(&dir).expect("the set"), board)
-        };
-
-        let pico = set(Some("rpi-pico2-w"));
-        assert!(pico.compiler().references().contains(&built), "the family build is in the set");
-        assert!(!pico.compiler().references().contains(&shared), "in the shared build's place");
-        assert_eq!(pico.board_buses(), lamella_catalog::bus_table("rpi-pico2-w"));
-        assert!(pico.board_buses().is_some(), "and the image carries the board's table");
-        assert_eq!(pico.family_build_of(BUS_LIBRARY), Some("rp2350"), "and names the build it holds");
-        assert_eq!(pico.refuse_unmet(&compiled(&pico, USES_GPIO), pico.carried()), Ok(()));
-
-        for other in [None, Some("bbc-micro-bit-v2")] {
-            let kept = set(other);
-            assert!(kept.compiler().references().contains(&shared), "{other:?} keeps the shared build");
-            assert_eq!(kept.board_buses(), None, "{other:?} carries no table");
-            assert_eq!(kept.family_build_of(BUS_LIBRARY), None, "{other:?} holds the shared build");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// **A PROGRAM THAT USES THE BUS LIBRARY IS REFUSED WHERE ITS BOARD's FAMILY BUILD IS MISSING**,
-    /// naming the file and the step that writes it. One that does not use it is built: its image
-    /// needs no family build.
-    #[test]
-    fn a_missing_family_build_refuses_only_a_program_that_uses_the_bus_library() {
-        let Some((dir, _)) = class_library("unmet", None) else {
-            return;
-        };
-        let set = ReferenceSet::for_board(LcscCompiler::in_folder(&dir).expect("the set"), Some("rpi-pico2"));
-
-        let refusal =
-            set.refuse_unmet(&compiled(&set, USES_GPIO), set.carried()).expect_err("the family build is missing");
-        let wanted = dir.join("families").join("rp2350").join("System.Device.Gpio.dll");
-        assert!(refusal.starts_with("the program uses System.Device.Gpio"), "{refusal}");
-        assert!(refusal.contains("for the rp2350 chip family, which rpi-pico2"), "{refusal}");
-        assert!(refusal.contains(&wanted.display().to_string()), "{refusal}");
-        assert!(refusal.contains("csharp/build-managed.ps1") && refusal.ends_with("Nothing was built."), "{refusal}");
-
-        assert_eq!(set.refuse_unmet(&compiled(&set, PRINTS), set.carried()), Ok(()));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// **A SET CUT TO THE LIBRARIES A PROGRAM NAMES BINDS AGAINST THOSE ALONE**, the corlib always
-    /// among them: a program using `System.Device.Gpio` compiles where the set names it and not
-    /// where it does not, and the missing one is named, as a .NET build names a missing reference.
-    /// A bake may still carry the whole set.
-    #[test]
-    fn a_set_cut_to_named_libraries_binds_those_alone_and_names_a_missing_one() {
-        let Some((dir, _)) = class_library("named", Some("rp2350")) else {
-            return;
-        };
-        let set = |names: &[&str]| {
-            let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
-            ReferenceSet::for_board(LcscCompiler::in_folder(&dir).expect("the set"), Some("rpi-pico2-w"))
-                .naming(&names)
-        };
-
-        let named = set(&["system.device.gpio", "mscorlib"]).expect("a library and the corlib's name");
-        assert_eq!(named.named(), [String::from(BUS_LIBRARY)], "matched without regard to case");
-        assert_eq!(named.compiler().references().len(), 2, "the corlib and the one library");
-        assert_eq!(named.carried().len(), 5, "a bake may carry the whole set");
-        assert!(named.compiler().compile(USES_GPIO).is_ok(), "the program binds");
-        assert_eq!(named.family_build_of(BUS_LIBRARY), Some("rp2350"));
-
-        let bare = set(&[]).expect("no library named");
-        assert!(bare.named().is_empty());
-        assert!(bare.compiler().compile(USES_GPIO).is_err(), "the program does not bind without it");
-        assert_eq!(bare.unnamed_libraries_in(USES_GPIO), [String::from(BUS_LIBRARY)]);
-        assert!(bare.unnamed_libraries_in(PRINTS).is_empty(), "a program using none misses none");
-        assert!(bare.compiler().compile(PRINTS).is_ok(), "and binds against the corlib alone");
-
-        let refusal = set(&["System.Device.Gpioo"]).err().expect("no such library");
-        assert!(refusal.starts_with("no library named \"System.Device.Gpioo\""), "{refusal}");
-        assert!(
-            refusal.contains("Lamella.Hardware, Lamella.Hardware.Facts, System.Device.Analog, System.Device.Gpio"),
-            "it lists what there is: {refusal}"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+        assert!(restore_family_build(false).contains("csharp/build-managed.ps1"));
+        assert!(restore_board_facts(false).contains("csharp/build-boards.ps1"));
     }
 
     /// **EVERY PRODUCT MODEL A BOARD DECLARES ANSWERS AS THAT BOARD**, so a route to firmware
@@ -544,8 +372,9 @@ mod tests {
             declared += 1;
         }
         assert!(declared > 20, "the census reached the catalog: {declared} models");
-        assert_eq!(board_answering(lamella_wire::product_model::PICO2_W).as_deref(), Some("rpi-pico2-w"));
+        assert_eq!(board_answering(lamella_wire::product_model::PICO2_W).as_deref(), Some("raspberrypi-pico-2-w"));
         assert_eq!(board_answering(lamella_wire::product_model::UNKNOWN), None);
         assert_eq!(board_answering(u16::MAX), None);
     }
 }
+

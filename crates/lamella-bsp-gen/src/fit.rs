@@ -220,7 +220,7 @@ mod tests {
     }
 
     fn board_with(memory: Vec<MemoryRegion>) -> BoardTable {
-        BoardTable { board: String::from("rpi-pico"), memory, ..BoardTable::default() }
+        BoardTable { board: String::from("raspberrypi-pico"), memory, ..BoardTable::default() }
     }
 
     fn xip_part() -> PartRow {
@@ -269,7 +269,7 @@ mod tests {
         let verdict = fit(&board_with(Vec::new()), &xip_part(), 100_000);
         match verdict.flash_fit {
             Fit::Unknown { ref missing } => {
-                assert!(missing.contains("rpi-pico"), "names the board: {missing}");
+                assert!(missing.contains("raspberrypi-pico"), "names the board: {missing}");
                 assert!(missing.contains("rp2040"), "and the part: {missing}");
             }
             other => panic!("an unstated budget must not render as a comparison: {other:?}"),
@@ -311,7 +311,7 @@ mod tests {
         let board = board_with(vec![region("flash", "flash", 0x0020_0000)]);
         let verdict = fit(&board, &xip_part(), 100_000);
         assert!(
-            verdict.assumptions.iter().any(|line| line.contains("board 'rpi-pico'")),
+            verdict.assumptions.iter().any(|line| line.contains("board 'raspberrypi-pico'")),
             "the flash assumption names its source: {:?}",
             verdict.assumptions
         );

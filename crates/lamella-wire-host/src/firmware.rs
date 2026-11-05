@@ -55,7 +55,7 @@ impl std::fmt::Display for FirmwareError {
                  well formed and will be answered once that carrier lets go"
             ),
             FirmwareError::Malformed(what) => write!(f, "the target's reply carried no {what}"),
-            FirmwareError::Transport(inner) => write!(f, "{inner:?}"),
+            FirmwareError::Transport(inner) => f.write_str(&crate::link_failure(*inner)),
         }
     }
 }

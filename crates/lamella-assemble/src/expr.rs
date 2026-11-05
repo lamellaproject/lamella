@@ -261,12 +261,25 @@ pub fn emit_expression(
             tokens,
             out,
         ),
-        BoundExprKind::Unary { operator, operand, .. } => {
+        BoundExprKind::Unary { operator, operand, checked } => {
             emit_expression(operand, frame, tokens, out)?;
             emit_unary(*operator, out)?;
+            // Enum complement returns the underlying width (ECMA-334 editions 2/4, 14.6.4).
+            // For sub-int enums, `not` flips a promoted 32-bit stack value; narrowing prevents
+            // its complemented high bits from leaking into the narrow unsigned result.
+            // Editions 1/2 retain the checked context; edition 4 requires unchecked narrowing.
             if *operator == UnaryOperator::Complement {
                 if let Some(underlying) = tokens.enum_underlying(&operand.ty) {
-                    narrow_subint(&TypeSymbol::Special(underlying), out);
+                    match checked_overflow_conversion(underlying, false) {
+                        Some(opcode)
+                            if *checked
+                                && tokens.language_version.enum_complement_uses_checked_context()
+                                && is_subint(underlying) =>
+                        {
+                            out.push(Instruction::simple(opcode));
+                        }
+                        _ => narrow_subint(&TypeSymbol::Special(underlying), out),
+                    }
                 }
             }
             Ok(())
@@ -500,10 +513,15 @@ pub fn emit_expression(
                 out.push(load_i4(0));
                 return Ok(());
             }
-            if is_value_type(&operand.ty, tokens) {
-                let box_token = tokens.instruction_type_token(&operand.ty).ok_or(EmitError::Unsupported(
-                    "boxing a value type for a type test with no metadata token",
-                ))?;
+            // ECMA-335 III.4.6 requires an object reference for isinst. Both value types
+            // and type parameters need box; III.4.1 leaves reference instantiations unchanged.
+            if boxes_to_a_reference(&operand.ty, tokens) {
+                let box_token =
+                    tokens
+                        .instruction_type_token(&operand.ty)
+                        .ok_or(EmitError::Unsupported(
+                            "boxing a type-test operand with no metadata token",
+                        ))?;
                 out.push(Instruction::new(Opcode::Box, Operand::Token(box_token)));
             }
             let token = tokens.instruction_type_token(target).ok_or(EmitError::Unsupported(
@@ -1583,8 +1601,23 @@ fn emit_call(
         _ => None,
     };
     let is_base_call = matches!(receiver, Some(r) if matches!(r.kind, BoundExprKind::Base));
-    let inherited_value_call =
-        matches!(value_type_receiver, Some(ty) if !same_type(&method.declaring_type, ty));
+    // An inherited instance member is named on Object, ValueType or Enum. Edition 2 requires a
+    // boxed receiver; edition 4 uses constrained dispatch. A member declared on the
+    // value type takes its address directly. The comparison normalizes predefined
+    // types such as int against the binder's System.Int32 spelling. The box/callvirt
+    // form also works with first-edition CIL, which has no constrained prefix.
+    let inherited_value_call = !method.is_static
+        && matches!(value_type_receiver, Some(ty) if !same_type(&method.declaring_type, ty));
+    let boxed_receiver = value_type_receiver.filter(|_| {
+        inherited_value_call && tokens.language_version.inherited_object_call_boxes_receiver()
+    });
+    // Where the value type declares the override itself, that override is called on a copy of
+    // the value instead of a boxed copy; see `own_override_target`.
+    let own_override = boxed_receiver.and_then(|_| own_override_target(method, receiver, tokens));
+    let mut receiver_storage = ReceiverStorage::Variable;
+    // An instance call evaluates its receiver first: value types use an address and
+    // reference types use a value. Inherited calls keep that address until arguments
+    // are evaluated, then box at ISO-1 or use constrained dispatch at later versions.
     let mut constrained_token = None;
     if !method.is_static {
         match &callee.kind {
@@ -1597,12 +1630,16 @@ fn emit_call(
                         ),
                     )?);
                 } else if inherited_value_call {
-                    emit_value_type_receiver(receiver, frame, tokens, out)?;
-                    constrained_token = Some(tokens.instruction_type_token(&receiver.ty).ok_or(
-                        EmitError::Unsupported(
-                            "a virtual call on a value type with no metadata token",
-                        ),
-                    )?);
+                    receiver_storage =
+                        emit_value_type_receiver_storage(receiver, frame, tokens, out)?;
+                    if boxed_receiver.is_none() {
+                        constrained_token =
+                            Some(tokens.instruction_type_token(&receiver.ty).ok_or(
+                                EmitError::Unsupported(
+                                    "a virtual call on a value type with no metadata token",
+                                ),
+                            )?);
+                    }
                 } else if value_type_receiver.is_some() {
                     emit_value_type_receiver(receiver, frame, tokens, out)?;
                 } else {
@@ -1613,16 +1650,55 @@ fn emit_call(
         }
     }
     let (fixed_args, extras) = split_vararg_arguments(arguments);
-    for argument in fixed_args {
+    // A temporary only this call holds cannot be written by its arguments, so its value is
+    // already the copy 14.4.3 would make after them, and the arguments need not wait.
+    let copy_after_arguments = boxed_receiver.is_some()
+        && !(own_override.is_some() && receiver_storage == ReceiverStorage::FreshTemporary);
+    let mut argument_slots = Vec::new();
+    for argument in fixed_args.iter().chain(extras.into_iter().flatten()) {
         emit_argument(argument, frame, tokens, out)?;
-    }
-    if let Some(extras) = extras {
-        for element in extras {
-            emit_argument(element, frame, tokens, out)?;
+        if copy_after_arguments {
+            let ty = match &argument.kind {
+                BoundExprKind::Ref { operand, .. } => TypeSymbol::ByRef(Box::new(operand.ty.clone())),
+                _ => argument.ty.clone(),
+            };
+            let slot = frame.reserve_local(&ty);
+            out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
+            argument_slots.push(slot);
         }
     }
-    let token = match method.instantiation.as_deref() {
-        Some(instantiation) => tokens
+    if let Some(receiver_type) = boxed_receiver {
+        // Edition 2, 14.4.3, evaluates arguments before boxing. Keep the receiver's
+        // address across their evaluation so their writes are visible in the copy;
+        // a readonly field or rvalue already has its own temporary receiver storage.
+        if own_override.is_none() {
+            emit_load_indirect(receiver_type, tokens, out)?;
+            let token =
+                tokens
+                    .instruction_type_token(receiver_type)
+                    .ok_or(EmitError::Unsupported(
+                        "boxing an inherited method receiver with no metadata token",
+                    ))?;
+            out.push(Instruction::new(Opcode::Box, Operand::Token(token)));
+        } else if receiver_storage == ReceiverStorage::Variable {
+            // The copy the box would hold, in a temporary only this call names: the override's
+            // writes to `this` reach the copy, never the variable.
+            emit_load_indirect(receiver_type, tokens, out)?;
+            let copy = frame.reserve_local(receiver_type);
+            out.push(Instruction::new(Opcode::Stloc, Operand::Variable(copy)));
+            out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(copy)));
+        }
+        for slot in argument_slots {
+            out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
+        }
+    }
+    let token = match (own_override, method.instantiation.as_deref()) {
+        (Some(value_type), _) => tokens
+            .method(value_type, &method.name, &method.parameters)
+            .ok_or(EmitError::Unsupported(
+                "a value type's own override that the pre-pass did not mint",
+            ))?,
+        (None, Some(instantiation)) => tokens
             .method(
                 &method.declaring_type,
                 &method.name,
@@ -1631,7 +1707,7 @@ fn emit_call(
             .ok_or(EmitError::Unsupported(
                 "a generic call whose instantiation could not be minted",
             ))?,
-        None => {
+        (None, None) => {
             let lookup_params = match extras {
                 Some(extras) => vararg_lookup_params(&method.parameters, extras),
                 None => method.parameters.clone(),
@@ -1648,7 +1724,9 @@ fn emit_call(
                 ))?
         }
     };
-    let opcode = if inherited_value_call || type_parameter_receiver.is_some() {
+    let opcode = if own_override.is_some() {
+        Opcode::Call
+    } else if inherited_value_call || type_parameter_receiver.is_some() {
         Opcode::Callvirt
     } else if method.is_static || value_type_receiver.is_some() || is_base_call {
         Opcode::Call
@@ -2341,6 +2419,41 @@ pub(crate) fn is_value_type(ty: &TypeSymbol, tokens: &Tokens) -> bool {
     }
 }
 
+/// The value type whose OWN override a call of an inherited `object` member is emitted against:
+/// `Some` when the language version invokes that member on a copy of a value receiver and the
+/// receiver's type declares the override itself.
+///
+/// ECMA-334 2nd edition 14.3 leaves overrides out of member lookup, so such a call names the
+/// inherited `object` declaration, and 14.4.3 invokes it on a boxed copy of the value, made after
+/// the arguments are evaluated, through the most derived implementation (17.5.3). A struct is
+/// sealed, so an override it declares IS that implementation, and 14.4.3.1 makes the boxed copy's
+/// variable `this`. Nothing can reach the box once the call returns, so calling the override
+/// directly on a copy of the value, made at the same point, is the same invocation without the
+/// allocation. A member the struct inherits from `System.ValueType`, `System.Enum` or
+/// `System.Object` has no implementation in the struct and keeps the box, and so does a `base`
+/// call, which names its base's member on purpose.
+pub(crate) fn own_override_target<'a>(
+    method: &lamella_binder::MethodReference,
+    receiver: Option<&BoundExpr>,
+    tokens: &'a Tokens,
+) -> Option<&'a TypeSymbol> {
+    let receiver = receiver?;
+    if !tokens
+        .language_version
+        .inherited_object_call_boxes_receiver()
+        || method.is_static
+        || method.instantiation.is_some()
+        || method.declaring_instantiation.is_some()
+        || matches!(receiver.kind, BoundExprKind::Base)
+        || !is_value_type(&receiver.ty, tokens)
+        || tokens.body_type_parameter(&receiver.ty).is_some()
+        || same_type(&method.declaring_type, &receiver.ty)
+    {
+        return None;
+    }
+    tokens.value_override(&receiver.ty, &method.name, &method.parameters)
+}
+
 /// Whether two type symbols denote the same type, treating a predefined `Special`
 /// type and its `System.<Name>` spelling as equal. The binder names a method's
 /// declaring type by its model identity (`System.Int32`) while a value's static type
@@ -2609,14 +2722,36 @@ pub(crate) fn emit_value_type_receiver(
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
+    emit_value_type_receiver_storage(receiver, frame, tokens, out).map(|_| ())
+}
+
+/// Where [`emit_value_type_receiver`] found the storage whose address it pushed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiverStorage {
+    /// A variable, or storage a later read may see: a write through the address is observable.
+    Variable,
+    /// A compiler temporary that holds the receiver's value and is read by nothing else.
+    FreshTemporary,
+}
+
+/// [`emit_value_type_receiver`], saying which kind of storage the address it pushed is. Every
+/// arm but the last addresses a variable, or a temporary a `Sequence` may read again; only the
+/// rvalue spill at the bottom makes a slot that nothing else names.
+fn emit_value_type_receiver_storage(
+    receiver: &BoundExpr,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<ReceiverStorage, EmitError> {
+    const VARIABLE: ReceiverStorage = ReceiverStorage::Variable;
     match &receiver.kind {
-        BoundExprKind::Local(name) => emit_local_address(name, frame, out),
+        BoundExprKind::Local(name) => emit_local_address(name, frame, out).map(|()| VARIABLE),
         BoundExprKind::Temp(index) => {
             let slot = frame
                 .temp_slot(*index)
                 .ok_or(EmitError::Unsupported("a Temp outside its Sequence"))?;
             out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(slot)));
-            Ok(())
+            Ok(VARIABLE)
         }
         BoundExprKind::FieldAccess {
             receiver: container,
@@ -2639,11 +2774,11 @@ pub(crate) fn emit_value_type_receiver(
                 }
                 out.push(Instruction::new(Opcode::Ldflda, Operand::Token(token)));
             }
-            Ok(())
+            Ok(VARIABLE)
         }
         BoundExprKind::This | BoundExprKind::Base => {
             out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
-            Ok(())
+            Ok(VARIABLE)
         }
         BoundExprKind::ElementAccess {
             receiver: pointer,
@@ -2653,6 +2788,7 @@ pub(crate) fn emit_value_type_receiver(
                 return Err(EmitError::Unsupported("a pointer element access with more than one index"));
             };
             emit_pointer_element_address(&receiver.ty, pointer, index, frame, tokens, out)
+                .map(|()| VARIABLE)
         }
         BoundExprKind::ElementAccess {
             receiver: array,
@@ -2675,15 +2811,17 @@ pub(crate) fn emit_value_type_receiver(
                     ))?;
                 out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
             }
-            Ok(())
+            Ok(VARIABLE)
         }
-        BoundExprKind::Dereference { operand } => emit_expression(operand, frame, tokens, out),
+        BoundExprKind::Dereference { operand } => {
+            emit_expression(operand, frame, tokens, out).map(|()| VARIABLE)
+        }
         _ => {
             emit_expression(receiver, frame, tokens, out)?;
             let slot = frame.reserve_local(&receiver.ty);
             out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
             out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(slot)));
-            Ok(())
+            Ok(ReceiverStorage::FreshTemporary)
         }
     }
 }

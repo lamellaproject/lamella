@@ -366,7 +366,7 @@ mod tests {
     #[test]
     fn a_probe_named_by_its_id_with_a_board_is_named_by_its_serial() {
         let attached = two_alike();
-        for named in ["probe:BBBB2222/rpi-pico2", "PROBE:BBBB2222/pimoroni-pico-plus-2", " probe: BBBB2222 /rpi-pico2 "] {
+        for named in ["probe:BBBB2222/raspberrypi-pico-2", "PROBE:BBBB2222/pimoroni-pico-plus-2", " probe: BBBB2222 /raspberrypi-pico-2 "] {
             assert_eq!(serial_named(named), "BBBB2222", "{named:?}");
             assert_eq!(
                 choose(&attached, &Selector::named_or(Some(named), Selector::any())),
@@ -374,8 +374,8 @@ mod tests {
                 "{named:?} selects the probe it lists"
             );
         }
-        assert_eq!(serial_named("probe:/rpi-pico2"), "", "no serial before the board");
-        assert_eq!(serial_named("probe:AB/CD/rpi-pico2"), "AB/CD", "the board is after the last slash");
+        assert_eq!(serial_named("probe:/raspberrypi-pico-2"), "", "no serial before the board");
+        assert_eq!(serial_named("probe:AB/CD/raspberrypi-pico-2"), "AB/CD", "the board is after the last slash");
         assert_eq!(serial_named("AB/CD"), "AB/CD", "a bare serial is the serial, whole");
     }
 

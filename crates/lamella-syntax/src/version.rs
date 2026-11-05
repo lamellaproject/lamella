@@ -13,9 +13,10 @@ use core::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[non_exhaustive]
 pub enum LanguageVersion {
-    /// C# 1.0, as standardized by ECMA-334 1st edition (December 2001).
+    /// C# 1.0 and 1.2, as standardized by ECMA-334 2nd edition (December 2002), which is
+    /// ISO/IEC 23270:2003.
     CSharp1,
-    /// C# 2.0 (ECMA-334 3rd ed). Present only to gate post-1.0 features; not implemented.
+    /// C# 2.0, as standardized by ECMA-334 4th edition (June 2006), which is ISO/IEC 23270:2006.
     CSharp2,
     /// C# 3.0. A gating label only; not implemented.
     CSharp3,
@@ -72,6 +73,66 @@ impl Default for LanguageVersion {
 }
 
 impl LanguageVersion {
+    /// Edition 2, 22.1, requires identical delegate signatures; edition 4, 14.5.10.3,
+    /// permits reference covariance and contravariance in value construction from C# 2.
+    #[must_use]
+    pub const fn delegate_value_allows_reference_variance(self) -> bool {
+        !matches!(self, Self::CSharp1)
+    }
+
+    /// ECMA-334 editions 2/4, 14.5.10.3, C# 3, 7.5.10.5, and C# 4, 7.6.10.5,
+    /// copy a delegate value's invocation list. ECMA-334 edition 5, 12.7.11.6,
+    /// constructs a single-entry wrapper starting with C# 5.
+    #[must_use]
+    pub const fn delegate_value_copies_invocation_list(self) -> bool {
+        matches!(
+            self,
+            Self::CSharp1 | Self::CSharp2 | Self::CSharp3 | Self::CSharp4
+        )
+    }
+
+    /// ECMA-334 edition 2, 14.3 and 14.4.3, boxes inherited Object receivers after arguments.
+    /// Edition 4, 14.4.3, uses the value receiver's storage starting with C# 2.
+    #[must_use]
+    pub const fn inherited_object_call_boxes_receiver(self) -> bool {
+        matches!(self, Self::CSharp1)
+    }
+
+    /// ECMA-334 edition 2, 15.8.4, converts an array's object Current to the iteration type.
+    /// Edition 4, 15.8.4, first converts Current to the array element type starting with C# 2.
+    #[must_use]
+    pub const fn array_foreach_uses_object_current(self) -> bool {
+        matches!(self, Self::CSharp1)
+    }
+
+    /// ECMA-334 edition 2, 15.8.4, falls back to IEnumerable for any incomplete pattern.
+    /// Edition 4, 15.8.4, rejects an invalid enumerator after selecting GetEnumerator.
+    #[must_use]
+    pub const fn foreach_incomplete_pattern_uses_interface(self) -> bool {
+        matches!(self, Self::CSharp1)
+    }
+
+    /// ECMA-334 edition 2, 9.4.4.3, gives zero decimal literals scale zero.
+    /// Edition 4, 9.4.4.3, preserves their apparent scale starting with C# 2.
+    #[must_use]
+    pub const fn decimal_zero_literal_is_normalized(self) -> bool {
+        matches!(self, Self::CSharp1)
+    }
+
+    /// ECMA-334 editions 1 and 2, 14.6.4, preserve an enum complement's conversion context.
+    /// Edition 4, 14.6.4, makes the final conversion unchecked starting with C# 2.
+    #[must_use]
+    pub const fn enum_complement_uses_checked_context(self) -> bool {
+        matches!(self, Self::CSharp1)
+    }
+
+    /// ECMA-334 editions 1 and 2, 14.5.5.2, check a delegate before evaluating arguments.
+    /// Edition 4, 14.5.5.2, evaluates the arguments first starting with C# 2.
+    #[must_use]
+    pub const fn null_delegate_check_precedes_arguments(self) -> bool {
+        matches!(self, Self::CSharp1)
+    }
+
     /// The dialect compiled when no `/langversion` is given: **the lowest rung that permits every
     /// feature this build implements**, derived rather than chosen.
     ///
@@ -696,6 +757,8 @@ pub enum Feature {
     /// feature rather than syntax -- it needs `RequiredMemberAttribute` and an
     /// initialization-safety rule.
     RequiredMembers,
+    /// A user-defined shift operator whose count parameter is not int or int?. C# 11.0.
+    RelaxedShiftOperators,
     /// A digit separator IMMEDIATELY AFTER a base prefix -- `0x_FF`, `0b_1010`. Introduced in
     /// C# 7.2, a full release AFTER separators themselves.
     ///
@@ -962,7 +1025,8 @@ impl Feature {
             | Feature::RefStruct
             | Feature::StackAllocNestedExpressions
             | Feature::StackAllocInitializer => true,
-            Feature::RequiredMembers | Feature::LeadingDigitSeparator => true,
+            Feature::RequiredMembers | Feature::LeadingDigitSeparator
+            | Feature::RelaxedShiftOperators => true,
             Feature::NullConditional => true,
             Feature::NullForgivingOperator => true,
             Feature::NullableReferenceTypes => true,
@@ -1040,7 +1104,7 @@ impl Feature {
     /// Two things keep this honest and they are both compiler-enforced, not remembered: the
     /// exhaustive `match` in `every_feature_is_in_all` fails to compile when a variant is added,
     /// and the length assertion beside it fails until the variant is added HERE too.
-    pub const ALL: [Feature; 99] = [
+    pub const ALL: [Feature; 100] = [
         Feature::Generics,
         Feature::StaticClasses,
         Feature::AnonymousMethods,
@@ -1098,6 +1162,7 @@ impl Feature {
         Feature::FileScopedNamespaces,
         Feature::GlobalUsingDirective,
         Feature::RequiredMembers,
+        Feature::RelaxedShiftOperators,
         Feature::LeadingDigitSeparator,
         Feature::Records,
         Feature::RecordStructs,
@@ -1210,6 +1275,7 @@ impl Feature {
             Feature::FileScopedNamespaces => LanguageVersion::CSharp10,
             Feature::GlobalUsingDirective => LanguageVersion::CSharp10,
             Feature::RequiredMembers => LanguageVersion::CSharp11,
+            Feature::RelaxedShiftOperators => LanguageVersion::CSharp11,
             Feature::DefaultInterfaceImplementation => LanguageVersion::CSharp8,
             Feature::ParameterlessStructConstructor => LanguageVersion::CSharp10,
             Feature::AsyncFunction => LanguageVersion::CSharp5,
@@ -1310,6 +1376,7 @@ impl Feature {
             Feature::FileScopedNamespaces => "file-scoped namespace",
             Feature::GlobalUsingDirective => "global using directive",
             Feature::RequiredMembers => "required members",
+            Feature::RelaxedShiftOperators => "relaxed shift operator",
             Feature::Records => "records",
             Feature::RecordStructs => "record structs",
             Feature::RecordInheritance => "records",
@@ -1491,6 +1558,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn enum_complement_context_changes_at_csharp2() {
+        assert!(LanguageVersion::CSharp1.enum_complement_uses_checked_context());
+        for version in LanguageVersion::ALL_SELECTABLE.into_iter().skip(1) {
+            assert!(!version.enum_complement_uses_checked_context(), "{version:?}");
+        }
+    }
+
+    #[test]
     fn the_default_is_the_lowest_rung_that_admits_everything_built() {
         let expected = Feature::ALL
             .into_iter()
@@ -1648,6 +1723,7 @@ mod tests {
                 | Feature::FileScopedNamespaces
                 | Feature::GlobalUsingDirective
                 | Feature::RequiredMembers
+                | Feature::RelaxedShiftOperators
                 | Feature::LeadingDigitSeparator
                 | Feature::Records
                 | Feature::RecordStructs
@@ -1694,7 +1770,7 @@ mod tests {
         }
         assert_eq!(
             Feature::ALL.len(),
-            99,
+            100,
             "a Feature variant was added without being added to Feature::ALL"
         );
     }

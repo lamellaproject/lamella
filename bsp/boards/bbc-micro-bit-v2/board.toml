@@ -11,6 +11,8 @@
 kind = "board"
 board = "bbc-micro-bit-v2"
 vendor = "bbc"
+maker = "BBC"
+product = "micro:bit v2"
 family = "nrf52833"
 part = "nrf52833"
 product_model = 11          # lamella_wire::product_model::MICROBIT_V2

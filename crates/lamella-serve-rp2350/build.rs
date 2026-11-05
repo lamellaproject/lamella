@@ -206,9 +206,9 @@ fn board() -> &'static str {
     } else if on("PICO_PLUS_2") {
         "pimoroni-pico-plus-2"
     } else if on("CYW43") {
-        "rpi-pico2-w"
+        "raspberrypi-pico-2-w"
     } else {
-        "rpi-pico2"
+        "raspberrypi-pico-2"
     }
 }
 

@@ -10,6 +10,8 @@
 kind = "board"
 board = "st-nucleo-l011k4"
 vendor = "st"
+maker = "STMicroelectronics"
+product = "NUCLEO-L011K4"
 family = "stm32l0"
 part = "stm32l011k4t"
 product_model = 39          # lamella_wire::product_model::NUCLEO_L011K4

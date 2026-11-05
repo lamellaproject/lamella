@@ -23,7 +23,8 @@ official curl distribution of the Mozilla store:
 
 The certificates come from the Mozilla CA certificate store (NSS `certdata.txt`), as curl
 redistributes it in `cacert.pem`. The store is published under the Mozilla Public License 2.0
-(MPL-2.0). This README and the generated file's header record that source.
+(MPL-2.0), so `src/roots.der` and `src/bundle.rs`, which is generated from it, are under the
+MPL-2.0: see `LICENSE-MPL` in this directory, and the notice at the top of `bundle.rs`.
 
 ## Refresh cadence -- IMPORTANT for device longevity
 

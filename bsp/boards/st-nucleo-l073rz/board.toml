@@ -11,6 +11,8 @@
 kind = "board"
 board = "st-nucleo-l073rz"
 vendor = "st"
+maker = "STMicroelectronics"
+product = "NUCLEO-L073RZ"
 family = "stm32l073"
 part = "stm32l073rzt6"
 product_model = 44            # lamella_wire::product_model::NUCLEO_L073RZ

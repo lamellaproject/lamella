@@ -327,9 +327,7 @@ fn in_folder(folder: &Path, triple: &str, board: Option<&str>) -> PathBuf {
 /// built the staticlib works without any setting at all.
 fn candidates(triple: &str, board: Option<&str>, cargo_target_dir: Option<&Path>) -> Vec<PathBuf> {
     let mut paths = Vec::new();
-    if let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
+    for dir in lamella_wire_host::engine::folders_beside_the_executable() {
         paths.push(in_folder(&dir.join("runtime-support"), triple, board));
     }
     let Some(root) = checkout() else {
@@ -367,8 +365,9 @@ fn check(path: PathBuf, bytes: Vec<u8>, triple: &str) -> Result<(PathBuf, Vec<u8
     let archive = lamella_elf::read_archive(&bytes).map_err(|error| {
         format!(
             "{} is not a runtime support archive: {error:?}\n\n\
-             It should be the `.a` staticlib built from tools/runtime/runtime-support for {triple}.",
-            path.display()
+             It should be {}.",
+            path.display(),
+            what_an_archive_is(checkout().is_some(), triple)
         )
     })?;
     let wanted = machine_for(triple);
@@ -387,9 +386,28 @@ fn check(path: PathBuf, bytes: Vec<u8>, triple: &str) -> Result<(PathBuf, Vec<u8
     Ok((path, bytes))
 }
 
+/// What a runtime support archive for `triple` is, in the words a refusal uses: a source tree says what
+/// builds it, and a packaged tool, whose reader has no source tree, says what holds it.
+fn what_an_archive_is(from_a_source_tree: bool, triple: &str) -> String {
+    if from_a_source_tree {
+        format!("the `.a` staticlib built from tools/runtime/runtime-support for {triple}")
+    } else {
+        format!("the archive for {triple} that this tool's own archive and Lamella.Sdk carry, in their runtime-support folders")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A packaged tool's reader has no source tree, so what it says names no path in one.
+    #[test]
+    fn what_an_archive_is_names_the_source_tree_only_from_one() {
+        assert!(what_an_archive_is(true, "t").contains("tools/runtime/runtime-support"));
+        let packaged = what_an_archive_is(false, "t");
+        assert!(!packaged.contains("tools/"), "{packaged}");
+        assert!(packaged.contains("runtime-support folders"), "{packaged}");
+    }
 
     /// An `ar` archive holding one object for `machine`, which is all the machine check reads.
     fn archive_of(machine: lamella_elf::Machine) -> Vec<u8> {
@@ -583,11 +601,11 @@ mod tests {
     #[test]
     fn a_board_build_is_looked_for_under_its_board_and_never_by_the_triple_alone() {
         let redirected = Path::new("F:/build/lamella/target-devtools");
-        let looked = candidates("thumbv8m.main-none-eabi", Some("rpi-pico2"), Some(redirected));
+        let looked = candidates("thumbv8m.main-none-eabi", Some("raspberrypi-pico-2"), Some(redirected));
         assert!(!looked.is_empty());
         for path in &looked {
             assert!(
-                path.components().any(|part| part.as_os_str() == "rpi-pico2"),
+                path.components().any(|part| part.as_os_str() == "raspberrypi-pico-2"),
                 "every place is the board's own: {}",
                 path.display()
             );
@@ -597,7 +615,7 @@ mod tests {
                 path.display()
             );
         }
-        let other = candidates("thumbv8m.main-none-eabi", Some("rpi-pico2-w"), None);
+        let other = candidates("thumbv8m.main-none-eabi", Some("raspberrypi-pico-2-w"), None);
         assert!(
             looked.iter().all(|path| !other.contains(path)),
             "two boards never share a place: {looked:?} and {other:?}"
@@ -719,7 +737,7 @@ mod tests {
         checked.sort_unstable();
         assert_eq!(
             checked,
-            ["pimoroni-pico-plus-2", "pimoroni-pico-plus-2-w", "rpi-pico2", "rpi-pico2-w"],
+            ["pimoroni-pico-plus-2", "pimoroni-pico-plus-2-w", "raspberrypi-pico-2", "raspberrypi-pico-2-w"],
             "the four RP2350 boards take a board build, and each one's console is the ring"
         );
     }
@@ -730,24 +748,24 @@ mod tests {
     #[test]
     fn a_named_folder_is_the_only_place_looked_in() {
         let folder = std::env::temp_dir().join("lamella-tiers-folder");
-        let board_dir = folder.join("thumbv8m.main-none-eabi").join("rpi-pico2");
+        let board_dir = folder.join("thumbv8m.main-none-eabi").join("raspberrypi-pico-2");
         std::fs::create_dir_all(&board_dir).expect("make the folder");
         let archive = board_dir.join(ARCHIVE_NAME);
         std::fs::write(&archive, archive_of(lamella_elf::Machine::Arm)).expect("write the archive");
 
-        let (found, _) = named_runtime_archive("rpi-pico2", "rp2350", None, Some((folder.clone(), FOLDER_ENV)))
+        let (found, _) = named_runtime_archive("raspberrypi-pico-2", "rp2350", None, Some((folder.clone(), FOLDER_ENV)))
             .expect("the board's archive in the folder");
         assert_eq!(found, archive, "it is found under the triple and the board");
 
-        let error = named_runtime_archive("rpi-pico2-w", "rp2350", None, Some((folder.clone(), FOLDER_ENV)))
+        let error = named_runtime_archive("raspberrypi-pico-2-w", "rp2350", None, Some((folder.clone(), FOLDER_ENV)))
             .expect_err("no archive for this board in the folder");
-        let missing = folder.join("thumbv8m.main-none-eabi").join("rpi-pico2-w").join(ARCHIVE_NAME);
+        let missing = folder.join("thumbv8m.main-none-eabi").join("raspberrypi-pico-2-w").join(ARCHIVE_NAME);
         assert!(error.contains(&format!("in the folder {FOLDER_ENV} names")), "it names the variable: {error}");
         assert!(error.contains(&missing.display().to_string()), "and the path: {error}");
         assert!(error.contains("Nothing else was looked at"), "and looks nowhere else: {error}");
 
         let named_by_option = crate::folders::RUNTIME_SUPPORT_DIR;
-        let error = named_runtime_archive("rpi-pico2-w", "rp2350", None, Some((folder.clone(), named_by_option)))
+        let error = named_runtime_archive("raspberrypi-pico-2-w", "rp2350", None, Some((folder.clone(), named_by_option)))
             .expect_err("no archive for this board in the folder");
         assert!(
             error.contains(&format!("in the folder {named_by_option} names")),
@@ -775,7 +793,7 @@ mod tests {
     fn the_folder_beside_the_executable_has_the_named_folders_layout() {
         let exe = std::env::current_exe().expect("the test's executable");
         let beside = exe.parent().expect("its folder").join("runtime-support");
-        for (triple, board) in [("thumbv6m-none-eabi", None), ("thumbv8m.main-none-eabi", Some("rpi-pico2"))] {
+        for (triple, board) in [("thumbv6m-none-eabi", None), ("thumbv8m.main-none-eabi", Some("raspberrypi-pico-2"))] {
             assert_eq!(
                 candidates(triple, board, None).first(),
                 Some(&in_folder(&beside, triple, board)),
@@ -787,7 +805,7 @@ mod tests {
     #[test]
     fn a_board_archive_for_the_right_machine_is_accepted() {
         let path = write_temp("arm-board.a", &archive_of(lamella_elf::Machine::Arm));
-        let (found, _) = named_runtime_archive("rpi-pico2", "rp2350", Some(path.clone()), None)
+        let (found, _) = named_runtime_archive("raspberrypi-pico-2", "rp2350", Some(path.clone()), None)
             .expect("an ARM archive serves the Cortex-M33");
         assert_eq!(found, path, "it reports the file it used");
     }

@@ -520,8 +520,13 @@ fn compile_with_target(
     .collect();
     let had_error = diagnostics.iter().any(Diagnostic::is_error);
     let units = core::slice::from_ref(unit);
-    let Some(program) = ValidatedProgram::from_clean_bind(units, references, &imported, had_error)
-    else {
+    let Some(program) = ValidatedProgram::from_clean_bind(
+        units,
+        references,
+        &imported,
+        language_version,
+        had_error,
+    ) else {
         return Compilation {
             diagnostics,
             image: None,
@@ -661,8 +666,13 @@ fn compile_sources_on_this_stack(
         *per_unit = suppressed;
     }
     let debug = emit_debug.then_some(sources);
-    let Some(program) = ValidatedProgram::from_clean_bind(&units, references, &imported, any_error)
-    else {
+    let Some(program) = ValidatedProgram::from_clean_bind(
+        &units,
+        references,
+        &imported,
+        language_version,
+        any_error,
+    ) else {
         return MultiCompilation {
             diagnostics,
             image: None,
@@ -704,12 +714,17 @@ fn compile_sources_on_this_stack(
 /// matches a qualified argument, so the emit-time call resolution silently fails ("a call that
 /// did not resolve") -- and a simple name shared by two namespaces resolves to the WRONG one or
 /// to none.
-fn reference_model(units: &[CompilationUnit], imported: &Model) -> Model {
+fn reference_model(
+    units: &[CompilationUnit],
+    imported: &Model,
+    language_version: LanguageVersion,
+) -> Model {
     let mut model = imported.clone();
     for unit in units {
         collect_into(&mut model, unit);
     }
     let mut binder = Binder::with_model(model);
+    binder.set_language_version(language_version);
     for unit in units {
         lamella_binder::program::qualify_declared_signatures(
             &mut binder,
@@ -724,19 +739,18 @@ fn reference_model(units: &[CompilationUnit], imported: &Model) -> Model {
     model
 }
 
-/// The emit-trust barrier (T1.2): a program whose declarations and bodies have bound without any
-/// error. [`build_image`] -- the PE/metadata emitter -- accepts ONLY this, and it can be minted
-/// ONLY by [`ValidatedProgram::from_clean_bind`] from an error-free bind, so no program still
-/// carrying errors (or recovery nodes) can reach emission. It carries just the units and references
-/// today; it is the seam Tier 3 grows into a fully-validated typed tree -- declaration validation,
-/// control flow, attributes, unsafe rules all discharged (the audit's C04 boundary) -- crossing
-/// here with its invariants proven.
+/// A program whose declarations and bodies have bound without errors. [`build_image`]
+/// accepts only this token, minted only by [`ValidatedProgram::from_clean_bind`] after
+/// an error-free bind, so programs carrying errors or recovery nodes cannot reach emission.
+/// The token carries the units, references and language version; emission resolves its
+/// source against the same references and language rules as the diagnostic bind.
 struct ValidatedProgram<'a, 'r> {
     units: &'a [CompilationUnit],
     references: &'a [Assembly<'r>],
     /// `references` as the bind read them ([`lamella_binder::load_references`], under the
     /// assembly name being built): what emission resolves against.
     imported: &'a Model,
+    language_version: LanguageVersion,
 }
 
 impl<'a, 'r> ValidatedProgram<'a, 'r> {
@@ -748,12 +762,14 @@ impl<'a, 'r> ValidatedProgram<'a, 'r> {
         units: &'a [CompilationUnit],
         references: &'a [Assembly<'r>],
         imported: &'a Model,
+        language_version: LanguageVersion,
         had_error: bool,
     ) -> Option<Self> {
         (!had_error).then_some(ValidatedProgram {
             units,
             references,
             imported,
+            language_version,
         })
     }
 }
@@ -880,12 +896,17 @@ fn emit_source_types(
 ) -> Result<SourceTypes, crate::EmitError> {
     let units = program.units;
     let references = program.references;
-    let model = reference_model(units, program.imported);
+    let model = reference_model(units, program.imported, program.language_version);
     let mut binder = Binder::with_model(model);
+    binder.set_language_version(program.language_version);
     let mut tokens = assign_tokens(units, &mut binder, partials, synthesized);
+    tokens.language_version = program.language_version;
     tokens.expect_struct_types(struct_types);
     tokens.set_native_interop(native_interop);
     mark_external_value_types(binder.model(), &mut tokens);
+    if tokens.language_version.inherited_object_call_boxes_receiver() {
+        mark_value_type_overrides(binder.model(), &mut tokens);
+    }
     let mut image = ImageBuilder::new(module_name, assembly_name);
     if let Some(sources) = debug {
         let mut content: Vec<u8> = assembly_name.as_bytes().to_vec();
@@ -1598,6 +1619,7 @@ pub(crate) fn build_submission_delta(
     return_type: &TypeSymbol,
     type_members: &[NamespaceMember],
     model: &Model,
+    language_version: LanguageVersion,
     module_name: &str,
     assembly_name: &str,
 ) -> Result<Vec<u8>, crate::EmitError> {
@@ -1613,6 +1635,7 @@ pub(crate) fn build_submission_delta(
         let mut next_field = 0u32;
         let mut next_method = 0u32;
         let mut binder = Binder::with_model(model.clone());
+        binder.set_language_version(language_version);
         let partials = PartialIndex::new();
         collect_tokens(
             &mut tokens,
@@ -3936,44 +3959,57 @@ fn emit_event(
             image.add_abstract_method(&accessor_name("remove_", name), &signature, flags, &value);
         (add, remove)
     } else {
-        let add = emit_method_body(
-            image,
-            binder,
-            tokens,
-            enclosing,
-            &[],
-            &[],
-            &accessor_name("add_", name),
-            &void,
-            &params,
-            &[],
-            &event_accessor_body(name, AssignmentOperator::Add),
-            is_static,
-            false,
-            false,
-            flags,
-            None,
-            debug,
-        )?;
-        let remove = emit_method_body(
-            image,
-            binder,
-            tokens,
-            enclosing,
-            &[],
-            &[],
-            &accessor_name("remove_", name),
-            &void,
-            &params,
-            &[],
-            &event_accessor_body(name, AssignmentOperator::Subtract),
-            is_static,
-            false,
-            false,
-            flags,
-            None,
-            debug,
-        )?;
+        // Edition 2, 17.7.1, requires the class instance/type monitor; editions 4 and 7
+        // permit the same choice. A struct's `this` is a ref variable (18.3.6), so its
+        // instance updates share the type monitor instead of locking a fresh box.
+        let held = if is_static || tokens.is_struct(enclosing) {
+            BoundExpr {
+                kind: BoundExprKind::TypeOf(self_type_symbol(tokens, enclosing)),
+                ty: crate::expr::system_type_symbol(),
+            }
+        } else {
+            BoundExpr {
+                kind: BoundExprKind::This,
+                ty: self_type_symbol(tokens, enclosing),
+            }
+        };
+        let mut emit_accessor = |prefix: &str, operator: AssignmentOperator| {
+            let method_name = accessor_name(prefix, name);
+            let bound = binder.bind_method(
+                Some(enclosing.clone()),
+                &method_name,
+                void.clone(),
+                &params,
+                &[],
+                is_static,
+                false,
+                &event_accessor_body(name, operator),
+            );
+            let span = bound.span;
+            let bound = BoundStmt {
+                kind: lamella_binder::statement::lower_monitor(held.clone(), bound, span),
+                span,
+            };
+            emit_bound_body(
+                image,
+                tokens,
+                enclosing,
+                &[],
+                &[],
+                &method_name,
+                &void,
+                &params,
+                &[],
+                &bound,
+                is_static,
+                false,
+                flags,
+                None,
+                debug,
+            )
+        };
+        let add = emit_accessor("add_", AssignmentOperator::Add)?;
+        let remove = emit_accessor("remove_", AssignmentOperator::Subtract)?;
         (add, remove)
     };
     let event_type_token = event_type_token(event_ty, image, tokens).ok_or(
@@ -7282,20 +7318,14 @@ fn emit_auto_accessor(
     ))
 }
 
-/// The token naming the type a body is INSIDE, where an instruction operand needs one: the
-/// `TypeDef` for an ordinary type, and the `TypeSpec` for `C<!0, !1, ...>` when the type is
-/// generic -- because inside `Bag<T>`, `this` has type `Bag<!0>` and not the open definition.
-fn self_type_token(
-    image: &mut ImageBuilder,
-    tokens: &mut Tokens,
-    enclosing: &TypeSymbol,
-) -> Option<Token> {
-    let parameters = tokens.type_parameters(enclosing).to_vec();
+/// The enclosing type constructed with all its declaring parameters, including outer ones.
+fn self_type_symbol(tokens: &Tokens, enclosing: &TypeSymbol) -> TypeSymbol {
+    let parameters = tokens.type_parameters(enclosing);
     if parameters.is_empty() {
-        return tokens.type_token(enclosing);
+        return enclosing.clone();
     }
     let TypeSymbol::Named(parts) = enclosing else {
-        return tokens.type_token(enclosing);
+        return enclosing.clone();
     };
     let mut definition_parts = parts.clone();
     if let Some(last) = definition_parts.last_mut() {
@@ -7305,12 +7335,33 @@ fn self_type_token(
         .iter()
         .map(|parameter| TypeSymbol::Named(Box::from([parameter.clone()])))
         .collect();
-    let instantiation = TypeSymbol::Instantiation {
-        definition: definition_parts.clone(),
-        arguments: arguments.clone(),
+    TypeSymbol::Instantiation {
+        definition: definition_parts,
+        arguments,
+    }
+}
+
+/// The token naming the type a body is INSIDE, where an instruction operand needs one: the
+/// `TypeDef` for an ordinary type, and the `TypeSpec` for `C<!0, !1, ...>` when the type is
+/// generic -- because inside `Bag<T>`, `this` has type `Bag<!0>` and not the open definition.
+fn self_type_token(
+    image: &mut ImageBuilder,
+    tokens: &mut Tokens,
+    enclosing: &TypeSymbol,
+) -> Option<Token> {
+    if tokens.type_parameters(enclosing).is_empty() || !matches!(enclosing, TypeSymbol::Named(_)) {
+        return tokens.type_token(enclosing);
+    }
+    let instantiation = self_type_symbol(tokens, enclosing);
+    let TypeSymbol::Instantiation {
+        definition,
+        arguments,
+    } = &instantiation else {
+        return tokens.type_token(enclosing);
     };
+    let parameters = tokens.type_parameters(enclosing).to_vec();
     let saved = tokens.enter_body_scope(&[], &parameters);
-    let spec = mint_type_spec(&instantiation, &definition_parts, &arguments, image, tokens);
+    let spec = mint_type_spec(&instantiation, definition, arguments, image, tokens);
     tokens.restore_body_scope(saved);
     spec.or_else(|| tokens.type_token(enclosing))
 }
@@ -8325,7 +8376,10 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
             {
                 mint_value_type_token(&operand.ty, image, tokens);
             }
-            if matches!(expr.ty, TypeSymbol::Named(_)) && !is_value_type(&expr.ty, tokens)
+            // A reference cast names its target: a class, interface or delegate (including a
+            // constructed generic type), or an array TypeSpec such as `(int[])arr.Clone()`.
+            if matches!(expr.ty, TypeSymbol::Named(_) | TypeSymbol::Instantiation { .. })
+                && !is_value_type(&expr.ty, tokens)
                 || matches!(expr.ty, TypeSymbol::Array { .. })
             {
                 mint_type_token(image, tokens, &expr.ty);
@@ -8364,11 +8418,22 @@ fn mint_in_expr(expr: &BoundExpr, image: &mut ImageBuilder, tokens: &mut Tokens)
                     } else {
                         method.parameters.clone()
                     };
+                    let receiver = match &callee.kind {
+                        BoundExprKind::MethodGroup { receiver, .. } => Some(&**receiver),
+                        _ => None,
+                    };
+                    let target = match crate::expr::own_override_target(method, receiver, tokens) {
+                        Some(value_type) => lamella_binder::MethodReference {
+                            declaring_type: value_type.clone(),
+                            ..method.clone()
+                        },
+                        None => method.clone(),
+                    };
                     if tokens
-                        .method(&method.declaring_type, &method.name, &def_key)
+                        .method(&target.declaring_type, &target.name, &def_key)
                         .is_none()
                     {
-                        mint_member_ref(method, image, tokens);
+                        mint_member_ref(&target, image, tokens);
                     }
                 }
             }
@@ -9647,6 +9712,30 @@ fn mark_external_value_types(model: &Model, tokens: &mut Tokens) {
                 tokens.insert_enum_underlying(&symbol, enum_underlying(model, &symbol));
             }
             _ => {}
+        }
+    }
+}
+
+/// Records every override a non-generic struct declares itself, this module's and referenced ones
+/// alike, so that an inherited `object` member called on a value of that struct can be invoked
+/// through the struct's own override (`crate::expr::own_override_target`). The type is spelled as
+/// a call names a declaring type: the namespace's parts, then the name, with no predefined form.
+fn mark_value_type_overrides(model: &Model, tokens: &mut Tokens) {
+    for (namespace, name) in model.type_keys() {
+        let Some(info) = model.get(namespace, name) else {
+            continue;
+        };
+        if info.kind != lamella_binder::TypeKind::Struct || !info.type_parameters.is_empty() {
+            continue;
+        }
+        let mut parts: Vec<Box<str>> = Vec::new();
+        if !namespace.is_empty() {
+            parts.extend(namespace.split('.').map(Box::from));
+        }
+        parts.push(name.into());
+        let declaring = TypeSymbol::Named(parts.into_boxed_slice());
+        for method in info.methods.iter().filter(|method| method.is_override && !method.is_static) {
+            tokens.insert_value_override(&declaring, &method.name, &method.parameters);
         }
     }
 }
@@ -11924,340 +12013,6 @@ mod tests {
         assert!(tokens.is_struct(&plain));
     }
 
-
-    const GENERIC_FIXTURE: &str = "generic-methods.dll";
-    const NESTED_FIXTURE: &str = "generic-params.dll";
-
-    /// A csc-built reference assembly from `lamella-metadata`'s fixture directory, read at RUN time.
-    ///
-    /// **A MISSING FIXTURE SKIPS ONLY WHERE SKIPPING IS RIGHT.** If the fixture DIRECTORY exists
-    /// and the file does not, that is a real breakage and this panics; only when the directory
-    /// itself is gone does it return `None`. Without that split, deleting a fixture would turn
-    /// every row below green.
-    ///
-    fn reference_fixture(name: &str) -> Option<Vec<u8>> {
-        let directory = format!(
-            "{}/../lamella-metadata/tests/fixtures",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        if !std::path::Path::new(&directory).is_dir() {
-            eprintln!("{directory} absent (a stripped drop); skipping");
-            return None;
-        }
-        let path = format!("{directory}/{name}");
-        Some(std::fs::read(&path).unwrap_or_else(|error| {
-            panic!("the fixture directory exists but {path} does not read: {error}")
-        }))
-    }
-
-    /// `expression` parsed inside a `Main` under C# 2 and bound against the generic-method fixture.
-    /// `None` when the fixture is unavailable -- see [`reference_fixture`].
-    fn bound_expression(expression: &str) -> Option<BoundExpr> {
-        let reference = reference_fixture(GENERIC_FIXTURE)?;
-        Some(bound_expression_against(&reference, expression))
-    }
-
-    /// `expression` parsed inside a `Main` under C# 2 and bound against `reference`.
-    ///
-    /// The DIALECT is load-bearing in the parser, not only in the binder: under the default C# 1.0
-    /// the parser skips a type-argument list, so `Id<int>(1)` arrives as a chain of comparisons and
-    /// every row below would measure a different program.
-    fn bound_expression_against(reference: &[u8], expression: &str) -> BoundExpr {
-        let source = format!("class C {{ static void Main() {{ {expression}; }} }}\n");
-        let options = LexOptions {
-            version: LanguageVersion::CSharp2,
-            ..LexOptions::default()
-        };
-        let unit = parse_compilation_unit_with(&source, options).unit;
-        let NamespaceMember::Type(declaration) = &unit.members[0] else {
-            panic!("the fixture source declares a class");
-        };
-        let Member::Method { body: Some(body), .. } = &declaration.members[0] else {
-            panic!("the fixture source declares a method with a body");
-        };
-        let StmtKind::Block(statements) = &body.kind else {
-            panic!("a method body is a block");
-        };
-        let StmtKind::Expression(expr) = &statements[0].kind else {
-            panic!("the body's one statement is an expression statement");
-        };
-        let assembly = Assembly::read(reference).expect("the fixture parses");
-        let mut model = Model::new();
-        load_assembly(&mut model, &assembly, "");
-        Binder::with_model(model).bind_expression(expr)
-    }
-
-    /// The token operand of the `call`/`callvirt` the expression lowers to.
-    fn emitted_call_token(
-        expr: &BoundExpr,
-        image: &mut ImageBuilder,
-        tokens: &mut Tokens,
-    ) -> Result<Token, crate::EmitError> {
-        mint_in_expr(expr, image, tokens);
-        let mut out = Vec::new();
-        crate::expr::emit_expression(expr, &crate::frame::Frame::empty(), tokens, &mut out)?;
-        let call = out
-            .iter()
-            .rev()
-            .find(|instruction| {
-                matches!(
-                    instruction.opcode,
-                    lamella_cil::Opcode::Call | lamella_cil::Opcode::Callvirt
-                )
-            })
-            .expect("the expression lowers to a call");
-        match call.operand {
-            lamella_cil::Operand::Token(token) => Ok(token),
-            ref other => panic!("a call names its target by token, got {other:?}"),
-        }
-    }
-
-    /// **THE ROW THE EMIT STAGE EXISTS FOR, AND ITS EVIDENCE IS THE SEPARATION.** A generic call
-    /// must name its own `MethodSpec`, never the definition's token -- because emitting the
-    /// definition still produces a call that BINDS, to the open method, with `!!0` unsubstituted.
-    /// That outcome throws no error and writes valid metadata, so nothing but this assertion
-    /// distinguishes it. `lamella-pe`'s `ImageBuilder::method_spec` doc records the same trap from
-    /// the writer's side.
-    #[test]
-    fn a_generic_call_names_its_own_method_spec_and_not_the_definition() {
-        let Some(expr) = bound_expression("Fixture.Util.Id<int>(1)") else { return };
-        let mut image = ImageBuilder::new("test.dll", "test");
-        let mut tokens = Tokens::new();
-        let site = emitted_call_token(&expr, &mut image, &mut tokens).expect("a generic call emits");
-
-        assert_eq!(
-            site.table(),
-            lamella_metadata::tables::table::METHOD_SPEC,
-            "the call must name a MethodSpec row, not the method it instantiates"
-        );
-        let definition = tokens
-            .method(
-                &named_symbol("Fixture", "Util"),
-                "Id",
-                &[TypeSymbol::Named(["T".into()].into())],
-            )
-            .expect("the open definition is minted under its OPEN parameter key");
-        assert_eq!(definition.table(), lamella_metadata::tables::table::MEMBER_REF);
-        assert_ne!(site, definition);
-    }
-
-    /// Two instantiations of one definition are two rows over one `MemberRef`, and the arguments
-    /// survive the blob round trip.
-    ///
-    /// **THE `assert_ne!` IS THE LOAD-BEARING LINE.** An implementation that interned the row
-    /// by (declaring type, name) -- the shape every other member in this table uses -- gives both
-    /// sites one token and one argument, and passes every "a MethodSpec appeared" assertion
-    /// perfectly. It is the same collapse a shared `TypeSpec` would be, reached through the method
-    /// table instead of the type one.
-    #[test]
-    fn two_instantiations_of_one_method_are_two_rows_over_one_member_ref() {
-        let Some(int_call) = bound_expression("Fixture.Util.Id<int>(1)") else { return };
-        let Some(string_call) = bound_expression("Fixture.Util.Id<string>(\"x\")") else { return };
-        let mut image = ImageBuilder::new("test.dll", "test");
-        let mut tokens = Tokens::new();
-        let int_site =
-            emitted_call_token(&int_call, &mut image, &mut tokens).expect("Id<int> emits");
-        let string_site =
-            emitted_call_token(&string_call, &mut image, &mut tokens).expect("Id<string> emits");
-        assert_ne!(int_site, string_site, "two instantiations are two rows");
-
-        let pe = image.finish(Token::new(0, 0), true);
-        let assembly = lamella_metadata::Assembly::read(&pe).expect("the emitted image parses");
-
-        let definition = assembly
-            .method_spec_method(int_site)
-            .expect("a MethodSpec names the method it instantiates");
-        assert_eq!(assembly.method_spec_method(string_site), Some(definition));
-
-        assert_eq!(
-            assembly.method_spec_instantiation(int_site),
-            Some(alloc::vec![lamella_metadata::SigType::I4])
-        );
-        assert_eq!(
-            assembly.method_spec_instantiation(string_site),
-            Some(alloc::vec![lamella_metadata::SigType::String])
-        );
-
-        let member = assembly
-            .member_ref(definition.row())
-            .expect("the definition is a MemberRef");
-        assert_eq!(member.name(), Some("Id"));
-        assert_eq!(
-            member.signature_blob(),
-            &[0x10, 0x01, 0x01, 0x1E, 0x00, 0x1E, 0x00],
-            "the open definition is GENERIC over one parameter and spelled with !!0"
-        );
-    }
-
-    /// **TWO TYPE PARAMETERS, IN ORDER -- AT ARITY ONE EVERY NUMBERING SCHEME AGREES.** `!!0` is
-    /// a POSITION, and the row above cannot tell a correct one from a hardcoded zero, from the
-    /// declaring type's numbering, or from a reversed list. `T Two<T,U>(T,U)` separates all four in
-    /// the signature AND in the instantiation blob, which are numbered from opposite ends of the
-    /// same fact.
-    #[test]
-    fn a_second_type_parameter_is_numbered_by_its_own_position() {
-        let Some(expr) = bound_expression("Fixture.Util.Two<int, string>(1, \"x\")") else { return };
-        let mut image = ImageBuilder::new("test.dll", "test");
-        let mut tokens = Tokens::new();
-        let site = emitted_call_token(&expr, &mut image, &mut tokens).expect("Two<int,string> emits");
-
-        let pe = image.finish(Token::new(0, 0), true);
-        let assembly = lamella_metadata::Assembly::read(&pe).expect("the emitted image parses");
-
-        assert_eq!(
-            assembly.method_spec_instantiation(site),
-            Some(alloc::vec![
-                lamella_metadata::SigType::I4,
-                lamella_metadata::SigType::String
-            ])
-        );
-        let definition = assembly
-            .method_spec_method(site)
-            .expect("a MethodSpec names the method it instantiates");
-        let member = assembly
-            .member_ref(definition.row())
-            .expect("the definition is a MemberRef");
-        assert_eq!(member.name(), Some("Two"));
-        assert_eq!(
-            member.signature_blob(),
-            &[0x10, 0x02, 0x02, 0x1E, 0x00, 0x1E, 0x00, 0x1E, 0x01],
-            "the second parameter is !!1 -- its own declaration position, not the first's"
-        );
-    }
-
-    /// **A GENERIC CALL WITH NO `MethodSpec` IS REFUSED, NEVER EMITTED AGAINST THE DEFINITION.**
-    /// This is the control for the fallback that would otherwise be the natural thing to write --
-    /// "look up the site, else the definition" -- and that fallback is not a degradation, it is the
-    /// silent wrong program: the call binds to the open method and `!!0` is never substituted. The
-    /// definition IS minted here and is a perfectly good token, so an emitter willing to use it
-    /// would succeed and this row is what says it must not.
-    #[test]
-    fn a_generic_call_without_its_row_refuses_rather_than_naming_the_definition() {
-        let Some(expr) = bound_expression("Fixture.Util.Id<int>(1)") else { return };
-        let BoundExprKind::Call { method: Some(method), .. } = &expr.kind else {
-            panic!("the expression bound to a call");
-        };
-        let instantiation = method
-            .instantiation
-            .as_deref()
-            .expect("the binder recorded the call site's type arguments");
-
-        let mut image = ImageBuilder::new("test.dll", "test");
-        let mut tokens = Tokens::new();
-        mint_generic_definition_ref(method, instantiation, &mut image, &mut tokens)
-            .expect("the definition mints");
-
-        let mut out = Vec::new();
-        let emitted =
-            crate::expr::emit_expression(&expr, &crate::frame::Frame::empty(), &tokens, &mut out);
-        assert!(
-            emitted.is_err(),
-            "a generic call with no MethodSpec must refuse, not fall back to the definition"
-        );
-    }
-
-    /// **A GENERIC CALL WHOSE DEFINITION HAS NO METHOD TOKEN IS REFUSED**, even when its declaring
-    /// type is a this-module `TypeDef`.
-    ///
-    /// **A THIS-MODULE DECLARING TYPE IS NOT ITSELF A REFUSAL.** `MethodSpec.Method` is a
-    /// `MethodDefOrRef` (II.22.29), so a generic method this module declares is named by its own
-    /// `MethodDef` -- its signature carries the GENERIC convention and its `GenericParam` rows, so
-    /// the spec and the definition agree. What this row measures is the REMAINING refusal: the
-    /// definition's token has to EXIST, and here only the TYPE is registered.
-    ///
-    /// The positive half -- a this-module generic call that DOES mint -- is not expressible in this
-    /// synthetic setup, because it needs the real pre-pass to have written the `MethodDef`. It is
-    /// covered end to end instead: `lcsc /langversion:ISO-2` compiles `Id<string>("ok")` against a
-    /// this-module `static T Id<T>(T x)`.
-    #[test]
-    fn a_generic_call_with_no_definition_token_is_refused_rather_than_wrongly_instantiated() {
-        let Some(expr) = bound_expression("Fixture.Util.Id<int>(1)") else { return };
-        let mut image = ImageBuilder::new("test.dll", "test");
-        let mut tokens = Tokens::new();
-        tokens.insert_type(&named_symbol("Fixture", "Util"), Token::new(TYPE_DEF, 2));
-
-        mint_in_expr(&expr, &mut image, &mut tokens);
-        let mut out = Vec::new();
-        assert!(
-            crate::expr::emit_expression(&expr, &crate::frame::Frame::empty(), &tokens, &mut out)
-                .is_err(),
-            "a MethodSpec over a non-generic MethodDef signature is refused, not written"
-        );
-    }
-
-    /// **AN *IMPORTED* GENERIC METHOD ON A GENERIC TYPE IS STILL REFUSED, AND THE REASON MOVED.**
-    /// The emitter could already write this shape for a THIS-MODULE declaration
-    /// (`a_generic_method_on_a_generic_type_declared_here`); what blocked the IMPORTED spelling was
-    /// one layer earlier and is not a generics-emission question at all. `reference::sigtype_to_symbol`
-    /// must decode `ELEMENT_TYPE_VAR` as well as `ELEMENT_TYPE_MVAR`: with an arm for only one,
-    /// `Fixture.Holder<TOuter>.Echo<TMethod>(TMethod) -> TOuter` arrives as
-    /// `parameters: [Named(["TMethod"])]` with `return_type: Error` -- **one rule, two numbering
-    /// spaces, the case written in one of them.**
-    ///
-    /// **BOTH HALVES ARE ASSERTED HERE BECAUSE ONLY THE PAIR SEPARATES THE TWO SPACES.** A decode
-    /// that answered every numbered parameter from the METHOD's list would give this signature
-    /// `[Named(["TMethod"])]` and `Named(["TMethod"])` -- one right and one wrong, and the parameter
-    /// row alone cannot tell. `TOuter` in the return is what says `!0` was numbered against the
-    /// DECLARING type's list.
-    #[test]
-    fn an_imported_generic_method_on_a_generic_type_decodes_both_numbering_spaces() {
-        let Some(reference) = reference_fixture(NESTED_FIXTURE) else { return };
-        let expr = bound_expression_against(
-            &reference,
-            "new Fixture.Holder<int>().Echo<string>(\"x\")",
-        );
-        let BoundExprKind::Call { method: Some(method), .. } = &expr.kind else {
-            panic!("the expression bound to a call");
-        };
-        assert!(
-            method.instantiation.is_some(),
-            "the call site's own type argument is recorded"
-        );
-        let declaring = method
-            .declaring_instantiation
-            .as_deref()
-            .expect("the DECLARING type's open form is recovered, or the `!n` half has no owner");
-        assert_eq!(
-            declaring.type_parameters,
-            [Box::<str>::from("TOuter")],
-            "the declaring type's parameter NAMES are what `!0` is numbered against"
-        );
-        assert_eq!(
-            declaring.parameters,
-            [TypeSymbol::Named([Box::from("TMethod")].into())],
-            "MVAR 0 decodes to the METHOD's declared name"
-        );
-        assert_eq!(
-            declaring.return_type,
-            TypeSymbol::Named([Box::from("TOuter")].into()),
-            "VAR 0 decodes to the DECLARING TYPE's declared name, not the method's and not Error"
-        );
-
-        let mut image = ImageBuilder::new("test.dll", "test");
-        let mut tokens = Tokens::new();
-        let spec = emitted_call_token(&expr, &mut image, &mut tokens)
-            .expect("an imported generic method on a generic type emits");
-        assert_eq!(spec.table(), lamella_metadata::tables::table::METHOD_SPEC);
-        let built = image.finish(Token::new(0, 0), true);
-        let assembly = Assembly::read(&built).expect("the image parses");
-        let definition = assembly
-            .method_spec_method(spec)
-            .expect("a MethodSpec names the method it instantiates");
-        let member = assembly
-            .member_ref(definition.row())
-            .expect("the MemberRef row is readable");
-        assert_eq!(
-            member.parent().table(),
-            TYPE_SPEC,
-            "the parent is the instantiation's TypeSpec, so `<int>` is not lost"
-        );
-        assert_eq!(
-            member.signature_blob(),
-            &[0x30, 0x01, 0x01, 0x13, 0x00, 0x1e, 0x00],
-            "GENERIC | HAS_THIS, GenParamCount 1, 1 parameter, VAR 0 return, MVAR 0 parameter"
-        );
-    }
-
     /// **A GENERIC METHOD ON A GENERIC *TYPE* HAS BOTH NUMBERING SPACES LIVE IN ONE SIGNATURE**,
     /// and this is the smallest program that does. csc's own bytes for `Echo` are
     /// `30 01 01 13 00 1e 00`: the GENERIC convention, `GenParamCount` 1, one parameter, a `!0`
@@ -12469,8 +12224,14 @@ mod tests {
             diagnostics.iter().map(|d| alloc::format!("{}", d.kind)).collect::<Vec<_>>()
         );
         let imported = load_references(&references, "test");
-        let program = ValidatedProgram::from_clean_bind(&units, &references, &imported, false)
-            .expect("the barrier is minted from the assertion above");
+        let program = ValidatedProgram::from_clean_bind(
+            &units,
+            &references,
+            &imported,
+            LanguageVersion::CSharp4,
+            false,
+        )
+        .expect("the barrier is minted from the assertion above");
         let (image, _) = build_image(&program, "test.dll", "test", None, false, false, OutputKind::Inferred)
             .expect("an optional parameter emits");
         image
@@ -12596,8 +12357,14 @@ mod tests {
             );
         }
         let imported = load_references(&references, "test");
-        let program = ValidatedProgram::from_clean_bind(&units, &references, &imported, false)
-            .expect("the barrier is minted from the assertion above, not from a bare `false`");
+        let program = ValidatedProgram::from_clean_bind(
+            &units,
+            &references,
+            &imported,
+            LanguageVersion::CSharp2,
+            false,
+        )
+        .expect("the barrier is minted from the assertion above, not from a bare `false`");
         let (image, _) = build_image(&program, "test.dll", "test", None, false, false, OutputKind::Inferred)
             .expect("a generic declaration emits");
         image
@@ -12650,20 +12417,6 @@ mod tests {
             "no accessor may be called at the definition's own MethodDef -- that is the erased \
              form, identical for every instantiation: {calls:?}"
         );
-    }
-
-    /// [`image_of_gated_source`] with a csc-built REFERENCE assembly behind it, so an IMPORTED
-    /// generic definition is in scope.
-    ///
-    /// **A SEPARATE HARNESS BECAUSE A SAME-MODULE GENERIC CANNOT EXERCISE THE PATH UNDER TEST.**
-    /// A this-module `Box`1` already has a `TypeDef` in the token table, so `type_sig` finds it and
-    /// no minting is needed -- which is exactly why the imported case went unnoticed. The reference
-    /// is what makes the definition need a `TypeRef` that something has to mint.
-    /// `None` when the fixture is unavailable -- see [`reference_fixture`], whose note explains why
-    /// `include_bytes!` is the one thing this must not do.
-    fn image_of_source_against_generic_fixture(source: &str) -> Option<Vec<u8>> {
-        let fixture = reference_fixture(NESTED_FIXTURE)?;
-        Some(image_of_source_against(&fixture, source))
     }
 
     /// Compiles `source` under C# 2 with no references and returns the image, like
@@ -13376,177 +13129,6 @@ mod tests {
         }
     }
 
-    /// [`image_of_source_against_generic_fixture`] for any reference assembly.
-    ///
-    /// Taken as a parameter rather than copied per fixture: the generic-METHOD rows below need
-    /// `generic-methods.dll` where the rows above need `generic-params.dll`, and a second copy of
-    /// this body is a second place for the bind settings to drift from.
-    fn image_of_source_against(fixture: &[u8], source: &str) -> Vec<u8> {
-        let options = LexOptions {
-            version: LanguageVersion::CSharp2,
-            ..LexOptions::default()
-        };
-        let parsed = parse_compilation_unit_with(source, options);
-        assert!(
-            parsed.diagnostics.iter().all(|d| d.severity() != Severity::Error),
-            "the source must PARSE cleanly under C# 2: {:?}",
-            parsed.diagnostics
-        );
-        let units = alloc::vec![parsed.unit];
-        let references = alloc::vec![Assembly::read(fixture).expect("the fixture parses")];
-        for diagnostic in lamella_binder::bind_compilation_unit_with_dialect(
-            &units[0],
-            &references,
-            false,
-            LanguageVersion::CSharp2,
-        ) {
-            assert!(
-                diagnostic.severity() != Severity::Error,
-                "the bind must produce no ERROR: {}",
-                diagnostic.kind
-            );
-        }
-        let imported = load_references(&references, "test");
-        let program = ValidatedProgram::from_clean_bind(&units, &references, &imported, false)
-            .expect("the barrier is minted from the assertion above");
-        let (image, _) = build_image(&program, "test.dll", "test", None, false, false, OutputKind::Inferred)
-            .expect("an imported generic in a signature emits");
-        image
-    }
-
-    /// An IMPORTED generic definition used in every signature position a type can occupy.
-    ///
-    ///
-    /// Each row is a whole compilation that must EMIT, so a refusal anywhere in the pipeline fails
-    /// it. `build_image` returning is the assertion.
-    #[test]
-    fn an_imported_generic_emits_in_every_signature_position() {
-        for (label, source) in [
-            ("field", "class C { Fixture.Box<Fixture.Plain> f; }"),
-            (
-                "parameter",
-                "class C { void M(Fixture.Box<Fixture.Plain> p) { } }",
-            ),
-            (
-                "return",
-                "class C { Fixture.Box<Fixture.Plain> M() { return null; } }",
-            ),
-            (
-                "UNUSED local -- the row that found the second site",
-                "class C { void M() { Fixture.Box<Fixture.Plain> x = null; } }",
-            ),
-            (
-                "used local",
-                "class C { Fixture.Box<Fixture.Plain> M() { \
-                 Fixture.Box<Fixture.Plain> x = null; return x; } }",
-            ),
-            ("array", "class C { Fixture.Box<Fixture.Plain>[] a; }"),
-            (
-                "array local",
-                "class C { void M() { Fixture.Box<Fixture.Plain>[] a = null; } }",
-            ),
-            (
-                "two arguments",
-                "class C { Fixture.Pair<Fixture.Plain, Fixture.Plain> p; }",
-            ),
-            (
-                "nested argument",
-                "class C { Fixture.Box<Fixture.Box<Fixture.Plain>> n; }",
-            ),
-            (
-                "ref parameter",
-                "class C { void M(ref Fixture.Box<Fixture.Plain> p) { } }",
-            ),
-        ] {
-            let Some(image) = image_of_source_against_generic_fixture(source) else {
-                return;
-            };
-            assert!(!image.is_empty(), "{label} must emit: {source}");
-        }
-    }
-
-    /// A generic call whose TYPE ARGUMENT is itself a type parameter -- `Util.Id<T>()` written
-    /// inside a generic body -- and the closed spelling beside it as the control.
-    ///
-    /// **THE OPEN ROW IS THE FIRST GENERIC CALL IN THIS TREE WHOSE ARGUMENT IS NOT A CLOSED TYPE.**
-    /// Every other call site passes something that names itself, so the argument encoder was never
-    /// asked a question it could not answer: it refused `T` as an unresolvable named type, dropped
-    /// the `MethodSpec`, and the whole call refused with "a generic call whose instantiation could
-    /// not be minted". The closed row passed throughout and is why nothing noticed.
-    ///
-    /// **THE BLOB IS THE ASSERTION, NOT THE EMIT.** A `MethodSpec` carrying the wrong argument
-    /// emits perfectly -- and an argument silently encoded as a TypeRef to a type named `T` is the
-    /// shape that compiles clean and throws `TypeLoadException` on entry, which no "it emitted"
-    /// check can see. `Var(0)` is the declaring type's first parameter, by position.
-    #[test]
-    fn a_generic_call_can_pass_a_type_parameter_as_its_argument() {
-        let Some(fixture) = reference_fixture(GENERIC_FIXTURE) else {
-            return;
-        };
-        let measured: Vec<(&str, Vec<Vec<lamella_metadata::SigType>>)> = [
-            (
-                "OPEN -- the argument is the declaring type's parameter",
-                "class Box<T> { public T Pass(T value) { return Fixture.Util.Id<T>(value); } }",
-            ),
-            (
-                "CONTROL -- closed, and it passed before the open row existed",
-                "class C { public int Pass(int value) { return Fixture.Util.Id<int>(value); } }",
-            ),
-        ]
-        .into_iter()
-        .map(|(label, source)| {
-            let image = image_of_source_against(&fixture, source);
-            let assembly = lamella_metadata::Assembly::read(&image)
-                .unwrap_or_else(|_| panic!("{label}: the emitted image parses"));
-            let rows = assembly
-                .tables()
-                .row_count(lamella_metadata::tables::table::METHOD_SPEC);
-            let specs = (1..=rows)
-                .filter_map(|row| {
-                    assembly.method_spec_instantiation(Token::new(
-                        lamella_metadata::tables::table::METHOD_SPEC,
-                        row,
-                    ))
-                })
-                .collect();
-            (label, specs)
-        })
-        .collect();
-
-        let expected: Vec<(&str, Vec<Vec<lamella_metadata::SigType>>)> = alloc::vec![
-            (
-                "OPEN -- the argument is the declaring type's parameter",
-                alloc::vec![alloc::vec![lamella_metadata::SigType::Var(0)]],
-            ),
-            (
-                "CONTROL -- closed, and it passed before the open row existed",
-                alloc::vec![alloc::vec![lamella_metadata::SigType::I4]],
-            ),
-        ];
-        assert_eq!(
-            measured, expected,
-            "each row emits exactly one MethodSpec carrying exactly its own argument"
-        );
-    }
-
-    /// The CONTROL for the row above: an imported NON-generic in the same positions. It passed
-    /// before the fix and must still pass, so a change that broke ordinary imported types would
-    /// fail here rather than hiding behind the generic rows going green.
-    #[test]
-    fn an_imported_non_generic_still_emits_in_the_same_positions() {
-        for source in [
-            "class C { Fixture.Plain f; }",
-            "class C { void M(Fixture.Plain p) { } }",
-            "class C { void M() { Fixture.Plain x = null; } }",
-            "class C { Fixture.Plain[] a; }",
-        ] {
-            let Some(image) = image_of_source_against_generic_fixture(source) else {
-                return;
-            };
-            assert!(!image.is_empty(), "the control must emit: {source}");
-        }
-    }
-
     /// **A SOURCE-DECLARED GENERIC TYPE IS NAMED `` Box`1 `` IN METADATA AND CARRIES ITS
     /// `GenericParam` ROWS.** Both halves are load-bearing and they fail in different places: the
     /// arity-mangled NAME is the single key space the binder's model, a reference-assembly reader
@@ -13830,7 +13412,7 @@ mod tests {
     }
 
     /// The `TypeSpec` table's index (II.22.39), as a `MemberRef` parent token's table byte.
-    const TYPE_SPEC: u8 = lamella_metadata::tables::table::TYPE_SPEC;
+    pub(super) const TYPE_SPEC: u8 = lamella_metadata::tables::table::TYPE_SPEC;
 
     /// Every `MemberRef` in `image` as `(parent table, name, signature blob)`.
     fn member_refs_of(assembly: &Assembly<'_>) -> Vec<(u8, String, Vec<u8>)> {
@@ -14587,71 +14169,6 @@ mod tests {
         );
     }
 
-    /// **A TYPE PARAMETER IS A POSITION, NOT A TYPE, AND ASKING FOR ITS TOKEN INVENTED ONE.** A
-    /// `class Box<T> { T item; T Get(); }` emitted a `TypeRef` with an empty namespace named `T` --
-    /// a reference to a type no assembly declares, which csc never writes.
-    ///
-    /// **THE ROW WAS UNREFERENCED, AND THAT IS WHY IT SURVIVED.** Every signature mentioning `T`
-    /// encodes `!0` through the declaring scope, which matches by NAME before it would consult a
-    /// token, so the emitted assembly decoded correctly and nothing was visibly wrong. The reason
-    /// it matters is elsewhere: `type_sig` refuses a bare `T` by failing its named-type lookup, and
-    /// that refusal is what stops a signature written in the WRONG scope from being numbered
-    /// against the wrong parameter list. A registered `T` turns that refusal into
-    /// `Class(TypeRef T)`.
-    ///
-    /// The CONTROL is the second half and it is not optional: an EXTERNAL type mentioned only in a
-    /// signature must STILL be minted, in the SAME compilation and through the same function. A
-    /// change that skipped every signature type would remove the phantom and break every external
-    /// type a member names -- and would pass an absence-only assertion perfectly. It needs a real
-    /// reference assembly, which is why this compiles against the fixture rather than using
-    /// `image_of_gated_source` (which passes none, so nothing external exists to mint).
-    #[test]
-    fn a_type_parameter_gets_no_type_ref_but_a_real_signature_type_still_does() {
-        let Some(reference) = reference_fixture(NESTED_FIXTURE) else {
-            return;
-        };
-        let reference = Assembly::read(&reference).expect("the fixture parses");
-        let compilation = compile_source_with(
-            "namespace App {
-                 public class Box<T> {
-                     private T item;
-                     public Box(T value) { item = value; }
-                     public T Get() { return item; }
-                     public Fixture.Plain Only() { return null; }
-                 }
-             }\n",
-            "test.cs",
-            "test",
-            "test",
-            core::slice::from_ref(&reference),
-            false,
-            LexOptions {
-                version: LanguageVersion::CSharp2,
-                ..LexOptions::default()
-            },
-        );
-        assert!(
-            compilation.diagnostics.is_empty(),
-            "the source compiles clean: {:?}",
-            compilation.diagnostics
-        );
-        let image = compilation.image.expect("an image is emitted");
-        let assembly = Assembly::read(&image).expect("the image parses");
-        let refs: Vec<(String, String)> = assembly
-            .type_refs()
-            .filter_map(|r| r.name())
-            .map(|n| (String::from(n.namespace), String::from(n.name)))
-            .collect();
-        assert!(
-            !refs.iter().any(|(_, name)| name == "T"),
-            "no TypeRef is minted for the type parameter `T`: {refs:?}"
-        );
-        assert!(
-            refs.iter().any(|(_, name)| name == "Plain"),
-            "an external type named only in a signature is still minted: {refs:?}"
-        );
-    }
-
     /// **THE SPELLING EVERY REAL PROGRAM USES FOR ITS OWN TYPES, AND IT DID NOT RESOLVE.** A
     /// `Box<int>` written inside the namespace that declares `` Box`1 `` was CS0246: an
     /// instantiation's definition was looked up by its dotted name EXACTLY, never through the
@@ -14743,18 +14260,6 @@ mod tests {
         );
     }
 
-    /// The ordinary path is unchanged: a NON-generic call still names a plain `MemberRef` and
-    /// mints no `MethodSpec` at all. Without this the branch above could have swallowed every call
-    /// in the language and the generic rows would still pass.
-    #[test]
-    fn a_non_generic_call_still_names_a_member_ref() {
-        let Some(expr) = bound_expression("Fixture.Util.Plain(1)") else { return };
-        let mut image = ImageBuilder::new("test.dll", "test");
-        let mut tokens = Tokens::new();
-        let site = emitted_call_token(&expr, &mut image, &mut tokens).expect("a plain call emits");
-        assert_eq!(site.table(), lamella_metadata::tables::table::MEMBER_REF);
-    }
-
     /// A generic STRUCT instantiates to a VALUE type, not a reference type. The two are not
     /// interchangeable in a signature: emitting `Class` for a value type decodes cleanly and boxes
     /// where nothing should be boxed, which is the quiet half of the same family as the cast hole.
@@ -14786,8 +14291,26 @@ mod tests {
         let no_units: &[CompilationUnit] = &[];
         let no_refs: &[Assembly] = &[];
         let imported = Model::new();
-        assert!(ValidatedProgram::from_clean_bind(no_units, no_refs, &imported, false).is_some());
-        assert!(ValidatedProgram::from_clean_bind(no_units, no_refs, &imported, true).is_none());
+        assert!(
+            ValidatedProgram::from_clean_bind(
+                no_units,
+                no_refs,
+                &imported,
+                LanguageVersion::default(),
+                false,
+            )
+            .is_some()
+        );
+        assert!(
+            ValidatedProgram::from_clean_bind(
+                no_units,
+                no_refs,
+                &imported,
+                LanguageVersion::default(),
+                true,
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -18723,7 +18246,7 @@ mod tests {
     }
 
     /// The row and both sides `check_method_rows` reports, or `None` when it passes.
-    fn refusal(image: &ImageBuilder, tokens: &Tokens) -> Option<(u32, String, String)> {
+    pub(super) fn refusal(image: &ImageBuilder, tokens: &Tokens) -> Option<(u32, String, String)> {
         match check_method_rows(image, tokens) {
             Ok(()) => None,
             Err(crate::EmitError::MethodRowMismatch {
@@ -18784,40 +18307,5 @@ mod tests {
         assert_eq!(refusal(&written(&[".ctor", "Run", "<Run>b__1_0", "Main"]), &tokens), None);
         assert_eq!(refusal(&written(&[]), &Tokens::new()), None);
     }
-
-    /// Through the real emission: the FIRST numbering of a program whose early class holds a lambda
-    /// that reads only `this` is short, and the check sees it. That refusal is what sends
-    /// `build_image` to number the program again, and it is why a numbering that went on missing
-    /// such a row would stop the build rather than call the wrong method.
-    #[test]
-    fn the_first_numbering_of_a_this_only_lambda_is_refused_by_the_check() {
-        let fixture = concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures/corlib.dll");
-        let Ok(bytes) = std::fs::read(fixture) else {
-            return;
-        };
-        let corlib = Assembly::read(std::boxed::Box::leak(bytes.into_boxed_slice()))
-        .expect("the corlib fixture reads");
-        let source = "using System;
-class K { int v = 3; public int Run() { Func<int> f = () => v; return f(); } }
-static class Program { static int Main() { return Helper(); } static int Helper() { return new K().Run(); } }";
-        let parsed = parse_compilation_unit_with(source, LexOptions::default());
-        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
-        let units = [parsed.unit];
-        let references = [corlib];
-        let imported = load_references(&references, "test");
-        let program = ValidatedProgram::from_clean_bind(&units, &references, &imported, false)
-            .expect("the bind is taken as clean");
-        let partials = index_partial_types(&units, &[]);
-        let emit = |measured| {
-            emit_source_types(&program, "App", "App", None, false, &[], &partials, measured, BTreeMap::new())
-                .unwrap_or_else(|error| panic!("the source types emit: {error}"))
-        };
-        let mut first = emit(crate::tokens::InstanceRows::new());
-        assert_eq!(
-            refusal(&first.image, &first.tokens),
-            Some((3, String::from("Program.Main"), String::from("<Run>b__1_0")))
-        );
-        let second = emit(first.tokens.take_instance_rows_written());
-        assert_eq!(refusal(&second.image, &second.tokens), None);
-    }
 }
+

@@ -36,7 +36,7 @@ pub const MONIKER: &str = "lamella1.0";
 
 /// The SDK a Lamella project names, which `dotnet build` resolves from NuGet.
 ///
-/// A project may pin its version as MSBuild spells it, `Lamella.Sdk/0.1.0`. The version is the
+/// A project may pin its version as MSBuild spells it, `Lamella.Sdk/1.0.0-alpha.2`. The version is the
 /// MSBuild SDK's, which only `dotnet` resolves, so this reader takes the name and leaves the version.
 pub const SDK: &str = "Lamella.Sdk";
 
@@ -733,6 +733,16 @@ impl BoardCheck {
             (None, Some(id)) => format!("{id} (product model {answered})"),
             (None, None) => format!("a board this build does not know (product model {answered})"),
         };
+        if verb == "run" {
+            let change = answering_id.as_ref().map_or_else(String::new, |id| {
+                format!(" or change <LamellaTargetBoard> to {id}")
+            });
+            return Err(format!(
+                "lamella run: the board on {target} is {answering}, which does not match the \
+                 project's board, {wanted}; nothing was sent, so connect {}{change}.",
+                wanted_name.as_deref().unwrap_or(&self.named.id),
+            ));
+        }
         let naming = match &self.project {
             Some(project) => format!("{}, line {}, names", project.display(), self.named.line),
             None => "The project names".to_owned(),
@@ -1128,20 +1138,20 @@ mod tests {
     /// empty property is unset to MSBuild. The last one wins, as MSBuild's last definition does.
     #[test]
     fn the_target_board_property_is_read_with_its_line() {
-        let named = project_with("named", "    <LamellaTargetBoard>rpi-pico2-w</LamellaTargetBoard>\n");
+        let named = project_with("named", "    <LamellaTargetBoard>raspberrypi-pico-2-w</LamellaTargetBoard>\n");
         let project = Project::read_file(&named, "build").expect("a project naming its board");
-        assert_eq!(project.board, Some(NamedBoard { id: "rpi-pico2-w".to_owned(), line: 4 }));
+        assert_eq!(project.board, Some(NamedBoard { id: "raspberrypi-pico-2-w".to_owned(), line: 4 }));
 
         let empty = project_with("empty", "    <LamellaTargetBoard></LamellaTargetBoard>\n");
         assert_eq!(Project::read_file(&empty, "build").expect("it reads").board, None);
 
         let twice = project_with(
             "twice",
-            "    <LamellaTargetBoard>rpi-pico2</LamellaTargetBoard>\n    \
-             <LamellaTargetBoard>rpi-pico2-w</LamellaTargetBoard>\n",
+            "    <LamellaTargetBoard>raspberrypi-pico-2</LamellaTargetBoard>\n    \
+             <LamellaTargetBoard>raspberrypi-pico-2-w</LamellaTargetBoard>\n",
         );
         let board = Project::read_file(&twice, "build").expect("it reads").board;
-        assert_eq!(board.map(|board| (board.id, board.line)), Some(("rpi-pico2-w".to_owned(), 5)));
+        assert_eq!(board.map(|board| (board.id, board.line)), Some(("raspberrypi-pico-2-w".to_owned(), 5)));
         for path in [named, empty, twice] {
             let _ = std::fs::remove_dir_all(path.parent().expect("its directory"));
         }
@@ -1151,19 +1161,19 @@ mod tests {
     /// different boards is refused with both, and the line of the property.
     #[test]
     fn a_build_takes_its_board_from_the_option_or_the_property_and_never_two() {
-        let named = project_with("one", "    <LamellaTargetBoard>rpi-pico2-w</LamellaTargetBoard>\n");
+        let named = project_with("one", "    <LamellaTargetBoard>raspberrypi-pico-2-w</LamellaTargetBoard>\n");
         let unnamed = project_with("none", "");
         let board = |path: &Path, flag| board_for_build("build", path, flag);
 
-        assert_eq!(board(&named, None), Ok(Some("rpi-pico2-w".to_owned())), "the property alone");
-        assert_eq!(board(&named, Some("rpi-pico2-w")), Ok(Some("rpi-pico2-w".to_owned())), "both, agreeing");
-        assert_eq!(board(&unnamed, Some("rpi-pico2")), Ok(Some("rpi-pico2".to_owned())), "the option alone");
+        assert_eq!(board(&named, None), Ok(Some("raspberrypi-pico-2-w".to_owned())), "the property alone");
+        assert_eq!(board(&named, Some("raspberrypi-pico-2-w")), Ok(Some("raspberrypi-pico-2-w".to_owned())), "both, agreeing");
+        assert_eq!(board(&unnamed, Some("raspberrypi-pico-2")), Ok(Some("raspberrypi-pico-2".to_owned())), "the option alone");
         assert_eq!(board(&unnamed, None), Ok(None), "neither");
-        assert_eq!(board(Path::new("Program.cs"), Some("rpi-pico2")), Ok(Some("rpi-pico2".to_owned())));
+        assert_eq!(board(Path::new("Program.cs"), Some("raspberrypi-pico-2")), Ok(Some("raspberrypi-pico-2".to_owned())));
 
-        let error = board(&named, Some("rpi-pico2")).expect_err("two boards");
-        assert!(error.contains("--board names rpi-pico2"), "{error}");
-        assert!(error.contains("line 4, names rpi-pico2-w"), "{error}");
+        let error = board(&named, Some("raspberrypi-pico-2")).expect_err("two boards");
+        assert!(error.contains("--board names raspberrypi-pico-2"), "{error}");
+        assert!(error.contains("line 4, names raspberrypi-pico-2-w"), "{error}");
         assert!(error.contains("Nothing was built"), "{error}");
         crate::rendered::assert_renders_cleanly(&error, crate::rendered::four_space_sample);
         for path in [named, unnamed] {
@@ -1175,9 +1185,9 @@ mod tests {
     /// is compiled for it, by every route that reads the property.
     #[test]
     fn an_unknown_target_board_is_refused_at_its_line() {
-        let typo = project_with("typo", "    <LamellaTargetBoard>rpi-pico2w</LamellaTargetBoard>\n");
+        let typo = project_with("typo", "    <LamellaTargetBoard>raspberrypi-pico-2w</LamellaTargetBoard>\n");
         let error = board_for_build("build", &typo, None).expect_err("no such board");
-        assert!(error.contains("line 4: <LamellaTargetBoard> names \"rpi-pico2w\""), "{error}");
+        assert!(error.contains("line 4: <LamellaTargetBoard> names \"raspberrypi-pico-2w\""), "{error}");
         assert!(error.contains("`lamella boards`"), "{error}");
         let error = BoardCheck::for_file("deploy", &typo).expect_err("no such board, on a --device route");
         assert!(error.starts_with("lamella deploy:"), "{error}");
@@ -1190,7 +1200,7 @@ mod tests {
     /// does not match, and names both boards, each by its name and its id.
     #[test]
     fn a_device_route_refuses_a_board_the_project_does_not_name() {
-        let named = project_with("device", "    <LamellaTargetBoard>rpi-pico2-w</LamellaTargetBoard>\n");
+        let named = project_with("device", "    <LamellaTargetBoard>raspberrypi-pico-2-w</LamellaTargetBoard>\n");
         let check = BoardCheck::for_file("run", &named)
             .expect("the project reads")
             .expect("it names a board");
@@ -1201,14 +1211,9 @@ mod tests {
             .expect_err("a Pico 2 is not a Pico 2 W");
         assert_eq!(
             error,
-            format!(
-                "lamella run: the board on COM7 is the Raspberry Pi Pico 2 (rpi-pico2), which does not match \
-                 the project's board, the Raspberry Pi Pico 2 W (rpi-pico2-w).\n\n\
-                 {}, line 4, names rpi-pico2-w with <LamellaTargetBoard>, and a program built for one board is \
-                 not sent to another. Connect the Raspberry Pi Pico 2 W, or change the property to rpi-pico2.\n\n\
-                 Nothing was sent.",
-                named.display()
-            )
+            "lamella run: the board on COM7 is the Raspberry Pi Pico 2 (raspberrypi-pico-2), which does not match \
+             the project's board, the Raspberry Pi Pico 2 W (raspberrypi-pico-2-w); nothing was sent, so connect \
+             the Raspberry Pi Pico 2 W or change <LamellaTargetBoard> to raspberrypi-pico-2."
         );
         crate::rendered::assert_renders_cleanly(&error, crate::rendered::four_space_sample);
 
@@ -1216,7 +1221,7 @@ mod tests {
         assert!(
             error.starts_with(
                 "lamella deploy: the board on tcp:10.0.0.7:5000 is a board this build does not know (product \
-                 model 65534), which does not match the project's board, the Raspberry Pi Pico 2 W (rpi-pico2-w)."
+                 model 65534), which does not match the project's board, the Raspberry Pi Pico 2 W (raspberrypi-pico-2-w)."
             ),
             "{error}"
         );
@@ -1236,24 +1241,40 @@ mod tests {
     /// is refused before anything is opened.
     #[test]
     fn a_board_the_sdk_passes_is_checked_against_the_board_that_answers() {
-        let check = BoardCheck::for_board("run", "rpi-pico2-w").expect("a board this build knows");
+        let check = BoardCheck::for_board("run", "raspberrypi-pico-2-w").expect("a board this build knows");
         let device = "usb:39e9:0001:A0000000000000B1";
         assert_eq!(check.against("run", device, lamella_wire::product_model::PICO2_W), Ok(()));
         assert_eq!(check.against("run", device, lamella_wire::product_model::UNKNOWN), Ok(()));
         let error = check.against("run", device, lamella_wire::product_model::PICO2).expect_err("a Pico 2 is not a Pico 2 W");
-        assert!(
-            error.starts_with(
-                "lamella run: the board on usb:39e9:0001:A0000000000000B1 is the Raspberry Pi Pico 2 (rpi-pico2), \
-                 which does not match the project's board, the Raspberry Pi Pico 2 W (rpi-pico2-w).\n\n\
-                 The project names rpi-pico2-w with <LamellaTargetBoard>, and"
-            ),
-            "{error}"
+        assert_eq!(
+            error,
+            "lamella run: the board on usb:39e9:0001:A0000000000000B1 is the Raspberry Pi Pico 2 (raspberrypi-pico-2), \
+             which does not match the project's board, the Raspberry Pi Pico 2 W (raspberrypi-pico-2-w); nothing was sent, \
+             so connect the Raspberry Pi Pico 2 W or change <LamellaTargetBoard> to raspberrypi-pico-2."
         );
-        assert!(error.ends_with("\n\nNothing was sent."), "{error}");
         crate::rendered::assert_renders_cleanly(&error, crate::rendered::four_space_sample);
 
-        let error = BoardCheck::for_board("run", "rpi-pico2w").expect_err("no such board");
-        assert!(error.contains("names \"rpi-pico2w\" with <LamellaTargetBoard>"), "{error}");
+        let error = BoardCheck::for_board("run", "raspberrypi-pico-2w").expect_err("no such board");
+        assert!(error.contains("names \"raspberrypi-pico-2w\" with <LamellaTargetBoard>"), "{error}");
+    }
+
+    /// A run's single-sentence refusal retains the action to take and the fact that nothing was sent.
+    #[test]
+    fn a_wrong_board_run_keeps_recovery_advice_in_its_rendered_refusal() {
+        for (wanted, answered) in [("pimoroni-pico-plus-2", "raspberrypi-pico-2"), ("raspberrypi-pico-2", "pimoroni-pico-plus-2")] {
+            let check = BoardCheck::for_board("run", wanted).expect("known project board");
+            let other = BoardCheck::for_board("run", answered).expect("known answering board");
+            let refusal = check.against("run", "usb:39e9:0001:TEST", other.product_model).expect_err("wrong board");
+            let mut output = Vec::new();
+            crate::own_lines::fail(&mut output, &refusal);
+            let output = String::from_utf8(output).expect("text");
+            assert!(output.contains(&format!("change <LamellaTargetBoard> to {answered}")), "{output}");
+            assert!(output.contains("nothing was sent"), "{output}");
+            assert!(output.contains(&format!("({wanted})")), "{output}");
+            assert!(output.contains(&format!("({answered})")), "{output}");
+            assert_eq!(output.lines().count(), 1, "{output}");
+            assert!(!output.starts_with("lamella"), "{output}");
+        }
     }
 
     /// **A MONIKER THAT IS NOT OURS IS REFUSED BY NAME**, with both spellings that would work.

@@ -289,15 +289,15 @@ impl UsbTransport {
     ///
     /// # Errors
     /// [`TransportError::Carrier`] if no matching device is present or it cannot be opened.
-    pub fn open() -> Result<Self, TransportError> {
+    pub fn open() -> Result<Self, OpenFailure> {
         Self::open_ids(lamella_wire::usb::VID, lamella_wire::usb::PID)
     }
 
     /// Open a specific `vid`/`pid` on the Lamella Link interface GUID (a board built with its own id pair).
     ///
     /// # Errors
-    /// [`TransportError::Carrier`] if no matching device is present or it cannot be opened.
-    pub fn open_ids(vid: u16, pid: u16) -> Result<Self, TransportError> {
+    /// As [`Self::open_matching`].
+    pub fn open_ids(vid: u16, pid: u16) -> Result<Self, OpenFailure> {
         Self::open_matching(vid, pid, None)
     }
 
@@ -307,15 +307,16 @@ impl UsbTransport {
     /// first match.
     ///
     /// # Errors
-    /// [`TransportError::Carrier`] if no matching device is present or it cannot be opened.
-    pub fn open_matching(vid: u16, pid: u16, serial: Option<&str>) -> Result<Self, TransportError> {
+    /// [`TransportError::Carrier`] if no matching device is present or it cannot be opened, with what the
+    /// OS said of the second.
+    pub fn open_matching(vid: u16, pid: u16, serial: Option<&str>) -> Result<Self, OpenFailure> {
         let device = lamella_usbbulk::Device::open_interface(
             lamella_wire::usb::WINUSB_INTERFACE_GUID,
             vid,
             pid,
             serial,
         )
-        .map_err(|_| TransportError::Carrier)?;
+        .map_err(usb_open_failure)?;
         Ok(Self { device, reader: FrameReader::new() })
     }
 
@@ -383,6 +384,122 @@ pub fn list_serial() -> Vec<SerialPortDesc> {
             SerialPortDesc { port: port.name, vid, pid, serial_number, product }
         })
         .collect()
+}
+
+/// The board a Lamella Link's USB product string names, which is known with nothing opened:
+/// `Raspberry Pi Pico 2 W` from `Lamella Link (Raspberry Pi Pico 2 W)`, a note on the build included.
+///
+/// **NO BOARD IS LISTED,** so a board newer than this tool is named by it, and a host learns which board
+/// it is talking to from the board's HELLO either way. What identifies a device stays its USB ids and serial.
+#[must_use]
+pub fn board_named_by_link(product: &str) -> Option<&str> {
+    let name = product.strip_prefix("Lamella Link (")?.strip_suffix(')')?.trim();
+    (!name.is_empty()).then_some(name)
+}
+
+/// What a refusal reason MEANS, as a sentence somebody can act on.
+///
+/// A refusal is the target answering, not failing, and each reason has a different remedy: one says
+/// stop asking, the other says wait for a colleague to unplug. Rendering the struct printed
+/// `reason: 2, msg_type: 2` for the second, which reads as a protocol fault and sends the reader to
+/// the cable -- the one direction that cannot help.
+#[must_use]
+pub fn describe_refusal(reason: u8) -> String {
+    match reason {
+        lamella_wire::error::SESSION_HELD => String::from(concat!(
+            "another carrier already holds the debug session -- typically somebody at the ",
+            "board with a cable, or a host that did not let go. The request was well formed ",
+            "and this target implements it, so the answer changes when the other carrier ",
+            "releases it; a reset clears a session whose host is gone.",
+        )),
+        lamella_wire::error::UNKNOWN_MESSAGE_TYPE => String::from(concat!(
+            "this target does not implement that message. Stop asking rather than retrying ",
+            "-- the answer will not change without different firmware.",
+        )),
+        other => format!("refusal reason {other}, which this build has no description for"),
+    }
+}
+
+/// What failed on a link to a board, in words, for the middle of a sentence that names the board. **No
+/// reader is shown the error's type,** which names nothing they can act on.
+#[must_use]
+pub fn link_failure(error: TransportError) -> String {
+    match error {
+        TransportError::Closed => "nothing came back in time, or the connection closed".to_owned(),
+        TransportError::Stalled => "it stopped taking data".to_owned(),
+        TransportError::PayloadTooLarge => "the message is too long for one frame on this link".to_owned(),
+        TransportError::Refused { reason, .. } => describe_refusal(reason),
+        TransportError::MalformedReply { msg_type } => format!("its reply to message {msg_type:#04x} did not decode"),
+        TransportError::VersionMismatch { target_min, target_max } => {
+            version_mismatch(lamella_wire::PROTOCOL_VERSION, target_min, target_max)
+        }
+        _ => "the connection to it failed".to_owned(),
+    }
+}
+
+/// A link to a board that could not be opened: what the rest of the link reads it as, and the operating
+/// system's own words where it gave some.
+///
+/// [`TransportError`] is shared with the firmware and holds no text, and what the OS said is the one thing
+/// a person can act on: on Linux, with no udev rule, a board that is there refuses every user but root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenFailure {
+    /// What the link reads this as.
+    pub error: TransportError,
+    /// Why, as the OS put it. `None` when nothing more is known than `error`.
+    pub why: Option<String>,
+}
+
+impl From<TransportError> for OpenFailure {
+    fn from(error: TransportError) -> Self {
+        OpenFailure { error, why: None }
+    }
+}
+
+impl From<OpenFailure> for TransportError {
+    fn from(failure: OpenFailure) -> Self {
+        failure.error
+    }
+}
+
+/// Why a link to a board could not be opened, in words, for the middle of a sentence that names the board.
+/// What the OS said comes first, where it said anything.
+#[must_use]
+pub fn open_failure(failure: impl Into<OpenFailure>) -> String {
+    let failure = failure.into();
+    if let Some(why) = failure.why {
+        return why.trim_end_matches('.').to_owned();
+    }
+    match failure.error {
+        TransportError::Carrier => "it is not attached, or another program holds it".to_owned(),
+        other => link_failure(other),
+    }
+}
+
+/// A Link's open that failed: no device matching says nothing more than the link's own words do, and any
+/// other failure keeps what the OS said, with [`lamella_probe_core::hint_after_a_refusal`]'s word after it.
+#[cfg(feature = "usb")]
+fn usb_open_failure(error: lamella_usbbulk::Error) -> OpenFailure {
+    let why = match error {
+        lamella_usbbulk::Error::NotFound => None,
+        other => {
+            let said = other.to_string();
+            Some(format!("{}{}", said.trim_end_matches('.'), lamella_probe_core::hint_after_a_refusal(&said)))
+        }
+    };
+    OpenFailure { error: TransportError::Carrier, why }
+}
+
+/// A device that opened and whose link then failed in the HELLO, which is not a device that would not open.
+#[cfg(feature = "debug-backend")]
+pub(crate) fn failed_after_the_open(error: TransportError) -> OpenFailure {
+    OpenFailure { error, why: Some(format!("it opened, and then {}", link_failure(error))) }
+}
+
+/// A board that answered, and whose firmware offers no debugging.
+#[cfg(feature = "debug-backend")]
+pub(crate) fn cannot_debug() -> OpenFailure {
+    OpenFailure { error: TransportError::Closed, why: Some("it answered, and its firmware offers no debugging".to_owned()) }
 }
 
 /// Parse an example's `usb` target argument into (vid, pid, serial-substring):
@@ -491,7 +608,7 @@ pub fn era_note(era: lamella_wire::usb::LinkIdentity) -> Option<&'static str> {
 impl Transport for UsbTransport {
     fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
         let frame = encode_frame(msg_type, seq, payload).ok_or(TransportError::PayloadTooLarge)?;
-        self.device.write_packet(&frame).map_err(|_| TransportError::Carrier)
+        self.device.write_packet(&frame).map_err(bulk_write_failure)
     }
 
     fn poll(&mut self) -> Result<Option<Frame>, TransportError> {
@@ -499,16 +616,39 @@ impl Transport for UsbTransport {
             return Ok(Some(frame));
         }
         let mut buf = [0u8; 512];
-        match self.device.read_packet(&mut buf, Duration::from_millis(50)) {
-            Ok(count) => self.reader.push(&buf[..count]),
-            Err(lamella_usbbulk::Error::Timeout) => {}
-            Err(_) => return Err(TransportError::Carrier),
-        }
+        let count = bulk_read_bytes(self.device.poll_packet(&mut buf, Duration::from_millis(50)))?;
+        self.reader.push(&buf[..count]);
         Ok(self.reader.next_frame())
     }
 
     fn discarded_bytes(&self) -> Option<u64> {
         Some(self.reader.discarded_bytes())
+    }
+}
+
+/// What a bulk write's failure is to a session: a write that timed out is a board that is there and
+/// not reading its USB, and any other failure is one that has gone away.
+#[cfg(feature = "usb")]
+fn bulk_write_failure(error: lamella_usbbulk::Error) -> TransportError {
+    match error {
+        lamella_usbbulk::Error::Timeout => TransportError::Stalled,
+        _ => TransportError::Carrier,
+    }
+}
+
+/// How many bytes a bulk read delivered to a session, or why the session is over.
+///
+/// **A READ THAT TIMED OUT IS A BOARD WITH NOTHING TO SAY, AND ANY OTHER FAILURE ENDS THE SESSION.**
+/// A running program can be silent for as long as it likes, so a quiet read must not end anything;
+/// a board that has been unplugged must end it at once, instead of leaving the tool waiting on it. The
+/// transfer stays outstanding across the timeout ([`lamella_usbbulk::Device::poll_packet`]), on every OS,
+/// so nothing that arrives as it runs out is lost.
+#[cfg(feature = "usb")]
+fn bulk_read_bytes(read: lamella_usbbulk::Result<usize>) -> Result<usize, TransportError> {
+    match read {
+        Ok(count) => Ok(count),
+        Err(lamella_usbbulk::Error::Timeout) => Ok(0),
+        Err(_) => Err(TransportError::Carrier),
     }
 }
 
@@ -843,23 +983,27 @@ pub fn classify_target(target: &str) -> TargetKind {
 /// # Errors
 /// [`TransportError::Carrier`] if the carrier will not open, or if the target names a carrier this
 /// build was compiled without -- a build missing a feature and a board that is unplugged are both
-/// "cannot reach it from here", and the message a tool prints should say which.
+/// "cannot reach it from here", and the message a tool prints should say which. [`open_failure`]
+/// puts one in words.
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
 pub fn open_target(
     target: &str,
     baud: u32,
     timeout: Duration,
-) -> Result<AnyTransport, TransportError> {
+) -> Result<AnyTransport, OpenFailure> {
     match classify_target(target) {
         TargetKind::Tcp => {
             #[cfg(feature = "tcp")]
             {
-                return TcpTransport::connect(target, timeout).map(AnyTransport::Tcp);
+                return TcpTransport::connect(target, timeout).map(AnyTransport::Tcp).map_err(|error| OpenFailure {
+                    error,
+                    why: (error == TransportError::Carrier).then(|| "nothing accepted a connection at that address, or the name does not resolve".to_owned()),
+                });
             }
             #[cfg(not(feature = "tcp"))]
             {
                 let _ = timeout;
-                Err(TransportError::Carrier)
+                Err(TransportError::Carrier.into())
             }
         }
         TargetKind::Usb => {
@@ -869,17 +1013,17 @@ pub fn open_target(
                 return UsbTransport::open_matching(vid, pid, serial.as_deref()).map(AnyTransport::Usb);
             }
             #[cfg(not(feature = "usb"))]
-            Err(TransportError::Carrier)
+            Err(TransportError::Carrier.into())
         }
         TargetKind::Serial => {
             #[cfg(feature = "serial")]
             {
-                return SerialTransport::open(target, baud).map(AnyTransport::Serial);
+                return SerialTransport::open(target, baud).map(AnyTransport::Serial).map_err(OpenFailure::from);
             }
             #[cfg(not(feature = "serial"))]
             {
                 let _ = baud;
-                Err(TransportError::Carrier)
+                Err(TransportError::Carrier.into())
             }
         }
     }
@@ -1150,7 +1294,8 @@ impl TransferAck {
             ),
             Self::TooLarge { image, window } => image_too_large(board, image, window),
             Self::OutOfRange { chunk } => format!(
-                "the image is too large for {place}: it refused chunk {chunk} as reaching past its deploy window"
+                "the image is too large for {place}: it refused chunk {chunk} as reaching past its \
+                 program area"
             ),
         }
     }
@@ -1184,7 +1329,10 @@ pub fn board_name(model: u16) -> Option<&'static str> {
 pub fn image_too_large(board: Option<&str>, image: usize, window: usize) -> String {
     let over = image.saturating_sub(window);
     let place = the_board(board);
-    format!("the image is {image} bytes, {over} more than the {window}-byte deploy window on {place}, so nothing was sent")
+    format!(
+        "the image is {image} bytes, {over} more than the {window}-byte program area on {place}, \
+         so nothing was sent"
+    )
 }
 
 /// What running a loaded artifact did: it ran, or the target refused the transfer and nothing
@@ -1380,10 +1528,16 @@ pub const CHUNK_DATA_CAP: usize = ((u16::MAX as usize - 8) / 512) * 512;
 /// unsatisfiable: a 256-byte receive ring cannot carry a 512-byte-aligned chunk at all, and that is
 /// a fact about the board rather than something a caller can pick its way around.
 ///
+/// # The first chunk waits longer
+///
+/// A target clears its deploy window before it writes the first chunk, and answers only then, so
+/// the first acknowledgement is given `timeout` and the time a window of the size the target
+/// reports may take to clear. Every later chunk is given `timeout`.
+///
 /// # Errors
 /// [`TransportError::Refused`] at once when the target answers `ERROR`,
 /// [`TransportError::MalformedReply`] when a compared acknowledgement carries no CRC, and
-/// [`TransportError::Closed`] if a chunk goes unacknowledged past `timeout`; otherwise a carrier
+/// [`TransportError::Closed`] if a chunk goes unacknowledged past its wait; otherwise a carrier
 /// [`TransportError`].
 pub fn deploy_image_blocking(
     transport: &mut impl Transport,
@@ -1414,10 +1568,46 @@ pub fn deploy_image_with_progress(
     session_caps: lamella_wire::Capabilities,
     progress: &mut dyn FnMut(usize),
 ) -> Result<TransferAck, TransportError> {
+    deploy_image_reporting(transport, seq, image, chunk_len, timeout, session_caps, &mut |event| {
+        if let DeployProgress::Acknowledged(written) = event {
+            progress(written);
+        }
+    })
+}
+
+/// What [`deploy_image_reporting`] tells its caller while a deploy goes, in the order it happens.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DeployProgress {
+    /// The first chunk is sent, and its acknowledgement is awaited for up to `wait`: longer than
+    /// the wait every chunk has, because the target clears its deploy window first, which is
+    /// `expected` to take as long as [`CLEAR_EXPECTED_PER_MIB`] gives that window. Told once,
+    /// before that wait, and only when the target reported a window, so only when it is longer.
+    Clearing { wait: Duration, expected: Duration },
+    /// The target has acknowledged this many bytes of the image.
+    Acknowledged(usize),
+}
+
+/// [`deploy_image_with_progress`], telling `report` too when the first chunk's acknowledgement is
+/// awaited for longer than every other chunk's, before that wait begins: a host can then say why
+/// the deploy is silent for as long as a large window takes to clear.
+///
+/// # Errors
+/// As [`deploy_image_blocking`].
+fn deploy_image_reporting(
+    transport: &mut impl Transport,
+    seq: u16,
+    image: &[u8],
+    chunk_len: usize,
+    timeout: Duration,
+    session_caps: lamella_wire::Capabilities,
+    report: &mut dyn FnMut(DeployProgress),
+) -> Result<TransferAck, TransportError> {
     use lamella_wire::crc32;
-    if let Some(refused) = refuse_if_larger_than_the_window(transport, seq, image.len(), timeout) {
-        return Ok(refused);
-    }
+    let window = match window_before_deploy(transport, seq, image.len(), timeout) {
+        Ok(window) => window,
+        Err(refused) => return Ok(refused),
+    };
+    let first_wait = timeout.saturating_add(first_chunk_allowance(window));
     let chunk_len = chunk_len.clamp(1, CHUNK_DATA_CAP);
     let compare = session_caps.has(lamella_wire::Capabilities::DEPLOY_PREFIX_CRC);
     let total = image.len() as u32;
@@ -1432,13 +1622,17 @@ pub fn deploy_image_with_progress(
         payload.extend_from_slice(&image[offset..end]);
         transport.send(deploy::DEPLOY_IMAGE, seq, &payload)?;
         sent = crc32::update(sent, &image[offset..end]);
-        let outcome = await_transfer_ack(transport, seq, chunk, compare.then_some(sent), timeout)?;
+        let wait = if chunk == 0 { first_wait } else { timeout };
+        if chunk == 0 && first_wait > timeout {
+            report(DeployProgress::Clearing { wait, expected: expected_clear(window) });
+        }
+        let outcome = await_transfer_ack(transport, seq, chunk, compare.then_some(sent), wait)?;
         if outcome != TransferAck::Accepted {
             return Ok(outcome);
         }
         offset = end;
         chunk += 1;
-        progress(offset);
+        report(DeployProgress::Acknowledged(offset));
     }
     Ok(TransferAck::Accepted)
 }
@@ -1771,9 +1965,12 @@ fn transfer_reply(frame: lamella_wire::Frame, seq: u16) -> Result<Option<Vec<u8>
 /// CONTRACT.** The protocol is those three; this is the one waiting policy that suits a CLI. A host
 /// with an event loop drives the same three and never blocks.
 ///
+/// The first chunk waits longer than `timeout`, as [`deploy_image_blocking`]'s does, for the
+/// target's deploy window to clear.
+///
 /// # Errors
 /// [`TransportError::Refused`] if the target does not implement the op, [`TransportError::Closed`]
-/// if a chunk goes unacked past `timeout`; otherwise a carrier [`TransportError`].
+/// if a chunk goes unacked past its wait; otherwise a carrier [`TransportError`].
 ///
 /// A target REJECTING a chunk is not among them: it is [`TransferAck::Rejected`], and it carries
 /// which chunk.
@@ -1793,16 +1990,18 @@ pub fn deploy_bundle_blocking(
     timeout: Duration,
     session_caps: lamella_wire::Capabilities,
 ) -> Result<TransferAck, TransportError> {
-    if let Some(refused) = refuse_if_larger_than_the_window(transport, seq, bundle.len(), timeout) {
-        return Ok(refused);
-    }
+    let first_wait = match window_before_deploy(transport, seq, bundle.len(), timeout) {
+        Ok(window) => timeout.saturating_add(first_chunk_allowance(window)),
+        Err(refused) => return Ok(refused),
+    };
     let compare = session_caps.has(lamella_wire::Capabilities::DEPLOY_PREFIX_CRC);
     let mut chunks = BundleChunks::new(bundle, chunk_len);
     let mut index = 0usize;
     while let Some(chunk) = chunks.next() {
         send_bundle_chunk(transport, seq, &chunk)?;
         let expected = compare.then(|| chunks.prefix_crc());
-        let outcome = await_transfer_ack(transport, seq, index, expected, timeout)?;
+        let wait = if index == 0 { first_wait } else { timeout };
+        let outcome = await_transfer_ack(transport, seq, index, expected, wait)?;
         if outcome != TransferAck::Accepted {
             return Ok(outcome);
         }
@@ -1876,25 +2075,65 @@ pub fn deploy_status_blocking(
     answered.ok_or(TransportError::Closed)
 }
 
-/// The refusal a deploy makes before it sends anything: [`TransferAck::TooLarge`] when the target
-/// reports a deploy window and `len` does not fit it, `None` when it fits or the window is unknown.
+/// What a deploy asks before it sends anything: the target's deploy window, in bytes, or `None`
+/// when it does not say; or the refusal of an artifact `len` bytes long that does not fit that
+/// window, [`TransferAck::TooLarge`].
 ///
 /// Asked under the deploy's own `seq`, so it costs a caller nothing to number: the answer is a
 /// different message type from every chunk acknowledgement that follows. A target that does not
 /// answer, or answers without a window, is deployed to as before -- an unknown window is not a
 /// window of zero.
-fn refuse_if_larger_than_the_window(
+fn window_before_deploy(
     transport: &mut impl Transport,
     seq: u16,
     len: usize,
     timeout: Duration,
-) -> Option<TransferAck> {
+) -> Result<Option<usize>, TransferAck> {
     if len == 0 {
-        return None;
+        return Ok(None);
     }
-    let window = deploy_status_blocking(transport, seq, timeout).ok()?.window?;
+    let asked = deploy_status_blocking(transport, seq, timeout);
+    let Some(window) = asked.ok().and_then(|status| status.window) else {
+        return Ok(None);
+    };
     let window = usize::try_from(window).unwrap_or(usize::MAX);
-    (len > window).then_some(TransferAck::TooLarge { image: len, window })
+    if len > window { Err(TransferAck::TooLarge { image: len, window }) } else { Ok(Some(window)) }
+}
+
+/// How long a target may take, for each mebibyte of its deploy window, to clear that window before
+/// it writes a deploy's first chunk.
+///
+/// A target's deploy serve erases whatever an earlier program left in the window when the first
+/// chunk arrives, and answers that chunk only once the erase is done, so on a board whose window
+/// holds much the first acknowledgement comes long after any other. Every later chunk is given only
+/// the deploy's own wait.
+const FIRST_CHUNK_CLEAR_PER_MIB: Duration = Duration::from_millis(11_500);
+
+/// What a deploy's first chunk is given besides the deploy's own wait: the time a deploy window of
+/// `window` bytes may take to clear, at [`FIRST_CHUNK_CLEAR_PER_MIB`]; nothing for a window the
+/// target did not report.
+///
+/// A target that stops answering altogether is not waited on for it: a carrier that fails, as a
+/// board's own USB does when it is unplugged, ends the wait at once.
+fn first_chunk_allowance(window: Option<usize>) -> Duration {
+    window.map_or(Duration::ZERO, |window| at_rate(window, FIRST_CHUNK_CLEAR_PER_MIB))
+}
+
+/// How long a target takes, for each mebibyte of a deploy window that holds data, to clear it, as
+/// a host expects the clear to take: [`FIRST_CHUNK_CLEAR_PER_MIB`], what a host allows, is about
+/// three times this.
+const CLEAR_EXPECTED_PER_MIB: Duration = Duration::from_millis(3_800);
+
+/// How long a deploy window of `window` bytes is expected to take to clear, at
+/// [`CLEAR_EXPECTED_PER_MIB`]; nothing for a window the target did not report.
+fn expected_clear(window: Option<usize>) -> Duration {
+    window.map_or(Duration::ZERO, |window| at_rate(window, CLEAR_EXPECTED_PER_MIB))
+}
+
+/// How long `window` bytes take at `per_mib` for each mebibyte.
+fn at_rate(window: usize, per_mib: Duration) -> Duration {
+    let micros = (window as u128).saturating_mul(per_mib.as_micros()) / (1 << 20);
+    Duration::from_micros(u64::try_from(micros).unwrap_or(u64::MAX))
 }
 
 /// What [`abort_blocking`] found the target doing.
@@ -2025,10 +2264,12 @@ impl core::fmt::Display for StartFailure {
         match self {
             Self::Refused(code) => f.write_str(&describe_start_refusal(*code)),
             Self::NoAnswer => f.write_str("the target did not acknowledge the start"),
-            Self::Transport(refused @ TransportError::Refused { .. }) => {
-                write!(f, "the target refused the start command: {refused:?}")
+            Self::Transport(TransportError::Refused { reason, .. }) => {
+                write!(f, "the target refused the start command: {}", describe_refusal(*reason))
             }
-            Self::Transport(error) => write!(f, "the carrier failed before the start was acknowledged: {error:?}"),
+            Self::Transport(error) => {
+                write!(f, "the start was not acknowledged: {}", link_failure(*error))
+            }
         }
     }
 }
@@ -2113,6 +2354,141 @@ fn await_result(
         std::thread::sleep(Duration::from_millis(2));
     }
     Err(TransportError::Closed)
+}
+
+#[cfg(all(test, feature = "usb"))]
+mod link_failure_tests {
+    use super::{OpenFailure, TransportError, link_failure, open_failure};
+
+    /// **EACH FIRMWARE'S STRING, AS IT SAYS IT:** a board's name where it names one, and nothing where it
+    /// names a chip's family. A name no tool has heard of is a name all the same, so an older tool shows a
+    /// newer board.
+    #[test]
+    fn a_links_product_string_names_a_board_and_a_chips_family_names_none() {
+        for (product, board) in [
+            ("Lamella Link (Raspberry Pi Pico 2)", "Raspberry Pi Pico 2"),
+            ("Lamella Link (Raspberry Pi Pico 2 W)", "Raspberry Pi Pico 2 W"),
+            ("Lamella Link (Pimoroni Pico Plus 2)", "Pimoroni Pico Plus 2"),
+            ("Lamella Link (Pimoroni Pico Plus 2 W)", "Pimoroni Pico Plus 2 W"),
+            ("Lamella Link (Raspberry Pi Pico)", "Raspberry Pi Pico"),
+            ("Lamella Link (ATSAMW25 Xplained Pro)", "ATSAMW25 Xplained Pro"),
+            ("Lamella Link (SAM4S Xplained Pro, bank B)", "SAM4S Xplained Pro, bank B"),
+            ("Lamella Link (A Board Nobody Here Has Heard Of)", "A Board Nobody Here Has Heard Of"),
+        ] {
+            assert_eq!(super::board_named_by_link(product), Some(board), "{product}");
+        }
+        for product in [
+            "Lamella Link ()",
+            "Lamella Link",
+            "Lamella Link (Raspberry Pi Pico 2",
+            "Debug Probe (CMSIS-DAP)",
+            "",
+        ] {
+            assert_eq!(super::board_named_by_link(product), None, "{product}");
+        }
+    }
+
+    /// **NO READER IS SHOWN AN ERROR'S TYPE.** Every failure of a link reads as words, and none of them is
+    /// the name of a variant.
+    #[test]
+    fn a_link_failure_reads_as_words_and_never_as_its_type() {
+        for error in [
+            TransportError::Closed,
+            TransportError::Carrier,
+            TransportError::Stalled,
+            TransportError::PayloadTooLarge,
+            TransportError::Refused { reason: lamella_wire::error::SESSION_HELD, msg_type: 0, holder: None },
+            TransportError::MalformedReply { msg_type: 0x21 },
+            TransportError::VersionMismatch { target_min: 9, target_max: 9 },
+        ] {
+            let name = format!("{error:?}");
+            let name = name.split([' ', '{']).next().unwrap();
+            for said in [link_failure(error), open_failure(error)] {
+                assert!(!said.contains(name), "{name}: {said}");
+                assert!(said.contains(' '), "{name}: {said}");
+            }
+        }
+        assert_eq!(link_failure(TransportError::Stalled), "it stopped taking data");
+        assert_eq!(open_failure(TransportError::Carrier), "it is not attached, or another program holds it");
+    }
+
+    /// A board that opened is not told it is not attached, and one that answered is told what it lacks.
+    #[cfg(feature = "debug-backend")]
+    #[test]
+    fn a_failure_after_the_open_says_it_opened() {
+        assert_eq!(
+            open_failure(super::failed_after_the_open(TransportError::Carrier)),
+            format!("it opened, and then {}", link_failure(TransportError::Carrier))
+        );
+        assert_eq!(open_failure(super::cannot_debug()), "it answered, and its firmware offers no debugging");
+    }
+
+    /// **WHAT THE OS SAID REACHES THE PERSON.** A board that is there and refuses to open is not "not
+    /// attached": on Linux with no udev rule that sentence sends everyone who is not root to the cable.
+    /// The sentence around this ends with its own full stop.
+    #[test]
+    fn a_links_open_says_what_the_os_said() {
+        let refused = OpenFailure {
+            error: TransportError::Carrier,
+            why: Some("USB error: open /dev/bus/usb/001/003: permission denied. Linux gives a USB device to the root user until a udev rule grants it to you, and Lamella does not install one yet.".to_owned()),
+        };
+        let said = open_failure(refused);
+        assert!(said.contains("permission denied") && said.contains("udev rule"), "{said}");
+        assert!(!said.contains("not attached") && !said.ends_with('.'), "{said}");
+        assert_eq!(TransportError::from(OpenFailure::from(TransportError::Carrier)), TransportError::Carrier);
+    }
+
+    #[cfg(feature = "usb")]
+    #[test]
+    fn only_a_device_that_is_not_there_is_told_it_is_not_attached() {
+        let absent = super::usb_open_failure(lamella_usbbulk::Error::NotFound);
+        assert_eq!(open_failure(absent), "it is not attached, or another program holds it");
+        let refused = super::usb_open_failure(lamella_usbbulk::Error::Os("Access is denied. (os error 5)".to_owned()));
+        assert_eq!(refused.error, TransportError::Carrier);
+        assert_eq!(open_failure(refused), "USB error: Access is denied. (os error 5). Another program may hold it");
+        for says in [
+            "open /dev/bus/usb/001/003: permission denied. Linux gives a USB device to the root user until a udev rule grants it to you.",
+            "macOS refused access; close apps using the device, reconnect it, and allow the accessory if macOS asks (USBInterfaceOpen: 0xe00002c1)",
+            "USBDeviceOpen: another program holds it",
+        ] {
+            let said = open_failure(super::usb_open_failure(lamella_usbbulk::Error::Os(says.to_owned())));
+            assert!(!said.contains("may hold it") && said.contains(says.trim_end_matches('.')), "{said}");
+        }
+    }
+}
+
+#[cfg(all(test, feature = "usb"))]
+mod bulk_read_tests {
+    use super::{TransportError, bulk_read_bytes};
+    use lamella_usbbulk::Error;
+
+    /// A read that delivered bytes delivers them.
+    #[test]
+    fn a_read_delivers_its_bytes() {
+        assert_eq!(bulk_read_bytes(Ok(64)), Ok(64));
+    }
+
+    /// **A RUNNING PROGRAM MAY BE SILENT.** A read that timed out is no bytes and no failure, so a
+    /// deploy waiting on a flash erase, or a program that prints and then waits, keeps its session.
+    #[test]
+    fn a_read_that_timed_out_keeps_the_session() {
+        assert_eq!(bulk_read_bytes(Err(Error::Timeout)), Ok(0));
+    }
+
+    /// **A BOARD THAT HAS GONE AWAY ENDS THE SESSION AT ONCE.** Every failure but a timeout does.
+    #[test]
+    fn any_other_failure_ends_the_session() {
+        for failure in [Error::Os("ReadPipeTO returned 0xe00002c0".to_owned()), Error::NotFound, Error::Unsupported] {
+            assert_eq!(bulk_read_bytes(Err(failure)), Err(TransportError::Carrier));
+        }
+    }
+
+    /// **A WRITE THAT TIMED OUT IS A BOARD NOT READING, AND NOT ONE THAT WENT AWAY.**
+    #[test]
+    fn a_write_that_timed_out_is_a_board_not_taking_data() {
+        assert_eq!(super::bulk_write_failure(Error::Timeout), TransportError::Stalled);
+        assert_eq!(super::bulk_write_failure(Error::Os("gone".to_owned())), TransportError::Carrier);
+    }
 }
 
 #[cfg(all(test, feature = "usb"))]
@@ -2261,8 +2637,8 @@ mod tests {
         assert_eq!(board.chunks_received, 0, "and not one chunk crossed");
         assert_eq!(
             image_too_large(Some("BBC micro:bit v2"), 8192, 4096),
-            "the image is 8192 bytes, 4096 more than the 4096-byte deploy window on the BBC micro:bit v2, so \
-             nothing was sent"
+            "the image is 8192 bytes, 4096 more than the 4096-byte program area on the BBC \
+             micro:bit v2, so nothing was sent"
         );
     }
 
@@ -2304,7 +2680,8 @@ mod tests {
         );
         assert_eq!(
             TransferAck::OutOfRange { chunk: 0 }.describe(board),
-            "the image is too large for the BBC micro:bit v2: it refused chunk 0 as reaching past its deploy window"
+            "the image is too large for the BBC micro:bit v2: it refused chunk 0 as reaching past \
+             its program area"
         );
         assert_eq!(
             TransferAck::Rejected { chunk: 3 }.describe(board),
@@ -2341,7 +2718,8 @@ mod tests {
         assert_eq!(ack, TransferAck::OutOfRange { chunk: 0 });
         assert_eq!(
             ack.describe(board),
-            "the image is too large for the BBC micro:bit v2: it refused chunk 0 as reaching past its deploy window"
+            "the image is too large for the BBC micro:bit v2: it refused chunk 0 as reaching past \
+             its program area"
         );
 
         let mut transport = MemTransport::new();
@@ -2484,6 +2862,7 @@ mod tests {
             serial_number: Some(String::from("BENCHSERIAL0001")),
             product: Some(String::from("Lamella Link (test)")),
             interface_name: None,
+            ..lamella_usbbulk::DeviceInfo::default()
         }
     }
 
@@ -2534,43 +2913,6 @@ mod tests {
         encode_frame(deploy::DEPLOY_STATUS_RESULT, seq, &payload).expect("a 14-byte status frames")
     }
 
-    fn corlib() -> Option<Vec<u8>> {
-        std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures/corlib.dll")).ok()
-    }
-
-    fn hello() -> Option<Vec<u8>> {
-        std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/hello.exe")).ok()
-    }
-
-    #[test]
-    fn run_program_executes_and_captures_output() {
-        let (Some(corlib), Some(program)) = (corlib(), hello()) else { return };
-        let result = run_program(&corlib, &program);
-        assert_eq!(result.exit, 7);
-        assert_eq!(result.stdout, "hi\n");
-    }
-
-    #[test]
-    fn tier0_repl_round_trips_over_the_wire() {
-        let (Some(corlib), Some(program)) = (corlib(), hello()) else { return };
-
-        let mut driver = MemTransport::new();
-        let mut runner = MemTransport::new();
-
-        send_program(&mut driver, 1, &program).unwrap();
-        runner.feed(&driver.take_sent());
-
-        let mut arena = ArtifactLoad::new();
-        while serve_one(&mut runner, &corlib, &mut arena).unwrap() {}
-        driver.feed(&runner.take_sent());
-
-        let mut run = RunCollector::new(1);
-        assert!(run.poll(&mut driver).unwrap(), "the execution ended");
-        let result = run.finish().expect("a result arrived");
-        assert_eq!(result.exit, 7);
-        assert_eq!(result.stdout, "hi\n");
-    }
-
     /// THE HAZARD [`CHUNK_DATA_CAP`] EXISTS FOR.
     ///
     /// A `DEPLOY_IMAGE` payload carries 8 bytes of `(offset, total)` ahead of the image bytes, and
@@ -2604,6 +2946,18 @@ mod tests {
         let frame = reader.next_frame().expect("a capped chunk is a well-formed frame");
         assert_eq!(frame.payload.len(), capped.len(), "a capped chunk must cross whole");
         assert_eq!(CHUNK_DATA_CAP % 512, 0, "a chunk must still start on a 512-byte flash page");
+    }
+
+    /// **A 16 MB BOARD's FIRST CHUNK IS GIVEN THREE TIMES THE 53.5 s ITS WHOLE WINDOW TAKES TO
+    /// CLEAR**: a Pimoroni Pico Plus 2's deploy window is 14,671,872 B, and every unit of it holding
+    /// data delays the first acknowledgement that long. A window the target does not report adds
+    /// nothing.
+    #[test]
+    fn the_first_chunk_is_given_three_times_the_clear_measured_on_a_16_mb_board() {
+        let measured = Duration::from_millis(53_500);
+        assert!(first_chunk_allowance(Some(14_671_872)) >= measured * 3);
+        assert_eq!(first_chunk_allowance(None), Duration::ZERO);
+        assert_eq!(first_chunk_allowance(Some(0)), Duration::ZERO);
     }
 
     /// **A DEPLOY CHUNK IS SIZED FOR ITS CARRIER**: 8 KiB where the carrier holds back what the
@@ -3042,3 +3396,4 @@ mod tests {
         assert!(took < Duration::from_secs(1), "took {took:?}");
     }
 }
+

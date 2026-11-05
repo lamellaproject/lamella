@@ -43,6 +43,7 @@ pub const TIMER0_BASE: u32 = 0x400B0000;
 pub const TIMER0_RESET_BIT: u32 = 23;
 pub const TIMER0_RESET_MASK: u32 = 0x800000;
 pub const TICKS_BASE: u32 = 0x40108000;
+pub const SYSINFO_BASE: u32 = 0x40000000;
 pub const TRNG_BASE: u32 = 0x400F0000;
 pub const TRNG_RESET_BIT: u32 = 25;
 pub const TRNG_RESET_MASK: u32 = 0x2000000;

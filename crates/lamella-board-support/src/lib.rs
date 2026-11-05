@@ -36,8 +36,8 @@ pub mod rp2350;
 
 /// How many `board-*` features this build selects.
 #[cfg(target_os = "none")]
-const BOARDS_SELECTED: u32 = cfg!(feature = "board-rpi-pico2") as u32
-    + cfg!(feature = "board-rpi-pico2-w") as u32
+const BOARDS_SELECTED: u32 = cfg!(feature = "board-raspberrypi-pico-2") as u32
+    + cfg!(feature = "board-raspberrypi-pico-2-w") as u32
     + cfg!(feature = "board-pimoroni-pico-plus-2") as u32
     + cfg!(feature = "board-pimoroni-pico-plus-2-w") as u32;
 
@@ -58,10 +58,10 @@ mod seams {
     use crate::boards::pimoroni_pico_plus_2::BOARD;
     #[cfg(feature = "board-pimoroni-pico-plus-2-w")]
     use crate::boards::pimoroni_pico_plus_2_w::BOARD;
-    #[cfg(feature = "board-rpi-pico2")]
-    use crate::boards::rpi_pico2::BOARD;
-    #[cfg(feature = "board-rpi-pico2-w")]
-    use crate::boards::rpi_pico2_w::BOARD;
+    #[cfg(feature = "board-raspberrypi-pico-2")]
+    use crate::boards::raspberrypi_pico_2::BOARD;
+    #[cfg(feature = "board-raspberrypi-pico-2-w")]
+    use crate::boards::raspberrypi_pico_2_w::BOARD;
     use crate::registers::Mmio;
     use crate::rp2350::{self, PsramRecord, State};
 

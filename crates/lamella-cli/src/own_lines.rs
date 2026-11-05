@@ -1,38 +1,59 @@
 //! This tool's own lines during a run, told apart from the program's.
 //!
 //! A run gives the program's standard output to standard output, and nothing else. This tool's own
-//! lines -- what it read, what it wrote and where, how the program ended -- go to standard error,
-//! where the program's standard error goes as well, so each of them is prefixed `lamella:`: a reader
-//! of standard error tells the two apart by it, and a caller keeping standard output in a file keeps
-//! the program's output alone.
+//! lines go to standard error without a prefix. A blank line separates the introduction from the
+//! program, and a caller keeping standard output in a file keeps the program's output alone.
 
 use std::io::{self, Write};
 
-/// The prefix every line of this tool's own carries.
-const PREFIX: &str = "lamella:";
+/// How the program runs.
+#[derive(Clone, Copy)]
+pub(crate) enum How {
+    Interpreter,
+    NativeImage,
+}
 
-/// The first line of a run, which says where the program runs and how, before anything else of the
-/// run: on this computer, under Lamella's interpreter.
-pub(crate) const RUNNING_HERE: &str = "running on this computer under the interpreter.";
+/// The first line of a run, naming the version, place and execution model.
+pub(crate) fn first_line(on: &str, how: How) -> String {
+    let how = match how {
+        How::Interpreter => "C# interpreter",
+        How::NativeImage => "AOT",
+    };
+    format!("Lamella v{}, {on} ({how})", env!("CARGO_PKG_VERSION"))
+}
+
+/// A board's human name, falling back to the identifier when the catalog has no name.
+pub(crate) fn board_name(id: &str) -> String {
+    lamella_catalog::load_board(id).map_or_else(|| id.to_owned(), |board| {
+        if board.product.is_empty() {
+            id.to_owned()
+        } else {
+            format!("{} {}", board.maker, board.product).trim().to_owned()
+        }
+    })
+}
 
 /// The first line of a run on a board running Lamella's firmware: `on` is the board the run names,
 /// or else the board that answered, as its firmware names it.
 pub(crate) fn running_interpreted(on: &str) -> String {
-    format!("running under the interpreter on {on}.")
+    first_line(on, How::Interpreter)
 }
 
-/// The first line of a run of a native image written over the debug probe with the USB serial
-/// number `serial`, for `board`.
-pub(crate) fn running_through_probe(board: &str, serial: &str) -> String {
-    format!("running the native image for {board} through probe {serial}.")
+/// The first line of a native run through a probe, naming the board catalog's chip family.
+pub(crate) fn running_through_probe(board: &str) -> String {
+    let chip = lamella_catalog::load_board(board)
+        .and_then(|board| lamella_catalog::family_of(&board))
+        .filter(|family| !family.is_empty())
+        .map_or_else(|| "unknown chip".to_owned(), |family| family.to_ascii_uppercase());
+    first_line(&chip, How::NativeImage)
 }
 
 /// The first line of a run of a native image in the emulator of the machine `machine`.
 pub(crate) fn running_in_emulator(machine: &str) -> String {
-    format!("running the native image in the {machine} emulator.")
+    first_line(&format!("{machine} emulator"), How::NativeImage)
 }
 
-/// Says `text` on `err` as this tool's own words: every line prefixed `lamella:`, a blank one too.
+/// Says `text` on standard error, without a prefix.
 pub(crate) fn say(err: &mut dyn Write, text: &str) {
     for line in text.lines() {
         let _ = said_line(err, line);
@@ -40,89 +61,108 @@ pub(crate) fn say(err: &mut dyn Write, text: &str) {
     let _ = err.flush();
 }
 
-/// One line of this tool's own, prefixed.
+/// One line, including a blank line.
 fn said_line(err: &mut dyn Write, line: &str) -> io::Result<()> {
-    if line.is_empty() { writeln!(err, "{PREFIX}") } else { writeln!(err, "{PREFIX} {line}") }
+    writeln!(err, "{line}")
 }
 
-/// A writer that says every line written to it as this tool's own, on `inner`.
-///
-/// For a routine that writes its progress to a writer it is given: each line is said once it is
-/// whole, and a line left without its end is said as it stands when the writer is dropped.
-#[cfg_attr(not(feature = "bake"), allow(dead_code))]
-pub(crate) struct OwnLines<W: Write> {
-    inner: W,
-    /// The line written so far, without its end.
-    partial: Vec<u8>,
+/// Separates the introduction from the program's output.
+pub(crate) fn blank_line(err: &mut dyn Write) {
+    let _ = writeln!(err);
+    let _ = err.flush();
 }
 
-impl<W: Write> OwnLines<W> {
-    /// A writer saying its lines on `inner`.
-    #[cfg_attr(not(feature = "bake"), allow(dead_code))]
-    pub(crate) fn new(inner: W) -> Self {
-        OwnLines { inner, partial: Vec::new() }
-    }
-
-    /// Says the line written so far, and starts the next.
-    fn end_line(&mut self) -> io::Result<()> {
-        let line = String::from_utf8_lossy(&self.partial).into_owned();
-        self.partial.clear();
-        said_line(&mut self.inner, line.strip_suffix('\r').unwrap_or(&line))
-    }
+/// A run's refusal, preserving the explanation, choices and recovery instructions without a command prefix.
+pub(crate) fn fail(err: &mut dyn Write, refusal: &str) {
+    full_failure(err, refusal);
 }
 
-impl<W: Write> Write for OwnLines<W> {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        for &byte in bytes {
-            if byte == b'\n' {
-                self.end_line()?;
-            } else {
-                self.partial.push(byte);
-            }
-        }
-        Ok(bytes.len())
-    }
+/// A direct command's full refusal, with no command prefix.
+pub(crate) fn full_failure(err: &mut dyn Write, refusal: &str) {
+    say(err, &capitalized(without_prefix(refusal)));
+}
 
-    fn flush(&mut self) -> io::Result<()> {
-        self.inner.flush()
+fn without_prefix(refusal: &str) -> &str {
+    let text = refusal.trim();
+    let text = text.strip_prefix("lamella: error: ").or_else(|| text.strip_prefix("lamella: ")).unwrap_or(text);
+    match text.strip_prefix("lamella ").and_then(|rest| rest.split_once(": ")) {
+        Some((verb, rest)) if verb.chars().all(|ch| ch.is_ascii_lowercase() || ch == '-') => rest,
+        _ => text,
     }
 }
 
-impl<W: Write> Drop for OwnLines<W> {
-    fn drop(&mut self) {
-        if !self.partial.is_empty() {
-            let _ = self.end_line();
-        }
-        let _ = self.inner.flush();
+/// A leading word takes a capital; paths, identifiers and percentages keep their spelling.
+pub(crate) fn capitalized(text: &str) -> String {
+    let word = text.split_whitespace().next().unwrap_or_default().trim_end_matches([',', '.', ':']);
+    if !word.chars().all(char::is_alphabetic) {
+        return text.to_owned();
     }
+    let mut chars = text.chars();
+    chars.next().map_or_else(String::new, |first| first.to_uppercase().chain(chars).collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// **EVERY LINE OF THIS TOOL'S IS MARKED**, a blank one too.
+    /// A probe run names the catalog's chip family, including a board carried by a module.
     #[test]
-    fn every_line_this_tool_says_is_marked() {
-        let mut err = Vec::new();
-        say(&mut err, "first\n\nthird");
-        assert_eq!(String::from_utf8(err).expect("text"), "lamella: first\nlamella:\nlamella: third\n");
+    fn a_probe_run_names_the_catalog_chip_instead_of_the_project_board() {
+        for (board, chip) in [
+            ("raspberrypi-pico-2", "RP2350"),
+            ("raspberrypi-pico-2-w", "RP2350"),
+            ("pimoroni-pico-plus-2", "RP2350"),
+            ("raspberrypi-pico", "RP2040"),
+            ("arduino-mkr1000", "SAMD21"),
+        ] {
+            assert_eq!(running_through_probe(board), format!("Lamella v{}, {chip} (AOT)", env!("CARGO_PKG_VERSION")), "{board}");
+        }
     }
 
-    /// **A LINE WRITTEN IN PIECES IS SAID ONCE, WHOLE**, a carriage return before its end is not
-    /// kept, and a line left open is said when the writer goes.
+    /// An unresolved chip is not presented as the project's board name.
     #[test]
-    fn a_writer_says_each_whole_line_once_and_the_last_when_it_goes() {
-        let mut err = Vec::new();
-        {
-            let mut lines = OwnLines::new(&mut err);
-            write!(lines, "deploying 40000 B").expect("written");
-            writeln!(lines, " to usb").expect("written");
-            lines.write_all(b"running on usb\r\n\nleft open").expect("written");
-        }
-        assert_eq!(
-            String::from_utf8(err).expect("text"),
-            "lamella: deploying 40000 B to usb\nlamella: running on usb\nlamella:\nlamella: left open\n"
-        );
+    fn an_unknown_probe_chip_does_not_claim_a_board_identity() {
+        assert_eq!(running_through_probe("unknown-board"), format!("Lamella v{}, unknown chip (AOT)", env!("CARGO_PKG_VERSION")));
     }
+
+    /// The interpreter retains the name supplied by the answering firmware.
+    #[test]
+    fn an_interpreter_run_keeps_the_reported_board_name() {
+        assert_eq!(running_interpreted("Pimoroni Pico Plus 2"), format!("Lamella v{}, Pimoroni Pico Plus 2 (C# interpreter)", env!("CARGO_PKG_VERSION")));
+    }
+
+    /// A refusal retains the filename and the action that follows it.
+    #[test]
+    fn a_short_refusal_keeps_the_filename_it_names() {
+        let mut err = Vec::new();
+        fail(&mut err, "lamella run: could not read \"C:\\Demo. App\\hello.dll\": access denied. Check permissions.");
+        assert_eq!(String::from_utf8(err).unwrap(), "Could not read \"C:\\Demo. App\\hello.dll\": access denied. Check permissions.\n");
+    }
+
+    /// A native error's nested parentheses stay complete inside a run's refusal.
+    #[test]
+    fn a_short_refusal_keeps_the_complete_parenthesized_device_error() {
+        let mut err = Vec::new();
+        fail(&mut err, "2e8a:000c serial TEST could not be opened (USB error: Access is denied. (os error 5)). Another program may hold it.");
+        assert_eq!(String::from_utf8(err).unwrap(), "2e8a:000c serial TEST could not be opened (USB error: Access is denied. (os error 5)). Another program may hold it.\n");
+    }
+
+    /// Recovery text keeps literal commands, paths and identifiers intact.
+    #[test]
+    fn a_refusal_does_not_add_punctuation_to_commands_paths_or_identifiers() {
+        for ending in ["Try: lamella run --help", "C:\\Demo. App\\program.elf", "probe:TEST/board"] {
+            let mut err = Vec::new();
+            fail(&mut err, &format!("lamella run: cannot continue.\n{ending}"));
+            assert_eq!(String::from_utf8(err).unwrap(), format!("Cannot continue.\n{ending}\n"));
+        }
+    }
+
+    /// Lines carry no prefix, and blank lines stay blank.
+    #[test]
+    fn a_run_has_no_prefix_and_keeps_blank_lines() {
+        let mut err = Vec::new();
+        say(&mut err, "first\n\nthird");
+        assert_eq!(String::from_utf8(err).expect("text"), "first\n\nthird\n");
+    }
+
 }

@@ -85,7 +85,7 @@ mod startup;
 mod rp2350_flash;
 
 #[cfg(all(target_os = "none", not(feature = "cyw43"), not(feature = "pico-plus-2")))]
-#[path = "../../../../bsp/boards/rpi-pico2/rust/rpi_pico2_bindings.rs"]
+#[path = "../../../../bsp/boards/raspberrypi-pico-2/rust/raspberrypi_pico_2_bindings.rs"]
 #[allow(dead_code)]
 mod board_bindings;
 #[cfg(all(target_os = "none", feature = "pico-plus-2"))]
@@ -93,7 +93,7 @@ mod board_bindings;
 #[allow(dead_code)]
 mod board_bindings;
 #[cfg(all(target_os = "none", feature = "cyw43", not(feature = "pico-plus-2-w")))]
-#[path = "../../../../bsp/boards/rpi-pico2-w/rust/rpi_pico2_w_bindings.rs"]
+#[path = "../../../../bsp/boards/raspberrypi-pico-2-w/rust/raspberrypi_pico_2_w_bindings.rs"]
 #[allow(dead_code)]
 mod board_bindings;
 #[cfg(all(target_os = "none", feature = "pico-plus-2-w"))]
@@ -890,14 +890,14 @@ mod serve {
         const RP2350_DPIDR: u32 = 0x4c01_3477;
         const SYSINFO_CHIP_ID: usize = 0x4000_0000;
         #[cfg(all(feature = "cyw43", not(feature = "pico-plus-2-w")))]
-        let board = lamella_wire::product_model::PICO2_W;
+        const BOARD: u16 = lamella_wire::product_model::PICO2_W;
         #[cfg(feature = "pico-plus-2-w")]
-        let board = lamella_wire::product_model::PICO_PLUS_2_W;
+        const BOARD: u16 = lamella_wire::product_model::PICO_PLUS_2_W;
         #[cfg(feature = "pico-plus-2")]
-        let board = lamella_wire::product_model::PICO_PLUS_2;
+        const BOARD: u16 = lamella_wire::product_model::PICO_PLUS_2;
         #[cfg(not(any(feature = "cyw43", feature = "pico-plus-2")))]
-        let board = lamella_wire::product_model::PICO2;
-        lamella_runner::set_board_identity(board, RP2350_DPIDR, read_register(SYSINFO_CHIP_ID));
+        const BOARD: u16 = lamella_wire::product_model::PICO2;
+        lamella_runner::set_board_identity(BOARD, RP2350_DPIDR, read_register(SYSINFO_CHIP_ID));
 
         {
             let tree = rp2350_clocks::read_tree(
@@ -931,11 +931,13 @@ mod serve {
         let mut flash = Rp2350Flash::new();
 
         #[cfg(feature = "usb")]
+        const USB_PRODUCT: &str = lamella_wire::link_product_string!(BOARD);
+        #[cfg(feature = "usb")]
         let usb_alloc = if clocked { Some(rp2350_usb::UsbBus::new()) } else { None };
         #[cfg(feature = "usb")]
-        let mut usb_link = usb_alloc
-            .as_ref()
-            .map(|alloc| usb_transport::build_device(alloc, "Lamella Link (RP2350)", rp2350_usb::serial_number()));
+        let mut usb_link = usb_alloc.as_ref().map(|alloc| {
+            usb_transport::build_device(alloc, USB_PRODUCT, rp2350_usb::serial_number())
+        });
 
         let artifact = lamella_runner::FlashSink::image_slice(&flash);
         let deployed = matches!(artifact.get(..2), Some(b"LM") | Some(b"MZ"));

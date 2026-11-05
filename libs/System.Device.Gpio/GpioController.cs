@@ -4,7 +4,7 @@ namespace System.Device.Gpio
     /// <summary>Represents a general-purpose I/O (GPIO) controller.</summary>
     public class GpioController : System.IDisposable
     {
-        private readonly GpioDriver _driver;
+        private GpioDriver _driver;
         private readonly bool[] _open;
         private readonly GpioPin[] _pins;
 
@@ -56,6 +56,14 @@ namespace System.Device.Gpio
             }
         }
 
+        private void CheckOpen(int pinNumber, string refusal)
+        {
+            if (!IsPinOpen(pinNumber))
+            {
+                throw new System.InvalidOperationException(refusal + pinNumber.ToString() + " because it is not open.");
+            }
+        }
+
         /// <summary>Opens a pin so it is ready to use, and returns it; a pin that is open already is
         /// returned as it is.</summary>
         public GpioPin OpenPin(int pinNumber)
@@ -63,6 +71,11 @@ namespace System.Device.Gpio
             if (!IsPinOpen(pinNumber))
             {
                 OpenPinCore(pinNumber);
+                if (pinNumber < 0 || pinNumber >= _open.Length)
+                {
+                    throw new System.ArgumentOutOfRangeException("pinNumber", "This controller has no such pin.");
+                }
+                _open[pinNumber] = true;
             }
             GpioPin pin = _pins[pinNumber];
             if ((object)pin == null)
@@ -97,18 +110,22 @@ namespace System.Device.Gpio
         }
 
         /// <summary>Closes an open pin.</summary>
+        /// <exception cref="System.InvalidOperationException">The pin is not open.</exception>
         public void ClosePin(int pinNumber)
         {
+            CheckOpen(pinNumber, "Can not close pin ");
             ClosePinCore(pinNumber);
+            _open[pinNumber] = false;
+            _pins[pinNumber] = null;
         }
 
         /// <summary>Opens a pin. The overridable half of <see cref="OpenPin(int)"/>.</summary>
         /// <param name="pinNumber">The pin number, in this controller's numbering scheme.</param>
+        /// <exception cref="System.ArgumentOutOfRangeException">The controller has no such pin.</exception>
         protected virtual void OpenPinCore(int pinNumber)
         {
             CheckDriverValid();
             _driver.OpenPin(pinNumber);
-            _open[pinNumber] = true;
         }
 
         /// <summary>Closes a pin. The overridable half of <see cref="ClosePin(int)"/>.</summary>
@@ -117,21 +134,21 @@ namespace System.Device.Gpio
         {
             CheckDriverValid();
             _driver.ClosePin(pinNumber);
-            _open[pinNumber] = false;
-            _pins[pinNumber] = null;
         }
 
         /// <summary>Sets the mode of a pin.</summary>
+        /// <exception cref="System.InvalidOperationException">The pin is not open.</exception>
         public virtual void SetPinMode(int pinNumber, PinMode mode)
         {
-            CheckDriverValid();
+            CheckOpen(pinNumber, "Can not set a mode to pin ");
             _driver.SetPinMode(pinNumber, mode);
         }
 
         /// <summary>Gets the mode of a pin.</summary>
+        /// <exception cref="System.InvalidOperationException">The pin is not open.</exception>
         public virtual PinMode GetPinMode(int pinNumber)
         {
-            CheckDriverValid();
+            CheckOpen(pinNumber, "Can not get the mode of pin ");
             return _driver.GetPinMode(pinNumber);
         }
 
@@ -143,44 +160,50 @@ namespace System.Device.Gpio
         }
 
         /// <summary>Reads the current value of a pin.</summary>
+        /// <exception cref="System.InvalidOperationException">The pin is not open.</exception>
         public virtual PinValue Read(int pinNumber)
         {
-            CheckDriverValid();
+            CheckOpen(pinNumber, "Can not read from pin ");
             return _driver.Read(pinNumber);
         }
 
         /// <summary>Writes a value to a pin.</summary>
+        /// <exception cref="System.InvalidOperationException">The pin is not open.</exception>
         public virtual void Write(int pinNumber, PinValue value)
         {
-            CheckDriverValid();
+            CheckOpen(pinNumber, "Can not write to pin ");
             _driver.Write(pinNumber, value);
         }
 
         /// <summary>Toggles the current value of a pin.</summary>
+        /// <exception cref="System.InvalidOperationException">The pin is not open.</exception>
         public virtual void Toggle(int pinNumber)
         {
-            CheckDriverValid();
+            CheckOpen(pinNumber, "Can not read from pin ");
             _driver.Toggle(pinNumber);
         }
 
         /// <summary>Adds a callback that is invoked when <paramref name="pinNumber"/> has an event
         /// of type <paramref name="eventTypes"/>.</summary>
+        /// <exception cref="System.InvalidOperationException">The pin is not open.</exception>
         public virtual void RegisterCallbackForPinValueChangedEvent(
             int pinNumber, PinEventTypes eventTypes, PinChangeEventHandler callback)
         {
-            CheckDriverValid();
+            CheckOpen(pinNumber, "Can not add callback for pin ");
             _driver.AddCallbackForPinValueChangedEvent(pinNumber, eventTypes, callback);
         }
 
         /// <summary>Removes a callback that was being invoked for the pin at
         /// <paramref name="pinNumber"/>.</summary>
+        /// <exception cref="System.InvalidOperationException">The pin is not open.</exception>
         public virtual void UnregisterCallbackForPinValueChangedEvent(int pinNumber, PinChangeEventHandler callback)
         {
-            CheckDriverValid();
+            CheckOpen(pinNumber, "Can not remove callback for pin ");
             _driver.RemoveCallbackForPinValueChangedEvent(pinNumber, callback);
         }
 
-        /// <summary>Disposes the controller and its driver.</summary>
+        /// <summary>Closes every pin this controller opened and disposes its driver; every member but this
+        /// one then throws <see cref="System.ObjectDisposedException"/>.</summary>
         public void Dispose()
         {
             Dispose(true);
@@ -194,7 +217,17 @@ namespace System.Device.Gpio
         {
             if (disposing && (object)_driver != null)
             {
+                for (int pin = 0; pin < _open.Length; pin = pin + 1)
+                {
+                    if (_open[pin])
+                    {
+                        ClosePinCore(pin);
+                        _open[pin] = false;
+                        _pins[pin] = null;
+                    }
+                }
                 _driver.Dispose();
+                _driver = null;
             }
         }
 
@@ -203,8 +236,10 @@ namespace System.Device.Gpio
         /// <param name="eventTypes">The edges to wait for.</param>
         /// <param name="timeout">How long to wait before giving up.</param>
         /// <returns>Which edge was seen, or a result whose TimedOut is true.</returns>
+        /// <exception cref="System.InvalidOperationException">The pin is not open.</exception>
         public WaitForEventResult WaitForEvent(int pinNumber, PinEventTypes eventTypes, System.TimeSpan timeout)
         {
+            CheckOpen(pinNumber, "Can not wait for events from pin ");
             WaitForEventResult result = new WaitForEventResult();
             PinValue start = Read(pinNumber);
             long deadline = System.DateTime.UtcNow.Ticks + timeout.Ticks;

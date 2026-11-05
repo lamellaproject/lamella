@@ -49,6 +49,8 @@
 kind = "board"
 board = "arduino-uno-q"
 vendor = "arduino"
+maker = "Arduino"
+product = "UNO Q"
 family = "stm32u585"
 part = "stm32u585ai"
 product_model = 36          # lamella_wire::product_model::ARDUINO_UNO_Q

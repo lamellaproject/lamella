@@ -5,6 +5,9 @@ namespace System.Collections.Generic
 
     /// A dynamically sized list of `T`, backed by an array that grows by doubling.
     public class List<T> : IEnumerable<T>, IEnumerable, IEnumerationVersion
+#if LAMELLA_SURFACE_NETFX_4_5
+        , IReadOnlyList<T>
+#endif
     {
         private T[] items;
         private int size;

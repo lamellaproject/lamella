@@ -20,6 +20,8 @@
 kind = "board"
 board = "st-stm32f769i-disco"
 vendor = "st"
+maker = "STMicroelectronics"
+product = "STM32F769I-DISCO"
 family = "stm32f769"
 part = "stm32f769ni"
 product_model = 30          # lamella_wire::product_model::STM32F769I_DISCO

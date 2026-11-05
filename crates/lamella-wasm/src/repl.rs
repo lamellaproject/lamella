@@ -182,50 +182,7 @@ pub extern "C" fn lamella_repl_reset() {
 mod tests {
     use super::*;
 
-    /// Reads the managed corlib + packs the net8.0 ref assemblies the way the host does.
-    ///
-    /// Both are committed fixtures, so a fresh checkout runs these tests with nothing configured
-    /// and no machine-specific path anywhere. `LAMELLA_REF_DIR` still wins when it is set, so a
-    /// caller can bind against a different reference pack without editing a test.
-    ///
-    /// Returns `None`, and the tests skip, only where the fixtures are absent.
-    fn assets() -> Option<(Vec<u8>, Vec<Vec<u8>>)> {
-        let corlib = std::fs::read(format!(
-            "{}/../lamella-load/tests/fixtures/corlib.dll",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .ok()?;
-        let reference_dir = std::env::var("LAMELLA_REF_DIR")
-            .unwrap_or_else(|_| fixture_dir().to_string_lossy().into_owned());
-        let runtime = std::fs::read(format!("{reference_dir}/System.Runtime.dll")).ok()?;
-        let console = std::fs::read(format!("{reference_dir}/System.Console.dll")).ok()?;
-        Some((corlib, vec![runtime, console]))
-    }
-
-    /// Where the committed reference assemblies live.
-    fn fixture_dir() -> std::path::PathBuf {
-        std::path::PathBuf::from(format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR")))
-    }
-
-    /// The four tests below report the SAME `ok` line whether they ran or returned at their first
-    /// statement, so an asset that stops resolving disables them without reddening anything --
-    /// elapsed time is the only tell, about a tenth of a second against roughly two. This row is
-    /// what makes that impossible to do by accident: where the fixtures are supposed to exist,
-    /// failing to load one is a failure and not a skip.
-    #[test]
-    fn every_repl_asset_loads_where_the_fixtures_are_present() {
-        if !fixture_dir().is_dir() {
-            eprintln!("no fixture directory -- the tests below skip, as intended here");
-            return;
-        }
-        assert!(
-            assets().is_some(),
-            "the fixture directory is present, so every REPL asset must load: a missing one \
-             silently disables four tests that go on reporting ok"
-        );
-    }
-
-    fn parse(buffer: Vec<u8>) -> serde_json::Value {
+    pub(super) fn parse(buffer: Vec<u8>) -> serde_json::Value {
         serde_json::from_slice(&buffer).expect("the eval JSON parses")
     }
 
@@ -235,58 +192,5 @@ mod tests {
         let value = parse(eval(b"40 + 2"));
         assert_eq!(value["compileError"], "REPL not initialized");
     }
-
-    #[test]
-    fn an_expression_prints_its_value_and_does_not_persist() {
-        let Some((corlib, refs)) = assets() else {
-            eprintln!("REPL assets absent; skipping");
-            return;
-        };
-        new_session(&corlib, refs);
-        let value = parse(eval(b"40 + 2"));
-        assert_eq!(value["kind"], "ran", "got {value}");
-        assert_eq!(value["output"], "42\n");
-        assert_eq!(value["exit"], 0);
-        assert_eq!(value["persisted"], false);
-    }
-
-    #[test]
-    fn a_statement_persists_and_a_later_line_sees_it() {
-        let Some((corlib, refs)) = assets() else {
-            eprintln!("REPL assets absent; skipping");
-            return;
-        };
-        new_session(&corlib, refs);
-        let declared = parse(eval(b"int n = 40;"));
-        assert_eq!(declared["persisted"], true, "got {declared}");
-        assert_eq!(declared["output"], "");
-        let used = parse(eval(b"Console.WriteLine(n + 2);"));
-        assert_eq!(used["output"], "42\n", "got {used}");
-        assert_eq!(used["persisted"], true);
-    }
-
-    #[test]
-    fn a_typo_is_a_compile_error_not_a_panic() {
-        let Some((corlib, refs)) = assets() else {
-            eprintln!("REPL assets absent; skipping");
-            return;
-        };
-        new_session(&corlib, refs);
-        let value = parse(eval(b"nonsense +"));
-        assert!(value.get("compileError").is_some(), "got {value}");
-        assert_eq!(parse(eval(b"1 + 1"))["output"], "2\n");
-    }
-
-    #[test]
-    fn reset_clears_the_transcript() {
-        let Some((corlib, refs)) = assets() else {
-            eprintln!("REPL assets absent; skipping");
-            return;
-        };
-        new_session(&corlib, refs);
-        assert_eq!(parse(eval(b"int k = 5;"))["persisted"], true);
-        reset();
-        let value = parse(eval(b"Console.WriteLine(k);"));
-        assert!(value.get("compileError").is_some(), "got {value}");
-    }
 }
+

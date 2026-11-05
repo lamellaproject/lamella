@@ -3,7 +3,7 @@
   <metadata>
     <id>Lamella.Tools.$rid$</id>
     <version>$version$</version>
-    <!-- Packing writes here what every package carries: authors, license, licenseUrl, projectUrl, copyright and repository. -->
+    <!-- Packing writes here what every package carries: authors, license, licenseUrl, projectUrl, copyright, repository and icon. -->
     <description>The Lamella command-line tool for $rid$. Lamella.Sdk restores and runs it for dotnet build, dotnet publish, and dotnet run. Do not reference this package directly.</description>
     <readme>README.md</readme>
   </metadata>

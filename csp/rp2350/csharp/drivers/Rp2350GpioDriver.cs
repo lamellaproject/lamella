@@ -1,4 +1,4 @@
-// A System.Device.Gpio driver for the RP2350 bank-0 GPIOs (GP0..GP31), over
+// A System.Device.Gpio driver for the RP2350's GPIOs, GP0 to GP29 on the QFN-60 package and GP0 to GP47 on the QFN-80, over
 using System.Device.Gpio;
 using Lamella.Generated;
 using Lamella.Hardware;
@@ -20,7 +20,12 @@ internal sealed class Rp2350GpioDriver : GpioDriver
     private readonly uint _intr0;
     private readonly uint _inte0;
 
+    const uint Bank1Stride = Rp2350SioLayout.GPIO_HI_OUT_SET_OFF - Rp2350SioLayout.GPIO_OUT_SET_OFF;
+
     private readonly uint _reserved;
+    private readonly uint _reservedBank1;
+
+    private int _pinCount;
 
     private readonly int[] _pairedPins;
     private readonly int[] _partnerPads;
@@ -28,7 +33,7 @@ internal sealed class Rp2350GpioDriver : GpioDriver
     /// <summary>Reserves nothing -- every pin is the app's.</summary>
     public Rp2350GpioDriver() : this(0u) { }
 
-    /// <summary>Reserves the pins whose bits are set, so <c>SetPinMode</c> refuses them. A board
+    /// <summary>Reserves the bank-0 pins whose bits are set, so <c>SetPinMode</c> refuses them. A board
     /// passes the lines it must keep -- its debug transport, a fixed peripheral's control pin --
     /// because only the board knows which those are.</summary>
     /// <remarks>The Pico 2 W is why this exists on this family. Its wireless part sits on GP23,
@@ -40,24 +45,32 @@ internal sealed class Rp2350GpioDriver : GpioDriver
     /// <summary>Reserves the pins whose bits are set, as <see cref="Rp2350GpioDriver(uint)"/> does,
     /// and pairs each of <paramref name="pairedPins"/> with the pad at the same index of
     /// <paramref name="partnerPads"/>, a second pad the board wires to the same net. Setting a mode
-    /// on a paired pin first leaves its partner high-impedance with no pull, so the partner neither
-    /// drives the line nor loads it.</summary>
+    /// on either pad first parks the other if nothing holds it, high-impedance with no pull, so it
+    /// neither drives the line nor loads it. Where the other holds the net, it is left as it is, so
+    /// one pad can read what the other drives; a second driver on the net, or a pull against the other's
+    /// pull, is refused.</summary>
     /// <remarks>The Pimoroni Pico Plus 2 boards are why. Their header positions 26 to 28 reach
     /// GPIO26 to GPIO28 and, through 1k, the converter's pads GPIO40 to GPIO42. A pad keeps its
     /// reset pull-down until something configures it, so without this a pulled-up input on one of
-    /// those positions sits near half the rail.</remarks>
+    /// those positions sits well below the rail.</remarks>
     /// <exception cref="System.ArgumentException">The two arrays differ in length.</exception>
     public Rp2350GpioDriver(uint reserved, int[] pairedPins, int[] partnerPads)
+        : this(reserved, 0u, pairedPins, partnerPads) { }
+
+    /// <summary>Reserves pins of both banks and pairs pads, as
+    /// <see cref="Rp2350GpioDriver(uint, int[], int[])"/> does: <paramref name="reservedBank1"/> holds GP32
+    /// in bit 0 and GP47 in bit 15.</summary>
+    /// <remarks>The Pimoroni boards wire their PSRAM's chip select to GP47, in bank 1, and a program that
+    /// took that line would stop the memory the PSRAM serves.</remarks>
+    /// <exception cref="System.ArgumentException">The two arrays differ in length.</exception>
+    public Rp2350GpioDriver(uint reserved, uint reservedBank1, int[] pairedPins, int[] partnerPads)
     {
         if (pairedPins.Length != partnerPads.Length)
         {
-#if LAMELLA_CORLIB_LINKED
             throw new System.ArgumentException("each paired pin needs exactly one partner pad");
-#else
-            throw new System.Exception("each paired pin needs exactly one partner pad");
-#endif
         }
         _reserved = reserved;
+        _reservedBank1 = reservedBank1;
         _pairedPins = pairedPins;
         _partnerPads = partnerPads;
         _resetsClr = Rp2350Instances.RESETS_CLR_BASE + Rp2350ResetsLayout.RESET_OFF;
@@ -76,12 +89,29 @@ internal sealed class Rp2350GpioDriver : GpioDriver
         _inte0 = Rp2350Instances.IO_BANK0_BASE + Rp2350IoBank0Layout.PROC0_INTE0_OFF;
     }
 
-    protected override int PinCount { get { return 32; } }
+    protected override int PinCount
+    {
+        get
+        {
+            if (_pinCount == 0)
+            {
+                uint package = Mmio.Read32(Rp2350Instances.SYSINFO_BASE + Rp2350SysinfoLayout.PACKAGE_SEL_OFF);
+                _pinCount = (package & Rp2350SysinfoLayout.PACKAGE_SEL_QFN60) != 0u ? 30 : 48;
+            }
+            return _pinCount;
+        }
+    }
 
-    protected override void OpenPin(int pinNumber) { }
+    /// <exception cref="System.ArgumentOutOfRangeException"><paramref name="pinNumber"/> is not a GPIO of
+    /// this chip's package.</exception>
+    protected override void OpenPin(int pinNumber)
+    {
+        CheckPin(pinNumber);
+    }
 
     protected override void ClosePin(int pinNumber)
     {
+        if (pinNumber < 0 || pinNumber >= PinCount) return;
         if (IsReserved(pinNumber)) return;
 
         if (IsArmed(pinNumber))
@@ -97,7 +127,12 @@ internal sealed class Rp2350GpioDriver : GpioDriver
             }
             Sense(pinNumber, 0);
         }
-        Mmio.Write32(_sioOeClr, 1u << pinNumber);
+        Mmio.Write32(BankOf(_sioOeClr, pinNumber), MaskOf(pinNumber));
+        if (TwinOf(pinNumber) >= 0)
+        {
+            EnsureBankReady();
+            Rp2350TwinPads.ParkUnlessPwm(pinNumber);
+        }
     }
 
     void EnsureBankReady()
@@ -111,80 +146,95 @@ internal sealed class Rp2350GpioDriver : GpioDriver
 
     private bool IsReserved(int pinNumber)
     {
-        return (_reserved & (1u << pinNumber)) != 0u;
+        return ((pinNumber < 32 ? _reserved : _reservedBank1) & MaskOf(pinNumber)) != 0u;
     }
 
+    private static uint BankOf(uint register, int pinNumber)
+    {
+        return pinNumber < 32 ? register : register + Bank1Stride;
+    }
+
+    private static uint MaskOf(int pinNumber)
+    {
+        return 1u << (pinNumber & 31);
+    }
+
+    /// <exception cref="System.ArgumentOutOfRangeException"><paramref name="pinNumber"/> is not a GPIO of
+    /// this chip's package.</exception>
+    /// <exception cref="System.ArgumentException">The board reserves the pin.</exception>
+    /// <exception cref="System.InvalidOperationException">The board wires the pin and a second pad to one net,
+    /// and the mode would drive that net while the second pad drives it, or would pull it against the second
+    /// pad's pull. The message names both pads, and nothing is written.</exception>
     protected override void SetPinMode(int pinNumber, PinMode mode)
     {
+        CheckPin(pinNumber);
         if (IsReserved(pinNumber))
         {
-#if LAMELLA_CORLIB_LINKED
             throw new System.ArgumentException("pin is reserved by the board");
-#else
-            throw new System.Exception("pin is reserved by the board");
-#endif
         }
         EnsureBankReady();
-        ParkPartner(pinNumber);
+        uint pull = 0u;
+        if (mode == PinMode.InputPullUp) pull = Rp2350PadsBank0Layout.GPIO0_PUE;
+        else if (mode == PinMode.InputPullDown) pull = Rp2350PadsBank0Layout.GPIO0_PDE;
+        int twin = TwinOf(pinNumber);
+        if (twin >= 0)
+        {
+            Rp2350TwinPads.Claim(pinNumber, twin, mode == PinMode.Output, pull);
+        }
         Mmio.Write32(_ioCtrl0 + Rp2350IoBank0Layout.GPIO_CTRL_STRIDE * (uint)pinNumber,
             Rp2350IoBank0Layout.FUNCSEL_SIO);
-        uint mask = 1u << pinNumber;
-        uint pads = _pads0 + Rp2350PadsBank0Layout.GPIO_STRIDE * (uint)pinNumber;
-        if (mode == PinMode.Output)
-        {
-            Mmio.Write32(pads, Rp2350PadsBank0Layout.GPIO0_IE);
-            Mmio.Write32(_sioOeSet, mask);
-        }
-        else
-        {
-            uint pad = Rp2350PadsBank0Layout.GPIO0_IE;
-            if (mode == PinMode.InputPullUp) pad |= Rp2350PadsBank0Layout.GPIO0_PUE;
-            else if (mode == PinMode.InputPullDown) pad |= Rp2350PadsBank0Layout.GPIO0_PDE;
-            Mmio.Write32(pads, pad);
-            Mmio.Write32(_sioOeClr, mask);
-        }
+        Mmio.Write32(_pads0 + Rp2350PadsBank0Layout.GPIO_STRIDE * (uint)pinNumber, Rp2350PadsBank0Layout.GPIO0_IE | pull);
+        Mmio.Write32(BankOf(mode == PinMode.Output ? _sioOeSet : _sioOeClr, pinNumber), MaskOf(pinNumber));
     }
 
-    void ParkPartner(int pinNumber)
+    int TwinOf(int pinNumber)
     {
         for (int i = 0; i < _pairedPins.Length; i++)
         {
-            if (_pairedPins[i] != pinNumber) continue;
-            uint partner = (uint)_partnerPads[i];
-            Mmio.Write32(_ioCtrl0 + Rp2350IoBank0Layout.GPIO_CTRL_STRIDE * partner, Rp2350IoBank0Layout.FUNCSEL_NULL);
-            Mmio.Write32(_pads0 + Rp2350PadsBank0Layout.GPIO_STRIDE * partner, Rp2350PadsBank0Layout.GPIO0_OD);
+            if (_pairedPins[i] == pinNumber) return _partnerPads[i];
+            if (_partnerPads[i] == pinNumber) return _pairedPins[i];
         }
+        return -1;
     }
 
     protected override PinMode GetPinMode(int pinNumber)
     {
-        return ((Mmio.Read32(_sioOe) >> pinNumber) & 1u) != 0u ? PinMode.Output : PinMode.Input;
+        CheckBank1(pinNumber);
+        return (Mmio.Read32(BankOf(_sioOe, pinNumber)) & MaskOf(pinNumber)) != 0u ? PinMode.Output : PinMode.Input;
     }
 
     protected override bool IsPinModeSupported(int pinNumber, PinMode mode) { return true; }
 
     protected override PinValue Read(int pinNumber)
     {
-        return (int)((Mmio.Read32(_sioIn) >> pinNumber) & 1u);
+        CheckBank1(pinNumber);
+        return (int)((Mmio.Read32(BankOf(_sioIn, pinNumber)) >> (pinNumber & 31)) & 1u);
     }
 
     protected override void Write(int pinNumber, PinValue value)
     {
-        if ((bool)value) Mmio.Write32(_sioOutSet, 1u << pinNumber);
-        else Mmio.Write32(_sioOutClr, 1u << pinNumber);
+        CheckBank1(pinNumber);
+        Mmio.Write32(BankOf((bool)value ? _sioOutSet : _sioOutClr, pinNumber), MaskOf(pinNumber));
     }
 
     protected override void Toggle(int pinNumber)
     {
-        Mmio.Write32(_sioOutXor, 1u << pinNumber);
+        CheckBank1(pinNumber);
+        Mmio.Write32(BankOf(_sioOutXor, pinNumber), MaskOf(pinNumber));
+    }
+
+    void CheckBank1(int pinNumber)
+    {
+        if ((uint)pinNumber >= 32u) CheckPin(pinNumber);
     }
 
     /// <summary>Registers <paramref name="callback"/> for the edges in <paramref name="eventTypes"/> on
     /// the pin, and enables the pin's edge interrupt. The pad's input buffer is enabled if it was not,
     /// so the level reported with each event is the pad's.</summary>
-    /// <exception cref="System.ArgumentException"><paramref name="pinNumber"/> is not a pin of this
-    /// driver or is reserved by the board, or <paramref name="eventTypes"/> names neither a rising nor
-    /// a falling edge.</exception>
+    /// <exception cref="System.ArgumentOutOfRangeException"><paramref name="pinNumber"/> is not a GPIO of
+    /// this chip's package.</exception>
+    /// <exception cref="System.ArgumentException"><paramref name="pinNumber"/> is reserved by the board, or
+    /// <paramref name="eventTypes"/> names neither a rising nor a falling edge.</exception>
     protected override void AddCallbackForPinValueChangedEvent(
         int pinNumber, PinEventTypes eventTypes, PinChangeEventHandler callback)
     {
@@ -211,8 +261,8 @@ internal sealed class Rp2350GpioDriver : GpioDriver
 
     /// <summary>Removes <paramref name="callback"/> from the pin, for every edge it was registered for,
     /// and disables the pin's edge interrupt once no callback remains on it.</summary>
-    /// <exception cref="System.ArgumentException"><paramref name="pinNumber"/> is not a pin of this
-    /// driver.</exception>
+    /// <exception cref="System.ArgumentOutOfRangeException"><paramref name="pinNumber"/> is not a GPIO of
+    /// this chip's package.</exception>
     protected override void RemoveCallbackForPinValueChangedEvent(int pinNumber, PinChangeEventHandler callback)
     {
         CheckPin(pinNumber);
@@ -272,9 +322,19 @@ internal sealed class Rp2350GpioDriver : GpioDriver
         int shift = (pinNumber % (int)Rp2350IoBank0Layout.GPIO_INT_PINS) * (int)Rp2350IoBank0Layout.GPIO_INT_BITS;
         if (was == 0)
         {
-            ParkPartner(pinNumber);
+            EnsureBankReady();
             uint pads = _pads0 + Rp2350PadsBank0Layout.GPIO_STRIDE * (uint)pinNumber;
-            Mmio.Write32(pads, (Mmio.Read32(pads) | Rp2350PadsBank0Layout.GPIO0_IE) & ~Rp2350PadsBank0Layout.GPIO0_ISO);
+            uint pad = Mmio.Read32(pads);
+            int twin = TwinOf(pinNumber);
+            if (twin >= 0)
+            {
+                Rp2350TwinPads.ParkIfIdle(twin);
+                if ((pad & Rp2350PadsBank0Layout.GPIO0_ISO) != 0u)
+                {
+                    pad = pad & ~(Rp2350PadsBank0Layout.GPIO0_PUE | Rp2350PadsBank0Layout.GPIO0_PDE);
+                }
+            }
+            Mmio.Write32(pads, (pad | Rp2350PadsBank0Layout.GPIO0_IE) & ~Rp2350PadsBank0Layout.GPIO0_ISO);
         }
         Mmio.Write32(_intr0 + register, EdgeBits(edges & ~was) << shift);
         uint enables = Mmio.Read32(_inte0 + register) & ~(EdgeBits(Both) << shift);
@@ -292,20 +352,17 @@ internal sealed class Rp2350GpioDriver : GpioDriver
         return bits;
     }
 
-    static void CheckPin(int pinNumber)
+    void CheckPin(int pinNumber)
     {
-        if (pinNumber < 0 || pinNumber >= 32)
+        if (pinNumber < 0 || pinNumber >= PinCount)
         {
-            BadArgument("pinNumber is not a pin of this driver: GP0..GP31 are 0..31");
+            throw new System.ArgumentOutOfRangeException("pinNumber",
+                "This chip's package has GP0 to GP" + (PinCount - 1).ToString() + ".");
         }
     }
 
     static void BadArgument(string why)
     {
-#if LAMELLA_CORLIB_LINKED
         throw new System.ArgumentException(why);
-#else
-        throw new System.Exception(why);
-#endif
     }
 }

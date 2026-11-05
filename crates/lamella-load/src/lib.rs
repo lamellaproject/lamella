@@ -239,6 +239,10 @@ pub enum LoadError {
     /// The message names the mechanism, the demanded name and the member carrying it, because a
     /// consumer that cannot say why it refused sends its reader to the wrong question.
     UnmetDemand(alloc::string::String),
+    /// Two assemblies of the set declare one type name where this loader cannot tell which is meant:
+    /// another assembly refers to the name, or the type is an exception, which a `catch` matches by
+    /// name. The message names the type and the assemblies, and says what to do.
+    SameNamedTypes(alloc::string::String),
 }
 
 impl fmt::Display for LoadError {
@@ -246,7 +250,9 @@ impl fmt::Display for LoadError {
         formatter.write_str(match self {
             LoadError::NoEntryPoint => "assembly has no entry point",
             LoadError::EntryHasNoBody => "entry point has no IL body",
-            LoadError::UnmetDemand(message) => return formatter.write_str(message),
+            LoadError::UnmetDemand(message) | LoadError::SameNamedTypes(message) => {
+                return formatter.write_str(message);
+            }
             LoadError::CircularLibraryReferences => {
                 "the library assemblies reference each other in a cycle, so no order loads each \
                  one after the libraries it references"
@@ -461,80 +467,6 @@ pub(crate) fn encode_sig_type(assembly: &Assembly, sig: &SigType) -> String {
     }
 }
 
-#[cfg(test)]
-mod encode_sig_type_tests {
-    use super::{Assembly, SigType, encode_sig_type};
-
-    /// A dispatch key must not carry a metadata TOKEN, because the two sides of a cross-assembly
-    /// dispatch name the same type through different ones.
-    ///
-    /// THIS IS THE PROPERTY, NOT THE SPELLING. Asserting the exact string would freeze an encoding
-    /// that is still open; asserting token-freedom is the thing that actually has to hold, and it
-    /// is what `GenericInst` violated by falling through to the `{:?}` fallback.
-    ///
-    /// **IT REFUSES TO PASS VACUOUSLY.** If no fixture contains a generic instantiation in any
-    /// signature, the property is trivially true and the test would be measuring nothing -- so
-    /// finding zero is a FAILURE, not a skip.
-    #[test]
-    fn a_generic_instantiation_encodes_without_a_token() {
-        let dir = alloc::format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            eprintln!("fixtures absent; skipping");
-            return;
-        };
-        let mut seen = 0usize;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("dll") {
-                continue;
-            }
-            let Ok(bytes) = std::fs::read(&path) else {
-                continue;
-            };
-            let Ok(assembly) = Assembly::read(&bytes) else {
-                continue;
-            };
-            seen += generic_instantiations_encode_by_name(&assembly);
-        }
-        assert!(
-            seen > 0,
-            "no fixture carries a generic instantiation in any signature, so this test asserted \
-             nothing -- add one rather than letting it pass vacuously"
-        );
-    }
-
-    /// Encodes every generic instantiation in `assembly`'s signatures and asserts each is
-    /// token-free, returning how many it checked.
-    fn generic_instantiations_encode_by_name(assembly: &Assembly<'_>) -> usize {
-        let mut seen = 0usize;
-        for type_def in assembly.type_defs() {
-            for method in type_def.methods() {
-                let Some(signature) = method.signature() else {
-                    continue;
-                };
-                for parameter in signature
-                    .parameters
-                    .iter()
-                    .chain(core::iter::once(&signature.return_type))
-                {
-                    if !matches!(parameter, SigType::GenericInst { .. }) {
-                        continue;
-                    }
-                    seen += 1;
-                    let key = encode_sig_type(assembly, parameter);
-                    assert!(
-                        !key.contains("Token"),
-                        "a generic instantiation must encode by NAME, not by token -- the two sides \
-                         of a cross-assembly dispatch spell the same type through different tokens \
-                         and would key differently; got `{key}`"
-                    );
-                }
-            }
-        }
-        seen
-    }
-}
-
 /// The `ELEMENT_TYPE_*` short form a fully-named core `System` type maps to, so a `Class` /
 /// `ValueType` reference to it (e.g. a corlib's own `System.Object`, or a `[mscorlib]` ref csc
 /// emits) encodes the same as the short form a program uses for the same type.
@@ -667,6 +599,167 @@ fn ram_cil(bytes: &[u8]) -> RawCil {
 /// # Errors
 /// [`LoadError::NoEntryPoint`] if the assembly names no entry point, or
 /// [`LoadError::EntryHasNoBody`] if that token has no loadable body.
+
+/// The names a reference may spell although two assemblies declare them: the attributes a compiler
+/// writes into an assembly whose target lacks them, and `IsExternalInit`, which a library declares so
+/// that its `init` setters compile. A name that starts with `<` is never a reference's to spell.
+const COMPILER_MARKERS: &[&str] = &[
+    "Microsoft.CodeAnalysis.EmbeddedAttribute",
+    "System.Runtime.CompilerServices.ExtensionMarkerAttribute",
+    "System.Runtime.CompilerServices.IsExternalInit",
+    "System.Runtime.CompilerServices.IsReadOnlyAttribute",
+    "System.Runtime.CompilerServices.IsUnmanagedAttribute",
+    "System.Runtime.CompilerServices.NativeIntegerAttribute",
+    "System.Runtime.CompilerServices.NullableAttribute",
+    "System.Runtime.CompilerServices.NullableContextAttribute",
+    "System.Runtime.CompilerServices.ParamCollectionAttribute",
+    "System.Runtime.CompilerServices.RefSafetyRulesAttribute",
+    "System.Runtime.CompilerServices.RequiresLocationAttribute",
+    "System.Runtime.CompilerServices.ScopedRefAttribute",
+];
+
+/// `names` as prose: `a` and `b`, or `a`, `b` and `c`.
+fn listed(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [only] => alloc::format!("`{only}`"),
+        [head @ .., last] => {
+            let head: Vec<String> = head.iter().map(|name| alloc::format!("`{name}`")).collect();
+            alloc::format!("{} and `{last}`", head.join(", "))
+        }
+    }
+}
+
+/// Refuses a set of assemblies in which a type cannot be told from another of one name: two assemblies
+/// declare the name, and either another assembly refers to it, or it is an exception type in both.
+///
+/// This loader finds a type another assembly refers to by its full name, and a `catch` matches an
+/// exception by its full name, where .NET goes by the assembly as well. Anywhere else, two assemblies
+/// may declare one name: each one's own uses are its own, and `Interop` in two libraries is ordinary.
+/// The answer does not depend on the order the assemblies come in.
+pub fn refuse_same_named_types(assemblies: &[&Assembly<'_>]) -> Result<(), LoadError> {
+    let mut declared: BTreeMap<String, Vec<(usize, u32)>> = BTreeMap::new();
+    let mut nested: BTreeMap<String, Vec<(usize, u32)>> = BTreeMap::new();
+    for (position, assembly) in assemblies.iter().enumerate() {
+        for type_def in assembly.type_defs() {
+            if type_def.is_nested() {
+                if let Some((chain, name)) = key_type_name(assembly, &type_def) {
+                    nested.entry(type_key(&chain, &name)).or_default().push((position, type_def.token().row()));
+                }
+                continue;
+            }
+            let Some(name) = type_def.name() else {
+                continue;
+            };
+            if name.name.starts_with('<') {
+                continue;
+            }
+            declared.entry(full_type_name(name)).or_default().push((position, type_def.token().row()));
+        }
+    }
+    declared.retain(|_, declarers| declarers.len() > 1);
+    if declared.is_empty() {
+        return Ok(());
+    }
+    nested.retain(|_, declarers| declarers.len() > 1);
+    let name_of = |assembly: &Assembly<'_>| -> String {
+        String::from(assembly.assembly_name().unwrap_or("an unnamed assembly"))
+    };
+    let names_of = |declarers: &[(usize, u32)]| -> Vec<String> {
+        let names: BTreeSet<String> = declarers.iter().map(|(position, _)| name_of(assemblies[*position])).collect();
+        names.into_iter().collect()
+    };
+    let mut referring: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+    for assembly in assemblies {
+        for type_ref in assembly.type_refs() {
+            if type_ref.resolution_scope().table() == TYPE_REF {
+                continue;
+            }
+            let Some(name) = type_ref.name() else {
+                continue;
+            };
+            let full = full_type_name(name);
+            if declared.contains_key(&full) && !COMPILER_MARKERS.contains(&full.as_str()) {
+                referring.entry(full).or_default().insert(name_of(assembly));
+            }
+        }
+    }
+    if let Some((full, referrers)) = referring.iter().next() {
+        let referrers: Vec<String> = referrers.iter().cloned().collect();
+        return Err(LoadError::SameNamedTypes(alloc::format!(
+            "The type `{full}` is declared by {}, and {} {} to it. Lamella finds a type another \
+             assembly refers to by its full name, so it cannot tell which one is meant. To run this \
+             program, rename one of these types, move it to another namespace, or remove one of these \
+             assemblies from the program.",
+            listed(&names_of(&declared[full])),
+            listed(&referrers),
+            if referrers.len() == 1 { "refers" } else { "refer" },
+        )));
+    }
+    for (full, declarers) in declared.iter().chain(nested.iter()) {
+        let exceptions: Vec<(usize, u32)> = declarers
+            .iter()
+            .copied()
+            .filter(|(position, row)| definition_is_exception(assemblies, *position, *row))
+            .collect();
+        if exceptions.len() > 1 {
+            return Err(LoadError::SameNamedTypes(alloc::format!(
+                "The exception type `{full}` is declared by {}. Lamella matches a catch clause by the \
+                 exception type's full name, so a catch of one would also catch the other. To run this \
+                 program, rename one of these types or move it to another namespace.",
+                listed(&names_of(&exceptions)),
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Whether the type at `row` of `assemblies[assembly]` derives from `System.Exception`, read from metadata
+/// alone: its chain may pass through a constructed base, and through other assemblies by name.
+pub(crate) fn definition_is_exception(assemblies: &[&Assembly<'_>], assembly: usize, row: u32) -> bool {
+    let mut at = assembly;
+    let mut token = Token::new(TYPE_DEF, row);
+    for _ in 0..64 {
+        let current = assemblies[at];
+        token = match token.table() {
+            TYPE_DEF => {
+                let Some(type_def) = current.type_def(token.row()) else {
+                    return false;
+                };
+                if type_def.name().is_some_and(|name| name.namespace == "System" && name.name == "Exception") {
+                    return true;
+                }
+                type_def.extends()
+            }
+            TYPE_REF => {
+                let Some(name) = current.type_token_name(token) else {
+                    return false;
+                };
+                if name.namespace == "System" && name.name == "Exception" {
+                    return true;
+                }
+                let found = assemblies
+                    .iter()
+                    .enumerate()
+                    .find_map(|(position, other)| other.find_type(name.namespace, name.name).map(|found| (position, found)));
+                let Some((position, found)) = found else {
+                    return false;
+                };
+                at = position;
+                found.token()
+            }
+            TYPE_SPEC => match current.type_spec_signature(token) {
+                Some(SigType::GenericInst { definition, .. }) => match definition.as_ref() {
+                    SigType::Class(base) | SigType::ValueType(base) => *base,
+                    _ => return false,
+                },
+                _ => return false,
+            },
+            _ => return false,
+        };
+    }
+    false
+}
 
 /// Refuses an assembly whose author marked it "do not use this if you do not understand it" with
 /// something this runtime does not implement.
@@ -1655,6 +1748,11 @@ pub fn load_program_lazy_corlib_with_libraries_unfrozen<'c, 'l, 'p>(
     {
         let assemblies: Vec<&Assembly<'_>> = libraries.iter().collect();
         refuse_unmet_demands(&assemblies)?;
+        let mut all: Vec<&Assembly<'_>> = Vec::with_capacity(assemblies.len() + 2);
+        all.push(corlib);
+        all.extend(assemblies);
+        all.push(program);
+        refuse_same_named_types(&all)?;
     }
     let library_asm = |position: usize| LAZY_PROGRAM_ASM + position as u8;
     let program_asm = library_asm(libraries.len());
@@ -1770,6 +1868,9 @@ pub fn load_program_lazy_corlib_with_libraries_unfrozen<'c, 'l, 'p>(
             &instantiations,
             plans,
         );
+        if let Some(message) = &lowering.exception_of_two_meanings {
+            return Err(LoadError::SameNamedTypes(message.clone()).into());
+        }
         materialize_copied_corlib_definitions(
             &mut module,
             &mut resolution,
@@ -1777,6 +1878,7 @@ pub fn load_program_lazy_corlib_with_libraries_unfrozen<'c, 'l, 'p>(
             &lowering.copied_definitions,
         );
         relink_generic_base_heirs(&mut module, &heirs, &lowering);
+        rebind_relinked_field_refs(&mut module, &heirs, &sources, &mut resolution.field_index);
         monomorphize::name_unlowered_sites(&mut module, &sources, program_asm, &lowering);
     }
     #[cfg(not(feature = "generics"))]
@@ -3227,16 +3329,8 @@ pub fn load_with_corlib_and_libraries_unfrozen<'c, 'l, 'p>(
     all.extend(libraries.iter());
     all.push(program);
     refuse_unmet_demands(&all)?;
-    #[cfg(feature = "generics")]
-    let instantiations = {
-        let mut references: Vec<Assembly<'_>> = Vec::with_capacity(1 + libraries.len());
-        references.push(corlib.clone());
-        references.extend(libraries.iter().cloned());
-        monomorphize::collect_instantiations(program, &references)
-    };
-    #[cfg(not(feature = "generics"))]
-    let instantiations: Vec<monomorphize::Instantiation> = Vec::new();
-    load_with_corlib_and_libraries_lowered(corlib, libraries, program, &instantiations)
+    refuse_same_named_types(&all)?;
+    load_with_corlib_and_libraries_lowered(corlib, libraries, program, None)
         .map(|(program, _)| program)
 }
 
@@ -3269,7 +3363,7 @@ pub fn load_with_corlib_monomorphized<'c, 'p>(
     program: &SourceAssembly<'p>,
     instantiations: &[monomorphize::Instantiation],
 ) -> Result<(Program, monomorphize::Lowering), LoadError> {
-    load_with_corlib_and_libraries_lowered(corlib, &[], program, instantiations)
+    load_with_corlib_and_libraries_lowered(corlib, &[], program, Some(instantiations))
 }
 
 /// The libraries among `available` that `program` references, directly or through another of them,
@@ -3355,9 +3449,10 @@ fn library_load_order(libraries: &[SourceAssembly<'_>]) -> Result<Vec<usize>, Lo
     Ok(order)
 }
 
-/// The one loading core. `instantiations` are the PROGRAM's closed generic instantiations; the
-/// references' own plans are collected and lowered beside them here, so an empty slice still lowers
-/// what the corlib and the libraries name for themselves.
+/// The one loading core. `requested` is the PROGRAM's closed generic instantiations, or `None` for
+/// the set [`monomorphize::collect_instantiations`] answers; the references' own plans are collected
+/// and lowered beside them here, so an empty slice still lowers what the corlib and the libraries
+/// name for themselves.
 ///
 /// # Errors
 /// As [`load_with_corlib_and_libraries`].
@@ -3368,7 +3463,7 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
     corlib: &SourceAssembly<'c>,
     libraries: &[SourceAssembly<'l>],
     program: &SourceAssembly<'p>,
-    instantiations: &[monomorphize::Instantiation],
+    requested: Option<&[monomorphize::Instantiation]>,
 ) -> Result<(Program, monomorphize::Lowering), LoadError> {
     assert!(
         libraries.len() <= usize::from(u8::MAX) - 2,
@@ -3383,6 +3478,19 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
         order.into_iter().map(|position| libraries[position].clone()).collect()
     };
     let libraries: &[SourceAssembly<'l>] = &ordered;
+    #[cfg(feature = "generics")]
+    let collected: Vec<monomorphize::Instantiation> = match requested {
+        Some(_) => Vec::new(),
+        None => {
+            let mut references: Vec<Assembly<'_>> = Vec::with_capacity(1 + libraries.len());
+            references.push(corlib.clone());
+            references.extend(libraries.iter().cloned());
+            monomorphize::collect_instantiations(program, &references)
+        }
+    };
+    #[cfg(not(feature = "generics"))]
+    let collected: Vec<monomorphize::Instantiation> = Vec::new();
+    let instantiations: &[monomorphize::Instantiation] = requested.unwrap_or(&collected);
     let mut module = Module::new();
     let mut index = NameIndex::new();
     let mut type_index = TypeNameIndex::new();
@@ -3479,7 +3587,11 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
         instantiations,
         plans,
     );
+    if let Some(message) = &lowering.exception_of_two_meanings {
+        return Err(LoadError::SameNamedTypes(message.clone()));
+    }
     relink_generic_base_heirs(&mut module, &heirs, &lowering);
+    rebind_relinked_field_refs(&mut module, &heirs, &sources, &mut field_index);
     monomorphize::name_unlowered_sites(&mut module, &sources, program_asm, &lowering);
     let entry = entry.ok_or(LoadError::EntryHasNoBody)?;
     Ok((Program { module, entry }, lowering))
@@ -3564,6 +3676,9 @@ struct GenericBaseHeir<'pe> {
     base: HeirBase,
     /// Its OWN instance fields, in declaration order -- the token to rebind and the zero value.
     own_fields: Vec<(Token, Value, Option<Token>)>,
+    /// The qualified name each of [`own_fields`](Self::own_fields) is published under, for another
+    /// assembly's `MemberRef` to find: see [`rebind_relinked_field_refs`].
+    own_field_keys: Vec<Option<String>>,
     /// Its OWN virtual methods, in declaration order.
     virtuals: Vec<VirtualMethod>,
     /// Its OWN non-virtual instance methods, in declaration order.
@@ -3917,11 +4032,17 @@ fn load_assembly_collecting<'pe>(
                         let tag =
                             exception_tag_for_name(catch_name.namespace, catch_name.name);
                         module.bind_catch_type_tag(asm, catch_token, tag);
-                    } else if matches!(
-                        assembly.type_spec_signature(catch_token),
-                        Some(lamella_metadata::SigType::GenericInst { .. })
-                    ) {
+                    } else if let Some(signature @ lamella_metadata::SigType::GenericInst { .. }) =
+                        assembly.type_spec_signature(catch_token)
+                    {
                         module.mark_unlowered_generic(asm, catch_token);
+                        if let Some(spelled) = monomorphize::spell_site(assembly, &signature) {
+                            module.bind_catch_type_tag(
+                                asm,
+                                catch_token,
+                                lamella_cil_runtime::exception::exception_tag(&spelled),
+                            );
+                        }
                     }
                 }
             }
@@ -4121,6 +4242,10 @@ fn load_assembly_collecting<'pe>(
             asm,
             type_id: (type_offset + local) as u32,
             base,
+            own_field_keys: own_fields[local]
+                .iter()
+                .map(|(token, _, _)| instance_field_keys.get(&token.0).cloned())
+                .collect(),
             own_fields: own_fields[local].clone(),
             virtuals: type_virtuals[local].clone(),
             nonvirtuals: type_nonvirtuals[local].clone(),
@@ -5463,13 +5588,38 @@ fn default_field_value_of(
     enum_zeros: &BTreeMap<String, Value>,
 ) -> Value {
     if let Some(SigType::ValueType(token)) = signature {
-        if let Some(key) = type_index_key(assembly, token) {
-            if let Some(zero) = enum_zeros.get(&key) {
-                return zero.clone();
-            }
+        if let Some(zero) = enum_zero_of(assembly, token, enum_zeros) {
+            return zero;
         }
     }
     default_field_value(signature)
+}
+
+/// The zero of the enum `token` names, in `assembly`, if it names one.
+///
+/// A type the assembly declares answers for itself: another assembly can declare its name as a struct,
+/// or as an enum of another width, and the index holds one entry per name. A reference is found by
+/// that entry, the same qualified name `index_enum_zeros` wrote -- a NESTED enum's included, whose row
+/// alone names no enclosing type -- so a corlib enum a program's field names is found by the entry the
+/// corlib's own walk left behind.
+fn enum_zero_of(assembly: &Assembly, token: Token, enum_zeros: &BTreeMap<String, Value>) -> Option<Value> {
+    if token.table() == TYPE_DEF {
+        let type_def = assembly.type_def(token.row())?;
+        return is_enum_type(assembly, type_def.extends()).then(|| enum_zero_of_definition(&type_def));
+    }
+    enum_zeros.get(&type_index_key(assembly, token)?).cloned()
+}
+
+/// The zero of an enum's storage, read from its definition.
+fn enum_zero_of_definition(type_def: &lamella_metadata::TypeDef<'_>) -> Value {
+    let underlying = type_def
+        .fields()
+        .find(|field| !field.is_static())
+        .and_then(|field| field.signature());
+    match default_field_value(underlying) {
+        Value::Null => Value::Int32(0),
+        zero => zero,
+    }
 }
 
 /// Record every enum this assembly DECLARES against the zero its storage takes, so a field typed
@@ -5483,14 +5633,7 @@ fn index_enum_zeros(assembly: &Assembly, enum_zeros: &mut BTreeMap<String, Value
         let Some((namespace, name)) = key_type_name(assembly, &type_def) else {
             continue;
         };
-        let underlying = type_def
-            .fields()
-            .find(|field| !field.is_static())
-            .and_then(|field| field.signature());
-        let zero = match default_field_value(underlying) {
-            Value::Null => Value::Int32(0),
-            zero => zero,
-        };
+        let zero = enum_zero_of_definition(&type_def);
         enum_zeros.insert(alloc::format!("{namespace}.{name}"), zero);
     }
 }
@@ -5814,6 +5957,7 @@ fn bind_static_field_refs(
         if !member.is_field() {
             continue;
         }
+        mark_field_through_closed_instantiation(assembly, module, asm, &member, *token);
         let (Some((declaring_namespace, declaring_name)), Some(field_name)) =
             (assembly.type_token_full_name(member.parent()), member.name())
         else {
@@ -5823,6 +5967,32 @@ fn bind_static_field_refs(
         if let Some(&slot) = field_index.statics.get(&key) {
             module.bind_static_field_ref(asm, *token, slot);
         }
+    }
+}
+
+/// Marks a field `MemberRef` whose parent is a CLOSED generic instantiation as unlowered, as
+/// [`bind_generic_calls`] and the `TypeSpec` arm of the member binder mark a call site, until the
+/// monomorphizer binds it to the instantiation's own field and withdraws the mark.
+///
+/// An unbound field site was the one kind nothing marked, so `validate_profile`, which reads the mark,
+/// let an image carrying one bake, and the device trapped `UnresolvedField` on a bare token at the first
+/// read.
+fn mark_field_through_closed_instantiation(
+    assembly: &Assembly,
+    module: &mut Module,
+    asm: u8,
+    member: &lamella_metadata::MemberRef<'_>,
+    token: Token,
+) {
+    let parent = member.parent();
+    if parent.table() != TYPE_SPEC {
+        return;
+    }
+    let spec = assembly.type_spec_signature(parent);
+    if matches!(spec, Some(lamella_metadata::SigType::GenericInst { .. }))
+        && !spec.as_ref().is_some_and(monomorphize::mentions_parameter)
+    {
+        module.mark_unlowered_generic(asm, token);
     }
 }
 
@@ -5853,6 +6023,7 @@ fn bind_instance_field_refs(
         if !member.is_field() {
             continue;
         }
+        mark_field_through_closed_instantiation(assembly, module, asm, &member, *token);
         let (Some((declaring_namespace, declaring_name)), Some(field_name)) =
             (assembly.type_token_full_name(member.parent()), member.name())
         else {
@@ -6432,8 +6603,9 @@ fn classify_type_test_tokens(
     }
 }
 
-/// Binds every named type an array signature's elements carry, at any depth of `[]`, to its type in
-/// `type_index`, where the module has none bound yet. A type no loaded assembly defines stays unbound.
+/// Binds every named type a type test's signature carries, at any depth of `[]` and of a generic
+/// instantiation's arguments, to its type in `type_index`, where the module has none bound yet. A type no
+/// loaded assembly defines stays unbound.
 fn bind_signature_elements(
     assembly: &Assembly,
     module: &mut Module,
@@ -6448,6 +6620,11 @@ fn bind_signature_elements(
                 if let Some(id) = type_index_key(assembly, *token).and_then(|key| type_index.get(&key).copied()) {
                     module.bind_type_token(asm, *token, id);
                 }
+            }
+        }
+        SigType::GenericInst { arguments, .. } => {
+            for argument in arguments {
+                bind_signature_elements(assembly, module, asm, type_index, argument);
             }
         }
         _ => {}
@@ -6960,6 +7137,56 @@ fn relink_generic_base_heirs(
     }
 }
 
+/// Moves every field reference another assembly bound by NAME to a relinked heir's own field onto the
+/// slot the field now has, and the name index with it.
+///
+/// `build_field_layouts` publishes each instance field under its qualified name, and a later
+/// assembly's `MemberRef` copies that slot when THAT assembly loads, which is before the monomorphizer
+/// and the relink can run. The relink then shifts a heir's own fields up past its base's, so a program
+/// reading a library's `class Reading : Sample<int> { public int Own; }` held the pre-shift slot and
+/// read the base's first field.
+fn rebind_relinked_field_refs(
+    module: &mut Module,
+    heirs: &[GenericBaseHeir<'_>],
+    sources: &[monomorphize::DefinitionSource<'_>],
+    field_index: &mut FieldNameIndex,
+) {
+    let mut moved: BTreeMap<String, u32> = BTreeMap::new();
+    for heir in heirs {
+        for ((token, _, _), key) in heir.own_fields.iter().zip(&heir.own_field_keys) {
+            let (Some(key), Some(slot)) = (key, module.field_slot(heir.asm, *token)) else {
+                continue;
+            };
+            if field_index.instances.get(key) != Some(&slot) {
+                field_index.instances.insert(key.clone(), slot);
+                moved.insert(key.clone(), slot);
+            }
+        }
+    }
+    if moved.is_empty() {
+        return;
+    }
+    for source in sources {
+        let assembly = &source.assembly;
+        for row in 1..=u32::from(u16::MAX) {
+            let Some(member) = assembly.member_ref(row) else {
+                break;
+            };
+            if !member.is_field() {
+                continue;
+            }
+            let (Some((namespace, type_name)), Some(field)) =
+                (assembly.type_token_full_name(member.parent()), member.name())
+            else {
+                continue;
+            };
+            if let Some(&slot) = moved.get(&field_key(&namespace, &type_name, field)) {
+                module.bind_field(source.asm, Token::new(MEMBER_REF, row), slot);
+            }
+        }
+    }
+}
+
 /// Rewrites one heir's base link, field layout, vtable and dispatch maps against `base` -- the
 /// identity its `extends` names, now that it exists.
 fn relink_one(module: &mut Module, heir: &GenericBaseHeir<'_>, base: TypeId) {
@@ -7055,6 +7282,9 @@ fn generic_base_of(
     extends: Token,
     lowering: &monomorphize::Lowering,
 ) -> Option<TypeId> {
+    if let Some(type_id) = lowering.same_named_base(heir.asm, extends) {
+        return type_id;
+    }
     let signature = heir.assembly.type_spec_signature(extends)?;
     let name = lamella_generics::spell_sig(&heir.assembly, &signature)?;
     lowering.type_named(&name)

@@ -192,7 +192,15 @@ pub struct ParsedSubmission {
 /// the session model binds the result against the persistent `__Repl` scope.
 #[must_use]
 pub fn parse_submission(source: &str) -> ParsedSubmission {
-    let mut parser = Parser::new(tokenize(source));
+    parse_submission_with(source, LexOptions::default())
+}
+
+/// Parses a REPL submission under `options`, including its selected language version.
+#[must_use]
+pub fn parse_submission_with(source: &str, options: LexOptions) -> ParsedSubmission {
+    let version = options.version;
+    let mut parser = Parser::new(tokenize_with(source, options));
+    parser.version = version;
     let (usings, types, statements, trailing) = parser.parse_submission();
     ParsedSubmission {
         usings,
@@ -244,6 +252,9 @@ struct Parser {
     position: usize,
     /// Diagnostics gathered so far, beginning with the lexer's.
     diagnostics: Vec<Diagnostic>,
+    /// The namespaces and types around the declaration being parsed, outermost first, each dotted
+    /// part its own entry: what a qualified name in a record's member can spell the record through.
+    enclosing: Vec<Box<str>>,
     /// The `#define`d preprocessor symbols (9.5.3), carried onto the parsed
     /// [`CompilationUnit`] so the binder can resolve `[Conditional]` inclusion (24.4.2).
     defined_symbols: BTreeSet<Box<str>>,
@@ -345,6 +356,7 @@ impl Parser {
             tokens,
             position: 0,
             diagnostics: tokenized.diagnostics,
+            enclosing: Vec::new(),
             defined_symbols: tokenized.defined_symbols,
             version: LanguageVersion::DEFAULT,
             in_async_method: false,
@@ -2517,7 +2529,7 @@ impl Parser {
         if !declaration.bases.is_empty() {
             self.gate_feature(Feature::RecordInheritance, keyword_span);
         }
-        synthesize_record_members(&mut declaration);
+        synthesize_record_members(&mut declaration, &self.enclosing);
         declaration
     }
 
@@ -2664,6 +2676,8 @@ impl Parser {
         self.expect(Punctuator::OpenBrace, DiagnosticKind::OpenBraceExpected);
         let usings = self.parse_using_directives();
         let mut members = Vec::new();
+        let around = self.enclosing.len();
+        self.enclosing.extend(name.parts.iter().cloned());
         while self.current_punctuator() != Some(Punctuator::CloseBrace)
             && !matches!(self.current().kind, TokenKind::EndOfFile)
         {
@@ -2673,6 +2687,7 @@ impl Parser {
                 self.bump();
             }
         }
+        self.enclosing.truncate(around);
         let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
         self.eat_declaration_semicolon();
         NamespaceDecl {
@@ -2736,6 +2751,8 @@ impl Parser {
         self.bump();
         let usings = self.parse_using_directives();
         let mut members = Vec::new();
+        let around = self.enclosing.len();
+        self.enclosing.extend(name.parts.iter().cloned());
         while self.current_punctuator() != Some(Punctuator::CloseBrace)
             && !matches!(self.current().kind, TokenKind::EndOfFile)
         {
@@ -2745,6 +2762,7 @@ impl Parser {
                 self.bump();
             }
         }
+        self.enclosing.truncate(around);
         NamespaceDecl {
             name,
             usings,
@@ -2842,6 +2860,7 @@ impl Parser {
             end
         } else {
             self.expect(Punctuator::OpenBrace, DiagnosticKind::OpenBraceExpected);
+            self.enclosing.push(name.clone());
             while self.current_punctuator() != Some(Punctuator::CloseBrace)
                 && !matches!(self.current().kind, TokenKind::EndOfFile)
             {
@@ -2851,6 +2870,7 @@ impl Parser {
                     self.bump();
                 }
             }
+            self.enclosing.pop();
             let end = self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
             self.eat_declaration_semicolon();
             end
@@ -4423,7 +4443,7 @@ impl Parser {
                         TypeTestOperation::Is => {
                             self.parse_pattern(operator, PatternPosition::TypeTest)
                         }
-                        TypeTestOperation::As => Pattern::Type(self.parse_as_target_type()),
+                        TypeTestOperation::As => Pattern::Type(self.parse_is_target_type()),
                     };
                     let end = pattern_end(&target);
                     let span = Span::new(left.span.start, end);
@@ -4628,8 +4648,8 @@ impl Parser {
 
     /// The type on the right of an `is` or `as`, with the nullable suffix rule that position needs.
     ///
-    /// THE `?` AFTER THE TARGET IS TWO DIFFERENT TOKENS AND ONLY THE TOKEN AFTER THE NEXT ONE
-    /// TELLS THEM APART:
+    /// A suffix followed by a token that cannot start an expression belongs to the type.
+    /// A following identifier needs further lookahead to distinguish a pattern from a conditional:
     ///
     /// ```text
     /// x is int ? a : b     the CONDITIONAL operator, C# 1.0
@@ -4638,19 +4658,8 @@ impl Parser {
     ///
     fn parse_is_target_type(&mut self) -> TypeRef {
         let ty = self.parse_type_inner(false);
-        if self.current_punctuator() == Some(Punctuator::Question) && self.at_nullable_pattern_type()
-        {
-            return self.parse_nullable_suffix(ty, true);
-        }
-        ty
-    }
-
-    /// The type on the right of an `as`: [`Self::parse_is_target_type`]'s reading, and one more.
-    ///
-    fn parse_as_target_type(&mut self) -> TypeRef {
-        let ty = self.parse_is_target_type();
         if self.current_punctuator() == Some(Punctuator::Question)
-            && !self.can_start_expression_at(self.position + 1)
+            && (self.at_nullable_pattern_type() || !self.can_start_expression_at(self.position + 1))
         {
             return self.parse_nullable_suffix(ty, true);
         }
@@ -5056,6 +5065,7 @@ impl Parser {
                 .collect(),
             position: 0,
             diagnostics: Vec::new(),
+            enclosing: Vec::new(),
             defined_symbols: BTreeSet::new(),
             version: self.version,
             in_async_method: self.in_async_method,
@@ -7033,6 +7043,125 @@ fn top_level_program(statements: Vec<Stmt>, facts: TopLevelFacts) -> TypeDecl {
     }
 }
 
+/// Whether `qualifier`, written before a name, reaches a declaration whose surroundings are
+/// `enclosing`: nothing, the namespaces and types around it from any depth, or all of them from
+/// `global::`.
+fn qualifier_reaches(qualifier: &[&str], enclosing: &[Box<str>]) -> bool {
+    let same = |written: &[&str], around: &[Box<str>]| written.iter().zip(around).all(|(a, b)| *a == &**b);
+    match qualifier.split_first() {
+        Some((first, rest)) if crate::ast::alias_qualifier(first) == Some("global") => {
+            rest.len() == enclosing.len() && same(rest, enclosing)
+        }
+        _ => qualifier.len() <= enclosing.len() && same(qualifier, &enclosing[enclosing.len() - qualifier.len()..]),
+    }
+}
+
+/// Whether `ty`, as written, is the record `declaration` itself: its name, qualified as
+/// [`qualifier_reaches`] allows, with or without a `?`, which is only an annotation since a record
+/// here is a class.
+fn spells_the_record(ty: &TypeRef, declaration: &TypeDecl, enclosing: &[Box<str>]) -> bool {
+    match &ty.kind {
+        TypeRefKind::Nullable(underlying) => spells_the_record(underlying, declaration, enclosing),
+        TypeRefKind::Name(parts) => match parts.split_last() {
+            Some((last, qualifier)) if *last == declaration.name => {
+                let qualifier: Vec<&str> = qualifier.iter().map(|part| &**part).collect();
+                qualifier_reaches(&qualifier, enclosing)
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+/// Whether `ty`, as written, is `System.Text.StringBuilder`: that whole name, or the simple one, which
+/// a file reaches by its `using`, with or without a `?`, which is only an annotation on a class.
+fn spells_string_builder(ty: &TypeRef) -> bool {
+    let parts = match &ty.kind {
+        TypeRefKind::Nullable(underlying) => return spells_string_builder(underlying),
+        TypeRefKind::Name(parts) => parts,
+        _ => return false,
+    };
+    let names: Vec<&str> = parts.iter().map(|part| &**part).collect();
+    let unqualified = match names.split_first() {
+        Some((first, rest)) if crate::ast::alias_qualifier(first) == Some("global") => rest,
+        _ => &names[..],
+    };
+    matches!(unqualified, ["StringBuilder"] | ["System", "Text", "StringBuilder"])
+}
+
+/// The name a predefined type keyword abbreviates, in `System`.
+fn predefined_system_name(predefined: PredefinedType) -> &'static str {
+    match predefined {
+        PredefinedType::Bool => "Boolean",
+        PredefinedType::Byte => "Byte",
+        PredefinedType::Sbyte => "SByte",
+        PredefinedType::Short => "Int16",
+        PredefinedType::Ushort => "UInt16",
+        PredefinedType::Int => "Int32",
+        PredefinedType::Uint => "UInt32",
+        PredefinedType::Long => "Int64",
+        PredefinedType::Ulong => "UInt64",
+        PredefinedType::Char => "Char",
+        PredefinedType::Float => "Single",
+        PredefinedType::Double => "Double",
+        PredefinedType::Decimal => "Decimal",
+        PredefinedType::String => "String",
+        PredefinedType::Object => "Object",
+        PredefinedType::Void => "Void",
+    }
+}
+
+/// Whether two types as written are one type by their spelling alone: the same name, or a keyword and
+/// the `System` name it abbreviates, a `?` at any depth over a keyword's reference type or an array being
+/// only an annotation. A `?` over a name is not read: this cannot tell a class from a struct. Two spellings
+/// of one type this cannot see leave both members in the type, for the binder's CS0111.
+fn same_spelled_type(left: &TypeRef, right: &TypeRef) -> bool {
+    fn system_name(ty: &TypeRef) -> Option<&str> {
+        match &ty.kind {
+            TypeRefKind::Predefined(predefined) => Some(predefined_system_name(*predefined)),
+            TypeRefKind::Name(parts) => match parts.iter().map(|part| &**part).collect::<Vec<&str>>()[..] {
+                [only] | ["System", only] => Some(only),
+                [first, "System", only] if crate::ast::alias_qualifier(first) == Some("global") => Some(only),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    fn annotated(ty: &TypeRef) -> &TypeRef {
+        match &ty.kind {
+            TypeRefKind::Nullable(underlying)
+                if matches!(
+                    underlying.kind,
+                    TypeRefKind::Predefined(PredefinedType::String | PredefinedType::Object) | TypeRefKind::Array { .. }
+                ) =>
+            {
+                underlying
+            }
+            _ => ty,
+        }
+    }
+    fn same(left: &TypeRef, right: &TypeRef) -> bool {
+        let (left, right) = (annotated(left), annotated(right));
+        match (&left.kind, &right.kind) {
+            (TypeRefKind::Nullable(a), TypeRefKind::Nullable(b)) => same(a, b),
+            (TypeRefKind::Array { element: a, rank: left_rank }, TypeRefKind::Array { element: b, rank: right_rank }) => {
+                left_rank == right_rank && same(a, b)
+            }
+            (TypeRefKind::Generic { parts: a }, TypeRefKind::Generic { parts: b }) => {
+                a.len() == b.len()
+                    && a.iter().zip(b).all(|(a, b)| {
+                        a.name == b.name
+                            && a.arguments.len() == b.arguments.len()
+                            && a.arguments.iter().zip(&b.arguments).all(|(a, b)| same(a, b))
+                    })
+            }
+            (TypeRefKind::Name(a), TypeRefKind::Name(b)) if a == b => true,
+            _ => matches!((system_name(left), system_name(right)), (Some(a), Some(b)) if a == b),
+        }
+    }
+    same(left, right)
+}
+
 /// Adds the members a `record` declaration generates, as ORDINARY SYNTAX.
 ///
 ///
@@ -7047,8 +7176,9 @@ fn top_level_program(statements: Vec<Stmt>, facts: TopLevelFacts) -> TypeDecl {
 ///
 /// A member the SOURCE already declares is left alone: C# lets a record write its own `X` beside
 /// `record R(int X)`, and the generated one then does not exist. The same rule covers a
-/// hand-written `Equals`, `ToString` or `PrintMembers`.
-fn synthesize_record_members(declaration: &mut TypeDecl) {
+/// hand-written `Equals(R)`, `GetHashCode()`, `ToString` or `PrintMembers`, and `Equals(object)` is
+/// generated beside a hand-written `Equals(R)`, which it calls.
+fn synthesize_record_members(declaration: &mut TypeDecl, enclosing: &[Box<str>]) {
     let Some(parts) = declaration.record.clone() else {
         return;
     };
@@ -7132,7 +7262,7 @@ fn synthesize_record_members(declaration: &mut TypeDecl) {
     }
     if declaration.bases.is_empty() {
         let equatable =
-            synthesize_record_equality(declaration, &parameters, positional, span, &mut generated);
+            synthesize_record_equality(declaration, enclosing, &parameters, positional, span, &mut generated);
         declaration.members.extend(generated);
         if let Some(equatable) = equatable {
             declaration.bases.push(equatable);
@@ -7147,6 +7277,7 @@ fn synthesize_record_members(declaration: &mut TypeDecl) {
 ///
 fn synthesize_record_equality(
     declaration: &TypeDecl,
+    enclosing: &[Box<str>],
     parameters: &[Parameter],
     positional: bool,
     span: Span,
@@ -7164,20 +7295,38 @@ fn synthesize_record_equality(
     let object_ty = || synth_predefined(PredefinedType::Object, span);
     let this = || Expr::new(ExprKind::This, span);
     let name_expr = |name: &str| Expr::name(Box::from(name), span);
-    let declares_method = |name: &str| {
-        declaration.members.iter().any(|member| match member {
-            Member::Method { name: existing, .. } => &**existing == name,
-            Member::Property { name: existing, .. } => &**existing == name,
-            _ => false,
+    let declares = |wanted: &str, accepts: &dyn Fn(&[Parameter]) -> bool| {
+        declaration.members.iter().any(|member| {
+            matches!(member, Member::Method {
+                    name, parameters, type_parameters, is_vararg: false, explicit_interface: None, ..
+                } if &**name == wanted && type_parameters.is_empty() && accepts(parameters))
         })
     };
+    let takes_the_record = |parameters: &[Parameter]| {
+        matches!(parameters, [only] if only.modifier.is_none() && spells_the_record(&only.ty, declaration, enclosing))
+    };
+    let declares_typed_equals = declares("Equals", &takes_the_record);
+    let declares_hash = declares("GetHashCode", &|parameters| parameters.is_empty());
+    let declares_to_string = declares("ToString", &|parameters| parameters.is_empty());
+    let declares_print_members = declares("PrintMembers", &|parameters| {
+        matches!(parameters, [only] if only.modifier.is_none() && spells_string_builder(&only.ty))
+    });
+    let declares_deconstruct = declares("Deconstruct", &|declared| {
+        declared.len() == parameters.len()
+            && declared.iter().zip(parameters).all(|(declared, positional)| {
+                matches!(declared.modifier, Some(ParameterModifier::Out)) && same_spelled_type(&declared.ty, &positional.ty)
+            })
+    });
     let declares_operator = |wanted: OverloadableOperator| {
         declaration.members.iter().any(|member| {
             matches!(member, Member::Operator { operator, .. } if *operator == wanted)
         })
     };
 
-    if !declares_method("EqualityContract") {
+    let declares_contract = declaration.members.iter().any(
+        |member| matches!(member, Member::Property { name, .. } if &**name == "EqualityContract"),
+    );
+    if !declares_contract {
         generated.push(Member::Property {
             modifiers: alloc::vec![Modifier::Protected, Modifier::Virtual],
             ty: synth_type(&["System", "Type"], span),
@@ -7202,10 +7351,7 @@ fn synthesize_record_equality(
     }
 
     let already_copies = declaration.members.iter().any(|member| {
-        matches!(member, Member::Constructor { parameters, .. }
-            if parameters.len() == 1
-                && matches!(&parameters[0].ty.kind, TypeRefKind::Name(parts)
-                    if parts.len() == 1 && parts[0] == declaration.name))
+        matches!(member, Member::Constructor { parameters, .. } if takes_the_record(parameters))
     });
     if !already_copies {
         let copies = state
@@ -7263,7 +7409,7 @@ fn synthesize_record_equality(
         span,
     });
 
-    if !declares_method("Equals") {
+    if !declares_typed_equals {
         let other = || name_expr("other");
         let mut test = synth_binary(
             Expr::new(
@@ -7318,37 +7464,38 @@ fn synthesize_record_equality(
             attributes: Vec::new(),
             span,
         });
-        generated.push(Member::Method {
-            modifiers: alloc::vec![Modifier::Public, Modifier::Override],
-            return_type: bool_ty(),
-            name: Box::from("Equals"),
-            name_span: span,
-            type_parameters: Vec::new(),
-            constraints: Vec::new(),
-            parameters: alloc::vec![synth_parameter(object_ty(), "obj", span)],
-            is_vararg: false,
-            body: Some(synth_return_body(
-                synth_call(
-                    synth_member(this(), "Equals", span),
-                    alloc::vec![Expr::new(
-                        ExprKind::TypeTest {
-                            operation: TypeTestOperation::As,
-                            operand: Box::new(name_expr("obj")),
-                            target: Pattern::Type(record_ty.clone()),
-                        },
-                        span,
-                    )],
-                    span,
-                ),
-                span,
-            )),
-            explicit_interface: None,
-            attributes: Vec::new(),
-            span,
-        });
     }
 
-    if !declares_method("GetHashCode") {
+    generated.push(Member::Method {
+        modifiers: alloc::vec![Modifier::Public, Modifier::Override],
+        return_type: bool_ty(),
+        name: Box::from("Equals"),
+        name_span: span,
+        type_parameters: Vec::new(),
+        constraints: Vec::new(),
+        parameters: alloc::vec![synth_parameter(object_ty(), "obj", span)],
+        is_vararg: false,
+        body: Some(synth_return_body(
+            synth_call(
+                synth_member(this(), "Equals", span),
+                alloc::vec![Expr::new(
+                    ExprKind::TypeTest {
+                        operation: TypeTestOperation::As,
+                        operand: Box::new(name_expr("obj")),
+                        target: Pattern::Type(record_ty.clone()),
+                    },
+                    span,
+                )],
+                span,
+            ),
+            span,
+        )),
+        explicit_interface: None,
+        attributes: Vec::new(),
+        span,
+    });
+
+    if !declares_hash {
         let hash_of = |receiver: Expr, ty: TypeRef| {
             synth_call(
                 synth_member(
@@ -7475,7 +7622,7 @@ fn synthesize_record_equality(
     }
 
     let sb_ty = synth_type(&["System", "Text", "StringBuilder"], span);
-    if !declares_method("PrintMembers") {
+    if !declares_print_members {
         let builder = || name_expr("builder");
         let append = |value: Expr| {
             Stmt::new(
@@ -7551,7 +7698,7 @@ fn synthesize_record_equality(
             span,
         });
     }
-    if !declares_method("ToString") {
+    if !declares_to_string {
         let builder = || name_expr("builder");
         let literal = |text: &str| {
             Expr::new(
@@ -7632,7 +7779,7 @@ fn synthesize_record_equality(
         });
     }
 
-    if positional && !parameters.is_empty() && !declares_method("Deconstruct") {
+    if positional && !parameters.is_empty() && !declares_deconstruct {
         let out_parameters = parameters
             .iter()
             .map(|parameter| Parameter {

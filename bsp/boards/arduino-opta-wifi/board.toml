@@ -31,6 +31,8 @@
 kind = "board"
 board = "arduino-opta-wifi"
 vendor = "arduino"
+maker = "Arduino"
+product = "Opta WiFi"
 family = "stm32h7"
 part = "stm32h747xi"
 product_model = 43            # lamella_wire::product_model::ARDUINO_OPTA_WIFI

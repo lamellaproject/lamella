@@ -5,9 +5,9 @@
 //! not a command a person types: it is not in `lamella run --help`, and its arguments may change with
 //! the SDK that passes them. The SDK composes the emulator's command, an executable and its
 //! arguments, and hands both here instead of starting it itself, so that the run's first line says
-//! how the program runs, as it does on every other device: `running the native image in the
-//! <machine> emulator.`, on standard error with this tool's `lamella:` prefix. Everything after that line is the
-//! emulator's, unless the emulator cannot be started, which this tool then says, ending with 1.
+//! how the program runs. A runtime that supplies its own introduction uses `--no-banner` to omit
+//! this tool's first line and blank line. The emulator's output follows, unless it cannot be
+//! started, which this tool then says on standard error, ending with 1.
 //!
 //! **THE EMULATOR IS GIVEN EXACTLY THE ARGUMENTS IT WOULD HAVE HAD WITHOUT THIS TOOL.**
 //! `--emulator` names its executable, and everything after the first `--` is its arguments: the
@@ -22,7 +22,7 @@
 
 use crate::args;
 use crate::ending::Ended;
-use crate::own_lines::say;
+use crate::own_lines::{blank_line, fail, say};
 use std::io::Write;
 
 /// The option that asks for this run, and names the emulator's executable.
@@ -46,28 +46,31 @@ fn run_with(
         usage: Some(crate::program::RUN_USAGE),
         values: &[EMULATOR, "--device", "--board"],
         repeats: &[],
-        flags: &[],
+        flags: &["--no-banner"],
         positional: args::Positional::Own,
     };
-    let parsed = match args::parse_or_halt(options, &spec) {
+    let parsed = match args::parse_or_halt_with(options, &spec, |error| fail(err, error)) {
         Ok(parsed) => parsed,
         Err(args::Halt::Help) => return Ended::Program(0),
         Err(args::Halt::Bad) => return Ended::Failed,
     };
     if let Some(word) = parsed.positionals().first() {
-        say(err, &format!("{word:?} is not an option of a run on an emulator: the emulator's arguments come after --."));
+        fail(err, &format!("{word:?} is not an option of a run on an emulator: the emulator's arguments come after --."));
         return Ended::Failed;
     }
     let emulator = parsed.value(EMULATOR).unwrap_or_default();
     if emulator.is_empty() {
-        say(err, &format!("{EMULATOR} names no emulator to start."));
+        fail(err, &format!("{EMULATOR} names no emulator to start."));
         return Ended::Failed;
     }
     let Some(device) = parsed.value("--device").filter(|device| !device.is_empty()) else {
-        say(err, "a run on an emulator names the device it runs on, with --device <device>.");
+        fail(err, "A run on an emulator names the device it runs on, with --device <device>.");
         return Ended::Failed;
     };
-    say(err, &model_line(device));
+    if !parsed.flag("--no-banner") {
+        say(err, &model_line(device));
+        blank_line(err);
+    }
     start(emulator, arguments)
 }
 
@@ -103,7 +106,7 @@ fn start(emulator: &str, arguments: &[String]) -> Ended {
     match command.status() {
         Ok(status) => Ended::Program(status.code().unwrap_or(1)),
         Err(error) => {
-            say(&mut std::io::stderr(), &format!("could not start the emulator {emulator}: {error}"));
+            fail(&mut std::io::stderr(), &format!("Could not start the emulator {emulator:?}: {error}"));
             Ended::Failed
         }
     }
@@ -115,7 +118,7 @@ fn start(emulator: &str, arguments: &[String]) -> Ended {
 fn start(emulator: &str, arguments: &[String]) -> Ended {
     use std::os::unix::process::CommandExt as _;
     let error = std::process::Command::new(emulator).args(arguments).exec();
-    say(&mut std::io::stderr(), &format!("could not start the emulator {emulator}: {error}"));
+    fail(&mut std::io::stderr(), &format!("Could not start the emulator {emulator:?}: {error}"));
     Ended::Failed
 }
 
@@ -274,12 +277,29 @@ mod tests {
             Ended::Program(5)
         });
         assert_eq!(ended, Ended::Program(5));
-        assert_eq!(String::from_utf8(err).expect("text"), "lamella: running the native image in the mps2-an505 emulator.\n");
+        assert_eq!(String::from_utf8(err).expect("text"), format!("Lamella v{}, mps2-an505 emulator (AOT)\n\n", env!("CARGO_PKG_VERSION")));
         assert_eq!(started, Some((r"C:\Tools\qemu-system-arm.exe".to_owned(), words(&["-M", "mps2-an505"]))));
     }
 
+    /// A device SDK whose runtime introduces itself suppresses only this tool's introduction.
+    #[test]
+    fn a_runtime_with_its_own_banner_starts_without_a_second_one() {
+        let options = words(&["--emulator", "emulator-stub", "--device", "emulator:mps2-an505", "--no-banner"]);
+        let mut err = Vec::new();
+        let mut started = false;
+        let ended = run_with(&options, &words(&["program-marker"]), &mut err, |command, args| {
+            assert_eq!(command, "emulator-stub");
+            assert_eq!(args, words(&["program-marker"]));
+            started = true;
+            Ended::Program(7)
+        });
+        assert!(started);
+        assert_eq!(ended, Ended::Program(7));
+        assert!(err.is_empty(), "{}", String::from_utf8_lossy(&err));
+    }
+
     /// **A RUN THAT NAMES NO EMULATOR OR NO DEVICE STARTS NOTHING**, and neither does one with a
-    /// word before the `--` that is no option: each is refused in a sentence of this tool's, before
+    /// word before the `--` that is no option: each is refused with the help it needs, before
     /// the model line, and ends with 1.
     #[test]
     fn a_run_that_names_no_emulator_or_no_device_starts_nothing() {
@@ -289,12 +309,19 @@ mod tests {
             &["--emulator", "qemu-system-arm", "--board", "arm-mps2-an505"],
             &["--emulator", "qemu-system-arm", "--device", ""],
             &["--emulator", "qemu-system-arm", "--device", "emulator:mps2-an505", "stray"],
+            &["--emulator", "qemu-system-arm", "--device", "emulator:mps2-an505", "--misspelled"],
         ] {
             let mut err = Vec::new();
             let ended = run_with(&words(options), &[], &mut err, |_, _| panic!("the emulator was started for {options:?}"));
             assert_eq!(ended, Ended::Failed, "{options:?}");
             let said = String::from_utf8(err).expect("text");
-            assert!(said.starts_with("lamella: ") && !said.contains("native image"), "{options:?}: {said}");
+            assert!(!said.contains("lamella:") && !said.contains("(AOT)"), "{options:?}: {said}");
+            if options.contains(&"--misspelled") {
+                assert!(said.ends_with("Try: lamella run --help\n"), "{said}");
+                assert_eq!(said.lines().count(), 2, "{said}");
+            } else {
+                assert_eq!(said.lines().count(), 1, "{said}");
+            }
         }
     }
 
@@ -302,8 +329,9 @@ mod tests {
     /// of the machine the device names, never in words that say the program is on the board.
     #[test]
     fn a_runs_first_line_says_the_program_runs_on_the_emulator_as_a_native_image() {
-        assert_eq!(model_line("emulator:mps2-an505"), "running the native image in the mps2-an505 emulator.");
-        assert_eq!(model_line("Emulator:mps2-an505"), "running the native image in the mps2-an505 emulator.");
+        let expected = format!("Lamella v{}, mps2-an505 emulator (AOT)", env!("CARGO_PKG_VERSION"));
+        assert_eq!(model_line("emulator:mps2-an505"), expected);
+        assert_eq!(model_line("Emulator:mps2-an505"), expected);
     }
 
     /// **WHAT FOLLOWS THE FIRST `--` IS HANDED ON AS THE LINE HOLDS IT**: its quotes, its spacing and

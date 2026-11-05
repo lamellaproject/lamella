@@ -29,8 +29,10 @@ fn main() {
         Ok(_) => eprintln!("lamella-linkd: device {} opens at {} baud", options.device, options.baud),
         Err(error) => {
             eprintln!(
-                "lamella-linkd: cannot open device {} at {} baud: {error:?}",
-                options.device, options.baud
+                "lamella-linkd: cannot open device {} at {} baud: {}",
+                options.device,
+                options.baud,
+                lamella_wire_host::open_failure(error)
             );
             std::process::exit(1);
         }
@@ -65,7 +67,7 @@ fn main() {
         let mut device = match open_target(&options.device, options.baud, DEVICE_OPEN_TIMEOUT) {
             Ok(transport) => transport,
             Err(error) => {
-                eprintln!("lamella-linkd: device {} would not open: {error:?}", options.device);
+                eprintln!("lamella-linkd: device {} would not open: {}", options.device, lamella_wire_host::open_failure(error));
                 eprintln!("lamella-linkd: dropping {peer}; nothing was relayed");
                 continue;
             }

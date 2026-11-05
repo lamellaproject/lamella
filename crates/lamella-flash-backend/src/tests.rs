@@ -216,6 +216,30 @@ fn every_error_renders_a_sentence_naming_what_to_do_about_it() {
     assert!(intact.contains("Nothing was erased"), "got {intact}");
 }
 
+/// **A PROBE THAT STOPPED ANSWERING IS TOLD SO, WITH THE WAY TO BRING IT BACK**, and the transport's
+/// own prefix is not said twice.
+#[test]
+fn a_probe_that_stopped_answering_is_told_to_be_replugged() {
+    let stopped = |why: &str| FlashError::Probe(ProbeError::Transport(why.to_owned())).to_string();
+    let told = "the probe stopped answering (USB transfer timed out). Unplug its USB cable, plug it back \
+                in, and run this again.";
+    assert_eq!(stopped("probe transport error: USB transfer timed out"), told);
+    assert_eq!(stopped("USB transfer timed out"), told);
+}
+
+/// **EVERY OTHER PROBE FAILURE READS AS ITS OWN SENTENCE, NOT AS ITS TYPE**, and is not told to replug
+/// anything: a reply that was refused came from a probe that is answering.
+#[test]
+fn a_probe_failure_is_a_sentence_and_only_a_silent_probe_is_sent_to_the_cable() {
+    for (failure, sentence) in [
+        (ProbeError::Timeout("the flash to finish"), "timed out waiting for the flash to finish"),
+        (ProbeError::Device("the erase failed"), "target device error: the erase failed"),
+        (ProbeError::Ack(lamella_probe_core::Ack::Fault), "transfer not acknowledged: Fault"),
+    ] {
+        assert_eq!(FlashError::Probe(failure).to_string(), sentence);
+    }
+}
+
 /// An image knows the span it occupies, so a backend does not compute it and get it wrong.
 #[test]
 fn an_image_reports_its_own_end_address() {

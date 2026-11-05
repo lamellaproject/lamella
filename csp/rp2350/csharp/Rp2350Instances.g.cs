@@ -48,6 +48,7 @@ namespace Lamella.Generated
         public const uint TIMER0_RESET_BIT = 23;
         public const uint TIMER0_RESET_MASK = 0x800000;
         public const uint TICKS_BASE = 0x40108000;
+        public const uint SYSINFO_BASE = 0x40000000;
         public const uint TRNG_BASE = 0x400F0000;
         public const uint TRNG_RESET_BIT = 25;
         public const uint TRNG_RESET_MASK = 0x2000000;

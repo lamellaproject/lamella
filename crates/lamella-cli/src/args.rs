@@ -91,6 +91,11 @@ impl Options {
             .map(|(_, value)| value.as_str())
     }
 
+    /// Every value of a repeatable option, in command-line order.
+    pub fn values<'a>(&'a self, name: &'a str) -> impl Iterator<Item = &'a str> {
+        self.named.iter().filter(move |(option, _)| option == name).map(|(_, value)| value.as_str())
+    }
+
     /// Whether the standalone option `name` was given.
     #[must_use]
     pub fn flag(&self, name: &str) -> bool {
@@ -229,12 +234,20 @@ pub fn parse(args: &[String], spec: &Spec) -> Result<Options, String> {
 /// [`Halt::Help`] when help was asked for -- printed to stdout, and a SUCCESS for the shell.
 /// [`Halt::Bad`] when the command line was wrong -- printed to stderr, and a FAILURE.
 pub fn parse_or_halt(args: &[String], spec: &Spec) -> Result<Options, Halt> {
+    parse_or_halt_with(args, spec, |error| eprintln!("{error}"))
+}
+
+/// Parses a command line with the caller's refusal presentation and the usual help handling.
+///
+/// # Errors
+/// As [`parse_or_halt`]; a bad command line is reported through `refuse`.
+pub fn parse_or_halt_with(args: &[String], spec: &Spec, refuse: impl FnOnce(&str)) -> Result<Options, Halt> {
     if args.iter().any(|argument| argument == "--help" || argument == "-h") {
         println!("{}", help_text(spec));
         return Err(Halt::Help);
     }
     parse(args, spec).map_err(|error| {
-        eprintln!("{error}");
+        refuse(&error);
         Halt::Bad
     })
 }

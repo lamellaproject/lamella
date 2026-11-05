@@ -1,7 +1,12 @@
 #if LAMELLA_SURFACE_FLOAT
 // An RP2350 PWM slice driving pulse-width modulated outputs as dotnet/iot's PwmChannel: a board binds
 // one slice per PWM chip, and each output it routed -- A as channel 0, B as channel 1 -- is one channel
-// of that chip, created by PwmChannel.Create.
+// of that chip, created by PwmChannel.Create. TargetBoard.CreatePwmChannel reaches the same slices by
+// GPIO line instead, which names its slice and its output by the chip's function table (datasheet
+// 12.5.2): GPIO0 to GPIO15 are slices 0 to 7, A then B, GPIO16 to GPIO31 the same again, GPIO32 to
+// GPIO39 slices 8 to 11, and GPIO40 to GPIO47 those again. So two lines can name one output. The output
+// drives one pad here, and a channel that holds it refuses a second, since a second pad would carry the
+// same signal under a channel of its own.
 //
 // One rate per slice. The slice's period is the period of both its outputs, and each output owns only
 // its half of the compare register, which sets its duty cycle. So a frequency asked of one output
@@ -31,6 +36,14 @@
 // -- and enables the slice. Stopping an output gives its pad back what it had, and stopping the last
 // one disables the slice. Every wait is bounded, and one that runs out is reported as
 // InvalidOperationException rather than waited on forever.
+//
+// A started output drives a net, and where a board wires its pad and a second pad to one net, that is one
+// driver on it. A start while the other pad drives is refused, naming both; a start parks a second pad nothing
+// holds, so its reset pull-down does not load the signal, and leaves one in use, which then reads the signal. A
+// board's own bindings cannot name such a pad, since a binding and a twin cannot claim one pin, so this arises
+// only for a channel made by GPIO line. A pad that nothing held at its start is parked at its stop instead of
+// isolated again, which would put its reset pull-down back on the net. On the pad itself, a start takes the pad
+// from a GPIO output the program opened, and the stop gives it back.
 using System.Device.Pwm;
 using Lamella.Boards;
 using Lamella.Generated;
@@ -44,7 +57,9 @@ internal sealed class Rp2350PwmSlice
 
     const uint TopMax = 0xFFFEu;
 
-    readonly Rp2350PwmBinding _binding;
+    static Rp2350PwmSlice[] s_slices;
+
+    Rp2350PwmBinding _binding;
     readonly uint _csr;
     readonly uint _div;
     readonly uint _ctr;
@@ -53,8 +68,11 @@ internal sealed class Rp2350PwmSlice
     readonly uint _resetsClr;
     readonly uint _resetsDone;
 
-    // Per output, A then B: whether a channel holds it, whether it is started, the duty cycle asked of
-    // it, and its pad's CTRL and PADS words as found at its start, which its stop puts back.
+    // Per output, A then B: the pad a channel drives it on, the second pad a board wires to that net or -1,
+    // whether a channel holds it, whether it is started, the duty cycle asked of it, and its pad's CTRL and
+    // PADS words as found at its start, which its stop puts back.
+    readonly Rp2350PwmOutput[] _pads;
+    readonly int[] _twins;
     readonly bool[] _open;
     readonly bool[] _started;
     readonly double[] _duty;
@@ -82,11 +100,61 @@ internal sealed class Rp2350PwmSlice
         _top = slice + Rp2350PwmLayout.CH0_TOP_OFF;
         _resetsClr = Rp2350Instances.RESETS_CLR_BASE + Rp2350ResetsLayout.RESET_OFF;
         _resetsDone = Rp2350Instances.RESETS_BASE + Rp2350ResetsLayout.RESET_DONE_OFF;
+        _pads = new Rp2350PwmOutput[2];
+        _twins = new int[2];
         _open = new bool[2];
         _started = new bool[2];
         _duty = new double[2];
         _ctrlFound = new uint[2];
         _padFound = new uint[2];
+    }
+
+    /// <summary>The one driver of the slice <paramref name="binding"/> names, made when it is first
+    /// asked for.</summary>
+    public static Rp2350PwmSlice Of(Rp2350PwmBinding binding)
+    {
+        if ((object)s_slices == null)
+        {
+            s_slices = new Rp2350PwmSlice[(int)Rp2350PwmLayout.SLICE_COUNT];
+        }
+        int number = (int)binding.Slice;
+        Rp2350PwmSlice slice = s_slices[number];
+        if ((object)slice == null)
+        {
+            slice = new Rp2350PwmSlice(binding);
+            s_slices[number] = slice;
+        }
+        else if ((object)binding.Output(0) != null || (object)binding.Output(1) != null)
+        {
+            slice._binding = binding;
+        }
+        return slice;
+    }
+
+    /// <summary>Creates a channel on the GPIO line <paramref name="line"/>, whose number names its slice
+    /// and its output, set to <paramref name="frequency"/> and <paramref name="dutyCyclePercentage"/> and
+    /// not yet started. The channel drives that line and no other.</summary>
+    /// <param name="line">The GPIO line, which the caller has checked is one of the chip's.</param>
+    /// <param name="twin">The second GPIO the board wires to the line's net, or -1 where it wires none.</param>
+    /// <param name="clkSysHz">clk_sys under the board's plan, in hertz.</param>
+    /// <param name="frequency">The frequency in hertz.</param>
+    /// <param name="dutyCyclePercentage">The duty cycle, from 0.0 to 1.0.</param>
+    /// <exception cref="System.ArgumentOutOfRangeException">The frequency is outside what the slice can
+    /// produce, or the duty cycle is outside 0.0 to 1.0.</exception>
+    /// <exception cref="System.InvalidOperationException">The line's output is already open, on this line
+    /// or on the other line that names it, the slice's other output is started at a different frequency,
+    /// or the block did not come out of reset.</exception>
+    public static PwmChannel OpenLine(int line, int twin, uint clkSysHz, int frequency, double dutyCyclePercentage)
+    {
+        uint slice = line < 32 ? (uint)(line / 2) % 8u : 8u + (uint)((line - 32) / 2) % 4u;
+        uint output = (uint)line % 2u;
+        Rp2350PwmSlice driver = Of(new Rp2350PwmBinding(Rp2350Instances.PWM_BASE,
+            Rp2350Instances.PWM_RESET_MASK | Rp2350Instances.IO_BANK0_RESET_MASK | Rp2350Instances.PADS_BANK0_RESET_MASK,
+            slice, Rp2350IoBank0Layout.FUNCSEL_PWM, clkSysHz, new Rp2350PwmOutput[0]));
+        return driver.OpenOn((int)output, new Rp2350PwmOutput(output,
+            Rp2350Instances.IO_BANK0_BASE + Rp2350IoBank0Layout.GPIO0_CTRL_OFF + Rp2350IoBank0Layout.GPIO_CTRL_STRIDE * (uint)line,
+            Rp2350Instances.PADS_BANK0_BASE + Rp2350PadsBank0Layout.GPIO0_OFF + Rp2350PadsBank0Layout.GPIO_STRIDE * (uint)line),
+            twin, frequency, dutyCyclePercentage);
     }
 
     /// <summary>Creates output <paramref name="channel"/> of this slice, 0 for A and 1 for B, as a
@@ -100,14 +168,21 @@ internal sealed class Rp2350PwmSlice
     /// output is started at a different frequency, or the block did not come out of reset.</exception>
     public PwmChannel Open(int channel, int frequency, double dutyCyclePercentage)
     {
-        if ((object)_binding.Output(channel) == null)
+        Rp2350PwmOutput routed = _binding.Output(channel);
+        if ((object)routed == null)
         {
             throw new System.ArgumentOutOfRangeException("channel");
         }
+        return OpenOn(channel, routed, -1, frequency, dutyCyclePercentage);
+    }
+
+    // Output channel of this slice on the pad pad, every refusal before anything changes.
+    PwmChannel OpenOn(int channel, Rp2350PwmOutput pad, int twin, int frequency, double dutyCyclePercentage)
+    {
         if (_open[channel])
         {
-            throw new System.InvalidOperationException("PWM channel " + channel
-                + " is already open; dispose it before creating it again");
+            Rp2350Refusal.Refuse("PWM slice #'s output ~ is already open, on GP@; dispose its channel before creating it again",
+                (int)_binding.Slice, Rp2350TwinPads.PadOf(_pads[channel].IoCtrl), 0, (char)('A' + channel));
         }
         uint divider;
         uint top;
@@ -121,6 +196,8 @@ internal sealed class Rp2350PwmSlice
         {
             BringUp();
         }
+        _pads[channel] = pad;
+        _twins[channel] = twin;
         _duty[channel] = dutyCyclePercentage;
         _open[channel] = true;
         if (!Retime(frequency, divider, top))
@@ -164,7 +241,11 @@ internal sealed class Rp2350PwmSlice
         {
             return;
         }
-        Rp2350PwmOutput pad = _binding.Output(output);
+        Rp2350PwmOutput pad = _pads[output];
+        if (_twins[output] >= 0)
+        {
+            Rp2350TwinPads.Claim(Rp2350TwinPads.PadOf(pad.IoCtrl), _twins[output], true, 0u);
+        }
         _ctrlFound[output] = Mmio.Read32(pad.IoCtrl);
         _padFound[output] = Mmio.Read32(pad.Pads);
         // The function first, then the pad out of isolation, so the pad never drives another
@@ -186,11 +267,18 @@ internal sealed class Rp2350PwmSlice
         {
             return;
         }
-        Rp2350PwmOutput pad = _binding.Output(output);
-        // The function first, so a pad that was isolated at the start is isolated again with the
-        // slice no longer driving it.
-        Mmio.Write32(pad.IoCtrl, _ctrlFound[output]);
-        Mmio.Write32(pad.Pads, _padFound[output]);
+        Rp2350PwmOutput pad = _pads[output];
+        if (_twins[output] >= 0 && !Rp2350TwinPads.Holds(_ctrlFound[output], _padFound[output]))
+        {
+            Rp2350TwinPads.Park(Rp2350TwinPads.PadOf(pad.IoCtrl));
+        }
+        else
+        {
+            // The function first, so a pad that was isolated at the start is isolated again with the
+            // slice no longer driving it.
+            Mmio.Write32(pad.IoCtrl, _ctrlFound[output]);
+            Mmio.Write32(pad.Pads, _padFound[output]);
+        }
         _started[output] = false;
         if (!_started[0] && !_started[1])
         {
@@ -212,9 +300,8 @@ internal sealed class Rp2350PwmSlice
         int other = 1 - requester;
         if (_started[other] && frequency != _rate)
         {
-            throw new System.InvalidOperationException("PWM channel " + other
-                + " is started and runs this chip's slice, slice " + _binding.Slice + ", at " + _rate
-                + " Hz, which a started channel keeps: stop channel " + other + " or ask for " + _rate + " Hz");
+            Rp2350Refusal.Refuse("PWM slice #'s output ~ is started on GP@ and keeps the slice at % Hz: stop that channel or ask for % Hz",
+                (int)_binding.Slice, Rp2350TwinPads.PadOf(_pads[other].IoCtrl), _rate, (char)('A' + other));
         }
     }
 

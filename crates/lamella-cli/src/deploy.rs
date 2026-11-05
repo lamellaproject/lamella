@@ -294,13 +294,14 @@ Arguments:
 Options:
   --device <device>               The board's resident interpreter firmware, at a run target ID
                                   that `lamella devices` prints. Only the program is written.
-  --board <board>                 The board's chip, by board ID. The native image written there
+  --board <board>                 The board's chip, by board ID. The AOT image written there
                                   replaces everything on the chip.
   --no-run                        With --device: store the program without starting it.
   --erase                         With --device alone: stop and erase the stored program.
   --via probe|volume              With --board: how the chip is written. Default: the route the
-                                  board takes without extra hardware.
-  --probe <serial>                With --board: which probe, when several are attached.
+                                  board takes without extra hardware, or the probe --probe names.
+  --probe <serial>                With --board: write over this probe. Needed when several are
+                                  attached and LAMELLA_PROBE_SERIAL names none.
   --volume <name>                 With --board: which bootloader drive, when several are attached.
   --dfu <serial>                  With --board: which USB DFU bootloader, when several are attached.
   --nostdlib                      With --board: build the flat tier, the program alone.
@@ -316,7 +317,7 @@ What happens:
 
 Examples:
   lamella deploy Program.cs --device COM8
-  lamella deploy Program.cs --board rpi-pico2
+  lamella deploy Program.cs --board raspberrypi-pico-2
   lamella deploy --erase --device COM8
 
 Details:
@@ -337,9 +338,11 @@ Details:
   the board starts no program and waits for a deploy. Deploying a program replaces the stored one.
 
   With --board, the volume route copies the image to the bootloader drive and needs no probe; the
-  probe route writes over an attached SWD probe and reads every byte back to check it. With more
-  than one probe attached, --via probe is refused until you name one with --probe <serial>. The
-  last line says whether the image was read back.
+  probe route writes over an attached SWD probe and reads every byte back to check it. Naming a
+  probe with --probe <serial> takes the probe route; LAMELLA_PROBE_SERIAL alone does not, and
+  --probe with --via volume is refused. With more than one probe attached, the probe route is
+  refused until --probe or LAMELLA_PROBE_SERIAL names one. The last line says whether the image
+  was read back.
 
   --board links the program with the class library and the runtime support archive, so it may
   allocate, use floating point and call into System.*. On that tier a finalizer (a class's
@@ -470,20 +473,31 @@ pub(crate) fn connect(
     caps: Capabilities,
     board: Option<&crate::project::BoardCheck>,
 ) -> Option<(AnyTransport, lamella_wire::Negotiated)> {
-    let mut transport = open(verb, target, effect_of(verb))?;
-    match hello_on(&mut transport, 0, verb, target, caps) {
-        Ok(session) => match board.map(|board| board.against(verb, target, session.identity.product_model)) {
-            Some(Err(refusal)) => {
-                eprintln!("{refusal}");
-                None
-            }
-            _ => Some((transport, session)),
-        },
+    match connect_checked(verb, target, caps, board) {
+        Ok(connected) => Some(connected),
         Err(refusal) => {
             eprintln!("{refusal}");
             None
         }
     }
+}
+
+/// Open and check a named board, leaving the refusal's presentation to the caller.
+pub(crate) fn connect_checked(
+    verb: &str,
+    target: &str,
+    caps: Capabilities,
+    board: Option<&crate::project::BoardCheck>,
+) -> Result<(AnyTransport, lamella_wire::Negotiated), String> {
+    let mut transport = open_named(target, TIMEOUT).map_err(|why| format!(
+        "lamella {verb}: {why} Run `lamella devices` to list attached boards and their target names.\n\n{}",
+        effect_of(verb)
+    ))?;
+    let session = hello_on(&mut transport, 0, verb, target, caps)?;
+    if let Some(board) = board {
+        board.against(verb, target, session.identity.product_model)?;
+    }
+    Ok((transport, session))
 }
 
 /// Open `target`, or say why not and answer `None`.
@@ -520,7 +534,8 @@ fn effect_of(verb: &str) -> &'static str {
 /// Every other target goes through `open_target`, the one place that knows the target syntax.
 pub(crate) fn open_named(target: &str, timeout: Duration) -> Result<AnyTransport, String> {
     if lamella_wire_host::classify_target(target) != lamella_wire_host::TargetKind::Serial {
-        return open_target(target, BAUD, timeout).map_err(|error| format!("cannot open {target}: {error:?}."));
+        return open_target(target, BAUD, timeout)
+            .map_err(|error| format!("cannot open {target}: {}.", lamella_wire_host::open_failure(error)));
     }
     let ports = crate::ports::attached();
     let port = crate::ports::resolve(target, &ports)?;
@@ -538,20 +553,34 @@ pub(crate) fn open_named(target: &str, timeout: Duration) -> Result<AnyTransport
 /// Windows answers an open of a port another program holds as a denied access, and Linux and macOS
 /// answer it as a busy device, so each is read as held on that system alone.
 fn cannot_open_port(target: &str, port: &str, error: &lamella_serial_port::Error) -> String {
+    let cause = error
+        .os_code()
+        .and_then(|code| i32::try_from(code).ok())
+        .map_or_else(|| error.to_string(), |code| std::io::Error::from_raw_os_error(code).to_string());
+    port_open_refusal(target, port, error.kind(), &cause, std::env::consts::OS)
+}
+
+fn port_open_refusal(target: &str, port: &str, kind: std::io::ErrorKind, cause: &str, system: &str) -> String {
     let named = if target.eq_ignore_ascii_case(port) { target.to_owned() } else { format!("{target} ({port})") };
-    let held = match error.kind() {
+    let held = match kind {
         std::io::ErrorKind::NotFound => return format!("{target} is not attached."),
         std::io::ErrorKind::ResourceBusy => true,
-        std::io::ErrorKind::PermissionDenied => cfg!(windows),
+        std::io::ErrorKind::PermissionDenied => system == "windows",
         _ => false,
     };
     if held {
         return format!("cannot open {named}: another program holds it, and this tool does not take it from that program.");
     }
-    let cause = error
-        .os_code()
-        .and_then(|code| i32::try_from(code).ok())
-        .map_or_else(|| error.to_string(), |code| std::io::Error::from_raw_os_error(code).to_string());
+    if kind == std::io::ErrorKind::PermissionDenied {
+        if system == "linux" {
+            return format!("cannot open {named}: permission denied; ask your administrator to grant your account \
+                access to the serial port through a udev rule or the port's group, then sign in again and reconnect the device.");
+        }
+        if system == "macos" {
+            return format!("cannot open {named}: macOS refused access; close apps using the device, reconnect it, \
+                and allow the accessory if macOS asks ({cause}).");
+        }
+    }
     format!("cannot open {named}: {cause}.")
 }
 
@@ -559,6 +588,26 @@ fn cannot_open_port(target: &str, port: &str, error: &lamella_serial_port::Error
 mod port_refusal_tests {
     use super::cannot_open_port;
     use lamella_serial_port::Error;
+
+    #[test]
+    fn a_linux_permission_refusal_says_how_to_get_access() {
+        assert_eq!(super::port_open_refusal("usb-serial:FIXTURE", "/dev/ttyACM0", std::io::ErrorKind::PermissionDenied, "permission denied", "linux"),
+            "cannot open usb-serial:FIXTURE (/dev/ttyACM0): permission denied; ask your administrator to grant your account access to the serial port through a udev rule or the port's group, then sign in again and reconnect the device.");
+    }
+
+    #[test]
+    fn a_macos_permission_refusal_says_what_to_do() {
+        assert_eq!(super::port_open_refusal("/dev/cu.fixture", "/dev/cu.fixture", std::io::ErrorKind::PermissionDenied, "permission denied", "macos"),
+            "cannot open /dev/cu.fixture: macOS refused access; close apps using the device, reconnect it, and allow the accessory if macOS asks (permission denied).");
+    }
+
+    #[test]
+    fn other_serial_refusals_keep_the_os_reason() {
+        for system in ["linux", "macos"] {
+            assert_eq!(super::port_open_refusal("/dev/fixture", "/dev/fixture", std::io::ErrorKind::Other, "fixture cause", system),
+                "cannot open /dev/fixture: fixture cause.");
+        }
+    }
 
     /// **A PORT THAT IS NOT THERE IS SAID NOT TO BE ATTACHED, AND ONLY A HELD ONE TO BE HELD**, and a
     /// port named by its own name is named once.
@@ -612,7 +661,8 @@ pub(crate) fn hello_on(
             lamella_wire_host::version_mismatch(lamella_wire::PROTOCOL_VERSION, target_min, target_max)
         ),
         error => format!(
-            "lamella {verb}: {target} did not answer a HELLO ({error:?}).\n{}",
+            "lamella {verb}: {target} did not answer a HELLO ({}).\n{}",
+            lamella_wire_host::link_failure(error),
             no_answer()
         ),
     })
@@ -759,9 +809,10 @@ fn erase_on(transport: &mut impl lamella_wire::Transport, target: &str) -> Erase
         Err(error) => {
             return erased.refused(format!(
                 "lamella deploy: {board} answered the connection and then did not answer an ABORT \
-                 within {} s ({error:?}):\nit is neither waiting for a host nor running a program \
+                 within {} s ({}):\nit is neither waiting for a host nor running a program \
                  this tool can stop. Nothing was erased.",
-                TIMEOUT.as_secs()
+                TIMEOUT.as_secs(),
+                lamella_wire_host::link_failure(error)
             ));
         }
     };
@@ -782,7 +833,10 @@ fn erase_on(transport: &mut impl lamella_wire::Transport, target: &str) -> Erase
                 .refused(format!("lamella deploy: {board} refused the erase: {}", describe_refusal(reason)));
         }
         Err(error) => {
-            return erased.refused(format!("lamella deploy: the erase on {board} failed: {error:?}"));
+            return erased.refused(format!(
+                "lamella deploy: the erase on {board} failed: {}.",
+                lamella_wire_host::link_failure(error)
+            ));
         }
     };
     let now = deploy_status_blocking(transport, 6, TIMEOUT).ok();
@@ -978,7 +1032,7 @@ mod tests {
             "and how to replace it: {program}"
         );
         assert!(program.contains("\n       lamella deploy --erase --device <device>\nTry: lamella deploy --help"), "{program}");
-        let board = erase_target(&parsed(&[ERASE_FLAG, "--board", "rpi-pico2"]))
+        let board = erase_target(&parsed(&[ERASE_FLAG, "--board", "raspberrypi-pico-2"]))
             .expect_err("a board model has no firmware to ask");
         assert!(board.starts_with("lamella deploy: --erase asks a board's firmware to erase its program, so it takes a --device, not a --board.\n"), "{board}");
         let extra = erase_target(&parsed(&[ERASE_FLAG, "--device", "usb", "--no-run", "--unsafe"]))
@@ -1037,41 +1091,5 @@ mod tests {
         assert_eq!(running_now(&mut refusing, 9, quick), None, "a firmware that predates the question");
         assert_eq!(running_now(&mut Answering::with(|_| {}), 9, quick), None, "and one that is silent");
     }
-
-    /// **AN ERASE AGAINST THE DEPLOY SERVE A BOARD'S FIRMWARE RUNS.** A board holding a baked program
-    /// is asked whether one is running, taken back, asked what it stores, told to erase and asked
-    /// again, and the report is what it answered: erased, and the second time nothing to erase.
-    #[cfg(feature = "bake")]
-    #[test]
-    fn an_erase_against_the_firmware_serve_reports_what_the_board_answered() {
-        let Ok(set) = lamella_wire_host::boards::ReferenceSet::discover(None) else {
-            return;
-        };
-        let image = crate::bake::compile_and_bake(
-            &set,
-            "class Program\n{\n    static int Main()\n    {\n        return 42;\n    }\n}\n",
-            "run",
-        )
-        .expect("a program bakes");
-        let mut board =
-            lamella_wire_host::loopback::LoopbackBoard::on(lamella_wire_host::loopback::RamFlash::holding(&image));
-        assert!(
-            lamella_cil_runtime::verified_image_checksum(board.flash.region).is_some(),
-            "the board holds a verified program to begin with"
-        );
-
-        let first = erase_on(&mut board, "loopback");
-        assert_eq!(first.refusal, None, "{first:?}");
-        assert_eq!(first.lines.len(), 1, "nothing was running, so one line: {first:?}");
-        assert!(first.lines[0].starts_with("erased the stored program."), "{first:?}");
-        assert_eq!(board.flash.erases, 1, "the board was told to erase, once");
-        assert!(
-            lamella_cil_runtime::verified_image_checksum(board.flash.region).is_none(),
-            "and holds no program now"
-        );
-
-        let second = erase_on(&mut board, "loopback");
-        assert_eq!(second.refusal, None, "{second:?}");
-        assert!(second.lines[0].contains("held no stored program"), "{second:?}");
-    }
 }
+

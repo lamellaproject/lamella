@@ -352,6 +352,11 @@ pub struct Version {
     pub product_id: u16,
 }
 
+/// A USB transfer to the ST-LINK that failed: the probe going silent, and nothing a target said.
+fn transfer_failed(what: &str, why: &lamella_usbbulk::Error) -> ProbeError {
+    ProbeError::Transport(format!("the ST-LINK's {what} failed: {why}"))
+}
+
 /// A connected ST-Link.
 pub struct StLink {
     device: Device,
@@ -368,18 +373,18 @@ impl StLink {
     pub fn open(product_id: u16, serial: Option<&str>) -> Result<Self, ProbeError> {
         match lamella_usbbulk::diagnose(ST_DEBUG_INTERFACE_GUID, ST_VENDOR_ID, product_id) {
             Ok(Binding::Absent) => {
-                return Err(ProbeError::Device(
+                return Err(ProbeError::Debugger(
                     "no ST-Link found on the USB bus -- plug one in, or an ST board with one on board",
                 ));
             }
             Ok(Binding::PresentUnbound) => {
-                return Err(ProbeError::Device(
-                    "an ST-Link is plugged in but its debug interface has NO DRIVER BOUND, so it \
-                     cannot be opened. ST ships no MS-OS descriptors, so unlike a CMSIS-DAP v2 probe \
-                     it will not bind WinUSB by itself. Install ST's official driver (STSW-LINK009 \
-                     on st.com) -- it is WinUSB-based, so we can open the interface and ST's own \
-                     tools keep working; or install a Lamella-signed WinUSB INF with `pnputil \
-                     /add-driver`, which displaces ST's driver on that probe",
+                return Err(ProbeError::Unusable(
+                    "its debug interface has NO DRIVER BOUND, so it cannot be opened. ST ships no MS-OS \
+                     descriptors, so unlike a CMSIS-DAP v2 probe it will not bind WinUSB by itself. Install \
+                     ST's official driver (STSW-LINK009 on st.com) -- it is WinUSB-based, so we can open the \
+                     interface and ST's own tools keep working; or install a Lamella-signed WinUSB INF with \
+                     `pnputil /add-driver`, which displaces ST's driver on that probe"
+                        .to_owned(),
                 ));
             }
             Ok(Binding::Bound) => {}
@@ -401,7 +406,7 @@ impl StLink {
 
         let device =
             Device::open_interface(ST_DEBUG_INTERFACE_GUID, ST_VENDOR_ID, product_id, chosen.as_deref())
-                .map_err(|_| ProbeError::Device("could not open the ST-Link debug interface"))?;
+                .map_err(|why| ProbeError::Unusable(format!("its debug interface could not be opened ({why}){}", lamella_probe_core::hint_after_a_refusal(&why.to_string()))))?;
         Ok(StLink { device, wide_status: None })
     }
 
@@ -413,7 +418,7 @@ impl StLink {
         packet[..n].copy_from_slice(&command[..n]);
         self.device
             .write_packet(&packet)
-            .map_err(|_| ProbeError::Device("ST-Link command write failed"))?;
+            .map_err(|why| transfer_failed("command write", &why))?;
         if reply_len == 0 {
             return Ok(Vec::new());
         }
@@ -421,9 +426,9 @@ impl StLink {
         let got = self
             .device
             .read_packet(&mut buf, REPLY_TIMEOUT)
-            .map_err(|_| ProbeError::Device("ST-Link reply read failed or timed out"))?;
+            .map_err(|why| transfer_failed("reply read", &why))?;
         if got < reply_len {
-            return Err(ProbeError::Device("ST-Link reply was shorter than expected"));
+            return Err(ProbeError::Protocol(format!("the ST-LINK's reply was {got} bytes and {reply_len} were expected")));
         }
         buf.truncate(got);
         Ok(buf)
@@ -495,7 +500,7 @@ impl StLink {
         }
         let reply = self.transact(&[CMD_DEBUG, DEBUG_APIV2_ENTER, DEBUG_ENTER_SWD], 2)?;
         if reply[0] != DEBUG_ERR_OK {
-            return Err(ProbeError::Device("ST-Link refused to enter SWD debug mode"));
+            return Err(ProbeError::Debugger("ST-Link refused to enter SWD debug mode"));
         }
         Ok(())
     }
@@ -507,7 +512,7 @@ impl StLink {
     pub fn com_frequencies(&mut self) -> Result<Vec<u32>, ProbeError> {
         let reply = self.transact(&[CMD_DEBUG, DEBUG_APIV3_GET_COM_FREQ, COM_FREQ_MODE_SWD], 52)?;
         if reply[0] != DEBUG_ERR_OK {
-            return Err(ProbeError::Device("ST-Link refused to report its SWD frequencies"));
+            return Err(ProbeError::Debugger("ST-Link refused to report its SWD frequencies"));
         }
         let entries = (reply[8] as usize).min((reply.len() - 12) / 4);
         Ok((0..entries)
@@ -535,7 +540,7 @@ impl StLink {
             8,
         )?;
         if reply[0] != DEBUG_ERR_OK {
-            return Err(ProbeError::Device("ST-Link refused the requested SWD frequency"));
+            return Err(ProbeError::Debugger("ST-Link refused the requested SWD frequency"));
         }
         Ok(())
     }
@@ -555,7 +560,7 @@ impl StLink {
             .filter(|&khz| khz <= MAX_NEGOTIATED_KHZ)
             .max()
             .or_else(|| offered.iter().copied().min())
-            .ok_or(ProbeError::Device(
+            .ok_or(ProbeError::Debugger(
                 "ST-Link reported no SWD frequencies at all, so none can be selected",
             ))?;
         self.set_com_freq(chosen)
@@ -593,7 +598,7 @@ impl StLink {
     /// stall triage where four fault registers all read back as the DHCSR sampled just before them.
     pub fn read_mem32(&mut self, address: u32, byte_len: u16) -> Result<Vec<u8>, ProbeError> {
         if address % 4 != 0 || byte_len % 4 != 0 {
-            return Err(ProbeError::Device("32-bit memory access must be word-aligned in address and length"));
+            return Err(ProbeError::Debugger("32-bit memory access must be word-aligned in address and length"));
         }
         let address_bytes = address.to_le_bytes();
         let len = byte_len.to_le_bytes();
@@ -667,10 +672,10 @@ impl StLink {
     /// caller has no way to know the memory never changed.
     pub fn write_mem32(&mut self, address: u32, data: &[u8]) -> Result<(), ProbeError> {
         if address % 4 != 0 || data.len() % 4 != 0 {
-            return Err(ProbeError::Device("32-bit memory access must be word-aligned in address and length"));
+            return Err(ProbeError::Debugger("32-bit memory access must be word-aligned in address and length"));
         }
         let byte_len = u16::try_from(data.len())
-            .map_err(|_| ProbeError::Device("a single ST-Link memory write cannot exceed 65535 bytes"))?;
+            .map_err(|_| ProbeError::Debugger("a single ST-Link memory write cannot exceed 65535 bytes"))?;
         let address_bytes = address.to_le_bytes();
         let len = byte_len.to_le_bytes();
         let command = [
@@ -682,7 +687,7 @@ impl StLink {
         self.transact(&command, 0)?;
         self.device
             .write_packet(data)
-            .map_err(|_| ProbeError::Device("ST-Link memory write payload failed"))?;
+            .map_err(|why| transfer_failed("memory write", &why))?;
         self.check_last_rw_status()
     }
 
@@ -690,7 +695,7 @@ impl StLink {
     /// unlike emulating one by read-modify-writing a word.
     pub fn write_mem8(&mut self, address: u32, data: &[u8]) -> Result<(), ProbeError> {
         let byte_len = u16::try_from(data.len())
-            .map_err(|_| ProbeError::Device("a single ST-Link memory write cannot exceed 65535 bytes"))?;
+            .map_err(|_| ProbeError::Debugger("a single ST-Link memory write cannot exceed 65535 bytes"))?;
         let address_bytes = address.to_le_bytes();
         let len = byte_len.to_le_bytes();
         let command = [
@@ -702,7 +707,7 @@ impl StLink {
         self.transact(&command, 0)?;
         self.device
             .write_packet(data)
-            .map_err(|_| ProbeError::Device("ST-Link byte-write payload failed"))?;
+            .map_err(|why| transfer_failed("byte write", &why))?;
         self.check_last_rw_status()
     }
 
@@ -737,7 +742,7 @@ impl StLink {
         let level = if assert { NRST_LOW } else { NRST_HIGH };
         let reply = self.transact(&[CMD_DEBUG, DEBUG_APIV2_DRIVE_NRST, level], 2)?;
         if reply[0] != DEBUG_ERR_OK {
-            return Err(ProbeError::Device("ST-Link refused to drive nRST"));
+            return Err(ProbeError::Debugger("ST-Link refused to drive nRST"));
         }
         Ok(0)
     }
@@ -856,7 +861,7 @@ impl StLink {
         let reference = u32::from_le_bytes([reply[0], reply[1], reply[2], reply[3]]);
         let target = u32::from_le_bytes([reply[4], reply[5], reply[6], reply[7]]);
         if reference == 0 {
-            return Err(ProbeError::Device("ST-Link returned no ADC reference reading"));
+            return Err(ProbeError::Debugger("ST-Link returned no ADC reference reading"));
         }
         Ok(2.0 * target as f32 * 1.2 / reference as f32)
     }
@@ -1200,7 +1205,7 @@ impl TargetAccess for StLink {
 /// [`lamella_usbbulk::diagnose`].
 pub fn diagnose(product_id: u16) -> Result<Binding, ProbeError> {
     lamella_usbbulk::diagnose(ST_DEBUG_INTERFACE_GUID, ST_VENDOR_ID, product_id)
-        .map_err(|_| ProbeError::Device("could not classify the ST-Link's driver binding"))
+        .map_err(|_| ProbeError::Debugger("could not classify the ST-Link's driver binding"))
 }
 
 /// The devices a USB listing reports, or why it could not list them.
@@ -1230,7 +1235,7 @@ fn choose_debug_interface(
         Err(lamella_usbbulk::Error::Unsupported) => every_vendor_bulk_device(),
         registered => registered,
     }
-    .map_err(|_| ProbeError::Device("could not enumerate the ST-Link debug interfaces"))?;
+    .map_err(|_| ProbeError::Debugger("could not enumerate the ST-Link debug interfaces"))?;
 
     let candidates: Vec<selection::Candidate> = listed
         .into_iter()
@@ -1243,7 +1248,7 @@ fn choose_debug_interface(
 
     match selection::choose(&candidates, selector) {
         selection::Selection::Unique(found) => Ok(found),
-        selection::Selection::NotFound => Err(ProbeError::Device(
+        selection::Selection::NotFound => Err(ProbeError::Debugger(
             "no ST-Link matched -- check the serial, or the product id for this probe \
              generation (a V3 is a FAMILY of ids, not one)",
         )),
@@ -1265,8 +1270,7 @@ mod debug_interface_listing_tests {
             vendor_id,
             product_id,
             serial_number: serial.map(String::from),
-            product: None,
-            interface_name: None,
+            ..DeviceInfo::default()
         }
     }
 
@@ -1298,7 +1302,7 @@ mod debug_interface_listing_tests {
         );
         assert!(matches!(
             choose_debug_interface(no_registry(), || Ok(two_alike()), &selector(Some(NEITHER))),
-            Err(ProbeError::Device(why)) if why.starts_with("no ST-Link matched")
+            Err(ProbeError::Debugger(why)) if why.starts_with("no ST-Link matched")
         ));
     }
 
@@ -1342,7 +1346,7 @@ mod debug_interface_listing_tests {
     #[test]
     fn a_listing_that_fails_is_refused() {
         let refused = |chosen: Result<Option<String>, ProbeError>| {
-            matches!(chosen, Err(ProbeError::Device(why)) if why.starts_with("could not enumerate"))
+            matches!(chosen, Err(ProbeError::Debugger(why)) if why.starts_with("could not enumerate"))
         };
         assert!(refused(choose_debug_interface(
             Err(Error::Os(String::from("the registry could not be read"))),
@@ -1467,6 +1471,17 @@ mod tests {
                 "{word:#010x} must be refused"
             );
         }
+    }
+
+    /// **A TRANSFER THAT FAILED IS THE PROBE GOING SILENT, AND SAYS NOTHING OF THE TARGET:** a reader told
+    /// "target device error" goes to look at a board that was never asked.
+    #[test]
+    fn a_failed_transfer_is_the_probe_going_silent_and_never_the_target() {
+        let error = super::transfer_failed("reply read", &lamella_usbbulk::Error::Timeout);
+        assert!(matches!(error, ProbeError::Transport(_)), "{error:?}");
+        let said = error.to_string();
+        assert!(said.contains("stopped answering") && said.contains("reply read"), "{said}");
+        assert!(!said.contains("target"), "{said}");
     }
 
     #[test]

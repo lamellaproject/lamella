@@ -212,7 +212,7 @@ namespace Lamella.Boards.Adafruit
         {
             if ((object)_pwmSlices[slice] == null)
             {
-                _pwmSlices[slice] = new Rp2350PwmSlice(PwmBinding(slice));
+                _pwmSlices[slice] = Rp2350PwmSlice.Of(PwmBinding(slice));
             }
             return _pwmSlices[slice].Open(channel, frequency, dutyCyclePercentage);
         }

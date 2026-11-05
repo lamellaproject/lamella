@@ -26,6 +26,9 @@ use super::{
 /// collide with, since the tables it keys are shared with the assembly's own tokens.
 const SYNTHETIC_TABLE: u8 = 0x7E;
 
+/// The `AssemblyRef` table (II.22.5), a `TypeRef`'s resolution scope when it names another assembly.
+const ASSEMBLY_REF: u8 = 0x23;
+
 /// Which [`DefinitionSource`] is the program's own. The caller's contract is that it is first, and
 /// two things depend on it: a name a reference also declares resolves to the program's, and an
 /// instantiation of the program's own definition needs no check on its arguments -- there is one
@@ -90,6 +93,9 @@ fn definition_key(_assembly: &Assembly<'_>, _token: Token) -> Option<String> {
 /// reach it, and its set does not hold it. The loader still lowers it, because the module holds the
 /// corlib's code -- as that reference's PLAN, [`collect_reference_plans`], beside this set and
 /// reported apart from it.
+///
+/// `references` in the order the loader will hold them: an [`Instantiation::world`] is a position in
+/// that list, so a loader that sorts its libraries sorts them before collecting.
 #[cfg(feature = "generics")]
 pub fn collect_instantiations<'pe>(
     program: &Assembly<'pe>,
@@ -99,8 +105,9 @@ pub fn collect_instantiations<'pe>(
 }
 
 /// The PLAN `references` bring with their code: every closed instantiation their own rows name,
-/// closed and spelled as [`collect_instantiations`] closes and spells the program's set, with the
-/// signatures expressed against `program` -- the assembly the module is lowered for.
+/// closed and spelled as [`collect_instantiations`] closes and spells the program's set, each
+/// written in the first world that can express it: `program` -- the assembly the module is lowered
+/// for -- when it can, else the first reference that can ([`Instantiation::world`]).
 ///
 /// A loader that holds a reference's code beside the program's lowers this set too, because any
 /// of those methods can run: a library method that builds a `Span<byte>` internally is called by
@@ -158,57 +165,126 @@ fn collect<'pe>(
         return Vec::new();
     };
 
-    let mut program_tokens: BTreeMap<String, Token> = BTreeMap::new();
-    for type_ref in program.type_refs() {
-        let token = type_ref.token();
-        if let Some(name) = lamella_generics::type_def_full_name(program, token) {
-            program_tokens.entry(name).or_insert(token);
-        }
-    }
-    for type_def in program.type_defs() {
-        let token = type_def.token();
-        if let Some(name) = lamella_generics::type_def_full_name(program, token) {
-            program_tokens.insert(name, token);
-        }
-    }
-
-    let mut rows: Vec<(String, (String, Vec<SigType>))> = Vec::new();
-    for row in 1..u32::from(u16::MAX) {
-        let token = Token::new(TYPE_SPEC, row);
-        let Some(signature) = program.type_spec_signature(token) else {
-            break;
-        };
-        let (Some(name), Some(parts)) = (
-            lamella_generics::spell_sig(program, &signature),
-            lamella_generics::instantiation_of(program, token),
-        ) else {
-            continue;
-        };
-        rows.push((name, parts));
-    }
-
+    let (_, same_names) = read_declarations(assemblies.iter().collect());
+    let mut worlds: Vec<Option<World>> = assemblies.iter().map(|_| None).collect();
     let found = closed
         .into_iter()
-        .filter_map(|found| {
-            let (definition, arguments) = match rows
-                .iter()
-                .find(|(name, _)| name.as_str() == found.name.as_ref())
-                .map(|(_, parts)| parts.clone())
-            {
-                Some(parts) => parts,
-                None => (
-                    found.definition.clone().into_string(),
-                    expressible_arguments(&found.arguments, &program_tokens)?,
-                ),
-            };
-            Some(Instantiation {
-                definition,
-                arguments,
-                name: found.name.into_string(),
-            })
+        .flat_map(|found| {
+            let same_named = same_names.spells_a_same_name(&found);
+            let mut written: Vec<Instantiation> = Vec::new();
+            for position in 0..assemblies.len() {
+                let world = worlds[position].get_or_insert_with(|| World::of(&assemblies[position]));
+                let Some((definition, arguments)) = world.express(&found) else {
+                    continue;
+                };
+                let want = Instantiation {
+                    definition,
+                    arguments,
+                    world: position,
+                    name: String::from(found.name.as_ref()),
+                };
+                let new_meaning = !written.iter().any(|other| same_names.same_type(other, &want));
+                if new_meaning {
+                    written.push(want);
+                }
+                if !same_named {
+                    break;
+                }
+            }
+            written
         })
         .collect::<Vec<_>>();
-    with_vector_servers(found, &servers)
+    with_vector_servers(found, &servers, &same_names)
+}
+
+/// What one assembly can write in its own tokens: the instantiations its `TypeSpec` rows spell,
+/// and the token it holds for each type it has a row for.
+#[cfg(feature = "generics")]
+struct World {
+    /// Canonical name -> (definition, arguments), read off the rows rather than reconstructed.
+    rows: BTreeMap<String, (String, Vec<SigType>)>,
+    /// Full name -> the assembly's own token for that type, over its `TypeDef` and `TypeRef` rows.
+    tokens: BTreeMap<String, Token>,
+    /// Which of its `TypeDef` rows are value types.
+    value_types: BTreeSet<Token>,
+}
+
+#[cfg(feature = "generics")]
+impl World {
+    /// Reads `assembly`'s `TypeSpec`, `TypeRef` and `TypeDef` rows.
+    fn of(assembly: &Assembly<'_>) -> Self {
+        let mut tokens: BTreeMap<String, Token> = BTreeMap::new();
+        for type_ref in assembly.type_refs() {
+            let token = type_ref.token();
+            if let Some(name) = lamella_generics::type_def_full_name(assembly, token) {
+                tokens.entry(name).or_insert(token);
+            }
+        }
+        let mut value_types: BTreeSet<Token> = BTreeSet::new();
+        for type_def in assembly.type_defs() {
+            let token = type_def.token();
+            if let Some(name) = lamella_generics::type_def_full_name(assembly, token) {
+                tokens.insert(name, token);
+            }
+            if type_def.is_value_type() {
+                value_types.insert(token);
+            }
+        }
+        let mut rows: BTreeMap<String, (String, Vec<SigType>)> = BTreeMap::new();
+        for row in 1..u32::from(u16::MAX) {
+            let token = Token::new(TYPE_SPEC, row);
+            let Some(signature) = assembly.type_spec_signature(token) else {
+                break;
+            };
+            let (Some(name), Some(parts)) = (
+                lamella_generics::spell_sig(assembly, &signature),
+                lamella_generics::instantiation_of(assembly, token),
+            ) else {
+                continue;
+            };
+            rows.entry(name).or_insert(parts);
+        }
+        Self { rows, tokens, value_types }
+    }
+
+    /// `found`'s definition and arguments in this assembly's tokens: off a `TypeSpec` row that
+    /// spells it, else rebuilt from the walk's decoded arguments, else `None`.
+    fn express(&self, found: &lamella_generics::Instantiation) -> Option<(String, Vec<SigType>)> {
+        if let Some(parts) = self.rows.get(found.name.as_ref()) {
+            return Some(parts.clone());
+        }
+        let arguments = expressible_arguments(&found.arguments, &self.tokens)?;
+        Some((
+            found.definition.clone().into_string(),
+            arguments.into_iter().map(|argument| self.with_own_kinds(argument)).collect(),
+        ))
+    }
+
+    /// `sig` with each type this assembly declares marked class or value type as it declares it.
+    ///
+    /// The walk visits a canonical name once, so what it says of a name's kind is what the first assembly
+    /// it read means by that name. Another assembly can declare the name as the other kind: a struct
+    /// taken for a class has a null for its zero, and its dispatch keys spell another type.
+    fn with_own_kinds(&self, sig: SigType) -> SigType {
+        let kind = |token: Token, value_type: bool| {
+            let own = token.table() == TYPE_DEF;
+            if (own && self.value_types.contains(&token)) || (!own && value_type) {
+                SigType::ValueType(token)
+            } else {
+                SigType::Class(token)
+            }
+        };
+        match sig {
+            SigType::Class(token) => kind(token, false),
+            SigType::ValueType(token) => kind(token, true),
+            SigType::GenericInst { definition, arguments } => SigType::GenericInst {
+                definition: Box::new(self.with_own_kinds(*definition)),
+                arguments: arguments.into_iter().map(|argument| self.with_own_kinds(argument)).collect(),
+            },
+            SigType::SzArray(element) => SigType::SzArray(Box::new(self.with_own_kinds(*element))),
+            other => other,
+        }
+    }
 }
 
 /// The generic interfaces a vector implements at its element type (ECMA-335 I.8.9.1) that the
@@ -216,6 +292,7 @@ fn collect<'pe>(
 pub(crate) const VECTOR_ENUMERABLE: &str = "System.Collections.Generic.IEnumerable`1";
 pub(crate) const VECTOR_COLLECTION: &str = "System.Collections.Generic.ICollection`1";
 pub(crate) const VECTOR_READ_ONLY_COLLECTION: &str = "System.Collections.Generic.IReadOnlyCollection`1";
+pub(crate) const VECTOR_READ_ONLY_LIST: &str = "System.Collections.Generic.IReadOnlyList`1";
 pub(crate) const VECTOR_ENUMERATOR: &str = "System.SZGenericArrayEnumerator`1";
 pub(crate) const VECTOR_HELPER: &str = "System.SZArrayHelper`1";
 
@@ -226,6 +303,7 @@ pub(crate) const VECTOR_INTERFACES: &[(&str, &str)] = &[
     (VECTOR_ENUMERABLE, VECTOR_ENUMERATOR),
     (VECTOR_COLLECTION, VECTOR_HELPER),
     (VECTOR_READ_ONLY_COLLECTION, VECTOR_HELPER),
+    (VECTOR_READ_ONLY_LIST, VECTOR_HELPER),
 ];
 
 /// Whether `definition` is a vector interface of [`VECTOR_INTERFACES`].
@@ -254,7 +332,11 @@ fn references_define(references: &[Assembly<'_>], name: &str) -> bool {
 /// them as derived roots; this is where each gets its row when no `TypeSpec` names it and the walk's
 /// own arguments did not express, built from the interface's row, whose arguments it shares.
 #[cfg(feature = "generics")]
-fn with_vector_servers(mut found: Vec<Instantiation>, servers: &[(&str, &str)]) -> Vec<Instantiation> {
+fn with_vector_servers(
+    mut found: Vec<Instantiation>,
+    servers: &[(&str, &str)],
+    same_names: &SameNames<'_, '_>,
+) -> Vec<Instantiation> {
     let derived: Vec<Instantiation> = found
         .iter()
         .flat_map(|instantiation| {
@@ -266,13 +348,14 @@ fn with_vector_servers(mut found: Vec<Instantiation>, servers: &[(&str, &str)]) 
                     Some(Instantiation {
                         definition: String::from(server),
                         arguments: instantiation.arguments.clone(),
+                        world: instantiation.world,
                         name: alloc::format!("{server}{rest}"),
                     })
                 })
         })
         .collect();
     for server in derived {
-        if !found.iter().any(|instantiation| instantiation.name == server.name) {
+        if !found.iter().any(|instantiation| same_names.same_type(instantiation, &server)) {
             found.push(server);
         }
     }
@@ -380,11 +463,22 @@ fn payload_free_argument(argument: &lamella_generics::TypeArg) -> Option<SigType
 pub struct Instantiation {
     /// The generic definition's full name, backtick arity included (`` Pair`2 ``).
     pub definition: String,
-    /// The type arguments, in declaration order, as decoded signatures of the assembly being
-    /// lowered. Tokens inside them are that assembly's.
+    /// The type arguments, in declaration order, as decoded signatures of the assembly
+    /// [`world`](Self::world) names. Tokens inside them are that assembly's.
     pub arguments: Vec<SigType>,
+    /// The assembly whose tokens [`arguments`](Self::arguments) are written in: 0 for the program,
+    /// and `n + 1` for the `n`th reference the collection was given. A loader's list of definition
+    /// sources holds the program first and then those references in the same order, so this is
+    /// also an index into it.
+    ///
+    /// The program when it can write every argument; otherwise the first reference that can. An
+    /// instantiation made inside a library's body over a type the program never names --
+    /// `EqualityComparer<System.Type>` in a record's `GetHashCode` -- is written in that library's
+    /// tokens or the corlib's.
+    pub world: usize,
     /// The canonical spelling -- the instantiation's identity, and what
-    /// [`Module::bind_type_full_name`] records.
+    /// [`Module::bind_type_full_name`] records. Where more than one assembly declares a type it names,
+    /// one spelling can be two instantiations, told apart by the world each is written in.
     pub name: String,
 }
 
@@ -425,6 +519,251 @@ pub(crate) struct DefinitionSource<'pe> {
     /// contiguously. `None` on a tier that materializes types on demand, where no such offset
     /// exists and a `TypeDef` token has to be resolved through the module's own map instead.
     pub type_offset: Option<usize>,
+}
+
+/// The name every assembly's module type carries (II.22.30), which no signature can mention.
+const MODULE_TYPE_NAME: &str = "<Module>";
+
+/// A type a signature means: the [`DefinitionSource`] that declares it, and its `TypeDef` row there.
+type DeclaredType = (usize, u32);
+
+/// Reads every type each of `assemblies` declares: the first declaration of each name, and the names
+/// more than one declares. The order is the caller's, and it is the order a [`DeclaredType`]'s position
+/// and an [`Instantiation::world`] are positions in.
+fn read_declarations<'a, 'pe>(
+    assemblies: Vec<&'a Assembly<'pe>>,
+) -> (BTreeMap<String, DeclaredType>, SameNames<'a, 'pe>) {
+    let mut first: BTreeMap<String, DeclaredType> = BTreeMap::new();
+    let mut declared: BTreeMap<String, Vec<DeclaredType>> = BTreeMap::new();
+    for (position, assembly) in assemblies.iter().enumerate() {
+        let mut row = 0u32;
+        for type_def in assembly.type_defs() {
+            row += 1;
+            let Some(name) = definition_key(assembly, type_def.token()) else {
+                continue;
+            };
+            match first.get(&name) {
+                Some(&earlier) if name != MODULE_TYPE_NAME => {
+                    declared
+                        .entry(name)
+                        .or_insert_with(|| alloc::vec![earlier])
+                        .push((position, row));
+                }
+                Some(_) => {}
+                None => {
+                    first.insert(name, (position, row));
+                }
+            }
+        }
+    }
+    (first, SameNames { assemblies, declared })
+}
+
+/// The type names more than one assembly declares, and which type a signature means by each.
+///
+/// An instantiation's canonical name carries no assembly: it is .NET's own `Type.ToString()`, and it is
+/// what the walk keys on, one spelling once. Two assemblies that declare `N.Item` each mean a type of
+/// their own by it, so `Counter<N.Item>` spells two types, and .NET has two, with two static cells.
+/// This pass lowers one instantiation per MEANING, and a site binds to the one that means what it means.
+///
+/// Every signature means the empty list when it names no such type, so a set of assemblies that shares
+/// no name lowers one instantiation per spelling and binds every site by its name alone.
+struct SameNames<'a, 'pe> {
+    assemblies: Vec<&'a Assembly<'pe>>,
+    declared: BTreeMap<String, Vec<DeclaredType>>,
+}
+
+impl SameNames<'_, '_> {
+    /// Whether `found` spells any name more than one assembly declares.
+    #[cfg(feature = "generics")]
+    fn spells_a_same_name(&self, found: &lamella_generics::Instantiation) -> bool {
+        !self.declared.is_empty()
+            && (self.declared.contains_key(found.definition.as_ref())
+                || found.arguments.iter().any(|argument| self.names_a_same_name(argument)))
+    }
+
+    /// Whether `argument` names any name more than one assembly declares, anywhere inside it.
+    #[cfg(feature = "generics")]
+    fn names_a_same_name(&self, argument: &lamella_generics::TypeArg) -> bool {
+        use lamella_generics::TypeArg;
+        match argument {
+            TypeArg::Named { name, .. } => self.declared.contains_key(name.as_ref()),
+            TypeArg::Instance {
+                definition,
+                arguments,
+                ..
+            } => {
+                self.declared.contains_key(definition.as_ref())
+                    || arguments.iter().any(|argument| self.names_a_same_name(argument))
+            }
+            TypeArg::SzArray(inner) | TypeArg::Pointer(inner) | TypeArg::ByRef(inner) => {
+                self.names_a_same_name(inner)
+            }
+            TypeArg::Array { element, .. } => self.names_a_same_name(element),
+            _ => false,
+        }
+    }
+
+    /// Whether two instantiations are one type: one spelling, and one meaning of it.
+    fn same_type(&self, left: &Instantiation, right: &Instantiation) -> bool {
+        left.name == right.name && self.meaning_of(left) == self.meaning_of(right)
+    }
+
+    /// What an instantiation means by the same-named types it names, whichever declaration of its
+    /// definition that is.
+    fn meaning_of(&self, want: &Instantiation) -> Vec<DeclaredType> {
+        if self.declared.is_empty() {
+            return Vec::new();
+        }
+        let declared_first = self
+            .declared
+            .get(&want.definition)
+            .and_then(|declarers| declarers.first().copied())
+            .unwrap_or((want.world, 0));
+        self.of_instantiation(want, self.definition_in_world(want, declared_first))
+    }
+
+    /// The definition an instantiation means: the one its [`world`](Instantiation::world) names.
+    /// `first` is the first declaration of its name, which is the answer for a name one assembly
+    /// declares, and for a world that neither declares the name nor refers to it.
+    fn definition_in_world(&self, want: &Instantiation, first: DeclaredType) -> DeclaredType {
+        let Some(declarers) = self.declared.get(&want.definition) else {
+            return first;
+        };
+        if let Some(own) = declarers.iter().find(|(source, _)| *source == want.world) {
+            return *own;
+        }
+        let assembly = self.assemblies[want.world];
+        assembly
+            .type_refs()
+            .find(|type_ref| {
+                definition_key(assembly, type_ref.token()).as_deref() == Some(&want.definition)
+            })
+            .map_or(first, |type_ref| {
+                self.declared_by(want.world, type_ref.token(), declarers)
+            })
+    }
+
+    /// Which of `declarers` the token `token`, written in `written_in`, means: its own `TypeDef`, or
+    /// what its `TypeRef` names. A `TypeRef` names an assembly by name; a name no assembly here answers
+    /// is a reference assembly whose types the loader resolves into the corlib and the libraries, so
+    /// the first of those that declares the type is the one meant.
+    fn declared_by(&self, written_in: usize, token: Token, declarers: &[DeclaredType]) -> DeclaredType {
+        if token.table() == TYPE_DEF {
+            return (written_in, token.row());
+        }
+        let scope = resolution_assembly(self.assemblies[written_in], token);
+        scope
+            .and_then(|scope| {
+                declarers
+                    .iter()
+                    .find(|(source, _)| self.assemblies[*source].assembly_name() == Some(scope))
+            })
+            .or_else(|| {
+                declarers
+                    .iter()
+                    .find(|(source, _)| *source != written_in && *source != PROGRAM_SOURCE)
+            })
+            .or(declarers.first())
+            .copied()
+            .unwrap_or((written_in, token.row()))
+    }
+
+    /// Appends the type `sig` means by each same-named type it names, in the order a canonical name
+    /// spells them. `sig`'s tokens are `written_in`'s; a type parameter stands for an argument, whose
+    /// tokens are `arguments_in`'s.
+    fn read(
+        &self,
+        written_in: usize,
+        arguments_in: usize,
+        sig: &SigType,
+        type_arguments: &[SigType],
+        method_arguments: &[SigType],
+        out: &mut Vec<DeclaredType>,
+    ) {
+        match sig {
+            SigType::Class(token) | SigType::ValueType(token) => {
+                if let Some(declarers) = definition_key(self.assemblies[written_in], *token)
+                    .and_then(|name| self.declared.get(&name))
+                {
+                    out.push(self.declared_by(written_in, *token, declarers));
+                }
+            }
+            SigType::GenericInst {
+                definition,
+                arguments,
+            } => {
+                self.read(written_in, arguments_in, definition, type_arguments, method_arguments, out);
+                for argument in arguments {
+                    self.read(written_in, arguments_in, argument, type_arguments, method_arguments, out);
+                }
+            }
+            SigType::SzArray(inner) | SigType::Pointer(inner) | SigType::ByRef(inner) => {
+                self.read(written_in, arguments_in, inner, type_arguments, method_arguments, out);
+            }
+            SigType::Array { element, .. } => {
+                self.read(written_in, arguments_in, element, type_arguments, method_arguments, out);
+            }
+            SigType::Var(index) => {
+                if let Some(argument) = type_arguments.get(*index as usize) {
+                    self.read(arguments_in, arguments_in, argument, &[], &[], out);
+                }
+            }
+            SigType::MVar(index) => {
+                if let Some(argument) = method_arguments.get(*index as usize) {
+                    self.read(arguments_in, arguments_in, argument, &[], &[], out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// What a site means by the same-named types of `sig`, closed under the two argument lists.
+    fn of_site(
+        &self,
+        written_in: usize,
+        arguments_in: usize,
+        sig: &SigType,
+        type_arguments: &[SigType],
+        method_arguments: &[SigType],
+    ) -> Vec<DeclaredType> {
+        let mut meaning = Vec::new();
+        if !self.declared.is_empty() {
+            self.read(written_in, arguments_in, sig, type_arguments, method_arguments, &mut meaning);
+        }
+        meaning
+    }
+
+    /// What an instantiation of `definition` means by the same-named types it names, in the order
+    /// [`of_site`](Self::of_site) answers for a site that spells it.
+    fn of_instantiation(&self, want: &Instantiation, definition: DeclaredType) -> Vec<DeclaredType> {
+        let mut meaning = Vec::new();
+        if self.declared.is_empty() {
+            return meaning;
+        }
+        if self.declared.contains_key(&want.definition) {
+            meaning.push(definition);
+        }
+        for argument in &want.arguments {
+            self.read(want.world, want.world, argument, &[], &[], &mut meaning);
+        }
+        meaning
+    }
+
+}
+
+/// The assembly a `TypeRef` names as its resolution scope, through its enclosing `TypeRef`s.
+fn resolution_assembly<'pe>(assembly: &Assembly<'pe>, token: Token) -> Option<&'pe str> {
+    let mut current = token;
+    for _ in 0..64 {
+        let scope = assembly.type_ref(current.row())?.resolution_scope();
+        match scope.table() {
+            TYPE_REF => current = scope,
+            ASSEMBLY_REF => return assembly.assembly_ref(scope.row())?.name(),
+            _ => return None,
+        }
+    }
+    None
 }
 
 /// Why one instantiation, or one token inside one, could not be lowered.
@@ -471,6 +810,20 @@ pub enum Refusal {
         /// The instantiation whose body named it.
         instantiation: String,
         /// The definition that was named.
+        wanted: String,
+    },
+    /// A site names an instantiation through a type name more than one assembly declares, and no
+    /// instantiation lowered here means what the site means by it. Binding the site to one that spells
+    /// the same name would hand it a type it does not mean: one static cell for two types, or one
+    /// type's layout for another's.
+    ///
+    /// Each meaning of a spelling gets its own instantiation, so this names the ones that cannot have
+    /// one: an argument this pass would read as another assembly's type, and a second exception type of
+    /// one spelling, whose exception tag would be the first's.
+    SameNamedTypes {
+        /// The instantiation whose body names it, or the instantiation itself at a closed site.
+        instantiation: String,
+        /// The canonical name both meanings spell.
         wanted: String,
     },
     /// An open token substituted to something this pass cannot bind: a member that the definition
@@ -672,6 +1025,12 @@ impl fmt::Display for Refusal {
             Refusal::InstantiationNotInSet { instantiation, wanted } => {
                 write!(formatter, "`{instantiation}` names an instantiation of `{wanted}` that the instantiation set does not contain")
             }
+            Refusal::SameNamedTypes { instantiation, wanted } => {
+                if instantiation != wanted {
+                    write!(formatter, "`{instantiation}` names `{wanted}`, and ")?;
+                }
+                write!(formatter, "`{wanted}` spells a type name more than one assembly declares, and this pass could not lower the type this site means by it")
+            }
             Refusal::UnboundAfterSubstitution { instantiation, token } => {
                 write!(formatter, "`{instantiation}` names token 0x{token:08X}, which substitution did not resolve to anything bindable")
             }
@@ -731,6 +1090,9 @@ impl Refusal {
         let carries = |own: u32| token == Some(own);
         match self {
             Refusal::DefinitionNotHere { definition } => names(definition),
+            Refusal::SameNamedTypes { instantiation, wanted } => {
+                names(instantiation) || names(wanted)
+            }
             Refusal::StaticFieldNotSeparated { instantiation, .. }
             | Refusal::MethodTypeParameter { instantiation, .. }
             | Refusal::InstantiationNotInSet { instantiation, .. }
@@ -779,13 +1141,19 @@ pub(crate) fn name_unlowered_sites(
             .refusals
             .iter()
             .find(|refusal| refusal.concerns(&label, own_row));
+        let is_field = token.table() == MEMBER_REF
+            && source
+                .assembly
+                .member_ref(token.row())
+                .is_some_and(|member| member.is_field());
+        let what = if is_field { "Field" } else { "Method" };
         let message = match refusal {
             Some(refusal) => alloc::format!(
-                "Method not found: '{label}'. Lamella did not lower this generic instantiation: \
+                "{what} not found: '{label}'. Lamella did not lower this generic instantiation: \
                  {refusal}."
             ),
             None => alloc::format!(
-                "Method not found: '{label}'. Lamella did not lower this generic instantiation."
+                "{what} not found: '{label}'. Lamella did not lower this generic instantiation."
             ),
         };
         module.name_unlowered_generic(asm, token, &message);
@@ -857,6 +1225,8 @@ pub struct Lowering {
     /// than for the set the caller handed in, and its type identity. An instantiation in both is
     /// lowered once and listed under [`types`](Self::types).
     pub reference_types: Vec<(String, TypeId)>,
+    /// Why the load has to be refused, if one spelling of an exception type means two types.
+    pub exception_of_two_meanings: Option<String>,
     /// Everything it refused. Empty means every instantiation in the set now has a type identity
     /// and every call site that reaches one is bound.
     pub refusals: Vec<Refusal>,
@@ -865,6 +1235,10 @@ pub struct Lowering {
     /// on that token already being bound, so a caller that resolved the DEFINING assembly lazily has
     /// to materialize what those bodies reach itself.
     pub copied_definitions: Vec<(u8, u32)>,
+    /// Each `TypeSpec` base that names a type more than one assembly declares, as (its assembly's id,
+    /// the token, the instantiation that means what it means, if one was lowered). Such a base cannot
+    /// be found by its spelling alone ([`SameNames`]).
+    same_named_bases: Vec<(u8, Token, Option<TypeId>)>,
 }
 
 impl Lowering {
@@ -876,6 +1250,16 @@ impl Lowering {
             .chain(self.reference_types.iter())
             .find(|(lowered, _)| lowered == name)
             .map(|(_, type_id)| *type_id)
+    }
+
+    /// The instantiation the `TypeSpec` base `token` of `asm` means, where it names a type more than
+    /// one assembly declares: `None` for any other base, which its spelling finds, and `Some(None)`
+    /// for one that no instantiation lowered here means.
+    pub(crate) fn same_named_base(&self, asm: u8, token: Token) -> Option<Option<TypeId>> {
+        self.same_named_bases
+            .iter()
+            .find(|(base_asm, base_token, _)| *base_asm == asm && *base_token == token)
+            .map(|(_, _, type_id)| *type_id)
     }
 
     /// Moves each identity that `requested` does not name from [`types`](Self::types) to
@@ -907,9 +1291,10 @@ pub(crate) fn monomorphize_with_reference_plans<'pe>(
     requested: &[Instantiation],
     plans: Vec<Instantiation>,
 ) -> Lowering {
+    let (_, same_names) = read_declarations(sources.iter().map(|source| &source.assembly).collect());
     let mut lowered = requested.to_vec();
     for plan in plans {
-        if !lowered.iter().any(|want| want.name == plan.name) {
+        if !lowered.iter().any(|want| same_names.same_type(want, &plan)) {
             lowered.push(plan);
         }
     }
@@ -954,6 +1339,8 @@ struct Emitted {
     /// implementations gains a new case in none of them**, and this one has a case already: the two
     /// CLI bases that extend a value type and are themselves references.
     is_value_type: bool,
+    /// What this instantiation means by the same-named types it names ([`SameNames::of_instantiation`]).
+    meaning: Vec<DeclaredType>,
 }
 
 /// A definition's method as this pass needs to see it.
@@ -990,31 +1377,33 @@ pub(crate) fn monomorphize<'pe>(
     instantiations: &[Instantiation],
 ) -> Lowering {
     let mut lowering = Lowering {
+        exception_of_two_meanings: None,
         types: Vec::new(),
         reference_types: Vec::new(),
         refusals: Vec::new(),
         copied_definitions: Vec::new(),
+        same_named_bases: Vec::new(),
     };
 
-    let mut definition_rows: BTreeMap<String, (usize, u32)> = BTreeMap::new();
-    for (position, source) in sources.iter().enumerate() {
-        let mut row = 0u32;
-        for type_def in source.assembly.type_defs() {
-            row += 1;
-            if let Some(name) = definition_key(&source.assembly, type_def.token()) {
-                definition_rows.entry(name).or_insert((position, row));
-            }
-        }
-    }
+    let (definition_rows, same_names) =
+        read_declarations(sources.iter().map(|source| &source.assembly).collect());
 
     let mut emitted: Vec<(usize, Emitted)> = Vec::new();
     for (index, want) in instantiations.iter().enumerate() {
-        let Some(&(source, def_row)) = definition_rows.get(&want.definition) else {
+        let Some(&first_declared) = definition_rows.get(&want.definition) else {
             lowering.refusals.push(Refusal::DefinitionNotHere {
                 definition: want.definition.clone(),
             });
             continue;
         };
+        if want.world >= sources.len() {
+            lowering.refusals.push(Refusal::UnboundAfterSubstitution {
+                instantiation: want.name.clone(),
+                token: 0,
+            });
+            continue;
+        }
+        let (source, def_row) = same_names.definition_in_world(want, first_declared);
         let type_id = module.add_type(Vec::new());
         module.bind_type_full_name(type_id, want.name.clone());
         lowering.types.push((want.name.clone(), type_id));
@@ -1025,7 +1414,16 @@ pub(crate) fn monomorphize<'pe>(
                 type_def.is_value_type() && !is_special_reference_base(type_def.name())
             });
         module.set_type_is_value_type(type_id, is_value_type);
-        bind_nullable_underlying(module, program, type_index, want, type_id, source);
+        let meaning = same_names.of_instantiation(want, (source, def_row));
+        bind_nullable_underlying(
+            module,
+            &sources[want.world],
+            type_index,
+            want,
+            type_id,
+            source,
+            !meaning.is_empty(),
+        );
         emitted.push((
             index,
             Emitted {
@@ -1036,6 +1434,7 @@ pub(crate) fn monomorphize<'pe>(
                 own_static_slots: Vec::new(),
                 methods: Vec::new(),
                 is_value_type,
+                meaning,
             },
         ));
     }
@@ -1046,12 +1445,14 @@ pub(crate) fn monomorphize<'pe>(
             let source = &sources[entry.source];
             let extends = source.assembly.type_def(entry.def_row)?.extends();
             instantiation_of_spec(
-                &source.assembly,
-                &sources[PROGRAM_SOURCE].assembly,
+                entry.source,
+                sources,
+                instantiations[*index].world,
                 extends,
                 &instantiations[*index].arguments,
                 instantiations,
                 &emitted,
+                &same_names,
             )
             .or_else(|| {
                 base_type_of(
@@ -1068,6 +1469,7 @@ pub(crate) fn monomorphize<'pe>(
     for (position, (_, entry)) in emitted.iter().enumerate() {
         module.set_type_base(entry.type_id, base_of[position]);
     }
+    lowering.exception_of_two_meanings = exception_of_two_meanings(sources, instantiations, &emitted);
     let order = inheritance_order(&emitted, &base_of);
 
     for position in &order {
@@ -1108,6 +1510,7 @@ pub(crate) fn monomorphize<'pe>(
                         module,
                         sources,
                         owner_source,
+                        want.world,
                         type_index,
                         &declared,
                         &substituted,
@@ -1138,6 +1541,7 @@ pub(crate) fn monomorphize<'pe>(
                 module,
                 sources,
                 owner_source,
+                want.world,
                 type_index,
                 &declared,
                 &substituted,
@@ -1167,12 +1571,14 @@ pub(crate) fn monomorphize<'pe>(
         for token in type_def.interfaces() {
             let interface_id = if token.table() == TYPE_SPEC {
                 instantiation_of_spec(
-                    assembly,
-                    &sources[PROGRAM_SOURCE].assembly,
+                    entry.source,
+                    sources,
+                    want.world,
                     token,
                     &want.arguments,
                     instantiations,
                     &emitted,
+                    &same_names,
                 )
             } else {
                 module.type_id_of(asm, token).or_else(|| {
@@ -1188,7 +1594,7 @@ pub(crate) fn monomorphize<'pe>(
         }
     }
 
-    for source in sources {
+    for (position, source) in sources.iter().enumerate() {
         let assembly = &source.assembly;
         let generic_definitions = super::generic_definition_rows(assembly);
         let mut row = 0u32;
@@ -1202,12 +1608,14 @@ pub(crate) fn monomorphize<'pe>(
                 .filter(|token| token.table() == TYPE_SPEC)
                 .filter_map(|token| {
                     instantiation_of_spec(
-                        assembly,
-                        &sources[PROGRAM_SOURCE].assembly,
+                        position,
+                        sources,
+                        position,
                         token,
                         &[],
                         instantiations,
                         &emitted,
+                        &same_names,
                     )
                 })
                 .collect();
@@ -1296,9 +1704,10 @@ pub(crate) fn monomorphize<'pe>(
         instantiations,
         &emitted,
         &definition_methods,
+        &same_names,
     );
 
-    let mut withdrawn: Vec<(usize, usize)> = Vec::new();
+    let mut withdrawn: Vec<(usize, usize, MethodId)> = Vec::new();
     for position in 0..emitted.len() {
         let (index, source_index, def_row, type_id, own_statics, own_instance) = {
             let (index, entry) = &emitted[position];
@@ -1336,7 +1745,7 @@ pub(crate) fn monomorphize<'pe>(
                 continue;
             };
             let mut bytes = raw.to_vec();
-            let mut body_refused = false;
+            let mut body_refusal: Option<String> = None;
             for site in plan {
                 let synthetic = Token::new(SYNTHETIC_TABLE, next_synthetic_row);
                 next_synthetic_row += 1;
@@ -1346,6 +1755,7 @@ pub(crate) fn monomorphize<'pe>(
                     asm,
                     sources,
                     source_index,
+                    want.world,
                     type_index,
                     field_index,
                     instantiations,
@@ -1359,26 +1769,45 @@ pub(crate) fn monomorphize<'pe>(
                     synthetic,
                     &mut deferred,
                     &explicit,
+                    &same_names,
                 ) {
                     Ok(()) => {
                         let at = site.operand_at;
                         bytes[at..at + 4].copy_from_slice(&synthetic.0.to_le_bytes());
                     }
                     Err(refusal) => {
+                        if body_refusal.is_none() {
+                            body_refusal = Some(alloc::format!("{refusal}"));
+                        }
                         lowering.refusals.push(refusal);
-                        body_refused = true;
                     }
                 }
             }
-            if body_refused {
-                withdrawn.push((position, method_position));
+            if let Some(refusal) = body_refusal {
+                let synthetic = Token::new(SYNTHETIC_TABLE, next_synthetic_row);
+                next_synthetic_row += 1;
+                module.mark_unlowered_generic(asm, synthetic);
+                module.name_unlowered_generic(
+                    asm,
+                    synthetic,
+                    &alloc::format!(
+                        "Method not found: '{}.{}'. Lamella did not lower this generic \
+                         instantiation: {refusal}.",
+                        want.name,
+                        method.name
+                    ),
+                );
+                module.set_managed_body(id, owned_cil(refused_body(synthetic)), method.arg_count);
+                withdrawn.push((position, method_position, id));
                 continue;
             }
             module.set_managed_body(id, owned_cil(bytes), method.arg_count);
         }
     }
-    for (position, method_position) in withdrawn {
+    let mut refused_bodies: BTreeMap<(usize, usize), MethodId> = BTreeMap::new();
+    for (position, method_position, id) in withdrawn {
         emitted[position].1.methods[method_position] = None;
+        refused_bodies.insert((position, method_position), id);
     }
     for (_, entry) in &emitted {
         let definition = (sources[entry.source].asm, entry.def_row);
@@ -1388,6 +1817,7 @@ pub(crate) fn monomorphize<'pe>(
     }
 
     for position in &order {
+        let entry_position = *position;
         let (index, entry) = &emitted[*position];
         let want = &instantiations[*index];
         let assembly = &sources[entry.source].assembly;
@@ -1406,11 +1836,40 @@ pub(crate) fn monomorphize<'pe>(
         let mut slots: Vec<(MethodId, u32)> = Vec::new();
         for (position, method) in methods.iter().enumerate() {
             let Some(Some(id)) = entry.methods.get(position).copied() else {
+                let refused = method.is_virtual.then(|| {
+                    refused_bodies.get(&(entry_position, position)).copied()
+                });
+                if let Some(Some(refused)) = refused {
+                    let key = substituted_sig_key(
+                        assembly,
+                        &sources[want.world].assembly,
+                        &method.name,
+                        &method.params,
+                        &want.arguments,
+                        method.generic_arity,
+                    );
+                    if let Some(key) = key {
+                        let overridden = (!method.newslot)
+                            .then(|| lamella_metadata::overridden_slot(&vtable, |(slot, _)| *slot == key))
+                            .flatten();
+                        if let Some(slot) = overridden {
+                            vtable[slot].1 = refused;
+                            slots.push((refused, slot as u32));
+                        }
+                        super::insert_virtual_dispatch_entry(
+                            &mut virtuals,
+                            key,
+                            refused,
+                            method.newslot,
+                            &relisted,
+                        );
+                    }
+                }
                 continue;
             };
             let Some(key) = substituted_sig_key(
                 assembly,
-                &sources[PROGRAM_SOURCE].assembly,
+                &sources[want.world].assembly,
                 &method.name,
                 &method.params,
                 &want.arguments,
@@ -1471,6 +1930,7 @@ pub(crate) fn monomorphize<'pe>(
             &virtuals,
             &nonvirtuals,
             &mut lowering,
+            &same_names,
         );
         module.set_vtable_slot_keys(entry.type_id, vtable.clone());
         if !vtable.is_empty() {
@@ -1492,24 +1952,37 @@ pub(crate) fn monomorphize<'pe>(
         lowering.refusals.push(refusal);
         return lowering;
     }
-    for source in sources {
+    for (position, source) in sources.iter().enumerate() {
         bind_closed_type_specs(
             module,
             &source.assembly,
             source.asm,
+            position,
             instantiations,
             &emitted,
+            &same_names,
+            &mut lowering,
         );
         bind_closed_member_refs(
             module,
             &source.assembly,
             source.asm,
+            position,
             sources,
             instantiations,
             &emitted,
             &definition_methods,
             &mut lowering,
             &explicit,
+            &same_names,
+        );
+        note_same_named_bases(
+            position,
+            sources,
+            instantiations,
+            &emitted,
+            &same_names,
+            &mut lowering,
         );
     }
 
@@ -1528,6 +2001,7 @@ pub(crate) fn monomorphize<'pe>(
         &mut next_synthetic_row,
         &mut lowering,
         &explicit,
+        &same_names,
     );
     register_named_interface_sites(module, sources, &explicit);
 
@@ -1581,6 +2055,37 @@ pub(crate) fn monomorphize<'pe>(
     }
 
     lowering
+}
+
+/// What refuses the load when one spelling of an exception type means two types, because a tag is the
+/// hash of a spelling: a `catch` of either would catch the other, and a thrown one would answer to both.
+fn exception_of_two_meanings(
+    sources: &[DefinitionSource<'_>],
+    instantiations: &[Instantiation],
+    emitted: &[(usize, Emitted)],
+) -> Option<String> {
+    let assemblies: Vec<&Assembly<'_>> = sources.iter().map(|source| &source.assembly).collect();
+    for position in 1..emitted.len() {
+        let (index, entry) = &emitted[position];
+        let want = &instantiations[*index];
+        let Some((first, _)) = emitted[..position].iter().find(|(other, _)| instantiations[*other].name == want.name) else {
+            continue;
+        };
+        if !super::definition_is_exception(&assemblies, entry.source, entry.def_row) {
+            continue;
+        }
+        let name_of = |world: usize| sources[world].assembly.assembly_name().unwrap_or("an unnamed assembly");
+        return Some(alloc::format!(
+            "The exception type `{}` means one type in `{}` and another in `{}`, because its type \
+             arguments name different types in each. Lamella matches a catch clause by the exception \
+             type's full name, so a catch of one would also catch the other. To run this program, rename \
+             one of those types or move it to another namespace.",
+            want.name,
+            name_of(instantiations[*first].world),
+            name_of(want.world),
+        ));
+    }
+    None
 }
 
 /// One (generic method, CALL-SITE type arguments) pair -- the unit the method axis emits a body for.
@@ -1651,6 +2156,7 @@ fn lower_method_pairs<'pe>(
     _next_synthetic_row: &mut u32,
     _lowering: &mut Lowering,
     _explicit: &ExplicitIndex,
+    _same_names: &SameNames<'_, '_>,
 ) {
 }
 
@@ -1717,6 +2223,7 @@ fn lower_method_pairs<'pe>(
     next_synthetic_row: &mut u32,
     lowering: &mut Lowering,
     explicit: &ExplicitIndex,
+    same_names: &SameNames<'_, '_>,
 ) {
     let mut declaring_rows: Option<BTreeMap<u32, u32>> = None;
 
@@ -1898,6 +2405,7 @@ fn lower_method_pairs<'pe>(
                     asm,
                     sources,
                     PROGRAM_SOURCE,
+                    PROGRAM_SOURCE,
                     type_index,
                     field_index,
                     instantiations,
@@ -1911,6 +2419,7 @@ fn lower_method_pairs<'pe>(
                     synthetic,
                     &mut Vec::new(),
                     explicit,
+                    same_names,
                 ) {
                     Ok(()) => {
                         let at = site.operand_at;
@@ -2713,21 +3222,20 @@ fn default_field_value_substituted<'pe>(
     module: &Module,
     sources: &[DefinitionSource<'pe>],
     owner_source: usize,
+    world: usize,
     type_index: &TypeNameIndex,
     declared: &SigType,
     substituted: &SigType,
     enum_zeros: &BTreeMap<String, Value>,
 ) -> Value {
     let world = &sources[if substituted_is_an_argument(declared) {
-        PROGRAM_SOURCE
+        world
     } else {
         owner_source
     }];
     if let SigType::ValueType(token) = substituted {
-        if let Some(key) = type_index_key(&world.assembly, *token) {
-            if let Some(zero) = enum_zeros.get(&key) {
-                return zero.clone();
-            }
+        if let Some(zero) = super::enum_zero_of(&world.assembly, *token, enum_zeros) {
+            return zero;
         }
     }
     struct_zero_of_sig(
@@ -2812,19 +3320,24 @@ fn base_type_of<'pe>(
 /// ordinary `TypeDefOrRef` resolution, or leaves the link absent, which is where it was.
 ///
 #[cfg(feature = "generics")]
+#[allow(clippy::too_many_arguments)]
 fn instantiation_of_spec<'pe>(
-    assembly: &Assembly<'pe>,
-    program: &Assembly<'pe>,
+    written_in: usize,
+    sources: &[DefinitionSource<'pe>],
+    world: usize,
     token: Token,
     arguments: &[SigType],
     instantiations: &[Instantiation],
     emitted: &[(usize, Emitted)],
+    same_names: &SameNames<'_, '_>,
 ) -> Option<TypeId> {
     if token.table() != TYPE_SPEC {
         return None;
     }
+    let assembly = &sources[written_in].assembly;
     let open = assembly.type_spec_signature(token)?;
-    let spelled = spell_instantiation(assembly, program, &open, arguments);
+    let meaning = same_names.of_site(written_in, world, &open, arguments, &[]);
+    let spelled = spell_instantiation(assembly, &sources[world].assembly, &open, arguments);
     let SigType::GenericInst {
         definition,
         arguments: closed,
@@ -2837,20 +3350,31 @@ fn instantiation_of_spec<'pe>(
         _ => return None,
     };
     let name = definition_key(assembly, definition_token)?;
-    let target =
-        find_instantiation_named(instantiations, emitted, &name, &closed, spelled.as_deref())?;
+    let target = find_instantiation_named(
+        instantiations,
+        emitted,
+        &name,
+        &closed,
+        world,
+        spelled.as_deref(),
+        &meaning,
+    )
+    .ok()?;
     Some(emitted[target].1.type_id)
 }
 
 /// The capability-off answer: there is no instantiation set, so no `TypeSpec` names one.
 #[cfg(not(feature = "generics"))]
+#[allow(clippy::too_many_arguments)]
 fn instantiation_of_spec<'pe>(
-    _assembly: &Assembly<'pe>,
-    _program: &Assembly<'pe>,
+    _written_in: usize,
+    _sources: &[DefinitionSource<'pe>],
+    _world: usize,
     _token: Token,
     _arguments: &[SigType],
     _instantiations: &[Instantiation],
     _emitted: &[(usize, Emitted)],
+    _same_names: &SameNames<'_, '_>,
 ) -> Option<TypeId> {
     None
 }
@@ -2921,11 +3445,12 @@ const NULLABLE_DEFINITION: &str = "System.Nullable`1";
 /// where .NET throws.
 fn bind_nullable_underlying<'pe>(
     module: &mut Module,
-    program: &Assembly<'pe>,
+    world: &DefinitionSource<'pe>,
     type_index: &TypeNameIndex,
     want: &Instantiation,
     type_id: TypeId,
     source: usize,
+    names_a_same_named_type: bool,
 ) {
     if source == PROGRAM_SOURCE
         || want.definition != NULLABLE_DEFINITION
@@ -2948,13 +3473,23 @@ fn bind_nullable_underlying<'pe>(
         | SigType::R8
         | SigType::IntPtr
         | SigType::UIntPtr) => type_key("System", primitive_display_name(argument)),
-        SigType::Class(token) | SigType::ValueType(token) => match type_index_key(program, *token) {
-            Some(key) => key,
-            None => return,
-        },
+        SigType::Class(token) | SigType::ValueType(token) => {
+            match type_index_key(&world.assembly, *token) {
+                Some(key) => key,
+                None => return,
+            }
+        }
         _ => return,
     };
-    let Some(&underlying_id) = type_index.get(&key) else {
+    let own_row = match &want.arguments[0] {
+        SigType::Class(token) | SigType::ValueType(token)
+            if names_a_same_named_type && token.table() == TYPE_DEF =>
+        {
+            module.type_id_of(world.asm, *token)
+        }
+        _ => None,
+    };
+    let Some(underlying_id) = own_row.or_else(|| type_index.get(&key).copied()) else {
         return;
     };
     if let Some(handle) = module.type_handle_of(underlying_id) {
@@ -3099,52 +3634,117 @@ impl ExplicitIndex {
 }
 
 /// The position, among a definition's `methods`, of the member a site names by `name` and `params`
-/// (decoded against `site`) under the instantiation `arguments`: structural equality first, then
-/// the spelling each side closes to. See [`bind_closed_member_refs`] for why the second test is the
-/// cross-assembly case rather than an optimization.
+/// (decoded against `site`) under the instantiation `arguments` (decoded against `arguments_from`):
+/// the parameters as declared first, then the spelling each side closes to.
+///
+/// A `MemberRef` through an instantiation carries the signature AS DECLARED on the definition, so the
+/// declared form is exact. Closed, `M(T)` and `M(Item)` spell one thing at `Box<Item>`, and the first
+/// declared would answer for both where the compiler chose between them. See
+/// [`bind_closed_member_refs`] for what the closed test is for.
 fn member_position<'pe>(
     site: &Assembly<'pe>,
     name: &str,
     params: &[SigType],
     definition: &Assembly<'pe>,
     methods: &[DefMethod<'pe>],
+    arguments_from: &Assembly<'pe>,
     arguments: &[SigType],
 ) -> Option<usize> {
+    let declared_as = methods.iter().position(|method| {
+        method.name == name
+            && method.params.len() == params.len()
+            && method
+                .params
+                .iter()
+                .zip(params)
+                .all(|(declared, named)| same_declared_type(definition, declared, site, named))
+    });
+    if declared_as.is_some() {
+        return declared_as;
+    }
     let spelled_site: Option<Vec<String>> = params
         .iter()
-        .map(|param| spell_closed_param(site, param, arguments))
+        .map(|param| spell_closed_param(site, arguments_from, param, arguments))
         .collect();
+    let spelled = spelled_site.as_ref()?;
     methods.iter().position(|method| {
-        if method.name != name {
-            return false;
-        }
-        if method.params == params {
-            return true;
-        }
-        let Some(spelled) = spelled_site.as_ref() else {
-            return false;
-        };
-        method.params.len() == spelled.len()
+        method.name == name
+            && method.params.len() == spelled.len()
             && method.params.iter().zip(spelled).all(|(declared, spelled)| {
-                spell_closed_param(definition, declared, arguments)
+                spell_closed_param(definition, arguments_from, declared, arguments)
                     .is_some_and(|name| &name == spelled)
             })
     })
+}
+
+/// Whether two signatures, each read in its own assembly, are one type as written: a type parameter
+/// stays a parameter, and a token compares by the type it names, because its row number means nothing
+/// in the other assembly.
+fn same_declared_type(
+    left_assembly: &Assembly<'_>,
+    left: &SigType,
+    right_assembly: &Assembly<'_>,
+    right: &SigType,
+) -> bool {
+    let same = |left: &SigType, right: &SigType| {
+        same_declared_type(left_assembly, left, right_assembly, right)
+    };
+    match (left, right) {
+        (SigType::Class(left), SigType::Class(right))
+        | (SigType::ValueType(left), SigType::ValueType(right)) => {
+            definition_key(left_assembly, *left)
+                .is_some_and(|name| definition_key(right_assembly, *right) == Some(name))
+        }
+        (
+            SigType::GenericInst {
+                definition: left_definition,
+                arguments: left_arguments,
+            },
+            SigType::GenericInst {
+                definition: right_definition,
+                arguments: right_arguments,
+            },
+        ) => {
+            same(left_definition, right_definition)
+                && left_arguments.len() == right_arguments.len()
+                && left_arguments.iter().zip(right_arguments).all(|(left, right)| same(left, right))
+        }
+        (SigType::SzArray(left), SigType::SzArray(right))
+        | (SigType::Pointer(left), SigType::Pointer(right))
+        | (SigType::ByRef(left), SigType::ByRef(right)) => same(left, right),
+        (
+            SigType::Array {
+                element: left_element,
+                rank: left_rank,
+                ..
+            },
+            SigType::Array {
+                element: right_element,
+                rank: right_rank,
+                ..
+            },
+        ) => left_rank == right_rank && same(left_element, right_element),
+        _ => left == right,
+    }
 }
 
 /// The interface member a `MethodImpl` row's `declaration` names, for a type declared in
 /// `assembly` and instantiated at `arguments` (none for a non-generic type): a generic interface's
 /// member through the instantiation its `TypeSpec` closes to, or a non-generic one by name. `None`
 /// for an instantiation this pass did not emit.
+#[allow(clippy::too_many_arguments)]
 fn implemented_member<'pe>(
-    assembly: &Assembly<'pe>,
+    written_in: usize,
     declaration: Token,
     arguments: &[SigType],
+    world: usize,
     sources: &[DefinitionSource<'pe>],
     instantiations: &[Instantiation],
     emitted: &[(usize, Emitted)],
     definition_methods: &BTreeMap<(usize, u32), Vec<DefMethod<'pe>>>,
+    same_names: &SameNames<'_, '_>,
 ) -> Option<ImplementedMember> {
+    let assembly = &sources[written_in].assembly;
     if declaration.table() == METHOD_DEF {
         return super::method_def_identity(assembly, declaration).map(ImplementedMember::Named);
     }
@@ -3157,12 +3757,14 @@ fn implemented_member<'pe>(
         return super::member_ref_row_identity(assembly, &member).map(ImplementedMember::Named);
     }
     let interface = instantiation_of_spec(
-        assembly,
-        &sources[PROGRAM_SOURCE].assembly,
+        written_in,
+        sources,
+        world,
         parent,
         arguments,
         instantiations,
         emitted,
+        same_names,
     )?;
     let (index, entry) = emitted.iter().find(|(_, entry)| entry.type_id == interface)?;
     let methods = definition_methods.get(&(entry.source, entry.def_row))?;
@@ -3176,6 +3778,7 @@ fn implemented_member<'pe>(
         &params,
         &sources[entry.source].assembly,
         methods,
+        &sources[instantiations[*index].world].assembly,
         &instantiations[*index].arguments,
     )?;
     Some(ImplementedMember::Instantiated(interface, position))
@@ -3190,6 +3793,7 @@ fn index_explicit_implementations<'pe>(
     instantiations: &[Instantiation],
     emitted: &[(usize, Emitted)],
     definition_methods: &BTreeMap<(usize, u32), Vec<DefMethod<'pe>>>,
+    same_names: &SameNames<'_, '_>,
 ) -> ExplicitIndex {
     let mut index = ExplicitIndex::default();
     for (instantiation, entry) in emitted {
@@ -3207,13 +3811,15 @@ fn index_explicit_implementations<'pe>(
                 continue;
             };
             if let Some(member) = implemented_member(
-                assembly,
+                entry.source,
                 declaration,
                 &instantiations[*instantiation].arguments,
+                instantiations[*instantiation].world,
                 sources,
                 instantiations,
                 emitted,
                 definition_methods,
+                same_names,
             ) {
                 index.members.entry(member).or_default().push((entry.type_id, body));
             }
@@ -3230,12 +3836,13 @@ fn index_explicit_implementations<'pe>(
                 continue;
             };
             let arguments = &instantiations[*server_instantiation].arguments;
+            let world = instantiations[*server_instantiation].world;
             for (interface_instantiation, interface_entry) in emitted {
                 let interface = &instantiations[*interface_instantiation];
                 let routed = VECTOR_INTERFACES
                     .iter()
                     .any(|&(routes, serves)| routes == interface.definition && serves == server);
-                if !routed || &interface.arguments != arguments {
+                if !routed || interface.world != world || &interface.arguments != arguments {
                     continue;
                 }
                 let Some(members) = definition_methods.get(&(interface_entry.source, interface_entry.def_row))
@@ -3260,7 +3867,7 @@ fn index_explicit_implementations<'pe>(
             }
         }
     }
-    for source in sources {
+    for (position, source) in sources.iter().enumerate() {
         let assembly = &source.assembly;
         let generic_definitions = super::generic_definition_rows(assembly);
         let mut row = 0u32;
@@ -3278,13 +3885,15 @@ fn index_explicit_implementations<'pe>(
                     continue;
                 }
                 let Some(member @ ImplementedMember::Instantiated(..)) = implemented_member(
-                    assembly,
+                    position,
                     declaration,
                     &[],
+                    position,
                     sources,
                     instantiations,
                     emitted,
                     definition_methods,
+                    same_names,
                 ) else {
                     continue;
                 };
@@ -3375,12 +3984,12 @@ fn flag_interface_fallbacks<'pe>(
     virtuals: &BTreeMap<String, MethodId>,
     nonvirtuals: &BTreeMap<String, MethodId>,
     lowering: &mut Lowering,
+    same_names: &SameNames<'_, '_>,
 ) {
     if nonvirtuals.is_empty() {
         return;
     }
     let assembly = &sources[entry.source].assembly;
-    let program = &sources[PROGRAM_SOURCE].assembly;
     let Some(type_def) = assembly.type_def(entry.def_row) else {
         return;
     };
@@ -3397,12 +4006,14 @@ fn flag_interface_fallbacks<'pe>(
         if token.table() == TYPE_SPEC {
             let Some(interface) =
                 instantiation_of_spec(
-                    assembly,
-                    &sources[PROGRAM_SOURCE].assembly,
+                    entry.source,
+                    sources,
+                    want.world,
                     token,
                     &want.arguments,
                     instantiations,
                     emitted,
+                    same_names,
                 )
             else {
                 continue;
@@ -3424,7 +4035,7 @@ fn flag_interface_fallbacks<'pe>(
                 }
                 let Some(key) = substituted_sig_key(
                     interface_assembly,
-                    program,
+                    &sources[label.world].assembly,
                     &method.name,
                     &method.params,
                     &label.arguments,
@@ -3464,9 +4075,14 @@ fn flag_interface_fallbacks<'pe>(
             let signature = method.signature();
             let arity = signature.as_ref().map_or(0, |sig| sig.generic_param_count);
             let params = signature.map(|sig| sig.parameters).unwrap_or_default();
-            let Some(key) =
-                substituted_sig_key(interface_assembly, program, name, &params, &[], arity)
-            else {
+            let Some(key) = substituted_sig_key(
+                interface_assembly,
+                interface_assembly,
+                name,
+                &params,
+                &[],
+                arity,
+            ) else {
                 continue;
             };
             if !falls(&key) {
@@ -3506,11 +4122,17 @@ fn interface_definition<'pe>(
     })
 }
 
-/// Finds the instantiation of `definition` with exactly `arguments`.
+/// Finds the instantiation of `definition` with exactly `arguments`, written in `world`.
 ///
 /// The ARGUMENTS are matched STRUCTURALLY, on their decoded signatures, rather than through a name
 /// this pass would have had to spell. A comparison is the one form of identity that cannot drift
 /// from someone else's spelling rule.
+///
+/// **A structural match holds only within one world.** A token is a row number of the assembly that
+/// wrote it, so two instantiations' arguments compare only when both are written in the same
+/// assembly ([`Instantiation::world`]); across two, equal tokens can name two unrelated types.
+/// Arguments that carry no token at all mean the same in every assembly, so those compare across
+/// worlds as they always did.
 ///
 /// **THE DEFINITION HALF IS STILL A NAME, AND IT IS NOT THIS PASS'S TO SPELL.** `definition` must
 /// come from [`definition_key`], which is the speller that wrote every
@@ -3520,11 +4142,34 @@ fn find_instantiation(
     emitted: &[(usize, Emitted)],
     definition: &str,
     arguments: &[SigType],
+    world: usize,
+    meaning: &[DeclaredType],
 ) -> Option<usize> {
-    emitted.iter().position(|(index, _)| {
+    let token_free = !arguments.iter().any(names_a_token);
+    emitted.iter().position(|(index, entry)| {
         let want = &instantiations[*index];
-        want.definition == definition && want.arguments == arguments
+        want.definition == definition
+            && (token_free || want.world == world)
+            && want.arguments == arguments
+            && entry.meaning == meaning
     })
+}
+
+/// Whether `sig` holds a `TypeDef` or `TypeRef` token anywhere -- the part of a signature whose
+/// meaning depends on the assembly that wrote it.
+fn names_a_token(sig: &SigType) -> bool {
+    match sig {
+        SigType::Class(_) | SigType::ValueType(_) => true,
+        SigType::GenericInst {
+            definition,
+            arguments,
+        } => names_a_token(definition) || arguments.iter().any(names_a_token),
+        SigType::SzArray(inner) | SigType::Pointer(inner) | SigType::ByRef(inner) => {
+            names_a_token(inner)
+        }
+        SigType::Array { element, .. } => names_a_token(element),
+        _ => false,
+    }
 }
 
 /// [`find_instantiation`] by CANONICAL NAME first, falling back to the token-equality match.
@@ -3543,24 +4188,68 @@ fn find_instantiation(
 ///
 /// **The token path is kept as the fallback rather than replaced**, because a name cannot always be
 /// spelled: a site carrying a METHOD type parameter substitutes from an argument list the speller
-/// does not take, and answers `None`. Those sites match exactly as they did before.
-#[cfg(feature = "generics")]
+/// does not take, and answers `None`. Those sites match exactly as they did before, against the
+/// instantiations written in `world`, the assembly `arguments` were decoded in.
+///
+/// **A NAME THAT MATCHES IS NOT YET A BIND.** `meaning` is what the site means by any same-named type
+/// it names ([`SameNames`]), and an instantiation that means another assembly's type by that spelling
+/// is another type. A site with no instantiation of its own meaning is refused by name:
+/// [`Refusal::SameNamedTypes`].
 fn find_instantiation_named(
     instantiations: &[Instantiation],
     emitted: &[(usize, Emitted)],
     definition: &str,
     arguments: &[SigType],
+    world: usize,
     spelled: Option<&str>,
-) -> Option<usize> {
+    meaning: &[DeclaredType],
+) -> Result<usize, Miss> {
+    let mut another_meaning = None;
     if let Some(name) = spelled {
-        if let Some(found) = emitted
-            .iter()
-            .position(|(index, _)| instantiations[*index].name == name)
-        {
-            return Some(found);
+        for (position, (index, entry)) in emitted.iter().enumerate() {
+            if instantiations[*index].name == name {
+                if entry.meaning == meaning {
+                    return Ok(position);
+                }
+                another_meaning = Some(position);
+            }
         }
     }
-    find_instantiation(instantiations, emitted, definition, arguments)
+    if let Some(found) = find_instantiation(instantiations, emitted, definition, arguments, world, meaning) {
+        return Ok(found);
+    }
+    Err(another_meaning.map_or(Miss::NotInSet, Miss::AnotherMeaning))
+}
+
+/// Why [`find_instantiation_named`] found nothing for a site to bind to.
+enum Miss {
+    /// No instantiation of that name or those arguments was lowered.
+    NotInSet,
+    /// The instantiation at this position of `emitted` spells the name, and none means what the site
+    /// means.
+    AnotherMeaning(usize),
+}
+
+impl Miss {
+    /// The refusal of a body, `owner`, whose site named `definition` and missed.
+    fn refusal(
+        self,
+        owner: &str,
+        definition: String,
+        instantiations: &[Instantiation],
+        emitted: &[(usize, Emitted)],
+    ) -> Refusal {
+        match self {
+            Miss::NotInSet => Refusal::InstantiationNotInSet {
+                instantiation: owner.into(),
+                wanted: definition,
+            },
+            Miss::AnotherMeaning(found) => Refusal::SameNamedTypes {
+                instantiation: owner.into(),
+                wanted: instantiations[emitted[found].0].name.clone(),
+            },
+        }
+    }
 }
 
 /// One parameter of a member signature, closed under `arguments` and spelled canonically -- the
@@ -3571,20 +4260,35 @@ fn find_instantiation_named(
 #[cfg(feature = "generics")]
 fn spell_closed_param(
     assembly: &Assembly<'_>,
+    arguments_from: &Assembly<'_>,
     param: &SigType,
     arguments: &[SigType],
 ) -> Option<String> {
-    let closed = substitute(param, arguments)?;
-    lamella_generics::spell_sig(assembly, &closed)
+    lamella_generics::spell_sig_across(assembly, arguments_from, param, arguments)
 }
 
 /// The capability-off answer: no instantiation set, so nothing to spell against.
 #[cfg(not(feature = "generics"))]
 fn spell_closed_param(
     _assembly: &Assembly<'_>,
+    _arguments_from: &Assembly<'_>,
     _param: &SigType,
     _arguments: &[SigType],
 ) -> Option<String> {
+    None
+}
+
+/// The canonical name of a closed signature written in `assembly` -- a call site's own `TypeSpec`.
+/// `None` without the `generics` capability, or when it does not spell (a type parameter, most
+/// often, which no instantiation carries).
+#[cfg(feature = "generics")]
+pub(crate) fn spell_site(assembly: &Assembly<'_>, sig: &SigType) -> Option<String> {
+    lamella_generics::spell_sig(assembly, sig)
+}
+
+/// The capability-off answer: no instantiation set, so nothing to spell against.
+#[cfg(not(feature = "generics"))]
+pub(crate) fn spell_site(_assembly: &Assembly<'_>, _sig: &SigType) -> Option<String> {
     None
 }
 
@@ -3616,6 +4320,7 @@ fn bind_open_token<'pe>(
     asm: u8,
     sources: &[DefinitionSource<'pe>],
     owner_source: usize,
+    world: usize,
     type_index: &TypeNameIndex,
     field_index: &FieldNameIndex,
     instantiations: &[Instantiation],
@@ -3629,6 +4334,7 @@ fn bind_open_token<'pe>(
     synthetic: Token,
     deferred: &mut Vec<DeferredMethodSite>,
     explicit: &ExplicitIndex,
+    same_names: &SameNames<'_, '_>,
 ) -> Result<(), Refusal> {
     let unbound = || Refusal::UnboundAfterSubstitution {
         instantiation: owner.into(),
@@ -3655,7 +4361,7 @@ fn bind_open_token<'pe>(
             owner: owner.into(),
             token: site.token.0,
         }),
-        METHOD_SPEC if owner_source != PROGRAM_SOURCE => {
+        METHOD_SPEC if owner_source != PROGRAM_SOURCE || world != PROGRAM_SOURCE => {
             Err(Refusal::MethodSpecFromAnotherAssembly {
                 owner: owner.into(),
                 token: site.token.0,
@@ -3695,15 +4401,30 @@ fn bind_open_token<'pe>(
                     token: site.token.0,
                 })?;
             let operand = &sources[if substituted_is_an_argument(&sig) {
-                PROGRAM_SOURCE
+                world
             } else {
                 owner_source
             }];
+            #[cfg(feature = "generics")]
+            let spelled = lamella_generics::spell_sig_across_with_methods(
+                assembly,
+                &sources[world].assembly,
+                &sig,
+                type_arguments,
+                method_arguments,
+            );
+            #[cfg(not(feature = "generics"))]
+            let spelled: Option<String> = None;
+            let meaning =
+                same_names.of_site(owner_source, world, &sig, type_arguments, method_arguments);
             bind_type_operand(
                 module,
                 operand,
                 asm,
-                sources[PROGRAM_SOURCE].asm,
+                sources,
+                world,
+                spelled.as_deref(),
+                &meaning,
                 type_index,
                 instantiations,
                 emitted,
@@ -3721,9 +4442,16 @@ fn bind_open_token<'pe>(
             #[cfg(feature = "generics")]
             let spelled = spell_instantiation(
                 assembly,
-                &sources[PROGRAM_SOURCE].assembly,
+                &sources[world].assembly,
                 &parent_sig,
                 type_arguments,
+            );
+            let meaning = same_names.of_site(
+                owner_source,
+                world,
+                &parent_sig,
+                type_arguments,
+                method_arguments,
             );
             let SigType::GenericInst {
                 definition,
@@ -3745,19 +4473,18 @@ fn bind_open_token<'pe>(
                     instantiation: owner.into(),
                     token: site.token.0,
                 })?;
-            #[cfg(feature = "generics")]
-            let target =
-                find_instantiation_named(instantiations, emitted, &definition_name, &substituted, spelled.as_deref())
-                    .ok_or_else(|| Refusal::InstantiationNotInSet {
-                        instantiation: owner.into(),
-                        wanted: definition_name.clone(),
-                    })?;
             #[cfg(not(feature = "generics"))]
-            let target = find_instantiation(instantiations, emitted, &definition_name, &substituted)
-                .ok_or_else(|| Refusal::InstantiationNotInSet {
-                    instantiation: owner.into(),
-                    wanted: definition_name.clone(),
-                })?;
+            let spelled: Option<String> = None;
+            let target = find_instantiation_named(
+                instantiations,
+                emitted,
+                &definition_name,
+                &substituted,
+                world,
+                spelled.as_deref(),
+                &meaning,
+            )
+            .map_err(|miss| miss.refusal(owner, definition_name.clone(), instantiations, emitted))?;
             let (target_index, target_entry) = &emitted[target];
             let target_want = &instantiations[*target_index];
             let target_assembly = &sources[target_entry.source].assembly;
@@ -3790,10 +4517,16 @@ fn bind_open_token<'pe>(
                 .get(&(target_entry.source, target_entry.def_row))
                 .map(Vec::as_slice)
                 .unwrap_or(&[]);
-            let position = methods
-                .iter()
-                .position(|method| method.name == name && method.params == params)
-                .ok_or_else(unbound)?;
+            let position = member_position(
+                assembly,
+                name,
+                &params,
+                target_assembly,
+                methods,
+                &sources[target_want.world].assembly,
+                &target_want.arguments,
+            )
+            .ok_or_else(unbound)?;
             if !bind_member_call(
                 module,
                 asm,
@@ -3802,7 +4535,7 @@ fn bind_open_token<'pe>(
                 methods,
                 position,
                 target_assembly,
-                &sources[PROGRAM_SOURCE].assembly,
+                &sources[target_want.world].assembly,
                 &target_want.arguments,
                 params.len(),
                 explicit,
@@ -3839,7 +4572,10 @@ fn bind_type_operand<'pe>(
     module: &mut Module,
     operand: &DefinitionSource<'pe>,
     site_asm: u8,
-    program_asm: u8,
+    sources: &[DefinitionSource<'pe>],
+    world: usize,
+    spelled: Option<&str>,
+    meaning: &[DeclaredType],
     type_index: &TypeNameIndex,
     instantiations: &[Instantiation],
     emitted: &[(usize, Emitted)],
@@ -3875,23 +4611,44 @@ fn bind_type_operand<'pe>(
                 _ => return Err(unbound()),
             };
             let definition_name = definition_key(assembly, definition_token).ok_or_else(unbound)?;
-            let target = find_instantiation(instantiations, emitted, &definition_name, arguments)
-                .ok_or_else(|| Refusal::InstantiationNotInSet {
-                    instantiation: owner.into(),
-                    wanted: definition_name.clone(),
-                })?;
+            let target = find_instantiation_named(
+                instantiations,
+                emitted,
+                &definition_name,
+                arguments,
+                world,
+                spelled,
+                meaning,
+            )
+            .map_err(|miss| miss.refusal(owner, definition_name.clone(), instantiations, emitted))?;
             let (target_index, target_entry) = &emitted[target];
             module.bind_type_token(site_asm, synthetic, target_entry.type_id);
             module.bind_type_name(site_asm, synthetic, instantiations[*target_index].name.clone());
             let target = &instantiations[*target_index];
-            if let Some(shape) = vector_interface_shape(program_asm, &target.definition, &target.arguments) {
+            let target_asm = sources[target.world].asm;
+            if let Some(shape) = vector_interface_shape(target_asm, &target.definition, &target.arguments) {
+                for argument in &target.arguments {
+                    super::bind_signature_elements(
+                        &sources[target.world].assembly,
+                        module,
+                        target_asm,
+                        type_index,
+                        argument,
+                    );
+                }
                 module.bind_cast_elem(site_asm, synthetic, shape);
             }
             Ok(())
         }
         SigType::Class(token) | SigType::ValueType(token) => {
             let name = assembly.type_token_name(*token).ok_or_else(unbound)?;
-            if let Some(&type_id) = type_index_key(assembly, *token).and_then(|key| type_index.get(&key)) {
+            let own_row = (!meaning.is_empty() && token.table() == TYPE_DEF)
+                .then(|| module.type_id_of(asm, *token))
+                .flatten();
+            let type_id = own_row.or_else(|| {
+                type_index_key(assembly, *token).and_then(|key| type_index.get(&key).copied())
+            });
+            if let Some(type_id) = type_id {
                 module.bind_type_token(site_asm, synthetic, type_id);
             }
             module.bind_type_name(site_asm, synthetic, name.name.into());
@@ -4014,14 +4771,38 @@ fn vector_interface_shape(asm: u8, definition: &str, arguments: &[SigType]) -> O
     }
 }
 
+/// Records, once, why a closed site that spelled an instantiation's name stays unlowered. A site that
+/// simply is not in the set has no refusal: it keeps its mark, and the mark names it.
+fn note_closed_site_miss(
+    miss: Miss,
+    instantiations: &[Instantiation],
+    emitted: &[(usize, Emitted)],
+    lowering: &mut Lowering,
+) {
+    if let Miss::AnotherMeaning(found) = miss {
+        let name = &instantiations[emitted[found].0].name;
+        let refusal = Refusal::SameNamedTypes {
+            instantiation: name.clone(),
+            wanted: name.clone(),
+        };
+        if !lowering.refusals.contains(&refusal) {
+            lowering.refusals.push(refusal);
+        }
+    }
+}
+
 /// Binds every CLOSED `TypeSpec` row naming one of these instantiations to its type identity, so a
 /// `castclass` / `isinst` / `ldtoken` / `box` of `Pair<int,string>` reaches the type this pass made.
+#[allow(clippy::too_many_arguments)]
 fn bind_closed_type_specs<'pe>(
     module: &mut Module,
     assembly: &Assembly<'pe>,
     asm: u8,
+    world: usize,
     instantiations: &[Instantiation],
     emitted: &[(usize, Emitted)],
+    same_names: &SameNames<'_, '_>,
+    lowering: &mut Lowering,
 ) {
     for row in 1..=u32::from(u16::MAX) {
         let token = Token::new(TYPE_SPEC, row);
@@ -4042,8 +4823,22 @@ fn bind_closed_type_specs<'pe>(
         let Some(name) = definition_key(assembly, definition_token) else {
             continue;
         };
-        let Some(target) = find_instantiation(instantiations, emitted, &name, arguments) else {
-            continue;
+        let spelled = spell_site(assembly, &sig);
+        let meaning = same_names.of_site(world, world, &sig, &[], &[]);
+        let target = match find_instantiation_named(
+            instantiations,
+            emitted,
+            &name,
+            arguments,
+            world,
+            spelled.as_deref(),
+            &meaning,
+        ) {
+            Ok(target) => target,
+            Err(miss) => {
+                note_closed_site_miss(miss, instantiations, emitted, lowering);
+                continue;
+            }
         };
         let (index, entry) = &emitted[target];
         module.bind_type_token(asm, token, entry.type_id);
@@ -4105,18 +4900,61 @@ fn exception_tag_collision(
     None
 }
 
+/// Records, for each type of the assembly at `position` whose constructed base names a type more than
+/// one assembly declares, the instantiation that base means, for the loader's relink of that type
+/// ([`Lowering::same_named_base`]): its spelling alone cannot say which.
+fn note_same_named_bases<'pe>(
+    position: usize,
+    sources: &[DefinitionSource<'pe>],
+    instantiations: &[Instantiation],
+    emitted: &[(usize, Emitted)],
+    same_names: &SameNames<'_, '_>,
+    lowering: &mut Lowering,
+) {
+    if same_names.declared.is_empty() {
+        return;
+    }
+    let assembly = &sources[position].assembly;
+    for type_def in assembly.type_defs() {
+        let extends = type_def.extends();
+        if extends.table() != TYPE_SPEC {
+            continue;
+        }
+        let Some(sig) = assembly.type_spec_signature(extends) else {
+            continue;
+        };
+        if mentions_parameter(&sig) {
+            continue;
+        }
+        let meaning = same_names.of_site(position, position, &sig, &[], &[]);
+        if meaning.is_empty() {
+            continue;
+        }
+        let Some(name) = spell_site(assembly, &sig) else {
+            continue;
+        };
+        let type_id = emitted
+            .iter()
+            .find(|(index, entry)| instantiations[*index].name == name && entry.meaning == meaning)
+            .map(|(_, entry)| entry.type_id);
+        lowering.same_named_bases.push((sources[position].asm, extends, type_id));
+    }
+}
+
 /// Binds every `MemberRef` reached through a CLOSED instantiation to the member of the type this
 /// pass made, and withdraws that token's `UnloweredGeneric` mark -- but ONLY once it is bound.
 fn bind_closed_member_refs<'pe>(
     module: &mut Module,
     assembly: &Assembly<'pe>,
     asm: u8,
+    world: usize,
     sources: &[DefinitionSource<'pe>],
     instantiations: &[Instantiation],
     emitted: &[(usize, Emitted)],
     definition_methods: &BTreeMap<(usize, u32), Vec<DefMethod<'pe>>>,
     lowering: &mut Lowering,
     explicit: &ExplicitIndex,
+    same_names: &SameNames<'_, '_>,
 ) {
     for row in 1..=u32::from(u16::MAX) {
         let token = Token::new(MEMBER_REF, row);
@@ -4127,10 +4965,15 @@ fn bind_closed_member_refs<'pe>(
         if parent.table() != TYPE_SPEC {
             continue;
         }
-        let Some(SigType::GenericInst {
+        let Some(parent_sig) = assembly.type_spec_signature(parent) else {
+            continue;
+        };
+        let spelled = spell_site(assembly, &parent_sig);
+        let meaning = same_names.of_site(world, world, &parent_sig, &[], &[]);
+        let SigType::GenericInst {
             definition,
             arguments,
-        }) = assembly.type_spec_signature(parent)
+        } = parent_sig
         else {
             continue;
         };
@@ -4141,9 +4984,20 @@ fn bind_closed_member_refs<'pe>(
         let Some(definition_name) = definition_key(assembly, definition_token) else {
             continue;
         };
-        let Some(target) = find_instantiation(instantiations, emitted, &definition_name, &arguments)
-        else {
-            continue;
+        let target = match find_instantiation_named(
+            instantiations,
+            emitted,
+            &definition_name,
+            &arguments,
+            world,
+            spelled.as_deref(),
+            &meaning,
+        ) {
+            Ok(target) => target,
+            Err(miss) => {
+                note_closed_site_miss(miss, instantiations, emitted, lowering);
+                continue;
+            }
         };
         let (index, entry) = &emitted[target];
         let want = &instantiations[*index];
@@ -4186,12 +5040,14 @@ fn bind_closed_member_refs<'pe>(
             .get(&(entry.source, entry.def_row))
             .map(Vec::as_slice)
             .unwrap_or(&[]);
+        let arguments_from = &sources[want.world].assembly;
         let Some(position) = member_position(
             assembly,
             name,
             &params,
             definition_assembly,
             methods,
+            arguments_from,
             &want.arguments,
         ) else {
             lowering.refusals.push(Refusal::UnboundAfterSubstitution {
@@ -4208,7 +5064,7 @@ fn bind_closed_member_refs<'pe>(
             methods,
             position,
             definition_assembly,
-            &sources[PROGRAM_SOURCE].assembly,
+            arguments_from,
             &want.arguments,
             params.len(),
             explicit,
@@ -4221,6 +5077,21 @@ fn bind_closed_member_refs<'pe>(
         }
         module.clear_unlowered_generic(asm, token);
     }
+}
+
+/// The whole body of a method whose lowering was refused: a call through `marked`, whose mark raises
+/// the `MissingMethodException` naming the refusal (`Module::name_unlowered_generic`), and which a
+/// bake that keeps this body refuses by name (`Module::validate_profile`).
+fn refused_body(marked: Token) -> Vec<u8> {
+    const TINY_SIX_BYTES: u8 = (6 << 2) | 0x02;
+    const CALL: u8 = 0x28;
+    const RET: u8 = 0x2A;
+    let mut body = Vec::with_capacity(7);
+    body.push(TINY_SIX_BYTES);
+    body.push(CALL);
+    body.extend_from_slice(&marked.0.to_le_bytes());
+    body.push(RET);
+    body
 }
 
 /// A body whose bytes were REWRITTEN: it must be owned, because it no longer matches anything in

@@ -134,6 +134,7 @@ internal sealed class Rp2350SpiDriver : SpiDriver
         }
         uint divisor = (sspclk + (uint)(prescale * clockHz) - 1) / (prescale * (uint)clockHz);
         if (divisor < 1) divisor = 1;
+        if (divisor > 256u) divisor = 256u;
         uint scr = divisor - 1;
         _actualHz = (int)(sspclk / (prescale * (scr + 1u)));
 

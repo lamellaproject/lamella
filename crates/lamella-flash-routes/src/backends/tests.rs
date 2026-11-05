@@ -1238,19 +1238,19 @@ fn an_edbg_route_narrows_to_the_kit_and_not_to_the_vendor() {
 fn the_routed_microchip_kits_carry_their_own_product_ids() {
     use crate::{PROGRAMMING, Programmer};
     let expected = [
-        ("microchip-samd21-xpro", 0x2169u16),
-        ("microchip-atsamd11-xpro", 0x2111),
-        ("microchip-atsamd10-xmini", 0x2145),
-        ("microchip-samw25-xpro", 0x2111),
-        ("microchip-same51-cnano", 0x2175),
-        ("microchip-same54-xpro", 0x2111),
-        ("microchip-sam4e-xpro", 0x2111),
-        ("microchip-sam4n-xpro", 0x2111),
-        ("microchip-sam4l8-xpro", 0x2111),
-        ("microchip-sam4s-xpro", 0x2111),
+        ("microchip-sam-d21-xplained-pro", 0x2169u16),
+        ("microchip-sam-d11-xplained-pro", 0x2111),
+        ("microchip-sam-d10-xplained-mini", 0x2145),
+        ("microchip-sam-w25-xplained-pro", 0x2111),
+        ("microchip-sam-e51-curiosity-nano", 0x2175),
+        ("microchip-sam-e54-xplained-pro", 0x2111),
+        ("microchip-sam4e-xplained-pro", 0x2111),
+        ("microchip-sam4n-xplained-pro", 0x2111),
+        ("microchip-sam4l8-xplained-pro", 0x2111),
+        ("microchip-sam4s-xplained-pro", 0x2111),
         ("arduino-zero", 0x2157),
-        ("microchip-samd21-cnano", 0x2175),
-        ("microchip-samr21-xpro", 0x2111),
+        ("microchip-sam-d21-curiosity-nano", 0x2175),
+        ("microchip-sam-r21-xplained-pro", 0x2111),
     ];
     for (board, id) in expected {
         let row = PROGRAMMING
@@ -1278,7 +1278,7 @@ fn the_routed_microchip_kits_carry_their_own_product_ids() {
 /// which controller fronts which window is decided by a `GPNVM` swap bit that no address reveals,
 /// and filling one plane's write latch while commanding the other reports success.
 ///
-/// So `microchip-sam4s-xpro` must NOT carry this family: it is the dual-plane part, and it is routed on
+/// So `microchip-sam4s-xplained-pro` must NOT carry this family: it is the dual-plane part, and it is routed on
 /// [`crate::SamFamily::Sam4sDual`] instead. The erase arm refuses at run time on the descriptor's
 /// own plane count, and this refuses at the table.
 #[test]
@@ -1297,11 +1297,11 @@ fn the_eefc_family_routes_no_dual_plane_board() {
 
     assert!(!eefc.is_empty(), "no board carries this family, so the check proves nothing");
     assert!(
-        !eefc.contains(&"microchip-sam4s-xpro"),
+        !eefc.contains(&"microchip-sam4s-xplained-pro"),
         "the SAM4S Xplained Pro carries an ATSAM4SD32C -- two planes, two controllers, chosen by a \
          GPNVM bit rather than by the address: {eefc:?}"
     );
-    assert!(eefc.contains(&"microchip-sam4e-xpro") && eefc.contains(&"microchip-sam4n-xpro"), "{eefc:?}");
+    assert!(eefc.contains(&"microchip-sam4e-xplained-pro") && eefc.contains(&"microchip-sam4n-xplained-pro"), "{eefc:?}");
 
     let dual: Vec<&str> = PROGRAMMING
         .iter()
@@ -1313,7 +1313,7 @@ fn the_eefc_family_routes_no_dual_plane_board() {
         })
         .map(|row| row.board)
         .collect();
-    assert_eq!(dual, vec!["microchip-sam4s-xpro"], "{dual:?}");
+    assert_eq!(dual, vec!["microchip-sam4s-xplained-pro"], "{dual:?}");
 }
 
 /// A route's declared units count the family's own granule, so the same image does not read as
@@ -4759,6 +4759,14 @@ struct FakeRp2350 {
     /// An address whose erase never returns: the call that covers it erases the sectors below it
     /// and is given up on.
     erase_hangs_at: Option<u32>,
+    /// Whether `FLASH_DEVINFO`'s D8h bit was set when each erase call began, in call order: what
+    /// decides, on a real part, whether that call erases by 64 KiB block.
+    erase_with_d8h: Vec<bool>,
+    /// What the next read of `FLASH_DEVINFO`'s word fails with, once, while its D8h bit is set: the
+    /// read a write makes right after setting the bit.
+    fail_devinfo_read_while_set: Option<ProbeError>,
+    /// What the next write through boot RAM's clear alias fails with, once.
+    fail_clear: Option<ProbeError>,
     dhcsr: Dhcsr,
 }
 
@@ -4770,6 +4778,16 @@ const RP2350_FLASH_OP: u16 = 0x7104;
 const RP2350_FLASH_FLUSH_CACHE: u16 = 0x7106;
 /// Where the part routine runs its two secure-setup stubs (the part crate's `STUB_BASE`).
 const RP2350_STUBS: u32 = 0x2000_8000;
+/// Where the fake's ROM keeps the 32-bit pointer literal that its 'F','D' data item names.
+const RP2350_DEVINFO_LITERAL: u32 = RP2350_TABLE + 0x38;
+/// The boot-RAM halfword that pointer leads to, `FLASH_DEVINFO`: the upper half of its word, so
+/// that a write disturbing the lower half would show.
+const RP2350_DEVINFO: u32 = 0x400e_0016;
+/// The boot-RAM word around it as a boot leaves it: `FLASH_DEVINFO`'s default (16 MB on chip
+/// select 0, no D8h support) above, and below it a neighbour no write may change.
+const RP2350_DEVINFO_WORD: u32 = 0x0c00_beef;
+/// `FLASH_DEVINFO`'s D8h bit, where it sits in that word.
+const RP2350_DEVINFO_D8H: u32 = 0x80 << 16;
 
 impl FakeRp2350 {
     fn new() -> Self {
@@ -4782,6 +4800,12 @@ impl FakeRp2350 {
         rom[0x10..0x14].copy_from_slice(&0x0002_754d_u32.to_le_bytes());
         rom[0x14..0x18].copy_from_slice(&RP2350_TABLE.to_le_bytes());
         let mut at = RP2350_TABLE as usize;
+        rom[at..at + 2].copy_from_slice(b"FD");
+        rom[at + 2..at + 4].copy_from_slice(&0x0040_u16.to_le_bytes());
+        rom[at + 4..at + 6].copy_from_slice(&(RP2350_DEVINFO_LITERAL as u16).to_le_bytes());
+        at += 6;
+        let literal = RP2350_DEVINFO_LITERAL as usize;
+        rom[literal..literal + 4].copy_from_slice(&RP2350_DEVINFO.to_le_bytes());
         for (code, address) in [
             (*b"IF", RP2350_CONNECT_INTERNAL_FLASH),
             (*b"EX", RP2350_FLASH_EXIT_XIP),
@@ -4797,12 +4821,15 @@ impl FakeRp2350 {
             dhcsr: Dhcsr::default(),
             log: Vec::new(),
             flash: vec![0xFF; bytes],
-            ram: std::collections::HashMap::new(),
+            ram: std::collections::HashMap::from([(RP2350_DEVINFO & !3, RP2350_DEVINFO_WORD)]),
             rom,
             xip_reads: Vec::new(),
             fail_staging: None,
             erase_polls_per_sector: 0,
             erase_hangs_at: None,
+            erase_with_d8h: Vec::new(),
+            fail_devinfo_read_while_set: None,
+            fail_clear: None,
         }
     }
 
@@ -4810,6 +4837,17 @@ impl FakeRp2350 {
     fn in_flash(&self, address: u32) -> Option<usize> {
         let offset = address.checked_sub(lamella_cmsis_dap_rp2350::XIP_BASE)? as usize;
         (offset < self.flash.len()).then_some(offset)
+    }
+
+    /// The boot-RAM word that holds `FLASH_DEVINFO`.
+    fn devinfo_word(&self) -> u32 {
+        self.ram[&(RP2350_DEVINFO & !3)]
+    }
+
+    /// Points the ROM's `FLASH_DEVINFO` literal at `address` instead.
+    fn point_devinfo_at(&mut self, address: u32) {
+        let literal = RP2350_DEVINFO_LITERAL as usize;
+        self.rom[literal..literal + 4].copy_from_slice(&address.to_le_bytes());
     }
 }
 
@@ -4824,6 +4862,12 @@ impl TargetAccess for FakeRp2350 {
         Ok(())
     }
     fn read_word(&mut self, address: u32) -> Result<u32, ProbeError> {
+        if address == RP2350_DEVINFO & !3 && self.devinfo_word() & RP2350_DEVINFO_D8H != 0 {
+            if let Some(error) = self.fail_devinfo_read_while_set.take() {
+                self.log.push("FLASH_DEVINFO read failed".to_owned());
+                return Err(error);
+            }
+        }
         if let Some(at) = self.in_flash(address) {
             let cell = &self.flash[at..at + 4];
             return Ok(u32::from_le_bytes([cell[0], cell[1], cell[2], cell[3]]));
@@ -4853,6 +4897,23 @@ impl TargetAccess for FakeRp2350 {
         }
         if self.in_flash(address).is_some() {
             return Err(ProbeError::Device("flash is written through flash_op, not by a store"));
+        }
+        let (alias, plain) = (address & 0xffff_f000, address & !0x3000);
+        if alias == 0x400e_2000 || alias == 0x400e_3000 {
+            let what = if alias == 0x400e_2000 { "set" } else { "clear" };
+            if what == "clear" {
+                if let Some(error) = self.fail_clear.take() {
+                    self.log.push(format!("boot RAM clear failed at {plain:#010x}"));
+                    return Err(error);
+                }
+            }
+            let word = self.ram.entry(plain).or_insert(0);
+            if what == "set" { *word |= value } else { *word &= !value }
+            self.log.push(format!("boot RAM {what} {value:#010x} at {plain:#010x}"));
+            return Ok(());
+        }
+        if address == RP2350_DEVINFO & !3 {
+            return Err(ProbeError::Device("FLASH_DEVINFO's word is written only through an alias"));
         }
         self.ram.insert(address, value);
         Ok(())
@@ -4917,6 +4978,7 @@ impl TargetAccess for FakeRp2350 {
             .ok_or(ProbeError::Device("a flash_op outside the modelled flash"))?;
         match operation {
             0 => {
+                self.erase_with_d8h.push(self.devinfo_word() & RP2350_DEVINFO_D8H != 0);
                 let sectors = length / 4096;
                 let hang = self
                     .erase_hangs_at
@@ -5030,6 +5092,202 @@ fn the_rp2350_route_says_its_progress_to_its_caller() {
     assert!(lines.iter().all(|line| line.starts_with("  ")), "{lines:?}");
 }
 
+use lamella_cmsis_dap_rp2350::Erase;
+
+/// Writes `bytes` through an RP2350 probe route over `board`, erasing the way `erase` says, and
+/// hands back the write's outcome, the part, and the lines it said.
+fn rp2350_write(
+    board: FakeRp2350,
+    bytes: &[u8],
+    erase: Erase,
+) -> (Result<lamella_flash_backend::Report, FlashError>, FakeRp2350, Vec<String>) {
+    let lines = std::cell::RefCell::new(Vec::<String>::new());
+    let mut backend = Rp2350Probe::new(board, 0x4c01_3477, "an RP2350")
+        .erasing(erase)
+        .saying(|line: &str| lines.borrow_mut().push(line.to_owned()));
+    let image = Image {
+        bytes,
+        base: lamella_cmsis_dap_rp2350::XIP_BASE,
+    };
+    let outcome = flash(&mut backend, &image, VerifyPolicy::ReadBack, &Allow::Any);
+    (outcome, backend.target, lines.into_inner())
+}
+
+/// Where in `log` the first entry `matching` sits.
+fn first_at(log: &[String], matching: impl Fn(&str) -> bool) -> usize {
+    log.iter().position(|entry| matching(entry)).unwrap_or_else(|| panic!("{log:?}"))
+}
+
+/// **A BOARD WHOSE FLASH TAKES THE BLOCK ERASE ERASES WITH `FLASH_DEVINFO`'s D8h BIT SET, AND THE
+/// BIT IS CLEARED BEFORE ANYTHING IS PROGRAMMED.** The bit goes on through boot RAM's set alias
+/// and off through its clear alias, so the halfword beside it is never rewritten, and the word ends
+/// as the write found it.
+#[test]
+fn an_rp2350_write_by_block_erase_sets_the_d8h_bit_for_the_erase_alone() {
+    let bytes = rp2350_image(2 * 64 * 1024 + 4096 + 100);
+    let board = FakeRp2350::with_flash(4 * 64 * 1024);
+    let (outcome, part, lines) = rp2350_write(board, &bytes, Erase::Blocks);
+
+    outcome.unwrap_or_else(|why| panic!("{why}: {:?}", part.log));
+    assert_eq!(&part.flash[..bytes.len()], &bytes[..]);
+    assert_eq!(part.erase_with_d8h, [true, true, true], "two whole blocks, then the last 8 KiB");
+    assert_eq!(part.devinfo_word(), RP2350_DEVINFO_WORD, "boot RAM's word as the write found it");
+    let set = first_at(&part.log, |entry| entry == "boot RAM set 0x00800000 at 0x400e0014");
+    let first_erase = first_at(&part.log, |entry| entry.starts_with("erase "));
+    let clear = first_at(&part.log, |entry| entry == "boot RAM clear 0x00800000 at 0x400e0014");
+    let last_erase = part.log.iter().rposition(|entry| entry.starts_with("erase ")).expect("one");
+    let first_program = first_at(&part.log, |entry| entry.starts_with("program "));
+    assert!(set < first_erase && last_erase < clear && clear < first_program, "{:?}", part.log);
+    let said = "bytes a call, each whole 64 KiB block by one block erase...";
+    assert!(lines.iter().any(|line| line.ends_with(said)), "{lines:?}");
+}
+
+/// **A SECTOR ERASE LEAVES `FLASH_DEVINFO` ALONE**: what every route did before the block erase
+/// existed, and what a board whose flash part nobody named still gets.
+#[test]
+fn an_rp2350_write_by_sector_erase_never_touches_flash_devinfo() {
+    let bytes = rp2350_image(64 * 1024 + 100);
+    let board = FakeRp2350::with_flash(2 * 64 * 1024);
+    let (outcome, part, _) = rp2350_write(board, &bytes, Erase::Sectors);
+
+    outcome.unwrap_or_else(|why| panic!("{why}: {:?}", part.log));
+    assert_eq!(part.erase_with_d8h, [false, false]);
+    assert!(part.log.iter().all(|entry| !entry.starts_with("boot RAM")), "{:?}", part.log);
+    assert_eq!(part.devinfo_word(), RP2350_DEVINFO_WORD);
+}
+
+/// **AN ERASE THAT FAILS STILL CLEARS THE BIT**, and the write reports the erase's failure, which
+/// is why it stopped.
+#[test]
+fn an_rp2350_block_erase_that_fails_still_clears_the_d8h_bit() {
+    let mut board = FakeRp2350::with_flash(4 * 64 * 1024);
+    board.erase_hangs_at = Some(lamella_cmsis_dap_rp2350::XIP_BASE + 64 * 1024 + 4096);
+    let bytes = rp2350_image(3 * 64 * 1024);
+    let (outcome, part, _) = rp2350_write(board, &bytes, Erase::Blocks);
+
+    let why = outcome.expect_err("the second call hangs").to_string();
+    assert!(why.contains("did not return"), "{why}");
+    assert_eq!(part.erase_with_d8h, [true, true], "the first call, then the one that hung");
+    assert_eq!(part.devinfo_word(), RP2350_DEVINFO_WORD, "{:?}", part.log);
+    assert!(part.log.iter().all(|entry| !entry.starts_with("program ")), "{:?}", part.log);
+}
+
+/// **A BIT THE CHIP's OTP ALREADY SET IS LEFT SET**: the bootrom erases by block for such a part
+/// whatever this write does, and clearing the bit afterwards would undo the chip's own setting.
+#[test]
+fn an_rp2350_block_erase_leaves_a_d8h_bit_it_did_not_set() {
+    let mut board = FakeRp2350::with_flash(2 * 64 * 1024);
+    board.ram.insert(RP2350_DEVINFO & !3, RP2350_DEVINFO_WORD | RP2350_DEVINFO_D8H);
+    let bytes = rp2350_image(64 * 1024);
+    let (outcome, part, lines) = rp2350_write(board, &bytes, Erase::Blocks);
+
+    outcome.unwrap_or_else(|why| panic!("{why}: {:?}", part.log));
+    assert_eq!(part.erase_with_d8h, [true]);
+    assert_eq!(part.devinfo_word(), RP2350_DEVINFO_WORD | RP2350_DEVINFO_D8H);
+    assert!(part.log.iter().all(|entry| !entry.starts_with("boot RAM")), "{:?}", part.log);
+    let said = "  FLASH_DEVINFO already allows the 64 KiB block erase";
+    assert!(lines.iter().any(|line| line == said), "{lines:?}");
+}
+
+/// **A POINTER THAT DOES NOT LEAD INTO BOOT RAM IS NOT WRITTEN THROUGH**: the erase goes a sector
+/// at a time, as it would have, and the write says why.
+#[test]
+fn an_rp2350_block_erase_writes_through_no_pointer_outside_boot_ram() {
+    let mut board = FakeRp2350::with_flash(2 * 64 * 1024);
+    board.point_devinfo_at(0x2000_0100);
+    let bytes = rp2350_image(64 * 1024);
+    let (outcome, part, lines) = rp2350_write(board, &bytes, Erase::Blocks);
+
+    outcome.unwrap_or_else(|why| panic!("{why}: {:?}", part.log));
+    assert_eq!(part.erase_with_d8h, [false]);
+    assert!(part.log.iter().all(|entry| !entry.starts_with("boot RAM")), "{:?}", part.log);
+    let said = "0x20000100 is not in boot RAM, so the erase goes a 4 KiB sector at a time";
+    assert!(lines.iter().any(|line| line.contains(said)), "{lines:?}");
+}
+
+/// **A FAULT RIGHT AFTER THE D8h BIT GOES ON STILL CLEARS IT**: the read that checks the set is the
+/// first transfer after it, and its fault stops the write before anything is erased, with the bit
+/// cleared on the way out and the fault reported.
+#[test]
+fn an_rp2350_block_erase_clears_the_d8h_bit_when_the_read_after_the_set_faults() {
+    let mut board = FakeRp2350::with_flash(2 * 64 * 1024);
+    board.fail_devinfo_read_while_set = Some(ProbeError::Ack(lamella_probe_core::Ack::Fault));
+    let bytes = rp2350_image(64 * 1024);
+    let (outcome, part, _) = rp2350_write(board, &bytes, Erase::Blocks);
+
+    let why = outcome.expect_err("the read after the set faults");
+    assert!(
+        matches!(why, FlashError::Probe(ProbeError::Ack(lamella_probe_core::Ack::Fault))),
+        "{why}"
+    );
+    assert_eq!(part.devinfo_word(), RP2350_DEVINFO_WORD, "{:?}", part.log);
+    let set = first_at(&part.log, |entry| entry == "boot RAM set 0x00800000 at 0x400e0014");
+    let failed = first_at(&part.log, |entry| entry == "FLASH_DEVINFO read failed");
+    let clear = first_at(&part.log, |entry| entry == "boot RAM clear 0x00800000 at 0x400e0014");
+    assert!(set < failed && failed < clear, "{:?}", part.log);
+    assert!(part.erase_with_d8h.is_empty(), "nothing erased: {:?}", part.log);
+}
+
+/// **A CLEAR THAT FAILS TOO IS SAID, AND THE WRITE's SECOND ATTEMPT CLEARS THE BIT THE FIRST SET.**
+/// The fault at the faster clock makes the write again at the fallback clock, whose reset-halt
+/// leaves boot RAM as the first attempt left it, with the D8h bit set. Handed the record of the bit
+/// as the write first found it, the second attempt erases by block and clears the bit, rather than
+/// taking it for the chip's own setting.
+#[test]
+fn a_clear_that_fails_is_said_and_the_second_attempt_clears_the_bit_the_first_set() {
+    use lamella_cmsis_dap_rp2350::{FALLBACK_SWD_CLOCK_HZ, SWD_CLOCK_HZ};
+    use lamella_probe_core::Ack;
+
+    let bytes = rp2350_image(64 * 1024 + 100);
+    let board = FakeRp2350::with_flash(4 * 64 * 1024);
+    let (written, clocks, lines, board) =
+        write_rp2350_over(board, &bytes, Erase::Blocks, |clock_hz, board| {
+            if clock_hz == SWD_CLOCK_HZ {
+                board.fail_devinfo_read_while_set = Some(ProbeError::Ack(Ack::Fault));
+                board.fail_clear = Some(ProbeError::Ack(Ack::Fault));
+            }
+        });
+
+    let report = written.unwrap_or_else(|why| panic!("{why}: {:?} {lines:?}", board.log));
+    assert_eq!(report.verification, Verification::ReadBack);
+    assert_eq!(clocks, vec![SWD_CLOCK_HZ, FALLBACK_SWD_CLOCK_HZ]);
+    assert_eq!(&board.flash[..bytes.len()], &bytes[..]);
+    assert_eq!(board.devinfo_word(), RP2350_DEVINFO_WORD, "{:?}", board.log);
+    assert_eq!(board.erase_with_d8h, [true, true], "the second attempt erased by block");
+    let unclear = "  FLASH_DEVINFO's D8h bit could not be cleared (transfer not acknowledged: \
+                   Fault); the chip's next boot sets FLASH_DEVINFO up afresh";
+    assert!(lines.iter().any(|line| line == unclear), "{lines:?}");
+    let still = "  FLASH_DEVINFO still has the D8h bit an earlier attempt of this write set, so \
+                 it is cleared after the erase";
+    assert!(lines.iter().any(|line| line == still), "{lines:?}");
+    assert!(!lines.iter().any(|line| line.contains("already allows")), "{lines:?}");
+}
+
+/// **A WRITE THAT PANICS WHILE THE D8h BIT IS SET CLEARS IT AS IT UNWINDS**: here the line that
+/// says the erase panics, as printing it does when standard output has gone.
+#[test]
+fn a_write_that_panics_while_the_d8h_bit_is_set_clears_it_as_it_unwinds() {
+    let bytes = rp2350_image(64 * 1024);
+    let board = FakeRp2350::with_flash(2 * 64 * 1024);
+    let mut backend = Rp2350Probe::new(board, 0x4c01_3477, "an RP2350")
+        .erasing(Erase::Blocks)
+        .saying(|line: &str| assert!(!line.contains("flash_op ERASE"), "standard output has gone"));
+    let image = Image {
+        bytes: &bytes,
+        base: lamella_cmsis_dap_rp2350::XIP_BASE,
+    };
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        flash(&mut backend, &image, VerifyPolicy::ReadBack, &Allow::Any)
+    }));
+
+    assert!(unwound.is_err(), "the line panicked");
+    let part = &backend.target;
+    assert_eq!(part.devinfo_word(), RP2350_DEVINFO_WORD, "{:?}", part.log);
+    let set = first_at(&part.log, |entry| entry == "boot RAM set 0x00800000 at 0x400e0014");
+    let clear = first_at(&part.log, |entry| entry == "boot RAM clear 0x00800000 at 0x400e0014");
+    assert!(set < clear && part.erase_with_d8h.is_empty(), "{:?}", part.log);
+}
+
 /// **THE RP2350 ROUTE READS THE IMAGE BACK ONCE**, inside the part routine, and the contract compares
 /// that one read against the caller's bytes. A second read of the same window would take as long
 /// as the first, and could find nothing the first did not.
@@ -5061,21 +5319,39 @@ fn write_rp2350_on_a_fake(
     bytes: &[u8],
     mut fault: impl FnMut(u32) -> Option<ProbeError>,
 ) -> (Result<Report, String>, Vec<u32>, Vec<String>, FakeRp2350) {
+    write_rp2350_over(FakeRp2350::new(), bytes, Erase::Sectors, |clock_hz, board| {
+        board.fail_staging = fault(clock_hz);
+    })
+}
+
+/// [`write_rp2350_on_a_fake`] over `board`, erasing the way `erase` says, with `prepare` setting
+/// the board up for each attempt at that attempt's clock. Each attempt is handed the record of boot
+/// RAM's D8h bit the one before it left, as the route hands it.
+fn write_rp2350_over(
+    board: FakeRp2350,
+    bytes: &[u8],
+    erase: Erase,
+    mut prepare: impl FnMut(u32, &mut FakeRp2350),
+) -> (Result<Report, String>, Vec<u32>, Vec<String>, FakeRp2350) {
     let image = Image {
         bytes,
         base: lamella_cmsis_dap_rp2350::XIP_BASE,
     };
-    let mut board = Some(FakeRp2350::new());
+    let mut board = Some(board);
     let mut clocks = Vec::new();
     let mut lines = Vec::new();
     let written = write_rp2350(
-        |clock_hz, say| {
+        |clock_hz, d8h, say| {
             clocks.push(clock_hz);
             let mut fake = board.take().expect("the board, back from the last attempt");
-            fake.fail_staging = fault(clock_hz);
-            let mut backend = Rp2350Probe::new(fake, 0x4c01_3477, "an RP2350").saying(&mut *say);
+            prepare(clock_hz, &mut fake);
+            let mut backend = Rp2350Probe::new(fake, 0x4c01_3477, "an RP2350")
+                .erasing(erase)
+                .remembering(*d8h)
+                .saying(&mut *say);
             let written = flash(&mut backend, &image, VerifyPolicy::ReadBack, &Allow::Any)
                 .map_err(|why| rp2350_failure(why, clock_hz));
+            *d8h = backend.remembered();
             board = Some(backend.target);
             written
         },
@@ -5103,11 +5379,12 @@ fn rp2350_steps(board: &FakeRp2350) -> Vec<&str> {
 #[test]
 fn a_probe_that_cannot_be_opened_says_nothing_was_written_before_the_first_write_only() {
     let missing = "no probe is attached, or the one that is reports no serial number and so cannot be named.";
-    let first = write_rp2350(|_, _| Err(Rp2350Failure::Unopened(missing.to_owned())), &mut |_| {});
+    let first =
+        write_rp2350(|_, _, _| Err(Rp2350Failure::Unopened(missing.to_owned())), &mut |_| {});
     assert_eq!(first.err().as_deref(), Some(format!("{missing}\n\nNothing was written.").as_str()));
     let mut attempts = 0;
     let retried = write_rp2350(
-        |_, _| {
+        |_, _, _| {
             attempts += 1;
             Err(if attempts == 1 {
                 Rp2350Failure::AtSpeed("the part answered FAULT".to_owned())

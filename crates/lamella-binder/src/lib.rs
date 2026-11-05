@@ -1,7 +1,7 @@
 #![cfg_attr(not(test), no_std)]
 #![forbid(unsafe_code)]
 
-//! Semantic analysis for C# 1.0 (ECMA-334 1st edition).
+//! Semantic analysis for C# 1.0 and 1.2 (ECMA-334 2nd edition, ISO/IEC 23270:2003).
 
 extern crate alloc;
 

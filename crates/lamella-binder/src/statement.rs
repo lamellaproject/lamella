@@ -360,6 +360,74 @@ fn tuple_literal_names(expr: &Expr) -> Vec<Option<Box<str>>> {
     }
 }
 
+/// Lowers a monitor on a reference to a single evaluation, Enter, and try/finally Exit.
+/// The caller checks that `held` is a reference and gives nested guards distinct spans.
+/// Enter precedes the try so a failed acquisition never executes Exit (ECMA-334 15.12).
+pub fn lower_monitor(held: BoundExpr, bound_body: BoundStmt, span: Span) -> BoundStmtKind {
+    let object_ty = TypeSymbol::Special(SpecialType::Object);
+    let void_ty = TypeSymbol::Special(SpecialType::Void);
+    let monitor: TypeSymbol = {
+        let parts: alloc::vec::Vec<Box<str>> =
+            alloc::vec!["System".into(), "Threading".into(), "Monitor".into()];
+        TypeSymbol::Named(parts.into_boxed_slice())
+    };
+    let lock_obj: Box<str> = format!("<lock>{}", span.start).into();
+    let monitor_call = |name: &str| BoundStmt {
+        kind: BoundStmtKind::Expression(BoundExpr {
+            kind: BoundExprKind::Call {
+                callee: Box::new(BoundExpr {
+                    kind: BoundExprKind::MethodGroup {
+                        receiver: Box::new(BoundExpr {
+                            kind: BoundExprKind::TypeReference(monitor.clone()),
+                            ty: monitor.clone(),
+                        }),
+                        name: name.into(),
+                    },
+                    ty: TypeSymbol::Error,
+                }),
+                arguments: alloc::vec![BoundExpr {
+                    kind: BoundExprKind::Local(lock_obj.clone()),
+                    ty: object_ty.clone(),
+                }],
+                method: Some(MethodReference {
+                    declaring_type: monitor.clone(),
+                    name: name.into(),
+                    parameters: alloc::vec![object_ty.clone()],
+                    return_type: void_ty.clone(),
+                    is_static: true,
+                    is_vararg: false,
+                    instantiation: None,
+                    declaring_instantiation: None,
+                }),
+            },
+            ty: void_ty.clone(),
+        }),
+        span,
+    };
+    let lock_decl = BoundStmt {
+        kind: BoundStmtKind::Local {
+            ty: object_ty.clone(),
+            declarators: alloc::vec![BoundDeclarator {
+                name: lock_obj.clone(),
+                initializer: Some(held),
+            }],
+        },
+        span,
+    };
+    let guarded = BoundStmt {
+        kind: BoundStmtKind::Try {
+            body: Box::new(bound_body),
+            catches: Vec::new(),
+            finally: Some(Box::new(BoundStmt {
+                kind: BoundStmtKind::Block(alloc::vec![monitor_call("Exit")]),
+                span: Span::HIDDEN,
+            })),
+        },
+        span,
+    };
+    BoundStmtKind::Block(alloc::vec![lock_decl, monitor_call("Enter"), guarded])
+}
+
 impl Binder {
     /// Binds a statement (15).
     pub fn bind_statement(&mut self, stmt: &Stmt) -> BoundStmt {
@@ -518,7 +586,13 @@ impl Binder {
                 } else {
                     self.resolve_type_ref(ty)
                 };
-                let single_dimension_array = matches!(collection.ty, TypeSymbol::Array { rank: 1, .. });
+                // Edition 2, 15.8.4, uses System.Array's object-valued enumerator for every rank.
+                // Later single-dimensional arrays use indexed loads of the array element type.
+                // Rectangular arrays (19.6) retain System.Array's row-major enumeration order;
+                // non-array collections use their selected enumerator pattern (15.8.4).
+                let single_dimension_array =
+                    matches!(collection.ty, TypeSymbol::Array { rank: 1, .. })
+                        && !self.language_version().array_foreach_uses_object_current();
                 self.enter_readonly_local(name, "foreach iteration variable");
                 let enumerable = if single_dimension_array {
                     None
@@ -1057,13 +1131,25 @@ impl Binder {
         if self.assignable(&current, element_type) {
             return self.convert(current, element_type);
         }
+        // Edition 4, 13.2.3 and 13.2.5, allow a type parameter to convert to any interface.
+        // Boxing through object preserves value copies and reference identity before the cast.
+        if self.is_bare_type_parameter(&current.ty)
+            && self
+                .model()
+                .get_by_symbol(element_type)
+                .is_some_and(|info| info.kind == crate::symbols::TypeKind::Interface)
+        {
+            let boxed = self.convert(current, &TypeSymbol::Special(SpecialType::Object));
+            return self.bind_cast(boxed, element_type.clone(), span);
+        }
         self.bind_cast(current, element_type.clone(), span)
     }
 
-    /// Desugars `foreach (V name in collection)` over a non-array collection into the
+    /// Desugars `foreach (V name in collection)` over a selected enumerable collection into the
     /// enumerator pattern (15.8.4): a block that declares the enumerator, then
-    /// `while (e.MoveNext())` whose body binds `name = (V)e.Current` ahead of the original
+    /// `while (e.MoveNext())` whose body converts `e.Current` ahead of the original
     /// body, the loop wrapped in `try { ... } finally { <e> as IDisposable, disposed if non-null }`.
+    /// Arrays in C# 2 and later first convert Current to the array element type (edition 4).
     /// `None` when the collection has no `GetEnumerator` (the array/error path is kept).
     /// `statement_span` is the whole statement's, where an element that does not convert is
     /// reported (CS0030), as csc reports it.
@@ -1076,46 +1162,48 @@ impl Binder {
         collection: BoundExpr,
         body: &Stmt,
     ) -> Option<BoundStmtKind> {
-        let get_enumerator = self.resolve_instance_method(&collection.ty, "GetEnumerator", span)?;
+        let array_element = match &collection.ty {
+            TypeSymbol::Array { element, .. }
+                if !self.language_version().array_foreach_uses_object_current() =>
+            {
+                Some((**element).clone())
+            }
+            _ => None,
+        };
+        let (collection, get_enumerator) = self.foreach_collection(collection, span)?;
         let enumerator_type = get_enumerator.return_type.clone();
-        let ienumerator: TypeSymbol = {
-            let parts: alloc::vec::Vec<Box<str>> =
-                alloc::vec!["System".into(), "Collections".into(), "IEnumerator".into()];
-            TypeSymbol::Named(parts.into_boxed_slice())
+        // Lookup includes inherited interface members, including IEnumerator's members on
+        // IDictionaryEnumerator. A pattern enumerator need not implement IEnumerator; an
+        // incomplete pattern cannot borrow its members without changing the collection too.
+        let members =
+            self.quietly(|binder| binder.foreach_enumerator_members(&enumerator_type, span));
+        let Some((move_next, get_current)) = members else {
+            self.report(Diagnostic::new(
+                DiagnosticKind::ForEachInvalidEnumerator {
+                    enumerator: format!("{enumerator_type}").into(),
+                    collection: format!("{}", collection.ty).into(),
+                },
+                statement_span,
+            ));
+            return Some(BoundStmtKind::Block(Vec::new()));
         };
-        let pattern_move_next = self
-            .resolve_instance_method(&enumerator_type, "MoveNext", span)
-            .filter(|method| {
-                matches!(method.return_type, TypeSymbol::Special(SpecialType::Boolean))
-            });
-        let pattern_current = self.resolve_property_getter(&enumerator_type, "Current", span);
-        let (move_next, get_current) = match (pattern_move_next, pattern_current) {
-            (Some(move_next), Some(get_current)) => (move_next, get_current),
-            _ => (
-                self.resolve_instance_method(&ienumerator, "MoveNext", span)?,
-                self.resolve_property_getter(&ienumerator, "Current", span)?,
-            ),
-        };
+        if self.foreach_needs_generic_interface_calls(&enumerator_type, &move_next, &get_current) {
+            let mut diagnostic = Diagnostic::new(
+                DiagnosticKind::FeatureNotInThisBuild {
+                    feature: "foreach interface calls and disposal on a type-parameter enumerator"
+                        .into(),
+                    permitted_by: self.language_version(),
+                    instead: None,
+                },
+                statement_span,
+            );
+            // The pattern is valid; defer this capability refusal until all language checks pass.
+            diagnostic.phase = crate::diagnostic::DiagnosticPhase::Emission;
+            self.report(diagnostic);
+            return Some(BoundStmtKind::Block(Vec::new()));
+        }
 
         let enumerator: Box<str> = format!("<enumerator>{}", span.start).into();
-        let call = |receiver: BoundExpr, method: MethodReference| -> BoundExpr {
-            let return_type = method.return_type.clone();
-            let call = BoundExpr {
-                kind: BoundExprKind::Call {
-                    callee: Box::new(BoundExpr {
-                        kind: BoundExprKind::MethodGroup {
-                            receiver: Box::new(receiver),
-                            name: method.name.clone(),
-                        },
-                        ty: TypeSymbol::Error,
-                    }),
-                    arguments: Vec::new(),
-                    method: Some(method),
-                },
-                ty: return_type.clone(),
-            };
-            crate::bound::Binder::deref_ref_return(call, &return_type)
-        };
         let enumerator_ref = || BoundExpr {
             kind: BoundExprKind::Local(enumerator.clone()),
             ty: enumerator_type.clone(),
@@ -1126,13 +1214,20 @@ impl Binder {
                 ty: enumerator_type.clone(),
                 declarators: alloc::vec![BoundDeclarator {
                     name: enumerator.clone(),
-                    initializer: Some(call(collection, get_enumerator)),
+                    initializer: Some(self.foreach_call(collection, get_enumerator, statement_span)),
                 }],
             },
             span,
         };
-        let condition = call(enumerator_ref(), move_next);
-        let current = call(enumerator_ref(), get_current);
+        // Edition 4, 15.8.4, assigns (V)(T)e.Current: a rectangular array's T is its element
+        // type even though IEnumerator.Current returns object. Edition 2 casts directly to V.
+        let condition = self.foreach_call(enumerator_ref(), move_next, statement_span);
+        let current = self.foreach_call(enumerator_ref(), get_current, statement_span);
+        let current = if let Some(array_element) = array_element {
+            self.foreach_element_value(current, &array_element, statement_span)
+        } else {
+            current
+        };
         let element_value = self.foreach_element_value(current, element_type, statement_span);
 
         self.enter_scope_at(span);
@@ -1142,6 +1237,7 @@ impl Binder {
         self.exit_loop();
         self.exit_scope();
 
+        // while (<e>.MoveNext()) { V name = <converted Current>; <body> }
         let element_decl = BoundStmt {
             kind: BoundStmtKind::Local {
                 ty: element_type.clone(),
@@ -1212,7 +1308,11 @@ impl Binder {
                             ty: TypeSymbol::Special(SpecialType::Boolean),
                         },
                         then_branch: Box::new(BoundStmt {
-                            kind: BoundStmtKind::Expression(call(disposable_ref(), dispose)),
+                            kind: BoundStmtKind::Expression(self.foreach_call(
+                                disposable_ref(),
+                                dispose,
+                                statement_span,
+                            )),
                             span,
                         }),
                         else_branch: None,
@@ -1243,45 +1343,6 @@ impl Binder {
     fn bind_lock(&mut self, expression: &Expr, body: &Stmt) -> BoundStmtKind {
         let span = expression.span;
         let object_ty = TypeSymbol::Special(SpecialType::Object);
-        let void_ty = TypeSymbol::Special(SpecialType::Void);
-        let monitor: TypeSymbol = {
-            let parts: alloc::vec::Vec<Box<str>> =
-                alloc::vec!["System".into(), "Threading".into(), "Monitor".into()];
-            TypeSymbol::Named(parts.into_boxed_slice())
-        };
-        let lock_obj: Box<str> = format!("<lock>{}", span.start).into();
-        let monitor_call = |name: &str| BoundStmt {
-            kind: BoundStmtKind::Expression(BoundExpr {
-                kind: BoundExprKind::Call {
-                    callee: Box::new(BoundExpr {
-                        kind: BoundExprKind::MethodGroup {
-                            receiver: Box::new(BoundExpr {
-                                kind: BoundExprKind::TypeReference(monitor.clone()),
-                                ty: monitor.clone(),
-                            }),
-                            name: name.into(),
-                        },
-                        ty: TypeSymbol::Error,
-                    }),
-                    arguments: alloc::vec![BoundExpr {
-                        kind: BoundExprKind::Local(lock_obj.clone()),
-                        ty: object_ty.clone(),
-                    }],
-                    method: Some(MethodReference {
-                        declaring_type: monitor.clone(),
-                        name: name.into(),
-                        parameters: alloc::vec![object_ty.clone()],
-                        return_type: void_ty.clone(),
-                        is_static: true,
-                        is_vararg: false,
-                        instantiation: None,
-                        declaring_instantiation: None,
-                    }),
-                },
-                ty: void_ty.clone(),
-            }),
-            span,
-        };
         let held = self.bind_expression(expression);
         if !held.ty.is_error() && self.is_value_type(&held.ty) {
             let ty = format!("{}", held.ty).into();
@@ -1291,64 +1352,45 @@ impl Binder {
             ));
         }
         let held = self.convert(held, &object_ty);
-        let lock_decl = BoundStmt {
-            kind: BoundStmtKind::Local {
-                ty: object_ty.clone(),
-                declarators: alloc::vec![BoundDeclarator {
-                    name: lock_obj.clone(),
-                    initializer: Some(held),
-                }],
-            },
-            span,
-        };
         self.enter_lock();
         let bound_body = self.bind_statement(body);
         self.exit_lock();
-        let guarded = BoundStmt {
-            kind: BoundStmtKind::Try {
-                body: Box::new(bound_body),
-                catches: Vec::new(),
-                finally: Some(Box::new(BoundStmt {
-                    kind: BoundStmtKind::Block(alloc::vec![monitor_call("Exit")]),
-                    span: Span::HIDDEN,
-                })),
+        lower_monitor(held, bound_body, span)
+    }
+
+    /// A resource must convert implicitly to `IDisposable` (ECMA-334 fourth edition 15.13;
+    /// seventh edition 13.14). Nullable boxing uses the payload's interfaces (11.3.1).
+    /// C# 8 also permits a ref struct with an accessible instance `void Dispose()` pattern.
+    /// A missing base or interface prevents a definitive conversion error.
+    fn check_disposable(&mut self, ty: &TypeSymbol, span: Span) {
+        if ty.is_error() {
+            return;
+        }
+        let disposable =
+            TypeSymbol::Named(alloc::vec!["System".into(), "IDisposable".into()].into());
+        let resource = crate::conversion::nullable_underlying(ty).unwrap_or(ty);
+        if self.satisfies_named_constraint(resource, &disposable) {
+            return;
+        }
+        if self.language_version() >= LanguageVersion::CSharp8
+            && self.type_is_by_ref_like(resource)
+            && self.resolve_dispose_pattern(resource).is_some()
+        {
+            return;
+        }
+        if !self.has_complete_type_hierarchy(resource) {
+            return;
+        }
+        self.report(Diagnostic::new(
+            DiagnosticKind::UsingRequiresDisposable {
+                ty: format!("{ty}").into(),
             },
             span,
-        };
-        BoundStmtKind::Block(alloc::vec![lock_decl, monitor_call("Enter"), guarded])
+        ));
     }
 
-    /// Desugars `using (resource) body` (15.13) to `try`/`finally` that disposes the resource:
-    /// `{ <resource decl>; try { body } finally { IDisposable __d = r as IDisposable;
-    /// if (__d != null) __d.Dispose(); } }`. A declaration's resources are disposed in reverse
-    /// (nested-using order); an expression resource is held in a temp. The `as`+null-check form
-    /// is conformant (a null resource is a no-op), like the foreach `Dispose` (15.8.4).
-    /// Reports `CS1674` when `ty` provably does not implement `System.IDisposable`. Conservative
-    /// in the same direction as the exception rule: a type that does not resolve, or one whose
-    /// interface list this compilation cannot see in full, reports nothing rather than accusing
-    /// code it cannot check.
-    fn check_disposable(&mut self, ty: &TypeSymbol, span: Span) {
-        if ty.is_error() || !matches!(ty, TypeSymbol::Named(_)) {
-            return;
-        }
-        if self.model().get_by_symbol(ty).is_none() {
-            return;
-        }
-        let implements = self.interfaces_including_inherited(ty).iter().any(|interface| {
-            self.model()
-                .get_by_symbol(interface)
-                .is_some_and(|info| &*info.namespace == "System" && &*info.name == "IDisposable")
-        });
-        if !implements {
-            self.report(Diagnostic::new(
-                DiagnosticKind::UsingRequiresDisposable {
-                    ty: format!("{ty}").into(),
-                },
-                span,
-            ));
-        }
-    }
-
+    /// Saves each resource once and nests `try`/`finally` blocks so disposal runs in reverse
+    /// acquisition order. Reference and nullable resources are disposed only when present.
     fn bind_using(
         &mut self,
         span: Span,
@@ -1371,6 +1413,7 @@ impl Binder {
                     BoundStmtKind::Local { ty, .. } => ty.clone(),
                     _ => TypeSymbol::Error,
                 };
+                // Every declarator shares the type, so admission is checked once.
                 self.check_disposable(&resource_ty, ty.span);
                 let mut first = Some(first);
                 for declarator in declarators {
@@ -1389,6 +1432,7 @@ impl Binder {
             UsingResource::Expression(expression) => {
                 let span = expression.span;
                 let bound = self.bind_expression(expression);
+                self.check_disposable(&bound.ty, span);
                 let resource_ty = if matches!(bound.ty, TypeSymbol::Special(SpecialType::Null)) {
                     TypeSymbol::Special(SpecialType::Object)
                 } else {
@@ -1431,26 +1475,82 @@ impl Binder {
             resources.iter().map(|_| Vec::new()).collect();
         for (index, (name, resource_ty)) in resources.iter().enumerate() {
             let finally_stmts = &mut per_resource[index];
-            if self.is_value_type(resource_ty) {
-                if let Some(dispose) = self.resolve_instance_method(resource_ty, "Dispose", span) {
-                    finally_stmts.push(BoundStmt {
-                        kind: BoundStmtKind::Expression(BoundExpr {
-                            kind: BoundExprKind::Call {
-                                callee: Box::new(BoundExpr {
-                                    kind: BoundExprKind::MethodGroup {
-                                        receiver: Box::new(BoundExpr {
-                                            kind: BoundExprKind::Local(name.clone()),
-                                            ty: resource_ty.clone(),
-                                        }),
-                                        name: dispose.name.clone(),
-                                    },
-                                    ty: TypeSymbol::Error,
-                                }),
-                                arguments: Vec::new(),
-                                method: Some(dispose.clone()),
+            if crate::conversion::nullable_underlying(resource_ty).is_some() {
+                let resource = BoundExpr {
+                    kind: BoundExprKind::Local(name.clone()),
+                    ty: resource_ty.clone(),
+                };
+                let has_value = self.resolve_property_getter(resource_ty, "HasValue", span);
+                let value = self.nullable_value(resource.clone(), span);
+                let (Some(has_value), Some(value)) = (has_value, value) else {
+                    self.report(Diagnostic::new(
+                        DiagnosticKind::FeatureNotInThisBuild {
+                            feature: "nullable resource disposal without the Nullable accessors"
+                                .into(),
+                            permitted_by: self.language_version(),
+                            instead: None,
+                        },
+                        span,
+                    ));
+                    continue;
+                };
+                let call = |receiver: BoundExpr, method: MethodReference| BoundExpr {
+                    ty: method.return_type.clone(),
+                    kind: BoundExprKind::Call {
+                        callee: Box::new(BoundExpr {
+                            kind: BoundExprKind::MethodGroup {
+                                receiver: Box::new(receiver),
+                                name: method.name.clone(),
                             },
-                            ty: dispose.return_type.clone(),
+                            ty: TypeSymbol::Error,
                         }),
+                        arguments: Vec::new(),
+                        method: Some(method),
+                    },
+                };
+                // The payload is a copy. Interface dispatch also handles explicit implementations
+                // and constrained type parameters without boxing the value.
+                finally_stmts.push(BoundStmt {
+                    kind: BoundStmtKind::If {
+                        condition: call(resource, has_value),
+                        then_branch: Box::new(BoundStmt {
+                            kind: BoundStmtKind::Expression(call(value, dispose.clone())),
+                            span,
+                        }),
+                        else_branch: None,
+                    },
+                    span,
+                });
+                continue;
+            }
+            if self.is_value_type(resource_ty) {
+                // Interface dispatch includes explicit implementations. Ref structs use
+                // their pattern member because they cannot be boxed to an interface.
+                let resource = BoundExpr {
+                    kind: BoundExprKind::Local(name.clone()),
+                    ty: resource_ty.clone(),
+                };
+                let call = if self.type_is_by_ref_like(resource_ty) {
+                    self.bind_dispose_pattern(resource)
+                } else {
+                    Some(BoundExpr {
+                        kind: BoundExprKind::Call {
+                            callee: Box::new(BoundExpr {
+                                kind: BoundExprKind::MethodGroup {
+                                    receiver: Box::new(resource),
+                                    name: dispose.name.clone(),
+                                },
+                                ty: TypeSymbol::Error,
+                            }),
+                            arguments: Vec::new(),
+                            method: Some(dispose.clone()),
+                        },
+                        ty: dispose.return_type.clone(),
+                    })
+                };
+                if let Some(call) = call {
+                    finally_stmts.push(BoundStmt {
+                        kind: BoundStmtKind::Expression(call),
                         span,
                     });
                 }
@@ -1877,12 +1977,21 @@ impl Binder {
             return TypeSymbol::Error;
         }
         self.quietly(|binder| {
-            let Some(get_enumerator) =
-                binder.resolve_instance_method(&collection.ty, "GetEnumerator", span)
+            let Some((_, get_enumerator)) = binder.foreach_collection(collection.clone(), span)
             else {
                 return TypeSymbol::Error;
             };
             let enumerator_type = get_enumerator.return_type;
+            if binder.is_bare_type_parameter(&enumerator_type)
+                || binder
+                    .model()
+                    .get_by_symbol(&enumerator_type)
+                    .is_some_and(|info| info.kind == crate::symbols::TypeKind::Interface)
+            {
+                return binder
+                    .foreach_enumerator_members(&enumerator_type, span)
+                    .map_or(TypeSymbol::Error, |(_, current)| current.return_type);
+            }
             binder
                 .resolve_property_getter(&enumerator_type, "Current", span)
                 .map_or_else(
@@ -2077,7 +2186,7 @@ impl Binder {
         ));
     }
 
-    /// Binds a BOOLEAN CONDITION (14.11.2): the value itself when it converts to `bool`, an
+    /// Binds a Boolean condition (fourth edition 14.17): the value itself when it converts to `bool`, an
     /// `op_Implicit` call when a user conversion reaches one, an `op_True` call when the type
     /// declares one, and a diagnostic otherwise.
     ///
@@ -2458,6 +2567,37 @@ mod tests {
     use crate::resolve::TypeTable;
     use lamella_syntax::parser::parse_statement;
 
+    #[test]
+    fn using_an_incomplete_reference_hierarchy_does_not_claim_a_conversion_error() {
+        use crate::symbols::{Model, TypeInfo, TypeKind};
+
+        for version in [
+            LanguageVersion::CSharp2,
+            LanguageVersion::CSharp7_3,
+            LanguageVersion::DEFAULT,
+        ] {
+            for resource in ["using (value) {}", "using (Resource held = value) {}"] {
+                let mut model = Model::new();
+                let mut info = TypeInfo::new("", "Resource", TypeKind::Class);
+                info.is_external = true;
+                info.base = Some(TypeSymbol::Named(["UnavailableBase".into()].into()));
+                model.insert(info);
+                let mut binder = Binder::with_model(model);
+                binder.set_language_version(version);
+                binder.enter_scope();
+                binder.declare_local("value", TypeSymbol::Named(["Resource".into()].into()));
+                binder.bind_statement(&parse_statement(resource).statement);
+                let diagnostics = binder.into_diagnostics();
+                assert!(
+                    !diagnostics
+                        .iter()
+                        .any(|diagnostic| diagnostic.code() == 1674),
+                    "{version:?} {resource}: {diagnostics:?}"
+                );
+            }
+        }
+    }
+
     fn codes(source: &str) -> Vec<u16> {
         codes_at(source, lamella_syntax::version::LanguageVersion::DEFAULT)
     }
@@ -2602,7 +2742,7 @@ mod tests {
         assert_eq!(codes("try { } catch { }"), []);
         assert_eq!(codes("{ int x = true; }"), [29]);
         assert_eq!(codes("{ int n = 1; lock (n) { int m = n; } }"), [185]);
-        assert_eq!(codes("using (int r = 5) { int s = r; }"), []);
+        assert_eq!(codes("using (int r = 5) { int s = r; }"), [1674]);
         assert_eq!(codes("checked { int v = 1; }"), []);
         assert_eq!(codes("done: ;"), []);
     }

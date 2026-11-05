@@ -12,16 +12,28 @@ public enum Rp2350SioLayout {
     public static let GPIO_HI_IN_WIDTH: Int32 = 32
     public static let GPIO_OUT_SET_OFF: UInt32 = 0x18
     public static let GPIO_OUT_SET_WIDTH: Int32 = 32
+    public static let GPIO_HI_OUT_SET_OFF: UInt32 = 0x1C
+    public static let GPIO_HI_OUT_SET_WIDTH: Int32 = 32
     public static let GPIO_OUT_CLR_OFF: UInt32 = 0x20
     public static let GPIO_OUT_CLR_WIDTH: Int32 = 32
+    public static let GPIO_HI_OUT_CLR_OFF: UInt32 = 0x24
+    public static let GPIO_HI_OUT_CLR_WIDTH: Int32 = 32
     public static let GPIO_OUT_XOR_OFF: UInt32 = 0x28
     public static let GPIO_OUT_XOR_WIDTH: Int32 = 32
+    public static let GPIO_HI_OUT_XOR_OFF: UInt32 = 0x2C
+    public static let GPIO_HI_OUT_XOR_WIDTH: Int32 = 32
     public static let GPIO_OE_OFF: UInt32 = 0x30
     public static let GPIO_OE_WIDTH: Int32 = 32
+    public static let GPIO_HI_OE_OFF: UInt32 = 0x34
+    public static let GPIO_HI_OE_WIDTH: Int32 = 32
     public static let GPIO_OE_SET_OFF: UInt32 = 0x38
     public static let GPIO_OE_SET_WIDTH: Int32 = 32
+    public static let GPIO_HI_OE_SET_OFF: UInt32 = 0x3C
+    public static let GPIO_HI_OE_SET_WIDTH: Int32 = 32
     public static let GPIO_OE_CLR_OFF: UInt32 = 0x40
     public static let GPIO_OE_CLR_WIDTH: Int32 = 32
+    public static let GPIO_HI_OE_CLR_OFF: UInt32 = 0x44
+    public static let GPIO_HI_OE_CLR_WIDTH: Int32 = 32
 
     // -- fields: <REG>_<FIELD> = the shifted mask; _LSB = the shift --
 }

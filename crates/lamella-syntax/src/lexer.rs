@@ -1829,7 +1829,8 @@ impl<'a> Lexer<'a> {
     }
 
     /// Builds the token for a real-literal text (without its suffix). A `decimal` (`m`) literal
-    /// keeps its EXACT 96-bit mantissa and scale; a `float` or `double` is kept as `f64` bits.
+    /// keeps its exact 96-bit mantissa and scale, except that ISO-1 gives zero literals scale zero;
+    /// a `float` or `double` is kept as `f64` bits.
     fn numeric_real_token(&mut self, text: &str, suffix: RealSuffix, start: usize) -> TokenKind {
         let stripped;
         let text = if text.contains('_') {
@@ -1840,6 +1841,15 @@ impl<'a> Lexer<'a> {
         };
         if suffix == RealSuffix::Decimal {
             if let Some((lo, mid, hi, scale)) = parse_decimal_literal(text) {
+                let scale = if self.options.version.decimal_zero_literal_is_normalized()
+                    && lo == 0
+                    && mid == 0
+                    && hi == 0
+                {
+                    0
+                } else {
+                    scale
+                };
                 return TokenKind::DecimalLiteral { lo, mid, hi, scale };
             }
             self.report(

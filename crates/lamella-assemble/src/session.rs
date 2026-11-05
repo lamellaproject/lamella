@@ -8,12 +8,15 @@ use alloc::format;
 use alloc::string::{String, ToString};
 use alloc::vec::Vec;
 use lamella_binder::{
-    Binder, Model, TypeSymbol, bind_compilation_unit_with_model, collect_into, load_assembly,
+    BindOptions, Binder, Model, TypeSymbol, bind_compilation_unit_with_reference_model,
+    collect_into, load_assembly,
 };
 use lamella_metadata::Assembly;
 use lamella_syntax::ast::{CompilationUnit, NamespaceMember, UsingDirective, UsingKind};
-use lamella_syntax::parser::parse_submission;
+use lamella_syntax::lexer::LexOptions;
+use lamella_syntax::parser::parse_submission_with;
 use lamella_syntax::span::Span;
+use lamella_syntax::version::LanguageVersion;
 
 /// One accumulated session variable -- a persistent instance field of `__Repl`.
 struct SessionField {
@@ -33,6 +36,8 @@ struct SessionField {
 /// returns a [`SubmissionResult`] whose `delta` the runtime loads. Open a session with
 /// [`Session::new`] and load [`Session::bootstrap`] once before the first submission.
 pub struct Session {
+    /// The dialect shared by parsing, diagnostics, and emission for every submission.
+    language_version: LanguageVersion,
     /// The reference world (the BCL), loaded once and cloned per submission to bind against.
     base_model: Model,
     /// The session variables, in declaration order.
@@ -71,12 +76,19 @@ impl Session {
     /// (an empty `__Repl`) is [`Session::bootstrap`].
     #[must_use]
     pub fn new(references: &[Assembly]) -> Session {
+        Self::with_language_version(references, LanguageVersion::DEFAULT)
+    }
+
+    /// Opens a session with a fixed dialect for all submissions, including declared type bodies.
+    #[must_use]
+    pub fn with_language_version(references: &[Assembly], version: LanguageVersion) -> Session {
         let mut base_model = Model::new();
         for reference in references {
             load_assembly(&mut base_model, reference, "");
         }
         base_model.link_bases();
         Session {
+            language_version: version,
             base_model,
             fields: Vec::new(),
             imports: Vec::new(),
@@ -106,7 +118,13 @@ impl Session {
     }
 
     fn compile_submission_on_this_stack(&mut self, source: &str) -> SubmissionResult {
-        let parsed = parse_submission(source);
+        let parsed = parse_submission_with(
+            source,
+            LexOptions {
+                version: self.language_version,
+                ..LexOptions::default()
+            },
+        );
         let parse_diagnostics: Vec<Diagnostic> = parsed
             .diagnostics
             .iter()
@@ -138,7 +156,14 @@ impl Session {
                 unsafe_blocks: Vec::new(),
             };
             diagnostics.extend(
-                bind_compilation_unit_with_model(&types_unit, model.clone())
+                bind_compilation_unit_with_reference_model(
+                    &types_unit,
+                    model.clone(),
+                    BindOptions {
+                        language_version: self.language_version,
+                        ..BindOptions::default()
+                    },
+                )
                     .iter()
                     .map(Diagnostic::from_binder),
             );
@@ -147,6 +172,7 @@ impl Session {
         let initial_fields = self.field_table();
         let occurrences = self.occurrences();
         let mut binder = Binder::with_model(model.clone());
+        binder.set_language_version(self.language_version);
         for namespace in self.imports.iter().chain(new_imports.namespaces.iter()) {
             binder.import_namespace(namespace);
         }
@@ -181,6 +207,7 @@ impl Session {
             &binding.return_type,
             &parsed.types,
             &model,
+            self.language_version,
             &module_name,
             &module_name,
         ) {
@@ -230,6 +257,7 @@ impl Session {
             };
             collect_into(&mut model, &unit);
             let mut binder = lamella_binder::Binder::with_model(model);
+            binder.set_language_version(self.language_version);
             lamella_binder::program::qualify_declared_signatures(
                 &mut binder,
                 &unit.usings,

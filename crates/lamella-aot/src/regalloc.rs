@@ -264,8 +264,17 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                 Inst::LoadTypeDesc { object } => {
                     mark(&mut lo, &mut hi, &mut defined, *object, ip);
                 }
-                Inst::InterfaceHasTag { descriptor, .. } | Inst::TypeName { descriptor } => {
+                Inst::InterfaceHasTag { descriptor, .. }
+                | Inst::DescriptorWord { descriptor, .. }
+                | Inst::TypeName { descriptor } => {
                     mark(&mut lo, &mut hi, &mut defined, *descriptor, ip);
+                }
+                Inst::InterfaceHasArrayElementTag {
+                    descriptor,
+                    array_descriptor,
+                } => {
+                    mark(&mut lo, &mut hi, &mut defined, *descriptor, ip);
+                    mark(&mut lo, &mut hi, &mut defined, *array_descriptor, ip);
                 }
                 Inst::TypeDescAddr { .. } => {}
                 Inst::TypeDescLiteral { .. } => {}
@@ -676,7 +685,16 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         }
         Inst::FieldAddr { base, .. } => f(*base),
         Inst::LoadTypeDesc { object } => f(*object),
-        Inst::InterfaceHasTag { descriptor, .. } | Inst::TypeName { descriptor } => f(*descriptor),
+        Inst::InterfaceHasTag { descriptor, .. }
+        | Inst::DescriptorWord { descriptor, .. }
+        | Inst::TypeName { descriptor } => f(*descriptor),
+        Inst::InterfaceHasArrayElementTag {
+            descriptor,
+            array_descriptor,
+        } => {
+            f(*descriptor);
+            f(*array_descriptor);
+        }
         Inst::VirtualFuncAddr { object, .. } | Inst::InterfaceFuncAddr { object, .. } => f(*object),
         Inst::TypeDescAddr { .. } => {}
         Inst::TypeDescLiteral { .. } => {}

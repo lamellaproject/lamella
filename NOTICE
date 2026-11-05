@@ -19,6 +19,10 @@ Third-party components:
   Copyright The Mbed TLS Contributors, under your choice of the Apache License,
   Version 2.0 or the GNU General Public License v2.0 or later. See that directory's
   LICENSE.
+- crates/lamella-tls-roots/ -- the root certificates of the Mozilla CA certificate
+  store (from Mozilla NSS's certdata.txt, as curl redistributes it in cacert.pem)
+  and the index generated from them, src/roots.der and src/bundle.rs, under the
+  Mozilla Public License, Version 2.0. See LICENSE-MPL in that directory.
 - The Python implementation (the crates/lamella-py-* crates) -- the parts that
   compatibility with CPython dictates: the public names and shapes of the Python
   standard library functions and classes that it implements, and the exception

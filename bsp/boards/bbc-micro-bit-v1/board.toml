@@ -5,6 +5,8 @@
 kind = "board"
 board = "bbc-micro-bit-v1"
 vendor = "bbc"
+maker = "BBC"
+product = "micro:bit v1"
 family = "nrf51"
 part = "nrf51822"
 product_model = 1           # lamella_wire::product_model::MICROBIT_V1

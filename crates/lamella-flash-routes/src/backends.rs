@@ -185,6 +185,12 @@ pub struct Rp2350Probe<A: TargetAccess, S = fn(&str)> {
     /// The image as the part routine's verify read it back, once [`program`](FlashBackend::program)
     /// has run.
     read: Option<Vec<u32>>,
+    /// How the part routine erases the image's span: a sector at a time unless
+    /// [`erasing`](Rp2350Probe::erasing) says the board's flash takes the block erase.
+    erase: lamella_cmsis_dap_rp2350::Erase,
+    /// Boot RAM's D8h bit as the write's first attempt found it: see
+    /// [`remembering`](Rp2350Probe::remembering).
+    d8h: lamella_cmsis_dap_rp2350::D8hAsFound,
 }
 
 impl<A: TargetAccess> Rp2350Probe<A> {
@@ -204,6 +210,8 @@ impl<A: TargetAccess> Rp2350Probe<A> {
             },
             say: |_| {},
             read: None,
+            erase: lamella_cmsis_dap_rp2350::Erase::Sectors,
+            d8h: lamella_cmsis_dap_rp2350::D8hAsFound::default(),
         }
     }
 }
@@ -216,7 +224,33 @@ impl<A: TargetAccess, S> Rp2350Probe<A, S> {
             expect: self.expect,
             say,
             read: self.read,
+            erase: self.erase,
+            d8h: self.d8h,
         }
+    }
+
+    /// The same backend, erasing the way `erase` says: [`Erase::Blocks`] only for a board whose
+    /// flash device takes the 64 KiB block erase, as its route states.
+    ///
+    /// [`Erase::Blocks`]: lamella_cmsis_dap_rp2350::Erase::Blocks
+    #[must_use]
+    pub fn erasing(self, erase: lamella_cmsis_dap_rp2350::Erase) -> Self {
+        Rp2350Probe { erase, ..self }
+    }
+
+    /// The same backend, for a later attempt of a write whose earlier attempt left `d8h`: boot
+    /// RAM's D8h bit as that write first found it, which [`remembered`](Rp2350Probe::remembered)
+    /// handed back. With it, a bit the earlier attempt set and could not clear is cleared here.
+    #[must_use]
+    pub fn remembering(self, d8h: lamella_cmsis_dap_rp2350::D8hAsFound) -> Self {
+        Rp2350Probe { d8h, ..self }
+    }
+
+    /// Boot RAM's D8h bit as the write first found it, once [`program`](FlashBackend::program) has
+    /// looked: for the write's next attempt, through [`remembering`](Rp2350Probe::remembering).
+    #[must_use]
+    pub fn remembered(&self) -> lamella_cmsis_dap_rp2350::D8hAsFound {
+        self.d8h
     }
 }
 
@@ -266,9 +300,11 @@ impl<A: TargetAccess, S: FnMut(&str)> FlashBackend for Rp2350Probe<A, S> {
 
     fn program(&mut self, image: &Image<'_>) -> Result<(), FlashError> {
         let say = &mut self.say;
-        let read = lamella_cmsis_dap_rp2350::flash_image(&mut self.target, image.bytes, |line| {
-            say(&format!("  {line}"));
-        })?;
+        let (target, erase, d8h) = (&mut self.target, self.erase, &mut self.d8h);
+        let read =
+            lamella_cmsis_dap_rp2350::flash_image_with(target, image.bytes, erase, d8h, |line| {
+                say(&format!("  {line}"));
+            })?;
         self.read = Some(read);
         Ok(())
     }
@@ -345,13 +381,22 @@ pub(crate) fn rp2350_failure(error: FlashError, clock_hz: u32) -> Rp2350Failure 
 /// erase, the program, the read-back and the start. **THE WRITE IS MADE AGAIN WHOLE, NEVER
 /// RESUMED**, so the second is the route's write at the clock the other CMSIS-DAP routes run at,
 /// and checks every byte as the first would have. Its failure is the answer: there is no third.
+///
+/// Each attempt is handed the same record of boot RAM's D8h bit as the write first found it
+/// ([`Rp2350Probe::remembering`]), so a second attempt clears a bit the first set for a block erase
+/// and could not clear.
 pub(crate) fn write_rp2350(
-    mut attempt: impl FnMut(u32, &mut dyn FnMut(&str)) -> Result<Report, Rp2350Failure>,
+    mut attempt: impl FnMut(
+        u32,
+        &mut lamella_cmsis_dap_rp2350::D8hAsFound,
+        &mut dyn FnMut(&str),
+    ) -> Result<Report, Rp2350Failure>,
     say: &mut dyn FnMut(&str),
 ) -> Result<Report, String> {
     use lamella_cmsis_dap_rp2350::{FALLBACK_SWD_CLOCK_HZ, SWD_CLOCK_HZ};
 
-    match attempt(SWD_CLOCK_HZ, say) {
+    let mut d8h = lamella_cmsis_dap_rp2350::D8hAsFound::default();
+    match attempt(SWD_CLOCK_HZ, &mut d8h, say) {
         Ok(report) => Ok(report),
         Err(Rp2350Failure::Other(why)) => Err(why),
         Err(Rp2350Failure::Unopened(why)) => Err(crate::nothing_written(why)),
@@ -361,7 +406,7 @@ pub(crate) fn write_rp2350(
                 megahertz(SWD_CLOCK_HZ),
                 megahertz(FALLBACK_SWD_CLOCK_HZ)
             ));
-            attempt(FALLBACK_SWD_CLOCK_HZ, say).map_err(|failure| match failure {
+            attempt(FALLBACK_SWD_CLOCK_HZ, &mut d8h, say).map_err(|failure| match failure {
                 Rp2350Failure::AtSpeed(why) | Rp2350Failure::Other(why) | Rp2350Failure::Unopened(why) => why,
             })
         }

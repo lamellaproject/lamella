@@ -13,3 +13,8 @@ description = "Shared plumbing for the interpreter firmware crates: the bare-met
 # included rather than compiled as a library.
 publish = false
 [dependencies]
+
+# What the USB carrier's own host test includes it against.
+[dev-dependencies]
+lamella-wire = { path = "../lamella-wire" }
+usb-device = { version = "0.3.2" }

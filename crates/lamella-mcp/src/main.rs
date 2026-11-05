@@ -271,8 +271,9 @@ fn open(target: &str) -> Result<AnyTransport, Value> {
     open_target(target, BAUD, CONNECT_TIMEOUT).map_err(|error| {
         text_result(
             format!(
-                "cannot open {target}: {error:?}. This server can open: {}. lamella_list_devices lists \
+                "cannot open {target}: {}. This server can open: {}. lamella_list_devices lists \
                  what is attached, and the target to give for each.",
+                lamella_wire_host::open_failure(error),
                 lamella_wire_host::available_carriers().join(", ")
             ),
             true,
@@ -524,7 +525,10 @@ fn identify_over(scope: &DeviceScope, transport: &mut impl lamella_wire::Transpo
             format!("{target}: {}", lamella_wire_host::version_mismatch(lamella_wire::PROTOCOL_VERSION, target_min, target_max)),
             true,
         ),
-        Err(e) => text_result(format!("no HELLO_ACK from {target} (is serve firmware running?): {e:?}"), true),
+        Err(e) => text_result(
+            format!("no answer to a HELLO from {target} (is serve firmware running?): {}.", lamella_wire_host::link_failure(e)),
+            true,
+        ),
     }
 }
 
@@ -678,7 +682,9 @@ fn deploy_status_over(scope: &DeviceScope, t: &mut impl lamella_wire::Transport,
     let timeout = Duration::from_secs(5);
     let session = match hello_blocking(&mut *t, 0, host_caps(), timeout) {
         Ok(session) => session,
-        Err(e) => return text_result(format!("no HELLO_ACK from {target}: {e:?}"), true),
+        Err(e) => {
+            return text_result(format!("no answer to a HELLO from {target}: {}.", lamella_wire_host::link_failure(e)), true);
+        }
     };
     if let Err(why) = scope.permits_link_board(session.identity.product_model) {
         return text_result(why, true);
@@ -686,7 +692,7 @@ fn deploy_status_over(scope: &DeviceScope, t: &mut impl lamella_wire::Transport,
     match deployed_status_blocking(&mut *t, 1, timeout) {
         Ok(Some(sum)) => text_result(format!("{target} holds a resident image, checksum {sum:#018x}"), false),
         Ok(None) => text_result(format!("{target} has no resident image."), false),
-        Err(e) => text_result(format!("status query on {target} failed: {e:?}"), true),
+        Err(e) => text_result(format!("status query on {target} failed: {}.", lamella_wire_host::link_failure(e)), true),
     }
 }
 
@@ -953,7 +959,8 @@ That is set when the server starts.",
             Ok(row) => row,
             Err(error) => return text_result(error, true),
         };
-        let chosen = match lamella_flash_routes::route_for(row, via) {
+        let request = lamella_flash_routes::route_for_request(row, via, probe, volume, device);
+        let chosen = match request {
             Ok(programmer) => programmer,
             Err(error) => return text_result(error, true),
         };
@@ -1418,7 +1425,7 @@ enum Then {
     /// started (`lamella_deploy`).
     Start,
     /// Start it without a reset and follow its run under this watch (`lamella_run_on_device`).
-    Run(Watch),
+    Run(Watch<'static>),
 }
 
 /// `lamella_deploy` and `lamella_run_on_device` on an open carrier: HELLO the board, refuse it
@@ -1449,7 +1456,7 @@ fn to_firmware(
         return text_result(why, true);
     }
     if runs && !session.caps.has(Capabilities::EXEC_NO_RESET) {
-        return text_result(only_under_the_debugger(session.identity.product_model), true);
+        return text_result("The board cannot start a stored program.".to_owned(), true);
     }
     let board = lamella_wire_host::boards::board_answering(session.identity.product_model);
     let (built, image) = match image_for(board.as_deref()) {
@@ -1502,29 +1509,12 @@ fn no_session(target: &str, error: lamella_wire::TransportError) -> String {
             lamella_wire_host::version_mismatch(lamella_wire::PROTOCOL_VERSION, target_min, target_max)
         ),
         error => format!(
-            "{target} did not answer a HELLO ({error:?}). It opened, so the board is attached and the \
+            "{target} did not answer a HELLO ({}). It opened, so the board is attached and the \
              connection carries data; what did not happen is an answer, and the usual reason is that \
-             the board is not running Lamella firmware. Nothing was written."
+             the board is not running Lamella firmware. Nothing was written.",
+            lamella_wire_host::link_failure(error)
         ),
     }
-}
-
-/// What `lamella_run_on_device` says to a board whose firmware cannot start a stored program
-/// without a reset.
-///
-/// **REFUSED RATHER THAN RUN UNDER THE DEBUGGER**, where the `lamella` command runs it: the
-/// debugger steps one thread, and a debugged program that never ends would hold this server's one
-/// request loop, which `--run-timeout` cannot stop.
-#[cfg(feature = "bake")]
-fn only_under_the_debugger(product_model: u16) -> String {
-    let board = on_device::the_board(lamella_wire_host::board_name(product_model));
-    format!(
-        "{}'s firmware runs a program over this connection only under the debugger, which steps ONE \
-         thread, so lamella_run_on_device does not run it there: a program that starts a thread or \
-         waits on a socket would stop. lamella_debug_launch runs a program on it under the debugger; \
-         firmware built from this release runs one under the board's scheduler. Nothing was written.",
-        on_device::capitalized(&board)
-    )
 }
 
 /// The most of what a device route writes, in bytes, that its answer keeps.
@@ -1734,7 +1724,7 @@ impl DeviceScope {
     /// Bare `--allow-device` permits any known board -- the behavior before scopes existed, kept
     /// because a single-board bench does not need a narrowing and should not be made to write one.
     /// `--allow-device=<term>[,<term>]` narrows, and terms of the SAME kind are alternatives while
-    /// terms of DIFFERENT kinds must all hold: `board:rpi-pico2,probe:E66` means that model through
+    /// terms of DIFFERENT kinds must all hold: `board:raspberrypi-pico-2,probe:E66` means that model through
     /// that probe.
     ///
     fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
@@ -2249,108 +2239,12 @@ fn main() {
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "bake")]
-    mod a_program_and_its_references {
-        use super::super::{build, carried_text, library_on_this_machine, tools};
-        use lamella_wire_host::engine::LcscCompiler;
-
-        /// A dotnet/iot program that names no board class: it opens a pin through
-        /// `new GpioController()` alone, and says whether it could.
-        pub(super) const OPENS_A_PIN: &str = "using System;\nusing System.Device.Gpio;\n\npublic static class Program\n{\n    \
-            public static void Main()\n    {\n        try\n        {\n            \
-            GpioController controller = new GpioController();\n            controller.OpenPin(15, PinMode.Output);\n            \
-            Console.WriteLine(\"gpio opened\");\n        }\n        catch (PlatformNotSupportedException)\n        {\n            \
-            Console.WriteLine(\"gpio refused\");\n        }\n    }\n}\n";
-
-        const PRINTS: &str = "public static class Program\n{\n    public static int Main()\n    {\n        \
-            System.Console.WriteLine(\"hello\");\n        return 42;\n    }\n}\n";
+    pub(super) mod a_program_and_its_references {
+        use super::super::tools;
 
         /// The names a call gives in `references`.
-        fn named(names: &[&str]) -> Vec<String> {
+        pub(crate) fn named(names: &[&str]) -> Vec<String> {
             names.iter().map(|name| (*name).to_owned()).collect()
-        }
-
-        /// What an image prints when it is booted and run here, as the firmware boots it.
-        fn run_baked(image: Vec<u8>) -> String {
-            let image: &'static [u8] = Box::leak(image.into_boxed_slice());
-            let (module, entry) = lamella_cil_runtime::Module::from_baked(image).expect("it boots");
-            let entry = entry.expect("it records its entry point");
-            let mut vm = lamella_cil_runtime::Vm::new();
-            vm.set_memory_backend(Box::new(lamella_cil_runtime::memory::SafeMemory::new()));
-            let entry = lamella_cil_runtime::boot_baked(&module, &mut vm, entry).expect("its static constructors run");
-            lamella_cil_runtime::run(&module, &mut vm, entry, Vec::new()).expect("it runs to the end");
-            String::from_utf16_lossy(vm.output())
-        }
-
-        /// **A PROGRAM USING A LIBRARY IT DOES NOT NAME IS REFUSED THE WAY A .NET BUILD REFUSES IT**:
-        /// the compiler's own diagnostics, then the assembly it is missing and to add the reference.
-        /// `System.Device.Gpio` is not part of the corlib, so a caller is never left believing it is.
-        #[test]
-        fn a_program_using_a_library_it_does_not_name_is_refused_naming_the_reference_to_add() {
-            let Ok(compiler) = LcscCompiler::discover() else {
-                return;
-            };
-            let refusal = build(&compiler, Some("rpi-pico2-w"), &[], OPENS_A_PIN).err().expect("no reference, no image");
-            assert!(refusal.starts_with("compile failed:"), "{refusal}");
-            assert!(refusal.contains("error CS"), "the compiler's own diagnostics: {refusal}");
-            assert!(
-                refusal.contains("The program uses System.Device.Gpio, which it does not reference.")
-                    && refusal.contains("add \"System.Device.Gpio\" to `references`."),
-                "the assembly and what to do: {refusal}"
-            );
-        }
-
-        /// **A PROGRAM NAMING ITS LIBRARY IS BAKED FOR THE BOARD, AND THE ANSWER SAYS WHAT THE IMAGE
-        /// CARRIES**: each assembly, which build of it, and its code. Built for a Pico 2 W, the image
-        /// binds the RP2350 family's `System.Device.Gpio`, and `new GpioController()` alone opens the
-        /// board's pin; built for no board, it carries the build every family shares, which refuses.
-        #[test]
-        fn a_program_naming_its_library_bakes_for_the_board_and_says_what_the_image_carries() {
-            let Ok(compiler) = LcscCompiler::discover() else {
-                return;
-            };
-            let (set, baked) = build(&compiler, Some("rpi-pico2-w"), &named(&["System.Device.Gpio"]), OPENS_A_PIN)
-                .unwrap_or_else(|refusal| panic!("it bakes: {refusal}"));
-            let said = carried_text(&set, &baked);
-            assert!(said.starts_with("The image carries:"), "{said}");
-            assert!(said.contains("\n    corlib: the corlib, which every program references; "), "{said}");
-            assert!(
-                said.contains("\n    System.Device.Gpio: referenced, the rp2350 chip family's build; "),
-                "the library and its build: {said}"
-            );
-            assert!(said.contains("\n    the program: compiled from the code; "), "{said}");
-            assert!(said.contains(" B of code"), "{said}");
-            assert_eq!(run_baked(baked.image), "gpio opened\n");
-
-            let (set, baked) = build(&compiler, None, &named(&["System.Device.Gpio"]), OPENS_A_PIN)
-                .unwrap_or_else(|refusal| panic!("it bakes for no board: {refusal}"));
-            assert!(
-                carried_text(&set, &baked).contains("System.Device.Gpio: referenced, the build every chip family shares; "),
-                "{}",
-                carried_text(&set, &baked)
-            );
-            assert_eq!(run_baked(baked.image), "gpio refused\n");
-        }
-
-        /// **THE CORLIB IS IMPLICIT**, so naming it changes nothing, and a library named and not used
-        /// is said to be carried nowhere. A name no library answers to is refused with the ones there are.
-        #[test]
-        fn the_corlib_is_implicit_and_a_name_no_library_answers_to_is_refused() {
-            let Ok(compiler) = LcscCompiler::discover() else {
-                return;
-            };
-            let (set, baked) = build(&compiler, None, &named(&["mscorlib", "system.device.gpio"]), PRINTS)
-                .unwrap_or_else(|refusal| panic!("it bakes: {refusal}"));
-            let said = carried_text(&set, &baked);
-            assert!(!said.contains("mscorlib"), "the corlib's name is no reference: {said}");
-            assert!(
-                said.contains("\n    System.Device.Gpio: referenced, and not carried, because the program does not use it"),
-                "{said}"
-            );
-            assert_eq!(run_baked(baked.image), "hello\n");
-
-            let refusal = build(&compiler, None, &named(&["System.Device.Gpioo"]), PRINTS).err().expect("no such library");
-            assert!(refusal.starts_with("no library named \"System.Device.Gpioo\""), "{refusal}");
-            assert!(refusal.contains("System.Device.Gpio"), "it lists the libraries there are: {refusal}");
         }
 
         /// **EACH TOOL THAT TAKES `references` LISTS THE LIBRARIES THIS SERVER CAN REFERENCE**, from
@@ -2377,101 +2271,6 @@ mod tests {
             assert!(!description("lamella_run").contains("can reference:"), "{}", description("lamella_run"));
             assert!(tools(&[]).to_string().contains("holds no library besides the corlib"));
         }
-
-        /// **A PROGRAM USING A LIBRARY IS REFUSED BY `lamella_run` BY NAME**, which runs a program on
-        /// this machine against the corlib alone, and is pointed at the tools that take the library.
-        #[test]
-        fn a_run_on_this_machine_names_a_library_the_program_uses_and_the_tools_that_take_it() {
-            let Ok(compiler) = LcscCompiler::discover() else {
-                return;
-            };
-            let said = library_on_this_machine(&compiler, OPENS_A_PIN);
-            assert!(said.contains("The program uses System.Device.Gpio, a library besides the corlib."), "{said}");
-            assert!(said.contains("lamella_run_on_device runs it on a board"), "{said}");
-            assert!(library_on_this_machine(&compiler, PRINTS).is_empty(), "a program using none is told nothing");
-        }
-
-        /// The server these tests ask, or `None` where no class library is discoverable.
-        fn server() -> Option<super::super::Server> {
-            let scope = super::super::DeviceScope::default();
-            super::super::Server::new(scope, None, std::time::Duration::from_secs(20)).ok()
-        }
-
-        fn text(answer: &serde_json::Value) -> &str {
-            answer["content"][0]["text"].as_str().unwrap_or_default()
-        }
-
-        /// **`board` BUILDS WHAT THE DEVICE TOOLS BUILD FOR THAT BOARD, AND WITHOUT ONE A LIBRARY A
-        /// FAMILY BUILDS ITS OWN OF IS REFUSED.** For a Pico 2 W the image binds the RP2350 family's
-        /// `System.Device.Gpio` and opens the board's pin. For no board it would carry the build every
-        /// family shares, which throws on a board, so it is refused, naming `board`; a program using no
-        /// such library still bakes for no board. A name the catalog does not know builds nothing.
-        #[test]
-        fn a_board_builds_what_the_device_tools_build_and_none_refuses_a_family_library() {
-            let Some(server) = server() else {
-                return;
-            };
-            let gpio = named(&["System.Device.Gpio"]);
-            let (set, baked) = server
-                .built(OPENS_A_PIN, &gpio, Some("rpi-pico2-w"))
-                .unwrap_or_else(|refusal| panic!("it builds for the board: {refusal}"));
-            assert!(carried_text(&set, &baked).contains("System.Device.Gpio: referenced, the rp2350 chip family's build"));
-            assert_eq!(run_baked(baked.image), "gpio opened\n");
-
-            let refusal = server.built(OPENS_A_PIN, &gpio, None).err().expect("no board, no family's build");
-            assert!(refusal.starts_with("The image would carry System.Device.Gpio, which each chip family"), "{refusal}");
-            assert!(refusal.contains("name one in `board`"), "{refusal}");
-            assert!(refusal.contains("lamella_deploy and lamella_run_on_device build it"), "{refusal}");
-
-            let (_, baked) = server.built(PRINTS, &[], None).unwrap_or_else(|refusal| panic!("it bakes: {refusal}"));
-            assert_eq!(run_baked(baked.image), "hello\n");
-
-            let unknown = server.built(PRINTS, &[], Some("rpi-pico9")).err().expect("an unknown board");
-            assert!(unknown.contains("this build knows no board \"rpi-pico9\""), "{unknown}");
-        }
-
-        /// **`lamella_size` WITH `board` ANSWERS WHAT `lamella build <file> --board <id>` ANSWERS**: the
-        /// size, what the image carries, and lamella_fit's verdict for that board, led by what the
-        /// number leaves out. The `target` it declared and never read is refused by name.
-        #[test]
-        fn a_size_for_a_board_says_whether_it_fits_and_the_old_target_is_refused() {
-            use serde_json::json;
-            let Some(server) = server() else {
-                return;
-            };
-            let gpio = named(&["System.Device.Gpio"]);
-            let answer = server.tool_size(OPENS_A_PIN, &gpio, &json!({ "board": "rpi-pico2-w" }));
-            assert_eq!(answer["isError"], json!(false), "{}", text(&answer));
-            let said = text(&answer);
-            assert!(said.starts_with("baked flash image: "), "{said}");
-            assert!(said.contains(" bytes, for the rpi-pico2-w.\nThe image carries:"), "{said}");
-            assert!(
-                said.contains(&format!(
-                    "Does it fit on rpi-pico2-w? The number compared is the baked flash image, which excludes {}",
-                    lamella_wire_host::bake::SIZE_LEAVES_OUT
-                )),
-                "{said}"
-            );
-            assert!(said.contains("\"flash_fit\": \"Fits"), "lamella_fit's verdict: {said}");
-
-            let refused = server.tool_size(OPENS_A_PIN, &gpio, &json!({}));
-            assert_eq!(refused["isError"], json!(true));
-            assert!(text(&refused).contains("name one in `board`"), "{}", text(&refused));
-
-            let target = server.tool_size(PRINTS, &[], &json!({ "target": "rpi-pico2" }));
-            assert_eq!(target["isError"], json!(true));
-            assert!(text(&target).starts_with("lamella_size takes no target."), "{}", text(&target));
-
-            let carrierless = lamella_catalog::BOARDS
-                .iter()
-                .map(|(id, _)| *id)
-                .find(|id| lamella_catalog::resolve(id).is_ok_and(|(table, _)| table.carrier.kind.is_empty()));
-            if let Some(board) = carrierless {
-                let answer = server.tool_size(PRINTS, &[], &json!({ "board": board }));
-                assert_eq!(answer["isError"], json!(true), "{}", text(&answer));
-                assert!(text(&answer).contains(&format!("{board} cannot run a baked flash image")), "{}", text(&answer));
-            }
-        }
     }
 
     /// **THIS SERVER COMPILES C# ONLY, AND ITS CONTRACT SAYS SO**: a call asking for Python is refused
@@ -2493,7 +2292,7 @@ mod tests {
 
     /// A board at the other end of a Lamella Link connection, for the tools that open one, in every
     /// build.
-    mod a_board_answering_a_hello {
+    pub(super) mod a_board_answering_a_hello {
         use super::super::{DeviceScope, deploy_status_over, identify_over};
         use lamella_wire::{MemTransport, Transport, TransportError, msg};
         use serde_json::{Value, json};
@@ -2538,11 +2337,11 @@ mod tests {
             }
         }
 
-        pub(super) fn text(answer: &Value) -> &str {
+        pub(crate) fn text(answer: &Value) -> &str {
             answer["content"][0]["text"].as_str().expect("the answer is text")
         }
 
-        pub(super) fn scoped(term: &str) -> DeviceScope {
+        pub(crate) fn scoped(term: &str) -> DeviceScope {
             DeviceScope::parse([format!("--allow-device={term}")].into_iter()).expect("the term parses")
         }
 
@@ -2557,7 +2356,7 @@ mod tests {
         fn identifying_a_board_the_scope_does_not_name_is_refused_after_its_hello() {
             let v2 = lamella_wire::product_model::MICROBIT_V2;
             let mut board = Board::answering_as(v2);
-            let answer = identify_over(&scoped("board:rpi-pico2"), &mut board, "COM0");
+            let answer = identify_over(&scoped("board:raspberrypi-pico-2"), &mut board, "COM0");
             assert_eq!(answer["isError"], json!(true));
             assert!(text(&answer).contains("may not write this board"), "{}", text(&answer));
             assert!(text(&answer).contains("BBC micro:bit v2"), "it names the board: {}", text(&answer));
@@ -2575,7 +2374,7 @@ mod tests {
         fn a_deploy_status_of_a_board_the_scope_does_not_name_stops_at_its_hello() {
             let v2 = lamella_wire::product_model::MICROBIT_V2;
             let mut board = Board::answering_as(v2);
-            let answer = deploy_status_over(&scoped("board:rpi-pico2"), &mut board, "COM0");
+            let answer = deploy_status_over(&scoped("board:raspberrypi-pico-2"), &mut board, "COM0");
             assert_eq!(answer["isError"], json!(true));
             assert!(text(&answer).contains("may not write this board"), "{}", text(&answer));
             assert!(board.sent.iter().all(|sent| *sent == msg::HELLO), "only a HELLO was sent: {:?}", board.sent);
@@ -2590,7 +2389,7 @@ mod tests {
     #[cfg(feature = "bake")]
     mod a_route_to_firmware {
         use super::a_board_answering_a_hello::{Board, bare, scoped, text};
-        use super::super::{Server, Then, to_firmware};
+        use super::super::{Then, to_firmware};
         use lamella_wire::{MemTransport, Transport, TransportError, msg};
         use serde_json::json;
         use std::time::Duration;
@@ -2605,7 +2404,7 @@ mod tests {
         #[test]
         fn a_deploy_builds_its_image_for_the_board_that_answered() {
             for (model, expected) in [
-                (lamella_wire::product_model::PICO2_W, Some("rpi-pico2-w")),
+                (lamella_wire::product_model::PICO2_W, Some("raspberrypi-pico-2-w")),
                 (lamella_wire::product_model::UNKNOWN, None),
             ] {
                 let mut asked = None;
@@ -2625,7 +2424,7 @@ mod tests {
         fn a_deploy_to_a_board_the_scope_does_not_name_stops_at_its_hello() {
             let v2 = lamella_wire::product_model::MICROBIT_V2;
             let mut board = Board::answering_as(v2);
-            let answer = to_firmware(&scoped("board:rpi-pico2"), &mut board, "COM0", sixteen_bytes, Then::Start);
+            let answer = to_firmware(&scoped("board:raspberrypi-pico-2"), &mut board, "COM0", sixteen_bytes, Then::Start);
             assert_eq!(answer["isError"], json!(true));
             assert!(text(&answer).contains("may not write this board"), "{}", text(&answer));
             assert!(text(&answer).contains("BBC micro:bit v2"), "it names the board: {}", text(&answer));
@@ -2639,15 +2438,14 @@ mod tests {
         }
 
         /// **A RUN NEEDS A BOARD THAT STARTS A STORED PROGRAM WITHOUT A RESET**, and one whose firmware
-        /// cannot is refused before anything is built or written, naming the tool that runs it there.
+        /// cannot is refused before anything is built or written.
         #[test]
-        fn a_run_on_a_board_that_runs_programs_only_under_the_debugger_is_refused() {
+        fn a_run_on_a_board_that_cannot_start_a_stored_program_is_refused() {
             let mut board = Board::answering_as(lamella_wire::product_model::PICO2_W);
             let run = Then::Run(lamella_wire_host::on_device::Watch::for_at_most(Duration::from_secs(5)));
             let answer = to_firmware(&bare(), &mut board, "COM0", |_| panic!("nothing is built"), run);
             assert_eq!(answer["isError"], json!(true));
-            assert!(text(&answer).contains("only under the debugger"), "{}", text(&answer));
-            assert!(text(&answer).contains("lamella_debug_launch"), "{}", text(&answer));
+            assert_eq!(text(&answer), "The board cannot start a stored program.");
             assert_eq!(board.sent, [msg::HELLO], "nothing but the HELLO was sent");
         }
 
@@ -2712,37 +2510,45 @@ mod tests {
             assert_eq!(answer["isError"], json!(true), "{}", text(&answer));
             assert!(text(&answer).contains("does not hold the image that was sent"), "{}", text(&answer));
         }
+    }
 
-        /// **A PROGRAM NAMING `System.Device.Gpio` RUNS ON A PICO 2 W AND OPENS ITS PIN**, through the
-        /// route `lamella run --device` takes: built for the board that answered, stored by the board's
-        /// own deploy serve, started without a reset and followed to its end. The same program naming
-        /// no reference is refused before a board is opened, naming the reference to add.
+    /// `lamella_flash` chooses its route by the rule `lamella flash` uses.
+    mod a_flash_route {
+        use super::super::{DeviceScope, Server};
+        use serde_json::json;
+        use std::time::Duration;
+
+        /// **`lamella_flash` HANDS `probe` TO THE ROUTE RULE**: a probe named with a drive gets
+        /// that rule's refusal, saying what to leave out, before any probe or drive is listed. The
+        /// image is not UF2, and the drive named is no drive.
         #[test]
-        fn a_program_naming_its_library_runs_on_a_pico_2_w_and_one_naming_none_is_refused() {
-            use lamella_wire_host::loopback::{LoopbackBoard, RamFlash, answer_as};
-            let Ok(server) = Server::new(scoped("board:rpi-pico2-w"), None, Duration::from_secs(20)) else {
+        fn the_flash_tool_hands_a_probe_named_to_the_route_rule() {
+            let scope = DeviceScope::default();
+            let Ok(server) = Server::new(scope, None, Duration::from_secs(20)) else {
                 return;
             };
-            answer_as(lamella_wire::product_model::PICO2_W);
-            let opens_a_pin = super::a_program_and_its_references::OPENS_A_PIN;
-            let references = ["System.Device.Gpio".to_owned()];
-            let mut board = LoopbackBoard::on(RamFlash::erased(1024 * 1024));
-            let run = Then::Run(lamella_wire_host::on_device::Watch::for_at_most(Duration::from_secs(20)));
-            let answer =
-                to_firmware(&server.scope, &mut board, "usb", |b| server.image_for(b, &references, opens_a_pin), run);
-            let said = text(&answer);
-            assert_eq!(answer["isError"], json!(false), "{said}");
-            assert!(said.starts_with("Built for the rpi-pico2-w.\nThe image carries:"), "{said}");
-            assert!(said.contains("System.Device.Gpio: referenced, the rp2350 chip family's build"), "{said}");
-            assert!(said.contains("running on usb; output follows.\n\ngpio opened\n\nthe program ended, exit code 0."), "{said}");
-            assert!(!board.reset, "it was started without a reset");
+            let process = std::process::id();
+            let folder = std::env::temp_dir().join(format!("lamella-mcp-probe-route-{process}"));
+            std::fs::create_dir_all(&folder).expect("a scratch folder");
+            let image = folder.join("App.bin");
+            let bytes = b"not UF2: no block here carries the UF2 magic";
+            std::fs::write(&image, bytes).expect("the image");
 
-            let refused = server.tool_run_on_device("usb:no-such-board", opens_a_pin, &[]);
-            assert_eq!(refused["isError"], json!(true));
-            assert!(
-                text(&refused).contains("add \"System.Device.Gpio\" to `references`."),
-                "refused at the compile, before the board was opened: {}",
-                text(&refused)
+            let answer = server.tool_flash(&json!({
+                "image": image.to_str().expect("a scratch path in UTF-8"),
+                "board": "raspberrypi-pico-2",
+                "probe": "NOSUCHPROBE0000",
+                "volume": "D:",
+            }));
+            let _ = std::fs::remove_dir_all(&folder);
+
+            assert_eq!(answer["isError"], json!(true), "{answer}");
+            assert_eq!(
+                answer["content"][0]["text"].as_str().unwrap_or_default(),
+                "--probe names a debug probe, and --volume names a bootloader drive: two routes, \
+                 where a write takes one.\n\n\
+                 Leave out --volume to write over the probe, or leave out --probe to write to the \
+                 bootloader drive."
             );
         }
     }
@@ -2956,14 +2762,14 @@ mod tests {
              against the PART"
         );
 
-        let scope = DeviceScope::parse(["--allow-device=board:rpi-pico2".to_owned()].into_iter())
+        let scope = DeviceScope::parse(["--allow-device=board:raspberrypi-pico-2".to_owned()].into_iter())
             .expect("a board scope parses");
         assert_eq!(
             scope.identities(),
             lamella_flash_backend::Allow::Any,
             "a board scope narrows the REQUEST and says nothing about which part may be erased"
         );
-        assert!(scope.permits_request("rpi-pico2", None));
+        assert!(scope.permits_request("raspberrypi-pico-2", None));
         assert!(!scope.permits_request("bbc-micro-bit-v2", None), "another board is outside it");
     }
 
@@ -2973,10 +2779,10 @@ mod tests {
     fn a_probe_scope_is_not_satisfied_by_naming_no_probe() {
         let scope = DeviceScope::parse(["--allow-device=probe:SERIAL0000000005".to_owned()].into_iter())
             .expect("parses");
-        assert!(scope.permits_request("rpi-pico2", Some("SERIAL0000000005")));
-        assert!(!scope.permits_request("rpi-pico2", Some("SOMETHING-ELSE")));
+        assert!(scope.permits_request("raspberrypi-pico-2", Some("SERIAL0000000005")));
+        assert!(!scope.permits_request("raspberrypi-pico-2", Some("SOMETHING-ELSE")));
         assert!(
-            !scope.permits_request("rpi-pico2", None),
+            !scope.permits_request("raspberrypi-pico-2", None),
             "a call naming no probe cannot satisfy a scope that names one"
         );
     }
@@ -3016,10 +2822,10 @@ mod tests {
     /// that defaulted to "allow everything" would be the worst possible reading of a typo.
     #[test]
     fn a_malformed_scope_is_refused_rather_than_ignored() {
-        assert!(DeviceScope::parse(["--allow-device=rpi-pico2".to_owned()].into_iter()).is_err());
+        assert!(DeviceScope::parse(["--allow-device=raspberrypi-pico-2".to_owned()].into_iter()).is_err());
         assert!(DeviceScope::parse(["--allow-device=chip:zzz".to_owned()].into_iter()).is_err());
         assert!(DeviceScope::parse(["--allow-device=colour:red".to_owned()].into_iter()).is_err());
-        assert!(DeviceScope::parse(["--allow-device=board:rpi-pico-typo".to_owned()].into_iter()).is_err());
+        assert!(DeviceScope::parse(["--allow-device=board:raspberrypi-pico-typo".to_owned()].into_iter()).is_err());
     }
 
     /// The scope a single `--allow-device=<term>` sets.
@@ -3045,7 +2851,7 @@ mod tests {
                     assert!(refusal.is_none(), "without bake {tool} is not built, and its dispatch says so");
                 }
             }
-            assert!(refusal_before_dispatch(&scoped("board:rpi-pico2"), tool).is_none(), "{tool}");
+            assert!(refusal_before_dispatch(&scoped("board:raspberrypi-pico-2"), tool).is_none(), "{tool}");
             let bare = DeviceScope::parse(["--allow-device".to_owned()].into_iter()).expect("parses");
             assert!(refusal_before_dispatch(&bare, tool).is_none(), "{tool}");
         }
@@ -3060,10 +2866,10 @@ mod tests {
             let declared = lamella_catalog::load_board(id).expect("a known board").product_model;
             u16::try_from(declared).expect("a wire model")
         };
-        let (pico2, v2) = (model("rpi-pico2"), model("bbc-micro-bit-v2"));
+        let (pico2, v2) = (model("raspberrypi-pico-2"), model("bbc-micro-bit-v2"));
         assert_ne!(pico2, v2, "the control needs two different models");
 
-        let scope = scoped("board:rpi-pico2");
+        let scope = scoped("board:raspberrypi-pico-2");
         assert!(scope.permits_link_board(pico2).is_ok());
         let refusal = scope.permits_link_board(v2).expect_err("another model is outside it");
         assert!(refusal.contains("BBC micro:bit v2"), "the refusal names the board that answered: {refusal}");
@@ -3242,12 +3048,12 @@ mod tests {
             assert!(why.starts_with("Unknown tool: lamella_deploy") && why.contains("--features bake"), "{why}");
         }
 
-        let why = refused(json!({ "name": "lamella_fit", "arguments": { "board": "rpi-pico2", "image_bytes": -5 } }));
+        let why = refused(json!({ "name": "lamella_fit", "arguments": { "board": "raspberrypi-pico-2", "image_bytes": -5 } }));
         assert!(why.contains("arguments.image_bytes must be 0 or more"), "{why}");
         let why = refused(json!({ "name": "lamella_check", "arguments": {} }));
         assert!(why.contains("arguments.code is required"), "{why}");
 
-        let fit = json!({ "name": "lamella_fit", "arguments": { "board": "rpi-pico2", "image_bytes": 100 } });
+        let fit = json!({ "name": "lamella_fit", "arguments": { "board": "raspberrypi-pico-2", "image_bytes": 100 } });
         assert!(matches!(checked_call(Some(&fit)), Ok(("lamella_fit", _))));
         assert!(matches!(checked_call(Some(&json!({ "name": "lamella_version" }))), Ok(("lamella_version", _))));
     }
@@ -3448,10 +3254,10 @@ mod tests {
     #[test]
     fn the_verdict_tools_read_the_same_catalog_the_cli_does() {
         assert!(
-            lamella_catalog::BOARDS.iter().any(|(id, _)| *id == "rpi-pico2"),
+            lamella_catalog::BOARDS.iter().any(|(id, _)| *id == "raspberrypi-pico-2"),
             "the shared catalog is not reaching this crate"
         );
-        let (board, part) = lamella_catalog::resolve("rpi-pico2").expect("a known board");
+        let (board, part) = lamella_catalog::resolve("raspberrypi-pico-2").expect("a known board");
         let verdict = lamella_bsp_gen::fit::fit(&board, &part, 100_000);
         assert!(
             matches!(verdict.flash_fit, lamella_bsp_gen::fit::Fit::Fits { .. }),
@@ -3514,7 +3320,7 @@ mod tests {
             .count();
         assert!(unrouted > 0, "every board is routable, so the false side proves nothing");
 
-        assert!(lamella_flash_routes::can_flash("rpi-pico2"), "a Pico 2 has a route");
+        assert!(lamella_flash_routes::can_flash("raspberrypi-pico-2"), "a Pico 2 has a route");
     }
 
     /// `lamella_boards` lists every board of the catalog, as `lamella boards` does, the Pico LiPo 2
@@ -3529,3 +3335,4 @@ mod tests {
         assert_eq!(boards.len(), lamella_catalog::BOARDS.len(), "every board of the catalog is listed");
     }
 }
+

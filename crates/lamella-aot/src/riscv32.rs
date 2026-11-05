@@ -1971,6 +1971,9 @@ fn lower_function(
                     | Inst::LoadTypeDesc { .. }
                     | Inst::TypeDescAddr { .. }
                     | Inst::CastClassScan { .. }
+                    | Inst::InterfaceHasTag { .. }
+                    | Inst::InterfaceHasArrayElementTag { .. }
+                    | Inst::DescriptorWord { .. }
                     | Inst::CallNative { .. }
                     | Inst::AllocArrayMD { .. }
                     | Inst::ArrayMDLoad { .. }
@@ -2926,19 +2929,55 @@ fn lower_function_spilled(
     Ok(method_record)
 }
 
-/// Faults unless the ARRAY descriptor in `descriptor` is a vector's, rank 1; `scratch` and `one`
-/// are clobbered. The ARM twin's reason: a rectangular array's descriptor carries an EMPTY interface
-/// table, which would answer every interface query "not implemented" where `int[,]` implements every
-/// interface `System.Array` does.
-fn fault_unless_vector(enc: &mut Encoder, descriptor: Reg, scratch: Reg, one: Reg) {
-    let vector = enc.new_label();
-    enc.lw(scratch, descriptor, 0);
-    enc.slli(scratch, scratch, 8);
-    enc.srli(scratch, scratch, 8);
-    enc.li(one, 1);
-    enc.branch(BranchCond::Eq, scratch, one, vector);
-    enc.ebreak();
-    enc.bind_label(vector);
+/// An interface type test: leaves 1 in `t0` when the itable of the descriptor in the frame slot
+/// `descriptor` holds the tag `load_sought` puts in `sought`, and 0 when it does not. `t1`, `t2` and
+/// `sought` are clobbered.
+///
+/// A null reference's descriptor is 0 and implements nothing, so `load_sought` is reached only with a
+/// real descriptor and a non-empty itable.
+fn emit_interface_type_test(
+    enc: &mut Encoder,
+    descriptor: i32,
+    sought: Reg,
+    load_sought: impl FnOnce(&mut Encoder),
+) {
+    let (t0, t1, t2) = (Reg::T0, Reg::T1, Reg::T2);
+    let miss = enc.new_label();
+    let found = enc.new_label();
+    let search = enc.new_label();
+    let done = enc.new_label();
+    slot_load(enc, t0, descriptor);
+    enc.branch(BranchCond::Eq, t0, Reg::ZERO, miss);
+    let array_form = enc.new_label();
+    let have_itable = enc.new_label();
+    enc.lw(t1, t0, 0);
+    enc.srli(t1, t1, 24);
+    enc.li(t2, (ARRAY_DESC_MARK >> 24) as i32);
+    enc.branch(BranchCond::Eq, t1, t2, array_form);
+    enc.lw(t1, t0, 4);
+    enc.slli(t1, t1, 2);
+    enc.addi(t1, t1, 16);
+    enc.j(have_itable);
+    enc.bind_label(array_form);
+    enc.li(t1, crate::resolver::ARRAY_ITABLE_OFFSET as i32);
+    enc.bind_label(have_itable);
+    enc.add(t1, t0, t1);
+    enc.lw(t2, t1, 0);
+    enc.branch(BranchCond::Eq, t2, Reg::ZERO, miss);
+    enc.addi(t1, t1, 4);
+    load_sought(enc);
+    enc.bind_label(search);
+    enc.lw(t0, t1, 0);
+    enc.branch(BranchCond::Eq, t0, sought, found);
+    enc.addi(t1, t1, 8);
+    enc.addi(t2, t2, -1);
+    enc.branch(BranchCond::Ne, t2, Reg::ZERO, search);
+    enc.bind_label(miss);
+    enc.li(t0, 0);
+    enc.j(done);
+    enc.bind_label(found);
+    enc.li(t0, 1);
+    enc.bind_label(done);
 }
 
 /// Leaves in `scratch` the code pointer of `tag`'s implementation for the object in the frame slot
@@ -2962,7 +3001,6 @@ fn emit_interface_target(enc: &mut Encoder, receiver: i32, tag: u32, scratch: Re
     enc.addi(t1, t1, (DESC_HEADER_WORDS * 4) as i32);
     enc.j(have_itable);
     enc.bind_label(array_form);
-    fault_unless_vector(enc, t0, t1, t2);
     enc.li(t1, crate::resolver::ARRAY_ITABLE_OFFSET as i32);
     enc.bind_label(have_itable);
     enc.add(t1, t0, t1);
@@ -3265,30 +3303,42 @@ fn lower_inst_spilled(
             dim1,
             element_size,
             element_kind,
+            element,
+            element_cast_class,
         } => {
+            if matches!(profile, RiscvProfile::Rv32ec) && !element_size.is_power_of_two() {
+                return Err(LowerError::Unsupported);
+            }
             let desc_label = match type_desc_labels.iter().find(|(h, _)| h == handle) {
                 Some((_, l)) => *l,
                 None => {
                     let l = enc.new_label();
                     type_descs.push(DescEmit {
                         label: l,
-                        vtable: Vec::new(),
+                        vtable: descriptor_vtable(descriptors, *handle, externs),
                         words: alloc::vec![
                             crate::resolver::ARRAY_DESC_MARK | 2,
                             *element_kind,
                             0,
                             0,
                             0,
-                            0
+                            *element_cast_class
                         ],
-                        itable: Vec::new(),
-                        base: None,
-                        element: None,
+                        itable: descriptor_itable(descriptors, *handle, externs),
+                        base: descriptors
+                            .iter()
+                            .find(|m| m.handle == *handle)
+                            .and_then(|m| m.base),
+                        element: *element,
                     });
                     type_desc_labels.push((*handle, l));
                     l
                 }
             };
+            let has_descriptor = descriptors
+                .iter()
+                .find(|d| d.handle == *handle)
+                .is_some_and(|m| !m.vtable.is_empty() || !m.itable.is_empty());
             slot_load(enc, t0, slot(*dim0));
             slot_load(enc, t1, slot(*dim1));
             emit_soft_mul32(enc, t2, t0, t1, scratch, profile);
@@ -3298,13 +3348,18 @@ fn lower_inst_spilled(
                 enc.li(t1, *element_size as i32);
                 enc.mul(t2, t2, t1);
             }
-            enc.addi(Reg::A0, t2, 8);
+            enc.addi(Reg::A0, t2, if has_descriptor { 12 } else { 8 });
             emit_desc_words_addr(enc, Reg::A1, t0, *handle, desc_label, desc_ptr_pool, relocate);
             emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
             let ok = enc.new_label();
             enc.branch(BranchCond::Ne, Reg::A0, Reg::ZERO, ok);
             enc.ebreak();
             enc.bind_label(ok);
+            if has_descriptor {
+                emit_desc_words_addr(enc, t1, t0, *handle, desc_label, desc_ptr_pool, relocate);
+                enc.sw(t1, Reg::A0, 0);
+                enc.addi(Reg::A0, Reg::A0, 4);
+            }
             slot_load(enc, t0, slot(*dim0));
             enc.sw(t0, Reg::A0, 0);
             slot_load(enc, t0, slot(*dim1));
@@ -3392,6 +3447,8 @@ fn lower_inst_spilled(
             dims,
             element_size,
             element_kind,
+            element,
+            element_cast_class,
         } => {
             if matches!(profile, RiscvProfile::Rv32ec) {
                 return Err(LowerError::Unsupported);
@@ -3404,23 +3461,30 @@ fn lower_inst_spilled(
                     let l = enc.new_label();
                     type_descs.push(DescEmit {
                         label: l,
-                        vtable: Vec::new(),
+                        vtable: descriptor_vtable(descriptors, *handle, externs),
                         words: alloc::vec![
                             crate::resolver::ARRAY_DESC_MARK | u32::try_from(dims.len()).unwrap_or(1),
                             *element_kind,
                             0,
                             0,
                             0,
-                            0
+                            *element_cast_class
                         ],
-                        itable: Vec::new(),
-                        base: None,
-                        element: None,
+                        itable: descriptor_itable(descriptors, *handle, externs),
+                        base: descriptors
+                            .iter()
+                            .find(|m| m.handle == *handle)
+                            .and_then(|m| m.base),
+                        element: *element,
                     });
                     type_desc_labels.push((*handle, l));
                     l
                 }
             };
+            let has_descriptor = descriptors
+                .iter()
+                .find(|d| d.handle == *handle)
+                .is_some_and(|m| !m.vtable.is_empty() || !m.itable.is_empty());
             slot_load(enc, t0, slot(dims[0]));
             for d in &dims[1..] {
                 slot_load(enc, t1, slot(*d));
@@ -3432,13 +3496,18 @@ fn lower_inst_spilled(
                 enc.li(t1, *element_size as i32);
                 enc.mul(t0, t0, t1);
             }
-            enc.addi(Reg::A0, t0, header);
+            enc.addi(Reg::A0, t0, if has_descriptor { header + 4 } else { header });
             emit_desc_words_addr(enc, Reg::A1, t0, *handle, desc_label, desc_ptr_pool, relocate);
             emit_alloc_call(enc, alloc, func_labels, relocs, relocate)?;
             let ok = enc.new_label();
             enc.branch(BranchCond::Ne, Reg::A0, Reg::ZERO, ok);
             enc.ebreak();
             enc.bind_label(ok);
+            if has_descriptor {
+                emit_desc_words_addr(enc, t1, t0, *handle, desc_label, desc_ptr_pool, relocate);
+                enc.sw(t1, Reg::A0, 0);
+                enc.addi(Reg::A0, Reg::A0, 4);
+            }
             for (k, d) in dims.iter().enumerate() {
                 slot_load(enc, t0, slot(*d));
                 enc.sw(t0, Reg::A0, 4 * k as i32);
@@ -3451,7 +3520,7 @@ fn lower_inst_spilled(
             index1,
             element_size,
         } => {
-            if !matches!(*element_size, 1 | 2 | 4 | 8) {
+            if matches!(profile, RiscvProfile::Rv32ec) && !element_size.is_power_of_two() {
                 return Err(LowerError::Unsupported);
             }
             slot_load(enc, t0, slot(*array));
@@ -3475,7 +3544,7 @@ fn lower_inst_spilled(
             indices,
             element_size,
         } => {
-            if matches!(profile, RiscvProfile::Rv32ec) || !matches!(*element_size, 1 | 2 | 4 | 8) {
+            if matches!(profile, RiscvProfile::Rv32ec) {
                 return Err(LowerError::Unsupported);
             }
             slot_load(enc, t0, slot(*array));
@@ -4156,43 +4225,26 @@ fn lower_inst_spilled(
             slot_store(enc, t0, slot(result));
         }
         Inst::InterfaceHasTag { descriptor, tag } => {
-            let miss = enc.new_label();
-            let found = enc.new_label();
-            let search = enc.new_label();
+            emit_interface_type_test(enc, slot(*descriptor), scratch, |enc| {
+                enc.li(scratch, *tag as i32);
+            });
+            slot_store(enc, t0, slot(result));
+        }
+        Inst::InterfaceHasArrayElementTag {
+            descriptor,
+            array_descriptor,
+        } => {
+            emit_interface_type_test(enc, slot(*descriptor), scratch, |enc| {
+                slot_load(enc, scratch, slot(*array_descriptor));
+                enc.lw(scratch, scratch, crate::resolver::ARRAY_CAST_CLASS_OFFSET as i32);
+            });
+            slot_store(enc, t0, slot(result));
+        }
+        Inst::DescriptorWord { descriptor, offset } => {
             let done = enc.new_label();
             slot_load(enc, t0, slot(*descriptor));
-            enc.branch(BranchCond::Eq, t0, Reg::ZERO, miss);
-            let array_form = enc.new_label();
-            let have_itable = enc.new_label();
-            enc.lw(t1, t0, 0);
-            enc.srli(t1, t1, 24);
-            enc.li(t2, (ARRAY_DESC_MARK >> 24) as i32);
-            enc.branch(BranchCond::Eq, t1, t2, array_form);
-            enc.lw(t1, t0, 4);
-            enc.slli(t1, t1, 2);
-            enc.addi(t1, t1, 16);
-            enc.j(have_itable);
-            enc.bind_label(array_form);
-            fault_unless_vector(enc, t0, t1, t2);
-            enc.li(t1, crate::resolver::ARRAY_ITABLE_OFFSET as i32);
-            enc.bind_label(have_itable);
-            enc.add(t1, t0, t1);
-            enc.lw(t2, t1, 0);
-            enc.branch(BranchCond::Eq, t2, Reg::ZERO, miss);
-            enc.addi(t1, t1, 4);
-            let scratch_tag = scratch;
-            enc.li(scratch_tag, *tag as i32);
-            enc.bind_label(search);
-            enc.lw(t0, t1, 0);
-            enc.branch(BranchCond::Eq, t0, scratch_tag, found);
-            enc.addi(t1, t1, 8);
-            enc.addi(t2, t2, -1);
-            enc.branch(BranchCond::Ne, t2, Reg::ZERO, search);
-            enc.bind_label(miss);
-            enc.li(t0, 0);
-            enc.j(done);
-            enc.bind_label(found);
-            enc.li(t0, 1);
+            enc.branch(BranchCond::Eq, t0, Reg::ZERO, done);
+            enc.lw(t0, t0, *offset as i32);
             enc.bind_label(done);
             slot_store(enc, t0, slot(result));
         }
@@ -4949,16 +5001,34 @@ fn descriptor_label(
     type_desc_labels: &mut Vec<(TypeHandle, Label)>,
     externs: &mut Vec<alloc::string::String>,
 ) -> Label {
-    if let Some((_, label)) = type_desc_labels.iter().find(|(h, _)| *h == handle) {
-        return *label;
+    if let Some(at) = type_desc_labels.iter().position(|(h, _)| *h == handle) {
+        let laid = &mut type_descs[at].words;
+        if payload_size != 0 && laid.first() == Some(&0) {
+            laid[0] = payload_size;
+            laid[1] = ref_offsets.len() as u32;
+            laid.truncate(DESC_HEADER_WORDS as usize);
+            laid.extend_from_slice(ref_offsets);
+        }
+        return type_desc_labels[at].1;
     }
     let label = enc.new_label();
-    let mut words = Vec::with_capacity(DESC_HEADER_WORDS as usize + ref_offsets.len());
-    words.push(payload_size);
-    words.push(ref_offsets.len() as u32);
-    words.push(descriptor_tag(descriptors, handle));
-    words.push(0);
-    words.extend_from_slice(ref_offsets);
+    let known_header = descriptors
+        .iter()
+        .find(|d| d.handle == handle)
+        .and_then(|d| d.words.as_deref())
+        .filter(|_| payload_size == 0 && ref_offsets.is_empty());
+    let words = match known_header {
+        Some(words) => words.to_vec(),
+        None => {
+            let mut words = Vec::with_capacity(DESC_HEADER_WORDS as usize + ref_offsets.len());
+            words.push(payload_size);
+            words.push(ref_offsets.len() as u32);
+            words.push(descriptor_tag(descriptors, handle));
+            words.push(0);
+            words.extend_from_slice(ref_offsets);
+            words
+        }
+    };
     type_descs.push(DescEmit {
         label,
         vtable: descriptor_vtable(descriptors, handle, externs),
@@ -7287,6 +7357,8 @@ mod tests {
                             dim1: n(1),
                             element_size: 4,
                             element_kind: 5,
+                            element: None,
+                            element_cast_class: 0,
                         },
                     ),
                     (
@@ -7925,6 +7997,8 @@ mod tests {
                             dim1: n(0),
                             element_size: 8,
                             element_kind: 5,
+                            element: None,
+                            element_cast_class: 0,
                         },
                     ),
                     (
@@ -8742,5 +8816,46 @@ mod tests {
                 .all(|r| r.kind == lamella_elf::riscv::R_RISCV_32),
             "a carried-section relocation must be R_RISCV_32 on this target"
         );
+    }
+
+    /// An interface type test lowers on the spilled path, and its own presence is what sends a function
+    /// there: a `LoadTypeDesc` beside it is how a function built from CIL arrives, and nothing requires one.
+    #[test]
+    fn an_interface_type_test_alone_takes_the_spilled_path() {
+        let i32t = MirType::I32;
+        for (params, inst) in [
+            (
+                2,
+                Inst::InterfaceHasArrayElementTag {
+                    descriptor: ValueId(0),
+                    array_descriptor: ValueId(1),
+                },
+            ),
+            (
+                1,
+                Inst::InterfaceHasTag {
+                    descriptor: ValueId(0),
+                    tag: 0x8000_0001,
+                },
+            ),
+        ] {
+            let result = ValueId(params);
+            let func = Function {
+                params: vec![i32t; params as usize],
+                ret: Some(i32t),
+                value_types: vec![i32t; params as usize + 1],
+                entry: BlockId(0),
+                blocks: vec![BasicBlock {
+                    params: (0..params).map(ValueId).collect(),
+                    insts: vec![(result, inst)],
+                    terminator: Some(Terminator::Return(Some(result))),
+                }],
+            };
+            let code = lower_module(&[func]).expect("the test lowers with no descriptor load beside it");
+            assert!(
+                !code.chunks_exact(4).any(|word| word == [0x73, 0x00, 0x10, 0x00]),
+                "a type test has an answer for an array of any rank, and does not stop the machine"
+            );
+        }
     }
 }

@@ -4677,6 +4677,8 @@ impl Module {
         }
         let array_type = self.intrinsic_type_id(IntrinsicType::Array);
         let mut reached_sites: BTreeSet<u64> = BTreeSet::new();
+        let mut reached_keys: BTreeSet<u32> = BTreeSet::new();
+        let mut refused_by_key: BTreeMap<u32, Vec<MethodId>> = BTreeMap::new();
 
         while !queue.is_empty() || !type_queue.is_empty() {
             while let Some((type_id, as_reflection_root)) = type_queue.pop() {
@@ -4700,12 +4702,15 @@ impl Module {
                         for &target in info.vtable.iter() {
                             push(target, &mut keep_method, &mut queue);
                         }
-                        for target in info
-                            .sig_methods
-                            .values()
-                            .chain(info.sig_methods_nonvirtual.values())
-                        {
-                            push(*target, &mut keep_method, &mut queue);
+                        for (&key, &target) in &info.sig_methods {
+                            if !reached_keys.contains(&key) && self.is_refused_body(target) {
+                                refused_by_key.entry(key).or_default().push(target);
+                            } else {
+                                push(target, &mut keep_method, &mut queue);
+                            }
+                        }
+                        for &target in info.sig_methods_nonvirtual.values() {
+                            push(target, &mut keep_method, &mut queue);
                         }
                         if let Some(base) = info.base {
                             type_queue.push((base, as_reflection_root));
@@ -4794,6 +4799,13 @@ impl Module {
                                     push(body, &mut keep_method, &mut queue);
                                 }
                             }
+                            if let Some((key, _)) = self.call_target(asm, token) {
+                                if reached_keys.insert(key) {
+                                    for refused in refused_by_key.remove(&key).into_iter().flatten() {
+                                        push(refused, &mut keep_method, &mut queue);
+                                    }
+                                }
+                            }
                         }
                     }
                     Opcode::Ldstr => {
@@ -4828,12 +4840,49 @@ impl Module {
                         if let Some(type_id) = self.type_id_of(asm, token) {
                             type_queue.push((type_id, false));
                         }
+                        if let Some(type_id) = self
+                            .cast_elem(asm_key(asm, token.0))
+                            .and_then(|shape| self.array_shape_element(&shape))
+                        {
+                            type_queue.push((type_id, false));
+                        }
                     }
                     _ => {}
                 }
             }
         }
         (keep_method, keep_type, strings)
+    }
+
+    /// Whether `method` is nothing but a call through a token the loader marked as unlowered, which is
+    /// the body it gives a method whose lowering it refused: running it raises what the refusal says.
+    #[cfg(feature = "code-in-place")]
+    fn is_refused_body(&self, method: MethodId) -> bool {
+        let Some(Method::Managed { body, .. }) = self.methods.get(method as usize) else {
+            return false;
+        };
+        let Ok(code) = lamella_cil::decode(body.code()) else {
+            return false;
+        };
+        match code.as_slice() {
+            [call, ret] if call.opcode == lamella_cil::Opcode::Call && ret.opcode == lamella_cil::Opcode::Ret => {
+                matches!(call.operand, lamella_cil::Operand::Token(token)
+                    if self.is_unlowered_generic(self.method_asm(method), token))
+            }
+            _ => false,
+        }
+    }
+
+    /// The type an array or vector-interface cast shape compares elements against, if it names one.
+    #[cfg(feature = "code-in-place")]
+    fn array_shape_element(&self, shape: &CastElem) -> Option<TypeId> {
+        match shape {
+            CastElem::Array(element) | CastElem::VectorInterface(element) => match element.as_ref() {
+                CastElem::Named(handle) => self.type_id_by_handle(*handle),
+                deeper => self.array_shape_element(deeper),
+            },
+            _ => None,
+        }
     }
 
     /// Checks every kept managed body against THIS build's capability profile (the baking

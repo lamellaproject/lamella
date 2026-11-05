@@ -22,6 +22,8 @@
 kind = "board"
 board = "automationdirect-p1am-100"
 vendor = "automation-direct"   # -> the AutomationDirect namespace segment. The company sells the
+maker = "AutomationDirect"
+product = "P1AM-100"
                                # product; FACTS Engineering designed it and publishes the schematic
                                # and the Arduino core, which is why both appear in the sources.
 family = "samd21"

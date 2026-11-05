@@ -23,6 +23,8 @@
 kind = "board"
 board = "st-nucleo-h755zi-q"
 vendor = "st"
+maker = "STMicroelectronics"
+product = "NUCLEO-H755ZI-Q"
 family = "stm32h7"
 part = "stm32h755zi"
 product_model = 32          # lamella_wire::product_model::NUCLEO_H755ZI_Q

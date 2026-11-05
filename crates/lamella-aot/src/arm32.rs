@@ -390,6 +390,8 @@ fn lower_inst(
         | Inst::CallInterface { .. }
         | Inst::CastClassScan { .. }
         | Inst::InterfaceHasTag { .. }
+        | Inst::InterfaceHasArrayElementTag { .. }
+        | Inst::DescriptorWord { .. }
         | Inst::TypeName { .. } => {
             return Err(LowerError::CallUnsupported);
         }
@@ -928,7 +930,6 @@ fn emit_interface_target(
         .map_err(|_| LowerError::TooManyValues)?;
     enc.b(have_itable);
     enc.bind_label(array_form);
-    fault_unless_vector(enc, Reg::R0, Reg::R1)?;
     enc.movs_imm(Reg::R1, crate::resolver::ARRAY_ITABLE_OFFSET as u8)
         .map_err(|_| LowerError::TooManyValues)?;
     enc.bind_label(have_itable);
@@ -973,25 +974,73 @@ fn emit_interface_target(
     Ok(())
 }
 
-/// Faults unless the ARRAY descriptor in `descriptor` is a vector's, rank 1; `scratch` is clobbered.
+/// An interface type test: leaves 1 in r0 when the itable of the descriptor in spill slot
+/// `descriptor` holds the tag `load_sought` puts in r3, and 0 when it does not. r0-r3 are clobbered.
 ///
-/// Only a vector's descriptor carries `System.Array`'s interface table. A rectangular array's lays
-/// the same header with an EMPTY table, which would answer every interface query "not
-/// implemented" -- a false answer, since `int[,]` implements every interface `System.Array` does --
-/// so a query on one faults rather than answer it.
-fn fault_unless_vector(enc: &mut Encoder, descriptor: Reg, scratch: Reg) -> Result<(), LowerError> {
-    let vector = enc.new_label();
-    enc.ldr_imm(scratch, descriptor, 0)
+/// A null reference's descriptor is 0 and implements nothing, so `load_sought` is reached only with a
+/// real descriptor and a non-empty itable.
+fn interface_type_test(
+    enc: &mut Encoder,
+    descriptor: u16,
+    load_sought: impl FnOnce(&mut Encoder) -> Result<(), LowerError>,
+) -> Result<(), LowerError> {
+    let miss = enc.new_label();
+    let found = enc.new_label();
+    let search = enc.new_label();
+    let done = enc.new_label();
+    slot_load(enc, Reg::R0, descriptor)?;
+    enc.cmp_imm(Reg::R0, 0)
         .map_err(|_| LowerError::TooManyValues)?;
-    enc.lsls_imm(scratch, scratch, 8)
+    enc.b_cond(Cond::Eq, miss);
+    let array_form = enc.new_label();
+    let have_itable = enc.new_label();
+    enc.ldr_imm(Reg::R1, Reg::R0, 0)
         .map_err(|_| LowerError::TooManyValues)?;
-    enc.lsrs_imm(scratch, scratch, 8)
+    enc.lsrs_imm(Reg::R1, Reg::R1, 24)
         .map_err(|_| LowerError::TooManyValues)?;
-    enc.cmp_imm(scratch, 1)
+    enc.cmp_imm(Reg::R1, (ARRAY_DESC_MARK >> 24) as u8)
         .map_err(|_| LowerError::TooManyValues)?;
-    enc.b_cond(Cond::Eq, vector);
-    enc.udf(0);
-    enc.bind_label(vector);
+    enc.b_cond(Cond::Eq, array_form);
+    enc.ldr_imm(Reg::R1, Reg::R0, 4)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.lsls_imm(Reg::R1, Reg::R1, 2)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.adds_imm8(Reg::R1, 16)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.b(have_itable);
+    enc.bind_label(array_form);
+    enc.movs_imm(Reg::R1, crate::resolver::ARRAY_ITABLE_OFFSET as u8)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.bind_label(have_itable);
+    enc.adds(Reg::R1, Reg::R0, Reg::R1)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.ldr_imm(Reg::R2, Reg::R1, 0)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.cmp_imm(Reg::R2, 0)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.b_cond(Cond::Eq, miss);
+    enc.adds_imm8(Reg::R1, 4)
+        .map_err(|_| LowerError::TooManyValues)?;
+    load_sought(enc)?;
+    enc.bind_label(search);
+    enc.ldr_imm(Reg::R0, Reg::R1, 0)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.cmp_reg(Reg::R0, Reg::R3)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.b_cond(Cond::Eq, found);
+    enc.adds_imm8(Reg::R1, 8)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.subs_imm8(Reg::R2, 1)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.b_cond(Cond::Ne, search);
+    enc.bind_label(miss);
+    enc.movs_imm(Reg::R0, 0)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.b(done);
+    enc.bind_label(found);
+    enc.movs_imm(Reg::R0, 1)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.bind_label(done);
     Ok(())
 }
 
@@ -1429,64 +1478,24 @@ fn lower_spilled_inst(
             enc.bind_label(done);
         }
         Inst::InterfaceHasTag { descriptor, tag } => {
-            let miss = enc.new_label();
-            let found = enc.new_label();
-            let search = enc.new_label();
-            let done = enc.new_label();
+            interface_type_test(enc, slot(*descriptor), |enc| {
+                load_const_word(enc, pool, Reg::R3, *tag)
+            })?;
+        }
+        Inst::InterfaceHasArrayElementTag {
+            descriptor,
+            array_descriptor,
+        } => {
+            interface_type_test(enc, slot(*descriptor), |enc| {
+                slot_load(enc, Reg::R3, slot(*array_descriptor))?;
+                enc.ldr_imm(Reg::R3, Reg::R3, crate::resolver::ARRAY_CAST_CLASS_OFFSET as u16)
+                    .map_err(|_| LowerError::TooManyValues)
+            })?;
+        }
+        Inst::DescriptorWord { descriptor, offset } => {
             slot_load(enc, Reg::R0, slot(*descriptor))?;
-            enc.cmp_imm(Reg::R0, 0)
+            enc.ldr_imm(Reg::R0, Reg::R0, *offset as u16)
                 .map_err(|_| LowerError::TooManyValues)?;
-            enc.b_cond(Cond::Eq, miss);
-            let array_form = enc.new_label();
-            let have_itable = enc.new_label();
-            enc.ldr_imm(Reg::R1, Reg::R0, 0)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.lsrs_imm(Reg::R1, Reg::R1, 24)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.cmp_imm(Reg::R1, (ARRAY_DESC_MARK >> 24) as u8)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.b_cond(Cond::Eq, array_form);
-            enc.ldr_imm(Reg::R1, Reg::R0, 4)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.lsls_imm(Reg::R1, Reg::R1, 2)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.adds_imm8(Reg::R1, 16)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.b(have_itable);
-            enc.bind_label(array_form);
-            fault_unless_vector(enc, Reg::R0, Reg::R1)?;
-            enc.movs_imm(Reg::R1, crate::resolver::ARRAY_ITABLE_OFFSET as u8)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.bind_label(have_itable);
-            enc.adds(Reg::R1, Reg::R0, Reg::R1)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_imm(Reg::R2, Reg::R1, 0)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.cmp_imm(Reg::R2, 0)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.b_cond(Cond::Eq, miss);
-            enc.adds_imm8(Reg::R1, 4)
-                .map_err(|_| LowerError::TooManyValues)?;
-            load_const_word(enc, pool, Reg::R3, *tag)?;
-            enc.bind_label(search);
-            enc.ldr_imm(Reg::R0, Reg::R1, 0)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.cmp_reg(Reg::R0, Reg::R3)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.b_cond(Cond::Eq, found);
-            enc.adds_imm8(Reg::R1, 8)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.subs_imm8(Reg::R2, 1)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.b_cond(Cond::Ne, search);
-            enc.bind_label(miss);
-            enc.movs_imm(Reg::R0, 0)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.b(done);
-            enc.bind_label(found);
-            enc.movs_imm(Reg::R0, 1)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.bind_label(done);
         }
         Inst::Store {
             address,
@@ -3578,6 +3587,8 @@ fn lower_spilled_into(
                 dim1,
                 element_size,
                 element_kind,
+                element,
+                element_cast_class,
             } = inst
             {
                 let alloc = alloc_addr.ok_or(LowerError::CallUnsupported)?;
@@ -3587,10 +3598,13 @@ fn lower_spilled_into(
                         let label = enc.new_label();
                         type_descs.push((
                             label,
-                            alloc::vec![ARRAY_DESC_MARK | 2, *element_kind, 0u32, 0u32]
+                            alloc::vec![ARRAY_DESC_MARK | 2, *element_kind, 0u32, *element_cast_class]
                                 .into_boxed_slice(),
                         ));
                         type_desc_labels.push((*handle, label));
+                        if let Some(element) = element {
+                            element_edges.push((label, *element));
+                        }
                         label
                     }
                 };
@@ -3635,6 +3649,8 @@ fn lower_spilled_into(
                 dims,
                 element_size,
                 element_kind,
+                element,
+                element_cast_class,
             } = inst
             {
                 let alloc = alloc_addr.ok_or(LowerError::CallUnsupported)?;
@@ -3648,11 +3664,14 @@ fn lower_spilled_into(
                                 ARRAY_DESC_MARK | u32::try_from(dims.len()).unwrap_or(1),
                                 *element_kind,
                                 0u32,
-                                0u32
+                                *element_cast_class
                             ]
                             .into_boxed_slice(),
                         ));
                         type_desc_labels.push((*handle, label));
+                        if let Some(element) = element {
+                            element_edges.push((label, *element));
+                        }
                         label
                     }
                 };
@@ -4108,6 +4127,9 @@ fn prepare(func: &Function) -> Result<Assignment, LowerError> {
                     | Inst::CallVirtual { .. }
                     | Inst::CallInterface { .. }
                     | Inst::CastClassScan { .. }
+                    | Inst::InterfaceHasTag { .. }
+                    | Inst::InterfaceHasArrayElementTag { .. }
+                    | Inst::DescriptorWord { .. }
                     | Inst::PyIntrinsic { .. }
                     | Inst::CallIndirect { .. }
                     | Inst::CallNative { .. }
@@ -5336,8 +5358,8 @@ fn aeabi_float_compare(
 /// Rewrites a rectangular-array allocation (`AllocArray2D`/`AllocArrayMD`) for the OBJECT path into a
 /// linker-resolved `lamella_gc_alloc` call, appending the resulting instructions to `insts` (fresh
 /// `value_types` entries for each temporary). It allocates `4*N + product(dims)*element_size` bytes (the
-/// `[dim0]..[dim(N-1)]` row-major header before the elements), tags the object with a minimal `[0,0,tag,0]`
-/// descriptor (an array dispatches no virtuals through it), and writes each dimension length into the
+/// `[dim0]..[dim(N-1)]` row-major header before the elements), tags the object with its array descriptor,
+/// which carries `System.Array`'s slots where a corlib is attached, and writes each dimension length into the
 /// header. The 1-D `AllocArray` has its own rewrite above; the monolithic path lowers all of these inline
 /// against a fixed allocator address; the RISC-V object path does the same via `emit_alloc_call`.
 #[allow(clippy::too_many_arguments)]
@@ -5351,6 +5373,8 @@ fn rewrite_md_alloc(
     dims: &[ValueId],
     element_size: u32,
     element_kind: u32,
+    element: Option<lamella_ir::TypeHandle>,
+    element_cast_class: u32,
 ) {
     let symbol = intern_extern(externs, "lamella_gc_alloc");
     let type_tag = descriptors
@@ -5421,11 +5445,11 @@ fn rewrite_md_alloc(
                 type_tag,
                 0,
                 0,
-                0
+                element_cast_class
             ]
             .into_boxed_slice(),
-            vtable: alloc::vec![].into_boxed_slice(),
-            element: None,
+            vtable: descriptor_vtable(descriptors.iter().find(|m| m.handle == handle), externs),
+            element: element.map(|element| element.0),
         },
     ));
     insts.push((
@@ -5666,6 +5690,8 @@ fn lower_runtime_calls(
                 dim1,
                 element_size,
                 element_kind,
+                element,
+                element_cast_class,
             } = &inst
             {
                 rewrite_md_alloc(
@@ -5678,6 +5704,8 @@ fn lower_runtime_calls(
                     &[*dim0, *dim1],
                     *element_size,
                     *element_kind,
+                    *element,
+                    *element_cast_class,
                 );
                 continue;
             }
@@ -5686,6 +5714,8 @@ fn lower_runtime_calls(
                 dims,
                 element_size,
                 element_kind,
+                element,
+                element_cast_class,
             } = &inst
             {
                 rewrite_md_alloc(
@@ -5698,6 +5728,8 @@ fn lower_runtime_calls(
                     dims,
                     *element_size,
                     *element_kind,
+                    *element,
+                    *element_cast_class,
                 );
                 continue;
             }
@@ -10847,6 +10879,8 @@ mod tests {
                             dims: alloc::vec![n(0), n(1), n(2)].into_boxed_slice(),
                             element_size: 4,
                             element_kind: 5,
+                            element: None,
+                            element_cast_class: 0,
                         },
                     ),
                     (n(4), i32c(1)),
@@ -14122,127 +14156,45 @@ mod tests {
         }
     }
 
-    /// WHERE A METHOD'S VALUES LIVE, over the whole committed corlib -- the population behind the
-    /// question a debugger asks: to show a local, does it read target MEMORY or a core REGISTER?
-    ///
-    /// This calls [`prepare`] rather than re-deriving its predicate. A second copy would answer
-    /// correctly on the day it was written and drift silently afterwards, and the answer here is one
-    /// another lane is holding a design decision on.
-    ///
-    /// IT ASSERTS THE FACT IT REPORTS, so it is not a print that cannot fail: register-homed values
-    /// OCCUR, and they occur for reference types too. If a future change spilled everything, the
-    /// answer given downstream would have changed and this goes red saying so.
+    /// An interface type test lowers on the spilled path, and its own presence is what sends a function
+    /// there: a `LoadTypeDesc` beside it is how a function built from CIL arrives, and nothing requires one.
     #[test]
-    fn a_corlib_method_keeps_values_in_registers_and_not_only_in_frame_slots() {
-        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures");
-        if !std::path::Path::new(directory).is_dir() {
-            eprintln!("{directory} absent (a stripped drop); skipping");
-            return;
-        }
-        let path = alloc::format!("{directory}/corlib.dll");
-        let bytes = std::fs::read(&path).unwrap_or_else(|error| {
-            panic!("the fixture directory exists but {path} does not read: {error}")
-        });
-        let assembly = lamella_metadata::Assembly::read(&bytes).expect("parse corlib");
-        let methods: Vec<_> = assembly
-            .type_defs()
-            .flat_map(|t| t.methods().collect::<Vec<_>>())
-            .filter(|m| m.body().is_some())
-            .collect();
-        let rids: Vec<u32> = methods.iter().map(lamella_metadata::Method::rid).collect();
-        let resolver = crate::resolver::MetadataResolver::for_module(&assembly, &rids);
-        let target = lamella_metadata::TargetLayout::ilp32();
-        let mut funcs: Vec<lamella_ir::Function> = Vec::new();
-        let mut unlowered = 0usize;
-        for method in &methods {
-            let Some(body) = method.body() else { continue };
-            let Ok((arg_types, local_types)) =
-                crate::resolver::slot_types(&assembly, method, &target)
-            else {
-                unlowered += 1;
-                continue;
-            };
-            let Ok(returns) = crate::resolver::declared_return(&assembly, method, &target) else {
-                unlowered += 1;
-                continue;
-            };
-            let (arg_narrow, local_narrow) = crate::resolver::narrowing_of(&assembly, method, &[]);
-            match crate::cil::lower_method_typed(
-                &body,
-                &resolver,
-                &arg_types,
-                &local_types,
-                returns,
-                crate::cil::Narrowing {
-                    args: &arg_narrow,
-                    locals: &local_narrow,
-                    pointees: &[],
+    fn an_interface_type_test_alone_takes_the_spilled_path() {
+        let i32t = MirType::I32;
+        for (params, inst) in [
+            (
+                2,
+                Inst::InterfaceHasArrayElementTag {
+                    descriptor: ValueId(0),
+                    array_descriptor: ValueId(1),
                 },
-            ) {
-                Ok((func, _)) => funcs.push(func),
-                Err(_) => unlowered += 1,
-            }
+            ),
+            (
+                1,
+                Inst::InterfaceHasTag {
+                    descriptor: ValueId(0),
+                    tag: 0x8000_0001,
+                },
+            ),
+        ] {
+            let result = ValueId(params);
+            let func = Function {
+                params: vec![i32t; params as usize],
+                ret: Some(i32t),
+                value_types: vec![i32t; params as usize + 1],
+                entry: BlockId(0),
+                blocks: vec![BasicBlock {
+                    params: (0..params).map(ValueId).collect(),
+                    insts: vec![(result, inst)],
+                    terminator: Some(Terminator::Return(Some(result))),
+                }],
+            };
+            let code = lower_module(&[func]).expect("the test lowers with no descriptor load beside it");
+            assert!(
+                !code.chunks_exact(2).any(|halfword| halfword == [0x00, 0xDE]),
+                "a type test has an answer for an array of any rank, and does not stop the machine"
+            );
         }
-
-        let (mut all_regs, mut mixed, mut spilled, mut refused) = (0usize, 0, 0, 0);
-        let (mut reg_values, mut frame_values, mut reg_refs) = (0usize, 0, 0);
-        for func in &funcs {
-            match prepare(func) {
-                Ok(Assignment::Registers { regs, .. }) => {
-                    all_regs += 1;
-                    reg_values += regs.len();
-                    reg_refs += func
-                        .value_types
-                        .iter()
-                        .filter(|t| matches!(t, MirType::ObjectRef))
-                        .count();
-                }
-                Ok(Assignment::Mixed { homes, .. }) => {
-                    mixed += 1;
-                    for (value, home) in homes.iter().enumerate() {
-                        match home {
-                            Home::Reg(_) => {
-                                reg_values += 1;
-                                if matches!(
-                                    func.value_types.get(value),
-                                    Some(MirType::ObjectRef)
-                                ) {
-                                    reg_refs += 1;
-                                }
-                            }
-                            Home::Spill(_) => frame_values += 1,
-                        }
-                    }
-                }
-                Ok(Assignment::Spilled) => {
-                    spilled += 1;
-                    frame_values += func.value_types.len();
-                }
-                Err(_) => refused += 1,
-            }
-        }
-
-        println!(
-            "corlib bodies {}: all-registers {all_regs}, register/frame mix {mixed}, \
-             all-frame {spilled}, refused by this backend {refused}, not lowered {unlowered}",
-            funcs.len()
-        );
-        println!(
-            "values: register-homed {reg_values} (of which object references {reg_refs}), \
-             frame-homed {frame_values}"
-        );
-
-        assert!(
-            all_regs + mixed > 0,
-            "no corlib method keeps a value in a register, so every local would be readable from \
-             memory alone -- if that is now true it is a change downstream has been told the \
-             opposite of"
-        );
-        assert!(
-            reg_refs > 0,
-            "no OBJECT REFERENCE is register-homed. `prepare` spills I64, value types, managed \
-             pointers and floats but NOT ObjectRef, so this is expected to occur; if it has \
-             stopped, the reason belongs in this test"
-        );
     }
 }
+

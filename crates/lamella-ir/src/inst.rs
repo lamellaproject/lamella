@@ -526,6 +526,31 @@ pub enum Inst {
         /// the same derivation [`Inst::CallInterface`] uses, so the two agree by construction.
         tag: u32,
     },
+    /// [`Inst::InterfaceHasTag`] for an interface named by an array's descriptor rather than by the
+    /// code: scans `descriptor`'s itable for the tag in `array_descriptor`'s `cast_class@20` word. The
+    /// result is 1 if the entry is present and 0 if it is not.
+    ///
+    /// A store into an array of references needs this form because the type it must satisfy is the
+    /// array's run-time element type: `object[] o = new IFoo[1]; o[0] = x` names no `IFoo` where it
+    /// stores. An array whose element is not an interface holds 0 in that word, and no itable holds a
+    /// tag of 0, so the answer for one is 0.
+    InterfaceHasArrayElementTag {
+        /// The value's TypeDesc address (from [`Inst::LoadTypeDesc`]; 0 for a null reference, which
+        /// answers 0).
+        descriptor: ValueId,
+        /// The array's TypeDesc address (from [`Inst::LoadTypeDesc`]).
+        array_descriptor: ValueId,
+    },
+    /// The word at byte `offset` of a type descriptor. An array cast reads a descriptor's words before
+    /// it knows an object is there, and a null object's descriptor is 0, so reading through 0 does not
+    /// fault on any target, including one where address 0 does not read. What it answers there is
+    /// unspecified.
+    DescriptorWord {
+        /// The TypeDesc address (from [`Inst::LoadTypeDesc`]; 0 for a null reference).
+        descriptor: ValueId,
+        /// The word's byte offset in the descriptor.
+        offset: u32,
+    },
     /// The TYPE NAME string of `descriptor`'s type, as a `System.String` reference -- what
     /// `Object.ToString()` returns for a type that does not override it. 0 (null) when the build laid
     /// no name for that type, which is every build with the name knob off.
@@ -866,7 +891,8 @@ pub enum Inst {
         /// separate the first two pairs and join the second two.
         ///
         /// `0` where the element's only compatible partner is its own exact identity: every
-        /// reference element, and every real struct.
+        /// class, and every real struct. An element that is an interface carries one of that
+        /// interface's method tags here, for [`Inst::InterfaceHasArrayElementTag`].
         element_cast_class: u32,
     },
     /// Loads element `index` of `array` -- the CLI's `ldelem`. The result is the element at
@@ -930,6 +956,14 @@ pub enum Inst {
         /// the kind's absent value is 0, which is itself a meaningful code (a reference element), so
         /// neither word can be published without the other.
         element_kind: u32,
+        /// The element's identity, for the array descriptor's `element_desc@16`, as on [`Inst::AllocArray`]:
+        /// a cast to an array of a reference type walks it, and a collector strides and traces a struct
+        /// element through it. `None` for a primitive element, which neither question reaches, and for
+        /// an element no metadata row names.
+        element: Option<TypeHandle>,
+        /// Which elements this array may be cast between, for the descriptor's cast-class word, as on
+        /// [`Inst::AllocArray`].
+        element_cast_class: u32,
     },
     /// Loads element `(index0, index1)` of a 2-D `array` -- the CLI's `int[,]::Get`. The element sits
     /// at `array + 8 + (index0*dim1 + index1)*element_size` (row-major; `dim1` is read from
@@ -999,6 +1033,14 @@ pub enum Inst {
         /// the kind's absent value is 0, which is itself a meaningful code (a reference element), so
         /// neither word can be published without the other.
         element_kind: u32,
+        /// The element's identity, for the array descriptor's `element_desc@16`, as on [`Inst::AllocArray`]:
+        /// a cast to an array of a reference type walks it, and a collector strides and traces a struct
+        /// element through it. `None` for a primitive element, which neither question reaches, and for
+        /// an element no metadata row names.
+        element: Option<TypeHandle>,
+        /// Which elements this array may be cast between, for the descriptor's cast-class word, as on
+        /// [`Inst::AllocArray`].
+        element_cast_class: u32,
     },
     /// Loads element `(indices[0], ..., indices[N-1])` of a rank-N `array` -- the CLI's `int[,,...]::Get`.
     /// Row-major: the element sits at `array + 4*N + flat*element_size` where the flat index is the Horner

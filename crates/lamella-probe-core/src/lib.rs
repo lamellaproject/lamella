@@ -6,6 +6,48 @@ use std::fmt;
 
 pub mod selection;
 
+/// The refusal when several probes match and none was named. A probe with no serial cannot be named at all,
+/// so when none of them can, it asks for what can be done.
+#[must_use]
+pub fn ambiguous_words(names: &[String]) -> String {
+    if names.iter().all(|name| name.ends_with("(no serial)")) {
+        return format!(
+            "{} probes match and none reports a serial, so none can be named: leave one attached ({})",
+            names.len(),
+            names.join(", ")
+        );
+    }
+    format!(
+        "{} probes match and none was named; pass a serial or export {}=<one of>: {}",
+        names.len(),
+        selection::PROBE_SERIAL_ENV,
+        names.join(", ")
+    )
+}
+
+/// What follows the reason a device would not open, in a sentence that ends with the caller's own full stop.
+///
+/// A bare refusal, Windows' "Access is denied", is what another program holding the device looks like, so
+/// it says to look for one. A reason that already says what to do stands alone: Linux's permission refusal
+/// names the udev rule, and macOS names the steps to regain access.
+#[must_use]
+pub fn hint_after_a_refusal(reason: &str) -> &'static str {
+    if reason.contains("udev rule") || reason.contains("holds it") || reason.contains("macOS refused access;") {
+        ""
+    } else {
+        ". Another program may hold it"
+    }
+}
+
+#[cfg(test)]
+mod open_advice_tests {
+    #[test]
+    fn a_macos_access_remedy_has_no_conflicting_second_hint() {
+        assert_eq!(super::hint_after_a_refusal("HID error: macOS refused access; close apps using the device, reconnect it, and allow the accessory if macOS asks (IOHIDDeviceOpen: 0xe00002c1)"), "");
+        assert_eq!(super::hint_after_a_refusal("Access is denied"), ". Another program may hold it");
+    }
+}
+
 pub mod coresight;
 
 /// The acknowledge a DP/AP transfer returned. `Ok` is success; the others are the ADIv5 wire-level
@@ -38,7 +80,8 @@ pub enum Ack {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ProbeError {
-    /// The packet transport to the probe failed.
+    /// The packet transport to the probe failed: **THE PROBE WENT SILENT**, on whichever route, and every
+    /// route says so in the same words ([`probe_stopped_answering`]).
     Transport(String),
     /// The probe's reply could not be decoded, or echoed the wrong command.
     Protocol(String),
@@ -49,6 +92,9 @@ pub enum ProbeError {
     /// The target device reported an operation failure (names the device-side condition) -- e.g. a
     /// flash controller refusing a command or failing its post-write verify.
     Device(&'static str),
+    /// The debug probe itself, and not the target, refused or could not be found, or what was asked of
+    /// it cannot be asked (names the condition).
+    Debugger(&'static str),
     /// The probe is present but cannot be driven -- e.g. on Windows its debug interface is not bound
     /// to a usable driver. Carries the remedy, so callers can print something actionable rather than
     /// a cryptic transport failure.
@@ -63,22 +109,28 @@ pub enum ProbeError {
     Ambiguous(Vec<String>),
 }
 
+/// What a reader is told when a probe that was answering stops: what failed, and the way to bring it
+/// back. It is the one wording of the probe going silent, so a route cannot say it differently.
+///
+/// A device that never answered is another case, and has its own words in `lamella-probe`: a replug
+/// does not cure a device that is no probe, or one another program holds.
+#[must_use]
+pub fn probe_stopped_answering(why: &str) -> String {
+    let why = why.strip_prefix("probe transport error: ").unwrap_or(why);
+    format!("the probe stopped answering ({why}). Unplug its USB cable, plug it back in, and run this again.")
+}
+
 impl fmt::Display for ProbeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            ProbeError::Transport(e) => write!(f, "{e}"),
+            ProbeError::Transport(e) => f.write_str(&probe_stopped_answering(e)),
             ProbeError::Protocol(e) => write!(f, "malformed probe reply: {e}"),
             ProbeError::Ack(ack) => write!(f, "transfer not acknowledged: {ack:?}"),
             ProbeError::Timeout(what) => write!(f, "timed out waiting for {what}"),
             ProbeError::Device(what) => write!(f, "target device error: {what}"),
+            ProbeError::Debugger(what) => f.write_str(what),
             ProbeError::Unusable(remedy) => write!(f, "probe present but not usable: {remedy}"),
-            ProbeError::Ambiguous(names) => write!(
-                f,
-                "{} probes match and none was named; pass a serial or export {}=<one of>: {}",
-                names.len(),
-                selection::PROBE_SERIAL_ENV,
-                names.join(", ")
-            ),
+            ProbeError::Ambiguous(names) => f.write_str(&ambiguous_words(names)),
         }
     }
 }

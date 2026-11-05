@@ -254,7 +254,7 @@ mod tests {
     /// it to replace one is refused by name rather than ignored.
     #[test]
     fn a_board_that_states_no_bootloader_is_written_where_its_route_starts() {
-        let row = crate::programmer_for("microchip-samd21-xpro").expect("the XPro is routed");
+        let row = crate::programmer_for("microchip-sam-d21-xplained-pro").expect("the XPro is routed");
         assert_eq!(
             placement_for(row, row.programmer, BootloaderChoice::Keep),
             Ok(Placement::Start {

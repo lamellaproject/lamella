@@ -54,6 +54,15 @@ pub fn converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
     if is_by_ref_like(model, from) && is_reference_target(model, to) {
         return false;
     }
+    // Fourth-edition 11.3.1 and seventh-edition 10.2.9 give T? the same boxing
+    // targets as T. Decide this here so overload selection and applied conversions
+    // use the same relation, including interfaces implemented by T.
+    if let Some(underlying) = nullable_underlying(from)
+        && is_reference_target(model, to)
+        && converts(model, underlying, to)
+    {
+        return true;
+    }
     if matches!(from, TypeSymbol::Special(SpecialType::Null)) {
         return is_reference_type(model, to)
             || matches!(to, TypeSymbol::Special(SpecialType::Null))

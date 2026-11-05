@@ -18,6 +18,8 @@
 kind = "board"
 board = "st-stm32f429i-disco"
 vendor = "st"
+maker = "STMicroelectronics"
+product = "STM32F429I-DISCO"
 family = "stm32f42x"
 part = "stm32f429zi"
 product_model = 21          # lamella_wire::product_model::STM32F429I_DISCO

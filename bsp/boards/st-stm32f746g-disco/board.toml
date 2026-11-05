@@ -10,6 +10,8 @@
 kind = "board"
 board = "st-stm32f746g-disco"
 vendor = "st"
+maker = "STMicroelectronics"
+product = "STM32F746G-DISCO"
 family = "stm32f7"
 part = "stm32f746ng"
 product_model = 20          # lamella_wire::product_model::STM32F746G_DISCO

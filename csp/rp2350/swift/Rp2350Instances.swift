@@ -43,6 +43,7 @@ public enum Rp2350Instances {
     public static let TIMER0_RESET_BIT: UInt32 = 23
     public static let TIMER0_RESET_MASK: UInt32 = 0x800000
     public static let TICKS_BASE: UInt32 = 0x40108000
+    public static let SYSINFO_BASE: UInt32 = 0x40000000
     public static let TRNG_BASE: UInt32 = 0x400F0000
     public static let TRNG_RESET_BIT: UInt32 = 25
     public static let TRNG_RESET_MASK: UInt32 = 0x2000000

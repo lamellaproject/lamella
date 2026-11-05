@@ -910,8 +910,9 @@ pub struct ArrayElement {
     /// Which elements this array's may be cast BETWEEN -- ECMA-335 III.4.3's array-element rule,
     /// carried at run time so `castclass`/`isinst` on an array target can decide it. See
     /// [`crate::resolver::array_element_cast_class`];
-    /// [`crate::resolver::ARRAY_CAST_CLASS_NONE`] for a reference element or a real struct, whose
-    /// only compatible partner is its own exact identity.
+    /// [`crate::resolver::ARRAY_CAST_CLASS_NONE`] for a class element or a real struct, whose
+    /// only compatible partner is its own exact identity. An interface element carries one of its
+    /// method tags here instead, which is what a store into the array asks of a value's itable.
     ///
     /// **IT IS A WORD OF ITS OWN AND NOT SPARE BITS OF `element_kind`, WHICH WAS MEASURED RATHER
     /// THAN ASSUMED.** `element_kind` looks like it has 24 free bits, and it does not: `Array`'s
@@ -974,8 +975,13 @@ pub enum ArrayElementTest {
     /// A REFERENCE element: the object's `element_desc@16` must reach this descriptor by the
     /// base-pointer chain -- the same walk `castclass` uses on an object, run one level in.
     Chain(TypeHandle),
-    /// An INTERFACE element: the object's `element_desc@16` must carry this tag in its itable.
+    /// An INTERFACE element: the object's element must be that interface, which its
+    /// `cast_class@20` word says, or `element_desc@16` must carry this tag in its itable.
     Interface(u32),
+    /// A STRUCT element, whose only partner is itself: the object's element must be a struct, and
+    /// `element_desc@16` must be this descriptor. An emitter that had no size for the element leaves
+    /// that edge absent, and then the kind answers alone, so a valid cast is never refused.
+    Struct(TypeHandle),
 }
 
 /// Which of ECMA-335 I.8.9.5's type-initializer triggers a site is, as the opcode reveals it.
@@ -1029,6 +1035,10 @@ pub enum Array2DOp {
         element_size: u32,
         /// The array descriptor's word-1 element KIND -- see `Inst::AllocArray2D`.
         element_kind: u32,
+        /// The element's identity -- see `Inst::AllocArray2D`.
+        element: Option<TypeHandle>,
+        /// What the array may be cast between -- see `Inst::AllocArray2D`.
+        element_cast_class: u32,
     },
     /// `call int[,]::Get(i, j)` -- load; carries the element width/signedness and the loaded type.
     Get {
@@ -1067,6 +1077,10 @@ pub enum ArrayMDOp {
         element_size: u32,
         /// The array descriptor's word-1 element KIND -- see `Inst::AllocArrayMD`.
         element_kind: u32,
+        /// The element's identity -- see `Inst::AllocArrayMD`.
+        element: Option<TypeHandle>,
+        /// What the array may be cast between -- see `Inst::AllocArrayMD`.
+        element_cast_class: u32,
         /// The array's rank -- the number of dimension arguments.
         rank: usize,
     },
@@ -4007,6 +4021,22 @@ fn apply_value_op(
                     let index1 = stack.pop().ok_or(CilError::StackUnderflow)?;
                     let index0 = stack.pop().ok_or(CilError::StackUnderflow)?;
                     let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    if matches!(element_type, MirType::ValueType { .. }) {
+                        let address = new_value(value_types, MirType::ManagedPtr);
+                        insts.push((
+                            address,
+                            Inst::Array2DElemAddr {
+                                array,
+                                index0,
+                                index1,
+                                element_size,
+                            },
+                        ));
+                        let result = new_value(value_types, element_type);
+                        insts.push((result, Inst::FieldLoad { base: address, offset: 0 }));
+                        stack.push(result);
+                        return Ok(());
+                    }
                     let result = new_value(value_types, element_type);
                     insts.push((
                         result,
@@ -4043,6 +4073,28 @@ fn apply_value_op(
                     let index1 = stack.pop().ok_or(CilError::StackUnderflow)?;
                     let index0 = stack.pop().ok_or(CilError::StackUnderflow)?;
                     let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    if matches!(value_types.get(value.index()), Some(MirType::ValueType { .. })) {
+                        let address = new_value(value_types, MirType::ManagedPtr);
+                        insts.push((
+                            address,
+                            Inst::Array2DElemAddr {
+                                array,
+                                index0,
+                                index1,
+                                element_size,
+                            },
+                        ));
+                        let result = new_value(value_types, MirType::I32);
+                        insts.push((
+                            result,
+                            Inst::FieldStore {
+                                base: address,
+                                offset: 0,
+                                value,
+                            },
+                        ));
+                        return Ok(());
+                    }
                     let result = new_value(value_types, MirType::I32);
                     insts.push((
                         result,
@@ -4071,6 +4123,21 @@ fn apply_value_op(
                     }
                     indices.reverse();
                     let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    if matches!(element_type, MirType::ValueType { .. }) {
+                        let address = new_value(value_types, MirType::ManagedPtr);
+                        insts.push((
+                            address,
+                            Inst::ArrayMDElemAddr {
+                                array,
+                                indices: indices.into_boxed_slice(),
+                                element_size,
+                            },
+                        ));
+                        let result = new_value(value_types, element_type);
+                        insts.push((result, Inst::FieldLoad { base: address, offset: 0 }));
+                        stack.push(result);
+                        return Ok(());
+                    }
                     let result = new_value(value_types, element_type);
                     insts.push((
                         result,
@@ -4113,6 +4180,27 @@ fn apply_value_op(
                     }
                     indices.reverse();
                     let array = stack.pop().ok_or(CilError::StackUnderflow)?;
+                    if matches!(value_types.get(value.index()), Some(MirType::ValueType { .. })) {
+                        let address = new_value(value_types, MirType::ManagedPtr);
+                        insts.push((
+                            address,
+                            Inst::ArrayMDElemAddr {
+                                array,
+                                indices: indices.into_boxed_slice(),
+                                element_size,
+                            },
+                        ));
+                        let result = new_value(value_types, MirType::I32);
+                        insts.push((
+                            result,
+                            Inst::FieldStore {
+                                base: address,
+                                offset: 0,
+                                value,
+                            },
+                        ));
+                        return Ok(());
+                    }
                     let result = new_value(value_types, MirType::I32);
                     insts.push((
                         result,
@@ -5253,6 +5341,8 @@ fn apply_value_op(
                 handle,
                 element_size,
                 element_kind,
+                element,
+                element_cast_class,
             }) = resolver.array_2d_op(&inst.operand)
             {
                 let dim1 = stack.pop().ok_or(CilError::StackUnderflow)?;
@@ -5266,6 +5356,8 @@ fn apply_value_op(
                         dim1,
                         element_size,
                         element_kind,
+                        element,
+                        element_cast_class,
                     },
                 ));
                 stack.push(array);
@@ -5275,6 +5367,8 @@ fn apply_value_op(
                 handle,
                 element_size,
                 element_kind,
+                element,
+                element_cast_class,
                 rank,
             }) = resolver.array_md_op(&inst.operand)
             {
@@ -5291,6 +5385,8 @@ fn apply_value_op(
                         dims: dims.into_boxed_slice(),
                         element_size,
                         element_kind,
+                        element,
+                        element_cast_class,
                     },
                 ));
                 stack.push(array);
@@ -6330,6 +6426,11 @@ enum TrapKind {
     /// satisfy is the array's RUNTIME one and is not knowable at compile time. It is read from the
     /// array's own descriptor (`element_desc@16`) and the stored value's type is walked up its
     /// base-pointer chain against it -- the same scan `castclass` uses.
+    ///
+    /// An element that is an interface is on no value's chain, so when the walk finds nothing the
+    /// value's itable is asked for the tag in the array's `cast_class@20` word, which is what a
+    /// `castclass` to that interface asks. A class element's word is 0, which no itable holds, so
+    /// its refusal stands and a store the walk accepts never reaches the second question.
     BoundsThenArrayStore,
     /// A rectangular array's `Get`, `Set` or `Address`: any index at or past its own dimension (unsigned)
     /// -> `IndexOutOfRangeException`.
@@ -7255,10 +7356,9 @@ fn null_passes_the_cast(
 /// shape rather than a defect -- see the covariant-store check, which must not throw on it.
 const ARRAY_ELEMENT_DESC_OFFSET: i32 = 16;
 
-/// The byte offset of `element_cast_class` -- the SIXTH word of an array descriptor, ECMA-335
-/// III.4.3's array-element class for its element type. `0` where only the element's own identity
-/// will do (every reference element, and every real struct).
-const ARRAY_CAST_CLASS_OFFSET: i32 = 20;
+/// The byte offset of `element_cast_class` -- see [`crate::resolver::ARRAY_CAST_CLASS_OFFSET`], which
+/// says what the word holds.
+const ARRAY_CAST_CLASS_OFFSET: i32 = crate::resolver::ARRAY_CAST_CLASS_OFFSET as i32;
 
 /// The byte offset of `element_kind` -- the SECOND word, the frozen code saying what ONE ELEMENT IS
 /// (a reference, or which primitive). It is the only element fact an array descriptor carries
@@ -7272,30 +7372,12 @@ fn descriptor_word(
     value_types: &mut Vec<MirType>,
     insts: &mut Vec<(ValueId, Inst)>,
 ) -> ValueId {
-    let at = new_value(value_types, MirType::I32);
-    let off = new_value(value_types, MirType::I32);
-    insts.push((
-        off,
-        Inst::ConstInt {
-            ty: MirType::I32,
-            value: i64::from(offset),
-        },
-    ));
-    insts.push((
-        at,
-        Inst::Binary {
-            op: BinOp::Add,
-            lhs: descriptor,
-            rhs: off,
-        },
-    ));
     let word = new_value(value_types, MirType::I32);
     insts.push((
         word,
-        Inst::Load {
-            address: at,
-            width: 4,
-            signed: false,
+        Inst::DescriptorWord {
+            descriptor,
+            offset: offset as u32,
         },
     ));
     word
@@ -7305,15 +7387,14 @@ fn descriptor_word(
 /// accepts" -- ECMA-335 4th ed III.4.3 notes 2 and 3, shared by `castclass`'s trap and `isinst`'s
 /// value so the two opcodes cannot disagree about one rule.
 ///
-/// **IT COMPOSES FROM INSTRUCTIONS EVERY BACKEND ALREADY LOWERS**, so an array cast needs no new IR
-/// and no per-backend work: the descriptor words are read the way the covariant-store check reads
-/// `element_desc@16`, and a reference element reuses `CastClassScan` / `InterfaceHasTag` run one
-/// level in -- on the ELEMENT's descriptor rather than on the object's.
+/// **IT COMPOSES FROM INSTRUCTIONS EVERY BACKEND ALREADY LOWERS**, so an array cast needs no
+/// per-backend work: a reference element reuses `CastClassScan` / `InterfaceHasTag` run one level
+/// in -- on the ELEMENT's descriptor rather than on the object's.
 ///
-/// A NULL object needs no branch. `LoadTypeDesc` answers 0 for it, this reads words through that 0
-/// (readable on every target here -- the same reading the store check already makes), and the final
-/// term ANDs the whole answer with `object_desc != 0`, so a null is never an array. `castclass`
-/// additionally lets null through via `null_passes_the_cast`, which is where `(T[])null` succeeds.
+/// A NULL object needs no branch here. `LoadTypeDesc` answers 0 for it, [`Inst::DescriptorWord`]
+/// reads through that 0 without faulting on any target, and the final term ANDs the whole answer
+/// with `object_desc != 0`, so a null is never an array. `castclass` additionally lets null through
+/// via `null_passes_the_cast`, which is where `(T[])null` succeeds.
 ///
 /// READING a word through that 0 is safe; DERIVING AN ADDRESS from it is not, and the
 /// reference-element arms do the second -- see [`array_element_descriptor`], which masks it. The
@@ -7449,16 +7530,89 @@ fn array_cast_match(
                     tag: *tag,
                 },
             ));
-            let matched = new_value(value_types, MirType::I32);
+            let implemented = new_value(value_types, MirType::I32);
             insts.push((
-                matched,
+                implemented,
                 Inst::Compare {
                     op: CmpOp::Ne,
                     lhs: present,
                     rhs: zero,
                 },
             ));
+            let laid = descriptor_word(object_desc, ARRAY_CAST_CLASS_OFFSET, value_types, insts);
+            let want = konst(i64::from(*tag), value_types, insts);
+            let same_interface = new_value(value_types, MirType::I32);
+            insts.push((
+                same_interface,
+                Inst::Compare {
+                    op: CmpOp::Eq,
+                    lhs: laid,
+                    rhs: want,
+                },
+            ));
+            let matched = new_value(value_types, MirType::I32);
+            insts.push((
+                matched,
+                Inst::Binary {
+                    op: BinOp::Or,
+                    lhs: implemented,
+                    rhs: same_interface,
+                },
+            ));
             matched
+        }
+        ArrayElementTest::Struct(target) => {
+            let target = *target;
+            let kind = descriptor_word(object_desc, ARRAY_ELEMENT_KIND_OFFSET, value_types, insts);
+            let want = konst(i64::from(crate::resolver::ELEMENT_KIND_OPAQUE), value_types, insts);
+            let is_struct = new_value(value_types, MirType::I32);
+            insts.push((
+                is_struct,
+                Inst::Compare {
+                    op: CmpOp::Eq,
+                    lhs: kind,
+                    rhs: want,
+                },
+            ));
+            let edge = descriptor_word(object_desc, ARRAY_ELEMENT_DESC_OFFSET, value_types, insts);
+            let absent = new_value(value_types, MirType::I32);
+            insts.push((
+                absent,
+                Inst::Compare {
+                    op: CmpOp::Eq,
+                    lhs: edge,
+                    rhs: zero,
+                },
+            ));
+            let element_desc = array_element_descriptor(object_desc, value_types, insts);
+            let target_desc = new_value(value_types, MirType::I32);
+            insts.push((target_desc, Inst::TypeDescAddr { handle: target }));
+            let scanned = new_value(value_types, MirType::I32);
+            insts.push((
+                scanned,
+                Inst::CastClassScan {
+                    args: alloc::vec![element_desc, target_desc],
+                },
+            ));
+            let same = new_value(value_types, MirType::I32);
+            insts.push((
+                same,
+                Inst::Compare {
+                    op: CmpOp::Ne,
+                    lhs: scanned,
+                    rhs: zero,
+                },
+            ));
+            let identified = new_value(value_types, MirType::I32);
+            insts.push((
+                identified,
+                Inst::Binary {
+                    op: BinOp::Or,
+                    lhs: absent,
+                    rhs: same,
+                },
+            ));
+            and(is_struct, identified, value_types, insts)
         }
     };
 
@@ -7471,6 +7625,26 @@ fn array_cast_match(
             rhs: zero,
         },
     ));
+    let element_ok = if matches!(test.element, ArrayElementTest::Chain(_) | ArrayElementTest::Interface(_)) {
+        let kind = descriptor_word(object_desc, ARRAY_ELEMENT_KIND_OFFSET, value_types, insts);
+        let want = konst(
+            i64::from(crate::resolver::ELEMENT_KIND_REFERENCE),
+            value_types,
+            insts,
+        );
+        let references = new_value(value_types, MirType::I32);
+        insts.push((
+            references,
+            Inst::Compare {
+                op: CmpOp::Eq,
+                lhs: kind,
+                rhs: want,
+            },
+        ));
+        and(element_ok, references, value_types, insts)
+    } else {
+        element_ok
+    };
     let a = and(is_array, element_ok, value_types, insts);
     and(a, described, value_types, insts)
 }
@@ -7517,13 +7691,57 @@ fn array_element_descriptor(
             value: 0,
         },
     ));
-    let described = new_value(value_types, MirType::I32);
+    let present = new_value(value_types, MirType::I32);
     insts.push((
-        described,
+        present,
         Inst::Compare {
             op: CmpOp::Ne,
             lhs: object_desc,
             rhs: zero,
+        },
+    ));
+    let word0 = descriptor_word(object_desc, 0, value_types, insts);
+    let mark_mask = new_value(value_types, MirType::I32);
+    insts.push((
+        mark_mask,
+        Inst::ConstInt {
+            ty: MirType::I32,
+            value: i64::from(crate::resolver::ARRAY_DESC_MARK_MASK),
+        },
+    ));
+    let marked_word = new_value(value_types, MirType::I32);
+    insts.push((
+        marked_word,
+        Inst::Binary {
+            op: BinOp::And,
+            lhs: word0,
+            rhs: mark_mask,
+        },
+    ));
+    let mark = new_value(value_types, MirType::I32);
+    insts.push((
+        mark,
+        Inst::ConstInt {
+            ty: MirType::I32,
+            value: i64::from(crate::resolver::ARRAY_DESC_MARK),
+        },
+    ));
+    let marked = new_value(value_types, MirType::I32);
+    insts.push((
+        marked,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: marked_word,
+            rhs: mark,
+        },
+    ));
+    let described = new_value(value_types, MirType::I32);
+    insts.push((
+        described,
+        Inst::Binary {
+            op: BinOp::And,
+            lhs: present,
+            rhs: marked,
         },
     ));
     let mask = new_value(value_types, MirType::I32);
@@ -8185,13 +8403,32 @@ fn build_trap_access_check(
             block_count,
             propagate_fixups,
         )?;
+        let asked = new_value(value_types, MirType::I32);
+        let interface_check = block_count + split_blocks.len();
+        split_blocks.push(BasicBlock {
+            params: Vec::new(),
+            insts: alloc::vec![(
+                asked,
+                Inst::InterfaceHasArrayElementTag {
+                    descriptor: value_desc,
+                    array_descriptor: array_desc,
+                },
+            )],
+            terminator: Some(Terminator::Branch {
+                cond: asked,
+                if_true: BlockId(pass as u32),
+                true_args: Vec::new(),
+                if_false: BlockId(store_trap as u32),
+                false_args: Vec::new(),
+            }),
+        });
         let check = block_count + split_blocks.len();
         split_blocks.push(BasicBlock {
             params: Vec::new(),
             insts: check_insts,
             terminator: Some(Terminator::Branch {
                 cond: mismatch,
-                if_true: BlockId(store_trap as u32),
+                if_true: BlockId(interface_check as u32),
                 true_args: Vec::new(),
                 if_false: BlockId(pass as u32),
                 false_args: Vec::new(),
@@ -14123,12 +14360,21 @@ mod tests {
                 _ => None,
             })
             .collect();
+        let words: Vec<i64> = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter_map(|(_, i)| match i {
+                Inst::DescriptorWord { offset, .. } => Some(i64::from(*offset)),
+                _ => None,
+            })
+            .collect();
         assert!(
-            constants.contains(&i64::from(ARRAY_ELEMENT_KIND_OFFSET)),
-            "the test must reach `element_kind@4`; constants were {constants:?}"
+            words.contains(&i64::from(ARRAY_ELEMENT_KIND_OFFSET)),
+            "the test must reach `element_kind@4`; words read were {words:?}"
         );
         assert!(
-            !constants.contains(&i64::from(ARRAY_ELEMENT_DESC_OFFSET)),
+            !words.contains(&i64::from(ARRAY_ELEMENT_DESC_OFFSET)),
             "reading `element_desc@16` is the defect this arm exists to avoid -- it is ABSENT for a \
              nested array, and a walk from it lands on the array's own descriptor"
         );

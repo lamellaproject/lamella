@@ -45,24 +45,28 @@ done
 
 # Every assembly under libs/, in an order where each is built after what it references. The second
 # field lists other entries here that it references; all of them reference the corlib implicitly.
-# Fields are `name|references|foldedIn|held`, and an empty field is meaningful: `System.Device.Gpio||…`
+# Fields are `name|references|foldedIn|held|langVersion`, and an empty field is meaningful: `System.Device.Gpio||…`
 # references nothing beyond the corlib. `foldedIn` names source directories that build INTO this
 # assembly instead of getting one of their own -- upstream ships `PwmChannel` inside
 # `System.Device.Gpio.dll`, so the namespace is unchanged and only the assembly is. A folded
 # directory must not also be listed here on its own, or the same type lands in two assemblies and a
 # reference resolves it from whichever is found first.
 # `held` holds a row back and names the reason: a held row is reported on every run instead of built.
+# `langVersion` raises one assembly above the surface's language version, as the .ps1's row of that name does.
 assemblies=(
     # Its own assembly rather than folded, unlike System.Device.Pwm below. See csharp/build-managed.ps1's
     # entry for the upstream measurement the distinction rests on. References only corlib.
     "System.Device.Analog|"
     "System.Device.Gpio||System.Device.Pwm"
     # The boardless facts: a build for a board takes the board's own facts assembly, of the same name,
-    # in their place. See csharp/build-managed.ps1's entry. References only corlib.
-    "Lamella.Hardware.Facts|"
+    # in their place. See csharp/build-managed.ps1's entry. References System.Device.Gpio, which holds the
+    # PWM channel its one method answers.
+    "Lamella.Hardware.Facts|System.Device.Gpio"
     # TargetBoard, compiled once against the facts' fixed name. It hands out the standard GPIO, I2C,
-    # SPI and analog classes, so it references both of their assemblies, and neither references it.
-    "Lamella.Hardware|System.Device.Gpio,System.Device.Analog,Lamella.Hardware.Facts"
+    # SPI and analog classes, so it references both of their assemblies, and neither references it. At
+    # C# 9, because its pin and bus types are records, as the Lamella.Hardware package for .NET declares them.
+    # It names IReadOnlyList<T>, so a surface without LAMELLA_SURFACE_NETFX_4_5 stops at its compile.
+    "Lamella.Hardware|System.Device.Gpio,System.Device.Analog,Lamella.Hardware.Facts|||9"
     "System.Device.Model|"
     "System.Net.NetworkInformation|"
     # Bare, unprefixed: full .NET's own assembly name for full .NET's types. See csharp/build-managed.ps1's
@@ -193,7 +197,7 @@ write_sources "${corlib_src[@]}"
 
 # --- libs --------------------------------------------------------------------------------------
 for entry in "${assemblies[@]}"; do
-    IFS='|' read -r name deps folded held <<< "$entry"
+    IFS='|' read -r name deps folded held langver <<< "$entry"
     if [ -n "$held" ]; then
         echo "$name -- HELD, not built: $held"
         continue
@@ -219,7 +223,9 @@ for entry in "${assemblies[@]}"; do
     fi
     echo "$name (${#src[@]} sources) -> $out/$name.dll"
     write_sources "${src[@]}"
-    "$lcsc" "$source_list_arg" "$langversion" "--define=$define" "${refs[@]}" "--out=$out/$name.dll" --no-debug
+    lib_langversion="$langversion"
+    if [ -n "$langver" ]; then lib_langversion="--langversion=$langver"; fi
+    "$lcsc" "$source_list_arg" "$lib_langversion" "--define=$define" "${refs[@]}" "--out=$out/$name.dll" --no-debug
 done
 
 # --- System.Device.Gpio, once per family -------------------------------------------------------------
@@ -231,7 +237,7 @@ done
 # is the .ps1's, made with sed, and the list is read and refused as the .ps1 reads and refuses it.
 gpio_folded=""
 for entry in "${assemblies[@]}"; do
-    IFS='|' read -r name deps folded held <<< "$entry"
+    IFS='|' read -r name deps folded held langver <<< "$entry"
     if [ "$name" = "System.Device.Gpio" ]; then gpio_folded="$folded"; fi
 done
 read_lines < <(sources_of "$root/libs/System.Device.Gpio" 1)

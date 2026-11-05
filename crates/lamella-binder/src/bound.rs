@@ -31,6 +31,9 @@ use lamella_syntax::ast::{
 use lamella_syntax::span::Span;
 use lamella_syntax::token::{IntegerSuffix, RealSuffix};
 
+mod delegate_signature;
+mod foreach;
+
 /// Why a class does or does not implement one interface method. Three of the four outcomes are
 /// failures, and csc gives each its own code because each names a different repair: declare the
 /// member (`CS0535`), make it public (`CS0737`), or fix its return type (`CS0738`).
@@ -2207,8 +2210,9 @@ impl Binder {
         self.diagnostics.push(diagnostic);
     }
 
-    /// Marks every diagnostic reported since `first` as BODY phase, so the declaration gate can
-    /// withhold them (see [`crate::withhold_body_diagnostics_after_declaration_error`]).
+    /// Marks declaration-phase diagnostics reported since `first` as BODY phase, so the declaration
+    /// gate can withhold them (see [`crate::withhold_body_diagnostics_after_declaration_error`]).
+    /// Deferred emission refusals retain their phase until whole-program language validation ends.
     ///
     /// TAGGING A RANGE ON THE WAY OUT, rather than at each of the ~200 construction sites, is what
     /// keeps this from touching the whole binder -- and it is also the only form that survives the
@@ -2217,7 +2221,9 @@ impl Binder {
     /// longer exist. Marking afterwards, over whatever survived, cannot.
     fn mark_body_phase(&mut self, first: usize) {
         for diagnostic in &mut self.diagnostics[first..] {
-            diagnostic.phase = crate::diagnostic::DiagnosticPhase::Body;
+            if diagnostic.phase == crate::diagnostic::DiagnosticPhase::Declaration {
+                diagnostic.phase = crate::diagnostic::DiagnosticPhase::Body;
+            }
         }
     }
 
@@ -3355,7 +3361,17 @@ impl Binder {
             if !self.names_a_known_type(constraint) {
                 continue;
             }
-            if !self.satisfies_named_constraint(argument, constraint) {
+            // Fourth-edition 25.7.1 permits boxing for constraints only from a
+            // non-nullable value type. From C# 3 a nullable argument fails only an
+            // interface constraint.
+            let excluded_nullable_boxing = crate::conversion::nullable_underlying(argument)
+                .is_some()
+                && self.satisfies_reference_type_constraint(constraint)
+                && (self.language_version() == LanguageVersion::CSharp2
+                    || self
+                        .type_info_of(constraint)
+                        .is_some_and(|info| info.kind == TypeKind::Interface));
+            if excluded_nullable_boxing || !self.satisfies_named_constraint(argument, constraint) {
                 self.diagnostics.push(Diagnostic::new(
                     DiagnosticKind::TypeArgumentNoConversionToConstraint {
                         argument: alloc::format!("{argument}").into(),
@@ -3479,7 +3495,11 @@ impl Binder {
     /// 25.7.1's first bullet: the argument converts to the named constraint by identity, an
     /// implicit reference conversion, a boxing conversion, or -- from a type parameter -- an
     /// implicit reference, boxing or type parameter conversion (25.7.4).
-    fn satisfies_named_constraint(&self, argument: &TypeSymbol, constraint: &TypeSymbol) -> bool {
+    pub(crate) fn satisfies_named_constraint(
+        &self,
+        argument: &TypeSymbol,
+        constraint: &TypeSymbol,
+    ) -> bool {
         crate::conversion::converts(&self.model, argument, constraint)
             || self.type_parameter_converts_to(argument, constraint, self.type_parameters_in_scope.len())
     }
@@ -3876,39 +3896,194 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         to: &TypeSymbol,
         name: &str,
     ) -> Option<MethodReference> {
+        self.find_user_conversion(from, to, name, false)
+            .ok()
+            .flatten()
+    }
+
+    /// Cast searches distinguish an empty candidate set from an ambiguous one so
+    /// the latter cannot fall through to another conversion path (13.4.4).
+    fn find_user_conversion(
+        &self,
+        from: &TypeSymbol,
+        to: &TypeSymbol,
+        name: &str,
+        explicit: bool,
+    ) -> Result<Option<MethodReference>, ()> {
         if no_conversion_operator_can_exist(&self.model, from, to) {
-            return None;
+            return Ok(None);
         }
-        let mut fallback: Option<MethodReference> = None;
+        let names = if explicit {
+            &["op_Implicit", "op_Explicit"][..]
+        } else {
+            core::slice::from_ref(&name)
+        };
+        let mut candidates = Vec::new();
         for owner in [from, to] {
-            for method in self.methods_in_chain(owner, name) {
-                if method.parameters.len() != 1
-                    || !(&method.return_type == to || converts(&self.model, &method.return_type, to))
-                    || !converts(&self.model, from, &method.parameters[0])
-                {
-                    continue;
+            for name in names {
+                for method in self.methods_in_chain(owner, name) {
+                    if method.parameters.len() != 1 {
+                        continue;
+                    }
+                    // 13.4.4 permits a standard explicit conversion on either side of
+                    // either operator kind in a cast. Assignment uses only implicit
+                    // prefixes and suffixes (13.4.3).
+                    let standard = |source: &TypeSymbol, target: &TypeSymbol| {
+                        self.standard_implicit_conversion(source, target)
+                            || (explicit && self.standard_implicit_conversion(target, source))
+                    };
+                    if !standard(from, &method.parameters[0]) || !standard(&method.return_type, to)
+                    {
+                        continue;
+                    }
+                    let exact = &method.parameters[0] == from && &method.return_type == to;
+                    let declaring_type =
+                        self.declaring_type_in_chain(owner, name, &method.parameters);
+                    let declaring_instantiation =
+                        self.declaring_instantiation_of(&declaring_type, name, &method.parameters);
+                    let reference = MethodReference {
+                        declaring_type,
+                        name: (*name).into(),
+                        parameters: method.parameters,
+                        return_type: method.return_type,
+                        is_static: true,
+                        is_vararg: false,
+                        instantiation: None,
+                        declaring_instantiation,
+                    };
+                    if exact && !explicit {
+                        return Ok(Some(reference));
+                    }
+                    if !candidates.contains(&reference) {
+                        candidates.push(reference);
+                    }
                 }
-                let exact = &method.parameters[0] == from && &method.return_type == to;
-                let declaring_type = self.declaring_type_in_chain(owner, name, &method.parameters);
-                let declaring_instantiation =
-                    self.declaring_instantiation_of(&declaring_type, name, &method.parameters);
-                let reference = MethodReference {
-                    declaring_type,
-                    name: name.into(),
-                    parameters: method.parameters,
-                    return_type: method.return_type,
-                    is_static: true,
-                    is_vararg: false,
-                    instantiation: None,
-                    declaring_instantiation,
-                };
-                if exact {
-                    return Some(reference);
-                }
-                fallback.get_or_insert(reference);
             }
         }
-        fallback
+        if !explicit || candidates.is_empty() {
+            return Ok(candidates.into_iter().next());
+        }
+        // Fourth-edition 13.4.4 and seventh-edition 10.5.5 select source and target
+        // types independently over both operator kinds. An ambiguous set must not
+        // fall through to another cast path that picks an arbitrary operator.
+        let source = self
+            .most_specific_conversion_type(
+                candidates
+                    .iter()
+                    .map(|method| &method.parameters[0])
+                    .collect(),
+                from,
+                true,
+            )
+            .ok_or(())?;
+        let target = self
+            .most_specific_conversion_type(
+                candidates
+                    .iter()
+                    .map(|method| &method.return_type)
+                    .collect(),
+                to,
+                false,
+            )
+            .ok_or(())?;
+        let mut selected = candidates
+            .iter()
+            .filter(|method| &method.parameters[0] == source && &method.return_type == target);
+        let result = selected.next().ok_or(())?;
+        if selected.next().is_some() {
+            return Err(());
+        }
+        Ok(Some(result.clone()))
+    }
+
+    /// The most specific endpoint of a cast's candidate set (13.4.4). Source
+    /// selection prefers implicit prefixes and target selection prefers implicit
+    /// suffixes; only when that subset is empty is the encompassing direction reversed.
+    fn most_specific_conversion_type<'a>(
+        &self,
+        types: Vec<&'a TypeSymbol>,
+        endpoint: &TypeSymbol,
+        source: bool,
+    ) -> Option<&'a TypeSymbol> {
+        if let Some(exact) = types.iter().copied().find(|ty| *ty == endpoint) {
+            return Some(exact);
+        }
+        let preferred: Vec<_> = types
+            .iter()
+            .copied()
+            .filter(|ty| {
+                if source {
+                    self.standard_implicit_conversion(endpoint, ty)
+                } else {
+                    self.standard_implicit_conversion(ty, endpoint)
+                }
+            })
+            .collect();
+        let most_encompassed = source != preferred.is_empty();
+        let types = if preferred.is_empty() {
+            types
+        } else {
+            preferred
+        };
+        types.iter().copied().find(|candidate| {
+            types.iter().all(|other| {
+                if most_encompassed {
+                    self.standard_implicit_conversion(candidate, other)
+                } else {
+                    self.standard_implicit_conversion(other, candidate)
+                }
+            })
+        })
+    }
+
+    /// Type-based standard implicit conversions for user-defined conversion prefixes
+    /// and suffixes (fourth edition 13.3.1; seventh edition 10.4.2).
+    fn standard_implicit_conversion(&self, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+        if from.is_error()
+            || to.is_error()
+            || from.is_void()
+            || to.is_void()
+            || matches!(from, TypeSymbol::ByRef(_))
+            || matches!(to, TypeSymbol::ByRef(_))
+        {
+            return false;
+        }
+        if from == to {
+            return true;
+        }
+        if matches!(from, TypeSymbol::Special(SpecialType::Null)) {
+            // 13.1.4's null-to-reference conversion is standard. Neither 13.7.1's
+            // null-to-nullable nor 27.4's null-to-pointer conversion is in this set.
+            return self.satisfies_reference_type_constraint(to)
+                || (self.language_version() != LanguageVersion::CSharp2
+                    && (crate::conversion::nullable_underlying(to).is_some()
+                        || matches!(to, TypeSymbol::Pointer(_))));
+        }
+        if matches!(from, TypeSymbol::Pointer(_)) {
+            // 27.4 adds only pointer-to-void* to the standard implicit conversions.
+            return matches!(to, TypeSymbol::Pointer(element) if element.is_void());
+        }
+        if let Some(target) = crate::conversion::nullable_underlying(to) {
+            let source = crate::conversion::nullable_underlying(from).unwrap_or(from);
+            // A struct-constrained parameter is a non-nullable value type (25.7.1).
+            return self.satisfies_value_type_constraint(source)
+                && self.satisfies_value_type_constraint(target)
+                && self.standard_implicit_conversion(source, target)
+                && converts(&self.model, from, to);
+        }
+        if self.satisfies_reference_type_constraint(to) {
+            // Reference, boxing and constrained type-parameter conversions preserve
+            // their ordinary hierarchy checks (13.1.4, 13.1.5 and 13.1.6).
+            return (self.satisfies_reference_type_constraint(from)
+                || self.is_value_type(from)
+                || self.constraints_of_type_parameter(from).is_some())
+                && self.satisfies_named_constraint(from, to);
+        }
+        if self.constraints_of_type_parameter(from).is_some() {
+            return self.satisfies_named_constraint(from, to);
+        }
+        matches!((from, to), (TypeSymbol::Special(_), TypeSymbol::Special(_)))
+            && crate::conversion::has_implicit_conversion(from, to)
     }
 
     /// Reports a failed implicit conversion at `span`: `CS0266` when an explicit
@@ -4029,11 +4204,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             && !matches!(expr.ty, TypeSymbol::Special(SpecialType::Decimal))
         {
             if let Some(method) = self.user_conversion(&expr.ty, target, "op_Implicit") {
+                let argument = self.convert(expr, &method.parameters[0]);
                 return BoundExpr {
                     ty: target.clone(),
                     kind: BoundExprKind::Call {
                         callee: Box::new(error_expr()),
-                        arguments: alloc::vec![expr],
+                        arguments: alloc::vec![argument],
                         method: Some(method),
                     },
                 };
@@ -4060,11 +4236,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
         if let Some(method) = self.user_conversion(&expr.ty, target, "op_Implicit") {
             let produced = method.return_type.clone();
+            let argument = self.convert(expr, &method.parameters[0]);
             let call = BoundExpr {
                 ty: produced.clone(),
                 kind: BoundExprKind::Call {
                     callee: Box::new(error_expr()),
-                    arguments: alloc::vec![expr],
+                    arguments: alloc::vec![argument],
                     method: Some(method),
                 },
             };
@@ -5109,6 +5286,19 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.current_type
             .as_ref()
             .is_some_and(|ty| self.is_value_type(ty))
+    }
+
+    fn has_open_type_parameter(&self, ty: &TypeSymbol) -> bool {
+        match ty {
+            TypeSymbol::Named(_) => self.constraints_of_type_parameter(ty).is_some(),
+            TypeSymbol::Instantiation { arguments, .. } => arguments
+                .iter()
+                .any(|argument| self.has_open_type_parameter(argument)),
+            TypeSymbol::Array { element, .. }
+            | TypeSymbol::Pointer(element)
+            | TypeSymbol::ByRef(element) => self.has_open_type_parameter(element),
+            _ => false,
+        }
     }
 
     pub(crate) fn is_value_type(&self, ty: &TypeSymbol) -> bool {
@@ -8282,6 +8472,36 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 let annotated_as = matches!(operation, TypeTestOperation::As)
                     && self.is_top_level_annotation(target);
                 let resolved = self.resolve_type_ref(target);
+                // Pointers participate in neither boxing nor reference type tests
+                // (second-edition 25.2 and fourth-edition 27.2).
+                if matches!(operand.ty, TypeSymbol::Pointer(_))
+                    || matches!(resolved, TypeSymbol::Pointer(_))
+                {
+                    self.report(Diagnostic::new(DiagnosticKind::TypeTestOnPointer, span));
+                    return error_expr();
+                }
+                // Second-edition 14.9.10 requires a reference target. Fourth-edition
+                // 14.9.11 and seventh-edition 12.12.13 also admit nullable value types.
+                let nullable_as_target = self.language_version >= LanguageVersion::CSharp2;
+                if matches!(operation, TypeTestOperation::As)
+                    && !resolved.is_error()
+                    && !self.satisfies_reference_type_constraint(&resolved)
+                    && !(nullable_as_target
+                        && crate::conversion::nullable_underlying(&resolved).is_some())
+                {
+                    let kind = if self.constraints_of_type_parameter(&resolved).is_some() {
+                        DiagnosticKind::AsTypeParameterMustBeReference {
+                            target: resolved.to_string().into(),
+                        }
+                    } else {
+                        DiagnosticKind::AsTargetMustBeReference {
+                            target: resolved.to_string().into(),
+                            nullable_allowed: nullable_as_target,
+                        }
+                    };
+                    self.report(Diagnostic::new(kind, span));
+                    return error_expr();
+                }
                 if annotated_as {
                     self.report(Diagnostic::new(
                         DiagnosticKind::AsNullableReferenceType {
@@ -8298,6 +8518,29 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     }
                     _ => (resolved, declared),
                 };
+                if matches!(operation, TypeTestOperation::As)
+                    && self.is_value_type(&operand.ty)
+                    && self.satisfies_reference_type_constraint(&resolved)
+                    && !self.has_open_type_parameter(&operand.ty)
+                    && !self.has_open_type_parameter(&resolved)
+                {
+                    // Fourth-edition 14.9.11 and seventh-edition 12.12.13 require
+                    // a boxing conversion for a closed value-type operand. Nullable
+                    // boxing uses the underlying value's interfaces (11.3.1).
+                    let value =
+                        crate::conversion::nullable_underlying(&operand.ty).unwrap_or(&operand.ty);
+                    let boxing = self.satisfies_named_constraint(value, &resolved);
+                    if !boxing {
+                        self.report(Diagnostic::new(
+                            DiagnosticKind::AsConversionMissing {
+                                from: operand.ty.to_string().into(),
+                                to: resolved.to_string().into(),
+                            },
+                            span,
+                        ));
+                        return error_expr();
+                    }
+                }
                 if operand.ty.is_void() && matches!(operation, TypeTestOperation::As) {
                     self.diagnostics.push(Diagnostic::new(
                         DiagnosticKind::AsConversionMissing {
@@ -8318,6 +8561,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 };
                 if matches!(operation, TypeTestOperation::As)
                     && !operand.ty.is_error()
+                    && !self.has_open_type_parameter(&operand.ty)
+                    && !self.has_open_type_parameter(&resolved)
                     && both_classes(self, &operand.ty, &resolved)
                     && !self.converts(&operand.ty, &resolved)
                     && !self.converts(&resolved, &operand.ty)
@@ -9259,6 +9504,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let ty = if operand.ty.is_error() {
             TypeSymbol::Error
         } else if operator == UnaryOperator::Complement && self.is_enum_type(&operand.ty) {
+            self.check_enum_complement_constant(&operand, span);
             operand.ty.clone()
         } else if let Some(result) = unary_result_type(operator, &operand.ty) {
             result
@@ -9311,6 +9557,32 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 checked: self.checked_context,
             },
             ty,
+        }
+    }
+
+    /// A byte/ushort enum complement promotes to int before converting back to the enum.
+    /// Every constant result is negative, so the editions 1/2 checked conversion overflows.
+    /// Explicit unchecked contexts permit truncation; signed and wider enum types always fit.
+    fn check_enum_complement_constant(&mut self, operand: &BoundExpr, span: Span) {
+        if self.unchecked_context || !self.language_version.enum_complement_uses_checked_context() {
+            return;
+        }
+        let Some(underlying @ (SpecialType::Byte | SpecialType::UInt16)) =
+            self.integral_constant_type(&operand.ty)
+        else {
+            return;
+        };
+        if let Some(value) = self
+            .constant_value(operand)
+            .and_then(|literal| crate::integral_constant::value(&literal, underlying))
+        {
+            self.report(Diagnostic::new(
+                DiagnosticKind::CheckedConstantConversionOverflow {
+                    value: (!value).to_string().into(),
+                    to: operand.ty.to_string().into(),
+                },
+                span,
+            ));
         }
     }
 
@@ -10705,6 +10977,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         {
             return None;
         }
+        // Fourth-edition 14.10.4 defines only & and | on bool?. Without true/false
+        // operators, 14.11.2 cannot provide && or ||. Neither has a lifted form (14.2.7).
         if matches!(operator, Op::LogicalAnd | Op::LogicalOr)
             || (matches!(operator, Op::BitwiseAnd | Op::BitwiseOr)
                 && matches!(left_under, TypeSymbol::Special(SpecialType::Boolean))
@@ -11046,6 +11320,99 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         })
     }
 
+    /// Applies a predefined cast to a nullable target (fourth edition 13.7.2).
+    /// A nullable source is evaluated once; only a present value is converted and wrapped.
+    fn bind_predefined_nullable_cast(
+        &mut self,
+        operand: &BoundExpr,
+        target: &TypeSymbol,
+        span: Span,
+    ) -> Option<BoundExpr> {
+        let target_value = crate::conversion::nullable_underlying(target)?.clone();
+        let source_value = crate::conversion::nullable_underlying(&operand.ty);
+        let source = source_value.unwrap_or(&operand.ty);
+        if !self.satisfies_value_type_constraint(source)
+            || !can_cast(&self.model, source, &target_value)
+        {
+            return None;
+        }
+        if operand.ty == *target {
+            return Some(operand.clone());
+        }
+        if source_value.is_none() {
+            let value = self.bind_cast(operand.clone(), target_value, span);
+            return Some(self.convert(value, target));
+        }
+        let spilled = BoundExpr {
+            kind: BoundExprKind::Temp(0),
+            ty: operand.ty.clone(),
+        };
+        let has_value = self.quietly(|binder| {
+            binder.member_access_of(spilled.clone(), "HasValue", span)
+        });
+        let value = self.quietly(|binder| binder.nullable_value(spilled, span));
+        let Some(value) = value.filter(|_| !has_value.ty.is_error()) else {
+            self.report(Diagnostic::new(
+                DiagnosticKind::FeatureNotInThisBuild {
+                    feature: "a nullable cast without Nullable<T> value accessors".into(),
+                    permitted_by: self.language_version,
+                    instead: None,
+                },
+                span,
+            ));
+            return Some(error_expr());
+        };
+        let converted = self.bind_cast(value, target_value, span);
+        let wrapped = self.convert(converted, target);
+        Some(BoundExpr {
+            kind: BoundExprKind::Sequence {
+                spilled: alloc::vec![operand.clone()],
+                value: Box::new(BoundExpr {
+                    kind: BoundExprKind::Conditional {
+                        condition: Box::new(has_value),
+                        when_true: Box::new(wrapped),
+                        when_false: Box::new(BoundExpr {
+                            kind: BoundExprKind::DefaultValue(target.clone()),
+                            ty: target.clone(),
+                        }),
+                    },
+                    ty: target.clone(),
+                }),
+            },
+            ty: target.clone(),
+        })
+    }
+
+    /// Materializes both standard conversions surrounding a cast's selected operator
+    /// (fourth edition 13.4.4), preserving the call's actual parameter and return types.
+    fn bind_user_cast(
+        &mut self,
+        operand: BoundExpr,
+        target: TypeSymbol,
+        method: MethodReference,
+        span: Span,
+    ) -> BoundExpr {
+        let parameter = &method.parameters[0];
+        let argument = if converts(&self.model, &operand.ty, parameter) {
+            self.convert(operand, parameter)
+        } else {
+            self.bind_cast(operand, parameter.clone(), span)
+        };
+        let call = BoundExpr {
+            ty: method.return_type.clone(),
+            kind: BoundExprKind::Call {
+                callee: Box::new(error_expr()),
+                arguments: alloc::vec![argument],
+                method: Some(method),
+            },
+        };
+        if call.ty == target {
+            call
+        } else {
+            self.bind_cast(call, target, span)
+        }
+    }
+
     /// Binds `(ty)operand` for an operand that is already bound -- the conversion half of a cast
     /// expression, separate from the syntax so that a conversion that is itself a composition can
     /// bind its second step with the same rules as the first.
@@ -11104,6 +11471,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             }
         }
         if !operand.ty.is_error() && !ty.is_error() {
+            // Predefined nullable casts precede operator lookup: Nullable<T>'s
+            // implementation operators do not supply 13.7.2's null propagation.
+            if let Some(converted) = self.bind_predefined_nullable_cast(&operand, &ty, span) {
+                return converted;
+            }
             if crate::conversion::nullable_underlying(&ty).is_some()
                 && self.assignable(&operand, &ty)
             {
@@ -11144,29 +11516,23 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     .user_conversion(&operand.ty, &ty, "op_Implicit")
                     .or_else(|| self.user_conversion(&operand.ty, &ty, "op_Explicit"))
                 {
-                    let argument = self.convert(operand, &method.parameters[0].clone());
-                    return BoundExpr {
-                        ty,
-                        kind: BoundExprKind::Call {
-                            callee: Box::new(error_expr()),
-                            arguments: alloc::vec![argument],
-                            method: Some(method),
-                        },
-                    };
+                    return self.bind_user_cast(operand, ty, method, span);
                 }
             }
-            if let Some(method) = self
-                .user_conversion(&operand.ty, &ty, "op_Explicit")
-                .or_else(|| self.user_conversion(&operand.ty, &ty, "op_Implicit"))
-            {
-                return BoundExpr {
-                    ty,
-                    kind: BoundExprKind::Call {
-                        callee: Box::new(error_expr()),
-                        arguments: alloc::vec![operand],
-                        method: Some(method),
-                    },
-                };
+            // Casts consider implicit and explicit operators in one candidate set.
+            match self.find_user_conversion(&operand.ty, &ty, "op_Explicit", true) {
+                Ok(Some(method)) => return self.bind_user_cast(operand, ty, method, span),
+                Ok(None) => {}
+                Err(()) => {
+                    self.diagnostics.push(Diagnostic::new(
+                        DiagnosticKind::CannotCast {
+                            from: operand.ty.to_string().into(),
+                            to: ty.to_string().into(),
+                        },
+                        span,
+                    ));
+                    return error_expr();
+                }
             }
             if let Some(value) = constant_int_value(&operand) {
                 let via = self.type_info_of(&ty).and_then(|info| {
@@ -11210,36 +11576,21 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     };
                 }
             }
-            if let Some(underlying) = self.enum_underlying_type(&ty) {
-                if let Some(method) = self
-                    .user_conversion(&operand.ty, &underlying, "op_Explicit")
-                    .or_else(|| self.user_conversion(&operand.ty, &underlying, "op_Implicit"))
-                {
-                    return BoundExpr {
-                        ty,
-                        kind: BoundExprKind::Call {
-                            callee: Box::new(error_expr()),
-                            arguments: alloc::vec![operand],
-                            method: Some(method),
-                        },
-                    };
+            // 13.2.2's predefined decimal/enum conversion uses the enum's underlying
+            // numeric type. Its decimal operator call needs the same argument conversion
+            // as any other numeric cast. Enumeration conversions are not standard
+            // prefixes or suffixes (13.3), so this composition applies only to decimal.
+            if operand.ty == TypeSymbol::Special(SpecialType::Decimal) {
+                if let Some(underlying) = self.enum_underlying_type(&ty) {
+                    let value = self.bind_cast(operand, underlying, span);
+                    return self.bind_cast(value, ty, span);
                 }
             }
-            if let Some(underlying) = self.enum_underlying_type(&operand.ty) {
-                if let Some(method) = self
-                    .user_conversion(&underlying, &ty, "op_Implicit")
-                    .or_else(|| self.user_conversion(&underlying, &ty, "op_Explicit"))
-                {
+            if ty == TypeSymbol::Special(SpecialType::Decimal) {
+                if let Some(underlying) = self.enum_underlying_type(&operand.ty) {
                     let mut as_underlying = operand;
                     as_underlying.ty = underlying;
-                    return BoundExpr {
-                        ty,
-                        kind: BoundExprKind::Call {
-                            callee: Box::new(error_expr()),
-                            arguments: alloc::vec![as_underlying],
-                            method: Some(method),
-                        },
-                    };
+                    return self.bind_cast(as_underlying, ty, span);
                 }
             }
             if !can_cast(&self.model, &operand.ty, &ty) {
@@ -11275,7 +11626,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     ///
     /// `None` when `Nullable<T>` has no such method to resolve -- a corlib without one, where the
     /// caller declines the lifted form rather than emitting a call to nothing.
-    fn nullable_value(&mut self, operand: BoundExpr, span: Span) -> Option<BoundExpr> {
+    pub(crate) fn nullable_value(&mut self, operand: BoundExpr, span: Span) -> Option<BoundExpr> {
         if crate::conversion::nullable_underlying(&operand.ty).is_none() {
             return Some(operand);
         }
@@ -13021,7 +13372,20 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let rewritten = self.rewrite_out_discards(argument_exprs);
         let argument_exprs = rewritten.as_deref().unwrap_or(argument_exprs);
         let callee = self.bind_call_target(receiver_expr);
+        // A direct delegate invocation uses its signature (ECMA-334 edition 4, 22.3).
+        // Its synthesized Invoke method has that signature (ECMA-335 edition 4, I.8.9.3).
+        // Rewriting the callee to a method group on Invoke lets normal call resolution
+        // and callvirt emission handle the target.
+        // Editions 1 and 2 check the delegate before evaluating arguments (14.5.5.2),
+        // whereas an explicit f.Invoke(args) follows the method-invocation order (14.4.3).
+        // The guarded receiver evaluates once and throws NullReferenceException on null;
+        // these bound nodes express control flow without admitting newer source syntax.
         let callee = if self.is_delegate_value(&callee) {
+            let callee = if self.language_version.null_delegate_check_precedes_arguments() {
+                non_null_delegate(callee)
+            } else {
+                callee
+            };
             BoundExpr {
                 ty: TypeSymbol::Error,
                 kind: BoundExprKind::MethodGroup {
@@ -13162,8 +13526,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                         }
                         None => self.check_argument_modes(&method, &arguments, span),
                     }
-                    let declaring_type =
-                        self.declaring_type_in_chain(&receiver_ty, &method.name, &method.parameters);
+                    let declaring_type = self.invocation_declaring_type(&receiver_ty, &method);
                     let declaring_key = instantiation
                         .as_deref()
                         .map_or(&method.parameters[..], |open| &open.parameters[..]);
@@ -15558,9 +15921,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
 
     /// Binds a `new D(...)` whose target is a delegate type (14.5.10.3): a method-group argument
     /// converts as in [`Self::bind_delegate_creation`]; a VALUE of a delegate type whose `Invoke`
-    /// matches `D`'s creates a delegate to that value's invocation list -- the operand becomes the
-    /// receiver and its own `Invoke` the target, which the emitter already lowers as
-    /// `dup; ldvirtftn Invoke; newobj`. The delegate-value form lives HERE and not in the pure
+    /// matches `D`'s copies its invocation list through C# 4, or wraps its `Invoke` from C# 5
+    /// (`dup; ldvirtftn Invoke; newobj`). The delegate-value form lives here, not in the pure
     /// binder because it exists only in a delegate-creation-expression -- there is no implicit
     /// conversion between distinct delegate types, so the conversion probes must not see it.
     ///
@@ -15588,10 +15950,81 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         };
         if let ([argument], Some(target_invoke)) = (&arguments[..], invoke_of(self, delegate_ty)) {
             if let Some(operand_invoke) = invoke_of(self, &argument.ty) {
-                if operand_invoke.parameters == target_invoke.parameters
-                    && operand_invoke.return_type == target_invoke.return_type
+                if operand_invoke.parameters.len() == target_invoke.parameters.len()
+                    && self.delegate_signature_conversion(
+                        &operand_invoke.return_type,
+                        &target_invoke.return_type,
+                    )
+                    && operand_invoke
+                        .parameters
+                        .iter()
+                        .zip(&target_invoke.parameters)
+                        .enumerate()
+                        .all(|(index, (operand, target))| {
+                            operand_invoke.parameter_mode(index)
+                                == target_invoke.parameter_mode(index)
+                                && self.delegate_signature_conversion(target, operand)
+                        })
                 {
                     let operand_ty = self.resolve_type(&argument.ty);
+                    if self.language_version.delegate_value_copies_invocation_list() {
+                        // Clone preserves the invocation list and allocates a fresh instance of the
+                        // source's runtime type. That type must be the requested destination type.
+                        // Imported generic delegates can be variant even in an ISO compilation.
+                        // C# 4, 15.1, also permits source variance, which TypeInfo does not record.
+                        // Source generic declarations are invariant in earlier editions; at C# 4
+                        // their origin alone cannot prove that Clone allocates the destination type.
+                        let may_vary = self.type_info_of(&operand_ty).is_some_and(|info| {
+                            (info.is_external || self.language_version >= LanguageVersion::CSharp4)
+                                && matches!(operand_ty, TypeSymbol::Instantiation { .. })
+                        });
+                        if operand_ty != self.resolve_type(delegate_ty) || may_vary {
+                            let mut diagnostic = Diagnostic::new(
+                                DiagnosticKind::FeatureNotInThisBuild {
+                                    feature: "delegate invocation-list copying that requires runtime retyping".into(),
+                                    permitted_by: self.language_version,
+                                    instead: None,
+                                },
+                                span,
+                            );
+                            diagnostic.phase = crate::diagnostic::DiagnosticPhase::Emission;
+                            self.report(diagnostic);
+                            return bound;
+                        }
+                        let object_ty = TypeSymbol::Special(SpecialType::Object);
+                        let cloned = BoundExpr {
+                            kind: BoundExprKind::Call {
+                                callee: Box::new(BoundExpr {
+                                    kind: BoundExprKind::MethodGroup {
+                                        receiver: Box::new(non_null_delegate(argument.clone())),
+                                        name: "Clone".into(),
+                                    },
+                                    ty: TypeSymbol::Error,
+                                }),
+                                arguments: Vec::new(),
+                                method: Some(MethodReference {
+                                    declaring_instantiation: None,
+                                    declaring_type: TypeSymbol::Named(
+                                        [Box::from("System"), Box::from("Delegate")].into(),
+                                    ),
+                                    name: "Clone".into(),
+                                    parameters: Vec::new(),
+                                    return_type: object_ty.clone(),
+                                    is_static: false,
+                                    is_vararg: false,
+                                    instantiation: None,
+                                }),
+                            },
+                            ty: object_ty,
+                        };
+                        return BoundExpr {
+                            kind: BoundExprKind::Cast {
+                                operand: Box::new(cloned),
+                                checked: false,
+                            },
+                            ty: delegate_ty.clone(),
+                        };
+                    }
                     return BoundExpr {
                         kind: BoundExprKind::DelegateCreation {
                             delegate_type: delegate_ty.clone(),
@@ -15609,7 +16042,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                                 is_vararg: false,
                                 instantiation: None,
                             },
-                            receiver: Some(Box::new(argument.clone())),
+                            receiver: Some(Box::new(non_null_delegate(argument.clone()))),
                             virtual_slot: true,
                         },
                         ty: delegate_ty.clone(),
@@ -18008,6 +18441,37 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         result
     }
 
+    /// Whether every named base and interface needed to rule out a conversion is visible.
+    pub(crate) fn has_complete_type_hierarchy(&self, ty: &TypeSymbol) -> bool {
+        let mut seen = Vec::new();
+        let mut pending = alloc::vec![ty.clone()];
+        while let Some(current) = pending.pop() {
+            if seen.contains(&current) {
+                continue;
+            }
+            seen.push(current.clone());
+            if let Some(constraints) = self.constraints_of_type_parameter(&current) {
+                pending.extend(constraints.types.iter().cloned());
+                continue;
+            }
+            if matches!(
+                current,
+                TypeSymbol::Special(_)
+                    | TypeSymbol::Array { .. }
+                    | TypeSymbol::Pointer(_)
+                    | TypeSymbol::ByRef(_)
+            ) {
+                continue;
+            }
+            let Some(info) = self.type_info_of(&current) else {
+                return false;
+            };
+            pending.extend(info.bases.iter().cloned());
+            pending.extend(info.base.iter().cloned());
+        }
+        true
+    }
+
     /// The interfaces a type's own DECLARATION brings in: its interface bases, plus those
     /// interfaces' base interfaces. **A base CLASS is not traversed**, so an interface a base class
     /// implements is not reported here -- see
@@ -18315,8 +18779,71 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         false
     }
 
-    /// Every method named `name` on `ty` or any of its base classes -- the method
-    /// group an invocation resolves over (most-derived first).
+    /// C# 8's ref-struct disposal pattern resolves an accessible instance invocation
+    /// with no written arguments. Optional parameters and expanded params arrays
+    /// participate in overload resolution; the selected method must return void.
+    pub(crate) fn resolve_dispose_pattern(&self, ty: &TypeSymbol) -> Option<MethodSymbol> {
+        let candidates: Vec<MethodSymbol> = self
+            .methods_in_chain(ty, "Dispose")
+            .into_iter()
+            .filter(|method| {
+                !method.is_static
+                    && method.type_parameters.is_empty()
+                    && self.is_accessible(ty, method.accessibility)
+            })
+            .collect();
+        match resolve_overload(&self.model, &candidates, &[], &[], &[]) {
+            OverloadResult::Resolved(method)
+                if method.return_type == TypeSymbol::Special(SpecialType::Void) =>
+            {
+                Some(method)
+            }
+            _ => None,
+        }
+    }
+
+    /// Binds the selected disposal method with the arguments its signature requires,
+    /// using the same default-value conversions and params expansion as an ordinary call.
+    pub(crate) fn bind_dispose_pattern(&mut self, resource: BoundExpr) -> Option<BoundExpr> {
+        let method = self.resolve_dispose_pattern(&resource.ty)?;
+        let mut arguments = method
+            .omitted_defaults(0)
+            .iter()
+            .map(|(ty, literal)| self.default_argument(ty, literal))
+            .collect();
+        let declaring_type =
+            self.declaring_type_in_chain(&resource.ty, "Dispose", &method.parameters);
+        let declaring_instantiation =
+            self.declaring_instantiation_of(&declaring_type, "Dispose", &method.parameters);
+        let reference = MethodReference {
+            declaring_type,
+            name: method.name,
+            parameters: method.parameters,
+            return_type: method.return_type,
+            is_static: false,
+            is_vararg: false,
+            instantiation: None,
+            declaring_instantiation,
+        };
+        if method.is_params {
+            arguments = self.bind_params_arguments(&reference, arguments);
+        }
+        Some(BoundExpr {
+            ty: reference.return_type.clone(),
+            kind: BoundExprKind::Call {
+                callee: Box::new(BoundExpr {
+                    kind: BoundExprKind::MethodGroup {
+                        receiver: Box::new(resource),
+                        name: reference.name.clone(),
+                    },
+                    ty: TypeSymbol::Error,
+                }),
+                arguments,
+                method: Some(reference),
+            },
+        })
+    }
+
     /// Resolves a no-argument instance method `name` on `receiver_ty` to a reference -- for
     /// the compiler-synthesized calls of a `foreach` enumerator pattern (GetEnumerator on the
     /// collection, MoveNext/get_Current on the enumerator). `None` when the type has no such
@@ -18347,6 +18874,282 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             instantiation: None,
             declaring_instantiation,
         })
+    }
+
+    /// Selects the collection receiver and its GetEnumerator (15.8.4): the type's public instance
+    /// GetEnumerator; else, from C# 2, the one `IEnumerable<T>` it converts to (from C# 5, the
+    /// unique most-specific one); else the non-generic IEnumerable.
+    /// Edition 2 requires the complete pattern before preferring it to IEnumerable;
+    /// edition 4 selects GetEnumerator first and diagnoses an invalid enumerator afterward.
+    pub(crate) fn foreach_collection(
+        &mut self,
+        collection: BoundExpr,
+        span: Span,
+    ) -> Option<(BoundExpr, MethodReference)> {
+        let pattern = self.quietly(|binder| {
+            let method = binder.foreach_public_method(&collection.ty, "GetEnumerator", span)?;
+            if binder
+                .language_version
+                .foreach_incomplete_pattern_uses_interface()
+            {
+                binder.foreach_enumerator_members(&method.return_type, span)?;
+            }
+            Some(method)
+        });
+        if let Some(method) = pattern {
+            return Some((collection, method));
+        }
+        // Edition 4, 15.8.4, prefers a unique IEnumerable<T> to the non-generic interface.
+        // Convert the receiver as well as selecting its member: explicit implementations
+        // can return different enumerators from the rejected collection pattern.
+        if !self
+            .language_version
+            .foreach_incomplete_pattern_uses_interface()
+        {
+            let mut interfaces = self.foreach_enumerable_interfaces(&collection.ty);
+            if self.language_version >= LanguageVersion::CSharp5 && interfaces.len() > 1 {
+                // Edition 5, 13.9.5, selects the unique most-specific IEnumerable<T>.
+                // Its covariance requires a reference conversion, never numeric conversion
+                // or boxing of T. Earlier editions require a single interface outright.
+                let best: Vec<_> = interfaces
+                    .iter()
+                    .filter(|candidate| {
+                        let TypeSymbol::Instantiation { arguments, .. } = candidate else {
+                            return false;
+                        };
+                        interfaces.iter().all(|other| {
+                            let TypeSymbol::Instantiation {
+                                arguments: target, ..
+                            } = other
+                            else {
+                                return false;
+                            };
+                            arguments == target
+                                || (self.satisfies_reference_type_constraint(&arguments[0])
+                                    && self.satisfies_reference_type_constraint(&target[0])
+                                    && self.satisfies_named_constraint(&arguments[0], &target[0]))
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                if best.len() == 1 {
+                    interfaces = best;
+                }
+            }
+            match interfaces.as_slice() {
+                [enumerable] => {
+                    let method = self.resolve_instance_method(enumerable, "GetEnumerator", span)?;
+                    return Some((self.convert(collection, enumerable), method));
+                }
+                [] => {}
+                _ => return None,
+            }
+        }
+        let enumerable = type_symbol_in("System.Collections", "IEnumerable");
+        if !self.satisfies_named_constraint(&collection.ty, &enumerable) {
+            return None;
+        }
+        let method = self.resolve_instance_method(&enumerable, "GetEnumerator", span)?;
+        Some((self.convert(collection, &enumerable), method))
+    }
+
+    /// Collects constructed IEnumerable interfaces through base types and type-parameter
+    /// constraints. A visited set bounds cyclic constraints without losing distinct arguments.
+    fn foreach_enumerable_interfaces(&self, ty: &TypeSymbol) -> Vec<TypeSymbol> {
+        let definition = type_symbol_in("System.Collections.Generic", "IEnumerable");
+        let mut pending = alloc::vec![ty.clone()];
+        let mut seen = Vec::new();
+        let mut result = Vec::new();
+        while let Some(current) = pending.pop() {
+            let current = self.resolve_type(&current);
+            if seen.contains(&current) {
+                continue;
+            }
+            seen.push(current.clone());
+            if matches!(&current, TypeSymbol::Instantiation { definition: name, arguments }
+                if arguments.len() == 1 && TypeSymbol::Named(name.clone()) == definition)
+            {
+                result.push(current.clone());
+            }
+            if let Some(constraints) = self.constraints_of_type_parameter(&current) {
+                pending.extend(constraints.types.iter().cloned());
+            } else if let Some(info) = self.type_info_of(&current) {
+                pending.extend(info.bases.iter().cloned());
+            }
+        }
+        result
+    }
+
+    /// The public instance method selected by an empty argument list in a foreach pattern.
+    /// Edition 2 requires a parameterless signature, not an expanded params-array invocation.
+    fn foreach_public_method(
+        &mut self,
+        ty: &TypeSymbol,
+        name: &str,
+        span: Span,
+    ) -> Option<MethodReference> {
+        if !matches!(self.resolve_member(ty, name), MemberResolution::MethodGroup) {
+            return None;
+        }
+        let method = self.resolve_instance_method(ty, name, span)?;
+        if method.is_static
+            || (self
+                .language_version
+                .foreach_incomplete_pattern_uses_interface()
+                && !method.parameters.is_empty())
+        {
+            return None;
+        }
+        let public = self.type_info_of(&method.declaring_type).is_some_and(|info| {
+            info.methods_named(name).any(|candidate| {
+                candidate.parameters == method.parameters
+                    && candidate.accessibility == Accessibility::Public
+                    && !candidate.is_static
+            })
+        });
+        public.then_some(method)
+    }
+
+    /// Builds a selected foreach call with the arguments implied by its empty argument list.
+    /// Edition 4, 15.8.4, admits expanded params calls; C# 4, 8.8.4, also admits optional
+    /// defaults. Each declared parameter needs a stack argument even when none is written.
+    pub(crate) fn foreach_call(
+        &mut self,
+        receiver: BoundExpr,
+        method: MethodReference,
+        span: Span,
+    ) -> BoundExpr {
+        let arguments = self.quietly(|binder| {
+            if method.is_vararg {
+                return None;
+            }
+            if method.parameters.is_empty() {
+                return Some(Vec::new());
+            }
+            // Recover parameter facts from the selected declaration without resolving another
+            // overload. Constructed declaring types supply substituted parameter types here.
+            let chosen = binder
+                .type_info_of(&method.declaring_type)?
+                .methods_named(&method.name)
+                .find(|candidate| {
+                    candidate.parameters == method.parameters
+                        && candidate.return_type == method.return_type
+                        && candidate.is_static == method.is_static
+                        && candidate.type_parameters.is_empty()
+                })?
+                .clone();
+            if !chosen.accepts_argument_count(0)
+                || method
+                    .parameters
+                    .iter()
+                    .any(|parameter| matches!(parameter, TypeSymbol::ByRef(_)))
+                || (chosen.is_params
+                    && !matches!(
+                        method.parameters.last(),
+                        Some(TypeSymbol::Array { rank: 1, .. })
+                    ))
+            {
+                return None;
+            }
+            let before = binder.diagnostics.len();
+            let arguments = binder.constructor_call_arguments(&chosen, &method, Vec::new());
+            (arguments.len() == method.parameters.len()
+                && arguments.iter().all(|argument| !argument.ty.is_error())
+                && binder.diagnostics.len() == before)
+                .then_some(arguments)
+        });
+        let Some(arguments) = arguments else {
+            // Keep binding the loop body so language errors suppress this emission refusal.
+            let mut diagnostic = Diagnostic::new(
+                DiagnosticKind::FeatureNotInThisBuild {
+                    feature: "foreach calls whose omitted arguments cannot be emitted".into(),
+                    permitted_by: self.language_version,
+                    instead: None,
+                },
+                span,
+            );
+            diagnostic.phase = crate::diagnostic::DiagnosticPhase::Emission;
+            self.report(diagnostic);
+            return BoundExpr {
+                kind: BoundExprKind::Error,
+                ty: method.return_type,
+            };
+        };
+        let return_type = method.return_type.clone();
+        let call = BoundExpr {
+            kind: BoundExprKind::Call {
+                callee: Box::new(BoundExpr {
+                    kind: BoundExprKind::MethodGroup {
+                        receiver: Box::new(receiver),
+                        name: method.name.clone(),
+                    },
+                    ty: TypeSymbol::Error,
+                }),
+                arguments,
+                method: Some(method),
+            },
+            ty: return_type.clone(),
+        };
+        // A ref-returning Current, such as Span<T>.Enumerator.Current, reads through its
+        // address before conversion to the iteration type, just as an ordinary property does.
+        Self::deref_ref_return(call, &return_type)
+    }
+
+    /// The two usable enumerator members of a complete foreach pattern (15.8.4).
+    /// A field, static member, unreadable property, or inaccessible getter cannot supply Current.
+    pub(crate) fn foreach_enumerator_members(
+        &mut self,
+        ty: &TypeSymbol,
+        span: Span,
+    ) -> Option<(MethodReference, MethodReference)> {
+        if self.is_bare_type_parameter(ty)
+            || self
+                .type_info_of(ty)
+                .is_some_and(|info| info.kind == TypeKind::Interface)
+        {
+            return self.foreach_parameter_members(ty, span);
+        }
+        if !self
+            .type_info_of(&self.lookup_type_of(ty))
+            .is_some_and(|info| {
+                matches!(
+                    info.kind,
+                    TypeKind::Class | TypeKind::Struct | TypeKind::Interface
+                )
+            })
+        {
+            return None;
+        }
+        let move_next = self.foreach_public_method(ty, "MoveNext", span)?;
+        if move_next.return_type != TypeSymbol::Special(SpecialType::Boolean) {
+            return None;
+        }
+        if !matches!(
+            self.resolve_member(ty, "Current"),
+            MemberResolution::Property {
+                accessibility: Accessibility::Public,
+                is_static: false,
+                ..
+            }
+        ) {
+            return None;
+        }
+        let (getter_type, _) = self.property_accessor_declarers(ty, "Current");
+        let readable = self.type_info_of(&getter_type).is_some_and(|info| {
+            info.find_property("Current").is_some_and(|property| {
+                property.has_getter
+                    && !property.is_static
+                    && property.explicit_interface.is_none()
+                    && property
+                        .getter_accessibility
+                        .is_some_and(|accessibility| self.is_accessible(&getter_type, accessibility))
+            })
+        });
+        if !readable {
+            return None;
+        }
+        let current = self.resolve_property_getter(&getter_type, "Current", span)?;
+        Some((move_next, current))
     }
 
     /// Resolves a readable instance property's `get_<name>` getter on `ty` (14.5.4): the
@@ -18716,6 +19519,26 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         inaccessible_match.unwrap_or(lookup)
     }
 
+    /// Edition 2, 14.3, excludes overrides from lookup; its 14.4.3 dispatches a value
+    /// receiver through the inherited reference-type declaration and a boxed copy.
+    /// Naming that declaration preserves the distinction from a struct's new method.
+    fn invocation_declaring_type(&self, receiver: &TypeSymbol, method: &MethodSymbol) -> TypeSymbol {
+        if self.language_version.inherited_object_call_boxes_receiver()
+            && self.is_value_type(receiver)
+            && method.is_override
+        {
+            let lookup = self.lookup_type_of(receiver);
+            for (current_ty, info) in self.member_lookup_walk(&lookup, true) {
+                if info.methods_named(&method.name).any(|candidate| {
+                    !candidate.is_override && candidate.parameters == method.parameters
+                }) {
+                    return member_declaring_type(&current_ty, &info);
+                }
+            }
+        }
+        self.declaring_type_in_chain(receiver, &method.name, &method.parameters)
+    }
+
     /// The [`TypeInstantiation`] for a member named through an instantiated generic type --
     /// `None` for a member of an ordinary type, and for a member whose open declaration cannot be
     /// identified (emission refuses such a call rather than writing a `!n` it guessed).
@@ -18995,7 +19818,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// [`member_declaring_type`] is the same rule for a MEMBER's declaring type and carries the
     /// same instruction.
     ///
-    fn current_type_as_value(&self) -> TypeSymbol {
+    pub(crate) fn current_type_as_value(&self) -> TypeSymbol {
         let Some(current) = self.current_type.clone() else {
             return TypeSymbol::Error;
         };
@@ -19689,6 +20512,25 @@ fn names_a_tuple(expr: &Expr) -> bool {
         ExprKind::Tuple { .. } => true,
         ExprKind::Parenthesized(inner) => names_a_tuple(inner),
         _ => false,
+    }
+}
+
+/// Evaluates a delegate once and throws NullReferenceException if it is null.
+/// Bound control flow does not admit null-coalescing or throw syntax in older dialects.
+fn non_null_delegate(value: BoundExpr) -> BoundExpr {
+    let ty = value.ty.clone();
+    BoundExpr {
+        kind: BoundExprKind::NullCoalescing {
+            left: Box::new(value),
+            right: Box::new(BoundExpr {
+                kind: BoundExprKind::Throw(Box::new(BoundExpr {
+                    kind: BoundExprKind::Literal(Literal::Null),
+                    ty: TypeSymbol::Special(SpecialType::Null),
+                })),
+                ty: ty.clone(),
+            }),
+        },
+        ty,
     }
 }
 
@@ -21976,6 +22818,28 @@ fn operator_symbol(operator: BinaryOperator) -> &'static str {
 mod tests {
     use super::*;
     use lamella_syntax::parser::parse_expression;
+
+    #[test]
+    fn nullable_conditional_logic_is_invalid_without_accessors() {
+        for operator in ["&&", "||"] {
+            let mut binder = Binder::new();
+            binder.set_language_version(LanguageVersion::CSharp2);
+            binder.enter_scope();
+            let nullable = binder.nullable_of(&TypeSymbol::Special(SpecialType::Boolean));
+            binder.declare_local("left", nullable.clone());
+            binder.declare_local("right", nullable);
+            binder.bind_expression(&parse_expression(&format!("left {operator} right")).expr);
+            let diagnostics = binder.into_diagnostics();
+            assert!(
+                diagnostics.iter().any(|diagnostic| diagnostic.code() == 19),
+                "{operator}: {diagnostics:?}"
+            );
+            assert!(!diagnostics.iter().any(|diagnostic| matches!(
+                diagnostic.kind,
+                DiagnosticKind::FeatureNotInThisBuild { .. }
+            )));
+        }
+    }
 
     fn bound_type(source: &str) -> TypeSymbol {
         bind_expression(&parse_expression(source).expr).ty

@@ -176,8 +176,8 @@ mod tests {
     #[test]
     fn the_boards_rhu_builds_for_take_rhus_channel() {
         for (board, word) in [
-            ("rpi-pico2", "memory"),
-            ("rpi-pico2-w", "memory"),
+            ("raspberrypi-pico-2", "memory"),
+            ("raspberrypi-pico-2-w", "memory"),
             ("pimoroni-pico-plus-2", "memory"),
             ("pimoroni-pico-plus-2-w", "memory"),
             ("st-nucleo-u5a5zj-q", "probe"),
@@ -193,12 +193,12 @@ mod tests {
     #[test]
     fn a_boards_own_debugger_decides_its_default() {
         for (board, word) in [
-            ("microchip-samd21-xpro", "probe"),
+            ("microchip-sam-d21-xplained-pro", "probe"),
             ("st-nucleo-l476rg", "probe"),
             ("arduino-due", "memory"),
-            ("esp-esp32c6-devkitc", "memory"),
+            ("espressif-esp32-c6-devkitc-1", "memory"),
             ("adafruit-feather-m0-express", "memory"),
-            ("microchip-sam4e-xpro", "memory"),
+            ("microchip-sam4e-xplained-pro", "memory"),
         ] {
             assert_eq!(default_word(board), word, "{board}");
         }
@@ -372,7 +372,7 @@ mod tests {
     fn a_module_carrying_boards_family_is_its_modules() {
         let board = load_board("arduino-mkr1000").expect("the mkr1000 board file");
         assert_eq!(family_of(&board).as_deref(), Some("samd21"));
-        assert_eq!(family_of(&load_board("rpi-pico2").expect("pico2")).as_deref(), Some("rp2350"));
+        assert_eq!(family_of(&load_board("raspberrypi-pico-2").expect("pico2")).as_deref(), Some("rp2350"));
     }
 
     /// The two ways a board id fails must not read alike.
@@ -380,6 +380,6 @@ mod tests {
     fn an_unknown_id_and_an_unresolvable_board_report_differently() {
         let unknown = resolve("no-such-board").expect_err("refuses");
         assert!(unknown.contains("lamella boards"), "it says how to look: {unknown}");
-        assert!(resolve("rpi-pico").is_ok(), "a real board resolves");
+        assert!(resolve("raspberrypi-pico").is_ok(), "a real board resolves");
     }
 }

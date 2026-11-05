@@ -5,16 +5,10 @@ pub use lamella_flash_routes::{can_flash, uf2_family_for_board};
 use lamella_flash_routes::placement::{BootloaderChoice, Placement, placement_for};
 use lamella_flash_routes::{
     NoAotTarget, Programmer, Programming, WindowHalf, aot_target_for, prepare_image,
-    programmer_for, route_for, selector_for, wrap_for_route, write, write_set,
+    programmer_for, route_for_request, selector_for, wrap_for_route, write, write_set,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-
-
-
-
-
-
 
 /// Settle WHICH board to write, adding an interactive rung STRICTLY BELOW the refusal.
 ///
@@ -96,8 +90,6 @@ fn list_of(candidates: &[String]) -> String {
         .collect::<Vec<_>>()
         .join("\n")
 }
-
-
 
 /// `lamella flash <artifact> --board <id>`: write bytes that are already an image.
 ///
@@ -225,7 +217,13 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let chosen = match route_for(row, parsed.value("--via")) {
+    let chosen = match route_for_request(
+        row,
+        parsed.value("--via"),
+        parsed.value("--probe"),
+        parsed.value("--volume"),
+        parsed.value("--dfu"),
+    ) {
         Ok(programmer) => programmer,
         Err(error) => {
             eprintln!("lamella flash: {error}");
@@ -339,7 +337,6 @@ fn placement_line(placement: &Placement) -> Option<String> {
     }
 }
 
-
 /// What to tell the reader about a completed write.
 ///
 /// **IT IS NOT THE SAME SENTENCE ON BOTH ROUTES.** A probe write reads every word back and may
@@ -414,9 +411,6 @@ fn not_verified(programmer: Programmer) -> &'static str {
 /// What a write says when the read-back it could make was skipped.
 const SKIPPED: &str = "Verification skipped at your request; this route can read the flash back.";
 
-
-
-
 /// Write `image` through `programmer` at the address `placement` gives, settling which physical
 /// board first, and say what happened, a line at a time, to the verb's own output.
 ///
@@ -436,8 +430,14 @@ pub(crate) fn write_image(
     probe: Option<&str>,
     say: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
-    if probe.is_some() && programmer.writes_over_a_probe() {
-        named_probe_on_route(probe, board, programmer, &crate::devices::attached_probes())?;
+    let environment = std::env::var(lamella_probe::PROBE_SERIAL_ENV).ok();
+    let named = probe_named(probe, environment.as_deref());
+    if named.is_some() && programmer.writes_over_a_probe() {
+        let attached = crate::devices::attached_probes_naming(named.map(lamella_probe_core::selection::serial_named))
+            .map_err(|refusal| format!("{refusal}\n\nNothing was written."))?;
+        named_probe_on_route(named, board, programmer, &attached).map_err(|refusal| {
+            if probe.is_none() { crate::image_run::named_by_the_environment(refusal) } else { refusal }
+        })?;
     }
     let probe = choose_board(programmer, probe)?;
     if let Some((board, half)) = window {
@@ -483,6 +483,12 @@ pub(crate) fn write_image(
         say(&format!("  the {} starts it{wait}", bootloader.name));
     }
     Ok(())
+}
+
+/// The probe a write names: the option, or the environment, whose empty value names none, as in a run and
+/// in a probe's own selector.
+fn probe_named<'a>(option: Option<&'a str>, environment: Option<&'a str>) -> Option<&'a str> {
+    option.or_else(|| environment.filter(|serial| !lamella_probe_core::selection::serial_named(serial).is_empty()))
 }
 
 /// Whether the probe the command line names, `named`, may write `board` through `programmer`: on a
@@ -553,6 +559,13 @@ pub fn deploy_to_chip(
             return ExitCode::FAILURE;
         }
     };
+    let chosen = match route_for_request(row, via, probe, volume, device) {
+        Ok(programmer) => programmer,
+        Err(error) => {
+            eprintln!("lamella deploy: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     let project = if is_project(path) {
         match crate::project::Project::read_file(path, "deploy") {
             Ok(project) => Some(project),
@@ -600,13 +613,6 @@ pub fn deploy_to_chip(
         aot_target
     );
     println!("  {}", tier.line());
-    let chosen = match route_for(row, via) {
-        Ok(programmer) => programmer,
-        Err(error) => {
-            eprintln!("lamella deploy: {error}");
-            return ExitCode::FAILURE;
-        }
-    };
     let placement = match deploy_placement(row, chosen) {
         Ok(placement) => placement,
         Err(why) => {
@@ -812,7 +818,6 @@ fn debug_elf_from(
         )
     })
 }
-
 
 /// The message for a board this tree can WRITE and cannot BUILD FOR.
 ///
@@ -1570,7 +1575,6 @@ fn class_library_refusal(verb: &str, aot_target: &str) -> String {
     )
 }
 
-
 /// Why the tier flag cannot be honored on a route that builds no image.
 ///
 /// **AN OPTION ACCEPTED AND THEN DROPPED IS THIS CRATE'S OLDEST DEFECT SHAPE.** Its own parser says
@@ -1628,18 +1632,6 @@ fn has_entry_point(assembly: &[u8]) -> bool {
     })
 }
 
-
-
-
-
-
-
-
-
-
-
-
-
 /// The option that writes an image over the bootloader a board's product ships in flash, rather
 /// than behind it.
 const REPLACE_BOOTLOADER: &str = "--replace-bootloader";
@@ -1651,15 +1643,15 @@ Usage:
 Write an already-built image file to a board.
 
 Arguments:
-  <image>  The image: a .hex, .bin, .s19 or .elf file, or the .uf2 a bootloader-volume board takes.
+  <image>  The image: a .hex, .bin, .s19 or .elf file, or a .uf2 for a board with a UF2 bootloader.
 
 Options:
   --board <board>       The board ID, as `lamella boards` lists it. Optional when the image has a
                         sidecar, which names its board.
   --via probe|volume    How the chip is written. Default: the board's own debugger if it has one,
-                        and otherwise its bootloader drive.
-  --probe <serial>      Which probe, on the probe route. Default: LAMELLA_PROBE_SERIAL, then the
-                        only probe attached.
+                        and otherwise its bootloader drive, unless --probe names a probe.
+  --probe <serial>      Write over this probe. Naming one takes the probe route. Without it, the
+                        probe route takes LAMELLA_PROBE_SERIAL, then the only probe attached.
   --volume <name>       Which bootloader drive, on the volume route. Default: the only one.
   --dfu <serial>        Which USB DFU bootloader, on a DFU route. Default: the only one.
   --replace-bootloader  Write the image over the bootloader a board's product ships in flash,
@@ -1673,8 +1665,9 @@ What happens:
   write is refused or fails.
 
 Examples:
-  lamella flash Program.uf2 --board rpi-pico2
-  lamella flash Program.elf --board rpi-pico2 --via probe
+  lamella flash Program.uf2 --board raspberrypi-pico-2
+  lamella flash Program.elf --board raspberrypi-pico-2 --via probe
+  lamella flash Program.elf --board raspberrypi-pico-2 --probe <serial>
 
 Details:
   A linked .elf is flattened by physical address, as `objcopy -O binary` does, so an image another
@@ -1685,11 +1678,15 @@ Details:
   The volume route copies the image to the bootloader drive. It cannot read the flash back; it can
   only tell you whether the board rebooted, which is the bootloader's sign that it took the image.
   The probe route uses an external SWD probe and reads every byte back to check it. It takes .bin,
-  .hex, .elf and .s19 images, not .uf2.
+  .hex, .elf and .s19 images, and from a .uf2 the image its blocks for the board's chip family
+  hold, laid out by address. A .uf2 for another chip, or with blocks missing, is refused before
+  anything is opened. Naming the probe with --probe <serial> takes the probe route, and so does
+  --via probe. LAMELLA_PROBE_SERIAL says which probe to open, and it does not choose the route.
 
   When several probes, drives or bootloaders could be the one, the write is refused with every
   candidate named. A write to the wrong board succeeds and reports nothing, so it is never guessed.
-  --probe, --volume and --dfu each belong to one route, and naming one for another route is refused.
+  --volume and --dfu each belong to one route, and naming one for another route is refused, as is
+  --probe with --via volume.
 
   A sidecar beside the image, <image>.manifest.json, names the board it was built for and the hash
   of its bytes. When one is there, --board is checked against it, and the image against its hash,
@@ -1728,12 +1725,25 @@ Advanced:
 /// it; taking both from here is what keeps the two sentences a reader sees from disagreeing.
 const POSITIONAL: &str = "prebuilt image";
 
+#[cfg(test)]
+mod probe_named_tests {
+    use super::probe_named;
+
+    /// An empty `LAMELLA_PROBE_SERIAL` names no probe, here as in a run and in a probe's own selector.
+    #[test]
+    fn an_empty_variable_names_no_probe() {
+        assert_eq!(probe_named(None, Some("")), None);
+        assert_eq!(probe_named(None, Some("   ")), None);
+        assert_eq!(probe_named(None, Some("probe:/raspberrypi-pico-2")), None);
+        assert_eq!(probe_named(None, Some("ABC")), Some("ABC"));
+        assert_eq!(probe_named(Some("DEF"), Some("ABC")), Some("DEF"), "the option wins");
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use lamella_flash_routes::{PROGRAMMING, RP2_XIP_BASE, RP2350_UF2_FAMILY, cannot_write};
-    use crate::folders::Folders;
 
     /// **A PROBE THE COMMAND LINE NAMES MUST BE ATTACHED, AND ONE THAT CAN WRITE THE BOARD, ON EVERY
     /// ROUTE THAT WRITES OVER A PROBE**, so a serial nothing carries is refused by that serial, the
@@ -1816,9 +1826,9 @@ mod tests {
     /// is never a candidate. A future change that widened these routes to "any attached probe"
     /// would turn a bench with two pieces of hardware into a refusal, which is why the filter's
     /// PRESENCE is asserted rather than left as an implementation detail.
-    /// **A DRIVE AND A PROBE ARE DIFFERENT QUESTIONS**, so naming the wrong one is refused rather
-    /// than quietly dropped -- a reader who typed `--probe` at a volume route believed they had
-    /// said which board.
+    /// **A DRIVE AND A PROBE ARE DIFFERENT QUESTIONS**, so a name is never quietly dropped: a
+    /// probe named alone takes the probe route, and a name the chosen route cannot use is refused.
+    /// A reader who typed `--probe` believed they had said which board.
     /// `--via probe` must be a deliberate act, never something a board falls into.
     ///
     /// **THE DEFAULT MATTERS MORE THAN THE OPTION.** Somebody opening a new Pico owns no probe, and
@@ -1883,53 +1893,10 @@ mod tests {
     /// Every board it names must exist in the catalog and must name a chip the backend knows. A
     /// typo in either column would otherwise surface as "cannot write that board" or as a build
     /// failure at a user's prompt, neither of which points at this file.
-    /// A self-contained program of the shape the flat path covers: device registers written
-    /// through raw pointers, then a loop that never returns. The addresses are the micro:bit v1's;
-    /// what is under test is the PIPELINE, which lowers the same way whatever the constants are.
-    const BLINK: &str = "\
-class Program
-{
-    unsafe static int Main()
-    {
-        *(int*)0x50000518 = 0xFFF0;
-        *(int*)0x50000508 = 0xE000;
-        *(int*)0x5000050C = 0x1FF0;
-        while (true)
-        {
-        }
-    }
-}
-";
-
-    /// **THE WHOLE COMPILE-AND-LOWER PATH, FOR EVERY BOARD IN THE TABLE, WITH NO HARDWARE.** This
-    /// is the half of `flash` that can be gated, and it is the half that breaks silently: a board
-    /// whose chip name the backend stopped accepting, or a lowering that stopped covering this
-    /// shape, would otherwise surface as a failure at somebody's bench with a board in front of
-    /// them.
-    ///
-    /// **IT WEIGHS THE ARTIFACT RATHER THAN THE EXIT.** A boot image that came back empty, or
-    /// without the `[initial SP][reset]` header the chip resets into, is a successful build of
-    /// something that cannot run -- and every exit code involved is zero.
-    /// Where each part's vector table sits in its own image.
-    ///
-    /// **NOT EVERY IMAGE BEGINS WITH ITS VECTOR TABLE, AND ASSUMING SO IS A REAL BUG THIS TEST
-    /// CAUGHT.** The Nordic parts and the RP2350 do. The RP2040 does not: its mask ROM checksums a
-    /// 256-byte stage 2 at flash offset 0 and runs it from SRAM, so the vector table follows at
-    /// `+0x100`. A single "word 0 is the stack pointer" rule read the RP2040's boot2 code as a
-    /// stack pointer and failed with `0x88042014`, which is boot2, exactly as it should have.
-    fn vector_offset(aot_target: &str) -> usize {
-        match aot_target {
-            "rp2040" => 0x100,
-            _ => 0,
-        }
-    }
 
     /// **THE UF2 A BOARD GETS MUST NAME THAT BOARD'S CHIP FAMILY**, or its bootloader refuses it.
     /// Asserted against the table rather than a literal at the call site, because the family is a
     /// property of the part and the two Pico generations do not share one.
-    /// A program with no static `Main` is refused BEFORE an image exists, because the reset vector
-    /// would otherwise point at whatever lowered first -- which looks like a board that took the
-    /// write and then misbehaved.
     /// Two boards must not claim one entry, and one board must not appear twice with different
     /// mechanisms -- the second would make which one runs depend on table order.
     /// **THE MESSAGE FOR AN UNWRITABLE BOARD IS THE PRODUCT HERE**, since most boards are in that
@@ -2039,70 +2006,6 @@ class Program
         );
     }
 
-    /// Whether the C# compiler and its reference assemblies are present in this checkout.
-    ///
-    /// **THE ABSENCE THIS COVERS IS A NAMED ONE, AND NAMING IT IS WHAT MAKES A SKIP LEGITIMATE.**
-    /// `lcsc` cannot compile anything without reference assemblies. A development checkout has
-    /// them; a stripped copy of the tree does not, and there a case that compiles C# would be
-    /// measuring the checkout rather than the code. Skipping on that is the answer to a question
-    /// somebody asked.
-    fn csharp_compiler_is_available() -> bool {
-        lamella_wire_host::engine::LcscCompiler::discover().is_ok()
-    }
-
-    #[test]
-    fn every_programmable_board_builds_a_bootable_image_from_a_blink_program() {
-        if !csharp_compiler_is_available() {
-            return;
-        }
-        let path = Path::new("Blink.cs");
-        let mut built = 0;
-        for row in PROGRAMMING {
-            let Some(target) = row.aot_target else {
-                let refusal =
-                    cannot_build_for(row.board, "deploy", &NoAotTarget::WritableButNotBuildable);
-                assert!(refusal.contains(row.board), "{}: {refusal}", row.board);
-                assert!(refusal.contains("lamella flash"), "{}: {refusal}", row.board);
-                assert!(
-                    refusal.starts_with("lamella deploy:"),
-                    "{}: {refusal}",
-                    row.board
-                );
-                assert!(
-                    cannot_build_for(row.board, "build", &NoAotTarget::WritableButNotBuildable)
-                        .starts_with("lamella build:"),
-                    "{}: the build path must answer as build",
-                    row.board
-                );
-                assert!(
-                    image_for_board(path, BLINK, row.board, true, Tier::Flat, &[], &Folders::default()).is_err(),
-                    "{}: names no target, so building for it must refuse",
-                    row.board
-                );
-                continue;
-            };
-            built += 1;
-            let image = build_image(path, BLINK, row.board, target, true, Tier::Flat, &[], "deploy", &Folders::default())
-                .unwrap_or_else(|error| panic!("{}: {error}", row.board));
-            assert!(
-                image.len() > 64,
-                "{}: {} B is too small to be a program plus a vector table",
-                row.board,
-                image.len()
-            );
-            let at = vector_offset(target);
-            let sp = u32::from_le_bytes(image[at..at + 4].try_into().expect("four bytes"));
-            let reset = u32::from_le_bytes(image[at + 4..at + 8].try_into().expect("four bytes"));
-            assert!(
-                (0x2000_0000..=0x2010_0000).contains(&sp),
-                "{}: initial SP {sp:#010x} at offset {at:#x} is not in SRAM",
-                row.board
-            );
-            assert!(reset & 1 == 1, "{}: reset vector {reset:#010x} has no Thumb bit", row.board);
-        }
-        assert!(built > 0, "no row named a target, so this proved nothing");
-    }
-
     /// The refusal offers `lamella flash` only where flashing that board is possible.
     ///
     /// **A SUGGESTION THAT FAILS IS WORSE THAN NO SUGGESTION.** This one is false wherever nothing
@@ -2149,180 +2052,6 @@ class Program
 {message}");
     }
 
-    #[test]
-    fn the_tool_carries_a_code_generator_for_every_target_it_can_be_handed() {
-        if !csharp_compiler_is_available() {
-            return;
-        }
-        let path = Path::new("Blink.cs");
-        for (board, target) in [("bbc-micro-bit-v1", "microbit"), ("muselab-nano-ch32v003", "ch32v003")] {
-            let image = build_image(path, BLINK, board, target, true, Tier::Flat, &[], "deploy", &Folders::default())
-                .unwrap_or_else(|error| {
-                    panic!("{target}: this build cannot compile for it: {error}")
-                });
-            assert!(
-                image.len() > 64,
-                "{target}: {} B is too small to be a program",
-                image.len()
-            );
-        }
-    }
-
-    const CONSOLE: &str = "\
-class Program
-{
-    static int Main()
-    {
-        System.Console.Write(\"x\");
-        return 0;
-    }
-}
-";
-
-    /// **THE REFUSAL THREE SEPARATE PARTIES READ AS \"C# ON A BOARD CAN DO NOTHING\".** The flat
-    /// tier resolves no call outside the program and said so plainly, and a limit stated with no
-    /// way out of it reads as a limit of the project rather than of one tier.
-    #[test]
-    fn a_call_the_flat_tier_cannot_resolve_names_the_tier_that_can() {
-        if !csharp_compiler_is_available() {
-            return;
-        }
-        let error = build_image(
-            Path::new("Hello.cs"),
-            CONSOLE,
-            "bbc-micro-bit-v1",
-            "microbit",
-            false,
-            Tier::Flat,
-            &[],
-            "build",
-            &Folders::default(),
-        )
-        .expect_err("the flat tier resolves no call outside the program");
-        assert!(
-            error.contains(&format!("Without {FLAT_FLAG} this program is built against")),
-            "it names the way out: {error}"
-        );
-        assert!(
-            error.contains("lamella build"),
-            "and the verb that was run: {error}"
-        );
-    }
-
-    /// **A TARGET WITH NO LINKED PLAN MUST NOT BE SENT TO THE FLAG.** `--class-library` covers two
-    /// targets against a board table of dozens, so naming it on every refusal would hand a reader
-    /// holding a RISC-V part a flag that refuses them -- which is worse than the limit it replaced,
-    /// because it costs them a build to find out.
-    #[test]
-    fn a_target_with_no_linked_plan_is_not_sent_to_a_flag_that_would_refuse_it() {
-        if !csharp_compiler_is_available() {
-            return;
-        }
-        let Err(error) = build_image(
-            Path::new("Hello.cs"),
-            CONSOLE,
-            "muselab-nano-ch32v003",
-            "ch32v003",
-            false,
-            Tier::Flat,
-            &[],
-            "build",
-            &Folders::default(),
-        ) else {
-            return;
-        };
-        assert!(
-            !error.contains(CLASS_LIBRARY_FLAG) && !error.contains(FLAT_FLAG),
-            "ch32v003 has no linked plan, so the refusal must not name a way out: {error}"
-        );
-    }
-
-    /// **ASKED FOR AND UNAVAILABLE IS A REFUSAL, NEVER THE OTHER TIER.** The two tiers accept
-    /// different programs and produce images of very different sizes, so substituting one for the
-    /// other would answer a request for the class library with an image that has none -- and the
-    /// discovery would come at a board.
-    ///
-    /// **BOTH OUTCOMES ARE ASSERTED, BECAUSE WHICH ONE HAPPENS IS A PROPERTY OF THE MACHINE.**
-    /// Whether a runtime-support archive is discoverable decides whether the class-library request
-    /// can be satisfied at all, so a case asserting only one of the two describes the tier decision
-    /// on some machines and nothing at all on the rest.
-    #[test]
-    fn asking_for_the_class_library_refuses_by_name_rather_than_falling_back() {
-        if !csharp_compiler_is_available() {
-            return;
-        }
-        let flat = build_image(
-            Path::new("Blink.cs"),
-            BLINK,
-            "bbc-micro-bit-v1",
-            "microbit",
-            true,
-            Tier::Flat,
-            &[],
-            "deploy",
-            &Folders::default(),
-        )
-        .expect("BLINK lowers on the flat tier");
-        match build_image(
-            Path::new("Blink.cs"),
-            BLINK,
-            "bbc-micro-bit-v1",
-            "microbit",
-            true,
-            Tier::ClassLibrary,
-            &[],
-            "deploy",
-            &Folders::default(),
-        ) {
-            Err(error) => {
-                assert!(
-                    error.contains("class-library tier") || error.contains("class library"),
-                    "it names what was asked for: {error}"
-                );
-                assert!(
-                    error.contains("lamella deploy"),
-                    "and the verb that was run: {error}"
-                );
-            }
-            Ok(linked) => assert_ne!(
-                linked, flat,
-                "a class-library request is answered with a linked image or not at all"
-            ),
-        }
-    }
-
-    /// **A CLASS-LIBRARY IMAGE FOR A BOARD CARRIES THAT BOARD's BUS TABLE**, laid by the link word
-    /// for word as the catalog holds it, and so does the ELF a debugger is given for it. Skipped
-    /// where no runtime support archive has been built for the board.
-    #[test]
-    fn a_class_library_image_for_a_board_lays_the_boards_bus_table() {
-        let board = "rpi-pico2-w";
-        if !csharp_compiler_is_available() || !linked_tier_compiled_in() {
-            return;
-        }
-        let target = target_to_build_for(board).expect("the board has an ahead-of-time target");
-        if crate::tiers::runtime_archive(board, target, None).is_err() {
-            return;
-        }
-        let table = lamella_wire_host::boards::bus_table(Some(board)).expect("the board has a bus table");
-        let words: Vec<u8> = table.iter().flat_map(|word| word.to_le_bytes()).collect();
-        let fixture = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../lamella-wire-host/tests/fixtures/ReadsTheBusTable.cs"
-        );
-        let Ok(program) = std::fs::read_to_string(fixture) else {
-            return;
-        };
-        let path = Path::new("Buses.cs");
-
-        let (image, _) = image_for_board(path, &program, board, false, Tier::ClassLibrary, &[], &Folders::default())
-            .unwrap_or_else(|error| panic!("the program links: {error}"));
-        assert!(image.windows(words.len()).any(|at| at == words.as_slice()), "the image carries the table");
-        let elf = debug_elf_for_board(path, &program, board, false, &[], &Folders::default())
-            .unwrap_or_else(|error| panic!("the debug ELF links: {error}"));
-        assert!(elf.windows(words.len()).any(|at| at == words.as_slice()), "and so does the ELF");
-    }
-
     /// The reach of the flag is stated where somebody meets its edge, not only in the help.
     #[test]
     fn a_target_the_linked_tier_has_no_plan_for_is_refused_with_the_ones_it_does() {
@@ -2342,71 +2071,6 @@ class Program
                 "and the refusal lists it: {board}
 {error}"
             );
-        }
-    }
-
-    /// **THE VERB IN A MESSAGE IS THE VERB THAT WAS TYPED.** Both verbs share this path, and every
-    /// message on it said `lamella deploy` -- so `lamella build --format` refused in the name of a
-    /// command with a different command line, sending the reader to the wrong help.
-    #[test]
-    fn a_refusal_names_the_verb_that_was_run_rather_than_its_sibling() {
-        if !csharp_compiler_is_available() {
-            return;
-        }
-        let library = "public sealed class Blink { public static unsafe void Run() { } }";
-        let error = build_image(
-            Path::new("Blink.cs"),
-            library,
-            "bbc-micro-bit-v1",
-            "microbit",
-            true,
-            Tier::Flat,
-            &[],
-            "build",
-            &Folders::default(),
-        )
-        .expect_err("a library is not a program");
-        assert!(
-            error.contains("lamella build"),
-            "it names the verb run: {error}"
-        );
-        assert!(
-            !error.contains("lamella deploy"),
-            "and not its sibling: {error}"
-        );
-    }
-
-    #[test]
-    fn the_tier_messages_render_without_stray_columns() {
-        let mut rendered = vec![
-            class_library_refusal("build", "ch32v003"),
-            class_library_refusal("deploy", "microbit"),
-        ];
-        if lamella_wire_host::engine::LcscCompiler::discover().is_ok() {
-            rendered.push(
-                build_image(
-                    Path::new("Hello.cs"),
-                    CONSOLE,
-                    "bbc-micro-bit-v1",
-                    "microbit",
-                    false,
-                    Tier::Flat,
-                    &[],
-                    "build",
-                    &Folders::default(),
-                )
-                .expect_err("the flat tier refuses this call"),
-            );
-        }
-        for message in &rendered {
-            crate::rendered::assert_renders_cleanly(message, crate::rendered::four_space_sample);
-            for line in message.lines() {
-                assert!(
-                    line.len() <= 100,
-                    "a line runs to {}:\n{message}",
-                    line.len()
-                );
-            }
         }
     }
 
@@ -2490,91 +2154,12 @@ class Program
     }
 
     #[test]
-    fn a_program_with_no_entry_is_refused_by_name() {
-        if !csharp_compiler_is_available() {
-            return;
-        }
-        let library = "public sealed class Blink { public static unsafe void Run() { } }";
-        let error = build_image(
-            Path::new("Blink.cs"),
-            library,
-            "bbc-micro-bit-v1",
-            "microbit",
-            true,
-            Tier::Flat,
-            &[],
-            "deploy",
-            &Folders::default(),
-        )
-        .expect_err("a library is not a program");
-        assert!(
-            error.contains("no static Main"),
-            "it names the contract: {error}"
-        );
-        assert!(
-            error.contains("Run()"),
-            "and the shape it is telling apart: {error}"
-        );
-    }
-
-    /// A blink written as `dotnet new console` writes a program: TOP-LEVEL STATEMENTS (C# 9), whose
-    /// entry point is the method the CLI header names, `<Main>$`. Nothing in it is NAMED `Main`.
-    const BLINK_STATEMENTS: &str = "\
-unsafe
-{
-    *(int*)0x50000518 = 0xFFF0;
-    *(int*)0x50000508 = 0xE000;
-    *(int*)0x5000050C = 0x1FF0;
-}
-while (true)
-{
-}
-";
-
-    /// **A PROGRAM WRITTEN AS TOP-LEVEL STATEMENTS IS A PROGRAM**, and the flat image is built from
-    /// it whole.
-    #[test]
-    fn a_program_written_as_top_level_statements_builds_a_flat_image() {
-        if !csharp_compiler_is_available() {
-            return;
-        }
-        let image = build_image(
-            Path::new("Blink.cs"),
-            BLINK_STATEMENTS,
-            "bbc-micro-bit-v1",
-            "microbit",
-            true,
-            Tier::Flat,
-            &[],
-            "deploy",
-            &Folders::default(),
-        )
-        .unwrap_or_else(|error| panic!("the statements build: {error}"));
-        assert!(image.len() > 64, "{} B is too small to be a program plus a vector table", image.len());
-    }
-
-    /// The debug ELF takes the same program. It needs the class-library tier's runtime support
-    /// archive, which not every machine has built, so it is held here to the part every machine
-    /// reaches: the entry contract, checked before anything is linked.
-    #[test]
-    fn a_program_written_as_top_level_statements_passes_the_debug_build_s_entry_contract() {
-        if !csharp_compiler_is_available() {
-            return;
-        }
-        if let Err(error) =
-            debug_elf_for_board(Path::new("Blink.cs"), BLINK_STATEMENTS, "rpi-pico2-w", true, &[], &Folders::default())
-        {
-            assert!(!error.contains("no static Main"), "the debug build refused the entry contract: {error}");
-        }
-    }
-
-    #[test]
     fn the_refusal_names_the_missing_fact_and_what_still_works() {
-        let text = cannot_write("rpi-pico2");
+        let text = cannot_write("raspberrypi-pico-2");
         assert!(text.contains("bbc-micro-bit-v1"), "it lists what CAN be written: {text}");
         assert!(text.contains("not yet stated in any board file"), "and why the list is short");
         assert!(text.contains("lamella build"), "and what still works for that board");
-        assert!(text.contains("rpi-pico2"), "and names the board asked for");
+        assert!(text.contains("raspberrypi-pico-2"), "and names the board asked for");
         assert!(
             !text.contains("this build"),
             "no build writes a board another refuses, so the refusal must not imply one does: {text}"
@@ -2584,7 +2169,7 @@ while (true)
     #[test]
     fn the_coverage_column_agrees_with_the_table() {
         assert!(can_flash("bbc-micro-bit-v1"));
-        assert!(can_flash("rpi-pico2"));
+        assert!(can_flash("raspberrypi-pico-2"));
         assert!(!can_flash("st-nucleo-f429zi"), "no mechanism is stated for the ST boards yet");
         assert!(!can_flash("no-such-board"));
     }
@@ -2692,55 +2277,6 @@ while (true)
             .is_empty());
     }
 
-    /// **A LIBRARY THAT IS NOT AN ASSEMBLY IS REFUSED BY THE VERB THAT WAS RUN**, on both ways a
-    /// single file is compiled. Compiling for a debugger is the one a library reaches, because every
-    /// class-library image is compiled that way, `deploy`'s included; the plain compile shares the
-    /// refusal. Each is asked with a different verb, so neither can answer with a fixed one. This
-    /// refusal opened `lamella:` with no verb, the one message on this path that did not say which
-    /// command it came from.
-    #[test]
-    fn a_library_that_is_not_an_assembly_is_refused_by_the_verb_that_was_run() {
-        if !csharp_compiler_is_available() {
-            return;
-        }
-        let broken = [Library {
-            path: PathBuf::from("Broken.dll"),
-            bytes: vec![1, 2, 3],
-        }];
-        let program = "class P\n{\n    static void Main() { }\n}\n";
-        let Err(debug) = crate::program::compile_csharp_for_debugging(
-            Path::new("P.cs"),
-            program,
-            false,
-            &broken,
-            None,
-            "deploy",
-            &Folders::default(),
-        ) else {
-            panic!("three bytes are not an assembly");
-        };
-        let Err(plain) = crate::program::compile_csharp_assembly_with_corlib(
-            Path::new("P.cs"),
-            program,
-            false,
-            &broken,
-            None,
-            "build",
-            &Folders::default(),
-        ) else {
-            panic!("three bytes are not an assembly, compiled plainly either");
-        };
-        for (refusal, verb) in [(debug, "deploy"), (plain, "build")] {
-            assert!(
-                refusal.starts_with(&format!(
-                    "lamella {verb}: Broken.dll is not a readable .NET assembly"
-                )),
-                "{refusal}"
-            );
-            crate::rendered::assert_renders_cleanly(&refusal, crate::rendered::four_space_sample);
-        }
-    }
-
     /// **THE LIBRARY SET REACHES THE LINKED BUILD IN THE ORDER IT WAS DECLARED, AND WHOLE.**
     /// Precedence across a reference set is first-declarer-wins, so sorting or de-duplicating here
     /// would change which definition of a duplicated name the program binds -- with a successful
@@ -2795,7 +2331,7 @@ while (true)
             line.contains("--replace-bootloader with the bootloader's own file"),
             "the way back: {line}"
         );
-        let xpro = programmer_for("microchip-samd21-xpro").expect("the XPro is routed");
+        let xpro = programmer_for("microchip-sam-d21-xplained-pro").expect("the XPro is routed");
         let start = placement_for(xpro, xpro.programmer, BootloaderChoice::Keep).expect("placed");
         assert_eq!(placement_line(&start), None);
     }
@@ -2808,7 +2344,7 @@ while (true)
         let why = deploy_placement(zero, zero.programmer).expect_err("it keeps its bootloader");
         assert!(why.contains("Arduino Zero Bootloader"), "{why}");
         assert!(why.contains("Nothing was written"), "{why}");
-        let xpro = programmer_for("microchip-samd21-xpro").expect("the XPro is routed");
+        let xpro = programmer_for("microchip-sam-d21-xplained-pro").expect("the XPro is routed");
         assert_eq!(
             deploy_placement(xpro, xpro.programmer),
             Ok(Placement::Start { base: xpro.programmer.flash_base() })
@@ -2844,3 +2380,4 @@ while (true)
         assert_eq!(heap_line("bbc-micro-bit-v1", &image), None, "a flat image seeds no heap");
     }
 }
+

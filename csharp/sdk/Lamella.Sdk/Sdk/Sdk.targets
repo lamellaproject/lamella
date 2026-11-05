@@ -131,7 +131,7 @@
       <_LamellaToolFaultCode Condition="'$(LamellaToolPath)' != '' and !Exists('$(_LamellaTool)')">LAMSDK0001</_LamellaToolFaultCode>
       <_LamellaToolFault Condition="'$(LamellaToolPath)' != '' and !Exists('$(_LamellaTool)')">LamellaToolPath names the lamella tool at '$(_LamellaTool)', and there is no file there. Set LamellaToolPath to the full path of a lamella executable, or remove it to use the one restored with this SDK.</_LamellaToolFault>
       <_LamellaToolFaultCode Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolPinnedSha256)' == '' and '$(_LamellaToolMachines)' != ''">LAMSDK0002</_LamellaToolFaultCode>
-      <_LamellaToolFault Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolPinnedSha256)' == '' and '$(_LamellaToolMachines)' != ''">Lamella.Sdk $(LamellaSdkVersion) has no lamella tool for $(_LamellaToolRid), the machine the .NET SDK runs on; it has one for $(_LamellaToolMachines). Intel macOS (osx-x64) is not a supported Lamella.Sdk build or publish host in this release. Set LamellaToolPath to the full path of a lamella executable built for this machine.</_LamellaToolFault>
+      <_LamellaToolFault Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolPinnedSha256)' == '' and '$(_LamellaToolMachines)' != ''">Lamella.Sdk $(LamellaSdkVersion) has no lamella tool for $(_LamellaToolRid), the machine the .NET SDK runs on; it has one for $(_LamellaToolMachines). Set LamellaToolPath to the full path of a lamella executable built for this machine.</_LamellaToolFault>
       <_LamellaToolFaultCode Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolPinnedSha256)' == '' and '$(_LamellaToolMachines)' == ''">LAMSDK0002</_LamellaToolFaultCode>
       <_LamellaToolFault Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolPinnedSha256)' == '' and '$(_LamellaToolMachines)' == ''">Lamella.Sdk $(LamellaSdkVersion) has no lamella tool for any machine. Set LamellaToolPath to the full path of a lamella executable built for this machine.</_LamellaToolFault>
       <_LamellaToolFaultCode Condition="'$(LamellaToolPath)' == '' and '$(_LamellaToolPinnedSha256)' != '' and '$(_LamellaTool)' == ''">LAMSDK0003</_LamellaToolFaultCode>
@@ -168,12 +168,45 @@
     <Error Condition="'$(_LamellaToolFault)' != ''" Code="$(_LamellaToolFaultCode)" Text="$(_LamellaToolFault)" />
   </Target>
 
+  <!-- The version of a package this SDK provides, under central package management. This runs once for
+       each such package the project references, so each version it reads is that package's. NuGet never
+       sees these references, so what it reads and refuses for any other package is read and refused
+       here, in its words: the reference's VersionOverride, or else the project's PackageVersion. -->
+  <Target Name="_LamellaCentralPackageVersions" Outputs="%(LamellaPackageReference.Identity)" Condition="'$(ManagePackageVersionsCentrally)' == 'true'">
+    <PropertyGroup>
+      <_LamellaCentralId>%(LamellaPackageReference.Identity)</_LamellaCentralId>
+      <_LamellaCentralOverride>@(LamellaPackageReference->'%(VersionOverride)')</_LamellaCentralOverride>
+      <_LamellaCentralOverride>$(_LamellaCentralOverride.Split(';')[0])</_LamellaCentralOverride>
+      <_LamellaCentralOwnVersion>@(LamellaPackageReference->'%(Version)')</_LamellaCentralOwnVersion>
+      <_LamellaCentralOwnVersion>$(_LamellaCentralOwnVersion.Split(';')[0])</_LamellaCentralOwnVersion>
+      <_LamellaCentralVersions>@(PackageVersion->WithMetadataValue('Identity', '$(_LamellaCentralId)')->'%(Version)')</_LamellaCentralVersions>
+      <_LamellaCentralVersion>$(_LamellaCentralVersions.Split(';')[0])</_LamellaCentralVersion>
+    </PropertyGroup>
+    <!-- Two references to one package are a warning and a build to NuGet, which a Directory.Build.props beside a
+         project often makes: it takes the first reference as a whole, override and all, and the first of two
+         PackageVersions, each measured from a real restore. -->
+    <Warning Condition="'@(LamellaPackageReference->Count())' &gt; '1'" File="$(MSBuildProjectFullPath)" Code="NU1504" Text="Duplicate 'PackageReference' items found. Remove the duplicate items or use the Update functionality to ensure a consistent restore behavior. The duplicate 'PackageReference' items are: @(LamellaPackageReference, ' , ') ." />
+    <Warning Condition="$(_LamellaCentralVersions.Contains(';'))" File="$(MSBuildProjectFullPath)" Code="NU1506" Text="Duplicate 'PackageVersion' items found. Remove the duplicate items or use the Update functionality to ensure a consistent restore behavior. The duplicate 'PackageVersion' items are: $(_LamellaCentralId) $(_LamellaCentralVersions)." />
+    <Error Condition="'$(_LamellaCentralOverride)' != '' and '$(CentralPackageVersionOverrideEnabled)' == 'false'" File="$(MSBuildProjectFullPath)" Code="NU1013" Text="The following PackageReference items cannot specify a value for VersionOverride: $(_LamellaCentralId). Projects using Central Package Management are currently configured to disable this functionality." />
+    <Error Condition="'$(_LamellaCentralOverride)' == '' and '$(_LamellaCentralOwnVersion)' != ''" File="$(MSBuildProjectFullPath)" Code="NU1008" Text="The following PackageReference items cannot define a value for Version: $(_LamellaCentralId). Projects using Central Package Management must define a Version value on a PackageVersion item." />
+    <Error Condition="'$(_LamellaCentralOverride)' == '' and '$(_LamellaCentralVersion)' == ''" File="$(MSBuildProjectFullPath)" Code="NU1010" Text="The following PackageReference items do not define a corresponding PackageVersion item: $(_LamellaCentralId). Projects using Central Package Management must declare PackageReference and PackageVersion items with matching names." />
+    <Error Condition="'$(_LamellaCentralOverride)' == '' and $(_LamellaCentralVersion.Contains('*')) and '$(CentralPackageFloatingVersionsEnabled)' != 'true'" File="$(MSBuildProjectFullPath)" Code="NU1011" Text="The following PackageVersion items cannot specify a floating version: $(_LamellaCentralId). Set CentralPackageFloatingVersionsEnabled to true to allow one." />
+    <PropertyGroup>
+      <_LamellaCentralNamed>$(_LamellaCentralVersion)</_LamellaCentralNamed>
+      <_LamellaCentralNamed Condition="'$(_LamellaCentralOverride)' != ''">$(_LamellaCentralOverride)</_LamellaCentralNamed>
+    </PropertyGroup>
+    <ItemGroup>
+      <_LamellaCentrallyVersionedPackage Include="$(_LamellaCentralId)" Version="$(_LamellaCentralNamed)" />
+    </ItemGroup>
+  </Target>
+
   <!-- The lines both steps of a build give the tool: the project, each package reference as
        id@version (the id alone when it names no version), the board when the project names one, and
        where the tool writes the references it chooses. -->
-  <Target Name="_LamellaProjectInputs">
+  <Target Name="_LamellaProjectInputs" DependsOnTargets="_LamellaCentralPackageVersions">
     <ItemGroup>
-      <_LamellaPackageSpec Include="@(LamellaPackageReference)" />
+      <_LamellaPackageSpec Include="@(LamellaPackageReference)" Condition="'$(ManagePackageVersionsCentrally)' != 'true'" />
+      <_LamellaPackageSpec Include="@(_LamellaCentrallyVersionedPackage)" />
       <_LamellaPackageSpec Condition="'%(_LamellaPackageSpec.Version)' == ''">
         <LamellaSpec>%(_LamellaPackageSpec.Identity)</LamellaSpec>
       </_LamellaPackageSpec>

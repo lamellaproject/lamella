@@ -8,6 +8,8 @@
 kind = "board"
 board = "arduino-mkr1000"
 vendor = "arduino"
+maker = "Arduino"
+product = "MKR1000"
 module = "samw25"
 product_model = 9
 sources = [

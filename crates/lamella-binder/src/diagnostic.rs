@@ -20,7 +20,7 @@ pub(crate) fn compiling_version() -> LanguageVersion {
     LanguageVersion::DEFAULT
 }
 
-/// Which of a C# compiler's two passes reported a diagnostic. A compilation is checked in the
+/// Which validation phase reported a diagnostic. A compilation is checked in the
 /// order the language is defined: DECLARATIONS first -- signatures, base clauses, interface
 /// implementation, const values, enum members, attributes -- and then METHOD BODIES, which are
 /// checked AGAINST those declarations.
@@ -29,6 +29,8 @@ pub(crate) fn compiling_version() -> LanguageVersion {
 /// only worth analyzing if the declarations it is checked against are sound, so when the
 /// declaration pass reports an error the body pass is withheld entirely. See
 /// [`crate::withhold_body_diagnostics_after_declaration_error`].
+/// Emission-capability diagnostics marked as deferred are reported only after language validation
+/// succeeds; they describe a permitted construct that this build cannot emit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum DiagnosticPhase {
     /// Reported while checking declarations. Never withheld.
@@ -36,6 +38,8 @@ pub enum DiagnosticPhase {
     Declaration,
     /// Reported while checking a method body, a field initializer, or a constructor initializer.
     Body,
+    /// A deferred emission-capability refusal, retained only when language validation succeeds.
+    Emission,
 }
 
 /// A semantic diagnostic: its kind, the source range it concerns, and which pass reported it.
@@ -672,6 +676,18 @@ pub enum DiagnosticKind {
     /// (17.9.2), so a unary-only operator (`!`, `~`, `++`, `--`, `true`, `false`) given two
     /// parameters is rejected.
     OverloadableBinaryOperatorExpected,
+    /// `CS0564`: a shift-count parameter violates the selected edition's restriction
+    /// (second edition 14.8; fourth edition 17.9.2; seventh edition 15.10.3).
+    ShiftCountMustBeInt {
+        /// Whether the selected edition also permits `int?`.
+        nullable_allowed: bool,
+    },
+    /// `CS0564`: a shift's first operand must name its containing type (second edition
+    /// 14.8) or, from the fourth edition 17.9.2, that type's nullable form.
+    ShiftFirstOperandMustBeContainingType {
+        /// Whether the selected edition also permits the nullable containing type.
+        nullable_allowed: bool,
+    },
     /// `CS0578`: the `[Conditional]` attribute (24.4.2) requires a `void`-returning method; a method
     /// with a non-`void` return type is rejected.
     ConditionalMethodMustReturnVoid {
@@ -1270,6 +1286,13 @@ pub enum DiagnosticKind {
         /// The collection's type, as the message names it (twice).
         ty: Box<str>,
     },
+    /// `CS0202`: a selected GetEnumerator return type does not supply the enumerator pattern.
+    ForEachInvalidEnumerator {
+        /// The selected enumerator's type.
+        enumerator: Box<str>,
+        /// The collection type declaring GetEnumerator.
+        collection: Box<str>,
+    },
     /// `CS1536`: a parameter declared `void`. `void` is the absence of a value, so it names no
     /// storage a parameter could hold -- the same reason a `void` local is `CS1547`.
     VoidParameter,
@@ -1356,6 +1379,34 @@ pub enum DiagnosticKind {
         /// The type that declares it twice.
         type_name: Box<str>,
         /// The duplicated member name.
+        member: Box<str>,
+    },
+    /// `CS8869`: a record declares `GetHashCode()` or `ToString()` without overriding `object`'s.
+    RecordMemberNotOverriding {
+        /// The member, as `R.ToString()`.
+        member: Box<str>,
+    },
+    /// `CS8872`: a record that is not sealed declares a member of a generated signature that a
+    /// derived record could not override.
+    RecordMemberNotOverridable {
+        /// The member, as `R.Equals(R)`.
+        member: Box<str>,
+    },
+    /// `CS8873`: a record declares a member of a generated signature that is not public.
+    RecordMemberNotPublic {
+        /// The member, as `R.Equals(R)`.
+        member: Box<str>,
+    },
+    /// `CS8874`: a record declares a member of a generated signature with another return type.
+    RecordMemberReturn {
+        /// The member, as `R.Equals(R)`.
+        member: Box<str>,
+        /// The type it must return.
+        expected: &'static str,
+    },
+    /// `CS8877`: a record declares a member of a generated signature as static.
+    RecordMemberStatic {
+        /// The member, as `R.Equals(R)`.
         member: Box<str>,
     },
     /// `CS0111`: the type already defines a method with the same name and parameter
@@ -2175,6 +2226,8 @@ pub enum DiagnosticKind {
         /// The cast's target type.
         to: Box<str>,
     },
+    /// `CS0244`: neither operand of `is` or `as` may have a pointer type.
+    TypeTestOnPointer,
     /// `CS0039`: no conversion exists for an `as` expression -- the operand does not become
     /// the target via a reference, boxing, unboxing, wrapping, or null-type conversion.
     AsConversionMissing {
@@ -2182,6 +2235,19 @@ pub enum DiagnosticKind {
         from: Box<str>,
         /// The `as` target type.
         to: Box<str>,
+    },
+    /// `CS0077`: an `as` target is not a reference type or an admitted nullable value
+    /// type (fourth edition 14.9.11; seventh edition 12.12.13).
+    AsTargetMustBeReference {
+        /// The target type.
+        target: Box<str>,
+        /// Whether the selected edition also permits nullable value targets.
+        nullable_allowed: bool,
+    },
+    /// `CS0413`: an `as` target parameter is not known to be a reference type (25.7).
+    AsTypeParameterMustBeReference {
+        /// The target type parameter.
+        target: Box<str>,
     },
     /// `CS0165`: a local variable is read before it is definitely assigned.
     UseOfUnassignedLocal {
@@ -2459,6 +2525,8 @@ impl DiagnosticKind {
             DiagnosticKind::MultipleClassBases { .. } => 1721,
             DiagnosticKind::EventTypeMustBeDelegate { .. } => 66,
             DiagnosticKind::OverloadableBinaryOperatorExpected => 1020,
+            DiagnosticKind::ShiftCountMustBeInt { .. } => 564,
+            DiagnosticKind::ShiftFirstOperandMustBeContainingType { .. } => 564,
             DiagnosticKind::ConditionalMethodMustReturnVoid { .. } => 578,
             DiagnosticKind::DeriveFromSealed { .. } => 509,
             DiagnosticKind::NamespaceElementBadAccessibility => 1527,
@@ -2561,6 +2629,7 @@ impl DiagnosticKind {
             DiagnosticKind::CatchAfterGeneralCatch => 1017,
             DiagnosticKind::ConversionMustInvolveEnclosingType => 556,
             DiagnosticKind::ForEachNotEnumerable { .. } => 1579,
+            DiagnosticKind::ForEachInvalidEnumerator { .. } => 202,
             DiagnosticKind::VoidParameter => 1536,
             DiagnosticKind::ArrayInitializerLength { .. } => 847,
             DiagnosticKind::GotoCaseOutsideSwitch => 153,
@@ -2577,6 +2646,11 @@ impl DiagnosticKind {
             DiagnosticKind::BaseTypeNotInterface { .. } => 527,
             DiagnosticKind::DestructorNameMismatch => 574,
             DiagnosticKind::DestructorNotInClass => 575,
+            DiagnosticKind::RecordMemberNotOverriding { .. } => 8869,
+            DiagnosticKind::RecordMemberNotOverridable { .. } => 8872,
+            DiagnosticKind::RecordMemberNotPublic { .. } => 8873,
+            DiagnosticKind::RecordMemberReturn { .. } => 8874,
+            DiagnosticKind::RecordMemberStatic { .. } => 8877,
             DiagnosticKind::DuplicateMethod { .. } => 111,
             DiagnosticKind::DuplicateLabel { .. } => 140,
             DiagnosticKind::UndefinedLabel { .. } => 159,
@@ -2721,7 +2795,10 @@ impl DiagnosticKind {
             DiagnosticKind::CannotReturnScopedParameterByReference { .. } => 9075,
             DiagnosticKind::NotAllPathsReturn { .. } => 161,
             DiagnosticKind::CannotCast { .. } => 30,
+            DiagnosticKind::TypeTestOnPointer => 244,
             DiagnosticKind::AsConversionMissing { .. } => 39,
+            DiagnosticKind::AsTargetMustBeReference { .. } => 77,
+            DiagnosticKind::AsTypeParameterMustBeReference { .. } => 413,
             DiagnosticKind::UseOfUnassignedLocal { .. } => 165,
             DiagnosticKind::OutParameterNotAssigned { .. } => 177,
             DiagnosticKind::NamespaceMemberNotFound { .. } => 234,
@@ -3068,6 +3145,18 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::OverloadableBinaryOperatorExpected => {
                 write!(f, "Overloadable binary operator expected")
             }
+            DiagnosticKind::ShiftCountMustBeInt { nullable_allowed } => {
+                write!(
+                    f,
+                    "The second operand of an overloaded shift operator must have type {}",
+                    if *nullable_allowed { "int or int?" } else { "int" }
+                )
+            }
+            DiagnosticKind::ShiftFirstOperandMustBeContainingType { nullable_allowed } => write!(
+                f,
+                "The first operand of an overloaded shift operator must have the containing type{}",
+                if *nullable_allowed { " or its nullable form" } else { "" }
+            ),
             DiagnosticKind::ConditionalMethodMustReturnVoid { method } => {
                 write!(
                     f,
@@ -3503,6 +3592,11 @@ impl fmt::Display for DiagnosticKind {
                 "foreach statement cannot operate on variables of type '{ty}' because '{ty}' \
                  does not contain a public instance or extension definition for 'GetEnumerator'"
             ),
+            DiagnosticKind::ForEachInvalidEnumerator { enumerator, collection } => write!(
+                f,
+                "foreach requires that the return type '{enumerator}' of '{collection}.GetEnumerator()' \
+                 have a suitable public MoveNext method and public Current property"
+            ),
             DiagnosticKind::VoidParameter => write!(f, "Invalid parameter type 'void'"),
             DiagnosticKind::ArrayInitializerLength { length } => {
                 write!(f, "An array initializer of length '{length}' is expected")
@@ -3554,6 +3648,21 @@ impl fmt::Display for DiagnosticKind {
             }
             DiagnosticKind::DestructorNotInClass => {
                 write!(f, "Only class types can contain destructors")
+            }
+            DiagnosticKind::RecordMemberNotOverriding { member } => {
+                write!(f, "'{member}' does not override expected method from 'object'.")
+            }
+            DiagnosticKind::RecordMemberNotOverridable { member } => {
+                write!(f, "'{member}' must allow overriding because the containing record is not sealed.")
+            }
+            DiagnosticKind::RecordMemberNotPublic { member } => {
+                write!(f, "Record member '{member}' must be public.")
+            }
+            DiagnosticKind::RecordMemberReturn { member, expected } => {
+                write!(f, "Record member '{member}' must return '{expected}'.")
+            }
+            DiagnosticKind::RecordMemberStatic { member } => {
+                write!(f, "Record member '{member}' may not be static.")
             }
             DiagnosticKind::DuplicateMethod { type_name, member } => write!(
                 f,
@@ -4135,10 +4244,22 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::CannotCast { from, to } => {
                 write!(f, "Cannot convert type '{from}' to '{to}'")
             }
+            DiagnosticKind::TypeTestOnPointer => {
+                write!(f, "The is or as operator is not valid on pointer types")
+            }
             DiagnosticKind::AsConversionMissing { from, to } => write!(
                 f,
                 "Cannot convert type '{from}' to '{to}' via a reference conversion, boxing \
                  conversion, unboxing conversion, wrapping conversion, or null type conversion"
+            ),
+            DiagnosticKind::AsTargetMustBeReference { target, nullable_allowed } => write!(
+                f,
+                "The as operator must be used with {} ('{target}' is not an eligible target type)",
+                if *nullable_allowed { "a reference type or nullable value type" } else { "a reference type" }
+            ),
+            DiagnosticKind::AsTypeParameterMustBeReference { target } => write!(
+                f,
+                "The type parameter '{target}' cannot be used with the as operator because it is not known to be a reference type"
             ),
             DiagnosticKind::UseOfUnassignedLocal { name } => {
                 write!(f, "Use of unassigned local variable '{name}'")

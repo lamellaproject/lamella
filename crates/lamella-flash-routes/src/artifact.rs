@@ -108,8 +108,8 @@ pub fn read(path: &Path) -> Result<Artifact, String> {
             Ok(Artifact { bytes: image.bytes, base: Some(image.base), format: "ELF" })
         }
         Some("uf2") => Err(format!(
-            "{}: a UF2 is written by copying it to a bootloader volume, and this board is written \
-             over a probe.\nBuild the image in a format a probe takes: `--format hex` or `bin`.",
+            "{}: a UF2 can hold an image for each of several chips, so it is read for a board, \
+             whose chip family says which image to take.",
             path.display()
         )),
         _ => Err(format!("{}: not a format this can write", path.display())),
@@ -987,18 +987,18 @@ mod tests {
         assert_eq!(classify(Path::new("main.py")), Kind::Source);
     }
 
-    /// A format recognized as a chip image but not yet written must say why, because a reader
-    /// cannot otherwise tell a gap from a mistake.
+    /// A format recognized as a chip image but not read here must say why, because a reader cannot
+    /// otherwise tell a gap from a mistake.
     ///
     /// **UF2 IS NOW THE ONLY ONE**, and the second half of this test is what says so: `.s19` and
     /// `.elf` were both in this set, and both are read now. The way to prove a format is READ
     /// without having a file to hand is that it fails on the FILE rather than on the format --
     /// which is also a real behavior change, because a format refused by extension never opened
-    /// the file at all.
+    /// the file at all. A UF2 is read too, but for a board, by `prepare_image`.
     #[test]
     fn the_one_recognized_but_unwritable_format_says_why() {
-        let error = read(Path::new("serve.uf2")).expect_err("not written");
-        assert!(error.contains("bootloader volume"), "got {error}");
+        let error = read(Path::new("serve.uf2")).expect_err("read for a board");
+        assert!(error.contains("read for a board"), "got {error}");
 
         for name in ["serve.s19", "serve.elf"] {
             let error = read(Path::new(name)).expect_err("no such file");

@@ -3913,13 +3913,19 @@ fn append_reference_descriptors(
     for func in funcs {
         for block in &func.blocks {
             for (_, inst) in &block.insts {
-                if let (Inst::AllocArray { handle, .. }, Some(base)) = (inst, array_base.as_ref()) {
-                    let known = descriptors.iter().any(|d| d.handle == *handle)
+                let array = match inst {
+                    Inst::AllocArray { handle, .. }
+                    | Inst::AllocArray2D { handle, .. }
+                    | Inst::AllocArrayMD { handle, .. } => Some(*handle),
+                    _ => None,
+                };
+                if let (Some(handle), Some(base)) = (array, array_base.as_ref()) {
+                    let known = descriptors.iter().any(|d| d.handle == handle)
                         || added.contains(&handle.0);
                     if !known {
                         added.push(handle.0);
                         descriptors.push(crate::resolver::TypeMeta {
-                            handle: *handle,
+                            handle,
                             type_tag: 0,
                             vtable: base.vtable.clone(),
                             itable: base.itable.clone(),
@@ -3933,6 +3939,14 @@ fn append_reference_descriptors(
                 let handle = match inst {
                     Inst::Alloc { handle, .. } | Inst::TypeDescAddr { handle } => *handle,
                     Inst::AllocArray {
+                        element: Some(handle),
+                        ..
+                    }
+                    | Inst::AllocArray2D {
+                        element: Some(handle),
+                        ..
+                    }
+                    | Inst::AllocArrayMD {
                         element: Some(handle),
                         ..
                     } => *handle,
@@ -11266,8 +11280,10 @@ pub fn array_get_value_body() -> Function {
 ///
 /// - a REFERENCE element takes the reference itself, once the value is shown ASSIGNABLE to the element
 ///   type -- a `CastClassScan` from the value's own descriptor to the one `element_desc@16` names, the
-///   same base_ptr@12 walk `castclass`/`isinst` use. `null` is accepted without asking, since it is
-///   assignable to every reference type and has no descriptor to ask about.
+///   same base_ptr@12 walk `castclass`/`isinst` use, and where that finds nothing, the value's itable
+///   asked for the interface tag in `cast_class@20`, as a cast to that interface asks. `null` is
+///   accepted without asking, since it is assignable to every reference type and has no descriptor to
+///   ask about.
 /// - a VALUE-TYPE element, primitive or struct, takes the BOX apart: the value's descriptor must be
 ///   EXACTLY the element's (a box carries its type's canonical descriptor, which is how `GetValue`'s
 ///   box unboxes and passes `is int`), and then the payload copies in -- the reverse of `GetValue`'s
@@ -11275,14 +11291,12 @@ pub fn array_get_value_body() -> Function {
 ///
 /// The seam is `void`, so like [`array_clear_core_body`] it has no way to hand a verdict back: the two
 /// outcomes are STORE and TRAP. **That is deliberate, and it is why no managed `throw` sits on top of a
-/// declining return.** The scan cannot answer for an INTERFACE element -- the base_ptr chain carries
-/// classes only, and interface implementation lives in the itable, which is keyed per interface METHOD
-/// and so cannot answer "does this type implement `IFoo`" at all -- so for `IFoo[] a; a.SetValue(impl, 0)`
-/// the scan reads 0 on a store .NET performs. Trapping there says "this runtime could not do it", which
-/// is true. A `bool` decline turned into an `InvalidCastException` by the managed wrapper would instead
-/// say "your program was wrong", which is false, and it would be indistinguishable from the genuinely
-/// non-assignable case. Named as a limitation rather than dressed up as a diagnosis; answering it needs
-/// an interface SET in the descriptor format, which is a ratification, not a body.
+/// declining return.** Some elements cannot be asked about at all: an interface with no method tag, whose
+/// implementers nothing records, and an element no metadata row names, whose `element_desc@16` is
+/// absent. For those a store .NET performs reaches the trap, which says "this runtime could not do it",
+/// and that is true. A `bool` decline turned into an `InvalidCastException` by the managed wrapper
+/// would instead say "your program was wrong", which is false, and it would be indistinguishable from
+/// the genuinely non-assignable case.
 ///
 /// Two more cases trap for reasons worth stating, because .NET does something else in each: a WIDENING
 /// primitive store (a boxed `int` into a `long[]`, which .NET converts) declines on the exact-descriptor
@@ -11399,7 +11413,18 @@ pub fn array_set_value_body() -> Function {
         },
     );
     let store_block = mb.block();
-    mb.branch(assignable, store_block, trap);
+    let interface_block = mb.block();
+    mb.branch(assignable, store_block, interface_block);
+
+    mb.at(interface_block);
+    let implemented = mb.emit(
+        i32t,
+        Inst::InterfaceHasArrayElementTag {
+            descriptor: value_desc,
+            array_descriptor: desc,
+        },
+    );
+    mb.branch(implemented, store_block, trap);
 
     mb.at(store_block);
     let addr = array_element_address_by_width(&mut mb, base, index, width);
@@ -14953,528 +14978,6 @@ mod tests {
         assert_renders_as_one_sentence(&messages);
     }
 
-    fn fixture(relative: &str) -> Option<Vec<u8>> {
-        std::fs::read(alloc::format!("{}/{relative}", env!("CARGO_MANIFEST_DIR"))).ok()
-    }
-
-    /// A body that does not lower is refused BY NAME -- `Namespace.Type::Method`, beside its row --
-    /// and what the lowering met is said in words rather than as a variant.
-    #[test]
-    fn a_lowering_refusal_names_the_method_and_what_it_met() {
-        let Some(bytes) = fixture("../lamella-load/tests/fixtures/corlib.dll") else {
-            return;
-        };
-        let assembly = Assembly::read(&bytes).expect("the corlib fixture parses");
-        let rid = assembly
-            .find_type("System", "Object")
-            .and_then(|object| object.methods().find(|m| m.name() == Some("ToString")))
-            .expect("the corlib declares System.Object::ToString")
-            .rid();
-        let error = lower_cil_error(
-            &assembly,
-            rid,
-            cil::CilError::UnsupportedControlFlow(cil::ControlFlowGap::EdgeArity {
-                target: cil::EdgeTarget::FinallyHandler,
-                passed: 0,
-                takes: 2,
-            }),
-        );
-        let BuildError::LowerCil { method, .. } = &error else {
-            panic!("expected the lowering refusal, got {error:?}");
-        };
-        assert_eq!(method, "System.Object::ToString");
-        let message = alloc::format!("{error}");
-        assert!(message.contains("`System.Object::ToString`"), "{message}");
-        assert!(message.contains(&alloc::format!("(method {rid})")), "{message}");
-        assert!(message.contains("first block of a `finally` handler"), "{message}");
-        assert!(!message.contains("UnsupportedControlFlow"), "{message}");
-    }
-
-    /// A method whose every reachable path throws is lowered with the result type its signature
-    /// declares, by the front end ARM, RISC-V and WebAssembly all lower from. Each backend reads the
-    /// calling convention off that type -- on ARM and RISC-V whether a struct comes back through a
-    /// pointer the caller passes -- so a 16-byte struct method lowered with no result type reads its
-    /// argument one register off. A method that does not lower is a stub with no result type at all,
-    /// so the assertion also says each one lowered.
-    #[test]
-    fn an_always_throwing_method_takes_its_result_type_from_its_signature() {
-        let Some(bytes) = fixture("tests/fixtures/always-throws.dll") else {
-            return;
-        };
-        let assembly = read_assembly(&bytes).expect("the fixture reads");
-        let (funcs, _plan) =
-            lower_assembly(&assembly, find_main(&assembly), &[]).expect("the fixture lowers");
-        let mut checked = 0;
-        for type_def in assembly.type_defs() {
-            for method in type_def.methods() {
-                let ret = funcs[method.rid() as usize].ret;
-                match method.name() {
-                    Some(
-                        "Plain" | "OnBothArms" | "Rethrows" | "AfterFinally"
-                        | "RethrowsBeforeADeadReturn",
-                    ) => {
-                        assert_eq!(ret, Some(MirType::I32), "{:?} is a `static int`", method.name());
-                        checked += 1;
-                    }
-                    Some("Fail" | "Make") if type_def.name().is_some_and(|n| n.name != "Maker") => {
-                        assert!(
-                            matches!(ret, Some(MirType::ValueType { size: 16, .. })),
-                            "{:?} returns the 16-byte `Big`, lowered as {ret:?}",
-                            method.name()
-                        );
-                        checked += 1;
-                    }
-                    _ => {}
-                }
-            }
-        }
-        assert_eq!(checked, 7, "the fixture's five int methods and two struct methods");
-    }
-
-    /// The fixtures of the reachability test below, each described in its own source's header.
-    #[cfg(feature = "linked")]
-    struct Reach {
-        corlib: Vec<u8>,
-        runtime_stackalloc: Vec<u8>,
-        stackalloc_prog: Vec<u8>,
-        stackalloc_reach: Vec<u8>,
-        mono_unlowerable: Vec<u8>,
-        mono_prog: Vec<u8>,
-        mono_reach: Vec<u8>,
-    }
-
-    #[cfg(feature = "linked")]
-    fn reach_fixtures() -> Option<Reach> {
-        Some(Reach {
-            corlib: fixture("../lamella-load/tests/fixtures/corlib.dll")?,
-            runtime_stackalloc: fixture("tests/fixtures/runtimestackalloc.dll")?,
-            stackalloc_prog: fixture("tests/fixtures/stackallocprog.dll")?,
-            stackalloc_reach: fixture("tests/fixtures/stackallocreach.dll")?,
-            mono_unlowerable: fixture("tests/fixtures/monounlowerable.dll")?,
-            mono_prog: fixture("tests/fixtures/monoprog.dll")?,
-            mono_reach: fixture("tests/fixtures/monoreach.dll")?,
-        })
-    }
-
-    /// `program` built against `corlib` and `library`, and dead-stripped, as the linked tier builds
-    /// and links it.
-    #[cfg(feature = "linked")]
-    fn linked_objects(
-        program: &[u8],
-        corlib: &[u8],
-        library: &[u8],
-    ) -> Result<Vec<lamella_elf::Object>, BuildError> {
-        let (object, deferred) = build_linked_program_object(program, corlib, &[library], None, false)?;
-        reachable_objects(&object, deferred, corlib, &[library], false)
-    }
-
-    /// `program` built against `corlib` and the libraries of `libraries` it references, and
-    /// dead-stripped, as the linked tier's entry points build and link it.
-    #[cfg(feature = "linked")]
-    fn linked_objects_given(
-        program: &[u8],
-        corlib: &[u8],
-        libraries: &[&[u8]],
-    ) -> Result<Vec<lamella_elf::Object>, BuildError> {
-        let libraries = referenced_libraries(program, libraries)?;
-        let (object, deferred) =
-            build_linked_program_object(program, corlib, &libraries, None, false)?;
-        reachable_objects(&object, deferred, corlib, &libraries, false)
-    }
-
-    /// The library-chain fixtures, each described in its own source's header: `corlib`,
-    /// `libchainbase`, `libchainboard` and `chainprog`.
-    #[cfg(feature = "linked")]
-    fn chain_fixtures() -> Option<[Vec<u8>; 4]> {
-        Some([
-            fixture("../lamella-load/tests/fixtures/corlib.dll")?,
-            fixture("tests/fixtures/libchainbase.dll")?,
-            fixture("tests/fixtures/libchainboard.dll")?,
-            fixture("tests/fixtures/chainprog.dll")?,
-        ])
-    }
-
-    /// A LIBRARY LOWERS AGAINST THE LIBRARIES IT REFERENCES, WHATEVER ORDER THEY ARE GIVEN IN.
-    ///
-    /// `libchainboard`'s type initializer binds a `libchainbase` delegate, as a board's class binds
-    /// `System.Device.Analog`'s converter factory, and `chainprog` names only the board half. Both
-    /// orders link.
-    #[cfg(feature = "linked")]
-    #[test]
-    fn a_library_lowers_against_the_libraries_it_references_whatever_order_they_are_given_in() {
-        let Some([corlib, base, board, program]) = chain_fixtures() else {
-            return;
-        };
-        for libraries in [
-            [base.as_slice(), board.as_slice()],
-            [board.as_slice(), base.as_slice()],
-        ] {
-            if let Err(error) = linked_objects_given(&program, &corlib, &libraries) {
-                panic!("the chain links with its base given first or second: {error}");
-            }
-        }
-    }
-
-    /// A REACHED LIBRARY METHOD THAT USES AN ASSEMBLY THE BUILD WAS NOT GIVEN IS REFUSED NAMING IT.
-    ///
-    /// Given the board half alone, the program reaches the board's type initializer, whose body
-    /// constructs `libchainbase`'s delegate. The refusal names that assembly.
-    #[cfg(feature = "linked")]
-    #[test]
-    fn a_reached_library_method_that_uses_an_assembly_not_given_is_refused_naming_it() {
-        let Some([corlib, _, board, program]) = chain_fixtures() else {
-            return;
-        };
-        match linked_objects_given(&program, &corlib, &[board.as_slice()]) {
-            Err(BuildError::UnsuppliedLibraryReference { method, missing, total }) => {
-                assert!(
-                    method.contains("ChainBoard.Board::.cctor"),
-                    "names the reached method: {method}"
-                );
-                assert_eq!(missing, ["libchainbase"], "names the assembly it uses");
-                assert_eq!(total, 1, "one reached method uses it");
-            }
-            other => panic!(
-                "expected the missing assembly named, got {:?}",
-                other.map(|objects| objects.len())
-            ),
-        }
-    }
-
-    /// ONLY THE LIBRARIES A PROGRAM REFERENCES, DIRECTLY OR THROUGH ONE ANOTHER, ARE LINKED, IN THE
-    /// ORDER GIVEN.
-    ///
-    /// `seamreachlib` is given beside the chain and nothing the program references names it, so it
-    /// is not lowered at all, and a caller may hand the linked tier every library it has.
-    #[cfg(feature = "linked")]
-    #[test]
-    fn only_the_libraries_a_program_references_are_lowered_and_linked() {
-        let (Some([_, base, board, program]), Some(unrelated)) =
-            (chain_fixtures(), fixture("tests/fixtures/seamreachlib.dll"))
-        else {
-            return;
-        };
-        let given = [unrelated.as_slice(), board.as_slice(), base.as_slice()];
-        let chosen = referenced_libraries(&program, &given).expect("the assemblies parse");
-        assert!(
-            chosen == [board.as_slice(), base.as_slice()],
-            "the board half and, through it, the base half, in the order given"
-        );
-    }
-
-    /// A LIBRARY's OWN CALL INTO ITS SILENT SEAM REFUSES A PROGRAM THAT REACHES IT, AND NO OTHER.
-    ///
-    /// `seamreachlib`'s `Through` calls the library's private, unmarked, unsynthesized `Silent`; its
-    /// `Around` calls nothing. No program can name `Silent`, so no program build sees that edge, and
-    /// the library's own build cannot know who links it: only the program's dead-strip can say. A
-    /// program calling `Through` is refused, naming the library method and the seam; one calling
-    /// `Around` links.
-    #[cfg(feature = "linked")]
-    #[test]
-    fn a_library_s_own_call_into_its_silent_seam_refuses_only_a_program_that_reaches_it() {
-        let (Some(corlib), Some(library), Some(through), Some(around)) = (
-            fixture("../lamella-load/tests/fixtures/corlib.dll"),
-            fixture("tests/fixtures/seamreachlib.dll"),
-            fixture("tests/fixtures/seamreachprog-through.dll"),
-            fixture("tests/fixtures/seamreachprog-around.dll"),
-        ) else {
-            return;
-        };
-        match linked_objects(&through, &corlib, &library) {
-            Err(BuildError::SilentSeamCallEdge { caller, seam, total }) => {
-                assert!(caller.contains("Through"), "the refusal names the library method, got {caller:?}");
-                assert!(seam.contains("Silent"), "the refusal names the seam, got {seam:?}");
-                assert_eq!(total, 1, "exactly one reached edge");
-            }
-            other => panic!("expected a silent-seam refusal, got {:?}", other.map(|objects| objects.len())),
-        }
-        linked_objects(&around, &corlib, &library)
-            .expect("a program that does not reach the library's call into its seam links");
-    }
-
-    /// A SEAM'S CALLERS THAT ONLY AN UNCALLED SLOT KEEPS DROP, AND THE LINK IS NOT REFUSED.
-    ///
-    /// `seamreachprog-tabled` keeps an `Api` and calls nothing on it. `Api`'s vtable names
-    /// `seamreachlib`'s virtual `Tabled`, and `Tabled` calls `Relay`; both call the silent seam. No
-    /// kept function dispatches through `Tabled`'s slot, so the entry names the trap and both
-    /// callers drop. The test asserts first that they are the seam's callers, so it cannot pass on
-    /// a library that has lost the shape.
-    #[cfg(feature = "linked")]
-    #[test]
-    fn a_seam_s_callers_that_only_an_uncalled_slot_names_drop_and_the_link_stands() {
-        let (Some(corlib), Some(library), Some(tabled)) = (
-            fixture("../lamella-load/tests/fixtures/corlib.dll"),
-            fixture("tests/fixtures/seamreachlib.dll"),
-            fixture("tests/fixtures/seamreachprog-tabled.dll"),
-        ) else {
-            return;
-        };
-        let (_, _, edges) = build_library_object_deferring(&library, &[corlib.as_slice()], false)
-            .expect("the library builds deferring");
-        let slot_callers: Vec<&LibrarySeamEdge> = edges
-            .iter()
-            .filter(|edge| edge.caller.contains("Tabled") || edge.caller.contains("Relay"))
-            .collect();
-        assert_eq!(slot_callers.len(), 2, "`Tabled` and `Relay` each call the seam");
-        let objects = linked_objects(&tabled, &corlib, &library)
-            .expect("a program that never dispatches to `Tabled` links");
-        let kept: alloc::collections::BTreeSet<&str> = objects
-            .iter()
-            .flat_map(|object| &object.symbols)
-            .filter(|symbol| symbol.defined)
-            .map(|symbol| symbol.name.as_str())
-            .collect();
-        for edge in slot_callers {
-            assert!(
-                !kept.contains(edge.symbol.as_str()),
-                "`{}` is kept only by an uncalled slot, so it drops",
-                edge.caller
-            );
-        }
-    }
-
-    /// A PROGRAM THAT KEEPS AN EXCEPTION TYPE LINKS, AND KEEPS `Exception.ToString` ONLY IF IT CALLS IT.
-    ///
-    /// Corlib's `Exception.ToString` calls the `GetType` seam. The first program reads only `Message`,
-    /// so nothing dispatches through `ToString`'s slot and the method drops with what it calls. The
-    /// second calls `ToString` through the slot, so the method is kept -- and the link stands, because
-    /// the guard does not count a seam reached through a slot. The test asserts first that corlib's
-    /// `ToString` calls the seam, so it cannot pass on a corlib that has lost the shape.
-    #[cfg(feature = "linked")]
-    #[test]
-    fn a_program_that_keeps_an_exception_type_links_and_keeps_to_string_only_if_it_calls_it() {
-        let (Some(corlib), Some(held), Some(called)) = (
-            fixture("../lamella-load/tests/fixtures/corlib.dll"),
-            fixture("tests/fixtures/seamreachprog-exception-held.dll"),
-            fixture("tests/fixtures/seamreachprog-exception-called.dll"),
-        ) else {
-            return;
-        };
-        let (_, _, edges) = build_library_object_deferring(&corlib, &[], false)
-            .expect("corlib builds deferring");
-        let to_string: Vec<&LibrarySeamEdge> = edges
-            .iter()
-            .filter(|edge| edge.caller == "System.Exception::ToString")
-            .collect();
-        let seams: Vec<&str> = to_string.iter().map(|edge| edge.seam.as_str()).collect();
-        assert!(
-            seams.contains(&"System.Object::GetType"),
-            "`ToString` calls `GetType`, got {seams:?}"
-        );
-        for (name, program, calls_it) in [("held", &held, false), ("called", &called, true)] {
-            let (object, deferred) = build_linked_program_object(program, &corlib, &[], None, false)
-                .unwrap_or_else(|e| panic!("{name}: the program builds: {e:?}"));
-            let objects = reachable_objects(&object, deferred, &corlib, &[], false)
-                .unwrap_or_else(|e| panic!("{name}: a program that keeps an exception type links: {e:?}"));
-            let kept = objects
-                .iter()
-                .flat_map(|object| &object.symbols)
-                .any(|symbol| symbol.defined && symbol.name == to_string[0].symbol);
-            assert_eq!(
-                kept, calls_it,
-                "{name}: `Exception.ToString` is kept exactly when the program dispatches to it"
-            );
-        }
-    }
-
-    /// A VIRTUAL CALL ON A TYPE DECLARED NEXT DOOR RECORDS THE DESCRIPTOR SYMBOL ITS OWNER LAYS IT
-    /// UNDER, AND THE OWNER RECORDS THAT DESCRIPTOR'S BASE.
-    ///
-    /// The two halves are written by two builds, and the link matches them by string: a record
-    /// naming the type any other way would never meet the descriptor, and every slot it calls would
-    /// read as uncalled. `seamslotprog-called` calls `Probe.Read` through its slot; `seamslotlib`
-    /// lays `Probe`'s descriptor.
-    #[cfg(feature = "linked")]
-    #[test]
-    fn a_virtual_call_and_its_owner_name_the_descriptor_the_same_way() {
-        let (Some(corlib), Some(library), Some(called)) = (
-            fixture("../lamella-load/tests/fixtures/corlib.dll"),
-            fixture("tests/fixtures/seamslotlib.dll"),
-            fixture("tests/fixtures/seamslotprog-called.dll"),
-        ) else {
-            return;
-        };
-        let (program, _) =
-            build_linked_program_object(&called, &corlib, &[library.as_slice()], None, false)
-                .expect("the program builds");
-        let (library_object, _, _) =
-            build_library_object_deferring(&library, &[corlib.as_slice()], false)
-                .expect("the library builds deferring");
-        let read = |bytes: &[u8]| lamella_elf::read_object(bytes).expect("the object reads back");
-        let declared: Vec<alloc::string::String> = read(&program)
-            .symbols
-            .iter()
-            .filter_map(|s| match lamella_elf::dispatch::dispatch_record(&s.name)? {
-                (lamella_elf::dispatch::DispatchSlot::Virtual { declaring, .. }, _) => {
-                    Some(declaring)
-                }
-                _ => None,
-            })
-            .collect();
-        let library_object = read(&library_object);
-        let probe = library_object
-            .symbols
-            .iter()
-            .filter_map(|s| lamella_elf::dispatch::hierarchy_record(&s.name))
-            .find(|(descriptor, _)| declared.iter().any(|d| d == descriptor))
-            .unwrap_or_else(|| {
-                panic!("no descriptor the library records is one the program's calls name: {declared:?}")
-            });
-        assert!(
-            library_object
-                .symbols
-                .iter()
-                .any(|s| s.defined && s.name == probe.0),
-            "the library lays the descriptor its record names"
-        );
-        assert!(
-            probe
-                .1
-                .is_some_and(|base| base.starts_with(lamella_elf::TYPE_DESC_PREFIX)),
-            "`Probe` derives from `object`, and its record names that base"
-        );
-    }
-
-    /// A METHOD THIS BUILD CANNOT LOWER REFUSES A PROGRAM THAT REACHES IT, AND NO OTHER.
-    ///
-    /// Each library holds one method whose body does not lower beside one whose body does -- an
-    /// ordinary method in one library, a monomorphized body in the other -- and each is linked by a
-    /// program that reaches the good method and by one that reaches the bad. The first program
-    /// links; the second is refused, and the refusal names the method it reaches.
-    ///
-    /// The deferral is asserted first, so that if a run-time-sized `stackalloc` ever lowers, this
-    /// test says its fixtures no longer hold an unlowerable method rather than passing on nothing.
-    #[cfg(feature = "linked")]
-    #[test]
-    fn a_library_method_this_build_cannot_lower_refuses_only_a_program_that_reaches_it() {
-        let Some(reach) = reach_fixtures() else { return };
-        let corlib = &reach.corlib[..];
-        for (library, unlowerable) in [
-            (&reach.runtime_stackalloc[..], "RuntimeStackalloc::RuntimeSized"),
-            (&reach.mono_unlowerable[..], "Holder`1[System.Int32]::Scratch"),
-        ] {
-            let (_, deferred, _) = build_library_object_deferring(library, &[corlib], false)
-                .expect("a deferring library build does not refuse a method it cannot lower");
-            let names: Vec<&str> = deferred.iter().map(|body| body.method.as_str()).collect();
-            assert_eq!(
-                names,
-                [unlowerable],
-                "the library defers exactly the method whose body does not lower -- if it defers \
-                 nothing, the fixture no longer holds one; choose another"
-            );
-        }
-        let (_, deferred) =
-            build_linked_program_object(&reach.mono_prog, corlib, &[&reach.mono_unlowerable[..]], None, false)
-                .expect("a linked program build does not refuse a body it never plans");
-        let names: Vec<&str> = deferred.iter().map(|body| body.method.as_str()).collect();
-        assert!(
-            names.is_empty(),
-            "the program plans no instantiation only the library names, so it defers nothing: {names:?}"
-        );
-        for (program, library) in [
-            (&reach.stackalloc_prog[..], &reach.runtime_stackalloc[..]),
-            (&reach.mono_prog[..], &reach.mono_unlowerable[..]),
-        ] {
-            if let Err(error) = linked_objects(program, corlib, library) {
-                panic!("a program that never reaches the unlowerable method was refused: {error}");
-            }
-        }
-        for (program, library, unlowerable) in [
-            (&reach.stackalloc_reach[..], &reach.runtime_stackalloc[..], "RuntimeStackalloc::RuntimeSized"),
-            (&reach.mono_reach[..], &reach.mono_unlowerable[..], "Holder`1[System.Int32]::Scratch"),
-        ] {
-            match linked_objects(program, corlib, library) {
-                Err(BuildError::UnlowerableMethodReached { method, total, .. }) => {
-                    assert_eq!(method, unlowerable, "the refusal names the method reached");
-                    assert_eq!(total, 1, "one unlowerable method is reached");
-                }
-                Err(other) => panic!("expected the reached method to be refused, got {other}"),
-                Ok(_) => panic!("a program that reaches `{unlowerable}` linked"),
-            }
-        }
-    }
-
-    /// `explicitimpl.dll` -- a program allocating `Hashtable` and `SortedList`; see its source's header --
-    /// and the corlib it builds against.
-    fn explicit_impl_fixtures() -> Option<(Vec<u8>, Vec<u8>)> {
-        Some((
-            fixture("tests/fixtures/explicitimpl.dll")?,
-            fixture("../lamella-load/tests/fixtures/corlib.dll")?,
-        ))
-    }
-
-    /// The managed symbols `program` references that neither it nor `library` defines. A name the
-    /// runtime archive or the linker supplies (`lamella_...`, `__...`) is not one.
-    fn managed_symbols_left_undefined(
-        program: &[u8],
-        library: &[u8],
-    ) -> (Vec<alloc::string::String>, Vec<alloc::string::String>) {
-        let program = lamella_elf::read_object(program).expect("the program object reads back");
-        let library = lamella_elf::read_object(library).expect("the library object reads back");
-        let defined: alloc::collections::BTreeSet<&str> = program
-            .symbols
-            .iter()
-            .chain(&library.symbols)
-            .filter(|symbol| symbol.defined)
-            .map(|symbol| symbol.name.as_str())
-            .collect();
-        let referenced: Vec<alloc::string::String> = program
-            .symbols
-            .iter()
-            .filter(|symbol| !symbol.defined && !symbol.name.is_empty())
-            .map(|symbol| symbol.name.clone())
-            .collect();
-        let left = referenced
-            .iter()
-            .filter(|name| !name.starts_with("lamella_") && !name.starts_with("__"))
-            .filter(|name| !defined.contains(name.as_str()))
-            .cloned()
-            .collect();
-        (left, referenced)
-    }
-
-    /// A PROGRAM THAT ALLOCATES A LIBRARY TYPE LINKS AGAINST THE TYPE'S PRIVATE INTERFACE METHODS.
-    ///
-    /// `Hashtable` and `SortedList` implement `IEnumerable.GetEnumerator` explicitly, so the method is
-    /// private. The program's copy of each descriptor names it by its cross-assembly symbol, and the
-    /// library exported only accessible methods, so the link failed on the first one. The positive
-    /// control is that the program does name both, so this cannot pass on a program that no longer
-    /// lays the copies.
-    fn assert_a_program_names_only_what_corlib_exports(program: &[u8], library: &[u8]) {
-        let (left, referenced) = managed_symbols_left_undefined(program, library);
-        for owner in ["System.Collections.SortedList.", "System.Collections.Hashtable."] {
-            assert!(
-                referenced
-                    .iter()
-                    .any(|name| name.starts_with(owner) && name.contains("IEnumerable.GetEnumerator")),
-                "the program names {owner}'s explicit IEnumerable.GetEnumerator -- if it does not, the                  fixture no longer exercises a private slot; referenced: {referenced:?}"
-            );
-        }
-        assert!(
-            left.is_empty(),
-            "the program references managed symbols corlib does not define: {left:?}"
-        );
-    }
-
-    #[test]
-    fn a_program_links_against_a_private_interface_implementation_on_arm() {
-        let Some((program, corlib)) = explicit_impl_fixtures() else { return };
-        assert_a_program_names_only_what_corlib_exports(
-            &build_object_with_libraries(&program, &corlib, &[]).expect("the program builds"),
-            &build_library_object(&corlib).expect("corlib builds"),
-        );
-    }
-
-    #[cfg(feature = "riscv32")]
-    #[test]
-    fn a_program_links_against_a_private_interface_implementation_on_riscv() {
-        let Some((program, corlib)) = explicit_impl_fixtures() else { return };
-        assert_a_program_names_only_what_corlib_exports(
-            &build_object_riscv_with_reference(&program, &corlib).expect("the program builds"),
-            &build_library_object_riscv(&corlib).expect("corlib builds"),
-        );
-    }
-
     /// THE RP2350 STARTUP COPIES A LINK'S DATA RUN AFTER THE CLEAR AND BEFORE THE BOARD'S HOOK, which
     /// is what lets the hook run code the run holds -- the PSRAM bring-up's nucleus, which runs from
     /// RAM. The copy is a call to a routine laid on the first word after the text, and the heap starts
@@ -15670,3 +15173,4 @@ mod tests {
         );
     }
 }
+

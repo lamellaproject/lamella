@@ -8,7 +8,7 @@
 pub mod pimoroni_pico_plus_2;
 #[cfg(any(feature = "board-pimoroni-pico-plus-2-w", not(target_os = "none")))]
 pub mod pimoroni_pico_plus_2_w;
-#[cfg(any(feature = "board-rpi-pico2", not(target_os = "none")))]
-pub mod rpi_pico2;
-#[cfg(any(feature = "board-rpi-pico2-w", not(target_os = "none")))]
-pub mod rpi_pico2_w;
+#[cfg(any(feature = "board-raspberrypi-pico-2", not(target_os = "none")))]
+pub mod raspberrypi_pico_2;
+#[cfg(any(feature = "board-raspberrypi-pico-2-w", not(target_os = "none")))]
+pub mod raspberrypi_pico_2_w;

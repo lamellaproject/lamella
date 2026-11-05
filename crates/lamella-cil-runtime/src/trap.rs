@@ -79,6 +79,8 @@ pub enum RefusedWith {
     InvalidCast,
     /// `System.MissingMethodException`.
     MissingMethod,
+    /// `System.MissingFieldException`.
+    MissingField,
 }
 
 /// A controlled execution failure.

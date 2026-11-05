@@ -106,6 +106,51 @@ pub fn ctrl_c_pressed() -> bool {
     PRESSED.load(Ordering::SeqCst)
 }
 
+/// A local run's interrupt watcher, ended and joined when the run returns normally.
+pub(crate) struct LocalRunWatch(Option<(std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>)>);
+
+impl Drop for LocalRunWatch {
+    fn drop(&mut self) {
+        if let Some((stop, watcher)) = self.0.take() {
+            let _ = stop.send(());
+            let _ = watcher.join();
+            stop_local_run_if_pressed();
+        }
+    }
+}
+
+/// Says `Stopped.` and ends a local run on Ctrl+C, including while its interpreter is busy.
+/// The signal handler only sets a flag; the watcher writes and exits from an ordinary thread.
+pub(crate) fn watch_local_run() -> LocalRunWatch {
+    use std::sync::mpsc::{RecvTimeoutError, channel};
+    let (stop, stopped) = channel();
+    let watcher = std::thread::Builder::new().name("lamella-interrupt".to_owned()).spawn(move || {
+        loop {
+            let finished = matches!(stopped.recv_timeout(std::time::Duration::from_millis(10)),
+                Ok(()) | Err(RecvTimeoutError::Disconnected));
+            stop_local_run_if_pressed();
+            if finished { return; }
+        }
+    });
+    let Ok(watcher) = watcher else {
+        return LocalRunWatch(None);
+    };
+    let watch = LocalRunWatch(Some((stop, watcher)));
+    if watch_for_ctrl_c() {
+        watch
+    } else {
+        drop(watch);
+        LocalRunWatch(None)
+    }
+}
+
+fn stop_local_run_if_pressed() {
+    if ctrl_c_pressed() {
+        crate::own_lines::say(&mut std::io::stderr(), "Stopped.");
+        end_as_interrupted();
+    }
+}
+
 /// Ends this process the way the operating system ends a program Ctrl+C stopped.
 fn end_as_interrupted() -> ! {
     flush_both();
@@ -226,5 +271,44 @@ mod tests {
     #[test]
     fn ctrl_c_is_not_pressed_until_it_is() {
         assert!(!ctrl_c_pressed());
+    }
+
+    #[test]
+    fn pending_ctrl_c_at_local_exit_is_not_discarded() {
+        const CHILD: &str = "LAMELLA_LOCAL_EXIT_TEST";
+        if std::env::var_os(CHILD).is_some() {
+            let (stop, stopped) = std::sync::mpsc::channel();
+            let watcher = std::thread::spawn(move || { stopped.recv().unwrap(); });
+            let watch = LocalRunWatch(Some((stop, watcher)));
+            PRESSED.store(true, Ordering::SeqCst);
+            println!("local-exit-boundary-marker");
+            drop(watch);
+            println!("local-exit-swallowed-marker");
+            return;
+        }
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "ending::tests::pending_ctrl_c_at_local_exit_is_not_discarded", "--nocapture"])
+            .env(CHILD, "1").stdout(std::process::Stdio::piped()).stderr(std::process::Stdio::piped())
+            .spawn().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while child.try_wait().unwrap().is_none() {
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("the local exit helper did not finish");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let output = child.wait_with_output().unwrap();
+        assert!(String::from_utf8_lossy(&output.stdout).contains("local-exit-boundary-marker"));
+        #[cfg(windows)]
+        assert_eq!(output.status.code(), Some(INTERRUPTED));
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            assert_eq!(output.status.signal(), Some(libc::SIGINT));
+        }
+        assert_eq!(output.stderr, b"Stopped.\n");
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("local-exit-swallowed-marker"));
     }
 }

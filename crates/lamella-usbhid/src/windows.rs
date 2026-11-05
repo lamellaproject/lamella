@@ -8,11 +8,15 @@ use std::ptr;
 use std::time::Duration;
 
 use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
-    DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO, SP_DEVICE_INTERFACE_DATA,
+    CM_Get_DevNode_PropertyW, CM_Get_Device_IDW, CM_Get_Device_Interface_PropertyW, CM_Get_Parent,
+    CM_LOCATE_DEVNODE_NORMAL, CM_Locate_DevNodeW, CR_NO_SUCH_DEVNODE, CR_NO_SUCH_VALUE, CR_SUCCESS,
+    DIGCF_DEVICEINTERFACE, DIGCF_PRESENT, HDEVINFO, MAX_DEVICE_ID_LEN, SP_DEVICE_INTERFACE_DATA,
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
     SetupDiGetDeviceInterfaceDetailW, SetupDiGetDeviceInterfacePropertyW,
 };
-use windows_sys::Win32::Devices::Properties::DEVPROPTYPE;
+use windows_sys::Win32::Devices::Properties::{
+    DEVPKEY_Device_BusReportedDeviceDesc, DEVPKEY_Device_InstanceId, DEVPROPTYPE,
+};
 use windows_sys::Win32::Devices::HumanInterfaceDevice::{
     HIDD_ATTRIBUTES, HIDP_CAPS, HIDP_STATUS_SUCCESS, HidD_FreePreparsedData, HidD_GetAttributes,
     HidD_GetHidGuid, HidD_GetPreparsedData, HidD_GetProductString, HidD_GetSerialNumberString,
@@ -244,17 +248,135 @@ fn path_string(path: &[u16]) -> String {
     String::from_utf16_lossy(&path[..end])
 }
 
+/// What the device tree says about the USB device above a HID interface, read with no handle.
+#[derive(Default)]
+struct UsbContext {
+    on_usb: Option<bool>,
+    interface_name: Option<String>,
+    device_name: Option<String>,
+}
+
+/// Which kind of USB node an instance id names.
+#[derive(Debug, PartialEq, Eq)]
+enum UsbNode {
+    /// A whole device of one interface.
+    Device,
+    /// One interface of a composite device, whose parent is the device.
+    Interface,
+}
+
+/// The USB node an instance id names, or `None` if it names something else.
+fn usb_node(instance_id: &str) -> Option<UsbNode> {
+    let id = instance_id.to_ascii_uppercase();
+    id.starts_with("USB\\").then(|| if id.contains("&MI_") { UsbNode::Interface } else { UsbNode::Device })
+}
+
+/// Reads a HID interface's USB context by walking up the device tree from it.
+///
+/// **THE WALK SAYS "NOT ON USB" ONLY FROM THE ROOT**: every other way it can stop has read nothing, and
+/// reports nothing. `HidD_GetProductString` gives one string for an interface, and which one depends on
+/// the device, so the strings are read here from the nodes that hold them. A device of one interface
+/// has no interface node, so Windows holds no name apart from the device's, and its interface reads as
+/// having none.
+unsafe fn usb_context(path: &[u16]) -> UsbContext {
+    const DEEPEST: usize = 32;
+    let Some(mut node) = interface_node(path) else {
+        return UsbContext::default();
+    };
+    for _ in 0..DEEPEST {
+        let mut parent = 0u32;
+        match CM_Get_Parent(&mut parent, node, 0) {
+            CR_SUCCESS => node = parent,
+            CR_NO_SUCH_DEVNODE => return UsbContext { on_usb: Some(false), ..UsbContext::default() },
+            _ => return UsbContext::default(),
+        }
+        let Some(id) = instance_id(node) else {
+            return UsbContext::default();
+        };
+        match usb_node(&id) {
+            None => {}
+            Some(UsbNode::Device) => {
+                return UsbContext {
+                    on_usb: Some(true),
+                    interface_name: Some(String::new()),
+                    device_name: bus_reported_name(node),
+                };
+            }
+            Some(UsbNode::Interface) => {
+                let mut device = 0u32;
+                let device_name = if CM_Get_Parent(&mut device, node, 0) == CR_SUCCESS {
+                    bus_reported_name(device)
+                } else {
+                    None
+                };
+                return UsbContext { on_usb: Some(true), interface_name: bus_reported_name(node), device_name };
+            }
+        }
+    }
+    UsbContext::default()
+}
+
+/// The device-tree node of a HID device-interface path (NUL-terminated).
+unsafe fn interface_node(path: &[u16]) -> Option<u32> {
+    let mut ty: DEVPROPTYPE = 0;
+    let mut id = [0u16; MAX_DEVICE_ID_LEN as usize + 1];
+    let mut len = mem::size_of_val(&id) as u32;
+    if CM_Get_Device_Interface_PropertyW(
+        path.as_ptr(),
+        &DEVPKEY_Device_InstanceId,
+        &mut ty,
+        id.as_mut_ptr().cast::<u8>(),
+        &mut len,
+        0,
+    ) != CR_SUCCESS
+    {
+        return None;
+    }
+    let mut node = 0u32;
+    (CM_Locate_DevNodeW(&mut node, id.as_ptr(), CM_LOCATE_DEVNODE_NORMAL) == CR_SUCCESS).then_some(node)
+}
+
+/// A device-tree node's instance id.
+unsafe fn instance_id(node: u32) -> Option<String> {
+    let mut id = [0u16; MAX_DEVICE_ID_LEN as usize + 1];
+    (CM_Get_Device_IDW(node, id.as_mut_ptr(), id.len() as u32, 0) == CR_SUCCESS).then(|| path_string(&id))
+}
+
+/// `DEVPKEY_Device_BusReportedDeviceDesc`: the string the USB bus reported for a node, cached at
+/// enumeration. Empty when the node has none, and `None` when the read failed.
+unsafe fn bus_reported_name(node: u32) -> Option<String> {
+    let mut ty: DEVPROPTYPE = 0;
+    let mut name = [0u16; 128];
+    let mut len = mem::size_of_val(&name) as u32;
+    match CM_Get_DevNode_PropertyW(
+        node,
+        &DEVPKEY_Device_BusReportedDeviceDesc,
+        &mut ty,
+        name.as_mut_ptr().cast::<u8>(),
+        &mut len,
+        0,
+    ) {
+        CR_SUCCESS => Some(path_string(&name)),
+        CR_NO_SUCH_VALUE => Some(String::new()),
+        _ => None,
+    }
+}
+
 pub fn enumerate() -> Result<Vec<DeviceInfo>> {
     let mut out = Vec::new();
     unsafe {
         for_each_hid(|page, _| page.is_none_or(|page| page >= 0xFF00), |path, handle| {
             if let Some(attrs) = attributes(handle) {
                 let caps = hid_caps(handle);
+                let usb = usb_context(path);
                 out.push(DeviceInfo {
                     vendor_id: attrs.VendorID,
                     product_id: attrs.ProductID,
                     serial_number: hid_string(handle, true),
                     product: hid_string(handle, false),
+                    interface_name: usb.interface_name,
+                    device_name: usb.device_name,
+                    on_usb: usb.on_usb,
                     id: path_string(path),
                     usage_page: caps.as_ref().map(|c| c.usage_page),
                     usage: caps.as_ref().map(|c| c.usage),
@@ -319,7 +441,7 @@ impl Device {
             ptr::null_mut(),
         );
         if handle == INVALID_HANDLE_VALUE {
-            return Err(Error::Os("CreateFile (read/write) failed".into()));
+            return Err(Error::Os(format!("CreateFile (read/write) failed: {}", std::io::Error::last_os_error())));
         }
         let event = CreateEventW(ptr::null(), 1, 0, ptr::null());
         if event.is_null() {
@@ -358,10 +480,10 @@ impl Device {
                 if err != ERROR_IO_PENDING {
                     return Err(Error::Os(format!("WriteFile failed (error {err})")));
                 }
-                if WaitForSingleObject(self.event, 1000) != WAIT_OBJECT_0
-                    || GetOverlappedResult(self.handle, &ov, &mut written, 1) == 0
-                {
+                if WaitForSingleObject(self.event, 1000) != WAIT_OBJECT_0 {
                     CancelIo(self.handle);
+                }
+                if GetOverlappedResult(self.handle, &ov, &mut written, 1) == 0 {
                     return Err(Error::Os("WriteFile did not complete".into()));
                 }
             }
@@ -396,11 +518,15 @@ impl Device {
                     }
                     WAIT_TIMEOUT => {
                         CancelIo(self.handle);
-                        return Err(Error::Timeout);
+                        if GetOverlappedResult(self.handle, &ov, &mut read, 1) == 0 {
+                            return Err(Error::Timeout);
+                        }
                     }
                     _ => {
+                        let failure = std::io::Error::last_os_error();
                         CancelIo(self.handle);
-                        return Err(Error::Os("WaitForSingleObject failed".into()));
+                        let _ = GetOverlappedResult(self.handle, &ov, &mut read, 1);
+                        return Err(Error::Os(format!("WaitForSingleObject failed: {failure}")));
                     }
                 }
             }
@@ -408,6 +534,25 @@ impl Device {
             let n = data_len.min(buf.len());
             buf[..n].copy_from_slice(&report[1..1 + n]);
             Ok(n)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// **NO TRANSFER IS LEFT IN THE KERNEL'S HANDS WHEN ITS BUFFER IS FREED:** each `CancelIo` is followed by the
+    /// wait for what it cancelled. No test can hold a pending transfer without a device, so this reads the source.
+    #[test]
+    fn a_cancelled_transfer_is_waited_for() {
+        let source = include_str!("windows.rs");
+        let device = &source[source.find("impl Device {").unwrap()..source.find("#[cfg(test)]").unwrap()];
+        let cancels: Vec<usize> = device.match_indices("CancelIo(self.handle);").map(|(at, _)| at).collect();
+        assert_eq!(cancels.len(), 3, "the write's, the timed-out read's and the failed wait's");
+        for at in cancels {
+            let after = &device[at..device.len().min(at + 400)];
+            let wait = after.find("GetOverlappedResult(self.handle, &ov, &mut").unwrap_or_else(|| panic!("no wait after: {after}"));
+            assert!(!after[..wait].contains("return "), "it returned first: {after}");
+            assert!(after[wait..].lines().next().unwrap().contains(", 1)"), "it did not wait: {after}");
         }
     }
 }

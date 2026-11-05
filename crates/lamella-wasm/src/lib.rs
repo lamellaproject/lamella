@@ -197,67 +197,12 @@ pub(crate) fn push_json_string(json: &mut String, text: &str) {
 mod tests {
     use super::*;
 
-    fn fixture(name: &str) -> Option<Vec<u8>> {
-        let path = format!(
-            "{}/../lamella-load/tests/fixtures/{name}",
-            env!("CARGO_MANIFEST_DIR")
-        );
-        std::fs::read(path).ok()
-    }
-
-    #[test]
-    fn runs_hello_world() {
-        let Some(bytes) = fixture("hello.dll") else {
-            eprintln!("hello.dll absent; skipping");
-            return;
-        };
-        let result = run_bytes(&bytes);
-        assert_eq!(result.stdout, "Hello, World!\n");
-        assert_eq!(result.exit_code, 0);
-        assert!(result.diagnostics.is_empty());
-    }
-
-    #[test]
-    fn the_console_tap_streams_the_same_text_the_buffer_ends_up_with() {
-        let Some(bytes) = fixture("hello.dll") else {
-            eprintln!("hello.dll absent; skipping");
-            return;
-        };
-        let _ = console::take_streamed();
-        let result = run_bytes(&bytes);
-        let chunks = console::take_streamed();
-
-        assert_eq!(chunks.concat(), result.stdout);
-        assert!(!chunks.is_empty(), "the tap fired at least once");
-    }
-
-    #[test]
-    fn arithmetic_returns_its_exit_code() {
-        let Some(bytes) = fixture("arith.dll") else {
-            eprintln!("arith.dll absent; skipping");
-            return;
-        };
-        assert_eq!(run_bytes(&bytes).exit_code, 5);
-    }
-
     #[test]
     fn malformed_bytes_become_a_diagnostic_not_a_panic() {
         let result = run_bytes(b"this is not a managed assembly");
         assert_eq!(result.exit_code, -1);
         assert_eq!(result.diagnostics.len(), 1);
         assert_eq!(result.diagnostics[0].severity, "error");
-    }
-
-    #[test]
-    fn hello_world_serializes_to_json() {
-        let Some(bytes) = fixture("hello.dll") else {
-            eprintln!("hello.dll absent; skipping");
-            return;
-        };
-        let json = to_json(&run_bytes(&bytes));
-        assert!(json.contains(r#""stdout":"Hello, World!\n""#));
-        assert!(json.contains(r#""exitCode":0"#));
-        assert!(json.contains(r#""diagnostics":[]"#));
     }
 
     #[test]
@@ -269,72 +214,5 @@ mod tests {
         };
         assert!(to_json(&result).contains(r#""stdout":"a\"b\\c\n""#));
     }
-
-    /// A program that casts an `int[]` to two interfaces: `IComparable`, which `System.Array` does
-    /// not implement, so .NET throws InvalidCastException, and `IEnumerable`, which it does. It
-    /// prints which way the first cast went, and returns 0 or the number of the first check that
-    /// failed.
-    pub(crate) const CASTS_AN_ARRAY: &str = "\
-using System;
-using System.Collections;
-
-class Program
-{
-    static int Main()
-    {
-        object ints = new int[3];
-        try
-        {
-            object comparable = (IComparable)ints;
-            Console.WriteLine(\"no throw\");
-            return 1;
-        }
-        catch (InvalidCastException)
-        {
-            Console.WriteLine(\"InvalidCastException\");
-        }
-        if (ints is IComparable) return 2;
-        if (!(ints is IEnumerable)) return 3;
-        return 0;
-    }
 }
-";
 
-    /// `source` compiled against the committed corlib, as its image and PDB, for a run that then
-    /// loads it with no corlib. `None` where the corlib fixture is absent.
-    pub(crate) fn compiled_against_the_corlib(source: &str) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
-        let corlib = fixture("corlib.dll")?;
-        let references = [lamella_metadata::Assembly::read(&corlib).expect("the corlib parses")];
-        let compilation =
-            lamella_assemble::compile_source(source, "app.cs", "app.dll", "app", &references, true);
-        assert!(
-            compilation.diagnostics.is_empty(),
-            "{:?}",
-            compilation.diagnostics
-        );
-        Some((
-            compilation.image.expect("an assembly image"),
-            compilation.pdb,
-        ))
-    }
-
-    /// **WITH NO CORLIB, AN ARRAY CASTS AS .NET's DOES.** `lamella_run` runs a program the host
-    /// passed no corlib for, and an array's cast to an interface `System.Array` does not implement
-    /// was let through: `(IComparable)new int[3]` succeeded where .NET throws.
-    #[test]
-    fn a_program_run_with_no_corlib_casts_an_array_as_dotnet_does() {
-        let Some((image, _)) = compiled_against_the_corlib(CASTS_AN_ARRAY) else {
-            eprintln!("corlib.dll absent; skipping");
-            return;
-        };
-        let result = run_bytes(&image);
-        let said: Vec<&str> = result
-            .diagnostics
-            .iter()
-            .map(|diagnostic| diagnostic.message.as_str())
-            .collect();
-        assert_eq!(result.stdout, "InvalidCastException\n", "{said:?}");
-        assert_eq!(result.exit_code, 0, "the first check that failed");
-        assert!(said.is_empty(), "{said:?}");
-    }
-}

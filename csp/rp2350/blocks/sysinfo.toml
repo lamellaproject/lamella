@@ -1,0 +1,15 @@
+# BLOCK layout: the RP2350's system information registers, of which the GPIO driver reads which package
+# the chip is in: the QFN-60 (RP2350A) bonds GPIO0 to GPIO29 and the QFN-80 (RP2350B) GPIO0 to GPIO47.
+# Offsets are instance-base-relative (the `sysinfo` instance row at 0x40000000).
+
+[table]
+kind = "block"
+family = "rp2350"
+block = "sysinfo"
+sources = ["RP2350 datasheet ch 12.15.1 (SYSINFO), Table 1308"]
+
+[registers.PACKAGE_SEL]
+offset = 0x4
+width = 32
+fields = { QFN60 = [0, 1] }
+notes = "Bit 0: 0 on the QFN-80, 1 on the QFN-60 (Table 1308). Read-only, in no reset domain, so it reads the same at any time."

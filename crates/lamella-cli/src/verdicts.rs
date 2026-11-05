@@ -453,7 +453,7 @@ mod tests {
             .filter(|id| crate::project::BoardCheck::for_board("build", id).is_ok())
             .collect();
         assert_eq!(named, taken, "the file names the boards the board check takes, in the catalog's order");
-        assert!(named.contains(&"rpi-pico2") && named.contains(&"bbc-micro-bit-v2"), "{named:?}");
+        assert!(named.contains(&"raspberrypi-pico-2") && named.contains(&"bbc-micro-bit-v2"), "{named:?}");
         let mut unique = named.clone();
         unique.sort_unstable();
         unique.dedup();
@@ -472,8 +472,8 @@ mod tests {
             text.lines().map(str::trim).find(|line| line.starts_with(&start)).unwrap_or_default().to_owned()
         };
         assert_eq!(
-            line_of("rpi-pico2"),
-            "<LamellaBoard Include=\"rpi-pico2\" Name=\"Raspberry Pi Pico 2\" NativeImage=\"true\" ProbeFamilies=\"cmsis-dap\" />"
+            line_of("raspberrypi-pico-2"),
+            "<LamellaBoard Include=\"raspberrypi-pico-2\" Name=\"Raspberry Pi Pico 2\" NativeImage=\"true\" ProbeFamilies=\"cmsis-dap\" />"
         );
         assert_eq!(
             line_of("st-stm32f769i-disco"),
@@ -570,17 +570,17 @@ mod tests {
     /// with a selection the file does not state rather than with a board that drifts.
     #[test]
     fn the_rendering_leads_with_the_id_the_user_selected() {
-        let (board, part) = catalog::resolve("rpi-pico").expect("the pico board and its part");
+        let (board, part) = catalog::resolve("raspberrypi-pico").expect("the pico board and its part");
         let verdict = fit(&board, &part, 100_000);
-        let text = render("rpi-pico", &verdict);
-        assert!(text.starts_with("board rpi-pico"), "got {text:?}");
+        let text = render("raspberrypi-pico", &verdict);
+        assert!(text.starts_with("board raspberrypi-pico"), "got {text:?}");
         assert!(!text.contains("board id"), "the two ids agree, so only one is printed: {text:?}");
         assert!(text.contains("FITS"));
         assert!(text.contains("does NOT answer"), "the limits are printed, not logged");
 
         let other = render("a-name-the-file-does-not-state", &verdict);
         assert!(other.starts_with("board a-name-the-file-does-not-state"), "got {other:?}");
-        assert!(other.contains("\"rpi-pico\""), "and discloses the file's own id: {other:?}");
+        assert!(other.contains("\"raspberrypi-pico\""), "and discloses the file's own id: {other:?}");
     }
 
     /// An image over the budget is a failure exit; one whose budget is unknown is not.
@@ -590,7 +590,7 @@ mod tests {
     fn a_negative_size_is_refused_rather_than_fitted() {
         for size in ["-5", "-9223372036854775808"] {
             let args: Vec<String> =
-                ["--board", "rpi-pico", "--image-bytes", size].iter().map(|word| (*word).to_owned()).collect();
+                ["--board", "raspberrypi-pico", "--image-bytes", size].iter().map(|word| (*word).to_owned()).collect();
             assert_eq!(
                 format!("{:?}", fit_command(&args)),
                 format!("{:?}", ExitCode::FAILURE),
@@ -601,7 +601,7 @@ mod tests {
 
     #[test]
     fn only_exceeding_the_budget_is_a_failure_exit() {
-        let (board, part) = catalog::resolve("rpi-pico").expect("the pico board and its part");
+        let (board, part) = catalog::resolve("raspberrypi-pico").expect("the pico board and its part");
         let fits = fit(&board, &part, 1_000);
         let exceeds = fit(&board, &part, 1_000_000_000);
         assert!(matches!(exceeds.flash_fit, Fit::Exceeds { .. }), "got {:?}", exceeds.flash_fit);

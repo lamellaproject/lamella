@@ -105,7 +105,7 @@ impl From<ProbeError> for FlashError {
 impl core::fmt::Display for FlashError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            FlashError::Probe(error) => write!(f, "{error:?}"),
+            FlashError::Probe(error) => write!(f, "{error}"),
             FlashError::WrongPart { expected, found } => write!(
                 f,
                 "this board answered {found:#010x} and the image is for {:#010x} ({}). \

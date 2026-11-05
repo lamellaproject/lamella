@@ -74,12 +74,6 @@ pub fn default_resident_corlib(feature_variable: &str, tier: RuntimeTier) {
 mod tests {
     use super::*;
 
-    fn holds(haystack: &[u8], needle: &[u8]) -> bool {
-        haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
-    }
-
     #[test]
     fn a_full_runtime_takes_the_committed_corlib_first_then_the_built_one_then_nothing() {
         let manifest_dir = Path::new("crates/lamella-serve-example");
@@ -105,32 +99,6 @@ mod tests {
             assert!(
                 !candidates(RuntimeTier::Full).contains(kernel),
                 "{kernel} serves both tiers"
-            );
-        }
-    }
-
-    /// What this tree's defaults embed, read from the files: the full tier's carries `Span<T>`, which
-    /// the I2C and SPI facades of `System.Device.Gpio` take, and the kernel tier's does not. A tree
-    /// without a candidate file has nothing to check here and passes.
-    #[test]
-    fn the_defaults_in_this_tree_carry_the_surface_of_their_tier() {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        if let Some(full) = default_corlib(manifest_dir, RuntimeTier::Full, |path| path.exists()) {
-            let bytes = std::fs::read(&full).expect("the full default reads");
-            assert!(
-                holds(&bytes, b"Span`1"),
-                "{} has no Span<T>",
-                full.display()
-            );
-        }
-        if let Some(kernel) =
-            default_corlib(manifest_dir, RuntimeTier::Kernel, |path| path.exists())
-        {
-            let bytes = std::fs::read(&kernel).expect("the kernel default reads");
-            assert!(
-                !holds(&bytes, b"Span`1"),
-                "{} carries Span<T>",
-                kernel.display()
             );
         }
     }

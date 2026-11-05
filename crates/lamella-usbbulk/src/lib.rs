@@ -9,6 +9,9 @@
 
 use std::time::Duration;
 
+#[cfg(any(target_os = "linux", test))]
+mod open_error;
+
 /// An error enumerating, opening, or exchanging data with a USB device.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -17,7 +20,7 @@ pub enum Error {
     NotFound,
     /// The operating system's USB layer failed; carries a description.
     Os(String),
-    /// A read returned no packet, or a control transfer did not complete, within its timeout.
+    /// A transfer, a read, a write or a control transfer, did not complete within its timeout.
     Timeout,
     /// This operating system's backend is not implemented yet.
     Unsupported,
@@ -115,8 +118,25 @@ pub(crate) fn select_by_whole_serial<T>(
     candidates.into_iter().find(|c| serial_is(wanted, serial_of(c))).ok_or(Error::NotFound)
 }
 
+/// Moves into `buf` as much of `left` as fits, in order, and returns how much.
+pub(crate) fn take_left(left: &mut Vec<u8>, buf: &mut [u8]) -> usize {
+    let count = left.len().min(buf.len());
+    buf[..count].copy_from_slice(&left[..count]);
+    left.drain(..count);
+    count
+}
+
+/// What a finished read delivered, handed to the read collecting it: into `buf`, and what `buf` has no
+/// room for into `left`, for the next read. Returns how much went into `buf`.
+pub(crate) fn hand_over(delivered: &[u8], buf: &mut [u8], left: &mut Vec<u8>) -> usize {
+    let count = delivered.len().min(buf.len());
+    buf[..count].copy_from_slice(&delivered[..count]);
+    left.extend_from_slice(&delivered[count..]);
+    count
+}
+
 /// A bulk USB device discovered by [`enumerate`].
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct DeviceInfo {
     /// USB vendor id.
     pub vendor_id: u16,
@@ -136,9 +156,253 @@ pub struct DeviceInfo {
     ///
     /// Every backend reads it from the OS's own device tree, so it costs no handle: the interface
     /// node's bus-reported name on Windows, `kUSBString` on macOS, `.../interface` in sysfs on
-    /// Linux. `None` means the OS did not publish one, which is not the same as "not a probe" --
-    /// see `lamella-probe`, where that distinction is made.
+    /// Linux.
+    ///
+    /// **Two ways of having no name, and they are different answers.** An empty string means the OS
+    /// said the interface has no name: its `iInterface` is zero, or on Windows its node holds no such
+    /// string. `None` means the OS did not say, because a read was refused or the device tree does not
+    /// carry it. On Windows a device of one interface has no interface node, so that interface's name
+    /// is `None` there, and [`product`](Self::product) is where such a device names itself.
+    ///
+    /// With several vendor-class interfaces this is one name for all of them, as
+    /// [`vendor_interfaces`](Self::vendor_interfaces) has each.
     pub interface_name: Option<String>,
+    /// What the OS's device tree says of each of the device's vendor-class interfaces, in no particular
+    /// order. [`enumerate`] fills it, and [`enumerate_interface`], which lists what a driver registered,
+    /// leaves it empty.
+    pub vendor_interfaces: Vec<VendorInterface>,
+    /// Whether the device has more than one interface, which is what the CMSIS-DAP specification's
+    /// "USB composite device" comes to. `None` where the OS did not say, and from
+    /// [`enumerate_interface`].
+    pub composite: Option<bool>,
+    /// Whether the device is known to have no product string, its `iProduct` being zero. With
+    /// [`product`](Self::product) `None` and this `false`, the OS did not say.
+    pub product_is_absent: bool,
+    /// From [`enumerate`], the id Windows made from the device's place on the bus, where the device reports
+    /// no serial. It tells two such devices apart for as long as they stay in their ports, and it is not a
+    /// serial: no interface of a composite device opens by it, and no other backend or transport reports the
+    /// same text. [`enumerate_interface`] leaves it empty and lists such an interface under its own path's
+    /// id, which an open of that interface matches.
+    pub port_id: Option<String>,
+}
+
+/// What an OS's device tree says of one vendor-class interface, with nothing opened.
+///
+/// Each field is what the OS can say without a handle, and `None` is what it cannot. Which of them an
+/// OS fills differs, so a reader takes `None` as no answer and never as a no.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VendorInterface {
+    /// `bInterfaceSubClass` and `bInterfaceProtocol`.
+    pub subclass_protocol: Option<(u8, u8)>,
+    /// The interface's own name (`iInterface`): empty when it is known to have none, and `None` when
+    /// the OS did not say.
+    pub name: Option<String>,
+    /// Whether the interface has a bulk IN and a bulk OUT endpoint. `None` on Windows, which publishes
+    /// no endpoint without an open.
+    pub bulk_pair: Option<bool>,
+    /// Whether WinUSB registered this interface under the interface class the CMSIS-DAP specification
+    /// gives a v2 probe. `None` off Windows, which has no such registry.
+    pub spec_guid: Option<bool>,
+}
+
+/// Whether `subclass` and `protocol` are the ones the CMSIS-DAP specification requires of a v2 probe's
+/// vendor-class interface (zero and zero).
+pub(crate) fn is_spec_shape(subclass: u8, protocol: u8) -> bool {
+    (subclass, protocol) == (0, 0)
+}
+
+/// What the OS's device tree says of one interface's name, from the string it published and the
+/// `iInterface` index it published: the string; an empty string when the index is zero, which is an
+/// interface with no name; and `None` for an interface whose index promises a string the OS did not
+/// publish, or whose index it did not publish either.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+pub(crate) fn named_or_unnamed(published: Option<String>, string_index: Option<u16>) -> Option<String> {
+    match (published, string_index) {
+        (Some(name), _) => Some(name),
+        (None, Some(0)) => Some(String::new()),
+        (None, _) => None,
+    }
+}
+
+/// The bulk pair to drive an interface through, as `(in, out)` endpoint addresses, zero for a direction
+/// it has none in, from its bulk endpoints in descriptor order.
+///
+/// **THE SPECIFICATION GIVES A v2 PROBE'S ENDPOINTS IN ORDER:** Bulk Out, Bulk In, then an optional Bulk
+/// In for SWO, so an interface of that shape takes the first of each direction, and an SWO endpoint with
+/// the lower address is not mistaken for the replies. Any other interface takes the lowest address in
+/// each direction, by the usual convention that the command pair comes first: an ST-Link's command reply
+/// `0x81` beside its trace `0x82`, a WCH-Link's command pair `0x01`/`0x81` beside its data pair.
+pub(crate) fn bulk_pair(endpoints_in_descriptor_order: &[u8], spec_shape: bool) -> (u8, u8) {
+    let of_direction = |input: bool| {
+        let mut matching = endpoints_in_descriptor_order.iter().copied().filter(|address| (address & 0x80 != 0) == input);
+        if spec_shape { matching.next() } else { matching.min() }.unwrap_or(0)
+    };
+    (of_direction(true), of_direction(false))
+}
+
+/// Which of a device's vendor-class interfaces to try first: the lower sorts earlier.
+///
+/// The interface that can be driven comes before one that cannot, then one naming itself CMSIS-DAP, then
+/// one of the shape the specification requires. A caller breaks a tie by the lowest interface number, so
+/// that the order the OS lists the interfaces in decides nothing.
+pub(crate) fn open_rank(has_pair: Option<bool>, name: Option<&str>, spec_shape: bool) -> (bool, bool, bool) {
+    (has_pair == Some(false), !name.is_some_and(is_named_cmsis_dap), !spec_shape)
+}
+
+/// What trying to open one interface came to.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) enum Attempt<T> {
+    Opened(T),
+    /// The OS would not give it up, and said this.
+    Refused(String),
+    /// Not one to use, which says nothing about the device's others: another serial, or no bulk pair.
+    Passed,
+}
+
+/// The first of `interfaces` that opens, best first, each given with the device it belongs to: the open
+/// when one does, `None` when none would be used, and what the OS said when one refused and none opened.
+///
+/// **A REFUSED INTERFACE ENDS ITS OWN DEVICE AND NO OTHER.** Another program holding the best interface of a
+/// device does not make the one beside it what was asked for, whatever that one calls itself: a caller
+/// would write its protocol into it, and the reason it could not have the one it wanted would be lost.
+/// Another device is another matter, and it may be the one that was named. Linux gets the same answer by
+/// choosing one interface for each device before it opens anything.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) fn first_that_opens<D: PartialEq, I, T>(
+    interfaces: impl IntoIterator<Item = (D, I)>,
+    mut attempt: impl FnMut(I) -> Attempt<T>,
+) -> std::result::Result<Option<T>, String> {
+    let mut refused: Vec<D> = Vec::new();
+    let mut why = None;
+    for (device, interface) in interfaces {
+        if refused.contains(&device) {
+            continue;
+        }
+        match attempt(interface) {
+            Attempt::Opened(opened) => return Ok(Some(opened)),
+            Attempt::Refused(reason) => {
+                refused.push(device);
+                why = Some(reason);
+            }
+            Attempt::Passed => {}
+        }
+    }
+    why.map_or(Ok(None), Err)
+}
+
+/// One interface of a configuration, as its descriptors state it.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DescribedInterface {
+    pub(crate) number: u8,
+    pub(crate) alternate: u8,
+    pub(crate) class: u8,
+    pub(crate) subclass: u8,
+    pub(crate) protocol: u8,
+    pub(crate) string_index: u8,
+    /// Its bulk endpoints' addresses, in descriptor order.
+    pub(crate) bulk_endpoints: Vec<u8>,
+}
+
+/// Every interface of the configuration whose `bConfigurationValue` is `configuration` (the first one
+/// `raw` holds, when `None`), each alternate setting its own entry, among a device's raw descriptors:
+/// perhaps a device descriptor, then each configuration and what follows it (USB 2.0, Tables 9-10, 9-12
+/// and 9-13).
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+pub(crate) fn described_interfaces(raw: &[u8], configuration: Option<u8>) -> Vec<DescribedInterface> {
+    const CONFIGURATION: u8 = 2;
+    const INTERFACE: u8 = 4;
+    const ENDPOINT: u8 = 5;
+    const BULK: u8 = 2;
+    let mut out: Vec<DescribedInterface> = Vec::new();
+    let mut wanted = configuration;
+    let mut inside = false;
+    for descriptor in descriptors(raw) {
+        match *descriptor {
+            [_, CONFIGURATION, _, _, _, value, ..] => inside = *wanted.get_or_insert(value) == value,
+            [_, INTERFACE, number, alternate, _, class, subclass, protocol, string_index, ..] if inside => {
+                out.push(DescribedInterface {
+                    number,
+                    alternate,
+                    class,
+                    subclass,
+                    protocol,
+                    string_index,
+                    bulk_endpoints: Vec::new(),
+                });
+            }
+            [_, ENDPOINT, address, attributes, ..] if inside && attributes & 0x03 == BULK => {
+                if let Some(interface) = out.last_mut() {
+                    interface.bulk_endpoints.push(address);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether `endpoints` hold a bulk endpoint in each direction.
+#[cfg_attr(target_os = "windows", allow(dead_code))]
+pub(crate) fn has_bulk_pair(endpoints: &[u8]) -> bool {
+    endpoints.iter().any(|address| address & 0x80 != 0) && endpoints.iter().any(|address| address & 0x80 == 0)
+}
+
+/// A configuration's vendor-class interfaces at their first alternate settings, read from its descriptors
+/// alone, and whether it has more than one interface of any class. An interface's name is not in the
+/// descriptors, only its string index: zero is an interface with no name, and any other number is a
+/// string this walk has not read.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+pub(crate) fn vendor_interfaces_of_configuration(set: &[u8]) -> (Vec<VendorInterface>, bool) {
+    let all = described_interfaces(set, None);
+    let vendor = all
+        .iter()
+        .filter(|interface| interface.class == 0xFF && interface.alternate == 0)
+        .map(|interface| VendorInterface {
+            subclass_protocol: Some((interface.subclass, interface.protocol)),
+            name: named_or_unnamed(None, Some(u16::from(interface.string_index))),
+            bulk_pair: Some(has_bulk_pair(&interface.bulk_endpoints)),
+            spec_guid: None,
+        })
+        .collect();
+    (vendor, all.iter().any(|interface| interface.number != all[0].number))
+}
+
+/// [`DeviceInfo::interface_name`] for a device, from what the OS's device tree says of the name of
+/// each of its vendor-class interfaces, as [`named_or_unnamed`] gives it: a name holding `CMSIS-DAP`;
+/// otherwise `None` if any of them could not be read; otherwise the lowest of their names; otherwise an
+/// empty string, when every one of them is known to have none.
+///
+/// **THE ORDER THE OS LISTS THE INTERFACES IN DECIDES NOTHING.** A device with another vendor-class
+/// interface beside a CMSIS-DAP one is a probe, whether the other has a name or not, and an interface
+/// that could not be read may be the CMSIS-DAP one.
+pub(crate) fn vendor_interfaces_name(readings: impl IntoIterator<Item = Option<String>>) -> Option<String> {
+    let mut unread = false;
+    let mut lowest: Option<String> = None;
+    let mut unnamed = false;
+    for reading in readings {
+        match reading {
+            Some(name) if is_named_cmsis_dap(&name) => {
+                return Some(name);
+            }
+            Some(name) if !name.is_empty() => {
+                lowest = Some(lowest.map_or_else(|| name.clone(), |held| held.min(name.clone())));
+            }
+            Some(_) => unnamed = true,
+            None => unread = true,
+        }
+    }
+    if unread {
+        return None;
+    }
+    lowest.or_else(|| unnamed.then(String::new))
+}
+
+/// Whether an interface's name holds the token CMSIS-DAP requires, spelled as some platforms sanitize
+/// it. `lamella-probe`, which decides what is a probe, tests a name the same way.
+pub(crate) fn is_named_cmsis_dap(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.contains("CMSIS-DAP") || upper.contains("CMSIS_DAP")
 }
 
 /// Lists every connected device exposing a vendor-specific class-0xFF interface -- a CMSIS-DAP v2 probe OR
@@ -263,18 +527,33 @@ impl Device {
         self.0.describe_interface()
     }
 
-    /// Sends one bulk OUT packet (raw -- no report id or padding) on the primary (lowest-address) OUT
-    /// endpoint.
+    /// Sends one bulk OUT packet (raw -- no report id or padding) on the primary OUT endpoint.
     pub fn write_packet(&mut self, data: &[u8]) -> Result<()> {
         self.0.write_packet(data)
     }
 
     /// Reads one bulk IN packet into `buf` from the primary IN endpoint, returning its length.
     ///
-    /// **A timeout arrives as [`Error::Timeout`] on Windows only.** Linux and macOS report every
-    /// failed bulk transfer, a timeout included, as [`Error::Os`].
+    /// **A device with nothing to send in `timeout` is [`Error::Timeout`], on every platform,** and
+    /// the device is still there. Any other failure, one that has gone away among them, is
+    /// [`Error::Os`].
     pub fn read_packet(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
         self.0.read_packet(buf, timeout)
+    }
+
+    /// [`read_packet`](Self::read_packet) for a caller that polls a device which may send at any
+    /// moment, and so expects most reads to time out.
+    ///
+    /// **THE TRANSFER STAYS OUTSTANDING ACROSS A TIMEOUT, AND THE NEXT POLL COLLECTS IT, ON EVERY OS.** A
+    /// read that is given a time limit is cancelled at it, and what a cancelled transfer held is lost on
+    /// macOS and Linux and unspecified on Windows, so bytes arriving just as a poll times out would be
+    /// acknowledged to the device and thrown away, without a sign. Here nothing is cancelled until the
+    /// device is closed. A timeout says only that nothing finished in `timeout`.
+    ///
+    /// It is not how every read goes because a reply to a request is not polled for: its timeout is a
+    /// failure, and a transfer left behind it would take the next reply.
+    pub fn poll_packet(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        self.0.poll_packet(buf, timeout)
     }
 
     /// Sends one bulk OUT packet on a specific endpoint address. A single-pair probe uses only its
@@ -429,7 +708,8 @@ pub struct InterfaceInfo {
 }
 
 /// Lists every attached device that has an interface of `class`, with that interface's number and
-/// name -- the first such interface, where a device has several. Listing opens nothing.
+/// name -- one such interface, where a device has several, and the same one each time. Listing opens
+/// nothing.
 pub fn enumerate_class(class: InterfaceClass) -> Result<Vec<InterfaceInfo>> {
     imp::enumerate_class(class)
 }
@@ -537,6 +817,8 @@ impl ControlInterface {
     }
 }
 
+#[cfg(any(target_os = "macos", test))]
+mod iokit_status;
 #[cfg(target_os = "macos")]
 #[path = "macos.rs"]
 mod imp;
@@ -552,9 +834,62 @@ compile_error!("lamella-usbbulk supports macOS, Linux, and Windows");
 #[cfg(test)]
 mod tests {
     use super::{
-        Error, Result, candidate_satisfies, select_by_whole_serial, select_requested, serial_is,
-        serial_matches,
+        Attempt, Error, Result, candidate_satisfies, first_that_opens, select_by_whole_serial, select_requested,
+        serial_is, serial_matches,
     };
+
+    /// The walk over two devices' interfaces, each `(device, interface, what trying it comes to)`: what it
+    /// returned, and which interfaces it tried.
+    fn walked(interfaces: &[(u32, &'static str, Option<&'static str>)]) -> (std::result::Result<Option<&'static str>, String>, Vec<&'static str>) {
+        let mut tried = Vec::new();
+        let outcome = first_that_opens(interfaces.iter().map(|&(device, name, refusal)| (device, (name, refusal))), |(name, refusal)| {
+            tried.push(name);
+            match refusal {
+                Some("passed") => Attempt::Passed,
+                Some(why) => Attempt::Refused(why.to_owned()),
+                None => Attempt::Opened(name),
+            }
+        });
+        (outcome, tried)
+    }
+
+    /// **A REFUSED INTERFACE ENDS ITS OWN DEVICE, WHATEVER RANKS THE ONE BESIDE IT.** Two interfaces of one
+    /// rank are the ST-LINK/V3's Debug and Bridge, and a lower one is a composite's "Bridge" beside its
+    /// "CMSIS-DAP v2". The caller is told what the OS said, and writes nothing into the sibling.
+    #[test]
+    fn a_refused_interface_ends_its_device() {
+        let (outcome, tried) = walked(&[(1, "Debug", Some("held")), (1, "Bridge", None)]);
+        assert_eq!(outcome, Err("held".to_owned()));
+        assert_eq!(tried, ["Debug"], "the sibling is not tried");
+    }
+
+    /// **AND NO OTHER.** A held board is no reason to refuse the one that was named, whatever it ranks, and a
+    /// second held board stops its own sibling as the first did.
+    #[test]
+    fn a_refused_interface_ends_no_other_device() {
+        let (outcome, tried) = walked(&[(1, "A's DAP", Some("held")), (2, "B's nameless", None)]);
+        assert_eq!(outcome, Ok(Some("B's nameless")));
+        assert_eq!(tried, ["A's DAP", "B's nameless"]);
+
+        let (outcome, tried) = walked(&[
+            (1, "A's DAP", Some("A held")),
+            (2, "B's DAP", Some("B held")),
+            (1, "A's Bridge", None),
+            (2, "B's Bridge", None),
+        ]);
+        assert_eq!(outcome, Err("B held".to_owned()));
+        assert_eq!(tried, ["A's DAP", "B's DAP"]);
+    }
+
+    /// An interface that was merely passed over, for a serial or for having no bulk pair, says nothing about
+    /// the next, and with nothing opened and nothing refused the device is not there.
+    #[test]
+    fn a_passed_interface_ends_nothing() {
+        let (outcome, tried) = walked(&[(1, "no pair", Some("passed")), (1, "DAP", None)]);
+        assert_eq!(outcome, Ok(Some("DAP")));
+        assert_eq!(tried, ["no pair", "DAP"]);
+        assert_eq!(walked(&[(1, "another serial", Some("passed"))]).0, Ok(None));
+    }
 
 
     /// Candidates are (serial, tag); the tag stands for whatever the platform hands back.
@@ -767,5 +1102,176 @@ mod control_tests {
         let functional_with_class_bytes = [0x09, 0x21, 0x00, 0x00, 0x00, 0xFE, 0x01, 0x02, 0x00];
         let dfu_mode = InterfaceClass { class: 0xFE, subclass: 0x01, protocol: 0x02 };
         assert_eq!(interface_of_class(&functional_with_class_bytes, dfu_mode), None);
+    }
+
+    /// An index of zero says the interface has no name; a non-zero index with no string, or no index
+    /// at all, says nothing.
+    #[test]
+    fn an_interface_with_string_index_zero_has_no_name_and_anything_unpublished_is_unknown() {
+        let named = super::named_or_unnamed(Some("CMSIS-DAP v2 Interface".to_owned()), Some(5));
+        assert_eq!(named.as_deref(), Some("CMSIS-DAP v2 Interface"));
+        assert_eq!(super::named_or_unnamed(None, Some(0)).as_deref(), Some(""));
+        assert_eq!(super::named_or_unnamed(None, Some(5)), None);
+        assert_eq!(super::named_or_unnamed(None, None), None);
+    }
+
+    /// **THE ORDER THE OS LISTS THE INTERFACES IN DECIDES NOTHING**, and "no name" is only as settled
+    /// as the least settled interface: a device is known to have no name only when all of its
+    /// vendor-class interfaces are known to have none.
+    #[test]
+    fn a_device_has_no_name_only_when_every_vendor_interface_is_known_to_have_none() {
+        let name = || Some("CMSIS-DAP v2 Interface".to_owned());
+        let none = || Some(String::new());
+        let unread = || None;
+        let of = |readings: Vec<Option<String>>| super::vendor_interfaces_name(readings);
+        assert_eq!(of(vec![none(), name()]), name());
+        assert_eq!(of(vec![name(), none()]), name());
+        assert_eq!(of(vec![unread(), name()]), name());
+        let other = || Some("Acme Trace".to_owned());
+        assert_eq!(of(vec![other(), name()]), name(), "two names, and the one naming a probe is the answer");
+        assert_eq!(of(vec![name(), other()]), name());
+        let lower = || Some("Acme Bridge".to_owned());
+        assert_eq!(of(vec![other(), lower()]), lower(), "and with none naming one, the order still decides nothing");
+        assert_eq!(of(vec![lower(), other()]), lower());
+        assert_eq!(of(vec![other(), none()]), other());
+        assert_eq!(of(vec![other(), unread()]), unread(), "the unread one may be the probe");
+        assert_eq!(of(vec![unread(), other()]), unread());
+        assert_eq!(of(vec![none()]), none());
+        assert_eq!(of(vec![none(), none()]), none());
+        assert_eq!(of(vec![none(), unread()]), unread());
+        assert_eq!(of(vec![unread(), none()]), unread());
+        assert_eq!(of(vec![]), unread());
+    }
+
+    /// **A v2 PROBE'S ENDPOINTS ARE IN THE ORDER THE SPECIFICATION GIVES THEM,** so the first of each
+    /// direction is the pair, whatever the addresses, and an SWO endpoint with the lower address is not
+    /// taken for the replies. Any other interface keeps the lowest address in each direction.
+    #[test]
+    fn the_spec_shape_takes_the_first_of_each_direction_and_any_other_the_lowest_address() {
+        let swo_below_the_replies = [0x02, 0x83, 0x81];
+        assert_eq!(super::bulk_pair(&swo_below_the_replies, true), (0x83, 0x02), "commands, then replies, then SWO");
+        assert_eq!(super::bulk_pair(&swo_below_the_replies, false), (0x81, 0x02), "the lowest address");
+        let st_link = [0x01, 0x81, 0x82];
+        assert_eq!(super::bulk_pair(&st_link, false), (0x81, 0x01), "the command reply, not the trace");
+        let wch_link = [0x82, 0x02, 0x81, 0x01];
+        assert_eq!(super::bulk_pair(&wch_link, false), (0x81, 0x01), "the command pair, not the data pair");
+        assert_eq!(super::bulk_pair(&[0x81], true), (0x81, 0), "no OUT endpoint");
+        assert_eq!(super::bulk_pair(&[], false), (0, 0));
+        assert!(super::has_bulk_pair(&st_link));
+        assert!(!super::has_bulk_pair(&[0x81, 0x82]));
+        assert!(!super::has_bulk_pair(&[]));
+    }
+
+    /// The interface to open is the one that can be driven and names itself; a name alone does not
+    /// outrank a pair, since a name is all a control-only WebUSB interface has.
+    #[test]
+    fn an_interface_that_can_be_driven_and_names_itself_is_tried_first() {
+        let rank = super::open_rank;
+        let token = Some("CMSIS-DAP v2 Interface");
+        let bridge = Some("Bridge");
+        assert!(rank(Some(true), token, true) < rank(Some(true), bridge, true));
+        assert!(rank(Some(true), token, true) < rank(Some(true), token, false));
+        assert!(rank(Some(true), token, false) < rank(Some(true), bridge, true), "a name outranks the shape");
+        assert!(rank(Some(true), bridge, true) < rank(Some(true), bridge, false));
+        assert!(rank(Some(true), bridge, false) < rank(Some(false), token, true), "a pair outranks a name");
+        assert!(rank(None, token, true) < rank(Some(false), token, true), "a pair not known is not a pair known absent");
+        assert!(rank(None, token, true) < rank(None, None, true));
+        assert_eq!(rank(None, token, true), rank(Some(true), token, true), "not known costs nothing against known");
+    }
+
+    /// Each interface with its own bulk endpoints in descriptor order, whatever sits between, from the
+    /// configuration asked for.
+    #[test]
+    fn a_configurations_interfaces_are_read_with_their_bulk_endpoints_in_order() {
+        let mut raw = vec![18, 1];
+        raw.resize(18, 0);
+        raw.extend_from_slice(&[9, 2, 0, 0, 2, 1, 0, 0x80, 50]);
+        raw.extend_from_slice(&[9, 4, 0, 0, 3, 0xFF, 0, 0, 7]);
+        raw.extend_from_slice(&[7, 5, 0x02, 2, 64, 0, 0]);
+        raw.extend_from_slice(&[4, 0x21, 0, 0]);
+        raw.extend_from_slice(&[7, 5, 0x83, 2, 64, 0, 0]);
+        raw.extend_from_slice(&[7, 5, 0x81, 2, 64, 0, 0]);
+        raw.extend_from_slice(&[9, 4, 1, 0, 1, 0xFF, 0x10, 0xFF, 0]);
+        raw.extend_from_slice(&[7, 5, 0x84, 3, 8, 0, 1]);
+        raw.extend_from_slice(&[9, 2, 0, 0, 1, 2, 0, 0x80, 50]);
+        raw.extend_from_slice(&[9, 4, 0, 0, 2, 0xFF, 0x03, 0, 9]);
+        raw.extend_from_slice(&[7, 5, 0x01, 2, 64, 0, 0]);
+        raw.extend_from_slice(&[7, 5, 0x81, 2, 64, 0, 0]);
+
+        let first = super::described_interfaces(&raw, Some(1));
+        assert_eq!(first.len(), 2);
+        assert_eq!((first[0].number, first[0].class, first[0].subclass, first[0].protocol), (0, 0xFF, 0, 0));
+        assert_eq!(first[0].string_index, 7);
+        assert_eq!(first[0].bulk_endpoints, [0x02, 0x83, 0x81]);
+        assert_eq!((first[1].number, first[1].subclass, first[1].protocol), (1, 0x10, 0xFF));
+        assert_eq!(first[1].string_index, 0);
+        assert!(first[1].bulk_endpoints.is_empty(), "an interrupt endpoint is not a bulk one");
+
+        let second = super::described_interfaces(&raw, Some(2));
+        assert_eq!(second.len(), 1);
+        assert_eq!((second[0].subclass, second[0].string_index), (0x03, 9));
+        assert_eq!(second[0].bulk_endpoints, [0x01, 0x81]);
+
+        assert!(super::described_interfaces(&raw, Some(3)).is_empty());
+        assert_eq!(super::described_interfaces(&raw, None), first, "none named takes the first");
+        assert_eq!(super::described_interfaces(&raw[18..], None), first, "with no device descriptor before it");
+    }
+
+    /// **A DEVICE THE OS NEVER CONFIGURED STILL SAYS WHAT IT IS, IN ITS DESCRIPTORS:** a string index of
+    /// zero is an interface with no name, which is a settled answer, and one that is not zero is a
+    /// string nothing has read yet.
+    #[test]
+    fn a_configurations_descriptors_say_what_they_can_of_its_vendor_interfaces() {
+        let mut set = vec![9, 2, 0, 0, 3, 1, 0, 0x80, 50];
+        set.extend_from_slice(&[9, 4, 0, 0, 2, 0xFF, 0, 0, 0]);
+        set.extend_from_slice(&[7, 5, 0x01, 2, 64, 0, 0]);
+        set.extend_from_slice(&[7, 5, 0x81, 2, 64, 0, 0]);
+        set.extend_from_slice(&[9, 4, 1, 0, 1, 0xFF, 0x10, 0xFF, 6]);
+        set.extend_from_slice(&[7, 5, 0x82, 2, 64, 0, 0]);
+        set.extend_from_slice(&[9, 4, 2, 0, 0, 0x02, 0x02, 0x01, 7]);
+        set.extend_from_slice(&[9, 4, 0, 1, 0, 0xFF, 0x42, 0x01, 8]);
+        let (vendor, composite) = super::vendor_interfaces_of_configuration(&set);
+        assert!(composite);
+        assert_eq!(vendor.len(), 2);
+        assert_eq!(vendor[0].subclass_protocol, Some((0, 0)));
+        assert_eq!(vendor[0].name.as_deref(), Some(""), "a string index of zero");
+        assert_eq!(vendor[0].bulk_pair, Some(true));
+        assert_eq!(vendor[1].subclass_protocol, Some((0x10, 0xFF)));
+        assert_eq!(vendor[1].name, None, "a string nothing has read");
+        assert_eq!(vendor[1].bulk_pair, Some(false));
+
+        let mut one = vec![9, 2, 0, 0, 1, 1, 0, 0x80, 50];
+        one.extend_from_slice(&[9, 4, 0, 0, 0, 0xFF, 0, 0, 0]);
+        one.extend_from_slice(&[9, 4, 0, 1, 0, 0xFF, 0, 0, 0]);
+        let (vendor, composite) = super::vendor_interfaces_of_configuration(&one);
+        assert!(!composite, "two settings of one interface");
+        assert_eq!(vendor.len(), 1);
+        assert_eq!(super::vendor_interfaces_of_configuration(&[]), (Vec::new(), false));
+    }
+
+    /// An interface's string index is its own configuration's and alternate setting's, through a device
+    /// descriptor and whatever sits between.
+    #[test]
+    fn an_interfaces_string_index_is_read_from_its_own_configuration_and_setting() {
+        let mut raw = vec![18, 1];
+        raw.resize(18, 0);
+        raw.extend_from_slice(&[9, 2, 0, 0, 1, 1, 0, 0x80, 50]);
+        raw.extend_from_slice(&[9, 4, 0, 0, 2, 0xFF, 0, 0, 7]);
+        raw.extend_from_slice(&[7, 5, 0x81, 2, 64, 0, 0]);
+        raw.extend_from_slice(&[9, 4, 0, 1, 2, 0xFF, 0, 0, 8]);
+        raw.extend_from_slice(&[9, 2, 0, 0, 1, 2, 0, 0x80, 50]);
+        raw.extend_from_slice(&[9, 4, 0, 0, 2, 0xFF, 0, 0, 9]);
+
+        let index = |configuration, number, alternate| {
+            super::described_interfaces(&raw, Some(configuration))
+                .into_iter()
+                .find(|interface| (interface.number, interface.alternate) == (number, alternate))
+                .map(|interface| interface.string_index)
+        };
+        assert_eq!(index(1, 0, 0), Some(7));
+        assert_eq!(index(1, 0, 1), Some(8));
+        assert_eq!(index(2, 0, 0), Some(9));
+        assert_eq!(index(1, 1, 0), None);
+        assert_eq!(index(3, 0, 0), None);
     }
 }

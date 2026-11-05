@@ -37,9 +37,12 @@
 kind = "board"
 board = "pimoroni-pico-lipo-2"
 vendor = "pimoroni"
+maker = "Pimoroni"
+product = "Pico LiPo 2"
 family = "rp2350"
 part = "rp2350b"
 product_model = 64          # lamella_wire::product_model::PICO_LIPO_2
+pin_labels = "chip"         # the board prints the chip's own pin names: GP0, GP1, ...
 sources = [
     "Pimoroni Pico LiPo 2 schematic (Pimoroni_Pico_LiPo_2_Schematic.pdf, PIM775, 4 sheets): sheet 1 is the RP2350B, its nets and the SP/CE connector, sheet 2 the USB-C socket, the user LED, the VBUS sense divider, the debug and Qw/ST connectors, the PSRAM, the crystal, the flash and the combined boot/user switch, sheet 3 the 40-pin header, sheet 4 the battery sense divider, the charger and the power switch.",
     "Pimoroni Pico LiPo 2 pinout diagram (ppico_lipo_2_pinout_diagram.pdf): 51x21x10mm, RP2350B with 16MB Flash, 8MB PSRAM, USB-C, LiPo Charging & Protection, Power, Charging & User LEDs, On-Off & User/Boot Buttons, Qw/ST, SP/CE & Debug Connectors, 40 pins, USB Input: 3V-5.5V.",
@@ -228,6 +231,7 @@ name = "psram-cs"
 kind = "gpio-out"
 pin = "GP47"
 active = "low"
+reserved = true
 source = "Schematic sheet 1: the net PSRAM_CS lands on GPIO47/ADC7 (pin 58); sheet 2 carries it to the chip select of an 8MB APS6404L-3SQR-ZR, holds it at 3V3 through R12 (100k), and notes that PSRAM_CS can be GP0, GP8, GP19 or GP47, of which this board fits GP47. The level is the chip's own: the APMemory APS6404L-3SQR datasheet (APM_PSRAM_E3_QSPI v2.7), section 6, Table 2 'Signals Table', gives CE# as an input, 'Chip select, active low. When CE#=1, chip is in standby state'."
 
 [[devices]]

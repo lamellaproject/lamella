@@ -3838,6 +3838,14 @@ pub const ARRAY_DESC_WORDS: usize = 6;
 /// where every backend lays the itable it lays for a class. See [`ARRAY_DESC_WORDS`].
 pub const ARRAY_ITABLE_OFFSET: u32 = ARRAY_DESC_WORDS as u32 * 4;
 
+/// The byte offset of an ARRAY descriptor's `element_cast_class` word, the sixth of its header.
+///
+/// For a value element it is ECMA-335 III.4.3's array-element class, a signature byte. For an element
+/// that is an interface it is one of that interface's method tags, which is how a store into the
+/// array finds out what to ask the value's itable. The two cannot be confused, since every tag has
+/// its top bit set. Anything else is [`ARRAY_CAST_CLASS_NONE`].
+pub const ARRAY_CAST_CLASS_OFFSET: u32 = 20;
+
 /// The mask selecting [`ARRAY_DESC_MARK`] out of word 0; the remainder is the rank.
 pub const ARRAY_DESC_MARK_MASK: u32 = 0xFF00_0000;
 
@@ -3909,7 +3917,7 @@ fn sig_element_kind(element: &SigType) -> u32 {
         return primitive_element_kind(namespace, name).unwrap_or(ELEMENT_KIND_REFERENCE);
     }
     match element {
-        SigType::Class(_) => ELEMENT_KIND_REFERENCE,
+        SigType::Class(_) | SigType::Object => ELEMENT_KIND_REFERENCE,
         SigType::ValueType(_) => ELEMENT_KIND_OPAQUE,
         other => type_spec_element_kind(Some(other)),
     }
@@ -4569,19 +4577,21 @@ impl<'a> MetadataResolver<'a> {
         }
         match &closed {
             SigType::Class(token) => {
-                let element = TypeHandle(
-                    match self.argument_assembly {
-                        Some(_) => in_argument_world(*token),
-                        None => *token,
-                    }
-                    .0,
-                );
+                let element = self.argument_element_handle(match self.argument_assembly {
+                    Some(_) => in_argument_world(*token),
+                    None => *token,
+                });
                 Some(ArrayElement {
                     handle: argument_world_array_handle(element),
                     element: Some(element),
                     element_size: 4,
                     element_kind: ELEMENT_KIND_REFERENCE,
-                    element_cast_class: ARRAY_CAST_CLASS_NONE,
+                    element_cast_class: interface_tag_of_token(
+                        self.argument_world(),
+                        self.argument_world_references(),
+                        argument_world_token(*token).unwrap_or(*token),
+                    )
+                    .unwrap_or(ARRAY_CAST_CLASS_NONE),
                 })
             }
             SigType::ValueType(token) => {
@@ -4595,7 +4605,7 @@ impl<'a> MetadataResolver<'a> {
                 if !layout.reference_offsets.is_empty() {
                     return None;
                 }
-                let element = TypeHandle(marked_handle_token(*token, self.argument_assembly).0);
+                let element = self.argument_element_handle(*token);
                 Some(ArrayElement {
                     handle: argument_world_array_handle(element),
                     element: Some(element),
@@ -4620,6 +4630,118 @@ impl<'a> MetadataResolver<'a> {
             }
             _ => None,
         }
+    }
+
+    /// The element handle `new T[n]` names at a type argument written as `token`: the assembly that owns
+    /// the type, as [`Self::array_element`] answers for a plain `new Exception[n]`, so both make the one
+    /// array type. An argument is read where it was written, which in a body lowered out of another
+    /// assembly is not the assembly being read, and there the handle stays marked for
+    /// `build::rebase_identities`. An unmarked token in such a body is the owner's own row, which that
+    /// pass respells.
+    ///
+    /// Left unqualified, a class or struct the caller reaches by `TypeRef` names a descriptor of its own,
+    /// on no value's chain and with no size: `List<Exception>` refuses an `Exception`, and `GetValue` on
+    /// `new T[1]` at `T = TimeSpan` cannot box.
+    fn argument_element_handle(&self, token: Token) -> TypeHandle {
+        let rebased = self.argument_assembly.is_some();
+        let written = argument_world_token(token);
+        if rebased && written.is_none() {
+            return TypeHandle(token.0);
+        }
+        let owned = qualified_handle_across(
+            self.argument_world(),
+            written.unwrap_or(token),
+            self.argument_world_references(),
+        );
+        if rebased {
+            TypeHandle(in_argument_world(Token(owned.0)).0)
+        } else {
+            owned
+        }
+    }
+
+    /// The element a rectangular array's signature spells, as every question about the array asks it:
+    /// closed over the arguments in force, so `new T[2, 3]` at `T = long` strides by eight, and an enum
+    /// as its underlying integer, which is what it is in the array's memory.
+    fn rectangular_element(&self, element: &SigType) -> SigType {
+        let closed = self.apply_instantiation(element).unwrap_or_else(|| element.clone());
+        if let SigType::ValueType(token) = closed {
+            if let Some((_, underlying)) = enum_underlying_sig(self.assembly, token, self.references()) {
+                return underlying;
+            }
+        }
+        closed
+    }
+
+    /// The stride and the signedness of a [`Self::rectangular_element`]. A struct's stride is the size
+    /// of the slot it is read into, so the two cannot disagree.
+    fn rectangular_element_size(&self, element: &SigType) -> (u32, bool) {
+        match self.slot_type(element) {
+            Some(MirType::ValueType { size, .. }) => (size, false),
+            _ => array_element_size(element),
+        }
+    }
+
+    /// What a rectangular array's descriptor records about a [`Self::rectangular_element`], as
+    /// `(element_desc@16, cast_class@20)`: a reference element's identity and any interface tag, for a
+    /// cast to walk or ask; a struct's identity, for a collector to stride and trace by; a primitive's
+    /// cast class, its kind saying the rest.
+    fn rectangular_element_identity(&self, element: &SigType) -> (Option<TypeHandle>, u32) {
+        if let Some((namespace, name)) = row_free_element_name(element) {
+            if let Some(class) = array_element_cast_class_by_name(namespace, name) {
+                return (None, u32::from(class));
+            }
+            let handle = self
+                .assembly
+                .find_type(namespace, name)
+                .map(|type_def| TypeHandle(type_def.token().0))
+                .or_else(|| {
+                    self.find_reference_type(namespace, name)
+                        .map(|(ordinal, _, type_def)| reference_handle(ordinal, type_def.token().0))
+                });
+            return (handle, ARRAY_CAST_CLASS_NONE);
+        }
+        match element {
+            SigType::Class(token) => (
+                Some(self.argument_element_handle(match self.argument_assembly {
+                    Some(_) => in_argument_world(*token),
+                    None => *token,
+                })),
+                interface_tag_of_token(
+                    self.argument_world(),
+                    self.argument_world_references(),
+                    argument_world_token(*token).unwrap_or(*token),
+                )
+                .unwrap_or(ARRAY_CAST_CLASS_NONE),
+            ),
+            SigType::ValueType(token) => {
+                (Some(self.argument_element_handle(*token)), ARRAY_CAST_CLASS_NONE)
+            }
+            SigType::GenericInst { definition, .. } if matches!(definition.as_ref(), SigType::Class(_)) => (
+                crate::generics::spell_sig(self.assembly, element)
+                    .map(|spelling| crate::generics::instantiation_handle(&spelling)),
+                ARRAY_CAST_CLASS_NONE,
+            ),
+            _ => (None, ARRAY_CAST_CLASS_NONE),
+        }
+    }
+
+    /// The identity of the rectangular array the `TypeSpec` `parent` spells. Its own row, unless the
+    /// spec spells a type parameter: `T[,]` is a different array at each argument, each with its own
+    /// element words, so a closed one is named by its spelling, as an instantiation is. A body read
+    /// against another assembly keeps the row, which `build::rebase_identities` refuses.
+    fn rectangular_array_handle(&self, parent: Token) -> Option<TypeHandle> {
+        if self.closed_operand_sig(parent).is_none() || self.argument_assembly.is_some() {
+            return Some(TypeHandle(parent.0));
+        }
+        let spelling = crate::generics::spell_sig_across_with_methods(
+            self.assembly,
+            self.argument_world(),
+            &self.assembly.type_spec_signature(parent)?,
+            &self.type_arguments,
+            &self.method_arguments,
+        )?;
+        Some(crate::generics::instantiation_handle(&spelling))
     }
 
     /// A `TypeSpec` parent resolved to the generic definition it instantiates and the arguments to
@@ -5069,6 +5191,56 @@ pub fn interface_method_tag(
     Some(interface_method_hash(assembly, interface, method, params)? | 0x8000_0000)
 }
 
+/// The one tag that answers for `interface` as a whole: every type implementing it carries an entry
+/// for each of its methods, so any one of them will do. `spelled` is the interface's name as a tag
+/// folds it. `None` for an interface with no method to ask about, a marker for one.
+///
+/// A generic method does not qualify. Its entries are keyed per instantiation
+/// ([`instantiated_interface_method_tag`]), so a tag for the open declaration is in no type's itable,
+/// and asking for it answers no for every implementer.
+fn interface_type_tag(
+    interface_assembly: &Assembly<'_>,
+    spelled: &TypeName,
+    interface: TypeDef<'_>,
+) -> Option<u32> {
+    interface.methods().find_map(|method| {
+        let signature = method.signature()?;
+        if signature.generic_param_count != 0 {
+            return None;
+        }
+        interface_method_tag(
+            interface_assembly,
+            spelled,
+            method.name()?,
+            &signature.parameters,
+        )
+    })
+}
+
+/// [`interface_type_tag`] for the type `token` names in `world`, whose reference list is `references`:
+/// its method tag if it is an interface that has one, else `None`.
+fn interface_tag_of_token<'a>(
+    world: &'a Assembly<'a>,
+    references: &[&'a Assembly<'a>],
+    token: Token,
+) -> Option<u32> {
+    let name = world.type_token_name(token)?;
+    let (interface_assembly, interface) = match token.table() {
+        table::TYPE_DEF => (world, world.type_def(token.row())?),
+        table::TYPE_REF => {
+            let (namespace, full_name) = world.type_token_full_name(token)?;
+            let (ordinal, type_def) =
+                Assembly::find_in_references_identified(references, &namespace, &full_name)?;
+            (references[ordinal], type_def)
+        }
+        _ => return None,
+    };
+    if !interface.is_interface() {
+        return None;
+    }
+    interface_type_tag(interface_assembly, &name, interface)
+}
+
 /// A GENERIC interface method's tag at ONE instantiation of its own type parameters --
 /// `ITag.Tag<int>` as distinct from `ITag.Tag<string>`.
 ///
@@ -5148,7 +5320,7 @@ fn interface_method_hash(
 /// GENERIC element types only -- the payload that byte cannot carry.
 ///
 /// **EVERY NON-GENERIC PARAMETER FOLDS EXACTLY ONE BYTE, WHICH IS WHAT MAKES THIS ADDITIVE.** No
-/// tag that exists today moves; [`tests::the_interface_tag_spelling_is_pinned_to_literal_values`]
+/// tag that exists today moves; [`fixture_tests::the_interface_tag_spelling_is_pinned_to_literal_values`]
 /// is the guard, and it pins six literals that must not change.
 ///
 /// **Why the generic cases need more than a byte.** `element::GENERICINST` is one value, so folding
@@ -5401,20 +5573,22 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return None;
         };
-        let SigType::SzArray(element) = self.assembly.type_spec_signature(*token)? else {
-            return None;
+        let (element, rank) = match self.assembly.type_spec_signature(*token)? {
+            SigType::SzArray(element) => (element, 1),
+            SigType::Array { element, rank } if rank >= 2 => (element, rank),
+            _ => return None,
         };
         let element = self.apply_instantiation(&element).unwrap_or(*element);
         if matches!(element, SigType::Object) {
             return Some(ArrayCastTest {
-                rank: 1,
+                rank,
                 element: ArrayElementTest::Reference,
             });
         }
         if let Some((namespace, name)) = primitive_sig_name(&element) {
             if let Some(class) = array_element_cast_class_by_name(namespace, name) {
                 return Some(ArrayCastTest {
-                    rank: 1,
+                    rank,
                     element: ArrayElementTest::Class(u32::from(class)),
                 });
             }
@@ -5427,7 +5601,7 @@ impl CallResolver for MetadataResolver<'_> {
                         .map(|(ordinal, _, t)| reference_handle(ordinal, t.token().0))
                 })?;
             return Some(ArrayCastTest {
-                rank: 1,
+                rank,
                 element: ArrayElementTest::Chain(token),
             });
         }
@@ -5438,22 +5612,27 @@ impl CallResolver for MetadataResolver<'_> {
         if let Some(class) = array_element_cast_class(self.assembly, element_token, self.references())
         {
             return Some(ArrayCastTest {
-                rank: 1,
+                rank,
                 element: ArrayElementTest::Class(u32::from(class)),
             });
         }
         if matches!(element, SigType::ValueType(_)) {
-            return None;
+            return self
+                .cast_target_chain(&Operand::Token(element_token))
+                .map(|target| ArrayCastTest {
+                    rank,
+                    element: ArrayElementTest::Struct(target),
+                });
         }
         let element_operand = Operand::Token(element_token);
         if let Some(tag) = self.cast_interface_tag(&element_operand) {
             return Some(ArrayCastTest {
-                rank: 1,
+                rank,
                 element: ArrayElementTest::Interface(tag),
             });
         }
         self.cast_target_chain(&element_operand).map(|target| ArrayCastTest {
-            rank: 1,
+            rank,
             element: ArrayElementTest::Chain(target),
         })
     }
@@ -5778,7 +5957,9 @@ impl CallResolver for MetadataResolver<'_> {
             element_size,
             element_kind,
             element_cast_class: array_element_cast_class(self.assembly, *token, self.references())
-                .map_or(ARRAY_CAST_CLASS_NONE, u32::from),
+                .map(u32::from)
+                .or_else(|| interface_tag_of_token(self.assembly, &self.references, *token))
+                .unwrap_or(ARRAY_CAST_CLASS_NONE),
         })
     }
 
@@ -5797,13 +5978,19 @@ impl CallResolver for MetadataResolver<'_> {
         if rank != 2 {
             return None;
         }
-        let (element_size, signed) = array_element_size(&element);
+        let element = self.rectangular_element(&element);
+        let (element_size, signed) = self.rectangular_element_size(&element);
         match member.name()? {
-            ".ctor" => Some(Array2DOp::New {
-                handle: TypeHandle(parent.0),
-                element_size,
-                element_kind: sig_element_kind(&element),
-            }),
+            ".ctor" => {
+                let (identity, element_cast_class) = self.rectangular_element_identity(&element);
+                Some(Array2DOp::New {
+                    handle: self.rectangular_array_handle(parent)?,
+                    element_size,
+                    element_kind: sig_element_kind(&element),
+                    element: identity,
+                    element_cast_class,
+                })
+            }
             "Get" => Some(Array2DOp::Get {
                 element_size,
                 signed,
@@ -5834,14 +6021,20 @@ impl CallResolver for MetadataResolver<'_> {
             return None;
         }
         let rank = rank as usize;
-        let (element_size, signed) = array_element_size(&element);
+        let element = self.rectangular_element(&element);
+        let (element_size, signed) = self.rectangular_element_size(&element);
         match member.name()? {
-            ".ctor" => Some(ArrayMDOp::New {
-                handle: TypeHandle(parent.0),
-                element_size,
-                element_kind: sig_element_kind(&element),
-                rank,
-            }),
+            ".ctor" => {
+                let (identity, element_cast_class) = self.rectangular_element_identity(&element);
+                Some(ArrayMDOp::New {
+                    handle: self.rectangular_array_handle(parent)?,
+                    element_size,
+                    element_kind: sig_element_kind(&element),
+                    element: identity,
+                    element_cast_class,
+                    rank,
+                })
+            }
             "Get" => Some(ArrayMDOp::Get {
                 element_size,
                 signed,
@@ -6235,30 +6428,9 @@ impl CallResolver for MetadataResolver<'_> {
             let closed = self.closed_spec_signature(target)?;
             let identity = InterfaceIdentity::instantiated(self.assembly, &closed)?;
             let spelled = identity.type_name();
-            return interface.methods().find_map(|method| {
-                let signature = method.signature()?;
-                interface_method_tag(
-                    interface_assembly,
-                    &spelled,
-                    method.name()?,
-                    &signature.parameters,
-                )
-            });
+            return interface_type_tag(interface_assembly, &spelled, interface);
         }
-        let name = self.assembly.type_token_name(target)?;
-        let (_, interface_assembly, interface) = self.type_home(self.assembly, target)?;
-        if !interface.is_interface() {
-            return None;
-        }
-        interface.methods().find_map(|method| {
-            let signature = method.signature()?;
-            interface_method_tag(
-                interface_assembly,
-                &name,
-                method.name()?,
-                &signature.parameters,
-            )
-        })
+        interface_tag_of_token(self.assembly, &self.references, target)
     }
 
     fn cast_target_chain(&self, operand: &Operand) -> Option<TypeHandle> {
@@ -8027,8 +8199,8 @@ fn fold_signed_unsigned(byte: u8) -> u8 {
     }
 }
 
-/// The array descriptor's cast-class word for an element that has no class of its own -- a reference
-/// element, and a real struct.
+/// The array descriptor's cast-class word for an element with no class and no interface tag of its
+/// own -- a class, and a real struct.
 ///
 /// **ZERO IS FREE AND THAT IS CHECKED RATHER THAN ASSUMED**: II.23.1.16 assigns no element byte 0
 /// (`END` is 0x00 and is not a type), and [`array_element_cast_class`] only ever answers a primitive
@@ -8386,14 +8558,6 @@ fn decode_user_string(raw: &[u8]) -> Vec<u16> {
 mod tests {
     use super::*;
 
-    /// A fixture assembly from this crate's fixture directory, read at RUN time.
-    ///
-    /// **`include_bytes!` CANNOT BE USED HERE, AND THE REASON IS A DISTRIBUTION RULE RATHER THAN A
-    /// TESTING ONE.** It resolves at COMPILE time, so a tree that does not carry the fixture
-    /// directory fails to build this module at all -- while the identical source builds perfectly in
-    /// a tree that does. Reading at run time compiles everywhere and runs wherever the fixture
-    /// exists.
-    ///
     /// The `String` constructor rule is keyed on parameter TYPES, and the case that decides it is the
     /// one that must NOT match.
     ///
@@ -8427,123 +8591,6 @@ mod tests {
         assert_eq!(string_ctor_form(&[arr(I4), I4, I4]), None, "int[] is not char[]");
         assert_eq!(string_ctor_form(&[SigType::String]), None, "String(string)");
         assert_eq!(string_ctor_form(&[]), None, "the parameterless form");
-    }
-
-    /// **A MISSING FIXTURE SKIPS ONLY WHERE SKIPPING IS RIGHT.** If the DIRECTORY is gone -- exactly
-    /// the stripped drop and nowhere else -- the caller returns early. If the directory exists and
-    /// the FILE does not, that is a real breakage and this panics by name. Without that split,
-    /// deleting a fixture would turn every row using it green.
-    fn fixture_bytes(name: &str) -> Option<Vec<u8>> {
-        let directory = alloc::format!("{}/tests/fixtures", env!("CARGO_MANIFEST_DIR"));
-        if !std::path::Path::new(&directory).is_dir() {
-            eprintln!("{directory} absent (a stripped drop); skipping");
-            return None;
-        }
-        let path = alloc::format!("{directory}/{name}");
-        Some(std::fs::read(&path).unwrap_or_else(|error| {
-            panic!("the fixture directory exists but {path} does not read: {error}")
-        }))
-    }
-
-    /// THE OTHER HALF OF A CLAIM THAT NOW SPANS TWO CRATES, AND EACH HALF NAMES THE OTHER.
-    /// `lamella_generics::tests::instantiations_are_distinct_interfaces` proves the canonical
-    /// SPELLING separates two reference instantiations; this proves the INTERFACE TAG built from
-    /// that spelling separates them too -- which is the property `o is IList<string>` answering
-    /// FALSE for a type implementing only `IList<Foo>` actually rests on.
-    ///
-    /// **Two REFERENCE arguments, deliberately.** A pair like `IList<int>` against
-    /// `IList<string>` passes under BOTH the by-name spelling and the collapsed one, because a
-    /// VALUE argument is not what the shortcut collapses -- so it would separate nothing.
-    /// **`ldobj`/`ldelem` NAMING A CLASS MUST PRODUCE A REFERENCE, NOT AN INLINE STRUCT.**
-    ///
-    /// Nothing on the `type_operand_mir` path asks `is_value_type()`. `Assembly::value_type_layout`
-    /// checks only that the token is a `TypeDef` and then sums its instance fields, which a CLASS row
-    /// answers perfectly well -- so the value-type arm claims a class and the `ObjectRef`
-    /// fallthrough below it is never reached. The consequence is not a wrong width alone: a reference
-    /// typed as a struct is described to the GC stack map as inline words instead of a traced root,
-    /// and this collector is mark-compact.
-    ///
-    /// `ldelem <class>` is legal CIL. csc emits `ldelem.ref` for a reference element, which is why no
-    /// corpus program asks it and why 679 programs could not have caught this.
-    ///
-    /// **BOTH ROWS, CHECKED TO THE SAME DEPTH.** `arraydesc.dll` declares `Thing` (a class with an
-    /// instance field) beside `Point` (a struct with two), so this asserts that the guard
-    /// DISCRIMINATES rather than that it refuses everything -- a guard that answered `ObjectRef` for
-    /// both would pass a class-only test and silently un-inline every struct.
-    #[test]
-    fn a_class_token_at_ldobj_is_a_reference_and_a_struct_token_is_not() {
-        let Some(dll) = fixture_bytes("arraydesc.dll") else {
-            return;
-        };
-        let assembly = Assembly::read(&dll).expect("parse the fixture");
-        let resolver = MetadataResolver::new(&assembly);
-        let named = |wanted: &str| {
-            assembly
-                .type_defs()
-                .find(|type_def| type_def.name().is_some_and(|n| n.name == wanted))
-                .unwrap_or_else(|| panic!("the fixture declares {wanted}"))
-        };
-
-        let class = named("Thing");
-        assert!(!class.is_value_type(), "Thing is the CLASS row of this pair");
-        assert_eq!(
-            resolver.type_operand_mir(&Operand::Token(class.token())),
-            Some(MirType::ObjectRef),
-            "a class token typed as a ValueType puts a reference in untraced inline words"
-        );
-
-        let structure = named("Point");
-        assert!(structure.is_value_type(), "Point is the STRUCT row of this pair");
-        assert!(
-            matches!(
-                resolver.type_operand_mir(&Operand::Token(structure.token())),
-                Some(MirType::ValueType { .. })
-            ),
-            "a struct token must still be an inline value type, or the guard has un-inlined every struct"
-        );
-    }
-
-    #[test]
-    fn an_instantiations_interface_tag_takes_the_canonical_spelling() {
-        use lamella_generics::TypeArg;
-        let Some(dll) = fixture_bytes("interface.dll") else {
-            return;
-        };
-        let assembly = Assembly::read(&dll).expect("parse the fixture");
-        let of = |argument: TypeArg| {
-            TypeArg::Instance {
-                definition: "System.Collections.Generic.IList`1"
-                    .to_string()
-                    .into_boxed_str(),
-                value_type: false,
-                arguments: alloc::vec![argument],
-            }
-            .name()
-        };
-        let string_name = of(TypeArg::Primitive(
-            lamella_metadata::signature::element::STRING,
-        ));
-        let foo_name = of(TypeArg::Named {
-            name: "Sample.Foo".to_string().into_boxed_str(),
-            value_type: false,
-        });
-        let tag_of = |name: &str| {
-            interface_method_tag(
-                &assembly,
-                &TypeName {
-                    namespace: "System.Collections.Generic",
-                    name: name.strip_prefix("System.Collections.Generic.").unwrap(),
-                },
-                "Add",
-                &[],
-            )
-            .expect("a nullary parameter list names no type, so this cannot refuse")
-        };
-        assert_ne!(
-            tag_of(&string_name),
-            tag_of(&foo_name),
-            "IList<string> and IList<Foo> must not share an interface tag"
-        );
     }
 
     #[test]
@@ -8948,573 +8995,6 @@ mod tests {
         assert_eq!(primitive_sig_name(&SigType::Var(0)), None);
     }
 
-    /// `new T[n]` closed over each argument SHAPE, read off the corlib's own `List<T>` constructor
-    /// so the operand is the definition's real `!0` rather than a token built for the test.
-    ///
-    /// **THE KIND IS THE WORD THAT MATTERS, AND NO BUILD FAILURE EVER REPORTS IT.** An array of
-    /// references described OPAQUE is an array the collector never scans: the program builds, and
-    /// the objects only that array holds are reclaimed at the next collection. `object`, an array
-    /// and a class instantiation all hold references and all must say so. A value-type
-    /// instantiation must DECLINE rather than guess a width.
-    #[test]
-    fn a_type_parameter_array_describes_every_reference_argument_as_references() {
-        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures");
-        if !std::path::Path::new(directory).is_dir() {
-            eprintln!("{directory} absent (a stripped drop); skipping");
-            return;
-        }
-        let path = alloc::format!("{directory}/corlib.dll");
-        let bytes = std::fs::read(&path).unwrap_or_else(|error| {
-            panic!("the fixture directory exists but {path} does not read: {error}")
-        });
-        let corlib = Assembly::read(&bytes).expect("the corlib fixture parses");
-        let list = corlib
-            .find_type("System.Collections.Generic", "List`1")
-            .expect("the corlib declares List<T>");
-        let spec = list
-            .methods()
-            .filter(|method| method.name() == Some(".ctor"))
-            .filter_map(|method| method.body())
-            .flat_map(|body| body.code.into_vec())
-            .find_map(|instruction| match (instruction.opcode, instruction.operand) {
-                (Opcode::Newarr, Operand::Token(token)) => Some(token),
-                _ => None,
-            })
-            .expect("List<T>'s constructor allocates its backing array with `new T[n]`");
-        assert_eq!(spec.table(), table::TYPE_SPEC, "the operand is the definition's own `!0`");
-        let closed = |argument: SigType| {
-            MetadataResolver::new(&corlib)
-                .with_type_arguments(alloc::vec![argument.clone()])
-                .with_layout_arguments(alloc::vec![argument])
-                .substituted_array_element(spec)
-        };
-
-        let object = TypeHandle(
-            corlib
-                .find_type("System", "Object")
-                .expect("the corlib declares System.Object")
-                .token()
-                .0,
-        );
-        let element = closed(SigType::Object).expect("an `object` element is taken");
-        assert_eq!(element.element_kind, ELEMENT_KIND_REFERENCE);
-        assert_eq!(element.element, Some(object));
-        assert_eq!(element.handle, lamella_ir::array_handle(object));
-        assert_eq!(element.element_size, 4);
-
-        for (name, argument) in [
-            ("byte[]", SigType::SzArray(Box::new(SigType::U1))),
-            (
-                "List<int>",
-                SigType::GenericInst {
-                    definition: Box::new(SigType::Class(list.token())),
-                    arguments: alloc::vec![SigType::I4],
-                },
-            ),
-        ] {
-            let element = closed(argument).unwrap_or_else(|| panic!("a `{name}` element is taken"));
-            assert_eq!(
-                element.element_kind, ELEMENT_KIND_REFERENCE,
-                "{name}: an element that is itself a reference is traced, never stepped over"
-            );
-            assert_eq!(element.element, None, "{name}: no row names the element");
-            assert_eq!(
-                element.handle,
-                lamella_ir::synthetic_array_handle(ELEMENT_KIND_REFERENCE),
-                "{name}: the descriptor every array of references carries when no row names its element"
-            );
-            assert_eq!(element.element_size, 4, "{name}: one word per element");
-        }
-
-        let nullable = corlib
-            .find_type("System", "Nullable`1")
-            .expect("the corlib declares Nullable<T>");
-        assert!(
-            closed(SigType::GenericInst {
-                definition: Box::new(SigType::ValueType(nullable.token())),
-                arguments: alloc::vec![SigType::I4],
-            })
-            .is_none(),
-            "a value-type instantiation is laid inline and this tier has no layout for it"
-        );
-    }
-
-    /// `new Span<T>(...)` inside the corlib's own `Span<T>.Slice`, closed over `byte`: the value a
-    /// `newobj` of a VALUE-type instantiation builds is the very slot a local of that type is typed as.
-    ///
-    /// **ONE IDENTITY, OR A VERIFY MISMATCH WHERE THE TWO MEET.** `Slice` returns what its `newobj`
-    /// built, and its caller receives it into a slot typed from the signature -- so the handle, the
-    /// size and the trace map must agree exactly. Read off the real corlib so the operand is the
-    /// definition's own `MemberRef` over the `Span<!0>` it spells for itself.
-    #[test]
-    fn a_value_type_instantiation_built_by_newobj_is_the_slot_it_is_typed_as() {
-        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures");
-        if !std::path::Path::new(directory).is_dir() {
-            eprintln!("{directory} absent (a stripped drop); skipping");
-            return;
-        }
-        let path = alloc::format!("{directory}/corlib.dll");
-        let bytes = std::fs::read(&path).unwrap_or_else(|error| {
-            panic!("the fixture directory exists but {path} does not read: {error}")
-        });
-        let corlib = Assembly::read(&bytes).expect("the corlib fixture parses");
-        let span = corlib.find_type("System", "Span`1").expect("the corlib declares Span<T>");
-        let ctor = span
-            .methods()
-            .filter(|method| method.name() == Some("Slice"))
-            .filter_map(|method| method.body())
-            .flat_map(|body| body.code.into_vec())
-            .find_map(|instruction| match (instruction.opcode, instruction.operand) {
-                (Opcode::Newobj, Operand::Token(token))
-                    if match token.table() {
-                        table::METHOD_DEF => span.methods().any(|m| m.rid() == token.row()),
-                        table::MEMBER_REF => corlib.member_ref(token.row()).is_some_and(|m| {
-                            m.parent().table() == table::TYPE_SPEC
-                                && matches!(
-                                    corlib.type_spec_signature(m.parent()),
-                                    Some(SigType::GenericInst { ref definition, .. })
-                                        if matches!(**definition, SigType::ValueType(t) if t == span.token())
-                                )
-                        }),
-                        _ => false,
-                    } =>
-                {
-                    Some(token)
-                }
-                _ => None,
-            })
-            .expect("Span<T>.Slice builds its result with `new Span<T>(...)`");
-        let resolver = MetadataResolver::new(&corlib)
-            .with_type_arguments(alloc::vec![SigType::U1])
-            .with_layout_arguments(alloc::vec![SigType::U1]);
-        let built = resolver
-            .newobj_value_type(&Operand::Token(ctor))
-            .expect("`new Span<byte>` is a value this tier can build");
-        let slot = instantiated_value_type_slot(
-            &SigType::GenericInst {
-                definition: Box::new(SigType::ValueType(span.token())),
-                arguments: alloc::vec![SigType::U1],
-            },
-            &corlib,
-            &[],
-            &TargetLayout::ilp32(),
-        )
-        .expect("a `Span<byte>` local is a slot this tier can type");
-        assert_eq!(built, slot, "the value built and the slot it lands in are one identity");
-        let MirType::ValueType { size, .. } = built else {
-            panic!("a span is laid inline, not referenced: {built:?}");
-        };
-        assert_eq!(size, 12, "array reference, start, length");
-    }
-
-    /// `Pointer` AND `ByRef` NEED THEIR OWN ARM IN `sig_element_byte`. Falling to a `_ => 0x00`
-    /// fallback gives three overloads that differ only in those parameter types ONE tag -- and a tag
-    /// IS the dispatch key, so two of the three dispatch to the third's implementation. The
-    /// `assert_ne!`s below are what a fallback turns into `assert_eq!`s.
-    #[test]
-    fn pointer_and_byref_parameters_no_longer_collapse_to_one_tag() {
-        let Some(dll) = fixture_bytes("interface.dll") else {
-            return;
-        };
-        let assembly = Assembly::read(&dll).expect("parse the fixture");
-        let iface = TypeName {
-            namespace: "Probe",
-            name: "IOverloads",
-        };
-        let tag = |p: SigType| {
-            interface_method_tag(&assembly, &iface, "Bar", &[p])
-                .expect("a non-generic parameter names no type, so this cannot refuse")
-        };
-        let int_ptr = tag(SigType::Pointer(Box::new(SigType::I4)));
-        let byte_ptr = tag(SigType::Pointer(Box::new(SigType::U1)));
-        let by_ref = tag(SigType::ByRef(Box::new(SigType::I4)));
-        let plain = tag(SigType::I4);
-        assert_ne!(int_ptr, by_ref, "T* and ref T are different signatures");
-        assert_ne!(int_ptr, plain, "T* and T are different signatures");
-        assert_ne!(by_ref, plain, "ref T and T are different signatures");
-        assert_ne!(
-            int_ptr, byte_ptr,
-            "int* and byte* are different signatures -- PTR alone cannot name its pointee"
-        );
-    }
-
-    /// THE ONLY TEST THAT CAN SEE THE TAG'S SPELLING CHANGE, and the reason it has to spell the
-    /// answers out is the thing that makes this value ABI in the first place.
-    ///
-    /// Every other test here compares two tags this build computed, so both sides move together and
-    /// a changed spelling keeps them all green. But the agreement the tag actually needs is across
-    /// BUILDS, not within one: a `callvirt` emitted into a program object last month and the itable
-    /// entry emitted into a library's type descriptor today must derive the same u32 from the same
-    /// signature. **No test that recomputes the tag can observe that**, which is why the values
-    /// below are literals and not expressions.
-    ///
-    /// DERIVATION, so this is an answer key rather than a mirror: FNV-1a-32 (offset basis
-    /// `0x811c9dc5`, prime `0x01000193`) over the interface's namespace, `.`, its name, `.`, the
-    /// method name, then per parameter its `II.23.1.16` element byte -- **and, for a byte that
-    /// cannot name its own type, the canonical spelling after it** (`System.Int32*`,
-    /// `System.Int32&`). The result has its high bit forced.
-    ///
-    /// **ANCHOR THE GENERATOR BEFORE POINTING IT AT THIS DATA**, against FNV-1a-32's own published
-    /// check values -- `""` -> `0x811c9dc5`, `"a"` -> `0xe40c292c`, `"foobar"` -> `0xbf9cf968`.
-    /// **A value copied out of the implementation because the independent derivation was fiddly is a
-    /// mirror, and a mirror cannot fail.**
-    ///
-    /// A failure here is not a bug in this test. It means the tag's spelling moved, and every
-    /// artifact built before the change now disagrees with every artifact built after it -- a
-    /// deliberate decision while artifacts are ours to re-cut, and a break once they are not.
-    #[test]
-    fn the_interface_tag_spelling_is_pinned_to_literal_values() {
-        let Some(dll) = fixture_bytes("interface.dll") else {
-            return;
-        };
-        let assembly = Assembly::read(&dll).expect("parse the fixture");
-        let tag = |interface: &TypeName, method: &str, params: &[SigType]| {
-            interface_method_tag(&assembly, interface, method, params)
-                .expect("a non-generic parameter names no type, so this cannot refuse")
-        };
-        let foo = TypeName {
-            namespace: "",
-            name: "IFoo",
-        };
-        let list = TypeName {
-            namespace: "System.Collections",
-            name: "IList",
-        };
-        let mut moved: Vec<String> = Vec::new();
-        for (label, tag, expected) in [
-            ("IFoo.Bar()", tag(&foo, "Bar", &[]), 0xaca5_33df),
-            ("IFoo.Bar(int)", tag(&foo, "Bar", &[SigType::I4]), 0x9f10_9b75),
-            (
-                "IFoo.Bar(int*)",
-                tag(&foo, "Bar", &[SigType::Pointer(Box::new(SigType::I4))]),
-                0x81b8_4de7,
-            ),
-            (
-                "IFoo.Bar(ref int)",
-                tag(&foo, "Bar", &[SigType::ByRef(Box::new(SigType::I4))]),
-                0xd8de_64ac,
-            ),
-            (
-                "IFoo.Bar(int, string)",
-                tag(&foo, "Bar", &[SigType::I4, SigType::String]),
-                0xe224_c2a1,
-            ),
-            (
-                "System.Collections.IList.Add(object)",
-                tag(&list, "Add", &[SigType::Object]),
-                0xe64e_7989,
-            ),
-        ] {
-            if tag != expected {
-                moved.push(alloc::format!("{label}: {expected:#010x} -> {tag:#010x}"));
-            }
-        }
-        assert!(
-            moved.is_empty(),
-            "{} of 6 pinned tags moved -- this is cross-assembly ABI and every artifact built \
-             before the change disagrees with every one built after:\n  {}",
-            moved.len(),
-            moved.join("\n  ")
-        );
-    }
-
-    /// A GENERIC parameter contributes more than its element byte -- **and exactly how much more is
-    /// the point of this test: the obvious reading is the wrong one, and this is what says so.**
-    ///
-    /// **THE SEPARATION IT ACHIEVES:** the ARGUMENTS. Folding `element::GENERICINST` alone -- the
-    /// obvious reading of "give the new variants an arm" -- passes every other assertion in this
-    /// file while making `List<int>` and `List<string>` ONE TAG. The first row is what tells those
-    /// two candidates apart.
-    ///
-    /// **THE SEPARATION IT ACHIEVES: THE DEFINITION, AND THE NAMED ARGUMENT.** Folding a
-    /// definition's KIND byte makes `List<int>` and `HashSet<int>` one tag, and `List<Foo>` and
-    /// `List<Bar>` another. An instantiation folds its CANONICAL SPELLING instead, which is the only
-    /// identity that survives the assembly boundary -- a token is assembly-relative and therefore
-    /// unusable in a cross-assembly tag. **The `assert_ne!`s below are what a kind-byte fold turns
-    /// into `assert_eq!`s.**
-    ///
-    /// **THE TOKENS ARE READ FROM A REAL ASSEMBLY AND NOT BUILT HERE, AND THAT IS LOAD-BEARING.**
-    /// The fold RESOLVES a token, so an invented one -- `Class(Token::new(0x01, 7))`, a row no
-    /// assembly contains -- takes the refusal arm instead of the rule, and then asserting a COLLISION
-    /// succeeds whether the rule is right or not. A fixture that builds its own input is green about
-    /// a path nothing takes.
-    ///
-    /// **What is still NOT separated** is a bare `Class`/`ValueType` parameter: `IFoo.Bar(Foo)` and
-    /// `IFoo.Bar(Bar)` collide, as do `IFoo.Bar(int[])` and `IFoo.Bar(string[])`. That imprecision is
-    /// deliberate, pre-existing and recorded -- see [`sig_element_byte`] -- and closing it moves
-    /// every shipped tag with a non-primitive parameter, which this change deliberately does not.
-    #[test]
-    fn a_generic_parameter_folds_its_canonical_spelling() {
-        use lamella_metadata::signature::element;
-        let Some(dll) = fixture_bytes("interface.dll") else {
-            return;
-        };
-        let assembly = Assembly::read(&dll).expect("parse the fixture");
-        let foo = TypeName {
-            namespace: "",
-            name: "IFoo",
-        };
-        let named =
-            |n: &str| SigType::Class(assembly.find_type("", n).expect("fixture type").token());
-        let list = named("IShape");
-        let set = named("Square");
-        let other = named("Circle");
-        let instance = |definition: &SigType, argument: SigType| SigType::GenericInst {
-            definition: Box::new(definition.clone()),
-            arguments: alloc::vec![argument],
-        };
-        let tag = |p: SigType| {
-            interface_method_tag(&assembly, &foo, "Bar", &[p])
-                .expect("every token below resolves, so none of these refuse")
-        };
-
-        assert_ne!(
-            tag(instance(&list, SigType::I4)),
-            tag(instance(&list, SigType::String)),
-            "List<int> and List<string> must not share a tag"
-        );
-        assert_ne!(tag(instance(&list, SigType::I4)), tag(list.clone()));
-        assert_ne!(tag(instance(&list, SigType::I4)), tag(SigType::I4));
-        assert_ne!(tag(SigType::Var(0)), tag(SigType::Var(1)));
-        assert_ne!(tag(SigType::Var(0)), tag(SigType::MVar(0)));
-        assert_ne!(element::VAR, element::MVAR);
-
-        assert_ne!(
-            tag(instance(&list, SigType::I4)),
-            tag(instance(&set, SigType::I4)),
-            "List<int> and HashSet<int> must not share a tag -- the definition folds its NAME"
-        );
-        assert_ne!(
-            tag(instance(&list, set.clone())),
-            tag(instance(&list, other.clone())),
-            "List<Foo> and List<Bar> must not share a tag"
-        );
-        assert_ne!(
-            tag(set.clone()),
-            tag(other.clone()),
-            "two bare Class parameters name different types and must not share a dispatch key"
-        );
-        assert_ne!(
-            tag(SigType::SzArray(Box::new(SigType::I4))),
-            tag(SigType::SzArray(Box::new(SigType::String))),
-            "int[] and string[] are different signatures -- SZARRAY alone cannot name its element"
-        );
-        let ranked = |rank: u32| SigType::Array {
-            element: Box::new(SigType::I4),
-            rank,
-        };
-        assert_ne!(
-            tag(ranked(2)),
-            tag(ranked(3)),
-            "int[,] and int[,,] are different signatures"
-        );
-    }
-
-    /// **A PARAMETER THIS ASSEMBLY CANNOT NAME IS A REFUSAL, NOT A DEGRADATION**, and this is the
-    /// row that says so: folding the bare `GENERICINST` byte instead would put two instantiations
-    /// under one dispatch key, which is precisely the defect the spelling closes. A refusal a caller
-    /// maps to a default is not a refusal, so the value is `None` and every call site skips.
-    ///
-    /// The control is the SAME instantiation with a resolvable definition, which must answer `Some`
-    /// -- without it, a fold that refused unconditionally would pass.
-    #[test]
-    fn an_unnameable_instantiation_refuses_rather_than_folding_a_bare_byte() {
-        let Some(dll) = fixture_bytes("interface.dll") else {
-            return;
-        };
-        let assembly = Assembly::read(&dll).expect("parse the fixture");
-        let foo = TypeName {
-            namespace: "",
-            name: "IFoo",
-        };
-        let instance = |definition: SigType| SigType::GenericInst {
-            definition: Box::new(definition),
-            arguments: alloc::vec![SigType::I4],
-        };
-        let unnameable = SigType::Class(Token::new(table::TYPE_DEF, 0x00ff_fffe));
-        assert_eq!(
-            interface_method_tag(&assembly, &foo, "Bar", &[instance(unnameable)]),
-            None,
-            "an instantiation whose definition cannot be named must refuse the tag"
-        );
-        let real = SigType::Class(assembly.find_type("", "IShape").expect("IShape").token());
-        assert!(
-            interface_method_tag(&assembly, &foo, "Bar", &[instance(real)]).is_some(),
-            "the control: the same shape with a resolvable definition still yields a tag"
-        );
-    }
-
-    /// THE ADDITIVE CLAIM, AS A GUARD RATHER THAN A SENTENCE. Every non-generic parameter folds
-    /// exactly one byte, so no tag that exists today can move -- and the six pinned literals above
-    /// are only half the proof, because they were written before `fold_tag_element` existed and a
-    /// fold that appended a constant to EVERY parameter would break them loudly. This asserts the
-    /// other half: the fold and the raw byte agree on every non-generic type this tier emits.
-    #[test]
-    fn a_primitive_parameter_folds_exactly_its_element_byte() {
-        let Some(dll) = fixture_bytes("interface.dll") else {
-            return;
-        };
-        let assembly = Assembly::read(&dll).expect("parse the fixture");
-        let foo = TypeName {
-            namespace: "",
-            name: "IFoo",
-        };
-        for ty in [
-            SigType::Void,
-            SigType::Boolean,
-            SigType::Char,
-            SigType::I1,
-            SigType::U1,
-            SigType::I2,
-            SigType::U2,
-            SigType::I4,
-            SigType::U4,
-            SigType::I8,
-            SigType::U8,
-            SigType::R4,
-            SigType::R8,
-            SigType::String,
-            SigType::Object,
-            SigType::IntPtr,
-            SigType::UIntPtr,
-            SigType::TypedByRef,
-        ] {
-            let folded = fold_tag_element(&assembly, 0x811c_9dc5, &ty);
-            let raw = fnv1a32(0x811c_9dc5, &[sig_element_byte(&ty)]);
-            assert_eq!(folded, Some(raw), "{ty:?} must fold exactly one byte");
-            assert_eq!(
-                interface_method_tag(&assembly, &foo, "Bar", &[ty.clone()]),
-                Some(
-                    fnv1a32(
-                        fnv1a32(fnv1a32(fnv1a32(0x811c_9dc5, b"IFoo"), b"."), b"Bar"),
-                        &[sig_element_byte(&ty)]
-                    ) | 0x8000_0000
-                )
-            );
-        }
-    }
-
-    /// **THE OTHER HALF, AND THE ONE THAT MOVED THE ABI.** A byte standing for an infinite family
-    /// -- `CLASS`, `VALUETYPE`, `PTR`, `BYREF`, `SZARRAY`, `ARRAY`, `GENERICINST` -- folds the
-    /// canonical spelling after it, because the byte alone puts distinct legal signatures under one
-    /// dispatch key.
-    ///
-    /// **THE ROWS ARE PAIRS THAT SHARE A BYTE, NOT SINGLE TYPES, AND THAT IS THE WHOLE
-    /// CONSTRUCTION.** Asserting "this folds more than one byte" would pass under a fold that
-    /// appended any constant -- including one appending the SAME constant to every parameter, which
-    /// separates nothing. Each row here differs only in the part the byte cannot express, so only a
-    /// fold that reads that part can tell them apart.
-    #[test]
-    fn a_parameter_whose_byte_cannot_name_its_type_folds_the_spelling() {
-        let Some(dll) = fixture_bytes("interface.dll") else {
-            return;
-        };
-        let assembly = Assembly::read(&dll).expect("parse the fixture");
-        let foo = TypeName {
-            namespace: "",
-            name: "IFoo",
-        };
-        let named =
-            |n: &str| assembly.find_type("", n).expect("fixture type").token();
-        let (a, b) = (named("Square"), named("Circle"));
-        let tag = |p: SigType| {
-            interface_method_tag(&assembly, &foo, "Bar", &[p])
-                .expect("every token below resolves")
-        };
-        let boxed = |t: SigType| Box::new(t);
-        for (label, left, right) in [
-            ("CLASS", SigType::Class(a), SigType::Class(b)),
-            ("VALUETYPE", SigType::ValueType(a), SigType::ValueType(b)),
-            (
-                "PTR",
-                SigType::Pointer(boxed(SigType::I4)),
-                SigType::Pointer(boxed(SigType::U1)),
-            ),
-            (
-                "BYREF",
-                SigType::ByRef(boxed(SigType::I4)),
-                SigType::ByRef(boxed(SigType::String)),
-            ),
-            (
-                "SZARRAY",
-                SigType::SzArray(boxed(SigType::I4)),
-                SigType::SzArray(boxed(SigType::String)),
-            ),
-            (
-                "ARRAY rank",
-                SigType::Array {
-                    element: boxed(SigType::I4),
-                    rank: 2,
-                },
-                SigType::Array {
-                    element: boxed(SigType::I4),
-                    rank: 3,
-                },
-            ),
-        ] {
-            assert_eq!(
-                sig_element_byte(&left),
-                sig_element_byte(&right),
-                "{label}: the PRECONDITION -- these two must share an element byte, or the row \
-                 below proves nothing about the spelling"
-            );
-            assert_ne!(
-                tag(left),
-                tag(right),
-                "{label}: two signatures sharing one element byte must not share a dispatch key"
-            );
-        }
-    }
-
-    /// **`slot_key`'s DISTINGUISHER MUST BE DISJOINT FROM EVERY REAL KEY, AND THAT IS THE HALF OF
-    /// IT A TEST CAN REACH.** The undecodable arm itself is unreachable in this tree -- the
-    /// population is measured at zero since generic signatures started decoding -- so there is no
-    /// fixture that exercises it. What CAN fail silently is the disjointness: someone adding `#` to
-    /// [`encode_type`]'s alphabet would make a real signature collide with a distinguisher, and the
-    /// wrong-bind would be back with nothing red.
-    ///
-    /// **The nullary row is the one that matters most.** A method with no parameters once keyed the
-    /// EMPTY string, which is also what a substituted-away undecodable method produces -- so the
-    /// distinguisher must differ from the empty key too, not merely from populated ones.
-    #[test]
-    fn no_real_parameter_key_can_collide_with_the_undecodable_distinguisher() {
-        let Some(dll) = fixture_bytes("interface.dll") else {
-            return;
-        };
-        let assembly = Assembly::read(&dll).expect("parse the fixture");
-        let named = |n: &str| assembly.find_type("", n).expect("fixture type").token();
-        let boxed = |t: SigType| Box::new(t);
-        for params in [
-            alloc::vec![],
-            alloc::vec![SigType::I4],
-            alloc::vec![SigType::String, SigType::Object],
-            alloc::vec![SigType::Class(named("Square"))],
-            alloc::vec![SigType::ValueType(named("Circle"))],
-            alloc::vec![SigType::SzArray(boxed(SigType::I4))],
-            alloc::vec![SigType::Array {
-                element: boxed(SigType::I4),
-                rank: 3,
-            }],
-            alloc::vec![SigType::Pointer(boxed(SigType::U1))],
-            alloc::vec![SigType::ByRef(boxed(SigType::String))],
-            alloc::vec![SigType::Var(0), SigType::MVar(1)],
-        ] {
-            let key = param_key(&assembly, 0, &params);
-            assert!(
-                !key.starts_with('#'),
-                "a real parameter key must never begin with the undecodable distinguisher: \
-                 {params:?} keyed {key:?}"
-            );
-            assert_ne!(
-                param_key(&assembly, 0, &params),
-                param_key(&assembly, 1, &params),
-                "arity 0 and arity 1 must not key alike for {params:?}"
-            );
-        }
-        assert_ne!(param_key(&assembly, 0, &[]), alloc::format!("#{}", 3u32));
-        assert_ne!(param_key(&assembly, 1, &[]), alloc::format!("#{}", 3u32));
-    }
-
     /// The three codes reserved for generics must not alias a byte the tag already emits, or the
     /// first generic signature would be indistinguishable from an existing overload.
     #[test]
@@ -9560,71 +9040,6 @@ mod tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(sorted.len(), used.len(), "two parameter kinds share one byte");
-    }
-
-    /// Every method of each of the corlib's six nested `Enumerator`s is declared by its OWN type, as
-    /// the resolver answers it: the method's type token, its home, and, for a virtual one, its slot.
-    ///
-    /// **SIX TYPES OF ONE NAME, WHICH IS WHAT MAKES THE CORLIB THE TEST.** A nested type's namespace
-    /// is empty, so `Dictionary<,>.Enumerator`, the `Enumerator`s of its key and value collections and
-    /// those of `HashSet<T>`, `Queue<T>` and `Stack<T>` all carry `("", "Enumerator")`. A lookup by
-    /// that pair answers one of the six for all of them, so under one this fails for the other five.
-    #[test]
-    fn each_nested_enumerator_s_methods_are_declared_by_their_own_type() {
-        let directory = concat!(env!("CARGO_MANIFEST_DIR"), "/../lamella-load/tests/fixtures");
-        if !std::path::Path::new(directory).is_dir() {
-            eprintln!("{directory} absent (a stripped drop); skipping");
-            return;
-        }
-        let path = alloc::format!("{directory}/corlib.dll");
-        let bytes = std::fs::read(&path).unwrap_or_else(|error| {
-            panic!("the fixture directory exists but {path} does not read: {error}")
-        });
-        let corlib = Assembly::read(&bytes).expect("the corlib fixture parses");
-        let resolver = MetadataResolver::new(&corlib);
-        let enumerators: Vec<TypeDef> = corlib
-            .type_defs()
-            .filter(|type_def| {
-                type_def.enclosing_type().is_some()
-                    && type_def.name().is_some_and(|name| name.name == "Enumerator")
-            })
-            .collect();
-        assert_eq!(enumerators.len(), 6, "the corlib's nested `Enumerator`s");
-        let by_name = corlib
-            .find_type("", "Enumerator")
-            .expect("the bare pair names a nested type")
-            .token();
-        assert_eq!(enumerators.iter().filter(|e| e.token() != by_name).count(), 5);
-        let mut virtuals = 0;
-        for enumerator in &enumerators {
-            let owner = crate::generics::type_def_full_name(&corlib, enumerator.token())
-                .expect("each enumerator spells its own name");
-            let methods: Vec<_> = enumerator.methods().collect();
-            assert!(!methods.is_empty(), "{owner} declares methods");
-            for method in methods {
-                let what = alloc::format!("{owner}::{}", method.name().unwrap_or("?"));
-                assert_eq!(
-                    resolver.type_token_of(method.token()),
-                    Some(enumerator.token()),
-                    "{what}: its type token"
-                );
-                assert_eq!(
-                    resolver
-                        .method_home(&corlib, method.token())
-                        .map(|(ordinal, _, type_def)| (ordinal, type_def.token())),
-                    Some((None, enumerator.token())),
-                    "{what}: its home"
-                );
-                if method.is_virtual() {
-                    virtuals += 1;
-                    assert!(
-                        resolver.virtual_slot(&Operand::Token(method.token())).is_some(),
-                        "{what}: a slot in its own type's vtable"
-                    );
-                }
-            }
-        }
-        assert!(virtuals > 0, "the enumerators' virtual methods were asked about");
     }
 }
 

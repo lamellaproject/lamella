@@ -5,7 +5,7 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use super::{Binding, DeviceInfo, Error, Result};
+use super::{hand_over, take_left, Binding, DeviceInfo, Error, Result};
 use std::ptr::{null, null_mut};
 use std::time::Duration;
 use windows_sys::core::GUID;
@@ -13,12 +13,14 @@ use windows_sys::Win32::Devices::DeviceAndDriverInstallation::{
     CM_Get_Child, CM_Get_DevNode_PropertyW, CM_Get_DevNode_Registry_PropertyW, CM_Get_Device_IDW,
     CM_Get_Device_Interface_ListW, CM_Get_Device_Interface_List_SizeW, CM_Get_Parent, CM_Get_Sibling,
     CM_Open_DevNode_Key, CM_GET_DEVICE_INTERFACE_LIST_PRESENT, CM_REGISTRY_HARDWARE, CR_BUFFER_SMALL,
-    CR_SUCCESS, RegDisposition_OpenExisting,
+    CR_NO_SUCH_VALUE, CR_SUCCESS, RegDisposition_OpenExisting,
     SetupDiDestroyDeviceInfoList, SetupDiEnumDeviceInterfaces, SetupDiGetClassDevsW,
     SetupDiGetDeviceInterfaceDetailW, DIGCF_DEVICEINTERFACE, DIGCF_PRESENT,
     SP_DEVICE_INTERFACE_DATA, SP_DEVICE_INTERFACE_DETAIL_DATA_W, SP_DEVINFO_DATA,
 };
-use windows_sys::Win32::Devices::Properties::{DEVPKEY_Device_Service, DEVPROPTYPE};
+use windows_sys::Win32::Devices::Properties::{
+    DEVPKEY_Device_BusReportedDeviceDesc, DEVPKEY_Device_Service, DEVPROPTYPE,
+};
 use windows_sys::Win32::Devices::Usb::{
     UsbdPipeTypeBulk, WinUsb_ControlTransfer, WinUsb_Free, WinUsb_GetAssociatedInterface,
     WinUsb_GetOverlappedResult,
@@ -158,7 +160,8 @@ struct PnpIdentity {
     interface_name: Option<String>,
 }
 
-/// The devnode of this device's VENDOR-CLASS (`0xFF`) interface, if it has one.
+/// What the PnP tree says of each of this device's VENDOR-CLASS (`0xFF`) interfaces, and whether it has
+/// interface nodes at all.
 ///
 /// **THIS IS HOW WINDOWS ANSWERS "IS THIS A VENDOR-BULK DEVICE" WITHOUT OPENING IT**, matching what
 /// the Linux and macOS backends do. The interface class is in the node's COMPATIBLE IDS -- Windows
@@ -169,12 +172,69 @@ struct PnpIdentity {
 /// gets one child node per interface (`...&MI_00\...`), while a device with a single interface has
 /// the driver bound to the device node ITSELF and no interface children at all. Looking only at
 /// children would find every probe and miss every single-interface board, including ours.
-unsafe fn vendor_class_interface(devinst: u32) -> Option<u32> {
-    interface_node(devinst, |ids| ids.iter().any(|id| id.to_ascii_uppercase().contains("CLASS_FF")))
+///
+/// **EVERY CHILD IS ASKED**, since the order Windows lists them in decides nothing. An interface node's
+/// bus-reported name is its own. A device node's is the device's, so an interface there has no name to
+/// read, and the device's product string is what names it.
+unsafe fn vendor_interfaces_of(devinst: u32) -> (Vec<crate::VendorInterface>, bool) {
+    let mut interfaces = Vec::new();
+    let mut composite = false;
+    let mut child: u32 = 0;
+    if CM_Get_Child(&mut child, devinst, 0) == CR_SUCCESS {
+        loop {
+            if device_instance_id(child).as_deref().and_then(interface_number_from_instance_id).is_some() {
+                composite = true;
+                if let Some(interface) = vendor_interface_on(child, bus_reported_reading(child)) {
+                    interfaces.push(interface);
+                }
+            }
+            let mut next: u32 = 0;
+            if CM_Get_Sibling(&mut next, child, 0) != CR_SUCCESS {
+                break;
+            }
+            child = next;
+        }
+    }
+    if interfaces.is_empty()
+        && let Some(interface) = vendor_interface_on(devinst, None)
+    {
+        interfaces.push(interface);
+    }
+    (interfaces, composite)
+}
+
+/// What the PnP tree says of the interface on `node`, whose name reads as `name`, if it is vendor-class.
+unsafe fn vendor_interface_on(node: u32, name: Option<String>) -> Option<crate::VendorInterface> {
+    let ids = compatible_ids(node);
+    ids.iter().any(|id| id.to_ascii_uppercase().contains("CLASS_FF")).then(|| crate::VendorInterface {
+        subclass_protocol: vendor_subclass_protocol(&ids),
+        name,
+        bulk_pair: None,
+        spec_guid: Some(winusb_interface_classes(node).iter().any(|class| same_guid(class, &DAP_V2_GUID))),
+    })
+}
+
+/// The subclass and protocol in the compatible id Windows gives a vendor-class interface,
+/// `USB\CLASS_FF&SUBCLASS_s(2)&PROT_p(2)` (Standard USB Identifiers), in either case. A shorter id names
+/// no protocol, and an id of another class names another interface.
+fn vendor_subclass_protocol(ids: &[String]) -> Option<(u8, u8)> {
+    const CLASS: &str = "CLASS_FF&SUBCLASS_";
+    ids.iter().find_map(|id| {
+        let id = id.to_ascii_uppercase();
+        let rest = id.get(id.find(CLASS)? + CLASS.len()..)?;
+        let (subclass, rest) = (rest.get(..2)?, rest.get(2..)?);
+        let protocol = rest.strip_prefix("&PROT_")?.get(..2)?;
+        Some((u8::from_str_radix(subclass, 16).ok()?, u8::from_str_radix(protocol, 16).ok()?))
+    })
+}
+
+/// Whether two GUIDs are one.
+fn same_guid(a: &GUID, b: &GUID) -> bool {
+    (a.data1, a.data2, a.data3, a.data4) == (b.data1, b.data2, b.data3, b.data4)
 }
 
 /// The devnode whose compatible ids satisfy `wanted`: the device's own node, or one of its children --
-/// both shapes, for the reason [`vendor_class_interface`] gives.
+/// both shapes, for the reason [`vendor_interfaces_of`] gives.
 unsafe fn interface_node(devinst: u32, wanted: impl Fn(&[String]) -> bool) -> Option<u32> {
     if wanted(&compatible_ids(devinst)) {
         return Some(devinst);
@@ -292,19 +352,18 @@ fn instance_id_is_for(id: &str, vendor_id: u16, product_id: u16) -> bool {
         && upper.contains(&format!("PID_{product_id:04X}"))
 }
 
-/// `DEVPKEY_Device_BusReportedDeviceDesc` -- the USB `iProduct` string the DEVICE reported, cached
-/// by the hub driver at enumeration and readable without a handle.
+/// `DEVPKEY_Device_BusReportedDeviceDesc` -- the USB string the DEVICE reported for this node, its
+/// `iProduct` on a device node and its `iInterface` on an interface node, cached by the hub driver at
+/// enumeration and readable without a handle.
 unsafe fn bus_reported_name(devinst: u32) -> Option<String> {
-    const KEY: DEVPROPKEY = DEVPROPKEY {
-        fmtid: GUID {
-            data1: 0x540B_947E,
-            data2: 0x8B40,
-            data3: 0x45BC,
-            data4: [0xA8, 0xA2, 0x6A, 0x0B, 0x89, 0x4C, 0xBD, 0xA2],
-        },
-        pid: 4,
-    };
-    string_property(devinst, &KEY)
+    string_property(devinst, &DEVPKEY_Device_BusReportedDeviceDesc)
+}
+
+/// [`bus_reported_name`], as a reading: empty for a node holding no such string, and `None` for a read
+/// that failed. Windows holds nothing for a device whose `iProduct` is zero, as a Bluetooth radio with
+/// one measured here shows, so a string the node does not hold is a string the device does not have.
+unsafe fn bus_reported_reading(devinst: u32) -> Option<String> {
+    string_reading(devinst, &DEVPKEY_Device_BusReportedDeviceDesc)
 }
 
 /// `DEVPKEY_Device_Service`: the name of the service installed for a devnode, readable without a
@@ -315,18 +374,27 @@ unsafe fn service_name(devinst: u32) -> Option<String> {
 
 /// A string property of a devnode, read with no handle; `None` when it is absent or empty.
 unsafe fn string_property(devinst: u32, key: &DEVPROPKEY) -> Option<String> {
+    string_reading(devinst, key).filter(|text| !text.is_empty())
+}
+
+/// A string property of a devnode, read with no handle: empty when the node does not hold it, and `None`
+/// when the read failed, which is not the same answer.
+unsafe fn string_reading(devinst: u32, key: &DEVPROPKEY) -> Option<String> {
     let mut ty: DEVPROPTYPE = 0;
     let mut len: u32 = 0;
-    CM_Get_DevNode_PropertyW(devinst, key, &mut ty, null_mut(), &mut len, 0);
+    match CM_Get_DevNode_PropertyW(devinst, key, &mut ty, null_mut(), &mut len, 0) {
+        CR_NO_SUCH_VALUE => return Some(String::new()),
+        CR_BUFFER_SMALL | CR_SUCCESS => {}
+        _ => return None,
+    }
     if len == 0 {
-        return None;
+        return Some(String::new());
     }
     let mut buf = vec![0u8; len as usize];
     if CM_Get_DevNode_PropertyW(devinst, key, &mut ty, buf.as_mut_ptr(), &mut len, 0) != CR_SUCCESS {
         return None;
     }
-    let s = utf16_until_nul(&buf[..(len as usize).min(buf.len())]);
-    (!s.is_empty()).then_some(s)
+    Some(utf16_until_nul(&buf[..(len as usize).min(buf.len())]))
 }
 
 /// UTF-16LE `bytes` up to the first NUL, or to the end when there is none.
@@ -371,6 +439,41 @@ fn instance_id_from_path(path: &[u16]) -> Option<String> {
 }
 
 use crate::serial_matches;
+
+/// What a device's own node says of it: its serial, or the id Windows made from its place on the bus, which
+/// tells two serial-less devices apart and is not a serial: no interface of a composite device opens by it.
+/// A real serial that only the path could give is still a serial.
+fn serial_or_port_id(known: Option<String>, from_path: Option<String>) -> (Option<String>, Option<String>) {
+    match (known, from_path) {
+        (Some(serial), _) => (Some(serial), None),
+        (None, Some(id)) if is_synthesized_instance_id(&id) => (None, Some(id)),
+        (None, from_path) => (from_path, None),
+    }
+}
+
+/// What an interface is listed under: its serial, or else its own path's id. **THAT ID IS WHAT AN OPEN OF THE
+/// INTERFACE MATCHES,** so it reaches this interface and no other, and two boards with no serial keep a
+/// target each, where a target with no serial would write to whichever opened first.
+fn serial_of_an_interface(known: Option<String>, from_path: Option<String>) -> Option<String> {
+    known.or(from_path)
+}
+
+/// The node of the physical device an interface belongs to, given its parent's node and instance id: a
+/// composite device's own node, which its interfaces share, and otherwise the interface's own, a hub's ids
+/// not being the device's.
+fn device_node_of(devinst: u32, parent: Option<(u32, &str)>, vendor_id: u16, product_id: u16) -> u32 {
+    match parent {
+        Some((node, id)) if instance_id_is_for(id, vendor_id, product_id) => node,
+        _ => devinst,
+    }
+}
+
+/// [`device_node_of`], asked of the PnP tree.
+unsafe fn physical_device(devinst: u32, vendor_id: u16, product_id: u16) -> u32 {
+    let mut parent: u32 = 0;
+    let parent_id = if CM_Get_Parent(&mut parent, devinst, 0) == CR_SUCCESS { device_instance_id(parent) } else { None };
+    device_node_of(devinst, parent_id.as_deref().map(|id| (parent, id)), vendor_id, product_id)
+}
 
 /// Whether a path's instance-id segment is Windows' SYNTHESIZED id rather than the device's own
 /// serial -- which is what decides whether a mismatch against it means anything.
@@ -571,14 +674,22 @@ unsafe fn enumerate_vendor_class() -> Vec<DeviceInfo> {
     let mut out = Vec::new();
     for (path, devinst) in iface_paths(&USB_DEVICE_GUID) {
         let Some((vendor_id, product_id)) = vid_pid_from_path(&path) else { continue };
-        let Some(interface) = vendor_class_interface(devinst) else { continue };
+        let (vendor_interfaces, composite) = vendor_interfaces_of(devinst);
+        if vendor_interfaces.is_empty() {
+            continue;
+        }
         let identity = pnp_identity(devinst, vendor_id, product_id);
+        let (serial_number, port_id) = serial_or_port_id(identity.serial, instance_id_from_path(&path));
         out.push(DeviceInfo {
             vendor_id,
             product_id,
-            serial_number: identity.serial.or_else(|| instance_id_from_path(&path)),
+            serial_number,
             product: identity.product,
-            interface_name: bus_reported_name(interface).or(identity.interface_name),
+            interface_name: crate::vendor_interfaces_name(vendor_interfaces.iter().map(|interface| interface.name.clone())),
+            vendor_interfaces,
+            composite: Some(composite),
+            product_is_absent: bus_reported_reading(devinst).is_some_and(|name| name.is_empty()),
+            port_id,
         });
     }
     out
@@ -606,9 +717,13 @@ unsafe fn enumerate_iface(guid: &GUID) -> Vec<DeviceInfo> {
             out.push(DeviceInfo {
                 vendor_id,
                 product_id,
-                serial_number: identity.serial.or_else(|| instance_id_from_path(&path)),
+                serial_number: serial_of_an_interface(identity.serial, instance_id_from_path(&path)),
                 product: identity.product,
                 interface_name: identity.interface_name,
+                vendor_interfaces: Vec::new(),
+                composite: None,
+                product_is_absent: false,
+                port_id: None,
             });
         }
     }
@@ -688,6 +803,10 @@ fn wait_milliseconds(timeout_ms: u32) -> u32 {
     timeout_ms.min(INFINITE - 1)
 }
 
+/// `PIPE_TRANSFER_TIMEOUT`, the pipe policy that makes WinUSB cancel a transfer after a time (WinUSB
+/// Functions for Pipe Policy Modification).
+const PIPE_TRANSFER_TIMEOUT: u32 = 0x03;
+
 /// A control transfer WinUSB completed with the error `code`.
 ///
 /// `ERROR_SEM_TIMEOUT` is what WinUSB reports for a transfer its timeout policy cancelled
@@ -698,6 +817,19 @@ fn transfer_failed(code: u32) -> Error {
         return Error::Timeout;
     }
     Error::Os(format!("WinUsb_ControlTransfer failed (error {code})"))
+}
+
+/// What a bulk read that finished with the error `code` gives its caller, having delivered `got` bytes.
+///
+/// **A READ THAT RAN OUT OF TIME DELIVERS WHAT IT HELD.** Two timers of the same length end a read, the
+/// wait here and WinUSB's pipe policy, so either can end it with part of a transfer in hand, and the
+/// next read goes on with the rest of the stream. Only a read that delivered nothing timed out.
+fn read_finished_with(code: u32, got: u32) -> Result<usize> {
+    match code {
+        ERROR_SEM_TIMEOUT if got > 0 => Ok(got as usize),
+        ERROR_SEM_TIMEOUT => Err(Error::Timeout),
+        code => Err(Error::Os(format!("WinUsb read failed (error {code})"))),
+    }
 }
 
 /// Why a device that is attached, and has an interface of the class asked for, cannot be opened:
@@ -1011,6 +1143,49 @@ pub struct Device {
     /// several interfaces can register the SAME GUID, so "which one did we actually open" is a
     /// question that comes up and should not need guessing.
     path: String,
+    /// What each polled pipe has in hand.
+    reads: Vec<PipeReads>,
+}
+
+/// A bulk IN transfer handed to WinUSB and not yet collected. Boxed, because WinUSB holds its addresses
+/// from the call until the transfer finishes.
+struct OutstandingRead {
+    ov: OVERLAPPED,
+    /// What the call may write the byte count to. It lives as long as the transfer, as the rest does.
+    transferred: u32,
+    buffer: Vec<u8>,
+}
+
+/// What one pipe's polls have in hand between calls.
+struct PipeReads {
+    pipe: u8,
+    /// Signaled when this pipe's transfer finishes. A write resets [`Device::ev`], so a read left
+    /// outstanding beside writes cannot share it.
+    event: HANDLE,
+    outstanding: Option<Box<OutstandingRead>>,
+    /// Bytes a finished transfer delivered that the buffer collecting it had no room for.
+    left: Vec<u8>,
+}
+
+/// Hands WinUSB a bulk IN transfer of `length` bytes on `pipe`, which signals `event` when it finishes.
+///
+/// **NO TIMER RUNS ON IT, WinUSB'S OR ANOTHER'S.** A read before this one may have left a timeout policy on
+/// the pipe, and it would cancel this transfer, so the policy is set to none. A policy of zero is
+/// WinUSB's default: "transfers do not time out because the host controller will not cancel the transfer".
+unsafe fn submit_read(wu: WINUSB_INTERFACE_HANDLE, pipe: u8, length: usize, event: HANDLE) -> Result<Box<OutstandingRead>> {
+    let none: u32 = 0;
+    WinUsb_SetPipePolicy(wu, pipe, PIPE_TRANSFER_TIMEOUT, 4, (&raw const none).cast::<core::ffi::c_void>());
+    ResetEvent(event);
+    let mut read = Box::new(OutstandingRead { ov: std::mem::zeroed(), transferred: 0, buffer: vec![0; length] });
+    read.ov.hEvent = event;
+    let (buffer, transferred, ov) = (read.buffer.as_mut_ptr(), &raw mut read.transferred, &raw const read.ov);
+    if WinUsb_ReadPipe(wu, pipe, buffer, length as u32, transferred, ov) == 0 {
+        let code = GetLastError();
+        if code != ERROR_IO_PENDING {
+            return Err(Error::Os(format!("WinUsb_ReadPipe failed (error {code})")));
+        }
+    }
+    Ok(read)
 }
 
 impl Device {
@@ -1107,14 +1282,20 @@ interface {} alt {} class {:#04x}/{:#04x}/{:#04x}, {} endpoint(s)",
 
     fn open_with(guid: &GUID, vendor_id: u16, product_id: u16, serial: Option<&str>) -> Result<Self> {
         unsafe {
-            for (path, devinst) in iface_paths(guid) {
-                if vid_pid_from_path(&path) != Some((vendor_id, product_id)) {
-                    continue;
-                }
+            let mut candidates: Vec<(Vec<u16>, u32)> = iface_paths(guid)
+                .into_iter()
+                .filter(|(path, _)| vid_pid_from_path(path) == Some((vendor_id, product_id)))
+                .collect();
+            candidates.sort_by_key(|(_, devinst)| {
+                let spec_shape = vendor_subclass_protocol(&compatible_ids(*devinst))
+                    .is_some_and(|(subclass, protocol)| crate::is_spec_shape(subclass, protocol));
+                crate::open_rank(None, bus_reported_name(*devinst).as_deref(), spec_shape)
+            });
+            let attempt = |(path, devinst): (Vec<u16>, u32)| {
                 let settled_by_pnp = match pnp_identity(devinst, vendor_id, product_id).serial {
                     Some(known) => {
                         if !crate::candidate_satisfies(serial, Some(known.as_str())) {
-                            continue;
+                            return crate::Attempt::Passed;
                         }
                         true
                     }
@@ -1122,7 +1303,7 @@ interface {} alt {} class {:#04x}/{:#04x}/{:#04x}, {} endpoint(s)",
                 };
                 let verdict = judge_path(serial, &path);
                 if matches!(verdict, PathVerdict::Mismatch) {
-                    continue;
+                    return crate::Attempt::Passed;
                 }
                 let matched_by_path = settled_by_pnp || matches!(verdict, PathVerdict::Match);
                 let h = CreateFileW(
@@ -1135,12 +1316,13 @@ interface {} alt {} class {:#04x}/{:#04x}/{:#04x}, {} endpoint(s)",
                     null_mut(),
                 );
                 if h == INVALID_HANDLE_VALUE {
-                    continue;
+                    return crate::Attempt::Refused(std::io::Error::last_os_error().to_string());
                 }
                 let mut wu: WINUSB_INTERFACE_HANDLE = null_mut();
                 if WinUsb_Initialize(h, &mut wu) == 0 {
+                    let why = std::io::Error::last_os_error().to_string();
                     CloseHandle(h);
-                    continue;
+                    return crate::Attempt::Refused(why);
                 }
                 if !matched_by_path {
                     let wanted = serial.expect("only reachable when a serial was requested");
@@ -1148,32 +1330,37 @@ interface {} alt {} class {:#04x}/{:#04x}/{:#04x}, {} endpoint(s)",
                     if !crate::candidate_satisfies(Some(wanted), descriptor_serial.as_deref()) {
                         WinUsb_Free(wu);
                         CloseHandle(h);
-                        continue;
+                        return crate::Attempt::Passed;
                     }
                 }
                 let mut iface: USB_INTERFACE_DESCRIPTOR = std::mem::zeroed();
                 WinUsb_QueryInterfaceSettings(wu, 0, &mut iface);
-                let (mut ep_in, mut ep_out) = (0u8, 0u8);
+                let mut bulk = Vec::new();
                 for pipe in 0..iface.bNumEndpoints {
                     let mut pi: WINUSB_PIPE_INFORMATION = std::mem::zeroed();
                     if WinUsb_QueryPipe(wu, 0, pipe, &mut pi) != 0 && pi.PipeType == UsbdPipeTypeBulk {
-                        let slot = if pi.PipeId & 0x80 != 0 { &mut ep_in } else { &mut ep_out };
-                        if *slot == 0 || pi.PipeId < *slot {
-                            *slot = pi.PipeId;
-                        }
+                        bulk.push(pi.PipeId);
                     }
                 }
+                let spec_shape = iface.bInterfaceClass == 0xFF
+                    && crate::is_spec_shape(iface.bInterfaceSubClass, iface.bInterfaceProtocol);
+                let (ep_in, ep_out) = crate::bulk_pair(&bulk, spec_shape);
                 if ep_in == 0 || ep_out == 0 {
                     WinUsb_Free(wu);
                     CloseHandle(h);
-                    continue;
+                    return crate::Attempt::Passed;
                 }
                 let ev = CreateEventW(null(), 1, 0, null());
                 let opened = String::from_utf16_lossy(&path[..path.len().saturating_sub(1)]);
-                return Ok(Device { h, wu, ev, ep_out, ep_in, path: opened });
+                crate::Attempt::Opened(Device { h, wu, ev, ep_out, ep_in, path: opened, reads: Vec::new() })
+            };
+            let interfaces = candidates.into_iter().map(|candidate| (physical_device(candidate.1, vendor_id, product_id), candidate));
+            match crate::first_that_opens(interfaces, attempt) {
+                Ok(Some(device)) => Ok(device),
+                Ok(None) => Err(Error::NotFound),
+                Err(why) => Err(Error::Os(why)),
             }
         }
-        Err(Error::NotFound)
     }
 
     /// Sends one bulk OUT packet on a specific endpoint address (WinUSB's `PipeID` is the endpoint
@@ -1218,8 +1405,9 @@ interface {} alt {} class {:#04x}/{:#04x}/{:#04x}, {} endpoint(s)",
     /// [`crate::Device::read_endpoint`]. [`read_packet`](Self::read_packet) is this on the primary IN
     /// endpoint.
     pub fn read_endpoint(&mut self, endpoint: u8, buf: &mut [u8], timeout: Duration) -> Result<usize> {
-        const PIPE_TRANSFER_TIMEOUT: u32 = 0x03;
-        const ERROR_SEM_TIMEOUT: u32 = 121;
+        if self.reads.iter().any(|reads| reads.pipe == endpoint && (reads.outstanding.is_some() || !reads.left.is_empty())) {
+            return self.poll_pipe(endpoint, buf, timeout);
+        }
         let ms: u32 = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
         unsafe {
             WinUsb_SetPipePolicy(
@@ -1239,10 +1427,7 @@ interface {} alt {} class {:#04x}/{:#04x}/{:#04x}, {} endpoint(s)",
                     let waited = WaitForSingleObject(self.ev, wait_milliseconds(ms));
                     if waited == WAIT_OBJECT_0 {
                         if WinUsb_GetOverlappedResult(self.wu, &ov, &mut got, 0) == 0 {
-                            return Err(match GetLastError() {
-                                ERROR_SEM_TIMEOUT => Error::Timeout,
-                                code => Error::Os(format!("WinUsb read failed (error {code})")),
-                            });
+                            return read_finished_with(GetLastError(), got);
                         }
                     } else {
                         let wait_failure = (waited != WAIT_TIMEOUT).then(|| GetLastError());
@@ -1278,11 +1463,76 @@ interface {} alt {} class {:#04x}/{:#04x}/{:#04x}, {} endpoint(s)",
     pub fn read_packet(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
         self.read_endpoint(self.ep_in, buf, timeout)
     }
+
+    /// See [`crate::Device::poll_packet`].
+    pub fn poll_packet(&mut self, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        self.poll_pipe(self.ep_in, buf, timeout)
+    }
+
+    /// A read for a caller that polls: a pipe with nothing to deliver in `timeout` is [`Error::Timeout`],
+    /// and a transfer under way is not touched.
+    ///
+    /// **THE TRANSFER STAYS OUTSTANDING ACROSS A TIMEOUT, AND THE NEXT POLL COLLECTS IT.** A read cancelled
+    /// at its time limit keeps only what WinUSB reports for a cancelled transfer, and neither
+    /// `WinUsb_ReadPipe`'s page nor the pipe policies' gives a byte count for that case, so nothing here
+    /// rests on one: this cancels only when the device is closed.
+    fn poll_pipe(&mut self, pipe: u8, buf: &mut [u8], timeout: Duration) -> Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        let wu = self.wu;
+        let index = match self.reads.iter().position(|reads| reads.pipe == pipe) {
+            Some(index) => index,
+            None => {
+                let event = unsafe { CreateEventW(null(), 1, 0, null()) };
+                if event.is_null() {
+                    return Err(Error::Os(format!("CreateEvent failed (error {})", unsafe { GetLastError() })));
+                }
+                self.reads.push(PipeReads { pipe, event, outstanding: None, left: Vec::new() });
+                self.reads.len() - 1
+            }
+        };
+        let reads = &mut self.reads[index];
+        if !reads.left.is_empty() {
+            return Ok(take_left(&mut reads.left, buf));
+        }
+        if reads.outstanding.is_none() {
+            reads.outstanding = Some(unsafe { submit_read(wu, pipe, buf.len(), reads.event) }?);
+        }
+        let ms: u32 = timeout.as_millis().min(u128::from(u32::MAX)) as u32;
+        match unsafe { WaitForSingleObject(reads.event, wait_milliseconds(ms)) } {
+            WAIT_OBJECT_0 => {}
+            WAIT_TIMEOUT => return Err(Error::Timeout),
+            _ => {
+                let code = unsafe { GetLastError() };
+                return Err(Error::Os(format!("waiting for the bulk read failed (error {code})")));
+            }
+        }
+        let finished = reads.outstanding.take().expect("this read was outstanding");
+        let mut got = 0u32;
+        let code = (unsafe { WinUsb_GetOverlappedResult(wu, &raw const finished.ov, &mut got, 0) } == 0)
+            .then(|| unsafe { GetLastError() });
+        let delivered = match code {
+            None => got as usize,
+            Some(code) => read_finished_with(code, got)?,
+        };
+        Ok(hand_over(&finished.buffer[..delivered.min(finished.buffer.len())], buf, &mut reads.left))
+    }
 }
 
 impl Drop for Device {
     fn drop(&mut self) {
         unsafe {
+            for reads in &mut self.reads {
+                if let Some(read) = reads.outstanding.take() {
+                    WinUsb_AbortPipe(self.wu, reads.pipe);
+                    if WaitForSingleObject(reads.event, 1000) != WAIT_OBJECT_0 {
+                        std::mem::forget(read);
+                        continue;
+                    }
+                }
+                CloseHandle(reads.event);
+            }
             CloseHandle(self.ev);
             WinUsb_Free(self.wu);
             CloseHandle(self.h);
@@ -1295,10 +1545,75 @@ mod tests {
     use super::{
         addressed_through_interface, guids_from_wide_list, instance_id_is_for,
         interface_number_from_instance_id, judge_path, names_class, no_winusb_interface,
-        serial_from_instance_id, transfer_failed, utf16_until_nul, wait_milliseconds,
+        read_finished_with, serial_from_instance_id, transfer_failed, utf16_until_nul, wait_milliseconds,
         winusb_takes_length, Error, PathVerdict, ERROR_SEM_TIMEOUT, INFINITE,
     };
     use windows_sys::Win32::Foundation::ERROR_GEN_FAILURE;
+
+    /// **A READ THAT RAN OUT OF TIME DELIVERS WHAT IT HELD**, whichever timer ended it. Only one that
+    /// delivered nothing timed out, and any other failure keeps its code, whatever it delivered.
+    #[test]
+    fn a_read_that_timed_out_delivers_what_it_held() {
+        assert_eq!(read_finished_with(ERROR_SEM_TIMEOUT, 64).unwrap(), 64);
+        assert!(matches!(read_finished_with(ERROR_SEM_TIMEOUT, 0), Err(Error::Timeout)));
+        let Err(Error::Os(failure)) = read_finished_with(ERROR_GEN_FAILURE, 64) else {
+            panic!("another failure is that failure");
+        };
+        assert!(failure.contains(&ERROR_GEN_FAILURE.to_string()), "{failure}");
+    }
+
+    /// **A TARGET REACHES ITS OWN BOARD.** Two serial-less boards are each listed under their own interface's
+    /// id, which matches that interface's path and not the other's, so naming one cannot write to the other.
+    #[test]
+    fn two_serial_less_interfaces_keep_a_target_each() {
+        let path = |id: &str| -> Vec<u16> {
+            format!(r"\\?\usb#vid_39e9&pid_0001#{id}#{{dee824ef-729b-4a0e-9c14-b7117d33a817}}").encode_utf16().chain(std::iter::once(0)).collect()
+        };
+        let (a, b) = (path("6&1a2b3c4d&0&0000"), path("6&5e6f7a8b&0&0000"));
+        let listed_a = super::serial_of_an_interface(None, super::instance_id_from_path(&a)).unwrap();
+        let listed_b = super::serial_of_an_interface(None, super::instance_id_from_path(&b)).unwrap();
+        assert_ne!(listed_a, listed_b);
+        assert!(matches!(super::judge_path(Some(&listed_a), &a), super::PathVerdict::Match));
+        assert!(!matches!(super::judge_path(Some(&listed_a), &b), super::PathVerdict::Match));
+        assert_eq!(super::serial_of_an_interface(Some("ABC".to_owned()), Some("6&1".to_owned())).as_deref(), Some("ABC"));
+    }
+
+    /// **WHICH INTERFACES ARE ONE DEVICE.** A refusal ends a device, so a composite device's interfaces must
+    /// share a node, and a simple device under a hub is its own.
+    #[test]
+    fn a_composite_devices_interfaces_share_its_node_and_a_simple_device_keeps_its_own() {
+        let composite = r"USB\VID_2E8A&PID_000C\ABC";
+        assert_eq!(super::device_node_of(11, Some((7, composite)), 0x2e8a, 0x000c), 7);
+        assert_eq!(super::device_node_of(12, Some((7, composite)), 0x2e8a, 0x000c), 7);
+        let hub = r"USB\ROOT_HUB30\4&1A2B&0&0";
+        assert_eq!(super::device_node_of(21, Some((3, hub)), 0x2e8a, 0x000c), 21);
+        assert_eq!(super::device_node_of(22, None, 0x2e8a, 0x000c), 22);
+    }
+
+    /// A serial the PnP tree answered stands; an id Windows made from a place on the bus is that place and
+    /// not a serial; a real serial that only the path could give is still a serial.
+    #[test]
+    fn a_synthesized_id_is_a_port_id_and_not_a_serial() {
+        let serial_or_port = |known: Option<&str>, path: Option<&str>| {
+            super::serial_or_port_id(known.map(str::to_owned), path.map(str::to_owned))
+        };
+        assert_eq!(serial_or_port(Some("ABC"), Some("5&2CF64626&0&10")), (Some("ABC".to_owned()), None));
+        assert_eq!(serial_or_port(None, Some("5&2CF64626&0&10")), (None, Some("5&2CF64626&0&10".to_owned())));
+        assert_eq!(serial_or_port(None, Some("ABC")), (Some("ABC".to_owned()), None));
+        assert_eq!(serial_or_port(None, None), (None, None));
+    }
+
+    /// **A POLL CANCELS NOTHING.** What a cancelled transfer held is what this read exists not to depend on,
+    /// and a poll that cancelled on its way out would pass every test that has no board behind it, so the
+    /// source says it: the one place that aborts a polled read is the close.
+    #[test]
+    fn a_poll_cancels_nothing_and_a_close_waits_for_what_it_cancels() {
+        let source = include_str!("windows.rs");
+        let poll = &source[source.find("fn poll_pipe(").unwrap()..source.find("impl Drop for Device {").unwrap()];
+        assert!(!poll.contains("WinUsb_AbortPipe"), "a poll must not cancel its transfer");
+        let close = &source[source.find("impl Drop for Device {").unwrap()..source.find("#[cfg(test)]").unwrap()];
+        assert!(close.contains("WinUsb_AbortPipe") && close.contains("std::mem::forget(read)"));
+    }
 
     /// A device-interface path as Windows spells it, wide and null-terminated.
     fn path(text: &str) -> Vec<u16> {
@@ -1372,6 +1687,29 @@ mod tests {
     /// Compatible ids as Windows lists them for one interface node.
     fn ids(list: &[&str]) -> Vec<String> {
         list.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    #[test]
+    fn a_vendor_interfaces_subclass_and_protocol_are_read_from_its_compatible_ids() {
+        use super::vendor_subclass_protocol;
+        let debug_probe = ids(&[
+            "USB\\MS_COMP_WINUSB",
+            "USB\\COMPAT_VID_2e8a&Class_ff&SubClass_00&Prot_00",
+            "USB\\COMPAT_VID_2e8a&Class_ff&SubClass_00",
+            "USB\\COMPAT_VID_2e8a&Class_ff",
+            "USB\\Class_ff&SubClass_00&Prot_00",
+            "USB\\Class_ff&SubClass_00",
+            "USB\\Class_ff",
+        ]);
+        assert_eq!(vendor_subclass_protocol(&debug_probe), Some((0, 0)));
+        assert_eq!(vendor_subclass_protocol(&ids(&["USB\\Class_ff&SubClass_ff&Prot_ff"])), Some((0xFF, 0xFF)));
+        assert_eq!(vendor_subclass_protocol(&ids(&["USB\\Class_FF&SubClass_03&Prot_00"])), Some((0x03, 0)));
+        assert_eq!(vendor_subclass_protocol(&ids(&["USB\\Class_FF&SubClass_10&Prot_FF"])), Some((0x10, 0xFF)));
+        assert_eq!(vendor_subclass_protocol(&ids(&["USB\\Class_ff&SubClass_00"])), None, "no protocol");
+        assert_eq!(vendor_subclass_protocol(&ids(&["USB\\Class_ff"])), None);
+        assert_eq!(vendor_subclass_protocol(&ids(&["USB\\Class_02&SubClass_02&Prot_00"])), None, "another class");
+        assert_eq!(vendor_subclass_protocol(&ids(&["USB\\Class_ff&SubClass_zz&Prot_00"])), None, "not a number");
+        assert_eq!(vendor_subclass_protocol(&[]), None);
     }
 
     #[test]

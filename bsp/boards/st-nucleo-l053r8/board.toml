@@ -11,6 +11,8 @@
 kind = "board"
 board = "st-nucleo-l053r8"
 vendor = "st"
+maker = "STMicroelectronics"
+product = "NUCLEO-L053R8"
 family = "stm32l053"
 part = "stm32l053r8t6"
 product_model = 41          # lamella_wire::product_model::NUCLEO_L053R8

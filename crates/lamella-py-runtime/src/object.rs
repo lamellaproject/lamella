@@ -12495,7 +12495,7 @@ impl ObjectModel {
         };
         let instance = if let Some(role) = role {
             match self.board {
-                crate::gpio::Board::Samd21Xpro => {
+                crate::gpio::Board::SamD21XplainedPro => {
                     let facts = crate::board_binding::samd21_uart_facts(self, &role)?;
                     self.resolved_uart_facts = Some(facts);
                     0

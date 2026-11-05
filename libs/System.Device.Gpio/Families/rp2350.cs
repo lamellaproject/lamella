@@ -61,7 +61,8 @@ namespace Lamella.Hardware
             int length = BoardBuses.Length(BoardBuses.Gpio, 0);
             if (length <= 0) return null;
             int pairs = length > 1 ? (int)Word(BoardBuses.Gpio, 0, 1) : 0;
-            Expect(BoardBuses.Gpio, 0, length, 2 + 2 * pairs);
+            bool reservesBank1 = length == 3 + 2 * pairs;
+            if (!reservesBank1) Expect(BoardBuses.Gpio, 0, length, 2 + 2 * pairs);
             int[] paired = new int[pairs];
             int[] partners = new int[pairs];
             for (int pair = 0; pair < pairs; pair++)
@@ -69,7 +70,8 @@ namespace Lamella.Hardware
                 paired[pair] = (int)Word(BoardBuses.Gpio, 0, 2 + 2 * pair);
                 partners[pair] = (int)Word(BoardBuses.Gpio, 0, 3 + 2 * pair);
             }
-            return new Rp2350GpioDriver(Word(BoardBuses.Gpio, 0, 0), paired, partners);
+            uint reservedBank1 = reservesBank1 ? Word(BoardBuses.Gpio, 0, 2 + 2 * pairs) : 0u;
+            return new Rp2350GpioDriver(Word(BoardBuses.Gpio, 0, 0), reservedBank1, paired, partners);
         }
 
         /// <summary>Why bus <paramref name="bus"/> of <paramref name="kind"/> has no driver, as the

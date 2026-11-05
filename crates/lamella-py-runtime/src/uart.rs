@@ -162,7 +162,7 @@ impl crate::gpio::Board {
             crate::gpio::Board::Esp32c6
             | crate::gpio::Board::Rp2040
             | crate::gpio::Board::Rp2350
-            | crate::gpio::Board::Samd21Xpro => match name {
+            | crate::gpio::Board::SamD21XplainedPro => match name {
                 "UART0" => Some(0),
                 _ => None,
             },
@@ -186,7 +186,7 @@ impl crate::gpio::Board {
             crate::gpio::Board::Esp32c6 if instance == 0 => Some(uart_esp32c6::facts()),
             crate::gpio::Board::Rp2040 if instance == 0 => Some(uart_rp2040::facts()),
             crate::gpio::Board::Rp2350 if instance == 0 => Some(uart_rp2350::facts()),
-            crate::gpio::Board::Samd21Xpro if instance == 0 => resolved.map(uart_samd21::facts),
+            crate::gpio::Board::SamD21XplainedPro if instance == 0 => resolved.map(uart_samd21::facts),
             _ => None,
         }
     }
@@ -204,7 +204,7 @@ impl crate::gpio::Board {
             crate::gpio::Board::Esp32c6 if instance == 0 => Some(uart_esp32c6::open_ops(config)),
             crate::gpio::Board::Rp2040 if instance == 0 => Some(uart_rp2040::open_ops(config)),
             crate::gpio::Board::Rp2350 if instance == 0 => Some(uart_rp2350::open_ops(config)),
-            crate::gpio::Board::Samd21Xpro if instance == 0 => {
+            crate::gpio::Board::SamD21XplainedPro if instance == 0 => {
                 resolved.map(|facts| uart_samd21::open_ops(facts, config))
             }
             _ => None,
@@ -222,7 +222,7 @@ impl crate::gpio::Board {
             crate::gpio::Board::Esp32c6 if instance == 0 => uart_esp32c6::tx_byte_ops(byte),
             crate::gpio::Board::Rp2040 if instance == 0 => uart_rp2040::tx_byte_ops(byte),
             crate::gpio::Board::Rp2350 if instance == 0 => uart_rp2350::tx_byte_ops(byte),
-            crate::gpio::Board::Samd21Xpro if instance == 0 => resolved
+            crate::gpio::Board::SamD21XplainedPro if instance == 0 => resolved
                 .map(|facts| uart_samd21::tx_byte_ops(facts, byte))
                 .unwrap_or_default(),
             _ => Vec::new(),
@@ -251,7 +251,7 @@ impl crate::gpio::Board {
             crate::gpio::Board::Esp32c6 if instance == 0 => uart_esp32c6::flush_ops(),
             crate::gpio::Board::Rp2040 if instance == 0 => uart_rp2040::flush_ops(),
             crate::gpio::Board::Rp2350 if instance == 0 => uart_rp2350::flush_ops(),
-            crate::gpio::Board::Samd21Xpro if instance == 0 => resolved
+            crate::gpio::Board::SamD21XplainedPro if instance == 0 => resolved
                 .map(uart_samd21::flush_ops)
                 .unwrap_or_default(),
             _ => Vec::new(),

@@ -1,6 +1,6 @@
-# PARTS table for the nRF51 family. Its `pins` lists are partial: each names the pins checked
-# against the datasheet's pinout, not the whole package. A pin that is not listed is refused rather
-# than assumed.
+# PARTS table for the nRF51 family. The nrf51822 row's `pins` list is the QFN48 package's whole
+# GPIO set (pins_complete): its product specification states the set twice, as a count and as the
+# package's pin table, and the two agree. A pin that is not listed is refused rather than assumed.
 
 [table]
 kind = "parts"
@@ -13,5 +13,6 @@ flash = 0x40000
 ram = 0x4000
 dp_idcode = 0x0BB11477
 identity_source = "The debug port a BBC micro:bit v1 answers with, read through a CMSIS-DAP probe; the nRF flashing backend refuses a deploy whose target part answers a different one, which is the difference between nothing happening and the wrong board being erased. 0x0bb11477 is Arm's generic Cortex-M0 SW-DP and an STM32F0 answers the same, so it narrows a search and names no part. The reading that names a Nordic die is FICR."
-pins = ["P0.00", "P0.04-P0.15", "P0.21-P0.25", "P0.30"]
-source = "nRF51822 PS v3.4 (256 KB flash / 16 KB RAM; GPIO is one port of up to 32 I/Os depending on package, section 3.7). The pin list is PARTIAL rather than the package's full set: P0.04-P0.15 are the display matrix, P0.00 + P0.30 are the two-wire bus (QFN pins 4 and 3), P0.21-P0.23 are the edge connector's SPI (QFN pins 40 to 42), and P0.24 + P0.25 are the serial link to the board's interface chip (QFN pins 43 and 44) -- each confirmed as general-purpose I/O on the QFN pin assignment table."
+pins = ["P0.00-P0.30"]
+pins_complete = true
+source = "nRF51822 PS v3.4 (256 KB flash / 16 KB RAM; GPIO is one port of up to 32 I/Os depending on package, section 3.7). The pin list is the QFN48 package's WHOLE GPIO set, stated twice in the specification and the two agree: the feature list's '31 General Purpose I/O Pins', and section 2.2.1's QFN48 pin assignment and its pin function table, which name P0.00 to P0.30 and no other GPIO (P0.08 to P0.16 on QFN pins 14 to 22, P0.17 to P0.20 on 25 to 28, P0.21 to P0.25 on 40 to 44, P0.28 and P0.29 on 47 and 48, P0.30 on 3, P0.00 on 4). The BBC micro:bit v1 uses P0.04-P0.15 for its display matrix, P0.00 + P0.30 for the two-wire bus, P0.21-P0.23 for the edge connector's SPI and P0.24 + P0.25 for the serial link to its interface chip."

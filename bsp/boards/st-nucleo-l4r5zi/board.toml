@@ -17,6 +17,8 @@
 kind = "board"
 board = "st-nucleo-l4r5zi"
 vendor = "st"
+maker = "STMicroelectronics"
+product = "NUCLEO-L4R5ZI"
 family = "stm32l4r5"
 part = "stm32l4r5zit6"
 product_model = 63          # lamella_wire::product_model::NUCLEO_L4R5ZI

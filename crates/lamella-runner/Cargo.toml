@@ -101,8 +101,8 @@ lamella-assemble = { path = "../lamella-assemble" }
 # The board facts' own parser, so the deploy-window test reads a board's flash exactly as the RP2350
 # firmware's build script does.
 lamella-bsp-gen = { path = "../lamella-bsp-gen" }
-# The FAT backend (with mkfs) so the baked-deploy e2e test can mount a real RAM FatFs at /sd through
-# the StorageProvider seam -- the host twin of sam4s's device SD boot-mount.
+# The FAT backend (with mkfs) so the baked-deploy e2e test can mount a real RAM FatFs at /media/sd0 through
+# the StorageProvider seam, modeling a firmware-owned removable-card mount before program entry.
 lamella-fs-fat = { path = "../lamella-fs-fat", features = ["format"] }
 
 # Measures how many images a repeatedly-served board retains, so it needs the path that serves

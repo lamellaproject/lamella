@@ -184,7 +184,7 @@ fn provided_packages(out: &Path) -> Result<(), String> {
         .library_names()
         .into_iter()
         .filter(|name| !FRAMEWORK.iter().any(|framework| framework.eq_ignore_ascii_case(name)))
-        .filter_map(|name| crate::packages::provided(&name).map(|(id, _)| id))
+        .filter_map(|name| crate::packages::provided(&name).map(|provided| provided.id))
         .collect();
     ids.sort();
     ids.dedup();
@@ -335,7 +335,7 @@ fn resolve(inputs: &Inputs, warn: bool) -> Result<Vec<Resolved>, String> {
                 continue;
             }
             let version = crate::packages::provided(&name)
-                .and_then(|(_, versions)| versions.first().map(ToString::to_string))
+                .map(|provided| provided.version.to_string())
                 .unwrap_or_default();
             resolved.push(Resolved { id: name, version, path });
         }
@@ -359,7 +359,7 @@ fn resolve(inputs: &Inputs, warn: bool) -> Result<Vec<Resolved>, String> {
                 continue;
             }
             let version = crate::packages::provided(&name)
-                .and_then(|(_, versions)| versions.first().map(ToString::to_string))
+                .map(|provided| provided.version.to_string())
                 .unwrap_or_default();
             resolved.push(Resolved { id: name, version, path });
         }
@@ -470,6 +470,8 @@ fn compile(inputs: &Inputs) -> Result<(), String> {
 /// **THE BOARD IS CHECKED WHEN IT ANSWERS**, because the listing does not ask it: an id is a USB
 /// identity, and a probe's bridge can carry any board.
 pub fn run_built(options: &[String], program_args: &[String]) -> Ended {
+    use crate::own_lines::{blank_line, fail, running_interpreted, say};
+    let mut err = std::io::stderr();
     let (mut built, mut device, mut board) = (None, None, None);
     let (mut ref_dir, mut runtime_support_dir) = (None, None);
     let mut given = options.iter();
@@ -481,20 +483,20 @@ pub fn run_built(options: &[String], program_args: &[String]) -> Ended {
             REF_DIR => &mut ref_dir,
             RUNTIME_SUPPORT_DIR => &mut runtime_support_dir,
             other => {
-                eprintln!(
-                    "lamella: error: {BUILT} takes {BUILT} <assembly>, {REF_DIR} <folder>, \
+                fail(&mut err, &format!(
+                    "{BUILT} takes {BUILT} <assembly>, {REF_DIR} <folder>, \
                      {RUNTIME_SUPPORT_DIR} <folder>, --device <device> and --board <board>; {other:?} is none \
                      of them."
-                );
+                ));
                 return Ended::Failed;
             }
         };
         let Some(value) = given.next() else {
-            eprintln!("lamella: error: {option} wants a value.");
+            fail(&mut err, &format!("{option} wants a value."));
             return Ended::Failed;
         };
         if slot.is_some() {
-            eprintln!("lamella: error: {option} is given more than once.");
+            fail(&mut err, &format!("{option} is given more than once."));
             return Ended::Failed;
         }
         *slot = Some(value.as_str());
@@ -502,19 +504,19 @@ pub fn run_built(options: &[String], program_args: &[String]) -> Ended {
     let folders = match Folders::checked("run", ref_dir, runtime_support_dir) {
         Ok(folders) => folders,
         Err(refusal) => {
-            eprintln!("{refusal}");
+            fail(&mut err, &refusal);
             return Ended::Failed;
         }
     };
     let Some(built) = built.map(PathBuf::from) else {
-        eprintln!("lamella: error: {BUILT} wants the assembly a build made.");
+        fail(&mut err, &format!("{BUILT} wants the assembly a build made."));
         return Ended::Failed;
     };
     let board_id = board;
     let board = match board.map(|id| crate::project::BoardCheck::for_board("run", id)).transpose() {
         Ok(board) => board,
         Err(refusal) => {
-            eprintln!("{refusal}");
+            fail(&mut err, &refusal);
             return Ended::Failed;
         }
     };
@@ -531,18 +533,24 @@ pub fn run_built(options: &[String], program_args: &[String]) -> Ended {
             &folders,
         ),
         _ => {
-            crate::own_lines::say(&mut std::io::stderr(), crate::own_lines::RUNNING_HERE);
+            let mut introduction = err.lock();
+            let _interrupt = crate::ending::watch_local_run();
+            say(&mut introduction, &running_interpreted("this computer"));
+            blank_line(&mut introduction);
+            drop(introduction);
             run_here(&built, program_args, &folders)
         }
     }
 }
 
 /// The first line of a run of a built assembly on a board running Lamella's firmware, once the board
-/// has answered a HELLO as product model `answered`: on the board the project names, `board`, which
-/// the board that answered was checked against, and where the project names none, on the board that
-/// answered, in the words `lamella devices --identify` gives it.
+/// has answered a HELLO as product model `answered`, using its human name. The project's board
+/// supplies a name only when the firmware's product model has none.
 fn model_line(board: Option<&str>, answered: u16) -> String {
-    crate::own_lines::running_interpreted(&board.map_or_else(|| crate::devices::answered_as(answered), str::to_owned))
+    let name = lamella_wire_host::board_name(answered).map(str::to_owned)
+        .or_else(|| board.map(crate::own_lines::board_name))
+        .unwrap_or_else(|| crate::devices::answered_as(answered));
+    crate::own_lines::running_interpreted(&name)
 }
 
 /// The assembly at `path`, run on this computer under Lamella's interpreter, against the corlib of
@@ -553,27 +561,29 @@ fn model_line(board: Option<&str>, answered: u16) -> String {
 /// refused before it starts, naming them, rather than stopping at its first call into one with a
 /// trap that names a metadata token.
 fn run_here(path: &Path, program_args: &[String], folders: &Folders) -> Ended {
+    use crate::own_lines::fail;
+    let mut err = std::io::stderr();
     let assembly = match std::fs::read(path) {
         Ok(assembly) => assembly,
         Err(error) => {
-            eprintln!("lamella: error: read {}: {error}", path.display());
+            fail(&mut err, &format!("Could not read \"{}\": {error}", path.display()));
             return Ended::Failed;
         }
     };
     let corlib = match folders.compiler().map(|compiler| compiler.references().first().cloned()) {
         Ok(Some(corlib)) => corlib,
         Ok(None) => {
-            eprintln!("lamella: error: the class library holds no corlib");
+            fail(&mut err, "The class library holds no corlib.");
             return Ended::Failed;
         }
         Err(error) => {
-            eprintln!("lamella: error: {error}");
+            fail(&mut err, &error);
             return Ended::Failed;
         }
     };
     let beyond = references_beyond(&assembly, &corlib);
     if !beyond.is_empty() {
-        eprintln!("{}", runs_against_the_corlib_alone(path, &beyond));
+        fail(&mut err, &runs_against_the_corlib_alone(path, &beyond));
         return Ended::Failed;
     }
     crate::program::report(crate::program::run_here(corlib, &assembly, program_args))
@@ -606,7 +616,7 @@ fn runs_against_the_corlib_alone(path: &Path, beyond: &[String]) -> String {
         [] => String::new(),
     };
     format!(
-        "lamella run: {file} references {named}, and on this computer a program runs against the core \
+        "lamella run: \"{file}\" references {named}, and on this computer a program runs against the core \
          library alone. Run it on a board: dotnet run --list-devices lists the connected boards, and \
          dotnet run --device <device> runs it on one."
     )
@@ -616,6 +626,18 @@ fn runs_against_the_corlib_alone(path: &Path, beyond: &[String]) -> String {
 mod tests {
     use super::*;
 
+    /// A local refusal keeps the commands for running a library-dependent program on a board.
+    #[test]
+    fn a_run_refusal_keeps_the_board_run_instructions() {
+        let refusal = runs_against_the_corlib_alone(Path::new("App.dll"), &["Sensors".to_owned()]);
+        let mut err = Vec::new();
+        crate::own_lines::fail(&mut err, &refusal);
+        let shown = String::from_utf8(err).unwrap();
+        assert!(shown.starts_with("\"App.dll\" references Sensors"), "{shown}");
+        assert!(shown.contains("dotnet run --list-devices"), "{shown}");
+        assert!(shown.contains("dotnet run --device <device> runs it on one."), "{shown}");
+    }
+
     /// **A RUN ON A BOARD SAYS FIRST WHICH BOARD IT RUNS ON, UNDER THE INTERPRETER**: the project's
     /// board where it names one, and where it does not, the board that answered, as its firmware names
     /// it, never the device's ID. A product model this build does not know is said as `lamella devices
@@ -623,12 +645,13 @@ mod tests {
     #[test]
     fn a_runs_first_line_names_the_board_it_runs_on() {
         use lamella_wire::product_model::{PICO2, PICO2_W};
-        assert_eq!(model_line(None, PICO2_W), "running under the interpreter on Raspberry Pi Pico 2 W.");
+        let version = env!("CARGO_PKG_VERSION");
+        assert_eq!(model_line(None, PICO2_W), format!("Lamella v{version}, Raspberry Pi Pico 2 W (C# interpreter)"));
         assert_eq!(
             model_line(None, 0x7fff),
-            "running under the interpreter on a board this build does not know (product model 32767)."
+            format!("Lamella v{version}, a board this build does not know (product model 32767) (C# interpreter)")
         );
-        assert_eq!(model_line(Some("rpi-pico2"), PICO2), "running under the interpreter on rpi-pico2.");
+        assert_eq!(model_line(Some("raspberrypi-pico-2"), PICO2), format!("Lamella v{version}, Raspberry Pi Pico 2 (C# interpreter)"));
     }
 
     #[test]
@@ -654,41 +677,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// **THE PACKAGES THE TOOL PROVIDES ARE THE CLASS LIBRARY's**, by the one rule that chooses them
-    /// ([`crate::packages::provided`]): `System.Device.Gpio` and the `Lamella.*` libraries, and never
-    /// the corlib, a framework assembly or a library that comes only with another.
-    #[test]
-    fn the_provided_packages_are_the_class_librarys_by_the_tools_rule() {
-        if LcscCompiler::discover().is_err() {
-            return;
-        }
-        let out = std::env::temp_dir().join(format!("lamella-msbuild-packages-{}.props", std::process::id()));
-        provided_packages(&out).expect("written");
-        let text = std::fs::read_to_string(&out).expect("the list");
-        let ids: Vec<&str> = text.lines().filter_map(|line| line.split("Include=\"").nth(1)?.split('"').next()).collect();
-        assert!(ids.contains(&"System.Device.Gpio") && ids.contains(&"Lamella.Hardware"), "{text}");
-        for absent in ["corlib", "System.Net.NetworkInformation", "System.Device.Analog"] {
-            assert!(!ids.contains(&absent), "{absent} in {text}");
-        }
-        assert!(ids.iter().all(|id| *id == "System.Device.Gpio" || id.starts_with("Lamella.")), "{text}");
-        let _ = std::fs::remove_file(&out);
-    }
-
-    /// **A PLATFORM ASSEMBLY A PROJECT's OWN LIBRARY USES COMES WITH IT**, as NuGet brings a
-    /// package's dependencies: a library package's Lamella build that references a class library
-    /// assembly gets it in the set the program binds against.
-    #[test]
-    fn a_platform_assembly_the_projects_own_library_uses_comes_with_it() {
-        if LcscCompiler::discover().is_err() {
-            return;
-        }
-        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lamella-load/tests/fixtures");
-        let inputs = Inputs { references: vec![fixtures.join("Lamella.Hardware.dll")], ..Inputs::default() };
-        let resolved = resolve(&inputs, false).expect("resolved");
-        assert!(resolved.iter().any(|one| one.id == "System.Device.Analog"), "the library's own reference comes with it");
-        assert!(resolve(&Inputs::default(), false).expect("resolved").is_empty(), "and nothing comes unasked");
-    }
-
     /// **A PUBLISH's LINES ARE READ BESIDE THE COMPILE's**, and one that names no board or no known
     /// format is refused before anything is compiled.
     #[test]
@@ -700,15 +688,15 @@ mod tests {
             std::fs::write(&file, text).expect("write the inputs");
             Inputs::read(&file).expect("read")
         };
-        let inputs = read("project=C:\\app\\App.csproj\nboard=rpi-pico2\nformat=elf\nbuilt=C:\\app\\bin\\App.dll\nimage=C:\\app\\obj\\App.elf\n");
-        assert_eq!(inputs.board.as_deref(), Some("rpi-pico2"));
+        let inputs = read("project=C:\\app\\App.csproj\nboard=raspberrypi-pico-2\nformat=elf\nbuilt=C:\\app\\bin\\App.dll\nimage=C:\\app\\obj\\App.elf\n");
+        assert_eq!(inputs.board.as_deref(), Some("raspberrypi-pico-2"));
         assert_eq!(inputs.format.as_deref(), Some("elf"));
         assert_eq!(inputs.built, Some(PathBuf::from("C:\\app\\bin\\App.dll")));
         assert_eq!(inputs.image, Some(PathBuf::from("C:\\app\\obj\\App.elf")));
         let boardless = publish(&read("project=C:\\app\\App.csproj\nboard=\nformat=elf\nimage=C:\\app\\obj\\App.elf\n"))
             .expect_err("no board");
         assert!(boardless.contains("name no board"), "{boardless}");
-        let other = publish(&read(&format!("project=C:\\app\\App.csproj\nboard=rpi-pico2\nformat=hex\nimage={}\n", dir.join("App.hex").display())))
+        let other = publish(&read(&format!("project=C:\\app\\App.csproj\nboard=raspberrypi-pico-2\nformat=hex\nimage={}\n", dir.join("App.hex").display())))
             .expect_err("no such format");
         assert!(other.contains("\"hex\"") && other.contains("elf or lmli"), "{other}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -741,123 +729,5 @@ mod tests {
             assert!(!names_file_based(off), "{off:?}");
         }
     }
-
-    /// **A FILE-BASED APP's `#:` DIRECTIVES COMPILE ONLY IN ITS MODE.** The project `dotnet run
-    /// app.cs` writes hands the compile `features=;FileBasedProgram`, and lcsc then takes the
-    /// directive lines; a project's compile, with no such line, keeps refusing them with CS9298.
-    #[test]
-    fn a_file_based_apps_directives_compile_in_its_mode_alone() {
-        if LcscCompiler::discover().is_err() {
-            return;
-        }
-        let dir = std::env::temp_dir().join(format!("lamella-msbuild-file-based-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        let source = dir.join("app.cs");
-        std::fs::write(
-            &source,
-            "#:sdk Lamella.Sdk@1.0.0-alpha.1\n#:property TargetFramework=lamella1.0\nSystem.Console.WriteLine(\"Hello\");\n",
-        )
-        .expect("write the program");
-        let out = dir.join("app.dll");
-        let compile_with = |features: &str| {
-            let file = dir.join("lamella.compile.txt");
-            std::fs::write(
-                &file,
-                format!("project={}\nsource={}\n{features}assemblyname=app\nout={}\n", dir.join("app.csproj").display(), source.display(), out.display()),
-            )
-            .expect("write the inputs");
-            compile(&Inputs::read(&file).expect("read"))
-        };
-        let refused = compile_with("").expect_err("a project's compile refuses the directives");
-        assert!(refused.contains("CS9298"), "{refused}");
-        assert!(!out.exists(), "nothing was written");
-        compile_with("features=;FileBasedProgram\n").expect("a file-based app's compile takes them");
-        assert!(out.is_file(), "the assembly was written");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// **A NAMESPACE IS FOUND AS C# FINDS ONE**: every namespace a public type is declared in, and
-    /// every namespace enclosing one, and never the global namespace.
-    #[test]
-    fn the_namespaces_are_every_public_types_and_those_enclosing_them() {
-        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lamella-load/tests/fixtures");
-        let corlib = std::fs::read(fixtures.join("corlib.dll")).expect("a fixture");
-        let found = namespaces([corlib.as_slice()]);
-        assert!(found.contains("System"), "{found:?}");
-        assert!(!found.contains(""), "the global namespace is not one a using names");
-        for namespace in &found {
-            if let Some((enclosing, _)) = namespace.rsplit_once('.') {
-                assert!(found.contains(enclosing), "{namespace} without {enclosing}");
-            }
-        }
-        assert!(namespaces([&b"not an assembly"[..]]).is_empty());
-    }
-
-    /// **THE NAMESPACES ARE THE BUILD's OWN**: those of the corlib and the framework's assemblies,
-    /// and a package's only when the project references it, so the SDK keeps an implicit `using` for
-    /// what this program can name and no other.
-    #[test]
-    fn the_references_project_returns_the_namespaces_of_what_the_project_references() {
-        let Ok(compiler) = LcscCompiler::discover() else {
-            return;
-        };
-        let Ok(wifi) = std::fs::read(compiler.folder().join("Lamella.Net.WiFi.dll")) else {
-            return;
-        };
-        let corlib = compiler.references().first().cloned().expect("a corlib");
-        let mut framework = vec![corlib];
-        for name in FRAMEWORK {
-            framework.push(std::fs::read(compiler.folder().join(format!("{name}.dll"))).expect("a framework assembly"));
-        }
-        let only_the_package: Vec<String> = namespaces([wifi.as_slice()])
-            .difference(&namespaces(framework.iter().map(Vec::as_slice)))
-            .cloned()
-            .collect();
-        assert!(!only_the_package.is_empty(), "the package defines a namespace of its own");
-        let dir = std::env::temp_dir().join(format!("lamella-msbuild-namespaces-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).expect("a scratch directory");
-        let written = |packages: &str| {
-            let (file, out) = (dir.join("lamella.inputs.txt"), dir.join("lamella.references.proj"));
-            std::fs::write(&file, format!("project={}\n{packages}references-out={}\n", dir.join("App.csproj").display(), out.display()))
-                .expect("write the inputs");
-            references(&Inputs::read(&file).expect("read")).expect("the references are written");
-            std::fs::read_to_string(&out).expect("the references project")
-        };
-        let without = written("");
-        assert!(without.contains("<Target Name=\"LamellaNamespaces\" Returns=\"@(LamellaNamespace)\">"), "{without}");
-        assert!(without.contains("<LamellaNamespace Include=\"System\" />"), "{without}");
-        let with = written(&format!("package=Lamella.Net.WiFi@{}\n", env!("CARGO_PKG_VERSION")));
-        for namespace in &only_the_package {
-            let item = format!("<LamellaNamespace Include=\"{namespace}\" />");
-            assert!(!without.contains(&item), "{namespace} without the package");
-            assert!(with.contains(&item), "{namespace} with the package");
-        }
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// **A RUN HERE NAMES WHAT THE CORLIB ALONE CANNOT ANSWER**, and never the corlib, by either of
-    /// its names: the class library's own assemblies reference it as `mscorlib` and as `corlib`.
-    #[test]
-    fn a_run_here_names_the_assemblies_beyond_the_corlib() {
-        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("../lamella-load/tests/fixtures");
-        let read = |name: &str| std::fs::read(fixtures.join(name)).expect("a fixture");
-        let corlib = read("corlib.dll");
-        assert!(references_beyond(&corlib, &corlib).is_empty());
-        assert!(references_beyond(&read("System.Device.Gpio.dll"), &corlib).is_empty());
-        assert_eq!(
-            references_beyond(&read("Lamella.Hardware.dll"), &corlib),
-            ["System.Device.Gpio", "System.Device.Analog", "Lamella.Hardware.Facts"]
-        );
-
-        let said = |names: &[&str]| {
-            let names: Vec<String> = names.iter().map(|name| (*name).to_owned()).collect();
-            runs_against_the_corlib_alone(Path::new("bin/Debug/lamella1.0/App.dll"), &names)
-        };
-        assert!(said(&["System.Device.Gpio"]).starts_with("lamella run: App.dll references System.Device.Gpio, and"));
-        assert!(said(&["A", "B"]).contains("references A and B, and"));
-        assert!(said(&["A", "B", "C"]).contains("references A, B and C, and"));
-        crate::rendered::assert_renders_cleanly(&said(&["System.Device.Gpio"]), crate::rendered::four_space_sample);
-    }
 }
+

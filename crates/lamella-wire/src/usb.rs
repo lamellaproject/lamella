@@ -52,10 +52,10 @@ pub const fn identify(vendor_id: u16, product_id: u16) -> Option<LinkIdentity> {
 /// **ONE product id for every board, deliberately.** A product id distinguishes a device SHAPE, not a
 /// product variant -- what a host needs to know before it opens anything is "is this a Lamella Link",
 /// and there is exactly one answer. Which board it is, and which silicon, is carried where there is
-/// room to say it properly: `iProduct` ("Lamella Link (RP2350)"), `iSerialNumber`, and then the
-/// `HELLO` handshake's profile identity. Spending a product id per board would be a 16-bit copy of
-/// facts the protocol already states better, and would make every host filter a list that grows with
-/// the board count.
+/// room to say it properly: `iProduct` ("Lamella Link (Raspberry Pi Pico 2 W)"), `iSerialNumber`,
+/// and then the `HELLO` handshake's profile identity. Spending a product id per board would be a
+/// 16-bit copy of facts the protocol already states better, and would make every host filter a list
+/// that grows with the board count.
 ///
 /// **A NEW product id is warranted only when a host must tell two devices apart BEFORE opening one**
 /// -- i.e. when the interface layout differs, not when the hardware does. That means a composite
@@ -74,6 +74,95 @@ pub const BULK_IN_EP: u8 = 0x81;
 pub const BULK_OUT_EP: u8 = 0x01;
 /// Full-Speed bulk max packet size; frames are chunked to this on the wire.
 pub const BULK_MAX_PACKET: u16 = 64;
+
+/// What a Lamella Link's product string says before the board's name.
+const PRODUCT_STRING_OPENING: &str = "Lamella Link (";
+/// What it says after the board's name, and after any note on the build.
+const PRODUCT_STRING_CLOSING: &str = ")";
+
+/// The most bytes of text a Lamella Link's product string can hold.
+///
+/// A string descriptor is two bytes of header and two bytes for each UTF-16 code unit. USB's own
+/// limit, from the one-byte `bLength`, is 126 units; `usb-device` builds the descriptor in its
+/// 128-byte control buffer, which leaves room for 63. A longer string is not cut short: the stack
+/// sends nothing and does not stall, so the host waits out its own timeout at every enumeration.
+/// UTF-8 is never shorter than its UTF-16 units, so text that fits here fits the descriptor.
+pub const PRODUCT_STRING_MAX: usize = 63;
+
+/// The name of `model`, or a stop for a firmware announcing a board with no name.
+const fn board_name(model: u16) -> &'static str {
+    match crate::product_model::name(model) {
+        Some(name) => name,
+        None => panic!("this product_model has no name, so its firmware cannot name its board"),
+    }
+}
+
+/// The length in bytes of the product string [`crate::link_product_string`] builds.
+///
+/// # Panics
+///
+/// When `model` has no name, or the string would pass [`PRODUCT_STRING_MAX`]. In the `const` the
+/// macro evaluates this in, that stops the firmware's build.
+#[must_use]
+pub const fn product_string_len(model: u16, note: &str) -> usize {
+    let len = PRODUCT_STRING_OPENING.len()
+        + board_name(model).len()
+        + note.len()
+        + PRODUCT_STRING_CLOSING.len();
+    assert!(len <= PRODUCT_STRING_MAX, "this board's name does not fit a Link's product string");
+    len
+}
+
+/// The bytes of the product string [`crate::link_product_string`] builds. `N` is what
+/// [`product_string_len`] answers for the same arguments.
+///
+/// # Panics
+///
+/// When `N` is not that length.
+#[must_use]
+pub const fn product_string_bytes<const N: usize>(model: u16, note: &str) -> [u8; N] {
+    let parts = [PRODUCT_STRING_OPENING, board_name(model), note, PRODUCT_STRING_CLOSING];
+    let mut text = [0u8; N];
+    let mut written = 0;
+    let mut part = 0;
+    while part < parts.len() {
+        let bytes = parts[part].as_bytes();
+        let mut at = 0;
+        while at < bytes.len() {
+            text[written] = bytes[at];
+            written += 1;
+            at += 1;
+        }
+        part += 1;
+    }
+    assert!(written == N, "a product string's length is the one product_string_len answers");
+    text
+}
+
+/// A Lamella Link's USB product string, from the `product_model` its firmware announces:
+/// `link_product_string!(PICO2_W)` is `"Lamella Link (Raspberry Pi Pico 2 W)"`.
+///
+/// The name is [`crate::product_model::name`]'s, so the listing a host reads before it opens the
+/// board and the `HELLO` it gets afterwards say the same thing. A second argument is a note on the
+/// build, which follows the name: `link_product_string!(SAM4S_XPLAINED_PRO, ", bank B")`.
+///
+/// Both arguments must be constants. A board whose name does not fit stops the build, because
+/// [`PRODUCT_STRING_MAX`] is what a host could read.
+#[macro_export]
+macro_rules! link_product_string {
+    ($model:expr) => {
+        $crate::link_product_string!($model, "")
+    };
+    ($model:expr, $note:expr) => {{
+        const LEN: usize = $crate::usb::product_string_len($model, $note);
+        const BYTES: [u8; LEN] = $crate::usb::product_string_bytes::<LEN>($model, $note);
+        const TEXT: &str = match ::core::str::from_utf8(&BYTES) {
+            Ok(text) => text,
+            Err(_) => panic!("a board's name and a note on its build are text"),
+        };
+        TEXT
+    }};
+}
 
 /// The vendor request code (`bMS_VendorCode`) the device answers to return [`MS_OS_20_DESCRIPTOR_SET`].
 pub const MS_VENDOR_CODE: u8 = 0x01;
@@ -286,6 +375,70 @@ mod tests {
     fn the_allocated_identity_is_pinned() {
         assert_eq!(VID, 0x39E9, "Lamella LLC's allocated USB-IF vendor id");
         assert_eq!(PID, 0x0001, "Lamella Link; see the doc comment before spending a second one");
+    }
+
+    /// The name a person knows the board by, never the chip's family.
+    #[test]
+    fn a_product_string_names_the_board() {
+        use crate::product_model::{PICO_PLUS_2, PICO_PLUS_2_W, PICO2, PICO2_W};
+        assert_eq!(crate::link_product_string!(PICO2), "Lamella Link (Raspberry Pi Pico 2)");
+        assert_eq!(crate::link_product_string!(PICO2_W), "Lamella Link (Raspberry Pi Pico 2 W)");
+        assert_eq!(crate::link_product_string!(PICO_PLUS_2), "Lamella Link (Pimoroni Pico Plus 2)");
+        let plus_2_w = crate::link_product_string!(PICO_PLUS_2_W);
+        assert_eq!(plus_2_w, "Lamella Link (Pimoroni Pico Plus 2 W)");
+    }
+
+    /// A note on the build stays with the name rather than replacing it.
+    #[test]
+    fn a_note_on_the_build_follows_the_name() {
+        use crate::product_model::SAM4S_XPLAINED_PRO;
+        const BANK_B: &str = crate::link_product_string!(SAM4S_XPLAINED_PRO, ", bank B");
+        assert_eq!(BANK_B, "Lamella Link (SAM4S Xplained Pro, bank B)");
+    }
+
+    /// Every board this crate names fits in the USB control buffer.
+    #[test]
+    fn every_board_name_fits() {
+        let framing = PRODUCT_STRING_OPENING.len() + PRODUCT_STRING_CLOSING.len();
+        let too_long: Vec<u16> = (0..=u16::MAX)
+            .filter(|&model| {
+                crate::product_model::name(model)
+                    .is_some_and(|name| framing + name.len() > PRODUCT_STRING_MAX)
+            })
+            .collect();
+        assert!(too_long.is_empty(), "board names exceed the USB buffer: {too_long:?}");
+    }
+
+    /// The same stop the macro's `const` turns into a build error.
+    #[test]
+    #[should_panic(expected = "does not fit")]
+    fn a_product_string_one_byte_over_the_limit_is_refused() {
+        let model = crate::product_model::FEATHER_RP2350_HSTX_PSRAM;
+        let room = PRODUCT_STRING_MAX - product_string_len(model, "");
+        let fitting = "x".repeat(room);
+        assert_eq!(product_string_len(model, &fitting), PRODUCT_STRING_MAX);
+        let _ = product_string_len(model, &(fitting + "x"));
+    }
+
+    /// A note counts against the same limit as the name it follows.
+    #[test]
+    #[should_panic(expected = "does not fit")]
+    fn a_note_that_does_not_fit_is_refused() {
+        let note = "0123456789012345678901234567890123456789";
+        let _ = product_string_len(crate::product_model::PICO2, note);
+    }
+
+    #[test]
+    #[should_panic(expected = "has no name")]
+    fn a_model_with_no_name_is_refused() {
+        let _ = product_string_len(u16::MAX, "");
+    }
+
+    /// A caller that names the wrong length is told, rather than sent a string ending in zeros.
+    #[test]
+    #[should_panic(expected = "one product_string_len answers")]
+    fn a_wrong_length_is_refused() {
+        let _ = product_string_bytes::<64>(crate::product_model::PICO2, "");
     }
 
     #[test]

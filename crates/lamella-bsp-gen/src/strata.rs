@@ -271,6 +271,10 @@ pub struct PartRow {
     pub ram: i64,
     /// Present pins, as names or inclusive same-port ranges (`PA12-PA15`).
     pub pins: Vec<String>,
+    /// Whether `pins` is the package's WHOLE bonded GPIO set, as the row's sources state, rather
+    /// than the pins its bindings use. Only a complete list can number a board's pins for
+    /// `Lamella.Hardware.TargetBoard`: everything absent from it is absent from the silicon.
+    pub pins_complete: bool,
     /// The part's PROCESSOR SOCKETS, in boot order, each with the architecture(s) it can run.
     /// Empty on a single-core part, where the `isa*` fields describe the one core.
     ///
@@ -1270,7 +1274,7 @@ impl ExtensionTable {
 /// A board BSP: the bindings, carrier, plans, and identity of one product.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BoardTable {
-    /// The board id (`microchip-samd21-xpro`).
+    /// The board id (`microchip-sam-d21-xplained-pro`).
     pub board: String,
     /// Who MADE the board (`raspberry-pi`), kebab-cased like every other id here. Board truth:
     /// the same chip ships on boards from a dozen vendors, and a product name is unambiguous only
@@ -1284,6 +1288,15 @@ pub struct BoardTable {
     pub part: String,
     /// The `lamella_wire::product_model` wire code.
     pub product_model: i64,
+    /// Who made the board, as the board and its maker's documents name the maker (`Raspberry Pi`):
+    /// what `Lamella.Hardware.TargetBoard.Maker` answers. Empty when the table states none.
+    pub maker: String,
+    /// The board's product name, as its maker names it (`Pico 2 W`): what
+    /// `Lamella.Hardware.TargetBoard.Product` answers. Empty when the table states none.
+    pub product: String,
+    /// What the board prints beside its pins: `chip`, the chip's own pin names (`GP25`, `PA5`), or
+    /// empty for none of them. `Lamella.Hardware.TargetBoard`'s pin labels.
+    pub pin_labels: String,
     /// The memory regions the board fits, in table order. Empty = no record: the part's own
     /// parts row is the whole memory truth.
     pub memory: Vec<MemoryRegion>,
@@ -2943,6 +2956,7 @@ fn build_parts(
                     flash: 0,
                     ram: 0,
                     pins: Vec::new(),
+                    pins_complete: false,
                     cores: Vec::new(),
                     cores_share_memory: None,
                     reserved: Vec::new(),
@@ -3005,6 +3019,7 @@ fn build_parts(
                             }
                         }
                     }
+                    ("pins_complete", RawValue::Int(i)) => row.pins_complete = i.value != 0,
                     ("cores", RawValue::Inline(entries)) => {
                         for (socket, value) in entries {
                             let RawValue::Array(items) = value else {
@@ -3781,16 +3796,28 @@ fn build_board(
 ) -> Result<BoardTable, String> {
     header_reject_unknown(
         header,
-        &["kind", "board", "vendor", "family", "module", "part", "product_model", "sources", "notes"],
+        &[
+            "kind", "board", "vendor", "maker", "product", "family", "module", "part", "product_model",
+            "pin_labels", "sources", "notes",
+        ],
     )?;
     let mut table = BoardTable {
         board: header_str(header, "board")?,
         vendor: header_str(header, "vendor")?,
+        maker: header_str_opt(header, "maker")?,
+        product: header_str_opt(header, "product")?,
         family: header_str_opt(header, "family")?,
         module: header_str_opt(header, "module")?,
         part: header_str_opt(header, "part")?,
+        pin_labels: header_str_opt(header, "pin_labels")?,
         ..Default::default()
     };
+    if !table.pin_labels.is_empty() && table.pin_labels != "chip" {
+        return Err(format!(
+            "board '{}' states pin_labels = '{}' -- 'chip' (the board prints the chip's own pin names), or leave it out",
+            table.board, table.pin_labels
+        ));
+    }
     for (line, key, value) in header {
         if key == "product_model" {
             table.product_model = as_int(*line, key, value)?.value;
@@ -5707,14 +5734,14 @@ fn emit_pins_swift(map: &ExtIntMap, regen: &str) -> Result<String, String> {
     Ok(out)
 }
 
-/// The generated bindings class name for a board: `MicrochipSamd21XproBindings`.
+/// The generated bindings class name for a board: `MicrochipSamD21XplainedProBindings`.
 #[must_use]
 pub fn bindings_class(board: &str) -> String {
     format!("{}Bindings", pascal(board))
 }
 
 /// The name of the class a board's C# package declares by hand beside its generated bindings: the
-/// bindings name less the maker the board's id begins with, so `rpi-pico2-w` gives `Pico2W`. Its
+/// bindings name less the maker the board's id begins with, so `raspberrypi-pico-2-w` gives `Pico2W`. Its
 /// namespace is `Lamella.Boards.` and the board's [`vendor_segment`]. `csharp/build-boards.ps1`
 /// compiles the package into the board's facts assembly, which is `Lamella.Hardware.Facts` for every
 /// board.
@@ -5732,8 +5759,427 @@ pub fn board_class(board: &str) -> String {
 /// `csharp` directory.
 pub const TARGET_BOARD_FACTS_FILE: &str = "TargetBoardFacts.g.cs";
 
+/// `Lamella.Hardware.PinFunctions`' flags, which a board's pin table states for each pin.
+mod pin_function {
+    /// A general-purpose input or output.
+    pub const GPIO: u32 = 1;
+    /// An I2C bus's data line.
+    pub const I2C_SDA: u32 = 2;
+    /// An I2C bus's clock line.
+    pub const I2C_SCL: u32 = 4;
+    /// An SPI bus's clock line.
+    pub const SPI_SCK: u32 = 8;
+    /// The line an SPI bus's controller sends on.
+    pub const SPI_MOSI: u32 = 16;
+    /// The line an SPI bus's controller receives on.
+    pub const SPI_MISO: u32 = 32;
+    /// An SPI bus's chip select.
+    pub const SPI_CS: u32 = 64;
+    /// The line a serial port sends on.
+    pub const UART_TX: u32 = 128;
+    /// The line a serial port receives on.
+    pub const UART_RX: u32 = 256;
+    /// A PWM channel's output.
+    pub const PWM: u32 = 512;
+    /// An input of the chip's converter.
+    pub const ADC: u32 = 1024;
+}
+
+/// One pin's record in a board's facts: what `Lamella.Hardware.BoardPin` answers for it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PinFacts {
+    /// The labels the board prints for the pin, in order.
+    pub labels: Vec<String>,
+    /// `PinFunctions` flags.
+    pub functions: u32,
+    /// The I2C bus the pin's I2C function belongs to.
+    pub i2c_bus: Option<i64>,
+    /// The SPI bus the pin's SPI function belongs to.
+    pub spi_bus: Option<i64>,
+    /// The PWM chip `TargetBoard.CreatePwmChannel` takes for the channel that drives the pin.
+    pub pwm_chip: Option<i64>,
+    /// That channel's number, which on the RP2350 is the GPIO line.
+    pub pwm_channel: Option<i64>,
+    /// The converter channel that reads the pin.
+    pub adc_channel: Option<i64>,
+}
+
+/// One I2C bus in a board's facts: its number and its two pins, by pin number.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct I2cBusFacts {
+    /// The bus's number, the one `I2cConnectionSettings.BusId` takes.
+    pub number: i64,
+    /// The data pin's number.
+    pub sda: Option<i64>,
+    /// The clock pin's number.
+    pub scl: Option<i64>,
+}
+
+/// One SPI bus in a board's facts: its number, its pins by pin number, and the slowest and fastest
+/// rates its driver makes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpiBusFacts {
+    /// The bus's number, the one `SpiConnectionSettings.BusId` takes.
+    pub number: i64,
+    /// The clock pin's number.
+    pub sck: Option<i64>,
+    /// The number of the pin the controller sends on.
+    pub mosi: Option<i64>,
+    /// The number of the pin the controller receives on.
+    pub miso: Option<i64>,
+    /// The chip selects' pin numbers, by line.
+    pub selects: Vec<i64>,
+    /// The slowest rate in hertz the driver makes.
+    pub min_hz: i64,
+    /// The fastest rate in hertz the driver makes.
+    pub max_hz: i64,
+}
+
+/// Everything `Lamella.Hardware.TargetBoard` reads of a board beyond its id and its arming.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TargetBoardFacts {
+    /// The board's maker, as the maker names itself.
+    pub maker: String,
+    /// The board's product name, as its maker names it.
+    pub product: String,
+    /// The chip's name, as its maker writes it.
+    pub chip: String,
+    /// The processor's clock in hertz under the default plan; 0 where the table states none.
+    pub clock_hz: i64,
+    /// By pin number, 0 to the highest; empty where the part states no complete pin set.
+    pub pins: Vec<PinFacts>,
+    /// The I2C buses the board's bindings bind, in table order.
+    pub i2c: Vec<I2cBusFacts>,
+    /// The SPI buses the board's bindings bind, in table order.
+    pub spi: Vec<SpiBusFacts>,
+}
+
+/// The chip's name as its maker writes it, from the part id: upper case, as `rp2350a` is the
+/// RP2350A and `stm32f769ni` the STM32F769NI, but for the two makers whose names are not: Nordic's
+/// `nRF51822` and Espressif's `ESP32-C6`.
+#[must_use]
+pub fn chip_name(part: &str) -> String {
+    if let Some(rest) = part.strip_prefix("nrf") {
+        return format!("nRF{}", rest.to_ascii_uppercase());
+    }
+    if let Some(rest) = part.strip_prefix("esp32") {
+        return format!("ESP32-{}", rest.to_ascii_uppercase());
+    }
+    part.to_ascii_uppercase()
+}
+
+/// The frequency the board's default plan runs the processor at, or 0 where the table states none.
+///
+#[must_use]
+pub fn cpu_clock_hz(family: &str, plan: Option<&Plan>) -> i64 {
+    match family {
+        "nrf51" => return 16_000_000,
+        "nrf52833" => return 64_000_000,
+        _ => {}
+    }
+    let Some(plan) = plan else { return 0 };
+    let keys: &[&str] = match family {
+        "rp2350" | "rp2040" => &["clk_sys_hz"],
+        "sam3x" => &["mck_hz"],
+        "esp32c6" => &["xtal_hz"],
+        _ if family.starts_with("stm32") => &["sysclk_hz", "hclk_hz", "hsi_hz", "msi_hz", "msis_hz"],
+        _ if family.starts_with("sam") && !family.starts_with("sam4") => &["gclk0_hz"],
+        _ => &[],
+    };
+    keys.iter().find_map(|key| plan.rate(key)).unwrap_or(0)
+}
+
+/// The slowest and fastest clock an SPI bus's driver makes on `family`, as the driver computes them.
+///
+fn spi_rate_range(family: &str, board: &str, plan: Option<&Plan>) -> Result<(i64, i64), String> {
+    match family {
+        "rp2350" => {
+            let sspclk = plan.and_then(|plan| plan.rate("clk_peri_hz")).ok_or_else(|| {
+                format!("{board}: the default plan states no clk_peri_hz, which an SPI bus's rates divide")
+            })?;
+            Ok((sspclk / (254 * 256), sspclk / 2))
+        }
+        "nrf51" => Ok((125_000, 4_000_000)),
+        "nrf52833" => Ok((125_000, 8_000_000)),
+        _ => Err(format!("{board}: the {family} family's SPI rates are not stated to this generator")),
+    }
+}
+
+/// A bus's number as `Lamella.Hardware.TargetBoard` and the driver table give it: on the RP2350 the
+/// block number its instance ends in (the bus table's numbering); on a family with one bus of a kind
+/// per board, 0, the id its board class binds it at.
+fn facts_bus_number(family: &str, board: &str, binding: &Binding, of_kind: usize) -> Result<i64, String> {
+    if family == "rp2350" {
+        return bus_number(board, &binding.instance).map(i64::from);
+    }
+    if of_kind == 1 {
+        return Ok(0);
+    }
+    Err(format!(
+        "{board}: binds {of_kind} {} buses on the {family} family, whose bus numbers this generator does not state",
+        binding.kind
+    ))
+}
+
+/// The pin names a part's `pins` list states, each range expanded: `PA12-PA15` is PA12 to PA15, and
+/// `P0.04-P0.15` P0.04 to P0.15.
+fn expand_part_pins(board: &str, entries: &[String]) -> Result<Vec<String>, String> {
+    let mut names = Vec::new();
+    for entry in entries {
+        let Some((first, last)) = entry.split_once('-') else {
+            names.push(entry.clone());
+            continue;
+        };
+        let (Some((port, from)), Some((last_port, to))) = (split_pin(first), split_pin(last)) else {
+            return Err(format!("{board}: the part's pin range '{entry}' does not name two pins"));
+        };
+        if port != last_port || to < from {
+            return Err(format!("{board}: the part's pin range '{entry}' is not one port, low to high"));
+        }
+        let digits = first.len() - first.trim_end_matches(|c: char| c.is_ascii_digit()).len();
+        let prefix = &first[..first.len() - digits];
+        for index in from..=to {
+            names.push(format!("{prefix}{index:0digits$}"));
+        }
+    }
+    Ok(names)
+}
+
+/// What `Lamella.Hardware.TargetBoard` reads of `resolved` beyond its id.
+///
+/// The pins are numbered as the family's GPIO driver numbers them ([`logical_pin`]), 0 to the
+/// highest the part's pin set names, and only where the part states that set complete: a number the
+/// set leaves out names no pin and has no functions. A part whose set is a subset gives no pin table
+/// and so no bus tables, since a bus's pins are pins of the table, and `TargetBoard` refuses those
+/// members there. What a pin can be is the chip's function table where this generator holds it whole
+/// (the RP2350's, by its regular F1 to F4 columns), and otherwise GPIO; to that each binding adds the
+/// function it gives the pin. On the RP2350 every pin carries PWM chip 0 and its own line as the
+/// channel, which `TargetBoard.CreatePwmChannel` maps to the line's slice and output, and a converter
+/// channel only where the board leaves the channel's pad to it.
+pub fn target_board_facts(set: &FamilySet, resolved: &ResolvedBoard) -> Result<TargetBoardFacts, String> {
+    let board = &resolved.board.board;
+    let family = set.family.as_str();
+    let stated = |value: &str, key: &str| -> Result<String, String> {
+        if value.is_empty() {
+            return Err(format!("{board}: the board table states no {key}, which TargetBoard answers"));
+        }
+        if value.chars().any(|c| c.is_control() || c == '"' || c == '\\') {
+            return Err(format!("{board}: the board table's {key} '{value}' holds a quote, a backslash or a control character"));
+        }
+        Ok(value.to_string())
+    };
+    let maker = stated(&resolved.board.maker, "maker")?;
+    let product = stated(&resolved.board.product, "product")?;
+    let plan = resolved.board.default_plan();
+    let mut facts = TargetBoardFacts {
+        maker,
+        product,
+        chip: chip_name(&resolved.part),
+        clock_hz: cpu_clock_hz(family, plan),
+        pins: Vec::new(),
+        i2c: Vec::new(),
+        spi: Vec::new(),
+    };
+    let part = set
+        .parts
+        .rows
+        .iter()
+        .find(|row| row.part == resolved.part)
+        .ok_or_else(|| format!("{board}: part '{}' is not in parts.toml", resolved.part))?;
+    if !part.pins_complete {
+        return Ok(facts);
+    }
+    let mut numbered: Vec<(i64, String)> = Vec::new();
+    for name in expand_part_pins(board, &part.pins)? {
+        let number = logical_pin(family, board, &name)?;
+        if let Some(earlier) = pins_listed(&numbered, number) {
+            return Err(format!("{board}: part '{}' lists pin {number} twice, as {earlier} and as {name}", resolved.part));
+        }
+        numbered.push((number, name));
+    }
+    let count = numbered.iter().map(|(number, _)| number + 1).max().unwrap_or(0);
+    if count == 0 {
+        return Err(format!("{board}: part '{}' states its whole pin set and it names no pin", resolved.part));
+    }
+    let mut pins = vec![PinFacts::default(); usize::try_from(count).unwrap_or(0)];
+    for (number, name) in &numbered {
+        let pin = &mut pins[*number as usize];
+        pin.functions |= pin_function::GPIO;
+        if resolved.board.pin_labels == "chip" {
+            pin.labels.push(name.clone());
+        }
+        if family == "rp2350" {
+            let n = *number;
+            pin.functions |= pin_function::PWM;
+            pin.pwm_chip = Some(0);
+            pin.pwm_channel = Some(n);
+            pin.functions |= if n % 2 == 0 { pin_function::I2C_SDA } else { pin_function::I2C_SCL };
+            pin.i2c_bus = Some((n / 2) % 2);
+            pin.functions |= match n % 4 {
+                0 => pin_function::SPI_MISO | pin_function::UART_TX,
+                1 => pin_function::SPI_CS | pin_function::UART_RX,
+                2 => pin_function::SPI_SCK,
+                _ => pin_function::SPI_MOSI,
+            };
+            pin.spi_bus = Some((n / 8) % 2);
+        }
+    }
+    let number_of = |pin: &PinRef| -> Result<i64, String> {
+        let number = logical_pin(family, board, &pin.pin)?;
+        if number < 0 || number >= count || pins_listed(&numbered, number).is_none() {
+            return Err(format!("{board}: a binding names {}, which the part's complete pin set does not", pin.pin));
+        }
+        Ok(number)
+    };
+    let i2c_count = resolved.bindings.iter().filter(|b| b.kind == "i2c").count();
+    let spi_count = resolved.bindings.iter().filter(|b| b.kind == "spi").count();
+    for binding in &resolved.bindings {
+        let signal = |name: &str| binding.pins.iter().find(|(signal, _)| signal == name).map(|(_, pin)| pin);
+        match binding.kind.as_str() {
+            "i2c" => {
+                let bus = facts_bus_number(family, board, binding, i2c_count)?;
+                let mut entry = I2cBusFacts { number: bus, sda: None, scl: None };
+                for (name, flag) in [("sda", pin_function::I2C_SDA), ("scl", pin_function::I2C_SCL)] {
+                    let Some(pin) = signal(name) else {
+                        return Err(format!("{board}: i2c binding '{}' states no {name} pin", binding.role));
+                    };
+                    let number = number_of(pin)?;
+                    pins[number as usize].functions |= flag;
+                    pins[number as usize].i2c_bus = Some(bus);
+                    if name == "sda" { entry.sda = Some(number) } else { entry.scl = Some(number) }
+                }
+                facts.i2c.push(entry);
+            }
+            "spi" => {
+                let bus = facts_bus_number(family, board, binding, spi_count)?;
+                let (min_hz, max_hz) = spi_rate_range(family, board, plan)?;
+                let mut entry = SpiBusFacts { number: bus, sck: None, mosi: None, miso: None, selects: Vec::new(), min_hz, max_hz };
+                for (name, flag) in [
+                    ("sck", pin_function::SPI_SCK),
+                    ("mosi", pin_function::SPI_MOSI),
+                    ("miso", pin_function::SPI_MISO),
+                    ("cs", pin_function::SPI_CS),
+                ] {
+                    let Some(pin) = signal(name) else {
+                        if name == "cs" {
+                            continue;
+                        }
+                        return Err(format!("{board}: spi binding '{}' states no {name} pin", binding.role));
+                    };
+                    let number = number_of(pin)?;
+                    pins[number as usize].functions |= flag;
+                    pins[number as usize].spi_bus = Some(bus);
+                    match name {
+                        "sck" => entry.sck = Some(number),
+                        "mosi" => entry.mosi = Some(number),
+                        "miso" => entry.miso = Some(number),
+                        _ => entry.selects.push(number),
+                    }
+                }
+                facts.spi.push(entry);
+            }
+            "uart" => {
+                if let Some((name, _)) = binding.pins.iter().find(|(name, _)| name != "tx" && name != "rx") {
+                    return Err(format!("{board}: uart binding '{}' names a signal '{name}', and its lines are tx and rx", binding.role));
+                }
+                if binding.pins.is_empty() {
+                    return Err(format!("{board}: uart binding '{}' states neither tx nor rx", binding.role));
+                }
+                for (name, flag) in [("tx", pin_function::UART_TX), ("rx", pin_function::UART_RX)] {
+                    let Some(pin) = signal(name) else { continue };
+                    let number = number_of(pin)?;
+                    pins[number as usize].functions |= flag;
+                }
+            }
+            "pwm" if family == "rp2350" => {
+                for (name, pin) in &binding.pins {
+                    if name != "a" && name != "b" {
+                        return Err(format!(
+                            "{board}: pwm binding '{}' names a signal '{name}', and a slice's outputs are a and b",
+                            binding.role
+                        ));
+                    }
+                    number_of(pin)?;
+                }
+            }
+            "pwm" => {
+                return Err(format!(
+                    "{board}: pwm binding '{}' on the {family} family, whose PWM numbers this generator does not state",
+                    binding.role
+                ));
+            }
+            "adc" if family == "rp2350" => {
+                let block = set.block("adc", "").ok_or_else(|| format!("{board}: the {family} family has no adc block"))?;
+                let (channels, _) = rp_adc_channels(set, resolved, &block.channels)?;
+                for channel in channels {
+                    let (Some(pin), None) = (channel.pin, &channel.reserved_by) else { continue };
+                    if pin < 0 || pin >= count {
+                        continue;
+                    }
+                    pins[pin as usize].functions |= pin_function::ADC;
+                    pins[pin as usize].adc_channel = Some(channel.index);
+                }
+            }
+            "adc" => {
+                return Err(format!(
+                    "{board}: adc binding '{}' on the {family} family, whose converter channels this generator does not state",
+                    binding.role
+                ));
+            }
+            other => {
+                return Err(format!("{board}: binding '{}' is of kind '{other}', whose pins a board's facts cannot state", binding.role));
+            }
+        }
+    }
+    for pin in &pins {
+        for label in &pin.labels {
+            if label.is_empty() || label.chars().any(|c| c.is_whitespace() || c.is_control() || c == '"' || c == '\\') {
+                return Err(format!("{board}: the pin label '{label}' is empty or holds a space, a quote or a control character"));
+            }
+        }
+    }
+    facts.pins = pins;
+    Ok(facts)
+}
+
+/// The name a part's pin set lists for `number`, where it lists one.
+fn pins_listed(numbered: &[(i64, String)], number: i64) -> Option<&str> {
+    numbered.iter().find(|(n, _)| *n == number).map(|(_, name)| name.as_str())
+}
+
+/// A C# string literal holding `units`, one char each: a printable ASCII char as itself, and every
+/// other char as `\uXXXX`.
+fn csharp_char_table(units: &[u32]) -> Result<String, String> {
+    let mut out = String::from("\"");
+    for &unit in units {
+        if unit >= 0xD800 {
+            return Err(format!("a facts table value {unit} does not fit one char below the surrogates"));
+        }
+        match char::from_u32(unit) {
+            Some(c) if (' '..='~').contains(&c) && c != '"' && c != '\\' => out.push(c),
+            _ => out.push_str(&format!("\\u{unit:04X}")),
+        }
+    }
+    out.push('"');
+    Ok(out)
+}
+
+/// A number a facts table stores plus one, 0 standing for none.
+fn stored(value: Option<i64>) -> Result<u32, String> {
+    match value {
+        None => Ok(0),
+        Some(value) => u32::try_from(value + 1).map_err(|_| format!("a facts table value {value} is negative")),
+    }
+}
+
+/// A rate stored as two chars of 15 bits, high first.
+fn stored_wide(value: i64) -> Result<[u32; 2], String> {
+    let value = u32::try_from(value).map_err(|_| format!("a facts table rate {value} is negative or too large"))?;
+    Ok([value >> 15, value & 0x7FFF])
+}
+
 /// Emits what `Lamella.Hardware.TargetBoard` asks a board's facts for: the board's id, which is the
-/// name a build selects the board by, and the call that arms the board.
+/// name a build selects the board by, the call that arms the board, and [`target_board_facts`].
 ///
 /// `TargetBoard` is compiled once, in `libs/Lamella.Hardware`, against the facts assembly's fixed name,
 /// `Lamella.Hardware.Facts`, and `csharp/build-boards.ps1` compiles this file into the board's own
@@ -5745,14 +6191,18 @@ pub const TARGET_BOARD_FACTS_FILE: &str = "TargetBoardFacts.g.cs";
 /// rather than a construction, because a class's constructor may do more than bind: the Pico 2's
 /// raises the clock tree. A board whose package declares no class has nothing to bind, and arming it
 /// reads the generated bindings' identity alone.
-#[must_use]
+///
+/// The pin and bus tables are string literals, which an AOT image keeps in flash and a program
+/// decodes only when it asks for a pin or a bus; their layout is in the emitted comments.
 pub fn emit_target_board_facts_csharp(
+    set: &FamilySet,
     resolved: &ResolvedBoard,
     board_class: Option<&str>,
     sources: &[String],
     regen: &str,
-) -> String {
+) -> Result<String, String> {
     let id = &resolved.board.board;
+    let facts = target_board_facts(set, resolved)?;
     let arm = match board_class {
         Some(class) => format!(
             "        /// <summary>Binds the board's buses, and answers the board's wire identity: reading a\n        \
@@ -5770,22 +6220,109 @@ pub fn emit_target_board_facts_csharp(
             bindings = bindings_class(id),
         ),
     };
-    format!(
+    let mut pin_units = Vec::new();
+    for pin in &facts.pins {
+        pin_units.push(pin.functions);
+        for value in [pin.i2c_bus, pin.spi_bus, pin.pwm_chip, pin.pwm_channel, pin.adc_channel] {
+            pin_units.push(stored(value)?);
+        }
+    }
+    let labels: Vec<u32> = if facts.pins.iter().any(|pin| !pin.labels.is_empty()) {
+        facts.pins.iter().map(|pin| pin.labels.join(" ")).collect::<Vec<_>>().join("\n").chars().map(u32::from).collect()
+    } else {
+        Vec::new()
+    };
+    let mut i2c_units = Vec::new();
+    for bus in &facts.i2c {
+        i2c_units.push(u32::try_from(bus.number).map_err(|_| format!("{id}: a negative I2C bus number"))?);
+        i2c_units.push(stored(bus.sda)?);
+        i2c_units.push(stored(bus.scl)?);
+    }
+    let mut spi_units = Vec::new();
+    for bus in &facts.spi {
+        spi_units.push(u32::try_from(bus.number).map_err(|_| format!("{id}: a negative SPI bus number"))?);
+        spi_units.push(stored(bus.sck)?);
+        spi_units.push(stored(bus.mosi)?);
+        spi_units.push(stored(bus.miso)?);
+        spi_units.push(u32::try_from(bus.selects.len()).map_err(|_| format!("{id}: too many chip selects"))?);
+        for select in &bus.selects {
+            spi_units.push(stored(Some(*select))?);
+        }
+        spi_units.extend(stored_wide(bus.min_hz)?);
+        spi_units.extend(stored_wide(bus.max_hz)?);
+    }
+    let string_property = |summary: &str, name: &str, literal: &str| {
+        format!(
+            "        /// <summary>{summary}</summary>\n        internal static string {name}\n        {{\n            get {{ return {literal}; }}\n        }}\n"
+        )
+    };
+    let int_property = |summary: &str, name: &str, value: i64| {
+        format!(
+            "        /// <summary>{summary}</summary>\n        internal static int {name}\n        {{\n            get {{ return {value}; }}\n        }}\n"
+        )
+    };
+    let clock_summary = if facts.clock_hz == 0 {
+        "The processor's clock frequency in hertz: 0, as the board's table states none under its default\n        /// plan, which TargetBoard.ClockFrequency refuses to answer."
+    } else {
+        "The processor's clock frequency in hertz under the board's default plan."
+    };
+    let mut members = String::new();
+    members.push_str(&string_property("The board's maker, as the maker names itself.", "Maker", &format!("\"{}\"", facts.maker)));
+    members.push('\n');
+    members.push_str(&string_property("The board's product name, as its maker names it.", "Product", &format!("\"{}\"", facts.product)));
+    members.push('\n');
+    members.push_str(&string_property("The board's chip.", "Chip", &format!("\"{}\"", facts.chip)));
+    members.push('\n');
+    members.push_str(&int_property(clock_summary, "ClockFrequency", facts.clock_hz));
+    members.push('\n');
+    members.push_str(&int_property(
+        "How many pins the pin table numbers, from 0.",
+        "PinCount",
+        i64::try_from(facts.pins.len()).map_err(|_| format!("{id}: too many pins"))?,
+    ));
+    members.push('\n');
+    members.push_str(&string_property(
+        "The pin table, by pin number: six chars a pin, its functions, then its I2C bus, SPI bus, PWM\n        /// chip, PWM channel and converter channel, each stored plus one, 0 for none.",
+        "Pins",
+        &csharp_char_table(&pin_units)?,
+    ));
+    members.push('\n');
+    members.push_str(&string_property(
+        "The label table, by pin number: a pin's labels separated by spaces, the pins separated by\n        /// line feeds.",
+        "Labels",
+        &csharp_char_table(&labels)?,
+    ));
+    members.push('\n');
+    members.push_str(&string_property(
+        "The I2C bus table: three chars a bus, its number, then its data and clock pins, each stored\n        /// plus one.",
+        "I2cBuses",
+        &csharp_char_table(&i2c_units)?,
+    ));
+    members.push('\n');
+    members.push_str(&string_property(
+        "The SPI bus table: each bus's number, its clock, out and in pins, its chip-select count and\n        /// each select's pin, every pin stored plus one, then its slowest and fastest rates, each two chars\n        /// of 15 bits, high first.",
+        "SpiBuses",
+        &csharp_char_table(&spi_units)?,
+    ));
+    members.push('\n');
+    members.push_str(&pwm_line_members(set, resolved, &facts)?);
+    Ok(format!(
         "// GENERATED by lamella-bsp-gen from {list} -- DO NOT EDIT.\n\
          // Regenerate: {regen}\n\
          //\n\
-         // What Lamella.Hardware.TargetBoard answers on the {id}: its name, and how it is armed.\n\
+         // What Lamella.Hardware.TargetBoard answers on the {id}: its name, how it is armed, and its facts.\n\
          namespace Lamella.Generated\n\
          {{\n    \
          internal static class TargetBoardFacts\n    \
          {{\n        \
          /// <summary>The board's id, the name a build selects this board by.</summary>\n        \
          internal static string Name\n        {{\n            get {{ return \"{id}\"; }}\n        }}\n\n\
-         {arm}    \
+         {arm}\n\
+         {members}    \
          }}\n\
          }}\n",
         list = sources.join(" + "),
-    )
+    ))
 }
 
 /// One resolved uart-binding emission: the values the neutral binding contract names, derived
@@ -14597,36 +15134,99 @@ fn rp2350_bus_rows(set: &FamilySet, resolved: &ResolvedBoard) -> Result<Vec<BusR
     Ok(rows)
 }
 
-/// The GPIO row, in Rp2350GpioDriver's constructor order: the mask of the bank-0 lines the board
-/// reserves, the number of paired pins, then each pin and the partner pad the board wires to it.
+/// What `TargetBoard` asks of the board's PWM lines: whether the board keeps a line for itself, and a
+/// channel on a line. Only the RP2350's pin records carry a PWM line, so on any other board nothing
+/// reaches the second, and the first answers no.
+fn pwm_line_members(set: &FamilySet, resolved: &ResolvedBoard, facts: &TargetBoardFacts) -> Result<String, String> {
+    let (reserved, create) = if set.family == "rp2350" && !facts.pins.is_empty() {
+        let (bank0, bank1) = rp2350_reserved_masks(resolved)?;
+        let clock = u32::try_from(facts.clock_hz).map_err(|_| format!("{}: a clock that does not fit a word", resolved.board.board))?;
+        if clock == 0 {
+            return Err(format!(
+                "{}: the board states its pins and no clock under its default plan, and a PWM line's rate is a division of that clock",
+                resolved.board.board
+            ));
+        }
+        let twin = rp2350_paired_pads(resolved)?.iter().rev().fold(String::from("-1"), |rest, (paired, partner)| {
+            format!("pin == {paired} ? {partner} : pin == {partner} ? {paired} : {rest}")
+        });
+        (
+            if bank0 == 0 && bank1 == 0 {
+                String::from("return false;")
+            } else {
+                format!("return ((pin < 32 ? 0x{bank0:X}u : 0x{bank1:X}u) & (1u << (pin & 31))) != 0u;")
+            },
+            format!("return global::Rp2350PwmSlice.OpenLine(pin, {twin}, {clock}u, frequency, dutyCyclePercentage);"),
+        )
+    } else {
+        (
+            String::from("return false;"),
+            String::from("throw new global::System.NotSupportedException(\"this board's facts name no PWM line\");"),
+        )
+    };
+    Ok(format!(
+        "        /// <summary>Whether the board keeps the GPIO line <paramref name=\"pin\"/> for a part of its own.</summary>\n        \
+         internal static bool IsPinReserved(int pin)\n        {{\n            {reserved}\n        }}\n\n\
+         #if LAMELLA_SURFACE_FLOAT\n        \
+         /// <summary>A PWM channel on the GPIO line <paramref name=\"pin\"/>, not yet started.</summary>\n        \
+         internal static global::System.Device.Pwm.PwmChannel CreatePwmOn(int pin, int frequency, double dutyCyclePercentage)\n        {{\n            {create}\n        }}\n\
+         #endif\n"
+    ))
+}
+
+/// The GPIO lines the board reserves, as the masks of bank 0 and bank 1.
+fn rp2350_reserved_masks(resolved: &ResolvedBoard) -> Result<(u32, u32), String> {
+    let id = &resolved.board.board;
+    let mut reserved = 0u32;
+    let mut reserved_bank1 = 0u32;
+    for line in resolved.board.devices.iter().chain(resolved.module_pins.iter()) {
+        if !line.reserved {
+            continue;
+        }
+        let index = split_pin(&line.pin)
+            .map(|(_, index)| index)
+            .ok_or_else(|| format!("{id}: '{}' is not a GPIO, and the GPIO row numbers its pins", line.pin))?;
+        match index {
+            0..=31 => reserved |= 1 << index,
+            32..=47 => reserved_bank1 |= 1 << (index - 32),
+            _ => {
+                return Err(format!("{id}: device '{}' reserves {}, and the RP2350 has GP0 to GP47", line.name, line.pin));
+            }
+        }
+    }
+    Ok((reserved, reserved_bank1))
+}
+
+/// The GPIO row: the mask of the bank-0 lines the board reserves, the number of paired pins, each pin
+/// and the partner pad the board wires to it, and, only where the board reserves one, the mask of the
+/// bank-1 lines it reserves.
 fn rp2350_gpio_words(resolved: &ResolvedBoard) -> Result<Vec<u32>, String> {
+    let id = &resolved.board.board;
+    let (reserved, reserved_bank1) = rp2350_reserved_masks(resolved)?;
+    let pairs = rp2350_paired_pads(resolved)?;
+    let mut words = vec![reserved, u32::try_from(pairs.len()).map_err(|_| format!("{id}: too many paired pins"))?];
+    words.extend(pairs.iter().flat_map(|(paired, partner)| [*paired, *partner]));
+    if reserved_bank1 != 0 {
+        words.push(reserved_bank1);
+    }
+    Ok(words)
+}
+
+/// The two pads of each net the board wires twice, as (the row's twin, the row's own pin).
+fn rp2350_paired_pads(resolved: &ResolvedBoard) -> Result<Vec<(u32, u32)>, String> {
     let id = &resolved.board.board;
     let gpio = |pin: &str| {
         split_pin(pin)
             .map(|(_, index)| index)
             .ok_or_else(|| format!("{id}: '{pin}' is not a GPIO, and the GPIO row numbers its pins"))
     };
-    let mut reserved = 0u32;
     let mut pairs = Vec::new();
     for line in resolved.board.devices.iter().chain(resolved.module_pins.iter()) {
-        if line.reserved {
-            let index = gpio(&line.pin)?;
-            if index >= 32 {
-                return Err(format!(
-                    "{id}: device '{}' reserves {}, but the RP2350 GPIO driver's reserved mask covers GP0 to GP31",
-                    line.name, line.pin
-                ));
-            }
-            reserved |= 1 << index;
-        }
         if !line.twin.is_empty() {
-            pairs.push(gpio(&line.twin)?);
-            pairs.push(gpio(&line.pin)?);
+            pairs.push((gpio(&line.twin)?, gpio(&line.pin)?));
         }
     }
-    let mut words = vec![reserved, u32::try_from(pairs.len() / 2).map_err(|_| format!("{id}: too many paired pins"))?];
-    words.extend(pairs);
-    Ok(words)
+    Ok(pairs)
 }
 
 /// A bus's number: the block number its instance ends in (`i2c0` is bus 0).
@@ -14786,11 +15386,12 @@ pub fn generate_family(repo_root: &std::path::Path, family: &str) -> Result<Vec<
         out.push(Generated {
             path: format!("{BOARDS_DIR}/{dir}/csharp/{TARGET_BOARD_FACTS_FILE}"),
             contents: emit_target_board_facts_csharp(
+                &set,
                 &resolved,
                 declared.then_some(class.as_str()),
                 &facts_sources,
                 &regen,
-            ),
+            )?,
         });
         out.push(Generated {
             path: format!("{BOARDS_DIR}/{dir}/rust/{}_bindings.rs", snake(&id)),
@@ -14843,7 +15444,7 @@ value = 0x2
     /// static, or reads the bindings' identity where the package declares no class.
     #[test]
     fn target_board_facts_name_the_board_and_arm_its_class() {
-        assert_eq!(board_class("rpi-pico2-w"), "Pico2W");
+        assert_eq!(board_class("raspberrypi-pico-2-w"), "Pico2W");
         assert_eq!(board_class("pimoroni-pico-plus-2"), "PicoPlus2");
         assert_eq!(board_class("bbc-micro-bit-v2"), "MicroBitV2");
         assert_eq!(board_class("automationdirect-p1am-100"), "P1am100");
@@ -14858,12 +15459,129 @@ value = 0x2
             };
             resolve_board(&set, board).expect("resolves")
         };
-        let armed = emit_target_board_facts_csharp(&board("rpi-pico2-w"), Some("Pico2W"), &[], "regen");
-        assert!(armed.contains("internal static string Name\n        {\n            get { return \"rpi-pico2-w\"; }\n        }"), "{armed}");
+        let armed = emit_target_board_facts_csharp(&set, &board("raspberrypi-pico-2-w"), Some("Pico2W"), &[], "regen")
+            .expect("the Pico 2 W's facts emit");
+        assert!(armed.contains("internal static string Name\n        {\n            get { return \"raspberrypi-pico-2-w\"; }\n        }"), "{armed}");
         assert!(!armed.contains("const"), "a constant would be compiled into Lamella.Hardware: {armed}");
         assert!(armed.contains("return global::Lamella.Boards.RaspberryPi.Pico2W.BoardModel;"), "{armed}");
-        let bare = emit_target_board_facts_csharp(&board("rpi-pico2"), None, &[], "regen");
-        assert!(bare.contains("return RpiPico2Bindings.BOARD_MODEL;"), "{bare}");
+        let bare = emit_target_board_facts_csharp(&set, &board("raspberrypi-pico-2"), None, &[], "regen")
+            .expect("the Pico 2's facts emit");
+        assert!(bare.contains("return RaspberrypiPico2Bindings.BOARD_MODEL;"), "{bare}");
+    }
+
+
+    /// A part that states its whole pin set has every binding read into a board's facts, so a binding the
+    /// reading would pass over is refused: a UART signal it does not name, a UART naming none, and a kind it
+    /// does not read. An RP2350 board with pins and no clock under its default plan is refused too, since
+    /// a PWM line's rate is a division of that clock.
+    #[test]
+    fn target_board_facts_refuse_what_they_would_pass_over() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let set = load_family(&repo, "rp2350").expect("the family loads");
+        let resolved = || {
+            let Strata::Board(board) = parse(&read(&crate::boards::board_dir(&repo, "raspberrypi-pico-2").join("board.toml")).expect("reads"))
+                .expect("parses")
+            else {
+                panic!("a board table");
+            };
+            resolve_board(&set, board).expect("the board resolves")
+        };
+        let refusal = |change: &dyn Fn(&mut Binding)| {
+            let mut board = resolved();
+            change(board.bindings.iter_mut().find(|binding| binding.kind == "uart").expect("the board binds a UART"));
+            target_board_facts(&set, &board).expect_err("the facts refuse it")
+        };
+        let typo = refusal(&|binding| binding.pins[0].0 = String::from("txd"));
+        assert!(typo.contains("names a signal 'txd'"), "{typo}");
+        let empty = refusal(&|binding| binding.pins.clear());
+        assert!(empty.contains("states neither tx nor rx"), "{empty}");
+        let kind = refusal(&|binding| binding.kind = String::from("can"));
+        assert!(kind.contains("is of kind 'can'"), "{kind}");
+
+        let board = resolved();
+        let mut facts = target_board_facts(&set, &board).expect("the board's own facts");
+        facts.clock_hz = 0;
+        let clock = pwm_line_members(&set, &board, &facts).expect_err("no clock is refused");
+        assert!(clock.contains("no clock under its default plan"), "{clock}");
+    }
+
+    /// What `Lamella.Hardware.TargetBoard` reads of three boards. The Pico 2's facts are RHU's
+    /// `raspberrypi-pico-2` row's (maker, product, chip, clock, 30 pins labelled GP0 to GP29, I2C bus 0 on GP4 and
+    /// GP5, SPI bus 0 on GP18, GP19 and GP16 with GP17's select, 184 Hz to 6 MHz) but for PWM, which a pin
+    /// carries, as Lamella's slice and A or B, only on a slice the board binds. The micro:bit v1 numbers
+    /// the nRF51822's 31 GPIOs and prints no label for them. A board whose part states no whole pin set
+    /// gets no pin or bus table, and a chip is named as its maker writes it.
+    #[test]
+    fn target_board_facts_state_each_board_from_its_table() {
+        assert_eq!(chip_name("rp2350a"), "RP2350A");
+        assert_eq!(chip_name("nrf51822"), "nRF51822");
+        assert_eq!(chip_name("esp32c6"), "ESP32-C6");
+        assert_eq!(chip_name("stm32u5a5zjt6q"), "STM32U5A5ZJT6Q");
+
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let facts = |family: &str, id: &str| {
+            let set = load_family(&repo, family).expect("the family loads");
+            let Strata::Board(board) = parse(&read(&crate::boards::board_dir(&repo, id).join("board.toml")).expect("reads"))
+                .expect("parses")
+            else {
+                panic!("{id} is a board")
+            };
+            target_board_facts(&set, &resolve_board(&set, board).expect("resolves")).expect("the facts derive")
+        };
+
+        let pico = facts("rp2350", "raspberrypi-pico-2");
+        assert_eq!(
+            (pico.maker.as_str(), pico.product.as_str(), pico.chip.as_str(), pico.clock_hz),
+            ("Raspberry Pi", "Pico 2", "RP2350A", 150_000_000)
+        );
+        assert_eq!(pico.pins.len(), 30);
+        assert!(pico.pins.iter().enumerate().all(|(n, pin)| pin.labels == [format!("GP{n}")]));
+        assert_eq!(pico.i2c, [I2cBusFacts { number: 0, sda: Some(4), scl: Some(5) }]);
+        assert_eq!(
+            pico.spi,
+            [SpiBusFacts { number: 0, sck: Some(18), mosi: Some(19), miso: Some(16), selects: vec![17], min_hz: 184, max_hz: 6_000_000 }]
+        );
+        assert_eq!(
+            pico.pins[0].functions,
+            pin_function::GPIO | pin_function::I2C_SDA | pin_function::SPI_MISO | pin_function::UART_TX | pin_function::PWM
+        );
+        assert_eq!((pico.pins[0].i2c_bus, pico.pins[0].spi_bus, pico.pins[0].pwm_chip), (Some(0), Some(0), Some(0)));
+        assert!(
+            pico.pins.iter().enumerate().all(|(n, pin)| {
+                pin.functions & pin_function::PWM != 0 && pin.pwm_chip == Some(0) && pin.pwm_channel == Some(n as i64)
+            }),
+            "every pin is chip 0, with its own line as the channel"
+        );
+        assert_eq!((pico.pins[26].adc_channel, pico.pins[29].adc_channel), (Some(0), Some(3)));
+
+        let microbit = facts("nrf51", "bbc-micro-bit-v1");
+        assert_eq!(
+            (microbit.maker.as_str(), microbit.product.as_str(), microbit.chip.as_str(), microbit.clock_hz, microbit.pins.len()),
+            ("BBC", "micro:bit v1", "nRF51822", 16_000_000, 31)
+        );
+        assert!(microbit.pins.iter().all(|pin| pin.labels.is_empty() && pin.functions & pin_function::GPIO != 0));
+        assert_eq!(microbit.i2c, [I2cBusFacts { number: 0, sda: Some(30), scl: Some(0) }]);
+        assert_eq!(
+            microbit.spi,
+            [SpiBusFacts { number: 0, sck: Some(23), mosi: Some(21), miso: Some(22), selects: vec![], min_hz: 125_000, max_hz: 4_000_000 }]
+        );
+        assert_eq!(microbit.pins[24].functions, pin_function::GPIO | pin_function::UART_TX);
+
+        let xpro = facts("samd21", "microchip-sam-d21-xplained-pro");
+        assert!(xpro.pins.is_empty() && xpro.i2c.is_empty() && xpro.spi.is_empty(), "{xpro:?}");
+        assert_eq!((xpro.chip.as_str(), xpro.clock_hz), ("ATSAMD21J18A", 8_000_000));
+    }
+
+    /// The facts' tables are string literals of one char a value: printable ASCII as itself and every
+    /// other char escaped, a value at or above the surrogates refused, and a rate split into two chars
+    /// of 15 bits, high first.
+    #[test]
+    fn target_board_fact_tables_are_one_char_a_value() {
+        assert_eq!(csharp_char_table(&[0, 65, 0x22, 0x5C, 0x7F]), Ok(String::from("\"\\u0000A\\u0022\\u005C\\u007F\"")));
+        assert!(csharp_char_table(&[0xD800]).is_err());
+        assert_eq!(stored_wide(6_000_000), Ok([183, 3456]));
+        assert_eq!(stored(None), Ok(0));
+        assert_eq!(stored(Some(29)), Ok(30));
     }
 
     /// A chip select is numbered as its family's GPIO driver numbers the pin, and the family decides:
@@ -15978,7 +16696,7 @@ source = \"a datasheet\"
 
     #[test]
     fn snake_maps_board_ids_to_module_file_stems() {
-        assert_eq!(snake("microchip-samd21-xpro"), "microchip_samd21_xpro");
+        assert_eq!(snake("microchip-sam-d21-xplained-pro"), "microchip_sam_d21_xplained_pro");
         assert_eq!(snake("arduino-zero"), "arduino_zero");
         assert_eq!(snake("samd21"), "samd21");
     }
@@ -16680,7 +17398,7 @@ resolution_bits = "16..20, depending only on the oversampling setting"
         }
     }
 
-    const PICO2_W: &str = include_str!("../../../bsp/boards/rpi-pico2-w/board.toml");
+    const PICO2_W: &str = include_str!("../../../bsp/boards/raspberrypi-pico-2-w/board.toml");
 
     /// The Pico 2 W's file with `section` in place of its own `[csharp_interpreter]`, which is its last.
     fn pico2_w_with(section: &str) -> Result<BoardTable, String> {

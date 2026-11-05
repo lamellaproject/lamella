@@ -1,7 +1,7 @@
 # Board support
 
 Each board has one folder under `boards/`, named by the board's id, the name a build selects the
-board by: `boards/rpi-pico2/` is the Raspberry Pi Pico 2. A board's folder holds:
+board by: `boards/raspberrypi-pico-2/` is the Raspberry Pi Pico 2. A board's folder holds:
 
 - `board.toml`, the board's facts and the documents they come from.
 - `csharp/`, the board's C# package: its bindings and, on most boards, the board class that binds
@@ -24,5 +24,12 @@ compiles every source under `common/csharp/` into every board's facts assembly.
 
 `Lamella.Hardware.TargetBoard` is compiled once, in `libs/Lamella.Hardware`, against the one name
 every board's facts assembly has, `Lamella.Hardware.Facts`. It asks the facts which board the program
-was built for through each board's generated `TargetBoardFacts.g.cs`, and a build for a board takes
-that board's facts in place of the boardless ones in `libs/Lamella.Hardware.Facts`.
+was built for, and what that board is, through each board's generated `TargetBoardFacts.g.cs`: its
+maker and product (the `maker` and `product` keys of `board.toml`), its chip and clock, its pins and
+its buses. A build for a board takes that board's facts in place of the boardless ones in
+`libs/Lamella.Hardware.Facts`.
+
+A board's pins are numbered from its chip's whole pin set, which the chip family's `parts.toml` row
+states when it says `pins_complete = true`; a board whose chip's row lists only the pins its bindings
+use has no pin or bus table yet. `pin_labels = "chip"` says the board prints the chip's own pin names,
+`GP25` on a Raspberry Pi Pico 2.

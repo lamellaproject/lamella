@@ -9,5 +9,4 @@ The package holds the tool under `tools/`, the notices of the third-party softwa
 with, and Lamella's license texts.
 
 A tools package is published for each of these hosts: win-x64, win-arm64, linux-x64, linux-arm64
-and osx-arm64. Intel macOS (osx-x64) is not a supported Lamella.Sdk build or publish host in this
-release.
+and osx-arm64.

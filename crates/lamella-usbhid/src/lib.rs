@@ -3,6 +3,9 @@
 
 use std::time::Duration;
 
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+mod open_error;
+
 /// An error enumerating or exchanging reports with a HID device.
 #[derive(Debug)]
 #[non_exhaustive]
@@ -64,8 +67,21 @@ pub struct DeviceInfo {
     pub product_id: u16,
     /// Serial number string, if the OS reported one.
     pub serial_number: Option<String>,
-    /// Product string, if the OS reported one.
+    /// Product string, if the OS reported one. Which USB string this is differs by OS, so
+    /// [`interface_name`](Self::interface_name) and [`device_name`](Self::device_name) say what each
+    /// of them holds where the OS can read them.
     pub product: Option<String>,
+    /// The USB string naming this interface (`iInterface`). Empty when the OS holds none for it, and `None`
+    /// when the OS did not say, which is not the same thing. A device of one interface has no interface
+    /// node on Windows, so it reads as empty there, and [`device_name`](Self::device_name) is all that
+    /// names it.
+    pub interface_name: Option<String>,
+    /// The USB string naming the whole device (`iProduct`). Empty and `None` as for
+    /// [`interface_name`](Self::interface_name).
+    pub device_name: Option<String>,
+    /// Whether a USB device is above this interface in the OS's device tree, which a device over SPI or I2C
+    /// does not have. A Bluetooth device behind a USB radio does have one. `None` when the OS did not say.
+    pub on_usb: Option<bool>,
     /// An opaque, backend-specific handle that re-identifies THIS interface for [`Device::open_id`].
     /// It is the discriminator a composite probe needs, since every interface of one physical probe
     /// reports the same vid/pid/serial. Backend-specific and not to be parsed (Windows: the

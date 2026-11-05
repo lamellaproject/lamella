@@ -16,6 +16,16 @@ const HEADER: [&str; 4] = [
     "",
 ];
 
+/// The license notice `bundle.rs` carries, then a blank line. The store is published under the
+/// Mozilla Public License 2.0, and the index is generated from it, so the file states that
+/// license in the license's own notice form.
+const NOTICE: [&str; 4] = [
+    "// This Source Code Form is subject to the terms of the Mozilla Public",
+    "// License, v. 2.0. If a copy of the MPL was not distributed with this",
+    "// file, You can obtain one at https://mozilla.org/MPL/2.0/.",
+    "",
+];
+
 /// The lines of `bundle.rs` before the snapshot date's.
 const BEFORE_SNAPSHOT: [&str; 3] = [
     "/// The upstream bundle's \"Certificate data from Mozilla as of\" snapshot -- the store ages",
@@ -61,7 +71,7 @@ pub(crate) fn store(snapshot: &str, blocks: &[Block]) -> Result<Store, String> {
     entries.sort_by_key(|entry| entry.subject);
 
     let mut rust = String::new();
-    for line in HEADER.iter().chain(&BEFORE_SNAPSHOT) {
+    for line in HEADER.iter().chain(&NOTICE).chain(&BEFORE_SNAPSHOT) {
         rust.push_str(line);
         rust.push('\n');
     }

@@ -115,7 +115,8 @@ if (-not $Define) { $Define = $DefaultSurface }
 # without the capability behind them describes an image nobody can build, so it is refused here
 # rather than emerging as a missing type several assemblies later. The sources carry the same pairs
 # in their own `#if`, so the rule holds for any build path; this turns "you get an empty assembly"
-# into "you get told why".
+# into "you get told why". One dependency is not in this table: `Lamella.Hardware` names
+# `IReadOnlyList<T>`, so a surface without `LAMELLA_SURFACE_NETFX_4_5` stops at that library's compile.
 $SurfaceRequires = [ordered]@{
     'LAMELLA_SURFACE_NETFX_2_0' = @('LAMELLA_SURFACE_GENERICS')
     'LAMELLA_SURFACE_SERIAL'    = @('LAMELLA_SURFACE_NETFX_2_0')
@@ -141,7 +142,8 @@ foreach ($symbol in $SurfaceRequires.Keys) {
 
 # Every assembly under libs/, in an order where each is built after what it references. `references`
 # names other entries in this list; all of them reference the corlib implicitly. A row may carry
-# `held = '<reason>'`, and is then reported on every run instead of built.
+# `held = '<reason>'`, and is then reported on every run instead of built, and `langVersion = '<n>'`,
+# the C# version its own sources need when that is above the surface's (see the ladder below).
 $Assemblies = @(
     # Its own assembly, and the contrast with `System.Device.Pwm`'s fold below is the whole reason. Upstream's
     # `System.Device.Gpio` holds Gpio, I2c, Pwm and Spi and no Analog, so folding `System.Device.Pwm`
@@ -155,12 +157,14 @@ $Assemblies = @(
     # The boardless facts: what `Lamella.Hardware.TargetBoard` asks of the board a program was built
     # for, in a build that names none. Every board's facts assembly has this same name and these same
     # members, and a build for a board takes the board's in this one's place, as it takes the board's
-    # family build of System.Device.Gpio. References only corlib.
-    @{ name = 'Lamella.Hardware.Facts';                references = @() },
+    # family build of System.Device.Gpio. References System.Device.Gpio, which holds the PWM channel its
+    # one method answers.
+    @{ name = 'Lamella.Hardware.Facts';                references = @('System.Device.Gpio') },
     # `TargetBoard`, compiled once against the facts' fixed name. It hands out the standard GPIO, I2C,
     # SPI and analog classes, so it references both of their assemblies, and neither references it:
-    # the dotnet/iot-shaped surface a portable program references depends on nothing of ours.
-    @{ name = 'Lamella.Hardware';                      references = @('System.Device.Gpio', 'System.Device.Analog', 'Lamella.Hardware.Facts') },
+    # the dotnet/iot-shaped surface a portable program references depends on nothing of ours. At C# 9,
+    # because its pin and bus types are records, as the Lamella.Hardware package for .NET declares them.
+    @{ name = 'Lamella.Hardware';                      references = @('System.Device.Gpio', 'System.Device.Analog', 'Lamella.Hardware.Facts'); langVersion = '9' },
     @{ name = 'System.Device.Model';                   references = @() },
     @{ name = 'System.Net.NetworkInformation';         references = @() },
     # Full .NET's own assembly name, bare and unprefixed, because these are full .NET's types in full
@@ -318,7 +322,8 @@ foreach ($assembly in $Assemblies) {
     $refs = @("/reference:$corlibDll")
     foreach ($r in $assembly.references) { $refs += "/reference:$(Join-Path $out "$r.dll")" }
     Write-Host "$name ($($src.Count) sources) -> $dll"
-    Invoke-Lcsc $src @langArg @defineArg @refs /target:library "/out:$dll" /debug-
+    $libLangArg = @(if ($assembly.langVersion) { "/langversion:$($assembly.langVersion)" } else { $langArg })
+    Invoke-Lcsc $src @libLangArg @defineArg @refs /target:library "/out:$dll" /debug-
     if ($LASTEXITCODE -ne 0) { throw "$name compile failed ($LASTEXITCODE)" }
     $built += "$name.dll"
 }

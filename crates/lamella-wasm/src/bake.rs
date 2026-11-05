@@ -192,36 +192,3 @@ pub unsafe extern "C" fn lamella_bake_libs(
     ))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Reads the payload's `[u32 json_len][JSON]` head and the trailing image length.
-    fn parse(payload: &[u8]) -> (serde_json::Value, usize) {
-        let json_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
-        let json: serde_json::Value = serde_json::from_slice(&payload[4..4 + json_len]).unwrap();
-        let image_len =
-            u32::from_le_bytes(payload[4 + json_len..8 + json_len].try_into().unwrap()) as usize;
-        (json, image_len)
-    }
-
-    #[test]
-    fn bakes_a_corlib_and_app_into_an_image() {
-        let corlib = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../lamella-load/tests/fixtures/corlib.dll"
-        );
-        let app = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../lamella-wire-host/tests/fixtures/hello.exe"
-        );
-        let (Ok(corlib), Ok(app)) = (std::fs::read(corlib), std::fs::read(app)) else {
-            return;
-        };
-        let payload = bake(&corlib, &[], &app, true);
-        let (json, image_len) = parse(&payload);
-        assert!(json["error"].is_null(), "unexpected error: {}", json["error"]);
-        assert_eq!(json["violations"].as_array().unwrap().len(), 0, "no violations");
-        assert!(image_len > 0, "expected a baked image");
-    }
-}

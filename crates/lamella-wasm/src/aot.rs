@@ -294,7 +294,7 @@ mod tests {
     use super::*;
 
     /// Reads the payload's `[u32 json_len][JSON]` head and the trailing image length.
-    fn parse(payload: &[u8]) -> (serde_json::Value, usize) {
+    pub(super) fn parse(payload: &[u8]) -> (serde_json::Value, usize) {
         let json_len = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
         let json: serde_json::Value = serde_json::from_slice(&payload[4..4 + json_len]).unwrap();
         let image_len =
@@ -336,11 +336,11 @@ mod tests {
             ));
             json["busTable"].clone()
         };
-        assert_eq!(laid("rpi-pico2"), true);
+        assert_eq!(laid("raspberrypi-pico-2"), true);
         assert_eq!(laid("pimoroni-pico-plus-2-w"), true);
         assert_eq!(laid("bbc-micro-bit-v2"), false, "a family with no table");
         assert_eq!(
-            laid("rpi-pico2-typo"),
+            laid("raspberrypi-pico-2-typo"),
             false,
             "an id this build does not know"
         );
@@ -374,7 +374,7 @@ mod tests {
             &[],
             EMPTY_ARCHIVE,
             "rp2350",
-            "rpi-pico2",
+            "raspberrypi-pico-2",
         ));
         let error = json["error"].as_str().unwrap();
         assert!(
@@ -399,7 +399,7 @@ mod tests {
             &[],
             b"<!doctype html>",
             "rp2350",
-            "rpi-pico2",
+            "raspberrypi-pico-2",
         ));
         assert_eq!((image_len, elf_len), (0, 0));
         let error = json["error"].as_str().unwrap();
@@ -417,7 +417,7 @@ mod tests {
             &[],
             b"<!doctype html>",
             "rp2350",
-            "rpi-pico2",
+            "raspberrypi-pico-2",
         ));
         assert_eq!(image_len, 0);
         let error = json["error"].as_str().unwrap();
@@ -440,22 +440,5 @@ mod tests {
         assert_eq!(json["error"], "Parse");
         assert_eq!(image_len, 0);
     }
-
-    #[test]
-    fn a_real_assembly_reports_the_construct_that_did_not_lower() {
-        let fixture = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/../lamella-wire-host/tests/fixtures/hello.exe"
-        );
-        let Ok(cil) = std::fs::read(fixture) else {
-            return;
-        };
-        let (json, image_len) = parse(&build_payload(&cil, "rp2350"));
-        assert_eq!(image_len, 0);
-        assert!(
-            json["error"].as_str().unwrap().contains("CallUnsupported"),
-            "expected a lowering reason, got {}",
-            json["error"]
-        );
-    }
 }
+

@@ -2,6 +2,7 @@
 //! the Lamella Link debug channel -- VS Code (via lamella-dap) debugs code running ON A DEVICE
 //! with zero adapter changes.
 
+use crate::OpenFailure;
 use crate::{
     SerialTransport, TransferAck, abort_blocking, baked_image_checksum, deploy_image_blocking,
     deployed_status_blocking, hello_blocking, start_execution,
@@ -351,14 +352,14 @@ impl WireHostBackend {
     /// baked program this backend launches (and relaunches on a restart).
     ///
     /// # Errors
-    /// [`TransportError::Carrier`] if the port cannot be opened; [`TransportError::Closed`]
-    /// if the handshake times out or the target cannot debug.
+    /// [`TransportError::Carrier`] if the port cannot be opened; what the handshake or the target's
+    /// capabilities came to, said as happening after the open, otherwise.
     pub fn open(
         port: &str,
         baud: u32,
         image: Vec<u8>,
         timeout: Duration,
-    ) -> Result<Self, TransportError> {
+    ) -> Result<Self, OpenFailure> {
         Self::from_transport(WireTransport::Serial(SerialTransport::open(port, baud)?), image, timeout)
     }
 
@@ -374,7 +375,7 @@ impl WireHostBackend {
         serial: Option<&str>,
         image: Vec<u8>,
         timeout: Duration,
-    ) -> Result<Self, TransportError> {
+    ) -> Result<Self, OpenFailure> {
         Self::from_transport(WireTransport::Usb(UsbTransport::open_matching(vid, pid, serial)?), image, timeout)
     }
 
@@ -388,7 +389,7 @@ impl WireHostBackend {
         baud: u32,
         image: Vec<u8>,
         timeout: Duration,
-    ) -> Result<Self, TransportError> {
+    ) -> Result<Self, OpenFailure> {
         #[cfg(feature = "usb")]
         if target == "usb" || target.starts_with("usb:") {
             let (vid, pid, serial) = parse_usb_target(target);
@@ -402,7 +403,7 @@ impl WireHostBackend {
         mut transport: WireTransport,
         image: Vec<u8>,
         timeout: Duration,
-    ) -> Result<Self, TransportError> {
+    ) -> Result<Self, OpenFailure> {
         let caps = Capabilities(
             Capabilities::DEBUG_BASIC
                 | Capabilities::BREAKPOINTS
@@ -413,12 +414,12 @@ impl WireHostBackend {
                 | Capabilities::DEPLOY_PREFIX_CRC
                 | Capabilities::STRING_VALUES,
         );
-        let session = hello_blocking(&mut transport, 0, caps, timeout)?;
+        let session = hello_blocking(&mut transport, 0, caps, timeout).map_err(crate::failed_after_the_open)?;
         if !(session.caps.has(Capabilities::DEBUG_BASIC)
             && session.caps.has(Capabilities::BREAKPOINTS)
             && session.caps.has(Capabilities::STEPPING))
         {
-            return Err(TransportError::Closed);
+            return Err(crate::cannot_debug());
         }
         let pending_output = identity_line(&session.identity);
         Ok(Self {
@@ -724,8 +725,9 @@ impl WireHostBackend {
             .map(|_| ())
             .map_err(|error| {
                 format!(
-                    "the target did not acknowledge an ABORT ({error:?}): it is neither serving nor \
-                     running a program this host can stop"
+                    "the target did not acknowledge an ABORT ({}): it is neither serving nor \
+                     running a program this host can stop",
+                    crate::link_failure(error)
                 )
             })
     }
@@ -1242,7 +1244,7 @@ impl DebugBackend for WireHostBackend {
                 return Err("the target did not acknowledge the image as it was sent".to_string());
             }
             Err(error) => {
-                return Err(format!("the carrier failed while the image was sent: {error:?}"));
+                return Err(format!("the image could not be sent: {}", crate::link_failure(error)));
             }
         }
         self.start_deployed()

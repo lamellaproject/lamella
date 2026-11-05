@@ -8,11 +8,12 @@
   assembly, and its board, runtime and tools packages hold what those targets link a program with. This file decides
   only what a restore must know before any package exists, since a restore reads no package's props: the posture of an
   ahead-of-time build for RHU's boards, at the versions RHU's release was built with, and the packages to restore, each
-  at the exact version this SDK pins. Once they are restored, and each is the package this SDK pins by NuGet's own
-  SHA-512 of it, it imports RHU's props here, after Microsoft.NET.Sdk's props, and Sdk.targets imports RHU's targets
-  after Microsoft.NET.Sdk's targets, so that RHU's definition of each target it replaces is the last one. A package of
-  another hash, or a build package of another contract than this SDK's, is refused by name before any of RHU's targets
-  runs.
+  at the exact version this SDK pins. A library of RHU's release that the project references itself, such as
+  Lamella.Hardware, is restored at the version this SDK pins too. Once they are restored, and each is the package this
+  SDK pins by NuGet's content hash of it, it imports RHU's props here, after Microsoft.NET.Sdk's props, and Sdk.targets
+  imports RHU's targets after Microsoft.NET.Sdk's targets, so that RHU's definition of each target it replaces is the
+  last one. A package of another hash, or a build package of another contract than this SDK's, is refused by name
+  before any of RHU's targets runs.
 
   It never sets a property of RHU's own (Rhu*), nor CppCompilerAndLinker: those are RHU's targets' to set.
 -->
@@ -26,24 +27,31 @@
 
   <!-- The board the device dotnet run chose names, for a project that names none. Such a project lists a debug probe
        once for each of Lamella RHU's boards it reaches, probe:<serial>/<board>, and an emulator by the machine one of
-       RHU's boards runs on, emulator:<machine> (Lamella.Run.targets). dotnet run hands the device it chose to the
+       RHU's boards runs on, emulator:<machine>/<board> (Lamella.Run.targets). dotnet run hands the device it chose to the
        restore and the build as Device, so the board is taken here, before restore, which then brings the board's
        packages, and RHU's targets see it as if the project named it. A name that is none of RHU's boards gives no
        board, and the device list, which then holds no such device, refuses it. -->
   <PropertyGroup Condition="'$(_LamellaRhuDispatch)' == 'true' and '$(LamellaTargetBoard)' == '' and '$(Device)' != ''">
-    <_LamellaRhuDeviceBoard Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Device)', '^(?i:probe:).+/[^/]+$'))">$([System.Text.RegularExpressions.Regex]::Replace('$(Device)', '^.+/', ''))</_LamellaRhuDeviceBoard>
-    <_LamellaRhuDeviceMachine Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Device)', '^(?i:emulator:).+$'))">$([System.Text.RegularExpressions.Regex]::Replace('$(Device)', '^(?i:emulator:)', ''))</_LamellaRhuDeviceMachine>
-    <_LamellaRhuDeviceMachinePattern Condition="'$(_LamellaRhuDeviceMachine)' != ''">;$([System.Text.RegularExpressions.Regex]::Escape('$(_LamellaRhuDeviceMachine)'))=([^;]+);</_LamellaRhuDeviceMachinePattern>
-    <_LamellaRhuDeviceBoard Condition="'$(_LamellaRhuDeviceMachinePattern)' != '' and $([System.Text.RegularExpressions.Regex]::IsMatch('$(_LamellaRhuMachineBoards)', '$(_LamellaRhuDeviceMachinePattern)'))">$([System.Text.RegularExpressions.Regex]::Replace('$(_LamellaRhuMachineBoards)', '^.*$(_LamellaRhuDeviceMachinePattern).*$', '$1'))</_LamellaRhuDeviceBoard>
+    <_LamellaRhuDeviceBoard Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Device)', '^(?i:probe:|emulator:)[^/]+/[^/]+$'))">$([System.Text.RegularExpressions.Regex]::Replace('$(Device)', '^.+/', ''))</_LamellaRhuDeviceBoard>
+    <_LamellaRhuQualifiedMachine Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Device)', '^(?i:emulator:)[^/]+/[^/]+$'))">$([System.Text.RegularExpressions.Regex]::Replace('$(Device)', '^(?i:emulator:)([^/]+)/[^/]+$', '$1'))</_LamellaRhuQualifiedMachine>
+    <_LamellaRhuDeviceBoard Condition="'$(_LamellaRhuQualifiedMachine)' != '' and !$([System.String]::Copy('$(_LamellaRhuMachineBoards)').Contains(';$(_LamellaRhuQualifiedMachine)=$(_LamellaRhuDeviceBoard);'))"></_LamellaRhuDeviceBoard>
+    <_LamellaRhuDeviceMachine Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Device)', '^(?i:emulator:)[^/]+$'))">$([System.Text.RegularExpressions.Regex]::Replace('$(Device)', '^(?i:emulator:)', ''))</_LamellaRhuDeviceMachine>
+    <_LamellaRhuDeviceMachinePattern Condition="'$(_LamellaRhuDeviceMachine)' != ''">(?&lt;=;)$([System.Text.RegularExpressions.Regex]::Escape('$(_LamellaRhuDeviceMachine)'))=([^;]+)(?=;)</_LamellaRhuDeviceMachinePattern>
+    <_LamellaRhuDeviceBoard Condition="'$(_LamellaRhuDeviceMachinePattern)' != '' and $([System.Text.RegularExpressions.Regex]::Matches('$(_LamellaRhuMachineBoards)', '$(_LamellaRhuDeviceMachinePattern)').Count) == 1">$([System.Text.RegularExpressions.Regex]::Replace('$(_LamellaRhuMachineBoards)', '^.*$(_LamellaRhuDeviceMachinePattern).*$', '$1'))</_LamellaRhuDeviceBoard>
     <LamellaTargetBoard Condition="'$(_LamellaRhuDeviceBoard)' != '' and $([System.String]::Copy('$(_LamellaRhuBoardIds)').Contains(';$(_LamellaRhuDeviceBoard);'))">$(_LamellaRhuDeviceBoard)</LamellaTargetBoard>
     <_LamellaRhuBoardFromDevice Condition="'$(LamellaTargetBoard)' != ''">true</_LamellaRhuBoardFromDevice>
   </PropertyGroup>
 
-  <!-- A board the project names is never changed by a device: a device that names another board after a probe's
-       serial number is refused by name, before restore and before the first step of a build or a publish. One that
-       names the project's own board is that probe's id. -->
+  <!-- A board the project names is never changed by a device: a qualified probe or emulator that names another
+       board is refused by name, before restore and before the first step of a build or a publish. One that
+       names the project's own board is that device's unqualified id. -->
   <PropertyGroup Condition="'$(_LamellaRhuDispatch)' == 'true' and '$(_LamellaRhuBoardFromDevice)' != 'true' and '$(LamellaTargetBoard)' != ''">
-    <_LamellaRhuDeviceNamesBoard Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Device)', '^(?i:probe:).+/[^/]+$'))">$([System.Text.RegularExpressions.Regex]::Replace('$(Device)', '^.+/', ''))</_LamellaRhuDeviceNamesBoard>
+    <_LamellaRhuDeviceNamesBoard Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Device)', '^(?i:probe:|emulator:)[^/]+/[^/]+$'))">$([System.Text.RegularExpressions.Regex]::Replace('$(Device)', '^.+/', ''))</_LamellaRhuDeviceNamesBoard>
+  </PropertyGroup>
+  <!-- The release manifest marks emulator targets with a machine. A run route's machine alone
+       does not change a physical board into an emulator target. -->
+  <PropertyGroup Condition="'$(_LamellaRhuDispatch)' == 'true' and '$(LamellaTargetBoard)' != ''">
+    <_LamellaRhuEmulatorBoard Condition="$([System.String]::Copy('$(_LamellaRhuMachineBoards)').Contains('=$(LamellaTargetBoard);'))">true</_LamellaRhuEmulatorBoard>
   </PropertyGroup>
   <Target Name="_LamellaRhuDeviceBoardCheck"
           BeforeTargets="CollectPackageReferences;_CheckForInvalidConfigurationAndPlatform;BuildOnlySettings"
@@ -75,14 +83,15 @@
     <PackageReference Include="Lamella.Rhu.Build" Version="[$(_LamellaRhuBuildVersion)]" PrivateAssets="all" ExcludeAssets="all" IsImplicitlyDefined="true" />
   </ItemGroup>
 
-  <!-- RHU's build package as restored: its folder, and whether it is the package this SDK pins, by the SHA-512 NuGet
-       writes beside a package as it extracts it. A build evaluates the project before its first restore too, and then
+  <!-- RHU's build package as restored: its folder, and whether it is the package this SDK pins, by NuGet's content
+       hash of it, which NuGet writes as contentHash in .nupkg.metadata beside a package as it extracts it, and which a
+       repository's signature does not move. A build evaluates the project before its first restore too, and then
        nothing is restored yet. -->
   <PropertyGroup Condition="'$(_LamellaRhuDispatch)' == 'true' and '$(NuGetPackageRoot)' != ''">
     <_LamellaRhuBuildDir>$([MSBuild]::NormalizeDirectory('$(NuGetPackageRoot)', 'lamella.rhu.build', '$(_LamellaRhuBuildVersion.ToLowerInvariant())'))</_LamellaRhuBuildDir>
-    <_LamellaRhuBuildHashFile>$(_LamellaRhuBuildDir)lamella.rhu.build.$(_LamellaRhuBuildVersion.ToLowerInvariant()).nupkg.sha512</_LamellaRhuBuildHashFile>
-    <_LamellaRhuBuildRestoredSha512 Condition="Exists('$(_LamellaRhuBuildHashFile)')">$([System.IO.File]::ReadAllText('$(_LamellaRhuBuildHashFile)').Trim())</_LamellaRhuBuildRestoredSha512>
-    <_LamellaRhuBuildPinned Condition="'$(_LamellaRhuBuildRestoredSha512)' != '' and $([System.String]::Equals('$(_LamellaRhuBuildRestoredSha512)', '$(_LamellaRhuBuildNupkgSha512)'))">true</_LamellaRhuBuildPinned>
+    <_LamellaRhuBuildMetadataFile>$(_LamellaRhuBuildDir).nupkg.metadata</_LamellaRhuBuildMetadataFile>
+    <_LamellaRhuBuildRestoredContentSha512 Condition="Exists('$(_LamellaRhuBuildMetadataFile)')">$([System.Text.RegularExpressions.Regex]::Replace($([System.IO.File]::ReadAllText('$(_LamellaRhuBuildMetadataFile)')), '(?s)^(?:.*"contentHash"\s*:\s*"([A-Za-z0-9+/=]+)")?.*$', '$1'))</_LamellaRhuBuildRestoredContentSha512>
+    <_LamellaRhuBuildPinned Condition="'$(_LamellaRhuBuildRestoredContentSha512)' != '' and $([System.String]::Equals('$(_LamellaRhuBuildRestoredContentSha512)', '$(_LamellaRhuBuildContentSha512)'))">true</_LamellaRhuBuildPinned>
   </PropertyGroup>
 
   <!-- Its own props, which name RHU's props and targets and the contract version it implements. -->
@@ -98,7 +107,8 @@
 
   <!-- The packages a restore brings beside RHU's build package: RHU's tools for this machine on every restore, and,
        with a board named, the board's package and the runtime package of the board's processor class; each at the
-       exact version this SDK pins. -->
+       exact version this SDK pins. And each library of RHU's release the project references, which the project's own
+       reference restores. -->
   <Target Name="_LamellaRhuNeededPacks" Condition="'$(_LamellaRhuDispatch)' == 'true'">
     <ItemGroup>
       <_LamellaRhuNamedBoard Include="@(LamellaRhuBoard->WithMetadataValue('Identity', '$(LamellaTargetBoard)'))" Condition="'$(LamellaTargetBoard)' != ''" />
@@ -110,18 +120,58 @@
       <_LamellaRhuNeededPack Include="@(_LamellaRhuPack->WithMetadataValue('Kind', 'tools')->WithMetadataValue('RuntimeIdentifier', '$(_LamellaRhuHostRid)'))" />
       <_LamellaRhuNeededPack Include="@(_LamellaRhuPack->WithMetadataValue('Kind', 'board')->WithMetadataValue('Board', '$(LamellaTargetBoard)'))" Condition="'$(_LamellaRhuBoardClass)' != ''" />
       <_LamellaRhuNeededPack Include="@(_LamellaRhuPack->WithMetadataValue('Kind', 'runtime')->WithMetadataValue('Class', '$(_LamellaRhuBoardClass)'))" Condition="'$(_LamellaRhuBoardClass)' != ''" />
+      <_LamellaRhuLibraryPack Include="@(_LamellaRhuPack->WithMetadataValue('Kind', 'library'))" />
+      <_LamellaRhuUnreferencedLibrary Include="@(_LamellaRhuLibraryPack)" Exclude="@(PackageReference)" />
+      <_LamellaRhuReferencedLibrary Include="@(_LamellaRhuLibraryPack)" Exclude="@(_LamellaRhuUnreferencedLibrary)" />
+      <_LamellaRhuNeededPack Include="@(_LamellaRhuReferencedLibrary)" />
     </ItemGroup>
   </Target>
 
   <Target Name="_LamellaRhuDownloads" BeforeTargets="CollectPackageDownloads" DependsOnTargets="_LamellaRhuNeededPacks" Condition="'$(_LamellaRhuDispatch)' == 'true'">
     <ItemGroup>
-      <PackageDownload Include="@(_LamellaRhuNeededPack)" Version="[%(_LamellaRhuNeededPack.Version)]" />
+      <_LamellaRhuDownloadPack Include="@(_LamellaRhuNeededPack)" Exclude="@(_LamellaRhuReferencedLibrary)" />
+      <PackageDownload Include="@(_LamellaRhuDownloadPack)" Version="[%(_LamellaRhuDownloadPack.Version)]" />
     </ItemGroup>
   </Target>
 
+  <!-- The version a library of RHU's release is restored at: the one this SDK pins. This runs once for each library
+       the project references, so each version it reads is that library's. A reference that names no version is given
+       the pinned one, and one that names the pinned version is restored at exactly that version; one that names
+       another is kept, and refused below. With central package management the version is the project's
+       PackageVersion, or the reference's VersionOverride, and is checked, never changed. -->
+  <Target Name="_LamellaRhuLibraryVersion" DependsOnTargets="_LamellaRhuNeededPacks" Outputs="%(_LamellaRhuReferencedLibrary.Identity)" Condition="'$(_LamellaRhuDispatch)' == 'true'">
+    <PropertyGroup>
+      <_LamellaRhuLibraryId>@(_LamellaRhuReferencedLibrary)</_LamellaRhuLibraryId>
+      <_LamellaRhuLibraryPinnedVersion>@(_LamellaRhuReferencedLibrary->'%(Version)')</_LamellaRhuLibraryPinnedVersion>
+      <_LamellaRhuLibraryCentral>false</_LamellaRhuLibraryCentral>
+      <_LamellaRhuLibraryCentral Condition="'$(ManagePackageVersionsCentrally)' == 'true'">true</_LamellaRhuLibraryCentral>
+      <_LamellaRhuLibraryNamedVersion>@(PackageReference->WithMetadataValue('Identity', '$(_LamellaRhuLibraryId)')->'%(Version)')</_LamellaRhuLibraryNamedVersion>
+      <_LamellaRhuLibraryNamedVersion Condition="'$(_LamellaRhuLibraryCentral)' == 'true'">@(PackageVersion->WithMetadataValue('Identity', '$(_LamellaRhuLibraryId)')->'%(Version)')</_LamellaRhuLibraryNamedVersion>
+      <_LamellaRhuLibraryOverride Condition="'$(_LamellaRhuLibraryCentral)' == 'true'">@(PackageReference->WithMetadataValue('Identity', '$(_LamellaRhuLibraryId)')->'%(VersionOverride)')</_LamellaRhuLibraryOverride>
+      <_LamellaRhuLibraryNamedVersion Condition="'$(_LamellaRhuLibraryOverride)' != ''">$(_LamellaRhuLibraryOverride)</_LamellaRhuLibraryNamedVersion>
+      <_LamellaRhuLibraryNamed>$([System.String]::Copy('$(_LamellaRhuLibraryNamedVersion)').Trim().TrimStart('[').TrimEnd(']').Trim())</_LamellaRhuLibraryNamed>
+    </PropertyGroup>
+    <ItemGroup>
+      <_LamellaRhuMisnamedLibrary Include="@(_LamellaRhuReferencedLibrary)" NamedVersion="$(_LamellaRhuLibraryNamedVersion)" Central="$(_LamellaRhuLibraryCentral)" Condition="'$(_LamellaRhuLibraryNamed)' != '' and '$(_LamellaRhuLibraryNamed)' != '$(_LamellaRhuLibraryPinnedVersion)'" />
+      <PackageReference Condition="'%(PackageReference.Identity)' == '$(_LamellaRhuLibraryId)' and '$(_LamellaRhuLibraryCentral)' != 'true' and ('$(_LamellaRhuLibraryNamed)' == '' or '$(_LamellaRhuLibraryNamed)' == '$(_LamellaRhuLibraryPinnedVersion)')">
+        <Version>[$(_LamellaRhuLibraryPinnedVersion)]</Version>
+      </PackageReference>
+    </ItemGroup>
+  </Target>
+
+  <!-- A library of RHU's release named at another version than this SDK pins is refused by name, with both versions,
+       before restore and before the first step of a build or a publish. -->
+  <Target Name="_LamellaRhuLibraryCheck"
+          BeforeTargets="CollectPackageReferences;_CheckForInvalidConfigurationAndPlatform;BuildOnlySettings"
+          DependsOnTargets="_LamellaRhuLibraryVersion"
+          Condition="'$(_LamellaRhuDispatch)' == 'true'">
+    <Error Condition="'@(_LamellaRhuMisnamedLibrary->WithMetadataValue('Central', 'false'))' != ''" File="$(MSBuildProjectFullPath)" Code="LAMSDK0025" Text="@(_LamellaRhuMisnamedLibrary->WithMetadataValue('Central', 'false')->'This project references %(Identity) %(NamedVersion), and Lamella.Sdk $(LamellaSdkVersion) pins %(Identity) %(Version), from Lamella RHU%27s release $(_LamellaRhuRelease). Reference %(Identity) %(Version), or leave out its version to use the one Lamella.Sdk pins.', ' ')" />
+    <Error Condition="'@(_LamellaRhuMisnamedLibrary->WithMetadataValue('Central', 'true'))' != ''" File="$(MSBuildProjectFullPath)" Code="LAMSDK0025" Text="@(_LamellaRhuMisnamedLibrary->WithMetadataValue('Central', 'true')->'This project references %(Identity) %(NamedVersion), and Lamella.Sdk $(LamellaSdkVersion) pins %(Identity) %(Version), from Lamella RHU%27s release $(_LamellaRhuRelease). Give %(Identity) the version %(Version), in its PackageVersion or in the reference%27s VersionOverride.', ' ')" />
+  </Target>
+
   <!-- Why RHU's half cannot be used, or nothing when it can: RHU's build package or another of its packages not
-       restored, or restored with another SHA-512 than this SDK pins; or a build package of another contract than this
-       SDK's, or one that names no props or targets. -->
+       restored, or restored with another content hash than this SDK pins; or a build package of another contract than
+       this SDK's, or one that names no props or targets. -->
   <Target Name="_LamellaRhuFault" DependsOnTargets="_LamellaRhuNeededPacks" Condition="'$(_LamellaRhuDispatch)' == 'true'">
     <ItemGroup>
       <_LamellaRhuRestoredPack Include="@(_LamellaRhuNeededPack)">
@@ -132,22 +182,22 @@
         <PackageDirectory>$([MSBuild]::NormalizeDirectory('$(NuGetPackageRoot)', '%(LowerId)', '%(LowerVersion)'))</PackageDirectory>
       </_LamellaRhuRestoredPack>
       <_LamellaRhuRestoredPack>
-        <HashFile>%(PackageDirectory)%(LowerId).%(LowerVersion).nupkg.sha512</HashFile>
+        <MetadataFile>%(PackageDirectory).nupkg.metadata</MetadataFile>
       </_LamellaRhuRestoredPack>
-      <_LamellaRhuRestoredPack Condition="'$(NuGetPackageRoot)' != '' and Exists('%(HashFile)')">
-        <RestoredSha512>$([System.IO.File]::ReadAllText('%(HashFile)').Trim())</RestoredSha512>
+      <_LamellaRhuRestoredPack Condition="'$(NuGetPackageRoot)' != '' and Exists('%(MetadataFile)')">
+        <RestoredContentSha512>$([System.Text.RegularExpressions.Regex]::Replace($([System.IO.File]::ReadAllText('%(MetadataFile)')), '(?s)^(?:.*"contentHash"\s*:\s*"([A-Za-z0-9+/=]+)")?.*$', '$1'))</RestoredContentSha512>
       </_LamellaRhuRestoredPack>
-      <_LamellaRhuRestoredPack Condition="'%(_LamellaRhuRestoredPack.RestoredSha512)' != '' and !$([System.String]::Equals('%(_LamellaRhuRestoredPack.RestoredSha512)', '%(_LamellaRhuRestoredPack.NupkgSha512)'))">
+      <_LamellaRhuRestoredPack Condition="'%(_LamellaRhuRestoredPack.RestoredContentSha512)' != '' and !$([System.String]::Equals('%(_LamellaRhuRestoredPack.RestoredContentSha512)', '%(_LamellaRhuRestoredPack.ContentSha512)'))">
         <Unpinned>true</Unpinned>
       </_LamellaRhuRestoredPack>
-      <_LamellaRhuMissingPack Include="@(_LamellaRhuRestoredPack->WithMetadataValue('RestoredSha512', ''))" />
+      <_LamellaRhuMissingPack Include="@(_LamellaRhuRestoredPack->WithMetadataValue('RestoredContentSha512', ''))" />
       <_LamellaRhuUnpinnedPack Include="@(_LamellaRhuRestoredPack->WithMetadataValue('Unpinned', 'true'))" />
     </ItemGroup>
     <PropertyGroup>
-      <_LamellaRhuFaultCode Condition="'$(_LamellaRhuBuildRestoredSha512)' == ''">LAMSDK0012</_LamellaRhuFaultCode>
-      <_LamellaRhuFault Condition="'$(_LamellaRhuBuildRestoredSha512)' == ''">Lamella RHU's build package, Lamella.Rhu.Build $(_LamellaRhuBuildVersion), has not been restored. Restore the project (dotnet restore).</_LamellaRhuFault>
+      <_LamellaRhuFaultCode Condition="'$(_LamellaRhuBuildRestoredContentSha512)' == ''">LAMSDK0012</_LamellaRhuFaultCode>
+      <_LamellaRhuFault Condition="'$(_LamellaRhuBuildRestoredContentSha512)' == ''">Lamella RHU's build package, Lamella.Rhu.Build $(_LamellaRhuBuildVersion), has not been restored. Restore the project (dotnet restore).</_LamellaRhuFault>
       <_LamellaRhuFaultCode Condition="'$(_LamellaRhuFault)' == '' and '$(_LamellaRhuBuildPinned)' != 'true'">LAMSDK0013</_LamellaRhuFaultCode>
-      <_LamellaRhuFault Condition="'$(_LamellaRhuFault)' == '' and '$(_LamellaRhuBuildPinned)' != 'true'">The package Lamella.Rhu.Build $(_LamellaRhuBuildVersion) in '$(_LamellaRhuBuildDir)' is not the one Lamella.Sdk $(LamellaSdkVersion) pins: NuGet's SHA-512 of it is $(_LamellaRhuBuildRestoredSha512), and Lamella RHU's release $(_LamellaRhuRelease) has $(_LamellaRhuBuildNupkgSha512). Delete the folder '$(_LamellaRhuBuildDir)' and restore the project again (dotnet restore).</_LamellaRhuFault>
+      <_LamellaRhuFault Condition="'$(_LamellaRhuFault)' == '' and '$(_LamellaRhuBuildPinned)' != 'true'">The package Lamella.Rhu.Build $(_LamellaRhuBuildVersion) in '$(_LamellaRhuBuildDir)' is not the one Lamella.Sdk $(LamellaSdkVersion) pins: NuGet's content hash of it is $(_LamellaRhuBuildRestoredContentSha512), and Lamella RHU's release $(_LamellaRhuRelease) has $(_LamellaRhuBuildContentSha512). Delete the folder '$(_LamellaRhuBuildDir)' and restore the project again (dotnet restore).</_LamellaRhuFault>
       <_LamellaRhuFaultCode Condition="'$(_LamellaRhuFault)' == '' and '$(_LamellaRhuStatedContract)' != '$(LamellaShellContract)'">LAMSDK0014</_LamellaRhuFaultCode>
       <_LamellaRhuFault Condition="'$(_LamellaRhuFault)' == '' and '$(_LamellaRhuStatedContract)' != '$(LamellaShellContract)'">Lamella.Rhu.Build $(_LamellaRhuBuildVersion) implements contract $(_LamellaRhuStatedContract), and Lamella.Sdk $(LamellaSdkVersion) implements contract $(LamellaShellContract): they do not agree on what each hands the other, so none of Lamella RHU's targets is run.</_LamellaRhuFault>
       <_LamellaRhuFaultCode Condition="'$(_LamellaRhuFault)' == '' and '$(_LamellaRhuImports)' != 'true'">LAMSDK0015</_LamellaRhuFaultCode>
@@ -155,23 +205,23 @@
       <_LamellaRhuFaultCode Condition="'$(_LamellaRhuFault)' == '' and '@(_LamellaRhuMissingPack)' != ''">LAMSDK0012</_LamellaRhuFaultCode>
       <_LamellaRhuFault Condition="'$(_LamellaRhuFault)' == '' and '@(_LamellaRhuMissingPack)' != ''">Lamella RHU's package @(_LamellaRhuMissingPack->'%(Identity) %(Version)', ', ') has not been restored. Restore the project (dotnet restore).</_LamellaRhuFault>
       <_LamellaRhuFaultCode Condition="'$(_LamellaRhuFault)' == '' and '@(_LamellaRhuUnpinnedPack)' != ''">LAMSDK0013</_LamellaRhuFaultCode>
-      <_LamellaRhuFault Condition="'$(_LamellaRhuFault)' == '' and '@(_LamellaRhuUnpinnedPack)' != ''">@(_LamellaRhuUnpinnedPack->'The package %(Identity) %(Version) in %27%(PackageDirectory)%27 is not the one Lamella.Sdk $(LamellaSdkVersion) pins: NuGet%27s SHA-512 of it is %(RestoredSha512), and Lamella RHU%27s release $(_LamellaRhuRelease) has %(NupkgSha512). Delete the folder %27%(PackageDirectory)%27 and restore the project again (dotnet restore).', ' ')</_LamellaRhuFault>
+      <_LamellaRhuFault Condition="'$(_LamellaRhuFault)' == '' and '@(_LamellaRhuUnpinnedPack)' != ''">@(_LamellaRhuUnpinnedPack->'The package %(Identity) %(Version) in %27%(PackageDirectory)%27 is not the one Lamella.Sdk $(LamellaSdkVersion) pins: NuGet%27s content hash of it is %(RestoredContentSha512), and Lamella RHU%27s release $(_LamellaRhuRelease) has %(ContentSha512). Delete the folder %27%(PackageDirectory)%27 and restore the project again (dotnet restore).', ' ')</_LamellaRhuFault>
     </PropertyGroup>
   </Target>
 
   <!-- Before the first step of a build, of a publish and of a publish with no build, and so before any target of RHU's:
        a refusal, or the packages RHU's targets read, each as LamellaResolvedRhuPack: the package's id, its Kind (board,
        runtime or tools), the Version restored, and the PackageDirectory it was restored to, ending in a separator. Only
-       with a board named, and never the build package, whose own files find their folder. A publish of an ahead-of-time
-       program compiles without building, so it runs neither BeforeBuild nor the build's first check: BuildOnlySettings
-       is the step all three begin with. -->
+       with a board named, and never the build package, whose own files find their folder, nor a library, which the
+       project references itself. A publish of an ahead-of-time program compiles without building, so it runs neither
+       BeforeBuild nor the build's first check: BuildOnlySettings is the step all three begin with. -->
   <Target Name="_LamellaRhuCheck" BeforeTargets="_CheckForInvalidConfigurationAndPlatform;BuildOnlySettings" DependsOnTargets="_LamellaRhuFault" Condition="'$(_LamellaRhuDispatch)' == 'true'">
     <Error Condition="'$(_LamellaRhuFault)' != ''" File="$(MSBuildProjectFullPath)" Code="$(_LamellaRhuFaultCode)" Text="$(_LamellaRhuFault)" />
   </Target>
 
   <Target Name="_LamellaRhuResolvedPacks" BeforeTargets="_CheckForInvalidConfigurationAndPlatform;BuildOnlySettings" DependsOnTargets="_LamellaRhuCheck" Condition="'$(_LamellaRhuDispatch)' == 'true' and '$(LamellaTargetBoard)' != ''">
     <ItemGroup>
-      <LamellaResolvedRhuPack Include="@(_LamellaRhuRestoredPack)" KeepMetadata="Kind;Version;PackageDirectory" />
+      <LamellaResolvedRhuPack Include="@(_LamellaRhuRestoredPack)" Exclude="@(_LamellaRhuReferencedLibrary)" KeepMetadata="Kind;Version;PackageDirectory" />
     </ItemGroup>
   </Target>
 

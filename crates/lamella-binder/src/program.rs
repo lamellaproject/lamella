@@ -6,7 +6,7 @@ use crate::declaration::{
     accessibility_of, collect_into, declared_full_name, declared_type_name, is_constant_form,
     qualified_type_name, resolve_constants,
 };
-use crate::diagnostic::{Diagnostic, DiagnosticKind, DiagnosticPhase, SignaturePosition};
+use crate::diagnostic::{CodeNamespace, Diagnostic, DiagnosticKind, DiagnosticPhase, SignaturePosition};
 use lamella_syntax::lexer::OutputKind;
 use lamella_syntax::version::{Feature, LanguageVersion};
 use crate::reference::load_references;
@@ -184,6 +184,7 @@ pub fn bind_compilation_unit_with_reference_model(
     let mut per_unit = [diagnostics];
     withhold_body_diagnostics_after_declaration_error(&mut per_unit);
     attach_top_level_reports(&mut per_unit, top_level);
+    withhold_emission_diagnostics_after_language_error(&mut per_unit);
     let [diagnostics] = per_unit;
     diagnostics
 }
@@ -213,6 +214,7 @@ pub fn bind_compilation_unit_with_model(
     let mut per_unit = [diagnostics];
     withhold_body_diagnostics_after_declaration_error(&mut per_unit);
     attach_top_level_reports(&mut per_unit, top_level);
+    withhold_emission_diagnostics_after_language_error(&mut per_unit);
     let [diagnostics] = per_unit;
     diagnostics
 }
@@ -891,6 +893,7 @@ pub fn bind_compilation_units_with_reference_model(
     let mut reports = several_units;
     reports.extend(top_level);
     attach_top_level_reports(&mut per_unit, reports);
+    withhold_emission_diagnostics_after_language_error(&mut per_unit);
     per_unit
 }
 
@@ -2139,6 +2142,89 @@ fn validate_constraint_type(
 ///
 ///
 ///
+/// What the language asks of a member a record declares in the place of one it would generate:
+/// `GetHashCode()` and `ToString()` must override `object`'s, and `Equals(R)` must be an instance member,
+/// public, return `bool` and, in a record that is not sealed, allow overriding. The parser has already
+/// left out the generated member of that signature, so a member that fails here would otherwise go
+/// unreached by a call through `object`. Called in the type's scope.
+fn validate_record_members(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
+    if declaration.record.is_none() {
+        return;
+    }
+    let has = |modifiers: &[Modifier], wanted: fn(&Modifier) -> bool| modifiers.iter().any(wanted);
+    let sealed = has(&declaration.modifiers, |m| matches!(m, Modifier::Sealed));
+    let own = declared_symbol(namespace, declaration);
+    for member in &declaration.members {
+        let Member::Method {
+            modifiers,
+            return_type,
+            name,
+            type_parameters,
+            parameters,
+            is_vararg: false,
+            explicit_interface: None,
+            name_span,
+            ..
+        } = member
+        else {
+            continue;
+        };
+        if !type_parameters.is_empty() {
+            continue;
+        }
+        let signature = || method_signature(&declaration.name, name, parameters);
+        let is_static = has(modifiers, |m| matches!(m, Modifier::Static));
+        if parameters.is_empty() && (&**name == "GetHashCode" || &**name == "ToString") {
+            if is_static || !has(modifiers, |m| matches!(m, Modifier::Override)) {
+                binder.report(Diagnostic::new(
+                    DiagnosticKind::RecordMemberNotOverriding { member: signature() },
+                    *name_span,
+                ));
+            }
+            continue;
+        }
+        if &**name == "Deconstruct" && is_static {
+            let positional = declaration.record.as_ref().and_then(|record| record.parameters.as_ref());
+            let same = positional.is_some_and(|positional| {
+                positional.len() == parameters.len()
+                    && positional.iter().zip(parameters).all(|(positional, declared)| {
+                        matches!(declared.modifier, Some(ParameterModifier::Out))
+                            && binder.canonicalize(&bind_type(&positional.ty)) == binder.canonicalize(&bind_type(&declared.ty))
+                    })
+            });
+            if same {
+                binder.report(Diagnostic::new(DiagnosticKind::RecordMemberStatic { member: signature() }, *name_span));
+            }
+            continue;
+        }
+        let [only] = &parameters[..] else {
+            continue;
+        };
+        if &**name != "Equals" || only.modifier.is_some() || binder.canonicalize(&parameter_symbol(only)) != own {
+            continue;
+        }
+        let overridable = has(modifiers, |m| matches!(m, Modifier::Virtual | Modifier::Abstract | Modifier::Override))
+            && !has(modifiers, |m| matches!(m, Modifier::Sealed));
+        if !sealed && !overridable {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::RecordMemberNotOverridable { member: signature() },
+                *name_span,
+            ));
+        } else if is_static {
+            binder.report(Diagnostic::new(DiagnosticKind::RecordMemberStatic { member: signature() }, *name_span));
+        }
+        if !has(modifiers, |m| matches!(m, Modifier::Public)) {
+            binder.report(Diagnostic::new(DiagnosticKind::RecordMemberNotPublic { member: signature() }, *name_span));
+        }
+        if binder.canonicalize(&bind_type(return_type)) != TypeSymbol::Special(SpecialType::Boolean) {
+            binder.report(Diagnostic::new(
+                DiagnosticKind::RecordMemberReturn { member: signature(), expected: "bool" },
+                *name_span,
+            ));
+        }
+    }
+}
+
 fn validate_by_ref_like_fields(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
     binder.enter_type(declared_symbol(namespace, declaration));
     let declaring_is_by_ref_like = matches!(declaration.kind, TypeKind::Struct)
@@ -2643,6 +2729,22 @@ pub fn withhold_body_diagnostics_after_declaration_error(units: &mut [Vec<Diagno
     }
     for unit in units {
         unit.retain(|diagnostic| diagnostic.phase == DiagnosticPhase::Declaration);
+    }
+}
+
+/// A language-invalid program is rejected before deferred emission capabilities are considered.
+/// This check spans every source file and runs after all language diagnostics are collected, so
+/// source order cannot turn a language error into a refusal of an otherwise permitted program.
+/// Warnings do not defer emission checks, and a valid unsupported program retains its refusal.
+fn withhold_emission_diagnostics_after_language_error(units: &mut [Vec<Diagnostic>]) {
+    let language_error = units.iter().flatten().any(|diagnostic| {
+        diagnostic.namespace() == CodeNamespace::Cs
+            && diagnostic.severity() == lamella_syntax::diagnostic::Severity::Error
+    });
+    if language_error {
+        for unit in units {
+            unit.retain(|diagnostic| diagnostic.phase != DiagnosticPhase::Emission);
+        }
     }
 }
 
@@ -3193,6 +3295,48 @@ fn validate_operator_arity(binder: &mut Binder, declaration: &TypeDecl) {
                     DiagnosticKind::OverloadableBinaryOperatorExpected,
                     *span,
                 ));
+            }
+            // Second edition 14.8 requires the containing type as the first operand and
+            // int as the count. Fourth edition 17.9.2 also admits the nullable containing
+            // type and an int? count. Seventh edition 15.10.3 keeps both; C# 11 removes
+            // only the count restriction.
+            if matches!(
+                operator,
+                OverloadableOperator::LeftShift | OverloadableOperator::RightShift
+            ) && parameters.len() == 2
+            {
+                let first = binder.canonicalize(&bind_type(&parameters[0].ty));
+                let enclosing = binder.current_type_as_value();
+                let nullable_first = binder.language_version() >= LanguageVersion::CSharp2;
+                if first != enclosing
+                    && !(nullable_first
+                        && crate::conversion::nullable_underlying(&first) == Some(&enclosing))
+                    && binder.names_a_known_type(&first)
+                {
+                    binder.report(Diagnostic::new(
+                        DiagnosticKind::ShiftFirstOperandMustBeContainingType {
+                            nullable_allowed: nullable_first,
+                        },
+                        parameters[0].ty.span,
+                    ));
+                }
+                let count = binder.canonicalize(&bind_type(&parameters[1].ty));
+                let int = TypeSymbol::Special(SpecialType::Int32);
+                let nullable_allowed = binder.language_version() >= LanguageVersion::CSharp2;
+                if binder.language_version() < LanguageVersion::CSharp11
+                    && count != int
+                    && !(nullable_allowed
+                        && crate::conversion::nullable_underlying(&count) == Some(&int))
+                {
+                    if binder.language_version() >= LanguageVersion::CSharp3 {
+                        binder.gate_feature(Feature::RelaxedShiftOperators, parameters[1].ty.span);
+                    } else {
+                        binder.report(Diagnostic::new(
+                            DiagnosticKind::ShiftCountMustBeInt { nullable_allowed },
+                            parameters[1].ty.span,
+                        ));
+                    }
+                }
             }
         }
     }
@@ -3876,7 +4020,9 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
     validate_by_ref_like_fields(binder, namespace, declaration);
     validate_required_members(binder, namespace, declaration);
     validate_operator_modifiers(binder, declaration);
+    let outer = binder.replace_current_type(Some(enclosing.clone()));
     validate_operator_arity(binder, declaration);
+    binder.replace_current_type(outer);
     validate_conversion_operators(binder, declaration);
     validate_unsafe_permitted(binder, declaration);
     validate_constructor_initializer_cycles(binder, declaration);
@@ -3973,6 +4119,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
             _ => {}
         }
     }
+    binder.enter_type(declared_symbol(namespace, declaration));
     #[allow(clippy::type_complexity)]
     let mut seen_methods: alloc::vec::Vec<(
         (Box<str>, alloc::vec::Vec<TypeSymbol>),
@@ -3982,27 +4129,31 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
         let named = match member {
             Member::Method {
                 name,
+                type_parameters,
+                constraints,
                 parameters,
                 explicit_interface: None,
                 span,
                 ..
-            } => Some((name.clone(), parameters, span)),
+            } => Some((name.clone(), &type_parameters[..], &constraints[..], parameters, span)),
             Member::Indexer {
                 parameters,
                 explicit_interface: None,
                 span,
                 ..
-            } => Some((Box::from("this"), parameters, span)),
+            } => Some((Box::from("this"), &[][..], &[][..], parameters, span)),
             _ => None,
         };
-        if let Some((name, parameters, span)) = named {
+        if let Some((name, type_parameters, constraints, parameters, span)) = named {
+            let entered = binder.enter_type_parameters(type_parameters, constraints);
             let key = (
                 name.clone(),
                 parameters
                     .iter()
-                    .map(parameter_symbol)
+                    .map(|parameter| binder.canonicalize(&parameter_symbol(parameter)))
                     .collect::<alloc::vec::Vec<_>>(),
             );
+            binder.exit_type_parameters(entered);
             let modes = parameter_modes(parameters);
             if let Some((_, previous)) = seen_methods.iter().find(|(seen, _)| *seen == key) {
                 binder.report(Diagnostic::new(
@@ -4037,7 +4188,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                 continue;
             }
             let key: alloc::vec::Vec<TypeSymbol> =
-                parameters.iter().map(parameter_symbol).collect();
+                parameters.iter().map(|parameter| binder.canonicalize(&parameter_symbol(parameter))).collect();
             let modes = parameter_modes(parameters);
             if let Some((_, previous)) = seen_constructors.iter().find(|(seen, _)| *seen == key) {
                 binder.report(Diagnostic::new(
@@ -4055,6 +4206,8 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
             }
         }
     }
+    validate_record_members(binder, namespace, declaration);
+    binder.exit_type();
     let abstract_member = |modifiers: &[Modifier]| {
         modifiers
             .iter()

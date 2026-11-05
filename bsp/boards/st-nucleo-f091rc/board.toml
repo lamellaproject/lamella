@@ -8,6 +8,8 @@
 kind = "board"
 board = "st-nucleo-f091rc"
 vendor = "st"
+maker = "STMicroelectronics"
+product = "NUCLEO-F091RC"
 family = "stm32f091"
 part = "stm32f091rc"
 product_model = 7           # lamella_wire::product_model::STM32F091

@@ -21,6 +21,7 @@ lamella-serial-port = { path = "../lamella-serial-port", optional = true }
 # Host-only: the native-USB (driverless WinUSB) bulk carrier -- the fast interpreter-flash path for a
 # board with a native USB device peripheral (a WinUSB vendor interface). OPTIONAL, behind the usb feature.
 lamella-usbbulk = { path = "../lamella-usbbulk", optional = true }
+lamella-probe-core = { path = "../lamella-probe-core", optional = true }
 # The project's own C# compiler (lcsc), behind `repl-host`: the engine's [`LcscCompiler`] compiles a
 # submission IN-PROCESS -- the same compiler the `lamella-repl` CLI and the DAP Debug Console drive.
 # (No csc: it resolves BCL types against the .NET reference assemblies, not Microsoft's compiler.)
@@ -54,7 +55,7 @@ default = ["serial", "repl-host"]
 serial = ["dep:lamella-serial-port", "carrier"]
 # The native-USB (driverless WinUSB) carrier (UsbTransport), for a board with a native USB device
 # peripheral. Host-only; coexists with serial (a host build can drive either).
-usb = ["dep:lamella-usbbulk", "carrier"]
+usb = ["dep:lamella-usbbulk", "dep:lamella-probe-core", "carrier"]
 # The TCP carrier (TcpTransport): a board reached across a network instead of down a cable, either
 # because it serves Lamella Link on its own network interface or because a relay daemon on a
 # companion processor serves it on the board's behalf. std only -- no new dependency.

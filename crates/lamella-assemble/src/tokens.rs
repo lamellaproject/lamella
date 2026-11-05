@@ -115,6 +115,8 @@ pub(crate) type InstanceRows = BTreeMap<String, Vec<SynthesizedRow>>;
 /// call, which is what makes it the queue's home rather than a seventh parameter.
 #[derive(Debug, Default)]
 pub struct Tokens {
+    /// The selected dialect, including runtime rules that differ between editions.
+    pub(crate) language_version: lamella_syntax::version::LanguageVersion,
     /// Async methods whose machines and stub bodies land after the source types; see
     /// `compile::emit_async_machine`.
     pub(crate) pending_async: Vec<crate::compile::PendingAsync>,
@@ -198,6 +200,10 @@ pub struct Tokens {
     /// makes a row written out of its numbered place a refusal rather than a call that runs the
     /// wrong method.
     planned_rows: BTreeMap<u32, PlannedRow>,
+    /// Every override a non-generic value type declares itself, keyed like `methods`, with the
+    /// type spelled as a call names its declaring type. Recorded only where an inherited `object`
+    /// member is invoked on a copy of a value receiver; see [`Tokens::value_override`].
+    value_overrides: BTreeMap<String, TypeSymbol>,
     /// The `this`-capturing lambda rows each type's method run ended with, by type key, in the
     /// order they were written -- MEASURED by this emission, so that a numbering which did not
     /// count them can be done again with them counted.
@@ -427,8 +433,9 @@ impl Tokens {
         parameters: &[TypeSymbol],
         token: Token,
     ) {
-        self.methods
-            .insert(method_key(&self.canonical(declaring), name, &self.canonical_params(parameters)), token);
+        if let Some(key) = self.method_identity(declaring, name, parameters) {
+            self.methods.insert(key, token);
+        }
     }
 
     /// The token for the method with this identity, if one was recorded.
@@ -440,8 +447,62 @@ impl Tokens {
         parameters: &[TypeSymbol],
     ) -> Option<Token> {
         self.methods
-            .get(&method_key(&self.canonical(declaring), name, &self.canonical_params(parameters)))
+            .get(&self.method_identity(declaring, name, parameters)?)
             .copied()
+    }
+
+    /// Records that `value_type`, a non-generic value type, declares its own override
+    /// `name(parameters)` of an inherited virtual member. `value_type` is spelled as a call names
+    /// its declaring type, which is the spelling a reference to the override is minted under.
+    pub(crate) fn insert_value_override(
+        &mut self,
+        value_type: &TypeSymbol,
+        name: &str,
+        parameters: &[TypeSymbol],
+    ) {
+        let key = method_key(
+            &self.canonical(value_type),
+            name,
+            &self.canonical_params(parameters),
+        );
+        self.value_overrides.insert(key, value_type.clone());
+    }
+
+    /// The value type to name as the declaring type of `name(parameters)` when `receiver`'s type
+    /// declares that override itself, as [`Tokens::insert_value_override`] recorded it. A struct
+    /// is sealed, so the override it declares is the most derived implementation (ECMA-334 2nd
+    /// edition 17.5.3) for every value of the type.
+    #[must_use]
+    pub(crate) fn value_override(
+        &self,
+        receiver: &TypeSymbol,
+        name: &str,
+        parameters: &[TypeSymbol],
+    ) -> Option<&TypeSymbol> {
+        self.value_overrides.get(&method_key(
+            &self.canonical(receiver),
+            name,
+            &self.canonical_params(parameters),
+        ))
+    }
+
+    /// A constructed member's identity includes its encoded parent in the current body scope.
+    /// `D<T>` can mean `D<!0>` in a generic type and `D<!!0>` in a generic method. Reusing a
+    /// constructor or Invoke reference across those scopes produces an invalid method body.
+    /// The parent must already be minted before its member is recorded.
+    fn method_identity(
+        &self,
+        declaring: &TypeSymbol,
+        name: &str,
+        parameters: &[TypeSymbol],
+    ) -> Option<String> {
+        let declaring = self.canonical(declaring);
+        let mut key = method_key(&declaring, name, &self.canonical_params(parameters));
+        if matches!(declaring, TypeSymbol::Instantiation { .. }) {
+            let parent = crate::compile::structural_type_spec(self, &declaring)?;
+            let _ = write!(key, "\u{1}{}:{}", parent.table(), parent.row());
+        }
+        Some(key)
     }
 
     /// Records what reserved `MethodDef` row `row` is for: a member of `owner` whose row will be

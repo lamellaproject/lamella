@@ -16,16 +16,28 @@ namespace Lamella.Generated
         public const int GPIO_HI_IN_WIDTH = 32;
         public const uint GPIO_OUT_SET_OFF = 0x18;
         public const int GPIO_OUT_SET_WIDTH = 32;
+        public const uint GPIO_HI_OUT_SET_OFF = 0x1C;
+        public const int GPIO_HI_OUT_SET_WIDTH = 32;
         public const uint GPIO_OUT_CLR_OFF = 0x20;
         public const int GPIO_OUT_CLR_WIDTH = 32;
+        public const uint GPIO_HI_OUT_CLR_OFF = 0x24;
+        public const int GPIO_HI_OUT_CLR_WIDTH = 32;
         public const uint GPIO_OUT_XOR_OFF = 0x28;
         public const int GPIO_OUT_XOR_WIDTH = 32;
+        public const uint GPIO_HI_OUT_XOR_OFF = 0x2C;
+        public const int GPIO_HI_OUT_XOR_WIDTH = 32;
         public const uint GPIO_OE_OFF = 0x30;
         public const int GPIO_OE_WIDTH = 32;
+        public const uint GPIO_HI_OE_OFF = 0x34;
+        public const int GPIO_HI_OE_WIDTH = 32;
         public const uint GPIO_OE_SET_OFF = 0x38;
         public const int GPIO_OE_SET_WIDTH = 32;
+        public const uint GPIO_HI_OE_SET_OFF = 0x3C;
+        public const int GPIO_HI_OE_SET_WIDTH = 32;
         public const uint GPIO_OE_CLR_OFF = 0x40;
         public const int GPIO_OE_CLR_WIDTH = 32;
+        public const uint GPIO_HI_OE_CLR_OFF = 0x44;
+        public const int GPIO_HI_OE_CLR_WIDTH = 32;
 
         // -- fields: <REG>_<FIELD> = the shifted mask; _LSB = the shift --
     }

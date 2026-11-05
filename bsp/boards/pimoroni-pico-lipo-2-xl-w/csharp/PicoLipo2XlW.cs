@@ -55,7 +55,7 @@ namespace Lamella.Boards.Pimoroni
         private static I2cDriver MakeI2c0() { return new Rp2350I2cDriver(I2cBinding(0)); }
         private static GpioDriver MakeGpio()
         {
-            return new Rp2350GpioDriver(RadioPins,
+            return new Rp2350GpioDriver(RadioPins, PimoroniPicoLipo2XlWBindings.PSRAM_CS_BANK1_MASK,
                 new int[] {
                     (int)PimoroniPicoLipo2XlWBindings.ADC_CHANNEL0_TWIN_PIN,
                     (int)PimoroniPicoLipo2XlWBindings.ADC_CHANNEL1_TWIN_PIN,
@@ -77,10 +77,11 @@ namespace Lamella.Boards.Pimoroni
             return Buses.ResolveGpio();
         }
 
-        /// <summary>A GPIO controller over the RP2350 SIO/pad block, bank 0 (GP0..GP31). The radio's
-        /// four lines refuse <c>SetPinMode</c>. A mode set on GP26, GP27 or GP28 leaves the
-        /// converter's pad on the same header position (GP40, GP41 or GP42) high-impedance, with no
-        /// pull.</summary>
+        /// <summary>A GPIO controller over the RP2350 SIO and pads, GP0 to GP47. The radio's four lines refuse
+        /// <c>SetPinMode</c>. A mode set on either pad of a header position's pair (GP26 and GP40, GP27 and GP41, GP28 and GP42)
+        /// parks the other if nothing holds it, high-impedance with no pull; one that holds the net is left as it is, so
+        /// one pad can read what the other drives. A second driver on that net, or a pull against the other's pull, is
+        /// refused.</summary>
         public GpioController CreateGpioController()
         {
             return new GpioController();
@@ -252,7 +253,7 @@ namespace Lamella.Boards.Pimoroni
         {
             if ((object)_pwmSlices[slice] == null)
             {
-                _pwmSlices[slice] = new Rp2350PwmSlice(PwmBinding(slice));
+                _pwmSlices[slice] = Rp2350PwmSlice.Of(PwmBinding(slice));
             }
             return _pwmSlices[slice].Open(channel, frequency, dutyCyclePercentage);
         }

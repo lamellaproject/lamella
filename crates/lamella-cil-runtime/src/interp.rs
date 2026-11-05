@@ -779,7 +779,7 @@ impl Vm {
         let _ = self.mounts.mount("/", backend);
     }
 
-    /// Mounts `backend` at `prefix` (`"/sd"`, `"D:"`, ...) -- a second file system beside the root.
+    /// Mounts `backend` at `prefix` (`"/mnt/sd0"`, `"D:"`, ...) -- a second file system beside the root.
     ///
     /// # Errors
     /// [`crate::fs::FsError::InvalidPath`] if `prefix` escapes the root (a leading `..`).
@@ -3906,7 +3906,7 @@ impl Session {
             Flow::LoadField { location, field } => {
                 let slot = module
                     .field_slot(asm, field)
-                    .ok_or(Trap::UnresolvedField(field))?;
+                    .ok_or_else(|| unresolved_field(module, asm, field))?;
                 let value = read_field_at(frames, vm, location, slot);
                 frames
                     .get_mut(current)
@@ -3922,13 +3922,13 @@ impl Session {
             } => {
                 let slot = module
                     .field_slot(asm, field)
-                    .ok_or(Trap::UnresolvedField(field))?;
+                    .ok_or_else(|| unresolved_field(module, asm, field))?;
                 let type_id = module
                     .field_type(asm, field)
-                    .ok_or(Trap::UnresolvedField(field))?;
+                    .ok_or_else(|| unresolved_field(module, asm, field))?;
                 let shape = module
                     .type_field_defaults(type_id)
-                    .ok_or(Trap::UnresolvedField(field))?;
+                    .ok_or_else(|| unresolved_field(module, asm, field))?;
                 write_field_at(frames, vm, location, slot, &shape, value)?;
                 Ok(Status::Running)
             }
@@ -4623,6 +4623,26 @@ fn unresolved_call(module: &Module, asm: u8, token: Token) -> Trap {
     Trap::Refused(crate::trap::RefusedWith::MissingMethod, Cow::Owned(message))
 }
 
+/// The trap for a field instruction whose token resolves to no field.
+///
+/// A token the loader marked as reaching a generic instantiation it did not lower raises a catchable
+/// `MissingFieldException` naming the field, with why it was not lowered, as [`unresolved_call`] does
+/// for a call and as .NET raises one for a field it cannot bind. Any other token traps
+/// [`Trap::UnresolvedField`].
+fn unresolved_field(module: &Module, asm: u8, token: Token) -> Trap {
+    if !module.is_unlowered_generic(asm, token) {
+        return Trap::UnresolvedField(token);
+    }
+    let message = match module.unlowered_generic_name(asm, token) {
+        Some(message) => String::from(message),
+        None => alloc::format!(
+            "Field not found: the generic instantiation at token 0x{:08X}. Lamella did not lower it.",
+            token.0
+        ),
+    };
+    Trap::Refused(crate::trap::RefusedWith::MissingField, Cow::Owned(message))
+}
+
 /// Dispatches a `call` of a bodyless `[DllImport]` method: takes the call's arguments
 /// off the evaluation stack, marshals them per the target's recorded signature shape
 /// (integers ride a 64-bit scalar slot; a managed string becomes a NUL-terminated byte
@@ -4919,6 +4939,14 @@ fn fault_exception(trap: &Trap) -> Option<(Cow<'static, str>, &'static [&'static
         "System.Exception",
         "System.Object",
     ];
+    const MISSING_FIELD: &[&str] = &[
+        "System.MissingFieldException",
+        "System.MissingMemberException",
+        "System.MemberAccessException",
+        "System.SystemException",
+        "System.Exception",
+        "System.Object",
+    ];
     const ENCODER_FALLBACK: &[&str] = &[
         "System.Text.EncoderFallbackException",
         "System.ArgumentException",
@@ -4963,6 +4991,7 @@ fn fault_exception(trap: &Trap) -> Option<(Cow<'static, str>, &'static [&'static
                     crate::trap::RefusedWith::ArrayTypeMismatch => ARRAY_MISMATCH,
                     crate::trap::RefusedWith::InvalidCast => INVALID_CAST,
                     crate::trap::RefusedWith::MissingMethod => MISSING_METHOD,
+                    crate::trap::RefusedWith::MissingField => MISSING_FIELD,
                 },
             ));
         }
@@ -5976,7 +6005,7 @@ fn step(
             let token = token_operand(instruction)?;
             let slot = module
                 .field_slot(asm, token)
-                .ok_or(Trap::UnresolvedField(token))?;
+                .ok_or_else(|| unresolved_field(module, asm, token))?;
             match frame.pop()? {
                 Value::Object(object) => {
                     let value = vm
@@ -6007,7 +6036,7 @@ fn step(
             let token = token_operand(instruction)?;
             let slot = module
                 .field_slot(asm, token)
-                .ok_or(Trap::UnresolvedField(token))?;
+                .ok_or_else(|| unresolved_field(module, asm, token))?;
             let value = frame.pop()?;
             match frame.pop()? {
                 Value::Object(object) => {
@@ -6031,7 +6060,7 @@ fn step(
             let token = token_operand(instruction)?;
             let slot = module
                 .field_slot(asm, token)
-                .ok_or(Trap::UnresolvedField(token))?;
+                .ok_or_else(|| unresolved_field(module, asm, token))?;
             match frame.pop()? {
                 Value::Object(object) => {
                     frame
@@ -6053,7 +6082,7 @@ fn step(
             let token = token_operand(instruction)?;
             let slot = module
                 .static_field_slot(asm, token)
-                .ok_or(Trap::UnresolvedField(token))?;
+                .ok_or_else(|| unresolved_field(module, asm, token))?;
             if let Some(type_id) = module.type_of_static_slot(slot) {
                 if let Some(cctor) = vm.take_pending_cctor(module, type_id)
                     .map_err(Trap::TypeInitializationFailed)? {
@@ -6235,7 +6264,7 @@ fn step(
             let token = token_operand(instruction)?;
             let slot = module
                 .static_field_slot(asm, token)
-                .ok_or(Trap::UnresolvedField(token))?;
+                .ok_or_else(|| unresolved_field(module, asm, token))?;
             if let Some(type_id) = module.type_of_static_slot(slot) {
                 if let Some(cctor) = vm.take_pending_cctor(module, type_id)
                     .map_err(Trap::TypeInitializationFailed)? {
@@ -6253,7 +6282,7 @@ fn step(
             let token = token_operand(instruction)?;
             let slot = module
                 .static_field_slot(asm, token)
-                .ok_or(Trap::UnresolvedField(token))?;
+                .ok_or_else(|| unresolved_field(module, asm, token))?;
             if let Some(type_id) = module.type_of_static_slot(slot) {
                 if let Some(cctor) = vm.take_pending_cctor(module, type_id)
                     .map_err(Trap::TypeInitializationFailed)? {

@@ -11,6 +11,8 @@
 kind = "board"
 board = "adafruit-feather-m0-express"
 vendor = "adafruit"
+maker = "Adafruit"
+product = "Feather M0 Express"
 family = "samd21"
 part = "atsamd21g18a"
 product_model = 16          # lamella_wire::product_model::FEATHER_M0_EXPRESS

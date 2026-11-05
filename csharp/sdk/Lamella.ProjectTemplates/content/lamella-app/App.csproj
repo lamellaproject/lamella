@@ -2,7 +2,8 @@
 
   <PropertyGroup>
     <OutputType>Exe</OutputType>
-    <!-- The target framework picks the product: lamella1.0 is Lamella, and net11.0 is Lamella RHU. -->
+    <!-- The target framework selects the runtime: `net11.0` targets .NET 11 on Lamella RHU;
+      `lamella1.0` targets Lamella's C# runtime (for the smallest microcontrollers). -->
 <!--#if (bothFrameworks) -->
     <TargetFrameworks>net11.0;lamella1.0</TargetFrameworks>
 <!--#elif (rhuOnly) -->
@@ -18,12 +19,11 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PublishAot>true</PublishAot>
-    <!-- The board dotnet run runs this program on, by its id. With no board named, it runs on this
-         computer. -->
+    <!-- The target board specifies the board this program will run on. -->
 <!--#if (hasBoard) -->
     <LamellaTargetBoard>lamella-board-id</LamellaTargetBoard>
 <!--#else -->
-    <!-- <LamellaTargetBoard>rpi-pico2</LamellaTargetBoard> -->
+    <!-- <LamellaTargetBoard>raspberrypi-pico-2</LamellaTargetBoard> -->
 <!--#endif -->
   </PropertyGroup>
 

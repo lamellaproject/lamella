@@ -152,8 +152,18 @@ fn check_inst(
                 expect(MirType::ObjectRef, rt, errors);
             }
         }
-        Inst::InterfaceHasTag { descriptor, .. } => {
+        Inst::InterfaceHasTag { descriptor, .. } | Inst::DescriptorWord { descriptor, .. } => {
             use_value(func, defined, *descriptor, errors);
+            if let Some(rt) = result_ty {
+                expect(MirType::I32, rt, errors);
+            }
+        }
+        Inst::InterfaceHasArrayElementTag {
+            descriptor,
+            array_descriptor,
+        } => {
+            use_value(func, defined, *descriptor, errors);
+            use_value(func, defined, *array_descriptor, errors);
             if let Some(rt) = result_ty {
                 expect(MirType::I32, rt, errors);
             }

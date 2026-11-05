@@ -42,8 +42,8 @@ mod net_alloc {
 pub use lamella_runtime_support_debug as debug_support;
 
 #[cfg(any(
-    feature = "board-rpi-pico2",
-    feature = "board-rpi-pico2-w",
+    feature = "board-raspberrypi-pico-2",
+    feature = "board-raspberrypi-pico-2-w",
     feature = "board-pimoroni-pico-plus-2",
     feature = "board-pimoroni-pico-plus-2-w"
 ))]

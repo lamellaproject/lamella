@@ -24,6 +24,8 @@
 kind = "board"
 board = "adafruit-feather-rp2350-hstx"
 vendor = "adafruit"
+maker = "Adafruit"
+product = "Feather RP2350 with HSTX"
 family = "rp2350"
 part = "rp2350a"
 product_model = 66          # lamella_wire::product_model::FEATHER_RP2350_HSTX

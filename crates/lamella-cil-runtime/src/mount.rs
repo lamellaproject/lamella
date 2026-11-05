@@ -156,7 +156,7 @@ impl MountTable {
         Ok(segments)
     }
 
-    /// Mounts `backend` at `prefix` (`"/"`, `"/sd"`, `"D:"`, ...) as [`DriveType::Fixed`]. Replacing
+    /// Mounts `backend` at `prefix` (`"/"`, `"/mnt/sd0"`, `"D:"`, ...) as [`DriveType::Fixed`]. Replacing
     /// an existing mount at the exact same prefix swaps the backend.
     pub fn mount(&mut self, prefix: &str, backend: BoxedFsBackend) -> FsResult<()> {
         self.mount_as(prefix, backend, DriveType::Fixed)
@@ -528,15 +528,15 @@ mod tests {
         let (root, root_path) = recorder(1);
         let (sd, sd_path) = recorder(2);
         table.mount("/", Box::new(root)).unwrap();
-        table.mount("/sd", Box::new(sd)).unwrap();
+        table.mount("/mnt/sd0", Box::new(sd)).unwrap();
 
-        assert!(table.file_exists("/sd/log.txt"));
+        assert!(table.file_exists("/mnt/sd0/log.txt"));
         assert_eq!(*sd_path.borrow(), "/log.txt");
-        assert!(table.file_exists("/sdcard/x"));
-        assert_eq!(*root_path.borrow(), "/sdcard/x");
+        assert!(table.file_exists("/mnt/sd0x"));
+        assert_eq!(*root_path.borrow(), "/mnt/sd0x");
         assert!(table.file_exists("/notes.txt"));
         assert_eq!(*root_path.borrow(), "/notes.txt");
-        assert!(table.file_exists("/sd"));
+        assert!(table.file_exists("/mnt/sd0"));
         assert_eq!(*sd_path.borrow(), "/");
     }
 
@@ -553,10 +553,10 @@ mod tests {
     fn handles_are_re_homed_to_their_issuing_mount() {
         let mut table = MountTable::default();
         table.mount("/", Box::new(recorder(1).0)).unwrap();
-        table.mount("/sd", Box::new(recorder(2).0)).unwrap();
+        table.mount("/mnt/sd0", Box::new(recorder(2).0)).unwrap();
 
         let root_handle = table.open("/a.txt", FileMode::Open, FileAccess::Read).unwrap();
-        let sd_handle = table.open("/sd/b.txt", FileMode::Open, FileAccess::Read).unwrap();
+        let sd_handle = table.open("/mnt/sd0/b.txt", FileMode::Open, FileAccess::Read).unwrap();
         assert_ne!(root_handle, sd_handle);
         assert_eq!(table.read(root_handle, &mut [0u8; 4]).unwrap(), 1);
         assert_eq!(table.read(sd_handle, &mut [0u8; 4]).unwrap(), 2);
@@ -586,7 +586,7 @@ mod tests {
         };
         let (sd, sd_path) = recorder(2);
         table.mount("/", Box::new(host)).unwrap();
-        table.mount("/sd", Box::new(sd)).unwrap();
+        table.mount("/mnt/sd0", Box::new(sd)).unwrap();
         for path in [
             "notes.txt",
             "logs/../notes.txt",
@@ -598,7 +598,7 @@ mod tests {
             assert!(table.file_exists(path), "{path}");
             assert_eq!(*host_path.borrow(), path);
         }
-        assert!(table.file_exists("/sd/log.txt"));
+        assert!(table.file_exists("/mnt/sd0/log.txt"));
         assert_eq!(*sd_path.borrow(), "/log.txt");
 
         let mut volume = MountTable::default();
@@ -613,21 +613,21 @@ mod tests {
         let mut table = MountTable::default();
         let (root, root_path) = recorder(1);
         table.mount("/", Box::new(root)).unwrap();
-        table.mount("/sd", Box::new(recorder(2).0)).unwrap();
-        let handle = table.open("/sd/x", FileMode::Open, FileAccess::Read).unwrap();
-        assert!(table.unmount("/sd").unwrap());
+        table.mount("/mnt/sd0", Box::new(recorder(2).0)).unwrap();
+        let handle = table.open("/mnt/sd0/x", FileMode::Open, FileAccess::Read).unwrap();
+        assert!(table.unmount("/mnt/sd0").unwrap());
         assert_eq!(table.read(handle, &mut [0u8; 4]), Err(FsError::Io));
-        assert!(table.file_exists("/sd/x"));
-        assert_eq!(*root_path.borrow(), "/sd/x");
+        assert!(table.file_exists("/mnt/sd0/x"));
+        assert_eq!(*root_path.borrow(), "/mnt/sd0/x");
     }
 
     #[test]
     fn cross_mount_move_is_refused() {
         let mut table = MountTable::default();
         table.mount("/", Box::new(recorder(1).0)).unwrap();
-        table.mount("/sd", Box::new(recorder(2).0)).unwrap();
+        table.mount("/mnt/sd0", Box::new(recorder(2).0)).unwrap();
         assert!(table.move_entry("/a.txt", "/b.txt").is_ok());
-        assert_eq!(table.move_entry("/a.txt", "/sd/b.txt"), Err(FsError::Io));
+        assert_eq!(table.move_entry("/a.txt", "/mnt/sd0/b.txt"), Err(FsError::Io));
     }
 
     #[test]
@@ -635,7 +635,7 @@ mod tests {
         let mut table = MountTable::default();
         table
             .mount_as(
-                "D:",
+                "/mnt/sd0",
                 Box::new(RecordingFs {
                     tag: 2,
                     total: 1_900_000_000,
@@ -649,13 +649,13 @@ mod tests {
 
         assert_eq!(
             table.drive_names(),
-            alloc::vec![String::from("D:"), String::from("/")]
+            alloc::vec![String::from("/mnt/sd0"), String::from("/")]
         );
-        assert_eq!(table.drive_type_of("D:\\"), Some(DriveType::Removable));
+        assert_eq!(table.drive_type_of("/mnt/sd0/"), Some(DriveType::Removable));
         assert_eq!(table.drive_type_of("/"), Some(DriveType::Fixed));
-        assert_eq!(table.total_size_of("D:").unwrap(), 1_900_000_000);
+        assert_eq!(table.total_size_of("/mnt/sd0").unwrap(), 1_900_000_000);
         assert_eq!(table.total_size_of("/").unwrap(), 0);
-        assert!(table.reformat("D:", "FAT32", 0).is_ok());
+        assert!(table.reformat("/mnt/sd0", "FAT32", 0).is_ok());
         assert_eq!(table.reformat("/", "FAT", 0), Err(FsError::Unsupported));
         assert_eq!(table.drive_type_of("Z:"), None);
         assert_eq!(table.total_size_of("Z:"), Err(FsError::Io));

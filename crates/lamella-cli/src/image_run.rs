@@ -17,7 +17,7 @@
 //! **STANDARD OUTPUT IS THE BOARD'S CONSOLE, AND NOTHING OF THIS TOOL'S.** The ring holds the
 //! program's output and its kernel's own lines as they were written, interleaved, and all of it goes
 //! to standard output in that order. Everything this tool says -- what it read, the probe it used,
-//! how the write went, why it stopped -- goes to standard error, every line prefixed `lamella:`.
+//! why it stopped -- goes to standard error without a prefix.
 //!
 //! **A RUN ENDS AS THE PROGRAM ENDED**: with its own exit code, or with 1 and a sentence when the
 //! program was aborted, when the time limit `--timeout` sets ran out, or when this tool failed.
@@ -31,7 +31,7 @@
 use crate::args;
 use crate::devices::ProbeFound;
 use crate::ending::Ended;
-use crate::own_lines::say;
+use crate::own_lines::{blank_line, fail, say};
 use lamella_elf::symbols::DataObject;
 use lamella_flash_routes::manifest::{self, Manifest};
 use lamella_flash_routes::placement::{BootloaderChoice, Placement, placement_for};
@@ -73,29 +73,29 @@ pub(crate) fn run_manifest(options: &[String], after: &[String]) -> Ended {
         usage: Some(crate::program::RUN_USAGE),
         values: &[MANIFEST, "--probe", "--timeout"],
         repeats: &[],
-        flags: &[],
+        flags: &["--no-banner"],
         positional: args::Positional::Own,
     };
-    let parsed = match args::parse_or_halt(options, &spec) {
+    let mut err = std::io::stderr();
+    let parsed = match args::parse_or_halt_with(options, &spec, |error| fail(&mut err, error)) {
         Ok(parsed) => parsed,
         Err(args::Halt::Help) => return Ended::Program(0),
         Err(args::Halt::Bad) => return Ended::Failed,
     };
-    let mut err = std::io::stderr();
     let given: Vec<&String> = parsed.positionals().iter().chain(after).collect();
     if !given.is_empty() {
-        say(&mut err, &arguments_refusal(&given));
+        fail(&mut err, &arguments_refusal(&given));
         return Ended::Failed;
     }
     let manifest = parsed.value(MANIFEST).unwrap_or_default();
     let image = match image_of(Path::new(manifest)) {
         Ok(image) => image,
         Err(refusal) => {
-            say(&mut err, &refusal);
+            fail(&mut err, &refusal);
             return Ended::Failed;
         }
     };
-    run_image(&image, parsed.value("--probe"), parsed.value("--timeout"))
+    run_image(&image, parsed.value("--probe"), parsed.value("--timeout"), !parsed.flag("--no-banner"))
 }
 
 /// The refusal for a program given arguments, which a program on a board cannot take yet.
@@ -124,26 +124,29 @@ fn image_of(manifest: &Path) -> Result<PathBuf, String> {
 }
 
 /// The run of `image`, whose manifest is beside it, through the probe `probe` names.
-fn run_image(image: &Path, probe: Option<&str>, time_limit: Option<&str>) -> Ended {
+fn run_image(image: &Path, probe: Option<&str>, time_limit: Option<&str>, banner: bool) -> Ended {
     let mut err = std::io::stderr();
-    let plan = match plan(image, time_limit) {
+    let mut plan = match plan(image, time_limit) {
         Ok(plan) => plan,
         Err(refusal) => {
-            say(&mut err, &refusal);
+            fail(&mut err, &refusal);
             return Ended::Failed;
         }
     };
+    plan.banner = banner;
     let environment = std::env::var("LAMELLA_PROBE_SERIAL").ok();
-    let chosen = match choose_probe(
-        probe,
-        environment.as_deref(),
-        plan.board,
-        plan.route,
-        &crate::devices::attached_probes(),
-    ) {
+    let named = probe.or(environment.as_deref()).map(serial_named);
+    let attached = match crate::devices::attached_probes_naming(named) {
+        Ok(attached) => attached,
+        Err(refusal) => {
+            fail(&mut err, &refusal);
+            return Ended::Failed;
+        }
+    };
+    let chosen = match choose_probe(probe, environment.as_deref(), plan.board, plan.route, &attached) {
         Ok(chosen) => chosen,
         Err(refusal) => {
-            say(&mut err, &refusal);
+            fail(&mut err, &refusal);
             return Ended::Failed;
         }
     };
@@ -210,10 +213,8 @@ pub(crate) fn probe_families(board: &str) -> Vec<&'static str> {
 
 /// A run of an image, settled from files alone: what is written where, and what is followed.
 pub(crate) struct ImagePlan {
-    /// The image, as the caller named it.
-    image: PathBuf,
-    /// What the manifest attests, in the words a person reads before a write.
-    attestation: String,
+    /// Whether this tool supplies the banner; an RHU program supplies its own.
+    banner: bool,
     /// The board the image was built for.
     board: &'static str,
     /// The route that writes the board, which is always one over a debug probe.
@@ -226,8 +227,6 @@ pub(crate) struct ImagePlan {
     bytes: Vec<u8>,
     /// The image's half for the board's external flash, written with `bytes` as one set.
     window: Option<lamella_flash_routes::WindowHalf>,
-    /// What the file held: `998096 B of ELF`.
-    read: String,
     /// Where the image keeps its console ring, and how many bytes it gives it.
     ring: DataObject,
     /// Whether the image was built with its console off, so that nothing the program prints is
@@ -265,11 +264,9 @@ fn plan(image: &Path, time_limit: Option<&str>) -> Result<ImagePlan, String> {
     };
     if manifest.model == manifest::INTERPRETER {
         return Err(format!(
-            "{} is an image Lamella's firmware runs (its manifest's model is {}), and a run by its manifest \
-             writes a native image over a probe.\ndotnet run --device <device> runs the program on a board running \
-             the firmware.",
-            image.display(),
-            manifest::INTERPRETER
+            "{} is built for Lamella's interpreter, so it can't be written over a probe.\n\
+             To run it on a board running the firmware: dotnet run --device <device>.",
+            image.display()
         ));
     }
     let shipped = std::fs::read(image).map_err(|error| {
@@ -299,15 +296,13 @@ fn plan(image: &Path, time_limit: Option<&str>) -> Result<ImagePlan, String> {
     }
     let prepared = prepare_image(image, row, route, &placement)?;
     Ok(ImagePlan {
-        image: image.to_path_buf(),
-        attestation: manifest::attestation(&manifest),
+        banner: true,
         board: row.board,
         route,
         reach,
         placement,
         bytes: prepared.bytes,
         window: prepared.window,
-        read: prepared.read,
         ring,
         console_off: manifest.console_channel.as_deref() == Some("off"),
         limit,
@@ -468,8 +463,15 @@ fn choose_probe(
             )),
         };
     };
-    let probe = named_probe(serial, board, route, attached)?;
+    let probe = named_probe(serial, board, route, attached)
+        .map_err(|refusal| if named.is_none() { named_by_the_environment(refusal) } else { refusal })?;
     Ok(Chosen { serial: probe.serial.clone().unwrap_or_default(), probe: probe.clone() })
+}
+
+/// A refusal of a serial the environment named, saying so: someone who never typed it is told where it
+/// came from.
+pub(crate) fn named_by_the_environment(refusal: String) -> String {
+    format!("{refusal}\n\nThat serial number comes from {}.", lamella_probe::PROBE_SERIAL_ENV)
 }
 
 /// The attached probe whose USB serial number is `serial`, in either case, which must be one that
@@ -632,33 +634,30 @@ fn run_planned(
     watch: &mut dyn FnMut() -> bool,
     stop: &dyn Fn() -> bool,
 ) -> Ended {
-    say(
-        err,
-        &crate::own_lines::running_through_probe(&plan.board, &chosen.serial),
-    );
-    say(err, &plan.attestation);
-    say(err, &format!("read {} from {}", plan.read, plan.image.display()));
-    say(err, &format!("probe {}: {}", chosen.serial, chosen.probe.description));
+    if plan.banner {
+        say(err, &crate::own_lines::running_through_probe(plan.board));
+    }
     if plan.console_off {
         say(
             err,
-            "the image was built with its console off, so nothing the program prints is kept; \
-             this run says how\nit ends.",
+            "The image was built with its console off, so nothing the program prints is kept.",
         );
     }
-    if let Err(why) = writer.write(plan, &chosen.serial, &mut |line| say(&mut *err, line)) {
-        say(err, &why);
+    say(err, lamella_wire_host::on_device::ERASING);
+    if let Err(why) = writer.write(plan, &chosen.serial, &mut |_| {}) {
+        fail(err, &why);
         return Ended::Failed;
     }
     let first_look = clock.now() + SETTLE;
     let mut console = match attach.attach(plan, chosen) {
         Ok(console) => console,
         Err(why) => {
-            say(err, &why);
+            fail(err, &why);
             return Ended::Failed;
         }
     };
     let _ = watch();
+    blank_line(err);
     follow(console.as_mut(), out, err, plan.limit, clock, stop, first_look)
 }
 
@@ -676,7 +675,7 @@ fn follow(
     let started = clock.now();
     loop {
         if stop() {
-            say(err, "stopped by Ctrl+C. The program is still running on the board.");
+            say(err, lamella_wire_host::on_device::DISCONNECTED);
             return Ended::Interrupted;
         }
         if let Some(limit) = limit
@@ -685,7 +684,7 @@ fn follow(
             say(
                 err,
                 &format!(
-                    "the time limit of {} s ran out. The program is still running on the board.",
+                    "The time limit of {} s ran out while the program was still running on the board.",
                     limit.as_secs_f64()
                 ),
             );
@@ -698,7 +697,7 @@ fn follow(
         let seen = match console.poll() {
             Ok(seen) => seen,
             Err(why) => {
-                say(err, &format!("lost the program's console: {why}"));
+                fail(err, &format!("Lost the program's console: {why}"));
                 return Ended::Failed;
             }
         };
@@ -710,7 +709,7 @@ fn follow(
             match one {
                 Seen::Out(bytes) => {
                     if out.write_all(&bytes).and_then(|()| out.flush()).is_err() {
-                        say(err, "standard output was closed, so the program can no longer be followed.");
+                        say(err, "Standard output was closed, so the program can no longer be followed.");
                         return Ended::Failed;
                     }
                 }
@@ -722,11 +721,11 @@ fn follow(
                     ),
                 ),
                 Seen::Restarted => {
-                    say(err, "the board started again; following the program from its new start.");
+                    say(err, "The board started again; following the program from its new start.");
                 }
                 Seen::Ended(ProgramEnd::Returned(code)) => return Ended::Program(code),
                 Seen::Ended(ProgramEnd::Aborted(code)) => {
-                    say(err, &format!("the program was aborted, and the board gives code {code} for it."));
+                    say(err, &format!("The program was aborted, and the board gives code {code} for it."));
                     return Ended::Uncaught;
                 }
             }
@@ -909,7 +908,7 @@ mod tests {
 
     /// A Pico 2 image with a manifest naming its ELF.
     fn pico2_with_manifest(dir: &Path, extra: &str) -> PathBuf {
-        image_with_manifest(dir, "app.bin", &pico2_image(), "rpi-pico2", "0x10000000", &format!(",\"elf\":\"app.elf\"{extra}"))
+        image_with_manifest(dir, "app.bin", &pico2_image(), "raspberrypi-pico-2", "0x10000000", &format!(",\"elf\":\"app.elf\"{extra}"))
     }
 
     /// **AN IMAGE LAMELLA's FIRMWARE RUNS IS NOT WRITTEN OVER A PROBE**: its record's model is the
@@ -920,9 +919,15 @@ mod tests {
         let image = dir.join("app.lmli");
         let bytes = b"a baked image".to_vec();
         std::fs::write(&image, &bytes).expect("write the image");
-        manifest::write(&image, &manifest::for_lmli("rpi-pico2", &bytes, "a test")).expect("write the manifest");
+        manifest::write(&image, &manifest::for_lmli("raspberrypi-pico-2", &bytes, "a test")).expect("write the manifest");
         let refusal = plan(&image, None).err().expect("refused");
-        assert!(refusal.contains("an image Lamella's firmware runs") && refusal.contains("dotnet run --device <device>"), "{refusal}");
+        let mut err = Vec::new();
+        fail(&mut err, &refusal);
+        assert_eq!(String::from_utf8(err).unwrap(), format!(
+            "{} is built for Lamella's interpreter, so it can't be written over a probe.\n\
+             To run it on a board running the firmware: dotnet run --device <device>.\n",
+            image.display()
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -936,7 +941,7 @@ mod tests {
         let refusal = plan(&image, None).err().expect("refused");
         assert!(refusal.contains("no manifest at") && refusal.contains("app.bin.manifest.json"), "{refusal}");
 
-        let lone = image_with_manifest(&dir, "lone.bin", &pico2_image(), "rpi-pico2", "0x10000000", "");
+        let lone = image_with_manifest(&dir, "lone.bin", &pico2_image(), "raspberrypi-pico-2", "0x10000000", "");
         std::fs::remove_file(&lone).expect("remove the image");
         let refusal = plan(&lone, None).err().expect("refused");
         assert!(refusal.contains("lone.bin") && refusal.contains("named as the manifest is"), "{refusal}");
@@ -994,7 +999,7 @@ mod tests {
         assert_eq!(planned.ring, DataObject { address: RING_AT, size: RING_BYTES });
         assert!(!planned.console_off);
         assert_eq!(planned.limit, Some(Duration::from_millis(2500)));
-        assert_eq!(planned.board, "rpi-pico2");
+        assert_eq!(planned.board, "raspberrypi-pico-2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1003,7 +1008,7 @@ mod tests {
     #[test]
     fn a_run_without_a_ring_to_follow_writes_nothing() {
         let dir = scratch("no-ring");
-        let unnamed = image_with_manifest(&dir, "app.bin", &pico2_image(), "rpi-pico2", "0x10000000", "");
+        let unnamed = image_with_manifest(&dir, "app.bin", &pico2_image(), "raspberrypi-pico-2", "0x10000000", "");
         let refusal = plan(&unnamed, None).err().expect("refused");
         assert!(refusal.contains("names no ELF"), "{refusal}");
 
@@ -1055,7 +1060,7 @@ mod tests {
     fn a_flat_image_whose_manifest_names_another_address_is_refused() {
         let dir = scratch("base");
         let image =
-            image_with_manifest(&dir, "app.bin", &pico2_image(), "rpi-pico2", "0x10004000", ",\"elf\":\"app.elf\"");
+            image_with_manifest(&dir, "app.bin", &pico2_image(), "raspberrypi-pico-2", "0x10004000", ",\"elf\":\"app.elf\"");
         let refusal = plan(&image, None).err().expect("refused");
         assert!(refusal.contains("0x10004000") && refusal.contains("0x10000000"), "{refusal}");
         assert!(refusal.contains("nothing was written"), "{refusal}");
@@ -1086,7 +1091,7 @@ mod tests {
     /// RP2350 over its probe and an ST board over its own ST-LINK are followed.
     #[test]
     fn only_a_route_the_reader_can_follow_is_planned() {
-        assert_eq!(Reach::of(pico_route(), "rpi-pico2"), Ok(Reach::Rp2350));
+        assert_eq!(Reach::of(pico_route(), "raspberrypi-pico-2"), Ok(Reach::Rp2350));
         assert_eq!(
             Reach::of(f769_route(), "st-stm32f769i-disco"),
             Ok(Reach::StLink(lamella_stlink::product_id::V2_1))
@@ -1131,7 +1136,7 @@ mod tests {
     }
 
     fn pico_route() -> Programmer {
-        Programmer::Rp2350Probe { base: lamella_flash_routes::RP2_XIP_BASE }
+        Programmer::Rp2350Probe { base: lamella_flash_routes::RP2_XIP_BASE, block_erase: true }
     }
 
     fn f769_route() -> Programmer {
@@ -1146,13 +1151,13 @@ mod tests {
     /// whatever id it was given; the refusal lists what is attached.
     #[test]
     fn a_named_probe_must_be_attached_and_the_refusal_lists_what_is() {
-        let chosen = choose_probe(Some("e6610000000000b2"), None, "rpi-pico2", pico_route(), &bench())
+        let chosen = choose_probe(Some("e6610000000000b2"), None, "raspberrypi-pico-2", pico_route(), &bench())
             .expect("named, in any case");
         assert_eq!(chosen.serial, "E6610000000000B2", "the probe's own spelling");
-        let refusal = choose_probe(Some("NOT-A-PROBE"), None, "rpi-pico2", pico_route(), &bench())
+        let refusal = choose_probe(Some("NOT-A-PROBE"), None, "raspberrypi-pico-2", pico_route(), &bench())
             .expect_err("refused");
         assert!(refusal.contains("NOT-A-PROBE") && refusal.contains("E6610000000000C3"), "{refusal}");
-        let none = choose_probe(Some("X"), None, "rpi-pico2", pico_route(), &[]).expect_err("refused");
+        let none = choose_probe(Some("X"), None, "raspberrypi-pico-2", pico_route(), &[]).expect_err("refused");
         assert!(none.contains("No debug probe is attached"), "{none}");
     }
 
@@ -1161,7 +1166,7 @@ mod tests {
     #[test]
     fn an_empty_probe_name_is_refused_rather_than_taken_as_none() {
         let refusal =
-            choose_probe(Some("  "), None, "rpi-pico2", pico_route(), &bench()[..1]).expect_err("refused");
+            choose_probe(Some("  "), None, "raspberrypi-pico-2", pico_route(), &bench()[..1]).expect_err("refused");
         assert!(refusal.contains("no serial number"), "{refusal}");
     }
 
@@ -1170,27 +1175,51 @@ mod tests {
     /// after it is no name.
     #[test]
     fn a_probe_is_named_by_the_id_the_device_list_gives_it() {
-        let named = choose_probe(Some("probe:E6610000000000B2"), None, "rpi-pico2", pico_route(), &bench())
+        let named = choose_probe(Some("probe:E6610000000000B2"), None, "raspberrypi-pico-2", pico_route(), &bench())
             .expect("named by its id");
         assert_eq!(named.serial, "E6610000000000B2");
         let from_environment =
-            choose_probe(None, Some("probe:e6610000000000c3"), "rpi-pico2", pico_route(), &bench()).expect("chosen");
+            choose_probe(None, Some("probe:e6610000000000c3"), "raspberrypi-pico-2", pico_route(), &bench()).expect("chosen");
         assert_eq!(from_environment.serial, "E6610000000000C3", "the probe's own spelling");
-        let empty = choose_probe(Some("probe:"), None, "rpi-pico2", pico_route(), &bench()[..1]).expect_err("refused");
+        let empty = choose_probe(Some("probe:"), None, "raspberrypi-pico-2", pico_route(), &bench()[..1]).expect_err("refused");
         assert!(empty.contains("no serial number"), "{empty}");
-        let unknown = choose_probe(Some("probe:NOT-A-PROBE"), None, "rpi-pico2", pico_route(), &bench())
+        let unknown = choose_probe(Some("probe:NOT-A-PROBE"), None, "raspberrypi-pico-2", pico_route(), &bench())
             .expect_err("refused");
         assert!(unknown.contains("serial number NOT-A-PROBE."), "the serial it looked for: {unknown}");
+    }
+
+    /// The printed refusal preserves the available probes and the source of a stale serial.
+    #[test]
+    fn a_run_refusal_keeps_the_probe_list_and_environment_source() {
+        let refusal = choose_probe(None, Some("OLD123"), "raspberrypi-pico-2", pico_route(), &bench()).unwrap_err();
+        let mut err = Vec::new();
+        fail(&mut err, &refusal);
+        let shown = String::from_utf8(err).unwrap();
+        assert!(shown.contains("Attached:\n"), "{shown}");
+        assert!(shown.contains("E6610000000000B2"), "{shown}");
+        assert!(shown.contains("That serial number comes from LAMELLA_PROBE_SERIAL."), "{shown}");
+        assert!(shown.contains("`lamella devices` lists what is attached."), "{shown}");
+    }
+
+    /// An ambiguous selection prints each candidate and how to name one.
+    #[test]
+    fn a_run_refusal_keeps_the_ambiguous_probe_choices_and_action() {
+        let refusal = choose_probe(None, None, "raspberrypi-pico-2", pico_route(), &bench()).unwrap_err();
+        let mut err = Vec::new();
+        fail(&mut err, &refusal);
+        let shown = String::from_utf8(err).unwrap();
+        assert!(shown.contains("E6610000000000B2") && shown.contains("E6610000000000C3"), "{shown}");
+        assert!(shown.contains("\n\nName one with --probe <serial>, or set LAMELLA_PROBE_SERIAL."), "{shown}");
     }
 
     /// The environment names a probe when the command line does not, and the command line wins.
     #[test]
     fn the_environment_names_a_probe_when_the_command_line_does_not() {
         let from_environment =
-            choose_probe(None, Some("E6610000000000C3"), "rpi-pico2", pico_route(), &bench()).expect("chosen");
+            choose_probe(None, Some("E6610000000000C3"), "raspberrypi-pico-2", pico_route(), &bench()).expect("chosen");
         assert_eq!(from_environment.serial, "E6610000000000C3");
         let named =
-            choose_probe(Some("E6610000000000B2"), Some("E6610000000000C3"), "rpi-pico2", pico_route(), &bench())
+            choose_probe(Some("E6610000000000B2"), Some("E6610000000000C3"), "raspberrypi-pico-2", pico_route(), &bench())
                 .expect("chosen");
         assert_eq!(named.serial, "E6610000000000B2");
     }
@@ -1199,7 +1228,7 @@ mod tests {
     /// board whose debugger is soldered to it, only that kind of probe counts.
     #[test]
     fn with_none_named_one_probe_is_taken_and_several_are_refused() {
-        let several = choose_probe(None, None, "rpi-pico2", pico_route(), &bench()).expect_err("refused");
+        let several = choose_probe(None, None, "raspberrypi-pico-2", pico_route(), &bench()).expect_err("refused");
         assert!(several.contains("3 probes") && several.contains("LAMELLA_PROBE_SERIAL"), "{several}");
         let st_link = choose_probe(None, None, "st-stm32f769i-disco", f769_route(), &bench()).expect("the ST-LINK");
         assert_eq!(st_link.serial, "066D000000000000000000C1");
@@ -1286,7 +1315,7 @@ mod tests {
         assert_eq!(out, "hello board\nbye\n");
         assert_eq!(
             err,
-            "lamella: 12 bytes of the board's console were overwritten on the board before they \
+            "12 bytes of the board's console were overwritten on the board before they \
              could be read.\n"
         );
     }
@@ -1297,7 +1326,7 @@ mod tests {
         let mut console = scripted(vec![Ok(vec![Seen::Ended(ProgramEnd::Aborted(134))])]);
         let (ended, out, err) = followed_to_end(&mut console, None, &|| false);
         assert_eq!((ended, out.as_str()), (Ended::Uncaught, ""));
-        assert_eq!(err, "lamella: the program was aborted, and the board gives code 134 for it.\n");
+        assert_eq!(err, "The program was aborted, and the board gives code 134 for it.\n");
     }
 
     /// **A TIME LIMIT EXISTS ONLY WHEN THE CALLER GAVE ONE**, and a run it stops is 1, with the
@@ -1307,7 +1336,7 @@ mod tests {
         let mut quiet = scripted(Vec::new());
         let (ended, _, err) = followed_to_end(&mut quiet, Some(Duration::from_millis(100)), &|| false);
         assert_eq!(ended, Ended::TimedOut);
-        assert_eq!(err, "lamella: the time limit of 0.1 s ran out. The program is still running on the board.\n");
+        assert_eq!(err, "The time limit of 0.1 s ran out while the program was still running on the board.\n");
 
         let mut polls: Vec<Result<Vec<Seen>, String>> = (0..1000).map(|_| Ok(Vec::new())).collect();
         polls.push(Ok(vec![Seen::Ended(ProgramEnd::Returned(0))]));
@@ -1328,7 +1357,7 @@ mod tests {
         let (ended, out, err) = followed_to_end(&mut console, None, &stop);
         assert_eq!(ended, Ended::Interrupted);
         assert_eq!(out, "tick\n");
-        assert_eq!(err, "lamella: stopped by Ctrl+C. The program is still running on the board.\n");
+        assert_eq!(err, "Disconnected from the board.\n");
     }
 
     /// A console that cannot be read any longer is this tool's failure, and said.
@@ -1337,7 +1366,7 @@ mod tests {
         let mut console = scripted(vec![Err("the probe went away".to_owned())]);
         let (ended, _, err) = followed_to_end(&mut console, None, &|| false);
         assert_eq!(ended, Ended::Failed);
-        assert_eq!(err, "lamella: lost the program's console: the probe went away\n");
+        assert_eq!(err, "Lost the program's console: the probe went away\n");
     }
 
     /// The steps a whole run took, in order, as the fakes saw them.
@@ -1380,7 +1409,7 @@ mod tests {
     fn a_whole_run_writes_then_follows_and_ends_with_the_programs_code() {
         let dir = scratch("whole-run");
         let planned = planned_pico(&dir, "");
-        let chosen = choose_probe(Some("E6610000000000B2"), None, "rpi-pico2", planned.route, &bench())
+        let chosen = choose_probe(Some("E6610000000000B2"), None, "raspberrypi-pico-2", planned.route, &bench())
             .expect("chosen");
         let steps: Steps = Rc::default();
         let console = scripted(vec![Ok(vec![Seen::Out(b"42\n".to_vec()), Seen::Ended(ProgramEnd::Returned(7))])]);
@@ -1401,15 +1430,47 @@ mod tests {
             ["write 512 B through E6610000000000B2", "follow through E6610000000000B2", "watch Ctrl+C"]
         );
         let err = String::from_utf8(err).expect("text");
-        assert!(err.lines().all(|line| line.starts_with("lamella:")), "every line of ours is marked:\n{err}");
-        assert_eq!(
-            err.lines().next(),
-            Some("lamella: running the native image for rpi-pico2 through probe E6610000000000B2."),
-            "the run says how the program runs first:\n{err}"
-        );
-        assert!(err.contains("lamella: probe E6610000000000B2: Debugprobe on Pico (CMSIS-DAP)"), "{err}");
-        assert!(err.contains("lamella: writing over a test's probe..."), "the write's own lines: {err}");
-        assert!(!err.contains("console off"), "{err}");
+        assert_eq!(err, format!("Lamella v{}, RP2350 (AOT)\nErasing the program area of flash...\n\n", env!("CARGO_PKG_VERSION")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The introduction is visible before writing flash; a runtime's own banner is never doubled.
+    #[test]
+    fn the_banner_precedes_the_write_and_can_belong_to_the_runtime() {
+        #[derive(Clone, Default)]
+        struct Shared(Rc<std::cell::RefCell<Vec<u8>>>);
+        impl Write for Shared {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.borrow_mut().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        struct BeforeWrite { err: Shared, expected: String }
+        impl Writer for BeforeWrite {
+            fn write(&mut self, _: &ImagePlan, _: &str, say: &mut dyn FnMut(&str)) -> Result<(), String> {
+                assert_eq!(&*self.err.0.borrow(), self.expected.as_bytes());
+                say("a writer's private progress");
+                Ok(())
+            }
+        }
+        let dir = scratch("runtime-banner");
+        for banner in [true, false] {
+            let mut planned = planned_pico(&dir, "");
+            planned.banner = banner;
+            let chosen = choose_probe(Some("E6610000000000B2"), None, "raspberrypi-pico-2", planned.route, &bench()).unwrap();
+            let introduction = if banner { format!("Lamella v{}, RP2350 (AOT)\n", env!("CARGO_PKG_VERSION")) } else { String::new() };
+            let before = format!("{introduction}Erasing the program area of flash...\n");
+            let mut err = Shared::default();
+            let mut writer = BeforeWrite { err: err.clone(), expected: before.clone() };
+            let console = scripted(vec![Ok(vec![Seen::Out(b"runtime-banner-marker\nprogram-marker\n".to_vec()), Seen::Ended(ProgramEnd::Returned(0))])]);
+            let mut attach = FakeAttach { steps: Rc::default(), console: Some(Box::new(console)) };
+            let mut out = Vec::new();
+            let ended = run_planned(&planned, &chosen, &mut writer, &mut attach, &mut out, &mut err, &clock(), &mut || true, &|| false);
+            assert_eq!(ended, Ended::Program(0));
+            assert_eq!(out, b"runtime-banner-marker\nprogram-marker\n");
+            assert_eq!(&*err.0.borrow(), format!("{before}\n").as_bytes());
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1418,7 +1479,7 @@ mod tests {
     fn a_failed_write_ends_the_run_and_follows_nothing() {
         let dir = scratch("failed-write");
         let planned = planned_pico(&dir, "");
-        let chosen = choose_probe(None, Some("E6610000000000B2"), "rpi-pico2", planned.route, &bench())
+        let chosen = choose_probe(None, Some("E6610000000000B2"), "raspberrypi-pico-2", planned.route, &bench())
             .expect("chosen");
         let steps: Steps = Rc::default();
         let mut writer = FakeWriter { steps: Rc::clone(&steps), fails: true };
@@ -1428,7 +1489,7 @@ mod tests {
         assert_eq!(ended, Ended::Failed);
         assert!(out.is_empty());
         assert!(!steps.borrow().iter().any(|step| step.starts_with("follow")), "{:?}", steps.borrow());
-        assert!(String::from_utf8(err).expect("text").ends_with("lamella: the part did not answer\n"));
+        assert!(String::from_utf8(err).expect("text").ends_with("The part did not answer\n"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1438,7 +1499,7 @@ mod tests {
     fn the_ring_is_first_looked_at_a_settle_after_the_write() {
         let dir = scratch("settle");
         let planned = planned_pico(&dir, "");
-        let chosen = choose_probe(Some("E6610000000000B2"), None, "rpi-pico2", planned.route, &bench())
+        let chosen = choose_probe(Some("E6610000000000B2"), None, "raspberrypi-pico-2", planned.route, &bench())
             .expect("chosen");
         let clock = clock();
         let first = Rc::new(Cell::new(None));
@@ -1464,7 +1525,7 @@ mod tests {
         let dir = scratch("console-off");
         let planned = planned_pico(&dir, ",\"console_channel\":\"off\"");
         assert!(planned.console_off);
-        let chosen = choose_probe(Some("E6610000000000B2"), None, "rpi-pico2", planned.route, &bench())
+        let chosen = choose_probe(Some("E6610000000000B2"), None, "raspberrypi-pico-2", planned.route, &bench())
             .expect("chosen");
         let steps: Steps = Rc::default();
         let console = scripted(vec![Ok(vec![Seen::Ended(ProgramEnd::Returned(0))])]);
@@ -1475,7 +1536,7 @@ mod tests {
         assert_eq!(ended, Ended::Program(0));
         let err = String::from_utf8(err).expect("text");
         let said = err.find("console off").expect("said");
-        assert!(said < err.find("writing over").expect("the write"), "before the write:\n{err}");
+        assert!(said < err.find("Erasing the program area").expect("the write"), "before the write:\n{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

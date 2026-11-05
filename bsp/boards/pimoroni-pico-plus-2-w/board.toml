@@ -32,9 +32,12 @@
 kind = "board"
 board = "pimoroni-pico-plus-2-w"
 vendor = "pimoroni"
+maker = "Pimoroni"
+product = "Pico Plus 2 W"
 family = "rp2350"
 part = "rp2350b"
 product_model = 62          # lamella_wire::product_model::PICO_PLUS_2_W
+pin_labels = "chip"         # the board prints the chip's own pin names: GP0, GP1, ...
 sources = [
     "Pimoroni Pico Plus 2 W schematic (pimoroni-pico-plus-2w-schematic.pdf, 3 sheets): sheet 1 is the RP2350B, its nets and the RM2 module, sheet 2 the flash, PSRAM, USB-C, crystal, user LED and the combined boot/user switch, sheet 3 the 40-pin header.",
     "Pimoroni Pico Plus 2 W pinout diagram (ppico_plus_2_w_pinout_diagram.pdf).",
@@ -245,6 +248,7 @@ name = "psram-cs"
 kind = "gpio-out"
 pin = "GP47"
 active = "low"
+reserved = true
 source = "Schematic sheet 1: the net PSRAM_CS lands on GPIO47/ADC7 (ball 58); sheet 2 carries it to the chip select of an 8MB APS6404L-3SQR-ZR and notes that PSRAM_CS can be GP0, GP8, GP19 or GP47, of which this board fits GP47. The level is the chip's own: the APMemory APS6404L-3SQR datasheet (APM_PSRAM_E3_QSPI v2.7), section 6, Table 2 'Signals Table', gives CE# as an input, 'Chip select, active low. When CE#=1, chip is in standby state'."
 
 [[devices]]

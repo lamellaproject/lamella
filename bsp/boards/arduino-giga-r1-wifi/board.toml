@@ -33,6 +33,8 @@
 kind = "board"
 board = "arduino-giga-r1-wifi"
 vendor = "arduino"
+maker = "Arduino"
+product = "GIGA R1 WiFi"
 family = "stm32h7"
 part = "stm32h747xi"
 product_model = 33          # lamella_wire::product_model::ARDUINO_GIGA_R1_WIFI

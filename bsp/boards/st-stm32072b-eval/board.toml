@@ -37,6 +37,8 @@
 kind = "board"
 board = "st-stm32072b-eval"
 vendor = "st"
+maker = "STMicroelectronics"
+product = "STM32072B-EVAL"
 family = "stm32f091"
 part = "stm32f072vb"
 product_model = 31          # lamella_wire::product_model::STM32072B_EVAL

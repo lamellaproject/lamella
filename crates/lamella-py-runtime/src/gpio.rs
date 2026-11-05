@@ -120,7 +120,7 @@ pub enum Board {
     Rp2040,
     /// Microchip SAMD21 Xplained Pro. UART-first (its SERCOM USART arm is live, phase-7-shaped: the
     /// register FACTS come from the board binding, not a hand table); gpio waits on its own table.
-    Samd21Xpro,
+    SamD21XplainedPro,
 }
 
 impl Board {
@@ -129,7 +129,7 @@ impl Board {
         match self {
             Board::Stm32f4 => gpio_stm32f4::board_pin_id(name),
             Board::Rp2350 => gpio_rp2350::board_pin_id(name),
-            Board::Esp32c6 | Board::Rp2040 | Board::Samd21Xpro => None,
+            Board::Esp32c6 | Board::Rp2040 | Board::SamD21XplainedPro => None,
         }
     }
 
@@ -139,7 +139,7 @@ impl Board {
         match self {
             Board::Stm32f4 => gpio_stm32f4::pin_regs(pin),
             Board::Rp2350 => gpio_rp2350::pin_regs(pin),
-            Board::Esp32c6 | Board::Rp2040 | Board::Samd21Xpro => PinRegs {
+            Board::Esp32c6 | Board::Rp2040 | Board::SamD21XplainedPro => PinRegs {
                 pin_id: pin,
                 set_reg: 0,
                 set_val: 0,
@@ -157,7 +157,7 @@ impl Board {
         match self {
             Board::Stm32f4 => gpio_stm32f4::direction_ops(pin, output),
             Board::Rp2350 => gpio_rp2350::direction_ops(pin, output),
-            Board::Esp32c6 | Board::Rp2040 | Board::Samd21Xpro => alloc::vec::Vec::new(),
+            Board::Esp32c6 | Board::Rp2040 | Board::SamD21XplainedPro => alloc::vec::Vec::new(),
         }
     }
 
@@ -167,7 +167,7 @@ impl Board {
         match self {
             Board::Stm32f4 => gpio_stm32f4::open_ops(pin, output),
             Board::Rp2350 => gpio_rp2350::open_ops(pin, output),
-            Board::Esp32c6 | Board::Rp2040 | Board::Samd21Xpro => alloc::vec::Vec::new(),
+            Board::Esp32c6 | Board::Rp2040 | Board::SamD21XplainedPro => alloc::vec::Vec::new(),
         }
     }
 
@@ -176,14 +176,14 @@ impl Board {
         match self {
             Board::Stm32f4 => gpio_stm32f4::MAX_PIN,
             Board::Rp2350 => gpio_rp2350::MAX_PIN,
-            Board::Esp32c6 | Board::Rp2040 | Board::Samd21Xpro => 0,
+            Board::Esp32c6 | Board::Rp2040 | Board::SamD21XplainedPro => 0,
         }
     }
 
     /// Whether this board's GPIO arm is populated (the ESP32-C6 arm is UART-first: gpio waits
     /// on its table).
     pub(crate) fn gpio_supported(self) -> bool {
-        !matches!(self, Board::Esp32c6 | Board::Rp2040 | Board::Samd21Xpro)
+        !matches!(self, Board::Esp32c6 | Board::Rp2040 | Board::SamD21XplainedPro)
     }
 
     /// The board's RESETS `(clear-alias, done)` register pair, or `None` when the board has no such
@@ -194,7 +194,7 @@ impl Board {
         match self {
             Board::Rp2350 => Some((0x4002_3000, 0x4002_0008)),
             Board::Rp2040 => Some((0x4000_F000, 0x4000_C008)),
-            Board::Stm32f4 | Board::Esp32c6 | Board::Samd21Xpro => None,
+            Board::Stm32f4 | Board::Esp32c6 | Board::SamD21XplainedPro => None,
         }
     }
 }

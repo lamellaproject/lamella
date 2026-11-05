@@ -37,7 +37,8 @@ pub struct Programming {
     pub aot_target: Option<&'static str>,
     /// The route this board takes when nobody asks for another: its own mechanism.
     pub programmer: Programmer,
-    /// The route `--via probe` selects, where the board has a second one.
+    /// The route `--via probe` selects, where the board has a second one. Naming a probe with
+    /// `--probe <serial>` selects it too, where this is a probe route ([`route_for_request`]).
     ///
     /// **THE DEFAULT IS WHATEVER NEEDS NO HARDWARE THE OWNER DOES NOT ALREADY HAVE**, which is one
     /// rule covering every board rather than a preference stated per family:
@@ -78,11 +79,19 @@ pub enum Programmer {
     ///
     /// **NEVER A DEFAULT AND ALWAYS ASKED FOR.** A person who owns no probe has to be able to
     /// flash these boards, so the volume stays the route a board takes when nobody says otherwise.
-    /// This is what `--via probe` selects, and it offers the one thing the volume cannot: every
-    /// byte read back and compared.
+    /// This is what `--via probe` selects, and what naming a probe with `--probe <serial>` selects,
+    /// and it offers the one thing the volume cannot: every byte read back and compared.
     Rp2350Probe {
         /// Where the image belongs in the chip's address space.
         base: u32,
+        /// Whether the board's flash device takes the 64 KiB block erase (D8h), so the write erases
+        /// each whole block it covers with one command
+        /// ([`lamella_cmsis_dap_rp2350::Erase::Blocks`]).
+        ///
+        /// True only where the board's documents name a flash part whose own datasheet specifies
+        /// that command. Everywhere else the write erases a 4 KiB sector at a time, which every
+        /// part takes.
+        block_erase: bool,
     },
     /// An RP2040 over a general-purpose SWD probe, by the chip's own bootrom flash API.
     ///
@@ -499,7 +508,7 @@ impl Programmer {
         match self {
             Programmer::MicrobitV1Daplink | Programmer::MicrobitV2Daplink => 0,
             Programmer::Uf2Volume { base, .. } => base,
-            Programmer::Rp2350Probe { base } | Programmer::Rp2040Probe { base } => base,
+            Programmer::Rp2350Probe { base, .. } | Programmer::Rp2040Probe { base } => base,
             Programmer::StlinkOnboard { family, .. }
             | Programmer::StExternalProbe { family }
             | Programmer::StDfu { family } => family.plan().flash_base,
@@ -599,22 +608,22 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "rpi-pico2",
+        board: "raspberrypi-pico-2",
         aot_target: Some("rp2350"),
         programmer: Programmer::Uf2Volume {
             family: RP2350_UF2_FAMILY,
             base: RP2_XIP_BASE,
         },
-        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: true }),
     },
     Programming {
-        board: "rpi-pico2-w",
+        board: "raspberrypi-pico-2-w",
         aot_target: Some("rp2350"),
         programmer: Programmer::Uf2Volume {
             family: RP2350_UF2_FAMILY,
             base: RP2_XIP_BASE,
         },
-        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: true }),
     },
     Programming {
         board: "pimoroni-pico-plus-2",
@@ -623,7 +632,7 @@ pub const PROGRAMMING: &[Programming] = &[
             family: RP2350_UF2_FAMILY,
             base: RP2_XIP_BASE,
         },
-        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: true }),
     },
     Programming {
         board: "pimoroni-pico-plus-2-w",
@@ -632,7 +641,7 @@ pub const PROGRAMMING: &[Programming] = &[
             family: RP2350_UF2_FAMILY,
             base: RP2_XIP_BASE,
         },
-        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: true }),
     },
     Programming {
         board: "pimoroni-pico-lipo-2",
@@ -641,7 +650,7 @@ pub const PROGRAMMING: &[Programming] = &[
             family: RP2350_UF2_FAMILY,
             base: RP2_XIP_BASE,
         },
-        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: true }),
     },
     Programming {
         board: "pimoroni-pico-lipo-2-xl-w",
@@ -650,7 +659,7 @@ pub const PROGRAMMING: &[Programming] = &[
             family: RP2350_UF2_FAMILY,
             base: RP2_XIP_BASE,
         },
-        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: true }),
     },
     Programming {
         board: "adafruit-feather-rp2350-hstx",
@@ -659,7 +668,7 @@ pub const PROGRAMMING: &[Programming] = &[
             family: RP2350_UF2_FAMILY,
             base: RP2_XIP_BASE,
         },
-        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: false }),
     },
     Programming {
         board: "adafruit-feather-rp2350-hstx-psram",
@@ -668,10 +677,10 @@ pub const PROGRAMMING: &[Programming] = &[
             family: RP2350_UF2_FAMILY,
             base: RP2_XIP_BASE,
         },
-        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: false }),
     },
     Programming {
-        board: "rpi-pico",
+        board: "raspberrypi-pico",
         aot_target: Some("rp2040"),
         programmer: Programmer::Uf2Volume {
             family: RP2040_UF2_FAMILY,
@@ -680,7 +689,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: Some(Programmer::Rp2040Probe { base: RP2_XIP_BASE }),
     },
     Programming {
-        board: "rpi-pico-w",
+        board: "raspberrypi-pico-w",
         aot_target: Some("rp2040"),
         programmer: Programmer::Uf2Volume {
             family: RP2040_UF2_FAMILY,
@@ -752,7 +761,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "microchip-samd21-xpro",
+        board: "microchip-sam-d21-xplained-pro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Samd21,
@@ -770,7 +779,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "microchip-samd21-cnano",
+        board: "microchip-sam-d21-curiosity-nano",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Samd21,
@@ -779,7 +788,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "microchip-samr21-xpro",
+        board: "microchip-sam-r21-xplained-pro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Samd21,
@@ -788,7 +797,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "microchip-atsamd11-xpro",
+        board: "microchip-sam-d11-xplained-pro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Samd21,
@@ -797,7 +806,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "microchip-atsamd10-xmini",
+        board: "microchip-sam-d10-xplained-mini",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Samd21,
@@ -806,7 +815,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "microchip-samw25-xpro",
+        board: "microchip-sam-w25-xplained-pro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Samd21,
@@ -815,7 +824,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "microchip-same51-cnano",
+        board: "microchip-sam-e51-curiosity-nano",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Same54,
@@ -824,7 +833,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "microchip-same54-xpro",
+        board: "microchip-sam-e54-xplained-pro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Same54,
@@ -833,7 +842,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "microchip-sam4e-xpro",
+        board: "microchip-sam4e-xplained-pro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Sam4Eefc,
@@ -842,7 +851,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "microchip-sam4n-xpro",
+        board: "microchip-sam4n-xplained-pro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Sam4Eefc,
@@ -851,7 +860,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "microchip-sam4l8-xpro",
+        board: "microchip-sam4l8-xplained-pro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Sam4l,
@@ -886,7 +895,7 @@ pub const PROGRAMMING: &[Programming] = &[
         alternate: None,
     },
     Programming {
-        board: "microchip-sam4s-xpro",
+        board: "microchip-sam4s-xplained-pro",
         aot_target: None,
         programmer: Programmer::EdbgOnboard {
             family: SamFamily::Sam4sDual,
@@ -997,8 +1006,9 @@ fn selector_named(
     match programmer {
         Programmer::Uf2Volume { .. } => match (probe, device) {
             (Some(_), _) => Err(
-                "--probe names a debug probe, and this write goes to a bootloader DRIVE.\n\n\
-Name the drive with --volume <name>, or ask for the probe route with --via probe."
+                "--probe names a debug probe, and --via volume sends this write to a bootloader \
+DRIVE.\n\n\
+Name the drive with --volume <name>, or leave out --via volume to write over the probe."
                     .to_owned(),
             ),
             (None, Some(_)) => Err(
@@ -1011,10 +1021,10 @@ Name the drive with --volume <name>."
         },
         Programmer::StDfu { .. } => match (probe, volume) {
             (Some(_), _) => Err(
-                "--probe names a debug probe, and this write goes to the part's system bootloader \
-over USB DFU.\n\n\
-Name the bootloader with --dfu <serial> when several are attached, or ask for the probe route \
-with --via probe."
+                "--probe names a debug probe, and --via volume sends this write to the part's \
+system bootloader over USB DFU.\n\n\
+Name the bootloader with --dfu <serial> when several are attached, or leave out --via volume to \
+write over the probe."
                     .to_owned(),
             ),
             (None, Some(_)) => Err(
@@ -1029,7 +1039,8 @@ with --via probe."
         _ => match (volume, device) {
             (Some(_), _) => Err(
                 "--volume names a bootloader drive, and this write goes over a PROBE.\n\n\
-Name the probe with --probe <serial>, or ask for the drive with --via volume."
+Leave out --volume to write over the probe, naming it with --probe <serial> when several are \
+attached. On a board that has a bootloader drive, --via volume asks for the drive."
                     .to_owned(),
             ),
             (None, Some(_)) => Err(
@@ -1047,7 +1058,8 @@ Name the probe with --probe <serial>."
 /// in its bootloader and wired to a probe may be TWO DIFFERENT BOARDS -- the probe on one, another
 /// in BOOTSEL -- and there is nothing readable that says otherwise. Choosing for the reader in
 /// that state is the same mistake as picking between two mounted volumes, and its wrong outcome is
-/// the same: somebody else's board takes the program and every layer reports success.
+/// the same: somebody else's board takes the program and every layer reports success. The one
+/// other way to the probe route is a probe named by its serial, which [`route_for_request`] takes.
 ///
 /// # Errors
 /// An unknown value, or `probe` on a board with no probe route -- worded apart, because "you typed
@@ -1102,6 +1114,122 @@ because a probe attached to this board would connect and then fail at the chip."
         }
     }
 }
+
+/// Which route to write by, from everything a write names: `--via`, and the probe (`--probe`),
+/// drive (`--volume`) or system bootloader (`--dfu`) it names.
+///
+/// **A PROBE NAMED BY ITS SERIAL SELECTS THE PROBE ROUTE, AND NOTHING ELSE DOES WITHOUT `--via`.**
+/// [`route_for`] keeps the probe route out of every default because a board in its bootloader and
+/// a board wired to a probe may be two different boards. A serial settles that: it names the
+/// probe, and so the board wired to it. So on a board whose own route is its bootloader drive,
+/// `--probe <serial>` alone writes over that probe. `LAMELLA_PROBE_SERIAL` does not select it: the
+/// variable says which probe to open whenever one is opened, and it says nothing about whether
+/// this write goes over a probe. `--via volume` still sends a write to the drive.
+///
+/// A board whose own route is already a probe takes it, and the serial says which probe.
+///
+/// # Errors
+/// Whatever [`route_for`] refuses for `via`; a probe named on a board with no probe route; and a
+/// probe named together with `--via volume`, a drive or a system bootloader, which ask for two
+/// routes. Each refusal says what to leave out.
+pub fn route_for_request(
+    row: &Programming,
+    via: Option<&str>,
+    probe: Option<&str>,
+    volume: Option<&str>,
+    device: Option<&str>,
+) -> Result<Programmer, String> {
+    let via = via.map(str::trim).filter(|via| !via.is_empty());
+    if probe.is_none() {
+        return route_for(row, via);
+    }
+    if via == Some("volume") {
+        return Err(probe_with_via_volume(row));
+    }
+    if via.is_some() {
+        return route_for(row, via);
+    }
+    let probe_route = if row.programmer.writes_over_a_probe() {
+        row.programmer
+    } else {
+        match row.alternate {
+            Some(alternate) if alternate.writes_over_a_probe() => alternate,
+            _ => {
+                return Err(format!(
+                    "{} has no probe route in this build, so the probe --probe names cannot write \
+it.\n\n\
+It is written by {}. Leave out --probe to write it that way.",
+                    row.board,
+                    row.programmer.description()
+                ));
+            }
+        }
+    };
+    let other = match (volume, device) {
+        (Some(_), _) => Some(("--volume", "a bootloader drive")),
+        (None, Some(_)) => Some(("--dfu", "a system bootloader over USB DFU")),
+        (None, None) => None,
+    };
+    match other {
+        Some((option, names)) => Err(probe_with_another_route(row, option, names)),
+        None => Ok(probe_route),
+    }
+}
+
+/// What `row`'s own route writes to when that route is not a probe, and the option that names it
+/// there: its bootloader drive (`--volume`) or its part's system bootloader over USB DFU (`--dfu`).
+/// `None` when its own route is a probe.
+fn own_route_without_a_probe(row: &Programming) -> Option<(&'static str, &'static str)> {
+    match row.programmer {
+        Programmer::Uf2Volume { .. } => Some(("--volume", "the bootloader drive")),
+        Programmer::StDfu { .. } => Some(("--dfu", "the part's system bootloader over USB DFU")),
+        _ => None,
+    }
+}
+
+/// The refusal of `--probe` with `--via volume` on `row`, saying what to leave out.
+fn probe_with_via_volume(row: &Programming) -> String {
+    let probe_route = row.programmer.writes_over_a_probe()
+        || row.alternate.is_some_and(Programmer::writes_over_a_probe);
+    match own_route_without_a_probe(row) {
+        Some((_, what)) if probe_route => format!(
+            "--probe names a debug probe, and --via volume sends this write to {what}: two routes, \
+where a write takes one.\n\n\
+Leave out --via volume to write over the probe, or leave out --probe to write to {what}."
+        ),
+        Some((_, what)) => format!(
+            "--probe names a debug probe, and --via volume sends this write to {what}: two routes, \
+where a write takes one.\n\n\
+{} has no probe route in this build, so leave out --probe.",
+            row.board
+        ),
+        None => format!(
+            "--probe names a debug probe, and --via volume asks for a bootloader drive, which {} \
+does not have: its own route is a probe.\n\n\
+Leave out --via volume, and the write goes over the probe --probe names.",
+            row.board
+        ),
+    }
+}
+
+/// The refusal of `--probe` with `option`, which names `names`, on `row`, a board with a probe
+/// route, saying what to leave out.
+fn probe_with_another_route(row: &Programming, option: &str, names: &str) -> String {
+    match own_route_without_a_probe(row) {
+        Some((takes, what)) if takes == option => format!(
+            "--probe names a debug probe, and {option} names {names}: two routes, where a write \
+takes one.\n\n\
+Leave out {option} to write over the probe, or leave out --probe to write to {what}."
+        ),
+        _ => format!(
+            "--probe names a debug probe, and {option} names {names}, which {} does not \
+have.\n\n\
+Leave out {option}, and the write goes over the probe --probe names.",
+            row.board
+        ),
+    }
+}
+
 /// The mechanism for `board_id`, or the message explaining why there is none.
 ///
 /// # Errors
@@ -1144,8 +1272,13 @@ pub fn check_base(
     artifact: &crate::artifact::Artifact,
     placement: &placement::Placement,
 ) -> Result<(), String> {
+    check_stated_base(artifact.base, placement)
+}
+
+/// [`check_base`] for an image that states `stated`, or no address at all.
+fn check_stated_base(stated: Option<u32>, placement: &placement::Placement) -> Result<(), String> {
     let expected = placement.base();
-    let Some(stated) = artifact.base else {
+    let Some(stated) = stated else {
         return Ok(());
     };
     if stated == expected {
@@ -1207,12 +1340,14 @@ pub struct WindowHalf {
 /// describes, at the address `placement` gives. Nothing is opened: no probe, and no drive.
 ///
 /// A bootloader volume is handed a `.uf2` exactly as the file holds it. Every other image, on
-/// every route, is read to flat bytes at an address -- a `.bin`, Intel HEX, S-records, or a linked
-/// ELF flattened by physical address -- and for a bootloader volume those bytes are then wrapped
-/// into a UF2 by [`wrap_for_route`].
+/// every route, is read to flat bytes at an address -- a `.bin`, Intel HEX, S-records, a linked
+/// ELF flattened by physical address, or, on a route that takes no UF2, a `.uf2`'s blocks for the
+/// board's chip family laid out by address -- and for a bootloader volume those bytes are then
+/// wrapped into a UF2 by [`wrap_for_route`].
 ///
 /// # Errors
-/// A file that cannot be read or parsed; an image that states an address other than the one
+/// A file that cannot be read or parsed; a `.uf2` with no whole image for the board's chip family,
+/// or for a board whose own route takes no UF2; an image that states an address other than the one
 /// `placement` writes it from ([`check_base`]); an RP2350 image with no boot block
 /// ([`check_rp2350_stamp`]); or a flat image larger than the flash the board's facts state, less
 /// any bootloader the write keeps in front of it. Each is worded for a reader.
@@ -1234,6 +1369,7 @@ pub fn prepare_image(
     }
     let external = external_flash_for(row, route);
     let (artifact, window) = match external {
+        _ if extension.as_deref() == Some("uf2") => (uf2_image(path, row, placement)?, None),
         Some(flash) => crate::artifact::read_regions(
             path,
             flash.window..flash.window.saturating_add(flash.largest()),
@@ -1269,6 +1405,43 @@ pub fn prepare_image(
     Ok(match wrap_for_route(route, &artifact.bytes) {
         Some((bytes, line)) => Prepared { bytes, read, wrapped: Some(line), window },
         None => Prepared { bytes: artifact.bytes, read, wrapped: None, window },
+    })
+}
+
+/// The image the UF2 file at `path` holds for `row`'s board, for a route that takes flat bytes:
+/// the payloads of its blocks for the board's chip family, at the addresses they state, with
+/// erased flash between them, as the board's own bootloader would have written them from its drive.
+///
+/// # Errors
+/// A board whose own route takes no UF2, so has no chip family to check the file against, refused
+/// before the file is read; a file that is not a UF2 or holds no whole image for that family
+/// ([`lamella_flash_format::uf2::ReadError`]); and an image that starts anywhere but where
+/// `placement` writes from, or is longer than the board's flash -- both refused before the image is
+/// laid out, so blocks that lie far apart take no memory for the gap between them.
+///
+fn uf2_image(
+    path: &std::path::Path,
+    row: &Programming,
+    placement: &placement::Placement,
+) -> Result<crate::artifact::Artifact, String> {
+    let Some(family) = uf2_family_for_board(row.board) else {
+        return Err(format!(
+            "{}: a UF2 is for a board with a UF2 bootloader, and {} has none, so no chip family \
+             says which\nof the file's blocks to take. Build the image as `--format hex` or `bin`.",
+            path.display(),
+            row.board
+        ));
+    };
+    let file = std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
+    let image = lamella_flash_format::uf2::image_for_family(&file, family)
+        .map_err(|why| format!("{}: {why}.", path.display()))?;
+    check_stated_base(Some(image.base()), placement)?;
+    let length = usize::try_from(image.span()).unwrap_or(usize::MAX);
+    refuse_unless_length_fits(row.board, length, placement)?;
+    Ok(crate::artifact::Artifact {
+        bytes: image.to_bytes(),
+        base: Some(image.base()),
+        format: "UF2",
     })
 }
 
@@ -1346,10 +1519,19 @@ pub fn refuse_unless_it_fits(
     image: &[u8],
     placement: &placement::Placement,
 ) -> Result<(), String> {
+    refuse_unless_length_fits(board, image.len(), placement)
+}
+
+/// [`refuse_unless_it_fits`] for an image `length` bytes long, which need not be laid out yet.
+fn refuse_unless_length_fits(
+    board: &str,
+    length: usize,
+    placement: &placement::Placement,
+) -> Result<(), String> {
     let (table, part) = catalog::resolve(board)?;
     let kept = usize::try_from(placement.kept_bytes()).unwrap_or(usize::MAX);
-    let length = i64::try_from(image.len().saturating_add(kept)).unwrap_or(i64::MAX);
-    let verdict = lamella_bsp_gen::fit::fit(&table, &part, length);
+    let counted = i64::try_from(length.saturating_add(kept)).unwrap_or(i64::MAX);
+    let verdict = lamella_bsp_gen::fit::fit(&table, &part, counted);
     let lamella_bsp_gen::fit::Fit::Exceeds { over } = verdict.flash_fit else {
         return Ok(());
     };
@@ -1358,15 +1540,14 @@ pub fn refuse_unless_it_fits(
         lamella_bsp_gen::fit::BudgetSource::Part => format!("part {}", verdict.part),
     };
     let base = placement.base();
-    let end = u64::from(base).saturating_add(u64::try_from(image.len()).unwrap_or(u64::MAX));
+    let end = u64::from(base).saturating_add(u64::try_from(length).unwrap_or(u64::MAX));
     let kept_by = match placement.kept() {
         Some(bootloader) => format!(", {} B of it kept for the {}", bootloader.size, bootloader.name),
         None => String::new(),
     };
     Err(format!(
-        "this image is {} B, from {base:#010x} to {end:#010x}, and {board} has {} B of flash \
+        "this image is {length} B, from {base:#010x} to {end:#010x}, and {board} has {} B of flash \
          ({source}){kept_by} -- {over} B too many.",
-        image.len(),
         verdict.flash.bytes
     ))
 }
@@ -1490,22 +1671,24 @@ fn write_with(
             )
             .map_err(|why| why.to_string());
         }
-        Programmer::Rp2350Probe { base } => {
+        Programmer::Rp2350Probe { base, block_erase } => {
             use crate::backends::Rp2350Failure;
+            use lamella_cmsis_dap_rp2350::Erase;
 
+            let erase = if block_erase { Erase::Blocks } else { Erase::Sectors };
             let selector = lamella_probe::Selector::named_or_environment(probe);
             let image = lamella_flash_backend::Image {
                 bytes: image.bytes,
                 base,
             };
             return crate::backends::write_rp2350(
-                |clock_hz, say| {
+                |clock_hz, d8h, say| {
                     let session = lamella_probe::open(&selector).map_err(|why| {
                         Rp2350Failure::Unopened(describe_probe_choice(&why, &selector, probe, programmer))
                     })?;
                     let mut dap = lamella_probe_core::ArmDap::new(session.into_dap());
                     let idcode = lamella_cmsis_dap_rp2350::connect(&mut dap).map_err(|why| {
-                        Rp2350Failure::Other(format!("connecting to the RP2350: {why:?}"))
+                        Rp2350Failure::Other(format!("connecting to the RP2350: {}", lamella_flash_backend::FlashError::Probe(why)))
                     })?;
                     if clock_hz != lamella_cmsis_dap_rp2350::FALLBACK_SWD_CLOCK_HZ {
                         lamella_cmsis_dap_rp2350::set_swd_clock(&mut dap, clock_hz).map_err(|why| {
@@ -1513,14 +1696,17 @@ fn write_with(
                         })?;
                     }
                     let mut backend = crate::backends::Rp2350Probe::new(dap, idcode, RP2350_SETTLES)
+                        .erasing(erase)
+                        .remembering(*d8h)
                         .saying(&mut *say);
-                    lamella_flash_backend::flash(
+                    let written = lamella_flash_backend::flash(
                         &mut backend,
                         &image,
                         lamella_flash_backend::VerifyPolicy::ReadBack,
                         allow,
-                    )
-                    .map_err(|why| crate::backends::rp2350_failure(why, clock_hz))
+                    );
+                    *d8h = backend.remembered();
+                    written.map_err(|why| crate::backends::rp2350_failure(why, clock_hz))
                 },
                 say,
             );
@@ -1804,6 +1990,9 @@ fn attach_with_one_retry<P>(
     let mut probe = open()?;
     match attach(&mut probe) {
         Ok(()) => Ok(probe),
+        Err(second @ lamella_probe_core::ProbeError::Transport(_)) => {
+            Err(format!("attaching to the board through {through}, on the second try: {second}"))
+        }
         Err(second) => Err(format!(
             "attaching to the board through {through}: {second} (and {first} the time before). \
              Unplug the board's USB cable, plug it back in, and run the write again."
@@ -1815,11 +2004,7 @@ fn attach_with_one_retry<P>(
 /// command: a reply that never came, or a transport that dropped one.
 fn left_mid_command(error: &lamella_probe_core::ProbeError) -> bool {
     use lamella_probe_core::ProbeError;
-    match error {
-        ProbeError::Timeout(_) | ProbeError::Transport(_) => true,
-        ProbeError::Device(what) => what.contains("timed out"),
-        _ => false,
-    }
+    matches!(error, ProbeError::Timeout(_) | ProbeError::Transport(_))
 }
 
 /// Opens an ST-LINK with `open` and attaches it the way `family`'s plan says, retrying once on a
@@ -2136,7 +2321,7 @@ that is what this verb does by default.");
             }
             message
         }
-        other => format!("{other:?}"),
+        other => other.to_string(),
     }
 }
 /// Whether `image` is already a UF2, by the magic every block starts with.
@@ -2245,7 +2430,7 @@ mod tests {
             |probe: &mut i32| {
                 attaches += 1;
                 if *probe == 1 {
-                    Err(lamella_probe_core::ProbeError::Device("ST-Link reply read failed or timed out"))
+                    Err(lamella_probe_core::ProbeError::Transport("the ST-LINK's reply read failed".to_owned()))
                 } else {
                     Ok(())
                 }
@@ -2254,6 +2439,19 @@ mod tests {
         );
         assert_eq!(attached, Ok(2), "the second open is the one handed back");
         assert_eq!((opens, attaches), (2, 2));
+    }
+
+    /// A probe gone silent twice is told to be replugged once.
+    #[test]
+    fn an_attach_whose_probe_goes_silent_twice_says_it_once() {
+        let refusal = attach_with_one_retry(
+            || Ok(()),
+            |_: &mut ()| Err(lamella_probe_core::ProbeError::Transport("the ST-LINK's reply read failed".to_owned())),
+            "the board's ST-LINK",
+        )
+        .expect_err("silent twice");
+        assert_eq!(refusal.matches("Unplug").count(), 1, "{refusal}");
+        assert!(refusal.contains("the probe stopped answering"), "{refusal}");
     }
 
     /// Once, never a loop: a probe that times out twice is reported, with what to do about it.
@@ -2439,7 +2637,7 @@ mod tests {
     }
 
     fn pico2() -> &'static Programming {
-        programmer_for("rpi-pico2").expect("rpi-pico2 is routed")
+        programmer_for("raspberrypi-pico-2").expect("raspberrypi-pico-2 is routed")
     }
 
     /// Where the default write through `route` puts an image on `row`'s board.
@@ -2487,6 +2685,58 @@ mod tests {
         assert!(text.contains("LAMELLA_PROBE_SERIAL"), "names where it came from: {text}");
     }
 
+    /// **THE REPLUG SENTENCE IS FOR A PROBE THAT HAD ANSWERED.** A device that never did, or that could not
+    /// be opened, is named, with what it may be: a replug cures neither one that is no probe nor one another
+    /// program holds.
+    #[test]
+    fn only_a_probe_that_had_answered_is_told_to_be_replugged() {
+        let describe = |error: &lamella_probe::ProbeError| {
+            describe_probe_choice(
+                error,
+                &lamella_probe::Selector::by_serial("E6610000000000B2"),
+                None,
+                Programmer::SamExternalProbe { family: SamFamily::Samd21 },
+            )
+        };
+        let stopped = lamella_probe::ProbeError::Dap(lamella_probe::DapError::Transport(lamella_probe::TransportError(
+            "USB transfer timed out".to_owned(),
+        )));
+        assert_eq!(
+            describe(&stopped),
+            "the probe stopped answering (USB transfer timed out). Unplug its USB cable, plug it back in, and \
+             run this again."
+        );
+        let never = lamella_probe::ProbeError::NoAnswer {
+            device: "1234:5678 serial E6610000000000B2".to_owned(),
+            why: "USB transfer timed out".to_owned(),
+        };
+        let said = describe(&never);
+        assert!(said.contains("1234:5678 serial E6610000000000B2") && said.contains("CMSIS-DAP"), "{said}");
+        assert!(!said.contains("Unplug"), "{said}");
+        let unopened = lamella_probe::ProbeError::Unopened {
+            device: "1234:5678 serial E6610000000000B2".to_owned(),
+            why: "access denied".to_owned(),
+        };
+        let said = describe(&unopened);
+        assert!(said.contains("1234:5678 serial E6610000000000B2") && said.contains("access denied"), "{said}");
+        assert!(!said.contains("Unplug"), "{said}");
+    }
+
+    /// **EVERY ROUTE SAYS A SILENT PROBE THE SAME WAY,** whichever error type carried it and whatever came
+    /// before it in the sentence.
+    #[test]
+    fn a_silent_probe_reads_the_same_through_both_error_types() {
+        let through_the_seam = lamella_probe_core::ProbeError::Transport("probe transport error: USB transfer timed out".to_owned());
+        let at_the_open = lamella_probe::ProbeError::Dap(lamella_probe::DapError::Transport(lamella_probe::TransportError(
+            "USB transfer timed out".to_owned(),
+        )));
+        assert_eq!(through_the_seam.to_string(), at_the_open.to_string());
+        assert_eq!(
+            lamella_flash_backend::FlashError::Probe(through_the_seam.clone()).to_string(),
+            through_the_seam.to_string()
+        );
+    }
+
     /// **A PROBE NAMED BY ITS ID, `probe:<serial>`, IS REFUSED AS THE `--probe` THAT NAMED IT**, in
     /// either case: the id is what a device list prints, and a refusal that blamed
     /// `LAMELLA_PROBE_SERIAL` sent the reader to correct a variable nobody set.
@@ -2513,7 +2763,7 @@ mod tests {
             &lamella_probe::ProbeError::NotFound,
             &lamella_probe::Selector::any(),
             None,
-            Programmer::Rp2350Probe { base: RP2_XIP_BASE },
+            Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: true },
         );
         assert!(text.contains("bootloader volume"), "a Pico has one: {text}");
     }
@@ -2734,11 +2984,13 @@ mod tests {
         }
     }
 
-    /// A `.uf2` is copied to a volume byte for byte, and refused over a probe.
+    /// A `.uf2` is copied to a volume byte for byte. Over a probe it is the image its blocks for
+    /// the board's chip family hold, laid out flat, with the padding its writer gave the last page.
     #[test]
-    fn a_uf2_is_copied_to_a_volume_as_it_stands_and_refused_over_a_probe() {
+    fn a_uf2_is_copied_to_a_volume_as_it_stands_and_read_to_its_image_over_a_probe() {
+        let code = stamped(300);
         let uf2 = crate::artifact::Format::Uf2 { family: RP2350_UF2_FAMILY }
-            .render(&stamped(300), RP2_XIP_BASE);
+            .render(&code, RP2_XIP_BASE);
         let path = image_file("uf2", "image.uf2", &uf2);
         let row = pico2();
         let volume = route_for(row, None).expect("the default route");
@@ -2747,9 +2999,80 @@ mod tests {
         assert_eq!(prepared.bytes, uf2);
         assert_eq!(prepared.wrapped, None);
         let probe = route_for(row, Some("probe")).expect("the probe route");
+        let prepared = prepare_image(&path, row, probe, &placed(row, probe))
+            .expect("a probe takes the image the file holds");
+        let mut image = code;
+        image.resize(512, 0);
+        assert_eq!(prepared.bytes, image);
+        assert_eq!(prepared.read, "512 B of UF2");
+        assert_eq!(prepared.wrapped, None);
+    }
+
+    /// The block `numbered` as `number` of `count`, its other fields as they were.
+    fn numbered(mut block: Vec<u8>, number: u32, count: u32) -> Vec<u8> {
+        block[20..24].copy_from_slice(&number.to_le_bytes());
+        block[24..28].copy_from_slice(&count.to_le_bytes());
+        block
+    }
+
+    /// Over a probe, a UF2 for another chip is refused naming the board's chip family and the
+    /// file's, and so is one with no boot block, as an image in any other format is.
+    #[test]
+    fn over_a_probe_a_uf2_for_another_chip_or_with_no_boot_block_is_refused() {
+        let row = pico2();
+        let probe = route_for(row, Some("probe")).expect("the probe route");
+        let for_a_pico = crate::artifact::Format::Uf2 { family: RP2040_UF2_FAMILY }
+            .render(&stamped(300), RP2_XIP_BASE);
+        let path = image_file("uf2-family", "pico.uf2", &for_a_pico);
         let error = prepare_image(&path, row, probe, &placed(row, probe))
-            .expect_err("a probe takes raw bytes");
-        assert!(error.contains("bootloader volume"), "{error}");
+            .expect_err("another chip's image");
+        assert!(error.starts_with(&path.display().to_string()), "names the file: {error}");
+        assert!(error.contains("0xe48bff59") && error.contains("0xe48bff56"), "{error}");
+
+        let unstamped = crate::artifact::Format::Uf2 { family: RP2350_UF2_FAMILY }
+            .render(&[0u8; 700], RP2_XIP_BASE);
+        let path = image_file("uf2-stamp", "unstamped.uf2", &unstamped);
+        let error = prepare_image(&path, row, probe, &placed(row, probe))
+            .expect_err("no boot block");
+        assert!(error.contains("PICOBIN"), "{error}");
+    }
+
+    /// **A UF2 IS HELD TO THE BOARD'S ADDRESS AND FLASH BEFORE ITS IMAGE IS LAID OUT.** Two blocks
+    /// nearly 4 GiB apart are refused by the board's flash size, with no memory taken for the gap,
+    /// and an image for RAM by the address the board is written from.
+    #[test]
+    fn over_a_probe_a_uf2_is_held_to_the_boards_address_and_flash_before_it_is_laid_out() {
+        let row = pico2();
+        let probe = route_for(row, Some("probe")).expect("the probe route");
+        let uf2 = |image: &[u8], base: u32| {
+            crate::artifact::Format::Uf2 { family: RP2350_UF2_FAMILY }.render(image, base)
+        };
+        let mut apart = numbered(uf2(&stamped(256), RP2_XIP_BASE), 0, 2);
+        apart.extend(numbered(uf2(&[0xAA; 256], 0xFFFF_FF00), 1, 2));
+        let path = image_file("uf2-fit", "apart.uf2", &apart);
+        let error = prepare_image(&path, row, probe, &placed(row, probe))
+            .expect_err("larger than the flash");
+        assert!(error.contains("this image is 4026531840 B"), "how long: {error}");
+        assert!(error.contains("4194304 B of flash"), "what the board holds: {error}");
+
+        let path = image_file("uf2-ram", "ram.uf2", &uf2(&stamped(256), 0x2000_0000));
+        let error = prepare_image(&path, row, probe, &placed(row, probe))
+            .expect_err("not where flash is written from");
+        assert!(error.contains("0x20000000") && error.contains("0x10000000"), "{error}");
+    }
+
+    /// A board whose own route takes no UF2 has no chip family to check one against, so a `.uf2`
+    /// is refused naming the board, before the file is read.
+    #[test]
+    fn a_uf2_for_a_board_that_takes_none_is_refused_naming_the_board() {
+        let row = programmer_for("bbc-micro-bit-v2").expect("the micro:bit v2 is routed");
+        let route = row.programmer;
+        let path = std::env::temp_dir().join("lamella-flash-routes-no-such-file.uf2");
+        let error = prepare_image(&path, row, route, &placed(row, route))
+            .expect_err("no family to check it against");
+        assert!(error.contains("bbc-micro-bit-v2"), "names the board: {error}");
+        assert!(error.contains("--format hex"), "says what to build instead: {error}");
+        assert!(!error.contains("os error"), "refused before the file is read: {error}");
     }
 
     /// Behind the Zero's bootloader a flat image has the flash the bootloader leaves, and the
@@ -2847,7 +3170,7 @@ mod tests {
             );
         }
         assert_eq!(
-            Programmer::Rp2350Probe { base: RP2_XIP_BASE }.usb_identity(),
+            Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: true }.usb_identity(),
             None,
             "a Pico's probe is external by definition; refusing several is the same policy with \
              nothing to filter on"
@@ -2860,7 +3183,7 @@ mod tests {
             family: RP2350_UF2_FAMILY,
             base: RP2_XIP_BASE,
         };
-        let probe = Programmer::Rp2350Probe { base: RP2_XIP_BASE };
+        let probe = Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: true };
 
         let error =
             selector_for(volume, Some("SERIAL00"), None, None).expect_err("a drive is not a probe");
@@ -2889,6 +3212,151 @@ mod tests {
         );
     }
 
+    /// **A PROBE NAMED BY ITS SERIAL TAKES THE PROBE ROUTE ON A BOARD WHOSE OWN ROUTE IS ITS
+    /// BOOTLOADER DRIVE, AND NOTHING ELSE TAKES IT WITHOUT `--via`.** The serial names the probe,
+    /// and so the board wired to it. `--via probe` still takes it, and `--via volume` with a probe
+    /// named is refused, saying what to leave out.
+    #[test]
+    fn a_probe_named_by_its_serial_takes_the_probe_route_and_nothing_else_does() {
+        let pico = programmer_for("raspberrypi-pico-2").expect("the Pico 2");
+        let ask = |via, probe, volume| route_for_request(pico, via, probe, volume, None);
+        let (drive, probe_route) = (pico.programmer, pico.alternate.expect("a probe route"));
+        let serial = Some("E6614103E7000000");
+
+        assert_eq!(ask(None, serial, None), Ok(probe_route), "named alone");
+        assert_eq!(ask(None, Some("probe:E6614103E7000000"), None), Ok(probe_route), "by its id");
+        assert_eq!(ask(None, None, None), Ok(drive), "nothing named: the drive");
+        assert_eq!(ask(Some(" "), None, None), Ok(drive), "a blank --via is no --via");
+        assert_eq!(ask(None, None, Some("D:")), Ok(drive), "a drive named");
+        assert_eq!(ask(Some("probe"), serial, None), Ok(probe_route));
+        assert_eq!(ask(Some("probe"), None, None), Ok(probe_route));
+
+        assert_eq!(ask(Some("volume"), None, None), Ok(drive), "--via volume alone: the drive");
+        let error = ask(Some("volume"), serial, None).expect_err("a probe and --via volume");
+        assert_eq!(
+            error,
+            "--probe names a debug probe, and --via volume sends this write to the bootloader \
+             drive: two routes, where a write takes one.\n\n\
+             Leave out --via volume to write over the probe, or leave out --probe to write to the \
+             bootloader drive."
+        );
+        let error = selector_for(drive, serial, None, None).expect_err("a probe on the drive");
+        assert!(error.contains("--volume <name>"), "the drive's own option: {error}");
+        assert!(error.contains("leave out --via volume to write over the probe"), "{error}");
+
+        let empty = ask(None, Some(""), None).expect("the probe route");
+        let error = selector_for(empty, Some(""), None, None).expect_err("names nothing");
+        assert!(error.contains("--probe was given no serial number"), "{error}");
+    }
+
+    /// A board whose own route is already a probe keeps it when a probe is named, and the serial
+    /// says which probe; a board whose own route is a system bootloader over DFU takes its probe
+    /// route the way a drive board does.
+    #[test]
+    fn a_probe_named_keeps_a_probe_route_and_leaves_a_dfu_route_for_its_probe() {
+        let microbit = programmer_for("bbc-micro-bit-v2").expect("the micro:bit v2");
+        assert!(microbit.programmer.writes_over_a_probe(), "its own route is its DAPLink");
+        let named = route_for_request(microbit, None, Some("9906360200052833"), None, None);
+        assert_eq!(named, Ok(microbit.programmer));
+
+        let giga = programmer_for("arduino-giga-r1-wifi").expect("the GIGA R1 WiFi");
+        assert!(matches!(giga.programmer, Programmer::StDfu { .. }), "its own route is DFU");
+        let ask = |probe, device| route_for_request(giga, None, probe, None, device);
+        assert_eq!(ask(Some("SERIAL00"), None), Ok(giga.alternate.expect("a probe route")));
+        assert_eq!(ask(None, Some("SERIAL01")), Ok(giga.programmer));
+    }
+
+    /// **A PROBE NAMED WITH A DRIVE OR A BOOTLOADER ASKS FOR TWO ROUTES**, and a probe named for a
+    /// board with no probe route cannot write it; both are refused before anything is opened, each
+    /// saying what to leave out.
+    #[test]
+    fn a_probe_named_with_another_route_or_for_a_board_without_one_is_refused() {
+        let pico = programmer_for("raspberrypi-pico-2").expect("the Pico 2");
+        let ask = |volume, device| route_for_request(pico, None, Some("SERIAL00"), volume, device);
+        let error = ask(Some("D:"), None).expect_err("a probe and a drive");
+        assert_eq!(
+            error,
+            "--probe names a debug probe, and --volume names a bootloader drive: two routes, where \
+             a write takes one.\n\n\
+             Leave out --volume to write over the probe, or leave out --probe to write to the \
+             bootloader drive."
+        );
+        let error = ask(None, Some("SERIAL01")).expect_err("a probe and a bootloader");
+        assert_eq!(
+            error,
+            "--probe names a debug probe, and --dfu names a system bootloader over USB DFU, which \
+             raspberrypi-pico-2 does not have.\n\n\
+             Leave out --dfu, and the write goes over the probe --probe names."
+        );
+
+        let drive_only = Programming {
+            board: "raspberrypi-pico-2",
+            aot_target: None,
+            programmer: Programmer::Uf2Volume { family: RP2350_UF2_FAMILY, base: RP2_XIP_BASE },
+            alternate: None,
+        };
+        let error = route_for_request(&drive_only, None, Some("SERIAL00"), None, None);
+        let error = error.expect_err("no probe route");
+        assert!(error.starts_with("raspberrypi-pico-2 has no probe route in this build"), "{error}");
+        assert!(error.contains("Leave out --probe to write it that way."), "{error}");
+        let error = route_for_request(&drive_only, None, Some("SERIAL00"), Some("D:"), None);
+        assert!(error.expect_err("and with a drive").starts_with("raspberrypi-pico-2 has no probe route"));
+        let error = route_for_request(&drive_only, Some("volume"), Some("SERIAL00"), None, None);
+        assert!(error.expect_err("--via volume").ends_with("so leave out --probe."));
+        let unnamed = route_for_request(&drive_only, None, None, None, None);
+        assert_eq!(unnamed, Ok(drive_only.programmer));
+    }
+
+    /// **`--probe` WITH `--via volume` IS REFUSED ON EVERY BOARD, EACH SAYING WHAT TO LEAVE OUT**:
+    /// `--via volume` asks for the board's drive or bootloader and `--probe` for a probe. On a
+    /// board whose own route is a probe, where `--via volume` used to land on that probe and the
+    /// pair wrote over it, the refusal says the board has no drive; and a drive named for such a
+    /// board, or for one whose bootloader is DFU, is left out rather than chosen with `--via`,
+    /// which could not reach it.
+    #[test]
+    fn a_probe_with_via_volume_is_refused_on_every_board_saying_what_to_leave_out() {
+        let microbit = programmer_for("bbc-micro-bit-v2").expect("the micro:bit v2");
+        let error = route_for_request(microbit, Some("volume"), Some("SERIAL00"), None, None)
+            .expect_err("a probe and --via volume on a probe board");
+        assert_eq!(
+            error,
+            "--probe names a debug probe, and --via volume asks for a bootloader drive, which \
+             bbc-micro-bit-v2 does not have: its own route is a probe.\n\n\
+             Leave out --via volume, and the write goes over the probe --probe names."
+        );
+        let error = route_for_request(microbit, None, Some("SERIAL00"), Some("D:"), None)
+            .expect_err("a probe and a drive on a probe board");
+        assert_eq!(
+            error,
+            "--probe names a debug probe, and --volume names a bootloader drive, which \
+             bbc-micro-bit-v2 does not have.\n\n\
+             Leave out --volume, and the write goes over the probe --probe names."
+        );
+        let giga = programmer_for("arduino-giga-r1-wifi").expect("the GIGA R1 WiFi");
+        let error = route_for_request(giga, Some("volume"), Some("SERIAL00"), None, None)
+            .expect_err("a probe and --via volume on a DFU board");
+        let dfu = "the part's system bootloader over USB DFU";
+        assert!(error.contains(&format!("--via volume sends this write to {dfu}")), "{error}");
+        assert!(error.ends_with(&format!("or leave out --probe to write to {dfu}.")), "{error}");
+        let error = route_for_request(giga, None, Some("SERIAL00"), None, Some("SERIAL01"))
+            .expect_err("a probe and its bootloader on a DFU board");
+        let leave_out = "Leave out --dfu to write over the probe, or leave out --probe";
+        assert!(error.contains(leave_out), "{error}");
+        for board in PROGRAMMING {
+            assert!(
+                route_for_request(board, Some("volume"), Some("SERIAL00"), None, None).is_err(),
+                "{}: --probe with --via volume",
+                board.board
+            );
+            assert_eq!(
+                route_for_request(board, Some("volume"), None, None, None),
+                route_for(board, Some("volume")),
+                "{}: --via volume alone is as it was",
+                board.board
+            );
+        }
+    }
+
     /// A system bootloader over DFU is neither a probe nor a drive, so neither of their options can
     /// name one, and each refusal names the option that can; `--dfu` names it, and names nothing
     /// on any other route.
@@ -2910,7 +3378,7 @@ mod tests {
         );
         assert_eq!(selector_for(dfu, None, None, None).expect("none named is fine"), None);
 
-        let probe = Programmer::Rp2350Probe { base: RP2_XIP_BASE };
+        let probe = Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: true };
         let error =
             selector_for(probe, None, None, Some("SERIAL00")).expect_err("a probe is not a bootloader");
         assert!(error.contains("--probe <serial>"), "and it names the option that IS right: {error}");
@@ -2931,7 +3399,7 @@ mod tests {
     #[test]
     fn a_name_given_empty_is_refused_by_the_option_that_took_it() {
         let volume = Programmer::Uf2Volume { family: RP2350_UF2_FAMILY, base: RP2_XIP_BASE };
-        let probe = Programmer::Rp2350Probe { base: RP2_XIP_BASE };
+        let probe = Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: true };
         let dfu = Programmer::StDfu { family: StFamily::H7 };
         for empty in ["", "  "] {
             let error = selector_for(probe, Some(empty), None, None).expect_err("an empty probe");
@@ -2949,8 +3417,8 @@ mod tests {
     fn a_board_keeps_its_volume_route_unless_a_probe_is_asked_for() {
         let pico = PROGRAMMING
             .iter()
-            .find(|r| r.board == "rpi-pico2")
-            .expect("rpi-pico2 is listed");
+            .find(|r| r.board == "raspberrypi-pico-2")
+            .expect("raspberrypi-pico-2 is listed");
         assert!(
             matches!(route_for(pico, None), Ok(Programmer::Uf2Volume { .. })),
             "no --via means the route needing no probe"
@@ -3010,7 +3478,7 @@ mod tests {
 
     #[test]
     fn both_rp2040_picos_offer_the_probe_route_that_can_verify() {
-        for board in ["rpi-pico", "rpi-pico-w"] {
+        for board in ["raspberrypi-pico", "raspberrypi-pico-w"] {
             let row = PROGRAMMING
                 .iter()
                 .find(|r| r.board == board)
@@ -3048,9 +3516,11 @@ mod tests {
                 }),
                 "{board}: the bootloader drive, which needs no probe"
             );
-            assert_eq!(
-                route_for(row, Some("probe")),
-                Ok(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+            assert!(
+                matches!(
+                    route_for(row, Some("probe")),
+                    Ok(Programmer::Rp2350Probe { base: RP2_XIP_BASE, .. })
+                ),
                 "{board}: the probe route, which reads every byte back"
             );
             assert_eq!(uf2_family_for_board(board), Some(RP2350_UF2_FAMILY), "{board}");
@@ -3115,9 +3585,11 @@ mod tests {
                 }),
                 "{board}: the bootloader drive, which needs no probe"
             );
-            assert_eq!(
-                route_for(row, Some("probe")),
-                Ok(Programmer::Rp2350Probe { base: RP2_XIP_BASE }),
+            assert!(
+                matches!(
+                    route_for(row, Some("probe")),
+                    Ok(Programmer::Rp2350Probe { base: RP2_XIP_BASE, .. })
+                ),
                 "{board}: the probe route, which reads every byte back"
             );
             assert_eq!(uf2_family_for_board(board), Some(RP2350_UF2_FAMILY), "{board}");
@@ -3127,6 +3599,65 @@ mod tests {
                 "{board}: written, and not built for until it has an archive of its own"
             );
         }
+    }
+
+    /// **A PROBE ROUTE ERASES BY 64 KiB BLOCK EXACTLY WHERE THE BOARD's DOCUMENTS NAME A FLASH PART
+    /// THAT TAKES THE BLOCK ERASE.** Every RP2350 row's `block_erase` is checked against the part
+    /// its board's facts name for the flash region, in that region's `part` field: true when it is
+    /// such a part, false when it is not or the field is empty, unless a document the test names
+    /// gives the part where the field does not.
+    ///
+    /// So a row cannot claim the block erase for a part nobody named, a note elsewhere in a facts
+    /// file cannot change a row's answer, and a board whose facts come to name such a part cannot
+    /// be left erasing a sector at a time.
+    #[test]
+    fn an_rp2350_rows_block_erase_follows_the_flash_part_its_board_names() {
+        const TAKES_THE_BLOCK_ERASE: [&str; 2] = ["W25Q32RV", "W25Q128JV"];
+        const NAMED_BY_A_DOCUMENT: [(&str, &str, &str); 6] = [
+            ("raspberrypi-pico-2", "W25Q32RV", "the Pico 2 datasheet: flash (Winbond W25Q32RV)"),
+            ("raspberrypi-pico-2-w", "W25Q32RV", "its schematic, RPI-PICO2W rev 2 sheet 1: U3 W25Q32RVXHJQ"),
+            ("pimoroni-pico-plus-2", "W25Q128JV", "its schematic, sheet 2: U2 W25Q128JVPIQ"),
+            ("pimoroni-pico-plus-2-w", "W25Q128JV", "its schematic, sheet 2: U2 W25Q128JVPIQ"),
+            ("pimoroni-pico-lipo-2", "W25Q128JV", "its schematic, sheet 2: U2 W25Q128JVPIQ"),
+            ("pimoroni-pico-lipo-2-xl-w", "W25Q128JV", "its schematic, sheet 2: U2 W25Q128JVPIQ"),
+        ];
+        let takes_the_block_erase =
+            |part: &str| TAKES_THE_BLOCK_ERASE.iter().any(|takes| part.starts_with(takes));
+
+        let mut checked = 0;
+        for row in PROGRAMMING {
+            let block_erase = match (row.programmer, row.alternate) {
+                (Programmer::Rp2350Probe { block_erase, .. }, _)
+                | (_, Some(Programmer::Rp2350Probe { block_erase, .. })) => block_erase,
+                _ => continue,
+            };
+            let board = catalog::load_board(row.board)
+                .unwrap_or_else(|| panic!("{}: a catalog board", row.board));
+            let in_facts = board
+                .memory
+                .iter()
+                .find(|region| region.kind == "flash")
+                .map(|region| region.part.clone())
+                .filter(|part| !part.is_empty());
+            let by_document = NAMED_BY_A_DOCUMENT.iter().find(|(id, ..)| *id == row.board);
+            if let Some((_, part, document)) = by_document {
+                assert!(
+                    in_facts.is_none(),
+                    "{}: its facts now name its flash part, so drop the entry for {document}",
+                    row.board
+                );
+                assert!(takes_the_block_erase(part), "{}: {part}", row.board);
+            }
+            let part = in_facts.as_deref().or(by_document.map(|(_, part, _)| *part));
+            assert_eq!(
+                block_erase,
+                part.is_some_and(takes_the_block_erase),
+                "{}: block_erase against the flash part {part:?} its documents name",
+                row.board
+            );
+            checked += 1;
+        }
+        assert_eq!(checked, 8, "every RP2350 row, and only those, has a probe route to check");
     }
 
     /// An image that carries no PICOBIN block is refused for each of these boards on both routes,
@@ -3186,7 +3717,7 @@ mod tests {
     fn an_unknown_route_explains_the_two_that_exist() {
         let row = PROGRAMMING
             .iter()
-            .find(|r| r.board == "rpi-pico2")
+            .find(|r| r.board == "raspberrypi-pico-2")
             .expect("listed");
         let error = route_for(row, Some("swd")).expect_err("not a route");
         assert!(
@@ -3203,7 +3734,7 @@ mod tests {
     fn the_required_artifact_follows_the_route_not_the_board() {
         let row = PROGRAMMING
             .iter()
-            .find(|r| r.board == "rpi-pico2")
+            .find(|r| r.board == "raspberrypi-pico-2")
             .expect("listed");
         let volume = route_for(row, Some("volume")).expect("volume route");
         let probe = route_for(row, Some("probe")).expect("probe route");
@@ -3402,9 +3933,9 @@ mod tests {
 
     #[test]
     fn a_uf2_board_names_its_chip_family_and_a_probe_board_names_none() {
-        assert_eq!(uf2_family_for_board("rpi-pico2"), Some(RP2350_UF2_FAMILY));
-        assert_eq!(uf2_family_for_board("rpi-pico2-w"), Some(RP2350_UF2_FAMILY));
-        assert_eq!(uf2_family_for_board("rpi-pico"), Some(RP2040_UF2_FAMILY));
+        assert_eq!(uf2_family_for_board("raspberrypi-pico-2"), Some(RP2350_UF2_FAMILY));
+        assert_eq!(uf2_family_for_board("raspberrypi-pico-2-w"), Some(RP2350_UF2_FAMILY));
+        assert_eq!(uf2_family_for_board("raspberrypi-pico"), Some(RP2040_UF2_FAMILY));
         assert_ne!(
             RP2350_UF2_FAMILY, RP2040_UF2_FAMILY,
             "the two generations must not share a family, or each would accept the other's image"

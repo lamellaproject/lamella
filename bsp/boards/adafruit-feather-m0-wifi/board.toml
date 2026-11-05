@@ -19,6 +19,8 @@
 kind = "board"
 board = "adafruit-feather-m0-wifi"
 vendor = "adafruit"
+maker = "Adafruit"
+product = "Feather M0 WiFi"
 family = "samd21"
 part = "atsamd21g18a"
 product_model = 17          # lamella_wire::product_model::FEATHER_M0_WIFI

@@ -20,6 +20,7 @@ type IOOptionBits = u32;
 type Boolean = u8;
 type CFTimeInterval = f64;
 type CFStringEncoding = u32;
+type IoObject = u32;
 
 const KERN_SUCCESS: IOReturn = 0;
 const REPORT_TYPE_OUTPUT: u32 = 1;
@@ -63,6 +64,15 @@ unsafe extern "C" {
     fn IOHIDManagerSetDeviceMatching(manager: IOHIDManagerRef, matching: CFDictionaryRef);
     fn IOHIDManagerCopyDevices(manager: IOHIDManagerRef) -> CFSetRef;
     fn IOHIDDeviceGetProperty(device: IOHIDDeviceRef, key: CFStringRef) -> CFTypeRef;
+    fn IOHIDDeviceGetService(device: IOHIDDeviceRef) -> IoObject;
+    fn IORegistryEntryGetParentEntry(entry: IoObject, plane: *const c_char, parent: *mut IoObject) -> IOReturn;
+    fn IORegistryEntryCreateCFProperty(
+        entry: IoObject,
+        key: CFStringRef,
+        allocator: CFAllocatorRef,
+        options: IOOptionBits,
+    ) -> CFTypeRef;
+    fn IOObjectRelease(object: IoObject) -> IOReturn;
     fn IOHIDDeviceOpen(device: IOHIDDeviceRef, options: IOOptionBits) -> IOReturn;
     fn IOHIDDeviceSetReport(
         device: IOHIDDeviceRef,
@@ -155,6 +165,94 @@ unsafe fn device_string(device: IOHIDDeviceRef, key: &str) -> Option<String> {
     }
 }
 
+/// Reads a string property of an IORegistry entry.
+unsafe fn registry_string(entry: IoObject, key: &str) -> Option<String> {
+    unsafe {
+        let k = cfstr(key);
+        let prop = IORegistryEntryCreateCFProperty(entry, k, kCFAllocatorDefault, 0);
+        CFRelease(k);
+        if prop.is_null() {
+            return None;
+        }
+        let mut buf = [0 as c_char; 256];
+        let read = CFStringGetCString(prop, buf.as_mut_ptr(), buf.len() as CFIndex, UTF8) != 0;
+        let value = read.then(|| CStr::from_ptr(buf.as_ptr()).to_string_lossy().into_owned());
+        CFRelease(prop);
+        value
+    }
+}
+
+/// Reads a 32-bit integer property of an IORegistry entry.
+unsafe fn registry_number(entry: IoObject, key: &str) -> Option<i32> {
+    unsafe {
+        let k = cfstr(key);
+        let prop = IORegistryEntryCreateCFProperty(entry, k, kCFAllocatorDefault, 0);
+        CFRelease(k);
+        if prop.is_null() {
+            return None;
+        }
+        let mut value: i32 = 0;
+        let read = CFNumberGetValue(prop, CF_NUMBER_SINT32, (&mut value as *mut i32).cast()) != 0;
+        CFRelease(prop);
+        read.then_some(value)
+    }
+}
+
+/// What the registry says of a USB string, from the string it published and the descriptor's index for
+/// it: the string; empty when the index is zero, which is no string; and `None` when the index promises
+/// a string that was not published, or was not published either.
+fn string_or_none(published: Option<String>, index: Option<i32>) -> Option<String> {
+    match (published, index) {
+        (Some(name), _) => Some(name),
+        (None, Some(0)) => Some(String::new()),
+        (None, _) => None,
+    }
+}
+
+/// The USB strings above a HID device in the registry: the name of the interface it is on, and the
+/// name of the device that interface belongs to. Both are `None` when no USB interface is found.
+unsafe fn usb_strings(device: IOHIDDeviceRef) -> (Option<String>, Option<String>) {
+    const DEEPEST: usize = 6;
+    unsafe {
+        let plane = c"IOService".as_ptr();
+        let mut entry = IOHIDDeviceGetService(device);
+        let mut owned = false;
+        if entry == 0 {
+            return (None, None);
+        }
+        for _ in 0..DEEPEST {
+            let mut parent: IoObject = 0;
+            let read = IORegistryEntryGetParentEntry(entry, plane, &mut parent);
+            if owned {
+                IOObjectRelease(entry);
+            }
+            if read != KERN_SUCCESS {
+                return (None, None);
+            }
+            entry = parent;
+            owned = true;
+            if registry_number(entry, "bInterfaceNumber").is_some() {
+                let interface = string_or_none(registry_string(entry, "kUSBString"), registry_number(entry, "iInterface"));
+                let mut usb_device: IoObject = 0;
+                let device_name = if IORegistryEntryGetParentEntry(entry, plane, &mut usb_device) == KERN_SUCCESS {
+                    let name = string_or_none(
+                        registry_string(usb_device, "USB Product Name"),
+                        registry_number(usb_device, "iProduct"),
+                    );
+                    IOObjectRelease(usb_device);
+                    name
+                } else {
+                    None
+                };
+                IOObjectRelease(entry);
+                return (interface, device_name);
+            }
+        }
+        IOObjectRelease(entry);
+        (None, None)
+    }
+}
+
 /// Collects every device the manager matched into a Rust vector.
 unsafe fn manager_devices(manager: IOHIDManagerRef) -> Vec<IOHIDDeviceRef> {
     unsafe {
@@ -190,11 +288,15 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
         let infos = manager_devices(manager)
             .into_iter()
             .filter_map(|d| {
+                let (interface_name, device_name) = usb_strings(d);
                 Some(DeviceInfo {
                     vendor_id: device_u16(d, "VendorID")?,
                     product_id: device_u16(d, "ProductID")?,
                     serial_number: device_string(d, "SerialNumber"),
-                    product: device_string(d, "Product"),
+                    product: device_string(d, "Product").filter(|product| !product.is_empty()),
+                    interface_name,
+                    device_name,
+                    on_usb: device_string(d, "Transport").filter(|transport| !transport.is_empty()).map(|transport| transport == "USB"),
                     id: device_id(d),
                     usage_page: device_u16(d, "PrimaryUsagePage"),
                     usage: device_u16(d, "PrimaryUsage"),
@@ -292,9 +394,10 @@ impl Device {
                 CFRelease(manager);
                 return Err(Error::NotFound);
             };
-            if IOHIDDeviceOpen(device, 0) != KERN_SUCCESS {
+            let status = IOHIDDeviceOpen(device, 0);
+            if status != KERN_SUCCESS {
                 CFRelease(manager);
-                return Err(Error::Os("IOHIDDeviceOpen failed".into()));
+                return Err(crate::open_error::macos_open_failure(status));
             }
             let in_len = input_report_len(device);
             let mut inner = Box::new(Inner {

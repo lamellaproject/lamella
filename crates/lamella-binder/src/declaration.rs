@@ -1492,10 +1492,10 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 is_init: setter.as_ref().is_some_and(|accessor| accessor.is_init),
                 getter_accessibility: getter
                     .as_ref()
-                    .map(|accessor| accessor_access(accessor, modifiers)),
+                    .map(|accessor| accessor_access(accessor, access(modifiers))),
                 setter_accessibility: setter
                     .as_ref()
-                    .map(|accessor| accessor_access(accessor, modifiers)),
+                    .map(|accessor| accessor_access(accessor, access(modifiers))),
                     is_required: modifiers.iter().any(|m| matches!(m, Modifier::Required)),
                 });
             }
@@ -1735,14 +1735,16 @@ fn is_abstract_member(modifiers: &[Modifier], kind: TypeKind) -> bool {
 }
 
 /// An accessor's EFFECTIVE accessibility: its own access modifier (10.7.2) when it carries one,
-/// else the property's. The binder has already checked that the accessor's is strictly more
-/// restrictive, so this never widens a member.
+/// else the property's effective accessibility, including an interface's implicit public
+/// access (edition 4, 20.2). The binder has already checked that an accessor's own modifier is
+/// strictly more restrictive than the property's declared accessibility, so this never widens a
+/// member.
 fn accessor_access(
     accessor: &lamella_syntax::ast::Accessor,
-    property: &[Modifier],
+    property: Accessibility,
 ) -> Accessibility {
     if accessor.modifiers.is_empty() {
-        accessibility_of(property)
+        property
     } else {
         accessibility_of(&accessor.modifiers)
     }

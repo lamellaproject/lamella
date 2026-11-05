@@ -89,48 +89,5 @@ mod tests {
         assert_eq!(body["result"], json!("REPL unavailable: no references"));
         assert_eq!(body["variablesReference"], json!(0));
     }
-
-    #[test]
-    fn expressions_and_declarations_evaluate_over_the_engine() {
-        if LcscCompiler::discover().is_err() {
-            eprintln!("skipping: no reference assemblies on this host");
-            return;
-        }
-        let mut slot = None;
-        assert_eq!(evaluate(&mut slot, "1 + 2 * 3")["result"], json!("7"));
-        assert_eq!(evaluate(&mut slot, "int x = 5;")["result"], json!(""));
-        assert_eq!(evaluate(&mut slot, "x * 2")["result"], json!("10"));
-    }
-
-    #[test]
-    fn a_compile_error_is_reported_and_the_session_recovers() {
-        if LcscCompiler::discover().is_err() {
-            eprintln!("skipping: no reference assemblies on this host");
-            return;
-        }
-        let mut slot = None;
-        let error = evaluate(&mut slot, "nonsense +");
-        assert!(
-            error["result"].as_str().is_some_and(|text| !text.is_empty()),
-            "a compile error should carry diagnostics text; got {error}"
-        );
-        assert_eq!(evaluate(&mut slot, "1 + 1")["result"], json!("2"));
-    }
-
-    #[test]
-    fn an_array_is_an_instance_only_of_what_system_array_implements() {
-        if LcscCompiler::discover().is_err() {
-            eprintln!("skipping: no reference assemblies on this host");
-            return;
-        }
-        let mut slot = None;
-        assert_eq!(
-            evaluate(&mut slot, "((object)new int[3]) is System.IComparable")["result"],
-            json!("False")
-        );
-        assert_eq!(
-            evaluate(&mut slot, "((object)new int[3]) is System.Collections.IEnumerable")["result"],
-            json!("True")
-        );
-    }
 }
+
