@@ -5,9 +5,9 @@ much of each one Lamella's C# compiler supports. It is regenerated from the comp
 for every release, so a feature moves from "not yet" to "in progress" to "complete" here as it lands.
 
 Lamella's C# compiler, `lcsc`, against every named feature of C# 1.0 through C# 15.0:
-439 features, of which 69 are complete, 2 require more tests, 204 are in progress, 17 are not yet supported and 147 have no tests yet.
+439 features, of which 69 are complete, 3 require more tests, 204 are in progress, 17 are not yet supported and 146 have no tests yet.
 
-**No C# version is complete yet.** C# 1.0 has 56 of its 169 features complete. Each of
+**No C# version is complete yet.** C# 1.0 has 55 of its 169 features complete. Each of
 the others is listed below with the share of its conformance tests that pass.
 
 ## How each feature is measured
@@ -38,10 +38,10 @@ example, a C# 2.0 feature is scored at `/langversion:2`.
 
 The results on this page:
 
-- **Suite:** `ecma-334-conformance-tests` commit `f3d3a7809ac8a273eee1e38d8ca08110a0b1fca0`.
-- **Compiler:** `lcsc` as of 2026-10-28.
-- **Runs:** 2026-10-31, at C# 1, C# 2, C# 3, C# 4, C# 5, C# 6, C# 7, C# 7.1, C# 7.2, C# 7.3, C# 8, C# 9, C# 10 and C# 11.
-- **Platform:** the suite's programs run on .NET (Windows x64, .NET 11.0.0-rc.1.26425.128).
+- **Suite:** `ecma-334-conformance-tests` commit `0758afcaf326de61006a4e57aa106d9b48a914fd`.
+- **Compiler:** `lcsc` at tag `v0.4.0`.
+- **Runs:** 2026-11-09, at C# 1, C# 2, C# 3, C# 4, C# 5, C# 6, C# 7, C# 7.1, C# 7.2, C# 7.3, C# 8, C# 9, C# 10 and C# 11.
+- **Platform:** the suite's programs run on .NET (Windows x64, .NET 10.0.13).
 
 The .NET harness could not execute 74 test/language-level pairs; those pairs are excluded.
 Compiler feature refusals count as failures.
@@ -55,20 +55,20 @@ The suite was not run at C# 12.0 or later, so every feature of those versions ha
 
 | C# version | features | complete | in progress | not yet | no tests yet | suite tests passed at this version |
 |---|---:|---:|---:|---:|---:|---|
-| [C# 1.0](#c-10) | 169 | 56 | 106 | 2 | 5 | 4,686 of 5,851, 80% |
-| [C# 2.0](#c-20) | 38 | 2 | 23 | 4 | 9 | 6,855 of 9,812, 69% |
-| [C# 3.0](#c-30) | 11 | 1 | 7 | 3 | 0 | 7,523 of 11,080, 67% |
-| [C# 4.0](#c-40) | 4 | 0 | 4 | 0 | 0 | 7,593 of 11,315, 67% |
-| [C# 5.0](#c-50) | 2 | 0 | 1 | 1 | 0 | 7,655 of 11,407, 67% |
-| [C# 6.0](#c-60) | 18 | 0 | 15 | 0 | 3 | 7,797 of 11,597, 67% |
-| [C# 7.0](#c-70) | 19 | 2 | 16 | 1 | 0 | 8,034 of 11,909, 67% |
-| [C# 7.1](#c-71) | 4 | 0 | 4 | 0 | 0 | 8,038 of 11,929, 67% |
-| [C# 7.2](#c-72) | 11 | 2 | 8 | 1 | 0 | 8,119 of 12,093, 67% |
-| [C# 7.3](#c-73) | 12 | 0 | 12 | 0 | 0 | 8,156 of 12,172, 67% |
-| [C# 8.0](#c-80) | 30 | 4 | 1 | 0 | 25 | 8,204 of 12,261, 66% |
-| [C# 9.0](#c-90) | 25 | 1 | 3 | 1 | 20 | 8,546 of 13,866, 61% |
-| [C# 10.0](#c-100) | 21 | 1 | 2 | 1 | 17 | 8,570 of 13,930, 61% |
-| [C# 11.0](#c-110) | 22 | 0 | 4 | 3 | 15 | 8,577 of 13,943, 61% |
+| [C# 1.0](#c-10) | 169 | 55 | 107 | 2 | 5 | 4,707 of 5,883, 80% |
+| [C# 2.0](#c-20) | 38 | 3 | 23 | 4 | 8 | 8,061 of 9,881, 81% |
+| [C# 3.0](#c-30) | 11 | 1 | 7 | 3 | 0 | 8,789 of 11,147, 78% |
+| [C# 4.0](#c-40) | 4 | 0 | 4 | 0 | 0 | 8,862 of 11,382, 77% |
+| [C# 5.0](#c-50) | 2 | 0 | 1 | 1 | 0 | 8,929 of 11,474, 77% |
+| [C# 6.0](#c-60) | 18 | 0 | 15 | 0 | 3 | 9,071 of 11,664, 77% |
+| [C# 7.0](#c-70) | 19 | 2 | 16 | 1 | 0 | 9,308 of 11,976, 77% |
+| [C# 7.1](#c-71) | 4 | 0 | 4 | 0 | 0 | 9,312 of 11,996, 77% |
+| [C# 7.2](#c-72) | 11 | 2 | 8 | 1 | 0 | 9,393 of 12,160, 77% |
+| [C# 7.3](#c-73) | 12 | 0 | 12 | 0 | 0 | 9,427 of 12,235, 77% |
+| [C# 8.0](#c-80) | 30 | 4 | 1 | 0 | 25 | 9,478 of 12,327, 76% |
+| [C# 9.0](#c-90) | 25 | 1 | 3 | 1 | 20 | 9,821 of 13,932, 70% |
+| [C# 10.0](#c-100) | 21 | 1 | 2 | 1 | 17 | 9,845 of 13,996, 70% |
+| [C# 11.0](#c-110) | 22 | 0 | 4 | 3 | 15 | 9,847 of 14,009, 70% |
 | [C# 12.0](#c-120) | 12 | 0 | 0 | 0 | 12 |  |
 | [C# 13.0](#c-130) | 12 | 0 | 0 | 0 | 12 |  |
 | [C# 14.0](#c-140) | 17 | 0 | 0 | 0 | 17 |  |
@@ -85,12 +85,12 @@ The last column counts every suite test that runs at that version, whichever fea
 | Access modifiers | Complete | 35 of 35, 100% | Control declared accessibility with public, protected, internal, private, and protected internal. | ECMA-334 7th edition, clause 7.5.2 |
 | Address-of operator | In progress | 4 of 7, 57% | Obtain a variable's address using & in unsafe code. | ECMA-334 7th edition, clause 23.6.5 |
 | Application entry point | In progress | 18 of 19, 94% | Start an executable with a permitted static Main signature. | ECMA-334 7th edition, clause 7.1 |
-| Arithmetic operators | In progress | 97 of 321, 30% | Add, subtract, multiply, divide, or calculate numeric remainders. | ECMA-334 7th edition, clause 12.10 |
-| Array covariance | In progress | 3 of 4, 75% | Convert reference-element arrays to compatible base-element array types. | ECMA-334 7th edition, clause 17.6 |
+| Arithmetic operators | In progress | 98 of 322, 30% | Add, subtract, multiply, divide, or calculate numeric remainders. | ECMA-334 7th edition, clause 12.10 |
+| Array covariance | In progress | 5 of 6, 83% | Convert reference-element arrays to compatible base-element array types. | ECMA-334 7th edition, clause 17.6 |
 | Array initializers | In progress | 10 of 13, 76% | Initialize array elements with a brace-delimited list. | ECMA-334 7th edition, clause 17.7 |
-| As operator | In progress | 2 of 4, 50% | Attempt a reference conversion, returning null when unsuccessful. | ECMA-334 7th edition, clause 12.12.13 |
-| Attribute targets | In progress | 19 of 31, 61% | Select the declaration or generated entity receiving an attribute. | ECMA-334 7th edition, clause 22.3 |
-| Attributes | In progress | 44 of 59, 74% | Attach metadata using positional and named attribute arguments. | ECMA-334 7th edition, clauses 22.2, 22.3 |
+| As operator | In progress | 4 of 5, 80% | Attempt a reference conversion, returning null when unsuccessful. | ECMA-334 7th edition, clause 12.12.13 |
+| Attribute targets | In progress | 20 of 32, 62% | Select the declaration or generated entity receiving an attribute. | ECMA-334 7th edition, clause 22.3 |
+| Attributes | In progress | 45 of 60, 75% | Attach metadata using positional and named attribute arguments. | ECMA-334 7th edition, clauses 22.2, 22.3 |
 | AttributeUsage attribute | Not yet | 0 of 1, 0% | Control permitted attribute targets, inheritance, and repeated application. | ECMA-334 7th edition, clause 22.5.2 |
 | Automatic memory management | Complete | 5 of 5, 100% | Allow the runtime to reclaim unreachable managed objects. | ECMA-334 7th edition, clause 7.9 |
 | Base access | In progress | 3 of 10, 30% | Access inherited implementations explicitly using base. | ECMA-334 7th edition, clause 12.8.14 |
@@ -116,26 +116,26 @@ The last column counts every suite test that runs at that version, whichever fea
 | Conditional logical operators | In progress | 2 of 4, 50% | Evaluate Boolean && or \|\| with short-circuiting. | ECMA-334 7th edition, clause 12.14.2 |
 | Conditional methods | In progress | 2 of 9, 22% | Omit calls to methods according to compilation symbols. | ECMA-334 7th edition, clause 22.5.3 |
 | Conditional operator | Complete | 4 of 4, 100% | Choose one of two expressions using a Boolean condition. | ECMA-334 7th edition, clause 12.18 |
-| Constant expressions | In progress | 588 of 932, 63% | Evaluate permitted expressions at compile time. | ECMA-334 7th edition, clause 12.23 |
+| Constant expressions | In progress | 582 of 932, 62% | Evaluate permitted expressions at compile time. | ECMA-334 7th edition, clause 12.23 |
 | Constants | In progress | 61 of 67, 91% | Declare compile-time values using const. | ECMA-334 7th edition, clauses 13.6.3, 15.4 |
 | Constructor initializers | In progress | 10 of 24, 41% | Invoke another instance constructor using this or base. | ECMA-334 7th edition, clause 15.11.2 |
 | Continue statement | Complete | 6 of 6, 100% | Advance to the next iteration of the nearest loop. | ECMA-334 7th edition, clause 13.10.3 |
 | Custom event accessors | Complete | 6 of 6, 100% | Control event subscription using explicit add and remove accessors. | ECMA-334 7th edition, clause 15.8.3 |
-| Decimal type | In progress | 15 of 16, 93% | Represent decimal arithmetic values using decimal. | ECMA-334 7th edition, clause 8.3.8 |
+| Decimal type | In progress | 14 of 15, 93% | Represent decimal arithmetic values using decimal. | ECMA-334 7th edition, clause 8.3.8 |
 | Default value initialization | In progress | 21 of 30, 70% | Automatically initialize fields, array elements, and default-constructed value types. | ECMA-334 7th edition, clauses 9.3, 8.3.3 |
-| Delegate creation | In progress | 5 of 9, 55% | Create delegates bound to instance or static methods. | ECMA-334 7th edition, clause 20.5 |
+| Delegate creation | In progress | 6 of 9, 66% | Create delegates bound to instance or static methods. | ECMA-334 7th edition, clause 20.5 |
 | Delegate invocation | In progress | 6 of 7, 85% | Invoke a delegate's callable target or invocation list. | ECMA-334 7th edition, clause 20.6 |
-| Delegates | In progress | 10 of 11, 90% | Declare callable reference types with a specific signature. | ECMA-334 7th edition, clause 20.2 |
+| Delegates | In progress | 10 of 12, 83% | Declare callable reference types with a specific signature. | ECMA-334 7th edition, clause 20.2 |
 | Diagnostic directives | In progress | 13 of 37, 35% | Issue explicit compiler errors or warnings using #error and #warning. | ECMA-334 7th edition, clause 6.5.6 |
 | Do statement | Complete | 7 of 7, 100% | Repeat a statement, testing its condition after each iteration. | ECMA-334 7th edition, clause 13.9.3 |
 | Element access | In progress | 15 of 18, 83% | Read or write array elements and indexer values. | ECMA-334 7th edition, clause 12.8.11 |
 | Empty statement | Complete | 1 of 1, 100% | Use a semicolon as a statement that performs no action. | ECMA-334 7th edition, clause 13.4 |
 | Enumeration conversions | Complete | 1 of 1, 100% | Cast between enumeration types and numeric types. | ECMA-334 7th edition, clause 10.3.3 |
 | Enums | In progress | 20 of 23, 86% | Declare named integral constants in a distinct value type. | ECMA-334 7th edition, clauses 19.2, 19.4 |
-| Equality operators | In progress | 93 of 170, 54% | Compare numbers, Booleans, enumerations, references, strings, or delegates for equality. | ECMA-334 7th edition, clause 12.12 |
+| Equality operators | In progress | 97 of 173, 56% | Compare numbers, Booleans, enumerations, references, strings, or delegates for equality. | ECMA-334 7th edition, clause 12.12 |
 | Event assignment | Complete | 1 of 1, 100% | Subscribe or unsubscribe delegate handlers using += or -=. | ECMA-334 7th edition, clause 12.21.5 |
 | Explicit interface implementation | In progress | 5 of 13, 38% | Qualify implementations with interface names to separate conflicting contracts. | ECMA-334 7th edition, clause 18.6.2 |
-| Explicit numeric conversions | In progress | 952 of 976, 97% | Cast between numeric types, possibly losing range or precision. | ECMA-334 7th edition, clause 10.3.2 |
+| Explicit numeric conversions | In progress | 940 of 976, 96% | Cast between numeric types, possibly losing range or precision. | ECMA-334 7th edition, clause 10.3.2 |
 | Expression statements | Complete | 7 of 7, 100% | Execute permitted expressions as standalone statements. | ECMA-334 7th edition, clause 13.7 |
 | External events | In progress | 28 of 50, 56% | Declare events whose accessors are implemented externally. | ECMA-334 7th edition, clause 15.8 |
 | External indexers | In progress | 36 of 44, 81% | Declare indexers whose accessors are implemented externally. | ECMA-334 7th edition, clause 15.9 |
@@ -146,7 +146,7 @@ The last column counts every suite test that runs at that version, whichever fea
 | Fields | In progress | 122 of 132, 92% | Declare instance or static storage inside classes and structs. | ECMA-334 7th edition, clause 15.5 |
 | Finalizers | In progress | 20 of 25, 80% | Declare cleanup invoked by the runtime when objects become eligible. | ECMA-334 7th edition, clause 15.13 |
 | Finally clauses | In progress | 21 of 24, 87% | Run cleanup when control leaves a try statement. | ECMA-334 7th edition, clause 13.11 |
-| Fixed statement | In progress | 10 of 19, 52% | Pin movable managed storage while using its address. | ECMA-334 7th edition, clause 23.7 |
+| Fixed statement | In progress | 13 of 23, 56% | Pin movable managed storage while using its address. | ECMA-334 7th edition, clause 23.7 |
 | Floating-point types | Complete | 5 of 5, 100% | Represent approximate real numbers using float and double. | ECMA-334 7th edition, clause 8.3.7 |
 | For statement | Complete | 12 of 12, 100% | Repeat with initialization, condition, and iteration expressions. | ECMA-334 7th edition, clause 13.9.4 |
 | Foreach statement | In progress | 20 of 33, 60% | Enumerate arrays or collections using the enumeration pattern or interfaces. | ECMA-334 7th edition, clause 13.9.5 |
@@ -163,23 +163,23 @@ The last column counts every suite test that runs at that version, whichever fea
 | Instance constructors | In progress | 52 of 69, 75% | Initialize new class or struct instances. | ECMA-334 7th edition, clause 15.11 |
 | Integer literals | Complete | 29 of 29, 100% | Write decimal or hexadecimal integers with optional type suffixes. | ECMA-334 7th edition, clause 6.4.5.3 |
 | Integral types | In progress | 23 of 32, 71% | Store signed or unsigned integers using predefined fixed-width types. | ECMA-334 7th edition, clause 8.3.6 |
-| Interface implementation | In progress | 33 of 44, 75% | Supply implementations of interface methods, properties, events, and indexers. | ECMA-334 7th edition, clause 18.6 |
+| Interface implementation | In progress | 36 of 47, 76% | Supply implementations of interface methods, properties, events, and indexers. | ECMA-334 7th edition, clause 18.6 |
 | Interface inheritance | Complete | 4 of 4, 100% | Extend interface contracts through one or more base interfaces. | ECMA-334 7th edition, clause 18.2.4 |
 | Interface reimplementation | In progress | 3 of 4, 75% | Replace a base class's interface mapping in a derived class. | ECMA-334 7th edition, clause 18.6.7 |
 | Interfaces | In progress | 9 of 11, 81% | Declare contracts implemented by classes or structs. | ECMA-334 7th edition, clause 18.2 |
 | Invocation expressions | In progress | 9 of 10, 90% | Call methods or delegates with argument lists. | ECMA-334 7th edition, clause 12.8.9 |
-| Is operator | In progress | 2 of 3, 66% | Test whether a value is compatible with a type. | ECMA-334 7th edition, clause 12.12.12 |
+| Is operator | In progress | 4 of 5, 80% | Test whether a value is compatible with a type. | ECMA-334 7th edition, clause 12.12.12 |
 | Jagged arrays | Complete | 10 of 10, 100% | Create arrays whose elements are other arrays. | ECMA-334 7th edition, clause 17.2 |
 | Labeled statements | In progress | 2 of 5, 40% | Name statement locations for goto transfers. | ECMA-334 7th edition, clause 13.5 |
-| Line directives | In progress | 11 of 35, 31% | Remap reported source line numbers and filenames, or restore defaults. | ECMA-334 7th edition, clause 6.5.8 |
-| Local variables | Complete | 17 of 17, 100% | Declare explicitly typed local storage with optional initializers. | ECMA-334 7th edition, clause 13.6.2 |
+| Line directives | In progress | 11 of 36, 30% | Remap reported source line numbers and filenames, or restore defaults. | ECMA-334 7th edition, clause 6.5.8 |
+| Local variables | In progress | 16 of 17, 94% | Declare explicitly typed local storage with optional initializers. | ECMA-334 7th edition, clause 13.6.2 |
 | Lock statement | Complete | 6 of 6, 100% | Acquire a mutual-exclusion monitor for a statement's duration. | ECMA-334 7th edition, clause 13.13 |
 | Logical negation operator | No tests yet |  | Invert a Boolean value using !. | ECMA-334 7th edition, clause 12.9.4 |
 | Member access | In progress | 40 of 41, 97% | Select members with qualified names and the dot operator. | ECMA-334 7th edition, clause 12.8.7 |
 | Member hiding | In progress | 1 of 4, 25% | Hide inherited members explicitly using new. | ECMA-334 7th edition, clause 15.3.5 |
 | Method overloading | In progress | 50 of 54, 92% | Declare methods sharing a name with distinct signatures. | ECMA-334 7th edition, clauses 7.6, 12.6.4 |
-| Methods | In progress | 148 of 166, 89% | Declare callable instance or static members with bodies. | ECMA-334 7th edition, clause 15.6 |
-| Module attributes | In progress | 19 of 31, 61% | Attach metadata attributes to the current module using the module target. | ECMA-334 7th edition, clause 22.3 |
+| Methods | In progress | 148 of 167, 88% | Declare callable instance or static members with bodies. | ECMA-334 7th edition, clause 15.6 |
+| Module attributes | In progress | 20 of 32, 62% | Attach metadata attributes to the current module using the module target. | ECMA-334 7th edition, clause 22.3 |
 | Multicast delegates | In progress | 55 of 129, 42% | Combine or remove delegate targets using addition and subtraction. | ECMA-334 7th edition, clauses 12.10.5, 12.10.6 |
 | Multidimensional arrays | Complete | 10 of 10, 100% | Store elements indexed by multiple dimensions. | ECMA-334 7th edition, clause 17.2 |
 | Namespaces | In progress | 4 of 5, 80% | Organize type declarations within named or nested namespaces. | ECMA-334 7th edition, clause 14.3 |
@@ -188,29 +188,29 @@ The last column counts every suite test that runs at that version, whichever fea
 | Object creation expressions | In progress | 23 of 25, 92% | Construct instances using new and constructor arguments. | ECMA-334 7th edition, clause 12.8.16 |
 | Object type | Complete | 1 of 1, 100% | Treat values through the common object base type. | ECMA-334 7th edition, clause 8.2.3 |
 | Obsolete attribute | In progress | 1 of 2, 50% | Report warnings or errors when obsolete declarations are used. | ECMA-334 7th edition, clause 22.5.4 |
-| Output parameters | In progress | 53 of 54, 98% | Return values through definitely assigned out parameters. | ECMA-334 7th edition, clause 15.6.2 |
+| Output parameters | In progress | 53 of 55, 96% | Return values through definitely assigned out parameters. | ECMA-334 7th edition, clause 15.6.2 |
 | Override methods | In progress | 18 of 19, 94% | Provide implementations for inherited virtual or abstract methods. | ECMA-334 7th edition, clause 15.6.5 |
-| Parameter arrays | In progress | 53 of 54, 98% | Accept a variable number of arguments through a final params array. | ECMA-334 7th edition, clause 15.6.2 |
+| Parameter arrays | In progress | 53 of 55, 96% | Accept a variable number of arguments through a final params array. | ECMA-334 7th edition, clause 15.6.2 |
 | Parenthesized expressions | In progress | 2 of 4, 50% | Group expressions explicitly to control evaluation precedence. | ECMA-334 7th edition, clause 12.8.5 |
 | Pointer arithmetic | In progress | 15 of 22, 68% | Advance pointers or calculate element distances. | ECMA-334 7th edition, clauses 23.6.6, 23.6.7 |
-| Pointer arrays | In progress | 30 of 38, 78% | Store pointer values as elements of managed arrays in unsafe code. | ECMA-334 7th edition, clauses 23.3, 17.2 |
+| Pointer arrays | In progress | 31 of 39, 79% | Store pointer values as elements of managed arrays in unsafe code. | ECMA-334 7th edition, clauses 23.3, 17.2 |
 | Pointer comparison | In progress | 1 of 7, 14% | Compare pointer addresses with equality or ordering operators. | ECMA-334 7th edition, clause 23.6.8 |
-| Pointer conversions | In progress | 29 of 40, 72% | Cast between pointer types and supported integral types. | ECMA-334 7th edition, clause 23.5 |
+| Pointer conversions | In progress | 30 of 40, 75% | Cast between pointer types and supported integral types. | ECMA-334 7th edition, clause 23.5 |
 | Pointer element access | Complete | 9 of 9, 100% | Index pointer-addressed storage using brackets. | ECMA-334 7th edition, clause 23.6.4 |
 | Pointer indirection | In progress | 2 of 3, 66% | Read or write the value addressed by a pointer. | ECMA-334 7th edition, clause 23.6.2 |
 | Pointer member access | In progress | 3 of 4, 75% | Access pointed-to struct members using ->. | ECMA-334 7th edition, clause 23.6.3 |
-| Pointer types | In progress | 20 of 28, 71% | Represent addresses of unmanaged values using typed or void pointers. | ECMA-334 7th edition, clause 23.3 |
+| Pointer types | In progress | 21 of 29, 72% | Represent addresses of unmanaged values using typed or void pointers. | ECMA-334 7th edition, clause 23.3 |
 | Properties | In progress | 67 of 84, 79% | Expose instance or static values through get and set accessors. | ECMA-334 7th edition, clause 15.7 |
 | Readonly fields | Complete | 25 of 25, 100% | Restrict field assignments to declarations and appropriate constructors. | ECMA-334 7th edition, clause 15.5.3 |
-| Real literals | Complete | 9 of 9, 100% | Write floating-point or decimal constants with optional exponents and suffixes. | ECMA-334 7th edition, clause 6.4.5.4 |
-| Reference conversions | Complete | 2 of 2, 100% | Convert compatible class, interface, array, and delegate references. | ECMA-334 7th edition, clauses 10.2.8, 10.3.5 |
-| Reference parameters | In progress | 53 of 54, 98% | Pass writable variable references using ref. | ECMA-334 7th edition, clause 15.6.2 |
+| Real literals | In progress | 8 of 9, 88% | Write floating-point or decimal constants with optional exponents and suffixes. | ECMA-334 7th edition, clause 6.4.5.4 |
+| Reference conversions | Complete | 4 of 4, 100% | Convert compatible class, interface, array, and delegate references. | ECMA-334 7th edition, clauses 10.2.8, 10.3.5 |
+| Reference parameters | In progress | 53 of 55, 96% | Pass writable variable references using ref. | ECMA-334 7th edition, clause 15.6.2 |
 | Region directives | Complete | 3 of 3, 100% | Group source text with #region and #endregion. | ECMA-334 7th edition, clause 6.5.7 |
 | Regular string literals | Complete | 4 of 4, 100% | Write strings with backslash escapes. | ECMA-334 7th edition, clause 6.4.5.6 |
 | Return statement | Complete | 11 of 11, 100% | Exit a function member, optionally returning a value. | ECMA-334 7th edition, clause 13.10.5 |
 | Sealed classes | In progress | 19 of 20, 95% | Prevent further class inheritance. | ECMA-334 7th edition, clause 15.2.2 |
 | Sealed overrides | Complete | 3 of 3, 100% | Prevent further overriding of an overridden member. | ECMA-334 7th edition, clause 15.6.6 |
-| Shift operators | In progress | 18 of 20, 90% | Shift integral bits left or right. | ECMA-334 7th edition, clause 12.11 |
+| Shift operators | Complete | 20 of 20, 100% | Shift integral bits left or right. | ECMA-334 7th edition, clause 12.11 |
 | Simple assignment | Complete | 2 of 2, 100% | Store a computed value in a variable, property, or indexer. | ECMA-334 7th edition, clause 12.21.2 |
 | Single-dimensional arrays | Complete | 10 of 10, 100% | Store indexed elements in a single dimension. | ECMA-334 7th edition, clause 17.2 |
 | Sizeof operator | In progress | 3 of 4, 75% | Obtain a value type's storage size. | ECMA-334 7th edition, clause 23.6.9 |
@@ -230,15 +230,15 @@ The last column counts every suite test that runs at that version, whichever fea
 | Unicode escape sequences | Complete | 8 of 8, 100% | Represent Unicode characters with hexadecimal escapes in identifiers and literals. | ECMA-334 7th edition, clause 6.4.2 |
 | Unicode identifiers | In progress | 196 of 198, 98% | Name program elements using Unicode letters and permitted combining characters. | ECMA-334 7th edition, clause 6.4.3 |
 | Unsafe contexts | In progress | 12 of 13, 92% | Permit pointer operations within explicitly unsafe declarations or blocks. | ECMA-334 7th edition, clause 23.2 |
-| User-defined binary operators | In progress | 14 of 39, 35% | Declare overloads for binary operations on user-defined types. | ECMA-334 7th edition, clause 15.10.3 |
-| User-defined conditional logical operators | Not yet | 0 of 2, 0% | Short-circuit user-defined types through overloaded logical and truth operators. | ECMA-334 7th edition, clause 12.14.3 |
+| User-defined binary operators | In progress | 22 of 41, 53% | Declare overloads for binary operations on user-defined types. | ECMA-334 7th edition, clause 15.10.3 |
+| User-defined conditional logical operators | Not yet | 0 of 4, 0% | Short-circuit user-defined types through overloaded logical and truth operators. | ECMA-334 7th edition, clause 12.14.3 |
 | User-defined explicit conversions | In progress | 7 of 16, 43% | Declare conversion operators requiring explicit casts. | ECMA-334 7th edition, clause 15.10.4 |
 | User-defined implicit conversions | In progress | 7 of 16, 43% | Declare conversion operators invoked without explicit casts. | ECMA-334 7th edition, clause 15.10.4 |
 | User-defined unary operators | In progress | 13 of 37, 35% | Declare overloads for unary operations on user-defined types. | ECMA-334 7th edition, clause 15.10.2 |
 | Using alias directives | In progress | 5 of 7, 71% | Give a namespace or named type a local alias. | ECMA-334 7th edition, clause 14.5.2 |
 | Using namespace directives | In progress | 5 of 6, 83% | Import namespace members for unqualified type references. | ECMA-334 7th edition, clause 14.5.3 |
-| Using statement | In progress | 15 of 17, 88% | Dispose a resource when control leaves its protected statement. | ECMA-334 7th edition, clause 13.14 |
-| Value parameters | In progress | 53 of 54, 98% | Pass parameter values by copying. | ECMA-334 7th edition, clause 15.6.2 |
+| Using statement | In progress | 16 of 18, 88% | Dispose a resource when control leaves its protected statement. | ECMA-334 7th edition, clause 13.14 |
+| Value parameters | In progress | 53 of 55, 96% | Pass parameter values by copying. | ECMA-334 7th edition, clause 15.6.2 |
 | Verbatim identifiers | In progress | 196 of 198, 98% | Prefix identifiers with @ to use keywords as names. | ECMA-334 7th edition, clause 6.4.3 |
 | Verbatim string literals | Complete | 4 of 4, 100% | Write multiline strings that preserve backslashes and escape quotes by doubling. | ECMA-334 7th edition, clause 6.4.5.6 |
 | Virtual events | In progress | 10 of 16, 62% | Declare virtual or abstract events and specialize or seal their overrides. | ECMA-334 7th edition, clause 15.8.5 |
@@ -264,24 +264,24 @@ The last column counts every suite test that runs at that version, whichever fea
 | Delegate covariance and contravariance | In progress | 2 of 9, 22% | Bind delegate targets with compatible reference return and parameter types. | ECMA-334 7th edition, clause 10.8 |
 | Extern aliases | In progress | 1 of 4, 25% | Disambiguate namespaces from separately aliased referenced assemblies. | ECMA-334 7th edition, clause 14.4 |
 | Fixed-size buffers | In progress | 18 of 39, 46% | Embed fixed-length primitive buffers inside unsafe structs. | ECMA-334 7th edition, clause 23.8 |
-| Generic classes | In progress | 28 of 42, 66% | Declare classes parameterized by one or more types. | ECMA-334 7th edition, clauses 15.2.3, 8.4 |
+| Generic classes | In progress | 29 of 43, 67% | Declare classes parameterized by one or more types. | ECMA-334 7th edition, clauses 15.2.3, 8.4 |
 | Generic delegates | No tests yet |  | Declare callable types parameterized by one or more types. | ECMA-334 3rd edition, clause 25.4 |
 | Generic interfaces | No tests yet |  | Declare contracts parameterized by one or more types. | ECMA-334 3rd edition, clause 25.3 |
-| Generic method type inference | In progress | 11 of 17, 64% | Infer generic method arguments from supplied argument types. | ECMA-334 7th edition, clause 12.6.3 |
+| Generic method type inference | In progress | 11 of 18, 61% | Infer generic method arguments from supplied argument types. | ECMA-334 7th edition, clause 12.6.3 |
 | Generic methods | No tests yet |  | Declare methods with their own type parameters. | ECMA-334 3rd edition, clause 25.6 |
 | Generic structs | No tests yet |  | Declare value types parameterized by one or more types. | ECMA-334 3rd edition, clause 25.2 |
-| Generic type constraints | In progress | 57 of 106, 53% | Restrict type arguments by base types, interfaces, class, struct, or new(). | ECMA-334 7th edition, clauses 15.2.5, 8.4.5 |
-| Hidden line directives | In progress | 11 of 35, 31% | Hide debugger sequence points using #line hidden. | ECMA-334 7th edition, clause 6.5.8 |
+| Generic type constraints | In progress | 58 of 107, 54% | Restrict type arguments by base types, interfaces, class, struct, or new(). | ECMA-334 7th edition, clauses 15.2.5, 8.4.5 |
+| Hidden line directives | In progress | 11 of 36, 30% | Hide debugger sequence points using #line hidden. | ECMA-334 7th edition, clause 6.5.8 |
 | Iterators | In progress | 2 of 67, 2% | Produce enumerable sequences incrementally using yield return and yield break. | ECMA-334 7th edition, clauses 15.14, 13.15 |
-| Lifted operators | In progress | 2 of 4, 50% | Apply supported operators to nullable value operands. | ECMA-334 7th edition, clause 12.4.8 |
+| Lifted operators | In progress | 2 of 5, 40% | Apply supported operators to nullable value operands. | ECMA-334 7th edition, clause 12.4.8 |
 | Lifted user-defined conversions | No tests yet |  | Apply value-type conversion operators to nullable values, preserving null. | ECMA-334 7th edition, clause 10.6.2 |
 | Method group conversions | In progress | 2 of 9, 22% | Convert compatible method groups directly to delegates. | ECMA-334 7th edition, clause 10.8 |
 | Namespace alias qualifier | In progress | 14 of 15, 93% | Resolve namespace or type names through alias::, including global::. | ECMA-334 7th edition, clause 14.8 |
-| Null-coalescing operator | No tests yet |  | Select a fallback value when the first operand is null. | ECMA-334 7th edition, clause 12.15 |
-| Nullable Boolean logical operators | Not yet | 0 of 2, 0% | Apply three-valued logic to nullable Boolean operands with & and \|. | ECMA-334 7th edition, clause 12.13.5 |
-| Nullable boxing and unboxing | In progress | 4 of 5, 80% | Box underlying values or null; unbox into compatible nullable values. | ECMA-334 7th edition, clauses 10.2.9, 10.3.7 |
-| Nullable conversions | In progress | 1,559 of 2,922, 53% | Convert between nullable and underlying values with wrapping or unwrapping. | ECMA-334 7th edition, clause 10.6 |
-| Nullable value types | In progress | 7 of 8, 87% | Represent either a value-type value or null using T?. | ECMA-334 7th edition, clause 8.3.12 |
+| Null-coalescing operator | Complete | 1 of 1, 100% | Select a fallback value when the first operand is null. | ECMA-334 7th edition, clause 12.15 |
+| Nullable Boolean logical operators | Not yet | 0 of 3, 0% | Apply three-valued logic to nullable Boolean operands with & and \|. | ECMA-334 7th edition, clause 12.13.5 |
+| Nullable boxing and unboxing | More tests required | 8 of 8, 100% | Box underlying values or null; unbox into compatible nullable values. | ECMA-334 7th edition, clauses 10.2.9, 10.3.7 |
+| Nullable conversions | In progress | 2,694 of 2,923, 92% | Convert between nullable and underlying values with wrapping or unwrapping. | ECMA-334 7th edition, clause 10.6 |
+| Nullable value types | In progress | 8 of 9, 88% | Represent either a value-type value or null using T?. | ECMA-334 7th edition, clause 8.3.12 |
 | Partial types | Complete | 9 of 9, 100% | Split class, struct, or interface declarations across source locations. | ECMA-334 7th edition, clause 15.2.7 |
 | Pragma checksum directives | More tests required | 2 of 2, 100% | Specify external source-document checksums with #pragma checksum. | ECMA-334 7th edition, clause 6.5.9 |
 | Pragma warning directives | Complete | 2 of 2, 100% | Disable or restore compiler warnings with #pragma warning. | ECMA-334 7th edition, clause 6.5.9 |
@@ -303,7 +303,7 @@ The last column counts every suite test that runs at that version, whichever fea
 | Expression trees | Not yet | 0 of 1, 0% | Convert supported lambdas into inspectable expression-tree objects. | ECMA-334 7th edition, clause 8.6 |
 | Extension methods | Not yet | 0 of 9, 0% | Invoke static methods as instance-style calls through a this parameter. | ECMA-334 7th edition, clause 15.6.10 |
 | Implicitly typed arrays | In progress | 19 of 28, 67% | Infer an array's element type from its initializer values. | ECMA-334 7th edition, clause 12.8.16.5 |
-| Implicitly typed local variables | In progress | 45 of 63, 71% | Infer local variable types using var and an initializer. | ECMA-334 7th edition, clauses 13.6.2, 13.9.5 |
+| Implicitly typed local variables | In progress | 57 of 63, 90% | Infer local variable types using var and an initializer. | ECMA-334 7th edition, clauses 13.6.2, 13.9.5 |
 | Lambda expressions | In progress | 25 of 51, 49% | Write anonymous functions using =>. | ECMA-334 7th edition, clause 12.19 |
 | Object initializers | In progress | 6 of 9, 66% | Assign accessible members when constructing an object. | ECMA-334 7th edition, clause 12.8.16.3 |
 | Partial methods | In progress | 27 of 34, 79% | Declare optional private void hooks whose unused calls can disappear. | ECMA-334 7th edition, clause 15.6.9 |
@@ -314,9 +314,9 @@ The last column counts every suite test that runs at that version, whichever fea
 | feature | status | suite tests passed | what it is | specification |
 |---|---|---|---|---|
 | Dynamic binding | In progress | 9 of 14, 64% | Resolve selected operations at runtime using dynamic. | ECMA-334 7th edition, clauses 8.7, 12.3.3 |
-| Generic covariance and contravariance | In progress | 35 of 44, 79% | Permit compatible conversions between variant generic interfaces and delegates. | ECMA-334 7th edition, clauses 18.2.3, 20.2 |
+| Generic covariance and contravariance | In progress | 35 of 45, 77% | Permit compatible conversions between variant generic interfaces and delegates. | ECMA-334 7th edition, clauses 18.2.3, 20.2 |
 | Named arguments | In progress | 19 of 22, 86% | Identify call arguments by their parameter names. | ECMA-334 7th edition, clause 12.6.2 |
-| Optional parameters | In progress | 63 of 86, 73% | Declare default parameter values used when arguments are omitted. | ECMA-334 7th edition, clause 15.6.2 |
+| Optional parameters | In progress | 63 of 87, 72% | Declare default parameter values used when arguments are omitted. | ECMA-334 7th edition, clause 15.6.2 |
 
 ## C# 5.0
 
@@ -366,7 +366,7 @@ The last column counts every suite test that runs at that version, whichever fea
 | Out variable declarations | In progress | 10 of 11, 90% | Declare explicitly or implicitly typed variables within out arguments. | ECMA-334 7th edition, clause 12.17 |
 | Pattern matching in switch statements | In progress | 26 of 34, 76% | Select switch sections using patterns and optional when guards. | ECMA-334 7th edition, clause 13.8.3 |
 | Ref locals | In progress | 4 of 6, 66% | Keep references to existing storage in local variables. | ECMA-334 7th edition, clause 13.6.2.4 |
-| Ref returns | In progress | 171 of 229, 74% | Return references to storage from methods, delegates, properties, or indexers. | ECMA-334 7th edition, clauses 15.6.1, 15.7.1, 15.9.1, 20.2, 12.19.1 |
+| Ref returns | In progress | 171 of 230, 74% | Return references to storage from methods, delegates, properties, or indexers. | ECMA-334 7th edition, clauses 15.6.1, 15.7.1, 15.9.1, 20.2, 12.19.1 |
 | Throw expressions | In progress | 6 of 9, 66% | Use throw within supported expression contexts. | ECMA-334 7th edition, clause 12.16 |
 | Tuple conversions | In progress | 5 of 7, 71% | Convert tuples element by element between compatible tuple types. | ECMA-334 7th edition, clauses 10.2.13, 10.3.6 |
 | Tuple types and expressions | In progress | 22 of 27, 81% | Represent ordered heterogeneous values with optional element names. | ECMA-334 7th edition, clauses 8.3.11, 12.8.6 |
@@ -393,7 +393,7 @@ The last column counts every suite test that runs at that version, whichever fea
 | Readonly structs | In progress | 7 of 12, 58% | Declare structs whose instance fields and behavior preserve readonly semantics. | ECMA-334 7th edition, clause 16.2.2 |
 | Ref extension methods | Not yet | 0 of 14, 0% | Pass struct extension-method receivers by writable or readonly reference. | ECMA-334 7th edition, clause 15.6.10 |
 | Ref readonly locals | In progress | 6 of 9, 66% | Keep readonly references to existing storage in local variables. | ECMA-334 7th edition, clause 13.6.2.4 |
-| Ref readonly returns | In progress | 169 of 217, 77% | Return readonly references from methods, delegates, properties, or indexers. | ECMA-334 7th edition, clauses 15.6.1, 15.7.1, 15.9.1, 20.2 |
+| Ref readonly returns | In progress | 169 of 218, 77% | Return readonly references from methods, delegates, properties, or indexers. | ECMA-334 7th edition, clauses 15.6.1, 15.7.1, 15.9.1, 20.2 |
 | Ref structs | In progress | 12 of 17, 70% | Declare stack-confined structs that cannot become ordinary heap objects. | ECMA-334 7th edition, clause 16.2.3 |
 | Stackalloc to Span | In progress | 1 of 2, 50% | Convert stackalloc storage to Span<T> without exposing pointers. | ECMA-334 7th edition, clause 23.9 |
 
@@ -401,13 +401,13 @@ The last column counts every suite test that runs at that version, whichever fea
 
 | feature | status | suite tests passed | what it is | specification |
 |---|---|---|---|---|
-| Attributes on backing fields | In progress | 23 of 53, 43% | Apply field-targeted attributes to auto-property backing fields. | ECMA-334 7th edition, clause 22.3 |
+| Attributes on backing fields | In progress | 24 of 54, 44% | Apply field-targeted attributes to auto-property backing fields. | ECMA-334 7th edition, clause 22.3 |
 | Delegate constraints | In progress | 52 of 106, 49% | Allow System.Delegate or MulticastDelegate as generic base-type constraints. | ECMA-334 7th edition, clause 15.2.5 |
 | Enum constraints | In progress | 52 of 106, 49% | Allow System.Enum as a generic base-type constraint. | ECMA-334 7th edition, clause 15.2.5 |
-| Expression variables in initializers and queries | In progress | 64 of 97, 65% | Allow out variables and patterns in additional initialization and query contexts. | ECMA-334 7th edition, clauses 7.3, 12.20 |
-| Pattern-based fixed statements | In progress | 17 of 41, 41% | Pin types exposing a suitable GetPinnableReference method. | ECMA-334 7th edition, clause 23.7 |
-| Ref for-loop variables | In progress | 43 of 46, 93% | Declare reference variables in a for loop's initializer. | ECMA-334 7th edition, clauses 13.9.4, 13.6.2 |
-| Ref foreach iteration variables | In progress | 30 of 55, 54% | Iterate using writable or readonly references to collection elements. | ECMA-334 7th edition, clause 13.9.5 |
+| Expression variables in initializers and queries | In progress | 65 of 98, 66% | Allow out variables and patterns in additional initialization and query contexts. | ECMA-334 7th edition, clauses 7.3, 12.20 |
+| Pattern-based fixed statements | In progress | 14 of 41, 34% | Pin types exposing a suitable GetPinnableReference method. | ECMA-334 7th edition, clause 23.7 |
+| Ref for-loop variables | In progress | 42 of 46, 91% | Declare reference variables in a for loop's initializer. | ECMA-334 7th edition, clauses 13.9.4, 13.6.2 |
+| Ref foreach iteration variables | In progress | 47 of 55, 85% | Iterate using writable or readonly references to collection elements. | ECMA-334 7th edition, clause 13.9.5 |
 | Ref reassignment | In progress | 6 of 10, 60% | Rebind a ref local to reference different storage. | ECMA-334 7th edition, clause 12.21.3 |
 | Stackalloc initializers | In progress | 6 of 7, 85% | Initialize stack-allocated storage using explicit or inferred element lists. | ECMA-334 7th edition, clause 23.9 |
 | Tuple equality operators | In progress | 3 of 9, 33% | Compare tuples element by element with == and !=. | ECMA-334 7th edition, clause 12.12.11 |
