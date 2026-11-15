@@ -257,16 +257,16 @@ impl Rp2350Flash {
         status == 0 && settings_sector(sector).iter().all(|&byte| byte == 0xFF)
     }
 
-    /// Programs `bytes` (at most one page) at the start of settings sector `sector`, which reads
-    /// erased. Returns whether the flash then reads them back.
-    pub fn settings_program(&self, sector: usize, bytes: &[u8]) -> bool {
-        if sector >= SETTINGS_SECTORS || bytes.is_empty() || bytes.len() > PAGE_BYTES {
+    /// Programs one page, `page`, at byte `offset` of settings sector `sector`: a multiple of the page
+    /// size, where the sector reads erased. Returns whether the flash then reads it back.
+    pub fn settings_program(&self, sector: usize, offset: usize, page: &[u8; PAGE_BYTES]) -> bool {
+        if sector >= SETTINGS_SECTORS || !offset.is_multiple_of(PAGE_BYTES) || offset + PAGE_BYTES > SECTOR_BYTES {
             return false;
         }
-        let staged = page_padded(bytes);
-        let at = SETTINGS_BASE + sector * SECTOR_BYTES;
+        let staged = page_padded(page);
+        let at = SETTINGS_BASE + sector * SECTOR_BYTES + offset;
         let status = self.run_ops(0, 0, at as u32, staged.as_ptr() as u32, staged.len() as u32);
-        status == 0 && &settings_sector(sector)[..bytes.len()] == bytes
+        status == 0 && settings_sector(sector)[offset..offset + PAGE_BYTES] == page[..]
     }
 }
 
@@ -287,15 +287,15 @@ impl SettingsStore {
 #[cfg(feature = "cyw43")]
 impl lamella_wifi_cyw4343x_smoltcp::record::RecordStore for SettingsStore {
     fn read(&self, slot: usize) -> &[u8] {
-        &settings_sector(slot)[..lamella_wifi_cyw4343x_smoltcp::record::SLOT_SPAN]
+        settings_sector(slot)
     }
 
     fn erase(&mut self, slot: usize) -> bool {
         self.flash.settings_erase(slot)
     }
 
-    fn program(&mut self, slot: usize, bytes: &[u8]) -> bool {
-        self.flash.settings_program(slot, bytes)
+    fn program(&mut self, slot: usize, offset: usize, page: &[u8; lamella_wifi_cyw4343x_smoltcp::record::PAGE]) -> bool {
+        self.flash.settings_program(slot, offset, page)
     }
 }
 

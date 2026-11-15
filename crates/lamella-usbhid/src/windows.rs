@@ -248,12 +248,51 @@ fn path_string(path: &[u16]) -> String {
     String::from_utf16_lossy(&path[..end])
 }
 
+/// What an open Windows refused with `error` comes to: [`Error::Held`] for the two refusals it gives
+/// beside another program holding the device, `ERROR_ACCESS_DENIED` and `ERROR_SHARING_VIOLATION`, and
+/// [`Error::Os`] for any other, in the words a refused open always had.
+fn refused(error: &std::io::Error) -> Error {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    let said = format!("CreateFile (read/write) failed: {error}");
+    if matches!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)) {
+        Error::Held(said)
+    } else {
+        Error::Os(said)
+    }
+}
+
 /// What the device tree says about the USB device above a HID interface, read with no handle.
 #[derive(Default)]
 struct UsbContext {
     on_usb: Option<bool>,
     interface_name: Option<String>,
     device_name: Option<String>,
+    /// The serial Windows names the USB device by, where its instance id ends in one.
+    serial: Option<String>,
+}
+
+/// The serial at the end of a USB device node's instance id (`USB\VID_0D28&PID_0204\<serial>`), or `None` where
+/// that segment is Windows' own synthesized id (`6&1035992E&0&3`), which it makes for a device that reports no
+/// serial.
+fn serial_in_instance_id(id: &str) -> Option<String> {
+    let last = id.rsplit('\\').next()?;
+    (!last.is_empty() && !last.contains('&')).then(|| last.to_owned())
+}
+
+/// The serial a HID interface is listed by: the device's own string, spelled as Windows names the device
+/// wherever the two differ only in case.
+///
+/// **ONE DEVICE, ONE SPELLING, WHICHEVER OF ITS INTERFACES REPRESENTS IT.** Windows names a USB device by its
+/// serial in upper case, and that name is the only one a vendor-class interface can be read by without
+/// opening the device. A device that writes its serial in lower case would otherwise be listed one way through
+/// its HID interface and the other through its bulk one. Only the case is ever taken from Windows' name, so a
+/// node that is not this device's leaves the device's own string as it was.
+fn listed_serial(windows: Option<String>, reported: Option<String>) -> Option<String> {
+    match (windows, reported) {
+        (Some(windows), Some(reported)) if windows.eq_ignore_ascii_case(&reported) => Some(windows),
+        (_, reported) => reported,
+    }
 }
 
 /// Which kind of USB node an instance id names.
@@ -277,7 +316,7 @@ fn usb_node(instance_id: &str) -> Option<UsbNode> {
 /// reports nothing. `HidD_GetProductString` gives one string for an interface, and which one depends on
 /// the device, so the strings are read here from the nodes that hold them. A device of one interface
 /// has no interface node, so Windows holds no name apart from the device's, and its interface reads as
-/// having none.
+/// having none. The device node's instance id gives the serial Windows names the device by.
 unsafe fn usb_context(path: &[u16]) -> UsbContext {
     const DEEPEST: usize = 32;
     let Some(mut node) = interface_node(path) else {
@@ -300,16 +339,20 @@ unsafe fn usb_context(path: &[u16]) -> UsbContext {
                     on_usb: Some(true),
                     interface_name: Some(String::new()),
                     device_name: bus_reported_name(node),
+                    serial: serial_in_instance_id(&id),
                 };
             }
             Some(UsbNode::Interface) => {
                 let mut device = 0u32;
-                let device_name = if CM_Get_Parent(&mut device, node, 0) == CR_SUCCESS {
-                    bus_reported_name(device)
+                let (device_name, serial) = if CM_Get_Parent(&mut device, node, 0) == CR_SUCCESS {
+                    let serial = instance_id(device)
+                        .filter(|id| usb_node(id) == Some(UsbNode::Device))
+                        .and_then(|id| serial_in_instance_id(&id));
+                    (bus_reported_name(device), serial)
                 } else {
-                    None
+                    (None, None)
                 };
-                return UsbContext { on_usb: Some(true), interface_name: bus_reported_name(node), device_name };
+                return UsbContext { on_usb: Some(true), interface_name: bus_reported_name(node), device_name, serial };
             }
         }
     }
@@ -372,7 +415,7 @@ pub fn enumerate() -> Result<Vec<DeviceInfo>> {
                 out.push(DeviceInfo {
                     vendor_id: attrs.VendorID,
                     product_id: attrs.ProductID,
-                    serial_number: hid_string(handle, true),
+                    serial_number: listed_serial(usb.serial, hid_string(handle, true)),
                     product: hid_string(handle, false),
                     interface_name: usb.interface_name,
                     device_name: usb.device_name,
@@ -416,32 +459,38 @@ impl Device {
             let Some(path) = chosen else {
                 return Err(Error::NotFound);
             };
-            Self::open_path(&path)
+            Self::open_path(&path, FILE_SHARE_READ | FILE_SHARE_WRITE)
         }
     }
 
     pub fn open_id(id: &str) -> Result<Self> {
         let mut path: Vec<u16> = id.encode_utf16().collect();
         path.push(0);
-        unsafe { Self::open_path(&path) }
+        unsafe { Self::open_path(&path, FILE_SHARE_READ | FILE_SHARE_WRITE) }
+    }
+
+    pub fn open_id_alone(id: &str) -> Result<Self> {
+        let mut path: Vec<u16> = id.encode_utf16().collect();
+        path.push(0);
+        unsafe { Self::open_path(&path, 0) }
     }
 
     /// Opens the HID interface at a device-interface `path` (a NUL-terminated wide string) for
     /// overlapped read/write, allocating the completion event and caching the report lengths. The
     /// shared tail of [`open`](Self::open) (path found by vid/pid/serial) and [`open_id`](Self::open_id)
     /// (path from an enumerated id).
-    unsafe fn open_path(path: &[u16]) -> Result<Self> {
+    unsafe fn open_path(path: &[u16], share: u32) -> Result<Self> {
         let handle = CreateFileW(
             path.as_ptr(),
             GENERIC_READ | GENERIC_WRITE,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            share,
             ptr::null(),
             OPEN_EXISTING,
             FILE_FLAG_OVERLAPPED,
             ptr::null_mut(),
         );
         if handle == INVALID_HANDLE_VALUE {
-            return Err(Error::Os(format!("CreateFile (read/write) failed: {}", std::io::Error::last_os_error())));
+            return Err(refused(&std::io::Error::last_os_error()));
         }
         let event = CreateEventW(ptr::null(), 1, 0, ptr::null());
         if event.is_null() {
@@ -540,6 +589,17 @@ impl Device {
 
 #[cfg(test)]
 mod tests {
+    /// **AN OPEN REFUSED BESIDE A HOLDER IS TYPED, AND SAYS WHAT IT ALWAYS SAID.**
+    #[test]
+    fn an_open_refused_beside_a_holder_is_held_and_keeps_its_words() {
+        for (code, held) in [(5, true), (32, true), (2, false), (31, false)] {
+            let error = std::io::Error::from_raw_os_error(code);
+            let typed = super::refused(&error);
+            assert_eq!(matches!(typed, crate::Error::Held(_)), held, "{code}: {typed:?}");
+            assert_eq!(typed.to_string(), format!("HID error: CreateFile (read/write) failed: {error}"));
+        }
+    }
+
     /// **NO TRANSFER IS LEFT IN THE KERNEL'S HANDS WHEN ITS BUFFER IS FREED:** each `CancelIo` is followed by the
     /// wait for what it cancelled. No test can hold a pending transfer without a device, so this reads the source.
     #[test]
@@ -554,6 +614,31 @@ mod tests {
             assert!(!after[..wait].contains("return "), "it returned first: {after}");
             assert!(after[wait..].lines().next().unwrap().contains(", 1)"), "it did not wait: {after}");
         }
+    }
+
+    /// **A DEVICE THAT WRITES ITS SERIAL IN LOWER CASE IS LISTED BY THE NAME WINDOWS GIVES IT,** which is the
+    /// spelling its bulk interface is listed by, so the one device is listed one way whichever interface
+    /// represents it.
+    #[test]
+    fn a_hid_serial_is_spelled_as_windows_names_the_device() {
+        let named = super::serial_in_instance_id("USB\\VID_0D28&PID_0204\\99010000000000000000000000000000000000000ABC0D1E");
+        assert_eq!(named.as_deref(), Some("99010000000000000000000000000000000000000ABC0D1E"));
+        let own = Some("99010000000000000000000000000000000000000abc0d1e".to_owned());
+        assert_eq!(super::listed_serial(named, own).as_deref(), Some("99010000000000000000000000000000000000000ABC0D1E"));
+    }
+
+    /// **ONLY THE CASE IS TAKEN FROM WINDOWS' NAME.** A device Windows names by a synthesized id keeps its own
+    /// string, and so does one whose own string differs from Windows' name by more than case; a device that
+    /// reports no serial is given none.
+    #[test]
+    fn a_serial_is_never_renamed_only_respelled() {
+        assert_eq!(super::serial_in_instance_id("USB\\VID_0D28&PID_0204&MI_03\\6&1035992E&0&0003"), None);
+        assert_eq!(super::serial_in_instance_id("USB\\VID_0D28&PID_0204\\"), None);
+        let own = || Some("0123456789abcdef".to_owned());
+        assert_eq!(super::listed_serial(None, own()), own());
+        assert_eq!(super::listed_serial(Some("5&ABC1234&0&2".to_owned()), own()), own());
+        assert_eq!(super::listed_serial(Some("0123456789ABCDEE".to_owned()), own()), own());
+        assert_eq!(super::listed_serial(Some("0123456789ABCDEF".to_owned()), None), None);
     }
 }
 

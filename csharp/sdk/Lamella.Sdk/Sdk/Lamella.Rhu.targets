@@ -25,12 +25,14 @@
     <_LamellaRhuHostRid Condition="'$(_LamellaRhuHostRid)' == ''">$(NETCoreSdkRuntimeIdentifier)</_LamellaRhuHostRid>
   </PropertyGroup>
 
-  <!-- The board the device dotnet run chose names, for a project that names none. Such a project lists a debug probe
-       once for each of Lamella RHU's boards it reaches, probe:<serial>/<board>, and an emulator by the machine one of
-       RHU's boards runs on, emulator:<machine>/<board> (Lamella.Run.targets). dotnet run hands the device it chose to the
-       restore and the build as Device, so the board is taken here, before restore, which then brings the board's
-       packages, and RHU's targets see it as if the project named it. A name that is none of RHU's boards gives no
-       board, and the device list, which then holds no such device, refuses it. -->
+  <!-- The board the device dotnet run was given names, for a project that names none. Such a project lists each debug
+       probe once, by its own id, with the boards of Lamella RHU's it reaches, since a probe cannot say which board it is
+       wired to; the board is named with the device, probe:<serial>/<board>, and a run on the probe's own id is refused
+       with those choices (Lamella.Run.targets). An emulator is listed by the machine one of RHU's boards runs on,
+       emulator:<machine>/<board>. dotnet run hands the device to the restore and the build as Device, so the board is
+       taken here, before restore, which then brings the board's packages, and RHU's targets see it as if the project
+       named it. A name that is none of RHU's boards gives no board, and the device list, which then holds no such
+       device, refuses it. -->
   <PropertyGroup Condition="'$(_LamellaRhuDispatch)' == 'true' and '$(LamellaTargetBoard)' == '' and '$(Device)' != ''">
     <_LamellaRhuDeviceBoard Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Device)', '^(?i:probe:|emulator:)[^/]+/[^/]+$'))">$([System.Text.RegularExpressions.Regex]::Replace('$(Device)', '^.+/', ''))</_LamellaRhuDeviceBoard>
     <_LamellaRhuQualifiedMachine Condition="$([System.Text.RegularExpressions.Regex]::IsMatch('$(Device)', '^(?i:emulator:)[^/]+/[^/]+$'))">$([System.Text.RegularExpressions.Regex]::Replace('$(Device)', '^(?i:emulator:)([^/]+)/[^/]+$', '$1'))</_LamellaRhuQualifiedMachine>

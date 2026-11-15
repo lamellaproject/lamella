@@ -8,6 +8,8 @@ use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
+#[cfg(feature = "gc")]
+use core::num::NonZeroUsize;
 
 /// A reference to a heap object: an index into the [`Heap`] arena. The null
 /// reference is [`crate::value::Value::Null`], not an `ObjectRef`, so every
@@ -230,6 +232,9 @@ pub enum Object {
         /// array minted without `newarr` info): such an array never raises
         /// `ArrayTypeMismatchException`, the pre-tracking behavior.
         element_type: u64,
+        /// The element's logical storage width when supplied by its type layout. Boxed
+        /// value slots do not encode padding or the widths of their constituent fields.
+        element_width: Option<usize>,
     },
     /// A multi-dimensional (rectangular) array (II.14.2): its per-dimension lengths and
     /// its elements in row-major order. Accessed via `Get`/`Set`/`.ctor` calls on the
@@ -239,6 +244,8 @@ pub enum Object {
         dims: Box<[i32]>,
         /// The elements, row-major; one per product-of-dims slot.
         elements: Box<[Value]>,
+        /// The asm-folded token carrying the array's cast shape, or 0 for an untracked allocation.
+        array_type: u64,
     },
     /// A boxed value type (III.4.1 `box`): a heap copy of a value-type value, tagged
     /// with the value type's token so `unbox` / `unbox.any` and casts can recover it.
@@ -545,6 +552,16 @@ pub struct Heap {
     /// [`Heap::should_collect`]); adapts after each collection.
     #[cfg(feature = "gc")]
     gc_threshold: usize,
+    /// A fixed interval, in allocations, that replaces the adaptive threshold when set; see
+    /// [`Heap::set_collection_interval`].
+    #[cfg(feature = "gc")]
+    collection_interval: Option<NonZeroUsize>,
+    /// The allocations since the last collection, which a collection interval is counted in.
+    #[cfg(feature = "gc")]
+    allocations_since_collection: usize,
+    /// Whether every collection moves every survivor; see [`Heap::set_move_every_survivor`].
+    #[cfg(feature = "gc")]
+    move_every_survivor: bool,
     /// Whether what decides a collection may have changed since the interpreter last weighed it
     /// at an instruction boundary; see [`Heap::collection_check_pending`].
     #[cfg(feature = "gc")]
@@ -594,6 +611,9 @@ impl Default for Heap {
             identity_hashes: Vec::new(),
             next_identity_hash: 0,
             gc_threshold: INITIAL_GC_THRESHOLD,
+            collection_interval: None,
+            allocations_since_collection: 0,
+            move_every_survivor: false,
             collection_check_pending: true,
             object_budget: None,
             #[cfg(feature = "finalizers")]
@@ -666,7 +686,10 @@ impl Heap {
         #[cfg(feature = "finalizers")]
         self.finalize_registered.push(false);
         #[cfg(feature = "gc")]
-        self.note_collection_check();
+        {
+            self.allocations_since_collection = self.allocations_since_collection.saturating_add(1);
+            self.note_collection_check();
+        }
         ObjectRef(index)
     }
 
@@ -890,19 +913,27 @@ impl Heap {
     /// ([`Heap::alloc_packed_array`]); of any other element, [`Heap::alloc_typed_array`]
     /// carries the covariance token.
     pub fn alloc_array(&mut self, elements: Vec<Value>) -> ObjectRef {
-        self.alloc(Object::Array {
-            store: ArrayStorage::Values(elements),
-            element_type: 0,
-        })
+        self.alloc_typed_array(elements, 0)
     }
 
     /// Allocates a boxed-value array tagged with its `newarr` element-type token (what a
     /// covariant `stelem.ref` checks against) -- the `newarr` path for a reference or
     /// value-type element.
     pub fn alloc_typed_array(&mut self, elements: Vec<Value>, element_type: u64) -> ObjectRef {
+        self.alloc_array_with_element_width(elements, element_type, None)
+    }
+
+    /// Allocates value slots with the element's declared byte stride, including padding.
+    pub(crate) fn alloc_array_with_element_width(
+        &mut self,
+        elements: Vec<Value>,
+        element_type: u64,
+        element_width: Option<usize>,
+    ) -> ObjectRef {
         self.alloc(Object::Array {
             store: ArrayStorage::Values(elements),
             element_type,
+            element_width,
         })
     }
 
@@ -917,6 +948,7 @@ impl Heap {
                 kind,
             },
             element_type,
+            element_width: Some(kind.byte_width()),
         })
     }
 
@@ -928,6 +960,7 @@ impl Heap {
         self.alloc(Object::Array {
             store: ArrayStorage::Packed { bytes, kind },
             element_type,
+            element_width: Some(kind.byte_width()),
         })
     }
 
@@ -951,13 +984,16 @@ impl Heap {
             Object::Array {
                 store,
                 element_type,
+                element_width,
             } => Object::Array {
                 store: store.clone(),
                 element_type: *element_type,
+                element_width: *element_width,
             },
-            Object::MdArray { dims, elements } => Object::MdArray {
+            Object::MdArray { dims, elements, array_type } => Object::MdArray {
                 dims: dims.clone(),
                 elements: elements.clone(),
+                array_type: *array_type,
             },
             _ => return None,
         };
@@ -1148,11 +1184,10 @@ impl Heap {
     }
 
     /// The width in bytes of an element of the array at `reference` -- the stride a
-    /// pinned-array (`fixed`) pointer's raw byte offset steps by. A packed array knows its
-    /// true element width; a boxed-value array is read off its first element's storage
-    /// width (every element of an array has the same width). `None` if `reference` is not
-    /// an array, or an empty boxed one (no element to size, and a `fixed` pointer into it
-    /// cannot be dereferenced anyway).
+    /// pinned-array (`fixed`) pointer's raw byte offset steps by. Packed arrays carry the
+    /// width in their storage kind; typed value arrays retain the declared layout size,
+    /// including padding. Without layout metadata only a scalar element can supply a
+    /// width: a struct's value slots do not describe its byte layout.
     #[must_use]
     pub fn array_element_width(&self, reference: ObjectRef) -> Option<usize> {
         let first = match self.get(reference)? {
@@ -1160,6 +1195,7 @@ impl Heap {
                 store: ArrayStorage::Packed { kind, .. },
                 ..
             } => return Some(kind.byte_width()),
+            Object::Array { element_width: Some(width), .. } => return Some(*width),
             Object::Array {
                 store: ArrayStorage::Values(elements),
                 ..
@@ -1167,7 +1203,7 @@ impl Heap {
             Object::MdArray { elements, .. } => elements.first(),
             _ => return None,
         };
-        first.map(value_storage_width)
+        first.and_then(value_storage_width)
     }
 
     /// The element type's true byte width of the array at `reference` -- the .NET element size
@@ -1338,10 +1374,12 @@ impl Heap {
             Object::Array {
                 store: source_store,
                 element_type: source_element,
+                ..
             },
             Object::Array {
                 store: destination_store,
                 element_type: destination_element,
+                ..
             },
         ) = (source_object, destination_object)
         else {
@@ -1444,19 +1482,35 @@ impl Heap {
     /// Allocates a multi-dimensional array with the given per-dimension lengths (elements
     /// zero-initialized to int32 zero) and returns a reference.
     pub fn alloc_md_array(&mut self, dims: Vec<i32>) -> ObjectRef {
+        self.alloc_md_array_typed(dims, 0)
+    }
+
+    /// Allocates a rectangular array tagged with the token carrying its cast shape.
+    /// Elements are initialized to int32 zero, as in [`Self::alloc_md_array`].
+    pub fn alloc_md_array_typed(&mut self, dims: Vec<i32>, array_type: u64) -> ObjectRef {
         let total: usize = dims.iter().map(|&d| d.max(0) as usize).product();
         let elements = alloc::vec![Value::Int32(0); total].into_boxed_slice();
         self.alloc(Object::MdArray {
             dims: dims.into_boxed_slice(),
             elements,
+            array_type,
         })
+    }
+
+    /// The rank and cast-shape handle of a rectangular array, or `None` for any other object.
+    #[must_use]
+    pub fn md_array_type(&self, reference: ObjectRef) -> Option<(u32, u64)> {
+        match self.get(reference)? {
+            Object::MdArray { dims, array_type, .. } => Some((u32::try_from(dims.len()).ok()?, *array_type)),
+            _ => None,
+        }
     }
 
     /// The element at `indices` (row-major) of the multi-dimensional array at `reference`,
     /// if it is such an array with every index in bounds.
     #[must_use]
     pub fn md_array_get(&self, reference: ObjectRef, indices: &[i32]) -> Option<Value> {
-        let Object::MdArray { dims, elements } = self.get(reference)? else {
+        let Object::MdArray { dims, elements, .. } = self.get(reference)? else {
             return None;
         };
         elements.get(md_flat_index(dims, indices)?).cloned()
@@ -1465,7 +1519,7 @@ impl Heap {
     /// Stores `value` at `indices` of the multi-dimensional array at `reference`; returns
     /// `false` if `reference` is not such an array or an index is out of range.
     pub fn md_array_set(&mut self, reference: ObjectRef, indices: &[i32], value: Value) -> bool {
-        let Some(Object::MdArray { dims, elements }) = self.objects.get_mut(reference.0 as usize)
+        let Some(Object::MdArray { dims, elements, .. }) = self.objects.get_mut(reference.0 as usize)
         else {
             return false;
         };
@@ -1696,10 +1750,43 @@ impl Heap {
     }
 
     /// Whether the live arena has reached the collection threshold -- one of the triggers the
-    /// interpreter weighs at an instruction boundary to decide whether to collect.
+    /// interpreter weighs at an instruction boundary to decide whether to collect. Under a
+    /// collection interval ([`Heap::set_collection_interval`]), whether that many allocations have
+    /// happened since the last collection instead.
     #[must_use]
     pub fn should_collect(&self) -> bool {
-        self.objects.len() >= self.gc_threshold
+        match self.collection_interval {
+            Some(interval) => self.allocations_since_collection >= interval.get(),
+            None => self.objects.len() >= self.gc_threshold,
+        }
+    }
+
+    /// Sets a fixed collection interval, in allocations, in place of the adaptive threshold
+    /// (`None`, the default, restores the threshold).
+    ///
+    /// With `Some(n)`, a collection comes due once `n` objects have been allocated since the
+    /// last one, however large the live set is, and runs at the next instruction boundary. So
+    /// `Some(1)` collects after every allocation: a stress setting for testing the collector's
+    /// roots. Every reference the collector cannot see is then reclaimed or left stale within an
+    /// allocation or two, where the adaptive threshold would let it go unnoticed for as many
+    /// allocations as the live set holds objects.
+    pub fn set_collection_interval(&mut self, interval: Option<NonZeroUsize>) {
+        self.collection_interval = interval;
+        self.note_collection_check();
+    }
+
+    /// Makes every collection move every object that survives it (`false`, the default,
+    /// compacts in place).
+    ///
+    /// A compacting collection moves a survivor only when something below it was reclaimed, so
+    /// a reference the collector cannot see stays right by luck whenever nothing below its object
+    /// died. With this set, each collection starts the arena with as many unreferenced
+    /// placeholder objects as it takes for every survivor to land at a new index, and the next
+    /// collection reclaims them. Such a reference is then wrong after any collection. A stress
+    /// setting for testing the collector's roots, with [`Heap::set_collection_interval`]. The
+    /// placeholders count as objects, so they also count toward an object budget.
+    pub fn set_move_every_survivor(&mut self, move_every_survivor: bool) {
+        self.move_every_survivor = move_every_survivor;
     }
 
     /// Whether a collection may have become due since the interpreter last weighed the triggers at
@@ -1786,8 +1873,9 @@ impl Heap {
             promoted
         };
 
+        let padding = if self.move_every_survivor { front_padding(&live) } else { 0 };
         let mut remap: Vec<Option<u32>> = alloc::vec![None; count];
-        let mut next = 0u32;
+        let mut next = padding;
         for (slot, &alive) in remap.iter_mut().zip(live.iter()) {
             if alive {
                 *slot = Some(next);
@@ -1797,6 +1885,11 @@ impl Heap {
         let old = core::mem::take(&mut self.objects);
         #[cfg(feature = "finalizers")]
         let old_registered = core::mem::take(&mut self.finalize_registered);
+        for _ in 0..padding {
+            self.objects.push(Object::Str(StrStore::default()));
+            #[cfg(feature = "finalizers")]
+            self.finalize_registered.push(false);
+        }
         for (index, mut object) in old.into_iter().enumerate() {
             if live[index] {
                 remap_object(&mut object, &remap);
@@ -1823,6 +1916,7 @@ impl Heap {
             .len()
             .saturating_mul(2)
             .max(INITIAL_GC_THRESHOLD);
+        self.allocations_since_collection = 0;
         self.note_collection_check();
 
         #[cfg(feature = "finalizers")]
@@ -1853,6 +1947,30 @@ fn trace(objects: &[Object], live: &mut [bool], work: &mut Vec<usize>) {
             }
         }
     }
+}
+
+/// The fewest placeholder objects to put at the front of the compacted arena so that no survivor
+/// keeps its index ([`Heap::set_move_every_survivor`]).
+///
+/// A survivor with `d` reclaimed objects below it moves from index `i` to `i - d + padding`, so it
+/// stays put exactly when `padding == d`. The answer is therefore the smallest count that no
+/// survivor has below it, and because those counts never decrease along the arena, one pass finds
+/// it. It is at most one more than the objects reclaimed, and after a collection that put
+/// placeholders down it is zero, since every survivor then has them below it.
+#[cfg(feature = "gc")]
+fn front_padding(live: &[bool]) -> u32 {
+    let mut reclaimed_below = 0u32;
+    let mut padding = 0u32;
+    for &alive in live {
+        if !alive {
+            reclaimed_below += 1;
+        } else if reclaimed_below == padding {
+            padding += 1;
+        } else if reclaimed_below > padding {
+            break;
+        }
+    }
+    padding
 }
 
 /// Visits each heap reference inside a managed-pointer location, recursing through a
@@ -1987,15 +2105,11 @@ fn remap_ref(reference: &mut ObjectRef, remap: &[Option<u32>]) {
     }
 }
 
-/// The storage width in bytes of an array element holding this `Value` -- the element size
-/// a pinned-array (`fixed`) pointer steps by. Element slots hold a reduced stack value, so
-/// the width follows the value kind: a 32-bit element (the common `int[]` / `bool[]` /
-/// `char[]` case, all widened to `Int32` on the stack) is 4 bytes, a 64-bit element 8, a
-/// reference one host word. Sub-`int32` typed arrays are not laid out distinctly yet, so a
-/// 32-bit slot is the right stride for the integer arrays csc pins here.
+/// The scalar width of a value slot without declared element-layout metadata. Typed
+/// primitive arrays use packed storage; aggregates require their recorded layout size.
 #[must_use]
-fn value_storage_width(value: &Value) -> usize {
-    match value {
+fn value_storage_width(value: &Value) -> Option<usize> {
+    Some(match value {
         Value::Int32(_) => 4,
         Value::Int64(_) => 8,
         Value::NativeInt(_) => 8,
@@ -2003,8 +2117,9 @@ fn value_storage_width(value: &Value) -> usize {
         Value::Float(_) => 8,
         #[cfg(feature = "float")]
         Value::Single(_) => 4,
+        Value::Struct(_) => return None,
         _ => core::mem::size_of::<usize>(),
-    }
+    })
 }
 
 #[cfg(all(test, feature = "gc"))]
@@ -2032,6 +2147,90 @@ mod gc_tests {
             other => panic!("field not an object: {other:?}"),
         };
         assert_eq!(heap.as_string(kept).as_deref(), Some(&[b'a' as u16][..]));
+    }
+
+    #[test]
+    fn a_collection_interval_counts_allocations_in_place_of_the_threshold() {
+        let mut heap = Heap::new();
+        heap.alloc_text("a");
+        heap.alloc_text("b");
+        heap.alloc_text("c");
+        assert!(!heap.should_collect());
+        heap.set_collection_interval(NonZeroUsize::new(2));
+        assert!(heap.should_collect());
+        let kept = heap.alloc_text("kept");
+        let mut roots = alloc::vec![Value::Object(kept)];
+        heap.collect(|visit| roots.iter_mut().for_each(visit));
+        assert_eq!(heap.object_count(), 1);
+        assert!(!heap.should_collect());
+        heap.alloc_text("d");
+        assert!(!heap.should_collect(), "one allocation of two");
+        heap.alloc_text("e");
+        assert!(heap.should_collect(), "two of two");
+        heap.set_collection_interval(None);
+        assert!(!heap.should_collect());
+    }
+
+    /// Collects once and answers, for each root, whether its index changed, after checking that it
+    /// still names the text it named before.
+    fn collect_moving(heap: &mut Heap, roots: &mut [Value]) -> Vec<bool> {
+        let before: Vec<u32> = roots
+            .iter()
+            .map(|root| match root {
+                Value::Object(reference) => reference.0,
+                other => panic!("root not an object: {other:?}"),
+            })
+            .collect();
+        let texts: Vec<_> = before
+            .iter()
+            .map(|&index| heap.as_string(ObjectRef(index)).map(|text| text.into_owned()))
+            .collect();
+        heap.collect(|visit| roots.iter_mut().for_each(visit));
+        roots
+            .iter()
+            .zip(before.iter().zip(&texts))
+            .map(|(root, (&old, text))| {
+                let Value::Object(moved) = root else { panic!("root not an object: {root:?}") };
+                assert_eq!(&heap.as_string(*moved).map(|text| text.into_owned()), text);
+                moved.0 != old
+            })
+            .collect()
+    }
+
+    #[test]
+    fn moving_every_survivor_leaves_no_survivor_at_its_index() {
+        for pattern in ["LLL", "xLL", "LxLxxL", "LxLxL", "xxLxLLxL"] {
+            let mut heap = Heap::new();
+            heap.set_move_every_survivor(true);
+            let mut roots = Vec::new();
+            for (at, kind) in pattern.chars().enumerate() {
+                let text = alloc::format!("{kind}{at}");
+                let reference = heap.alloc_text(&text);
+                if kind == 'L' {
+                    roots.push(Value::Object(reference));
+                }
+            }
+            for round in 1..=2 {
+                let moved = collect_moving(&mut heap, &mut roots);
+                assert!(moved.iter().all(|&moved| moved), "{pattern}, collection {round}: {moved:?}");
+                let reclaimed = pattern.chars().filter(|&kind| kind == 'x').count();
+                assert!(heap.object_count() <= roots.len() + reclaimed + 1, "{pattern}: no more than one placeholder per reclaimed object, and one");
+            }
+        }
+        let mut heap = Heap::new();
+        let mut roots = alloc::vec![Value::Object(heap.alloc_text("a")), Value::Object(heap.alloc_text("b"))];
+        assert_eq!(collect_moving(&mut heap, &mut roots), [false, false]);
+    }
+
+    #[test]
+    fn the_front_padding_is_the_smallest_count_no_survivor_has_reclaimed_below_it() {
+        let padding = |pattern: &str| front_padding(&pattern.chars().map(|kind| kind == 'L').collect::<Vec<_>>());
+        assert_eq!(padding(""), 0);
+        assert_eq!(padding("xxx"), 0);
+        assert_eq!(padding("LLL"), 1);
+        assert_eq!(padding("xLL"), 0);
+        assert_eq!(padding("LxLxxL"), 2);
+        assert_eq!(padding("LxLxL"), 3);
     }
 
     #[test]

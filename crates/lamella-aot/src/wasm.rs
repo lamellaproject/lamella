@@ -1343,16 +1343,18 @@ impl Raise {
     }
 }
 
-/// The object reference a field instruction dereferences, when it needs a null test first: a field
-/// access through an `ObjectRef`, as on ARM and RISC-V. A managed or unmanaged pointer is not tested
-/// (only an object reference is null here), and a struct held in the frame cannot be.
+/// The object reference an instruction needs tested for null first: a field access through an
+/// `ObjectRef`, as on ARM and RISC-V, and a `callvirt`'s receiver ([`Inst::NullCheck`], the test
+/// alone). A managed or unmanaged pointer is not tested (only an object reference is null here), and
+/// a struct held in the frame cannot be.
 fn null_tested_base(inst: &Inst, value_types: &[MirType]) -> Option<ValueId> {
     let base = match inst {
         Inst::FieldLoad { base, .. }
         | Inst::FieldStore { base, .. }
         | Inst::FieldLoadNarrow { base, .. }
         | Inst::FieldStoreNarrow { base, .. }
-        | Inst::FieldAddr { base, .. } => *base,
+        | Inst::FieldAddr { base, .. }
+        | Inst::NullCheck { object: base } => *base,
         _ => return None,
     };
     matches!(value_types.get(base.index()), Some(MirType::ObjectRef)).then_some(base)
@@ -2231,6 +2233,7 @@ fn lower_inst(
             homes.name_made_struct(body, result)?;
             emit_zero(body, local(result), size as u32);
         }
+        Inst::NullCheck { .. } => {}
         Inst::CopyStruct { src } => {
             let size = struct_size(value_types[result.index()])?;
             homes.name_made_struct(body, result)?;
@@ -2690,6 +2693,7 @@ fn lower_inst(
             body.local_get(local(*value));
             emit_sized_store(body, *element_size, value_types[value.index()])?;
         }
+        Inst::Nop => body.nop(),
         _ => return Err(LowerError::Unsupported),
     }
     Ok(())

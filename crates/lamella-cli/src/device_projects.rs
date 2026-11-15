@@ -1,4 +1,6 @@
-//! Complete project device lists, shared by the SDK and editor without opening a device.
+//! Complete project device lists, shared by the SDK and editor. Nothing is opened but an idle Raspberry Pi
+//! Debug Probe, read at its debug port for the chip behind it, so a board's list leaves out a probe wired to
+//! another chip.
 
 use super::*;
 use std::collections::HashSet;
@@ -60,7 +62,7 @@ impl<'a> Request<'a> {
             }
         }).collect::<Result<Vec<_>, _>>()?;
         Ok(Some(Self { framework, board, emulator_board: options.flag("--emulator-board"),
-            qualified: options.flag("--qualified") || board.is_none(), routes }))
+            qualified: options.flag("--qualified"), routes }))
     }
 
     pub(super) fn list(&self, attached: &[Attached]) -> Listing {
@@ -93,17 +95,20 @@ impl<'a> Request<'a> {
             if let Some(board) = self.board
                 && crate::flash::links_native_image(board)
             {
-                listing.probes(attached, &catalog, board, false);
+                listing.probes(attached, &catalog, board, Reach::Named);
             }
         } else {
+            let reach = if self.board.is_none() { Reach::Unknown } else if self.qualified { Reach::Qualified } else { Reach::Named };
+            // An emulator runs the board it is listed for, so a project that names none lists it once for each board.
+            let qualified = self.qualified || self.board.is_none();
             for route in &self.routes {
                 let board = match route { Route::Probe(board) | Route::Emulator { board, .. } => board };
                 if board.is_empty() || self.board.is_some_and(|wanted| board != wanted) { continue; }
                 match route {
-                    Route::Probe(board) => listing.probes(attached, &catalog, board, self.qualified),
+                    Route::Probe(board) => listing.probes(attached, &catalog, board, reach),
                     Route::Emulator { machine, available: true, .. } if self.board.is_none() || self.emulator_board => listing.devices.push(Device {
-                        id: if self.qualified { format!("emulator:{machine}/{board}") } else { format!("emulator:{machine}") },
-                        description: if self.qualified {
+                        id: if qualified { format!("emulator:{machine}/{board}") } else { format!("emulator:{machine}") },
+                        description: if qualified {
                             format!("{machine} emulator for {}: deploy as native (AOT)", crate::own_lines::board_name(board))
                         } else { format!("{machine} emulator: deploy as native (AOT)") },
                         device_type: "Emulator", status: "Installed", model: NATIVE, board: board.clone(),
@@ -168,6 +173,18 @@ impl Catalog {
     }
 }
 
+/// The chip a board is built around, as its BSP spells it: its `family` and `part`.
+fn chip_of_board(board: &str) -> Option<(String, String)> {
+    let table = lamella_catalog::load_board(board)?;
+    Some((lamella_catalog::family_of(&table)?, lamella_catalog::load_part(&table)?.part))
+}
+
+/// Whether the chip a read named can be the board's: the same family, and the same part where the read
+/// named one. An RP2350's part takes the system bus to read, so at the debug port its family decides.
+fn chip_fits(chip: &lamella_flash_routes::behind_probe::Chip, family: &str, part: &str) -> bool {
+    chip.family == family && chip.part.is_none_or(|named| named == part)
+}
+
 #[derive(Default)]
 struct Device {
     id: String,
@@ -179,6 +196,11 @@ struct Device {
     serial: String,
     route: &'static str,
     machine: String,
+    boards: Vec<String>,
+    /// For a probe, the chip behind it, where the listing read it.
+    chip: Option<lamella_flash_routes::behind_probe::Chip>,
+    /// For a probe the listing tried to read, whether another program held it.
+    in_use: Option<bool>,
 }
 
 #[derive(Default)]
@@ -188,25 +210,55 @@ pub(super) struct Listing {
     unreached: Vec<String>,
 }
 
+/// How a probe's row is named, by what the project says of its board.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Reach {
+    /// The project names the board: the probe's own id.
+    Named,
+    /// The board came from the device the person chose: the id they chose, `probe:<serial>/<board>`.
+    Qualified,
+    /// The project names no board: the probe's own id, once, with every board it reaches.
+    Unknown,
+}
+
 impl Listing {
-    fn probes(&mut self, attached: &[Attached], catalog: &Catalog, board: &str, qualified: bool) {
-        let families = crate::image_run::probe_families(board);
-        if families.is_empty() {
+    /// The probes `board`'s image can be written through: those of the family its run goes through, and on a board
+    /// with a debugger soldered to it, only that debugger's kind, as the run itself takes one. A probe cannot say
+    /// which board it is wired to, so its row names none; for a project that names none, each probe is listed once,
+    /// with the boards it reaches, and the deploy asks which.
+    fn probes(&mut self, attached: &[Attached], catalog: &Catalog, board: &str, reach: Reach) {
+        let Some(run) = crate::image_run::run_probe(board) else {
             if !self.unreached.iter().any(|id| id == board) { self.unreached.push(board.to_owned()); }
             return;
-        }
+        };
+        let board_chip = chip_of_board(board);
         for one in attached.iter().filter(|one| one.kind == Kind::Probe && one.id.is_some()) {
-            if !one.facts.family.is_some_and(|family| families.contains(&family))
+            if one.facts.family != Some(run.family)
+                || run.usb.is_some_and(|usb| one.facts.usb != Some(usb))
                 || !catalog.probe_allows(one.facts.product.as_deref(), board)
+            { continue; }
+            // A probe wired to another chip leaves the board's list. One in use, or whose chip is not known, stays.
+            if let (Some(Behind::Chip(chip)), Some((family, part))) = (&one.facts.behind, &board_chip)
+                && !chip_fits(chip, family, part)
             { continue; }
             let Some(serial) = &one.facts.serial else { continue };
             let id = one.id.as_deref().unwrap();
+            if reach == Reach::Unknown
+                && let Some(listed) = self.devices.iter_mut().find(|device| device.id.eq_ignore_ascii_case(id))
+            {
+                if !listed.boards.iter().any(|reached| reached == board) { listed.boards.push(board.to_owned()); }
+                continue;
+            }
             self.devices.push(Device {
-                id: if qualified { format!("{id}/{board}") } else { id.to_owned() },
-                description: if qualified { format!("Debug probe, {}: deploy as native (AOT)", crate::own_lines::board_name(board)) }
-                    else { NATIVE_DESCRIPTION.to_owned() },
+                id: if reach == Reach::Qualified { format!("{id}/{board}") } else { id.to_owned() },
+                description: NATIVE_DESCRIPTION.to_owned(),
                 device_type: DEVICE_TYPE, status: ATTACHED, model: NATIVE,
-                board: board.to_owned(), serial: serial.clone(), route: "probe", ..Device::default()
+                board: if reach == Reach::Unknown { String::new() } else { board.to_owned() },
+                boards: if reach == Reach::Unknown { vec![board.to_owned()] } else { Vec::new() },
+                serial: serial.clone(), route: "probe",
+                chip: match &one.facts.behind { Some(Behind::Chip(chip)) => Some(chip.clone()), _ => None },
+                in_use: one.facts.behind.as_ref().map(|behind| *behind == Behind::InUse),
+                ..Device::default()
             });
         }
     }
@@ -216,6 +268,12 @@ impl Listing {
             "id": device.id, "description": device.description, "type": device.device_type,
             "status": device.status, "model": device.model, "board": device.board,
             "serial": device.serial, "route": device.route, "machine": device.machine,
+            "boards": device.boards.iter().map(|board| json!({ "id": board, "name": crate::own_lines::board_name(board) }))
+                .collect::<Vec<_>>(),
+            "chip": device.chip.as_ref().map(|chip| json!({
+                "family": chip.family, "part": chip.part, "id": chip.chip_id.map(|id| format!("{id:016X}")),
+            })),
+            "in_use": device.in_use,
         })).collect();
         format!("{}\n", serde_json::to_string_pretty(&json!({
             "schema": 1, "devices": devices, "bridges": self.bridges, "unreached": self.unreached,
@@ -232,6 +290,23 @@ impl Listing {
                 ("Route", device.route), ("Machine", &device.machine),
             ] {
                 if !value.is_empty() { let _ = write!(text, " {name}=\"{}\"", attribute(value)); }
+            }
+            // A list, as MSBuild splits one: each board escaped, and the semicolons between them left as they are.
+            if !device.boards.is_empty() {
+                let boards: Vec<String> = device.boards.iter().map(|board| attribute(board)).collect();
+                let _ = write!(text, " Boards=\"{}\"", boards.join(";"));
+            }
+            if let Some(chip) = &device.chip {
+                let _ = write!(text, " ChipFamily=\"{}\"", attribute(chip.family));
+                if let Some(part) = chip.part {
+                    let _ = write!(text, " ChipPart=\"{}\"", attribute(part));
+                }
+                if let Some(id) = chip.chip_id {
+                    let _ = write!(text, " ChipId=\"{id:016X}\"");
+                }
+            }
+            if let Some(in_use) = device.in_use {
+                let _ = write!(text, " InUse=\"{in_use}\"");
             }
             text.push_str(" />\n");
         }
@@ -294,7 +369,7 @@ mod tests {
         let list = listed(&["--framework", "lamella1.0", "--json"], &bench);
         assert_eq!(ids(&list), ["local", "usb:MATCH", "usb-serial:BRIDGE", "usb:OTHER"]);
         assert_eq!(list.devices[1].description, "Pimoroni Pico Plus 2: deploy to interpreter");
-        assert_eq!(list.devices[2].description, "Board behind a debug probe: deploy to interpreter");
+        assert_eq!(list.devices[2].description, "Unknown board behind a debug probe: deploy to interpreter");
         assert_eq!(list.bridges, ["usb-serial:BRIDGE"]);
         assert_eq!(ids(&listed(&["--framework", "lamella1.0", "--json"], &[])), ["local"]);
     }
@@ -332,8 +407,8 @@ mod tests {
         let list = listed(&options, &bench);
         assert_eq!(ids(&list), ["usb:MATCH", "usb:UNKNOWN", "usb:UNNAMED", "probe:GENERIC"]);
         assert_eq!(list.devices[1].description, "Fixture Board Alpha: deploy to interpreter");
-        assert_eq!(list.devices[2].description, "Board running Lamella: deploy to interpreter");
-        assert_eq!(list.devices[3].description, "Debug probe: deploy as native (AOT)");
+        assert_eq!(list.devices[2].description, "Unknown board running Lamella: deploy to interpreter");
+        assert_eq!(list.devices[3].description, "Debug probe, Unknown board: deploy as native (AOT)");
         assert_eq!(list.devices[3].serial, "GENERIC");
         assert!(ids(&listed(&options, &[])).is_empty());
     }
@@ -366,15 +441,63 @@ mod tests {
             "--route", "probe:st-stm32f769i-disco",
             "--route", "emulator:raspberrypi-pico-2:mps2-an505:True",
             "--route", "emulator:raspberrypi-pico-2:missing:false",
-            "--route", "probe:bbc-micro-bit-v2",
+            "--route", "probe:raspberrypi-pico",
             "--route", "probe:not-in-catalog",
         ], &bench);
-        assert_eq!(ids(&list), ["probe:DAP/raspberrypi-pico-2", "probe:STLINK/st-stm32f769i-disco", "emulator:mps2-an505/raspberrypi-pico-2"]);
-        assert_eq!(list.devices[0].description, "Debug probe, Raspberry Pi Pico 2: deploy as native (AOT)");
+        assert_eq!(ids(&list), ["probe:DAP", "probe:STLINK", "emulator:mps2-an505/raspberrypi-pico-2"]);
+        assert_eq!(list.devices[0].description, "Debug probe, Unknown board: deploy as native (AOT)");
+        assert_eq!(list.devices[0].boards, ["raspberrypi-pico-2"]);
+        assert_eq!(list.devices[1].boards, ["st-stm32f769i-disco"]);
         assert_eq!(list.devices[2].description, "mps2-an505 emulator for Raspberry Pi Pico 2: deploy as native (AOT)");
         assert_eq!(list.devices[2].machine, "mps2-an505");
-        assert_eq!(list.unreached, ["bbc-micro-bit-v2", "not-in-catalog"]);
+        assert_eq!(list.unreached, ["raspberrypi-pico", "not-in-catalog"]);
         assert!(!list.msbuild().contains("RuntimeIdentifier"));
+    }
+
+    #[test]
+    fn a_microbit_project_lists_only_a_microbits_own_daplink() {
+        let bench = [
+            probe("probe:PICOPROBE", "Debug Probe (CMSIS-DAP)"),
+            attached(Some("probe:MICROBIT"), Kind::Probe, lamella_cmsis_dap_nrf::MICROBIT_DAPLINK, "BBC micro:bit CMSIS-DAP"),
+            attached(Some("probe:STLINK"), Kind::Probe, (0x0483, 0x374b), "STM32 STLink"),
+        ];
+        for board in ["bbc-micro-bit-v1", "bbc-micro-bit-v2"] {
+            let list = listed(&["--framework", "lamella1.0", "--board", board, "--json"], &bench);
+            assert_eq!(ids(&list), ["probe:MICROBIT"], "{board}");
+            assert_eq!(list.devices[0].board, board);
+            assert_eq!(list.devices[0].serial, "MICROBIT");
+            assert_eq!(list.devices[0].description, NATIVE_DESCRIPTION);
+            assert!(list.unreached.is_empty(), "{board}: {:?}", list.unreached);
+        }
+        let pico = listed(&["--framework", "lamella1.0", "--board", "raspberrypi-pico-2", "--json"], &bench);
+        assert_eq!(ids(&pico), ["probe:PICOPROBE"], "a micro:bit's DAPLink is not a Pico 2's probe");
+    }
+
+    #[test]
+    fn a_boardless_project_lists_each_probe_once_as_an_unknown_board_with_the_boards_it_reaches() {
+        let bench = [
+            probe("probe:DAP", "Debug Probe (CMSIS-DAP)"),
+            attached(Some("probe:STLINK"), Kind::Probe, (0x0483, 0x374b), "STM32 STLink"),
+        ];
+        let list = listed(&["--framework", "net11.0", "--json",
+            "--route", "probe:raspberrypi-pico-2", "--route", "probe:pimoroni-pico-plus-2",
+            "--route", "probe:st-stm32f769i-disco", "--route", "probe:pimoroni-pico-lipo-2-xl-w",
+            "--route", "probe:raspberrypi-pico-2",
+        ], &bench);
+        assert_eq!(ids(&list), ["probe:DAP", "probe:STLINK"]);
+        assert_eq!(list.devices[0].boards, ["raspberrypi-pico-2", "pimoroni-pico-plus-2", "pimoroni-pico-lipo-2-xl-w"]);
+        assert_eq!(list.devices[1].boards, ["st-stm32f769i-disco"]);
+        let names: Vec<String> = Catalog::new().0.into_iter().map(|board| board.name).collect();
+        for device in &list.devices {
+            assert_eq!(device.description, "Debug probe, Unknown board: deploy as native (AOT)");
+            assert!(device.board.is_empty(), "{}", device.id);
+            assert!(!names.iter().any(|name| device.description.contains(name.as_str())), "{}", device.description);
+        }
+        let json: Value = serde_json::from_str(&list.json()).unwrap();
+        assert_eq!(json["devices"][1]["boards"],
+            json!([{ "id": "st-stm32f769i-disco", "name": crate::own_lines::board_name("st-stm32f769i-disco") }]));
+        let xml = list.msbuild();
+        assert!(xml.contains(" Boards=\"raspberrypi-pico-2;pimoroni-pico-plus-2;pimoroni-pico-lipo-2-xl-w\""), "{xml}");
     }
 
     #[test]
@@ -419,7 +542,10 @@ mod tests {
         assert_eq!(list.devices[0].description, NATIVE_DESCRIPTION);
         let mut options = options.to_vec();
         options.push("--qualified");
-        assert_eq!(ids(&listed(&options, &bench)), ["probe:DAP/raspberrypi-pico-2"]);
+        let qualified = listed(&options, &bench);
+        assert_eq!(ids(&qualified), ["probe:DAP/raspberrypi-pico-2"]);
+        assert_eq!(qualified.devices[0].description, NATIVE_DESCRIPTION);
+        assert!(qualified.devices[0].boards.is_empty());
     }
 
     #[test]
@@ -464,7 +590,7 @@ mod tests {
                 "--route", route, "--route", "probe:raspberrypi-pico-2",
                 "--route", "emulator:arm-mps2-an505:mps2-an505:true"],
                 &[probe("probe:TEST", "Debug Probe")]);
-            assert_eq!(ids(&list), ["probe:TEST/raspberrypi-pico-2", "emulator:mps2-an505/arm-mps2-an505"], "{route}");
+            assert_eq!(ids(&list), ["probe:TEST", "emulator:mps2-an505/arm-mps2-an505"], "{route}");
         }
     }
 
@@ -482,5 +608,70 @@ mod tests {
             let parsed = args::parse(&args, &spec(&args)).unwrap();
             assert!(Request::parse(&parsed, &form(&parsed).unwrap()).is_err(), "{args:?}");
         }
+    }
+
+    /// A Raspberry Pi Debug Probe as a project's list finds it once the chip behind it is read.
+    fn read_probe(id: &str, behind: Behind) -> Attached {
+        let mut one = probe(id, "Debug Probe (CMSIS-DAP)");
+        one.facts.behind = Some(behind);
+        one
+    }
+
+    /// What a read named.
+    fn named(family: &'static str, part: Option<&'static str>) -> Behind {
+        Behind::Chip(lamella_flash_routes::behind_probe::Chip { family, part, chip_id: None })
+    }
+
+    /// **A PROBE WIRED TO ANOTHER CHIP LEAVES THE BOARD'S LIST, AND ONE WHOSE CHIP IS NOT KNOWN STAYS.** A
+    /// different family leaves, and a different part where the read named one; a probe in use, one whose
+    /// read named nothing and one that was not read stay, for both frameworks. Each says what was read.
+    #[test]
+    fn a_probe_wired_to_another_chip_leaves_the_boards_list_and_one_not_known_stays() {
+        let bench = [
+            read_probe("probe:RP2040", named("rp2040", Some("rp2040"))),
+            read_probe("probe:RP2350", named("rp2350", None)),
+            read_probe("probe:RP2350A", named("rp2350", Some("rp2350a"))),
+            read_probe("probe:RP2350B", named("rp2350", Some("rp2350b"))),
+            read_probe("probe:HELD", Behind::InUse),
+            read_probe("probe:SILENT", Behind::Unknown("no debug port answered".to_owned())),
+            probe("probe:UNREAD", "Debug Probe (CMSIS-DAP)"),
+        ];
+        let kept = ["probe:RP2350", "probe:RP2350B", "probe:HELD", "probe:SILENT", "probe:UNREAD"];
+        let board = "pimoroni-pico-plus-2";
+        let list = listed(&["--framework", "lamella1.0", "--board", board, "--json"], &bench);
+        assert_eq!(ids(&list), kept);
+        let rhu = listed(&["--framework", "net11.0", "--board", board, "--route", &format!("probe:{board}"), "--json"], &bench);
+        assert_eq!(ids(&rhu), kept, "net11.0's probe routes reach the same filter");
+
+        let json: Value = serde_json::from_str(&list.json()).unwrap();
+        let devices = &json["devices"];
+        assert_eq!(devices[1]["chip"], json!({ "family": "rp2350", "part": "rp2350b", "id": null }));
+        assert_eq!(devices[1]["in_use"], json!(false));
+        assert_eq!((&devices[2]["chip"], &devices[2]["in_use"]), (&Value::Null, &json!(true)));
+        assert_eq!((&devices[3]["chip"], &devices[3]["in_use"]), (&Value::Null, &json!(false)));
+        assert_eq!((&devices[4]["chip"], &devices[4]["in_use"]), (&Value::Null, &Value::Null), "a probe not read says nothing");
+        assert_eq!(devices[1]["description"], NATIVE_DESCRIPTION, "the words do not change");
+
+        let xml = list.msbuild();
+        let line = |id: &str| xml.lines().find(|line| line.contains(&format!("Include=\"{id}\""))).unwrap().to_owned();
+        assert!(line("probe:RP2350B").contains(" ChipFamily=\"rp2350\" ChipPart=\"rp2350b\" InUse=\"false\""), "{xml}");
+        assert!(line("probe:RP2350").contains(" ChipFamily=\"rp2350\" InUse=\"false\"") && !line("probe:RP2350").contains("ChipPart"), "{xml}");
+        assert!(line("probe:HELD").contains(" InUse=\"true\"") && !line("probe:HELD").contains("Chip"), "{xml}");
+        assert!(!line("probe:UNREAD").contains("Chip") && !line("probe:UNREAD").contains("InUse"), "{xml}");
+    }
+
+    /// **AN RP2040 BOARD KEEPS ONLY AN RP2040.** Its family has one part, so the read names it, and a probe
+    /// wired to an RP2350 leaves.
+    #[test]
+    fn a_board_keeps_a_probe_whose_chip_fits_it_by_family_and_by_part() {
+        let rp2040 = named("rp2040", Some("rp2040"));
+        let Behind::Chip(rp2040) = rp2040 else { unreachable!() };
+        assert!(chip_fits(&rp2040, "rp2040", "rp2040"));
+        assert!(!chip_fits(&rp2040, "rp2350", "rp2350a"));
+        let Behind::Chip(rp2350) = named("rp2350", None) else { unreachable!() };
+        assert!(chip_fits(&rp2350, "rp2350", "rp2350a") && chip_fits(&rp2350, "rp2350", "rp2350b"));
+        assert_eq!(chip_of_board("raspberrypi-pico"), Some(("rp2040".to_owned(), "rp2040".to_owned())));
+        assert_eq!(chip_of_board("pimoroni-pico-plus-2"), Some(("rp2350".to_owned(), "rp2350b".to_owned())));
+        assert_eq!(chip_of_board("no-such-board"), None);
     }
 }

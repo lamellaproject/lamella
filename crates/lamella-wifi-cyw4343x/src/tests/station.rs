@@ -26,8 +26,11 @@ use crate::event::{Event, EventMask, number, status};
 use crate::fixture::{End, FakeClock, FakeTransport, Op, Run, run};
 use crate::frame::Frames;
 use crate::link::{Credential, JoinFailure, LinkState, STAGE_AUTH_MODE};
-use crate::scan::{ScanEnd, params};
-use crate::station::{Capabilities, STAGE_ADDRESS, STAGE_SCAN_REGULATORY};
+use crate::scan::{ScanEnd, ScanRecord, params, params_for};
+use crate::station::{
+    Capabilities, REFUSED_REST_MAX_US, REFUSED_REST_US, STAGE_ADDRESS, STAGE_SCAN_REGULATORY,
+    refused_rest, spread_of, spread_step,
+};
 use crate::transport::{Part, Transport};
 use std::vec::Vec;
 
@@ -263,6 +266,19 @@ pub(super) fn up_ops(c: &mut Cursor, mailbox: bool) -> Vec<Op> {
 pub(super) fn scan_requests(v: &mut Vec<Op>, c: &mut Cursor, mailbox: bool, sync: u16) {
     exchange(v, c, mailbox, true, 49, b"", &[0, 0, 0, 0], 0, &[]);
     exchange(v, c, mailbox, true, 263, b"escan", &params(sync), 0, &[]);
+}
+
+/// The one request of a scan that asks for `name`, and its reply: the scan
+/// start alone, its parameters carrying the name.
+pub(super) fn named_scan_request(
+    v: &mut Vec<Op>,
+    c: &mut Cursor,
+    mailbox: bool,
+    sync: u16,
+    name: &[u8],
+) {
+    let value = params_for(sync, name);
+    exchange(v, c, mailbox, true, 263, b"escan", &value, 0, &[]);
 }
 
 /// A scan result event of `sync` with `status` carrying `recs`.
@@ -1286,11 +1302,242 @@ fn a_no_ack_association_is_latched_into_the_failure() {
     assert_eq!(bus.remaining(), 0);
 }
 
+/// The events of a WPA2 attempt that the handshake's timeout ends: the
+/// network associates, and the supplicant reports its reason 15.
+fn timeout_events(script: &mut Vec<Op>, c: &mut Cursor) {
+    event(script, c, true, number::AUTH, 0, 0, ADDRESS, &[]);
+    event(script, c, true, number::ASSOC, 0, 0, ADDRESS, &IES);
+    event(script, c, true, number::SET_SSID, 0, 0, ADDRESS, &[]);
+    event(
+        script,
+        c,
+        true,
+        number::PSK_SUP,
+        status::UNSOLICITED,
+        15,
+        ADDRESS,
+        &[],
+    );
+}
+
+/// The driver's own scan under `sync`, which hears the network, and the
+/// three requests of the WPA2 join it re-enters.
+fn seen_again(script: &mut Vec<Op>, c: &mut Cursor, sync: u16) {
+    scan_requests(script, c, true, sync);
+    scan_event(script, c, true, sync, status::PARTIAL, &[record_a()]);
+    scan_event(script, c, true, sync, status::SUCCESS, &[]);
+    join_requests(script, c, true, &secured_values()[5..]);
+}
+
+/// The events of a WPA3 attempt that fails at its authentication: the
+/// authentication event with a failure status, then the firmware's word
+/// that the join failed. The status is this battery's choice; no recorded
+/// exchange holds the one the firmware gives a password that does not
+/// match.
+fn sae_refused_events(script: &mut Vec<Op>, c: &mut Cursor) {
+    event_auth(
+        script,
+        c,
+        true,
+        number::AUTH,
+        status::FAIL,
+        0,
+        3,
+        ADDRESS,
+        &[],
+    );
+    event(
+        script,
+        c,
+        true,
+        number::SET_SSID,
+        status::FAIL,
+        0,
+        ADDRESS,
+        &[],
+    );
+}
+
+/// The failure that such an attempt reports.
+const SAE_REFUSED: JoinFailure = JoinFailure::Association {
+    status: 1,
+    assoc_status: 0,
+    auth_status: 1,
+};
+
+/// The driver's own scan under `sync`, which hears the network offering
+/// WPA3, and the three requests of the WPA3 join it re-enters.
+fn sae_seen_again(script: &mut Vec<Op>, c: &mut Cursor, sync: u16) {
+    scan_requests(script, c, true, sync);
+    scan_event(script, c, true, sync, status::PARTIAL, &[record_d()]);
+    scan_event(script, c, true, sync, status::SUCCESS, &[]);
+    join_requests(script, c, true, &sae_values()[6..]);
+}
+
+/// The outcomes of a WPA2 attempt that the handshake's timeout ends: three
+/// plain events, then the failure with the network held. Answers the rest
+/// that the failure began, as the driver says it.
+fn timed_out<T: Transport>(
+    driver: &mut Driver<'static>,
+    bus: &mut T,
+    clock: &mut FakeClock,
+) -> Option<Micros> {
+    for _ in 0..3 {
+        assert!(matches!(
+            outcome(driver, bus, clock).0,
+            Some(Outcome::Event(_))
+        ));
+    }
+    assert_eq!(
+        outcome(driver, bus, clock).0,
+        Some(Outcome::JoinFailed(JoinFailure::Supplicant { reason: 15 }))
+    );
+    assert_eq!(driver.link(), LinkState::Down, "the network is held");
+    driver.backoff()
+}
+
+/// The recovery cycle behind a rest, to the join it re-enters: the scan
+/// hears `heard`. Answers the passes of the rest before the scan, read on
+/// the clock at the cadence of ten milliseconds: a run's own record of its
+/// waits holds 2048 of them and no more.
+fn rested<T: Transport>(
+    driver: &mut Driver<'static>,
+    bus: &mut T,
+    clock: &mut FakeClock,
+    heard: ScanRecord,
+) -> usize {
+    let failed_at = clock.now();
+    let (o, _) = outcome(driver, bus, clock);
+    assert_eq!(o, Some(Outcome::ScanRecord(heard)));
+    let passes = ((clock.now() - failed_at) / 10_000) as usize;
+    assert_eq!(
+        outcome(driver, bus, clock).0,
+        Some(Outcome::ScanDone {
+            end: ScanEnd::Complete,
+            records: 1
+        })
+    );
+    assert_eq!(driver.link(), LinkState::Joining);
+    passes
+}
+
 #[test]
-fn the_supplicants_timeout_detaches_the_network_and_a_later_join_is_accepted() {
+fn the_rest_after_a_refused_secret_doubles_from_five_seconds_to_five_minutes() {
+    const SECONDS: [Micros; 12] = [5, 10, 20, 40, 80, 160, 300, 300, 300, 300, 300, 300];
+    for (at, seconds) in SECONDS.iter().enumerate() {
+        assert_eq!(
+            refused_rest(at as u32 + 1),
+            *seconds * 1_000_000,
+            "the rest behind the refusal {}",
+            at + 1
+        );
+    }
+    assert_eq!(refused_rest(0), 5_000_000, "no count rests shorter");
+    assert_eq!(refused_rest(1000), 300_000_000);
+    assert_eq!(refused_rest(u32::MAX), 300_000_000, "no count ends it");
+    assert_eq!(REFUSED_REST_US, 5_000_000);
+    assert_eq!(REFUSED_REST_MAX_US, 300_000_000);
+}
+
+#[test]
+fn a_refused_passphrase_is_tried_again_after_a_longer_rest_each_time_and_never_given_up() {
+    // Nine attempts in a row end in the handshake's timeout. The rests
+    // behind them, in passes at the cadence of ten milliseconds: five
+    // seconds doubled up to the cap of five minutes, and the cap from then
+    // on.
+    const PASSES: [usize; 9] = [500, 1000, 2000, 4000, 8000, 16000, 30000, 30000, 30000];
     let (mut script, mut c) = up_script();
     join_requests(&mut script, &mut c, true, &secured_values());
-    event(&mut script, &mut c, true, number::AUTH, 0, 0, ADDRESS, &[]);
+    timeout_events(&mut script, &mut c);
+    for (round, passes) in PASSES.iter().enumerate() {
+        repeat(&mut script, *passes as u32);
+        seen_again(&mut script, &mut c, round as u16 + 1);
+        if round + 1 < PASSES.len() {
+            timeout_events(&mut script, &mut c);
+        }
+    }
+    reentry_events(&mut script, &mut c);
+    let (mut driver, mut bus, mut clock) = up_over(&script);
+    assert_eq!(driver.backoff(), None);
+    assert!(driver.join(SSID, Some(PASSPHRASE)));
+    for (round, passes) in PASSES.iter().enumerate() {
+        let rest = timed_out(&mut driver, &mut bus, &mut clock);
+        assert_eq!(
+            rest,
+            Some(*passes as Micros * 10_000),
+            "the rest behind the refusal {}",
+            round + 1
+        );
+        assert_eq!(rest, Some(refused_rest(round as u32 + 1)));
+        assert!(
+            !driver.join(SSID, Some(PASSPHRASE)),
+            "the network is held: no new request is taken"
+        );
+        assert_eq!(rested(&mut driver, &mut bus, &mut clock, RECORD_A), *passes);
+    }
+    rejoined(&mut driver, &mut bus, &mut clock);
+    assert_eq!(driver.backoff(), None, "a join that completed");
+    assert_eq!(bus.remaining(), 0);
+    assert_eq!(bus.fault(), None);
+}
+
+#[test]
+fn a_failed_authentication_of_a_wpa3_join_is_rested_as_a_refused_password_is() {
+    let (mut script, mut c) = up_script();
+    join_requests(&mut script, &mut c, true, &sae_values());
+    sae_refused_events(&mut script, &mut c);
+    repeat(&mut script, 500);
+    sae_seen_again(&mut script, &mut c, 1);
+    // An association that is not acknowledged, behind an authentication
+    // that succeeded: a failed attempt, and no sign of a refused password.
+    event_auth(
+        &mut script,
+        &mut c,
+        true,
+        number::AUTH,
+        0,
+        0,
+        3,
+        ADDRESS,
+        &[],
+    );
+    event(
+        &mut script,
+        &mut c,
+        true,
+        number::ASSOC,
+        status::NO_ACK,
+        0,
+        ADDRESS,
+        &[],
+    );
+    event(
+        &mut script,
+        &mut c,
+        true,
+        number::SET_SSID,
+        status::FAIL,
+        0,
+        ADDRESS,
+        &[],
+    );
+    repeat(&mut script, 500);
+    sae_seen_again(&mut script, &mut c, 2);
+    sae_refused_events(&mut script, &mut c);
+    repeat(&mut script, 1000);
+    sae_seen_again(&mut script, &mut c, 3);
+    // The join completes, in the order the WPA3 flights delivered.
+    event_auth(
+        &mut script,
+        &mut c,
+        true,
+        number::AUTH,
+        0,
+        0,
+        3,
+        ADDRESS,
+        &[],
+    );
     event(
         &mut script,
         &mut c,
@@ -1301,6 +1548,18 @@ fn the_supplicants_timeout_detaches_the_network_and_a_later_join_is_accepted() {
         ADDRESS,
         &IES,
     );
+    event(&mut script, &mut c, true, number::LINK, 0, 0, ADDRESS, &[]);
+    event(
+        &mut script,
+        &mut c,
+        true,
+        number::PSK_SUP,
+        status::UNSOLICITED,
+        0,
+        ADDRESS,
+        &[],
+    );
+    event(&mut script, &mut c, true, number::JOIN, 0, 0, ADDRESS, &[]);
     event(
         &mut script,
         &mut c,
@@ -1311,37 +1570,385 @@ fn the_supplicants_timeout_detaches_the_network_and_a_later_join_is_accepted() {
         ADDRESS,
         &[],
     );
-    event(
-        &mut script,
-        &mut c,
-        true,
-        number::PSK_SUP,
-        status::UNSOLICITED,
-        15,
-        ADDRESS,
-        &[],
-    );
+    empty(&mut script, 5);
     let (mut driver, mut bus, mut clock) = up_over(&script);
-    assert!(driver.join(SSID, Some(PASSPHRASE)));
-    for _ in 0..3 {
+    assert!(driver.join_with(SSID, Credential::SaePassword(PASSPHRASE)));
+    assert!(matches!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::Event(_))
+    ));
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::JoinFailed(SAE_REFUSED))
+    );
+    assert_eq!(driver.link(), LinkState::Down, "the network is held");
+    assert_eq!(driver.backoff(), Some(5_000_000));
+    assert_eq!(rested(&mut driver, &mut bus, &mut clock, RECORD_D), 500);
+    for _ in 0..2 {
         assert!(matches!(
             outcome(&mut driver, &mut bus, &mut clock).0,
             Some(Outcome::Event(_))
         ));
     }
-    assert_eq!(driver.link(), LinkState::Joining, "associated, held");
     assert_eq!(
         outcome(&mut driver, &mut bus, &mut clock).0,
-        Some(Outcome::JoinFailed(JoinFailure::Supplicant { reason: 15 }))
+        Some(Outcome::JoinFailed(JoinFailure::Association {
+            status: 1,
+            assoc_status: 5,
+            auth_status: 0
+        }))
     );
-    assert_eq!(driver.link(), LinkState::Detached, "not retried");
+    assert_eq!(driver.link(), LinkState::Down);
+    assert_eq!(
+        driver.backoff(),
+        None,
+        "a failed attempt, and no refused password"
+    );
+    assert_eq!(
+        rested(&mut driver, &mut bus, &mut clock, RECORD_D),
+        500,
+        "the rest of every other failed attempt"
+    );
+    assert!(matches!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::Event(_))
+    ));
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::JoinFailed(SAE_REFUSED))
+    );
+    assert_eq!(
+        driver.backoff(),
+        Some(10_000_000),
+        "the second in the row: the other failure did not move the count"
+    );
+    assert_eq!(rested(&mut driver, &mut bus, &mut clock, RECORD_D), 1000);
+    for _ in 0..6 {
+        assert!(matches!(
+            outcome(&mut driver, &mut bus, &mut clock).0,
+            Some(Outcome::Event(_))
+        ));
+    }
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::Joined { bssid: ADDRESS })
+    );
+    assert_eq!(driver.backoff(), None);
+    assert_eq!(bus.remaining(), 0);
+    assert_eq!(bus.fault(), None);
+}
+
+#[test]
+fn a_join_puts_the_rest_back_and_no_other_failure_moves_it() {
+    let (mut script, mut c) = up_script();
+    join_requests(&mut script, &mut c, true, &secured_values());
+    timeout_events(&mut script, &mut c);
+    repeat(&mut script, 500);
+    // The driver's scan does not hear the network, and its scan that asks
+    // for the name hears nothing: a network not seen rests its own five
+    // seconds.
+    scan_requests(&mut script, &mut c, true, 1);
+    scan_event(&mut script, &mut c, true, 1, status::PARTIAL, &[record_b()]);
+    scan_event(&mut script, &mut c, true, 1, status::SUCCESS, &[]);
+    named_scan_request(&mut script, &mut c, true, 2, SSID);
+    scan_event(&mut script, &mut c, true, 2, status::SUCCESS, &[]);
+    repeat(&mut script, 500);
+    // The network is heard again, and a deauthentication ends the attempt.
+    seen_again(&mut script, &mut c, 3);
+    event(&mut script, &mut c, true, number::AUTH, 0, 0, ADDRESS, &[]);
+    event(
+        &mut script,
+        &mut c,
+        true,
+        number::DEAUTH_IND,
+        0,
+        2,
+        ADDRESS,
+        &[],
+    );
+    repeat(&mut script, 500);
+    // The handshake's timeout again: the second in the row.
+    seen_again(&mut script, &mut c, 4);
+    timeout_events(&mut script, &mut c);
+    repeat(&mut script, 1000);
+    // The join completes; the link is lost; the handshake times out.
+    seen_again(&mut script, &mut c, 5);
+    reentry_events(&mut script, &mut c);
+    script.extend(burst_ops(&mut c, true));
+    repeat(&mut script, 100);
+    seen_again(&mut script, &mut c, 6);
+    timeout_events(&mut script, &mut c);
+    repeat(&mut script, 500);
+    seen_again(&mut script, &mut c, 7);
+    reentry_events(&mut script, &mut c);
+    let (mut driver, mut bus, mut clock) = up_over(&script);
+    assert!(driver.join(SSID, Some(PASSPHRASE)));
+    assert_eq!(
+        timed_out(&mut driver, &mut bus, &mut clock),
+        Some(5_000_000)
+    );
+    let (o, r) = outcome(&mut driver, &mut bus, &mut clock);
+    assert_eq!(o, Some(Outcome::ScanRecord(RECORD_B)));
+    assert_eq!(r.deadlines().len(), 500);
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::ScanDone {
+            end: ScanEnd::Complete,
+            records: 1
+        })
+    );
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::JoinFailed(JoinFailure::NotFound))
+    );
+    assert_eq!(
+        driver.backoff(),
+        None,
+        "a network not seen is no refused secret"
+    );
+    assert_eq!(
+        rested(&mut driver, &mut bus, &mut clock, RECORD_A),
+        500,
+        "a network not seen keeps its rest"
+    );
+    assert!(matches!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::Event(_))
+    ));
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::JoinFailed(JoinFailure::Lost {
+            number: 6,
+            reason: 2
+        }))
+    );
+    assert_eq!(driver.backoff(), None);
+    assert_eq!(
+        rested(&mut driver, &mut bus, &mut clock, RECORD_A),
+        500,
+        "a loss during the attempt keeps its rest"
+    );
+    assert_eq!(
+        timed_out(&mut driver, &mut bus, &mut clock),
+        Some(10_000_000),
+        "the second in the row: neither failure between them moved the count"
+    );
+    assert_eq!(rested(&mut driver, &mut bus, &mut clock, RECORD_A), 1000);
+    rejoined(&mut driver, &mut bus, &mut clock);
+    assert_eq!(driver.backoff(), None);
+    for _ in 0..5 {
+        outcome(&mut driver, &mut bus, &mut clock);
+    }
+    assert_eq!(driver.link(), LinkState::Down);
+    assert_eq!(
+        rested(&mut driver, &mut bus, &mut clock, RECORD_A),
+        100,
+        "a lost link keeps its settle of a second"
+    );
+    assert_eq!(
+        timed_out(&mut driver, &mut bus, &mut clock),
+        Some(5_000_000),
+        "the join put the rest back"
+    );
+    assert_eq!(rested(&mut driver, &mut bus, &mut clock, RECORD_A), 500);
+    rejoined(&mut driver, &mut bus, &mut clock);
+    assert_eq!(bus.remaining(), 0);
+    assert_eq!(bus.fault(), None);
+}
+
+#[test]
+fn a_join_request_behind_a_mismatch_continues_the_rests_and_a_disconnect_ends_them() {
+    let (mut script, mut c) = up_script();
+    join_requests(&mut script, &mut c, true, &sae_values());
+    sae_refused_events(&mut script, &mut c);
+    repeat(&mut script, 500);
+    // The driver's scan hears the name on a network that offers WPA2
+    // alone, and the driver gives the network up.
+    scan_requests(&mut script, &mut c, true, 1);
+    scan_event(&mut script, &mut c, true, 1, status::PARTIAL, &[record_f()]);
+    scan_event(&mut script, &mut c, true, 1, status::SUCCESS, &[]);
+    // The caller's second choice of kind: the whole WPA2 join, the
+    // protection of management frames returned to none on its way, and the
+    // handshake's timeout.
+    join_requests(&mut script, &mut c, true, &secured_values_with_reset());
+    timeout_events(&mut script, &mut c);
+    // The caller ends the trying, and asks the join anew.
+    script.extend(disconnect_ops(&mut c, true));
+    join_requests(&mut script, &mut c, true, &secured_values());
+    timeout_events(&mut script, &mut c);
+    let (mut driver, mut bus, mut clock) = up_over(&script);
+    assert!(driver.join_with(SSID, Credential::SaePassword(PASSPHRASE)));
+    assert!(matches!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::Event(_))
+    ));
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::JoinFailed(SAE_REFUSED))
+    );
+    assert_eq!(driver.backoff(), Some(5_000_000));
+    let (o, r) = outcome(&mut driver, &mut bus, &mut clock);
+    assert_eq!(o, Some(Outcome::ScanRecord(RECORD_F)));
+    assert_eq!(r.deadlines().len(), 500);
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::ScanDone {
+            end: ScanEnd::Complete,
+            records: 1
+        })
+    );
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::JoinFailed(JoinFailure::Mismatch {
+            advertised: SECURITY_F
+        }))
+    );
+    assert_eq!(driver.link(), LinkState::Detached);
+    assert_eq!(driver.backoff(), None);
     assert!(
-        driver.join(SSID, Some(PASSPHRASE)),
-        "the caller joins again"
+        driver.join_with(SSID, Credential::Passphrase(PASSPHRASE)),
+        "the second choice of kind"
+    );
+    assert_eq!(
+        timed_out(&mut driver, &mut bus, &mut clock),
+        Some(10_000_000),
+        "the second in the row: the join request did not put the rest back"
+    );
+    assert!(driver.disconnect());
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::Disconnected)
+    );
+    assert!(matches!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::Event(_))
+    ));
+    assert!(driver.join(SSID, Some(PASSPHRASE)));
+    assert_eq!(
+        timed_out(&mut driver, &mut bus, &mut clock),
+        Some(5_000_000),
+        "the caller ended the trying: the first rest again"
+    );
+    assert_eq!(bus.remaining(), 0);
+    assert_eq!(bus.fault(), None);
+}
+
+#[test]
+fn a_disconnect_refused_while_detached_behind_a_mismatch_still_ends_the_rests() {
+    let (mut script, mut c) = up_script();
+    join_requests(&mut script, &mut c, true, &sae_values());
+    sae_refused_events(&mut script, &mut c);
+    repeat(&mut script, 500);
+    // The driver's scan hears the name on a network that offers WPA2
+    // alone, and the driver gives the network up.
+    scan_requests(&mut script, &mut c, true, 1);
+    scan_event(&mut script, &mut c, true, 1, status::PARTIAL, &[record_f()]);
+    scan_event(&mut script, &mut c, true, 1, status::SUCCESS, &[]);
+    // The caller ends the trying on the detached link, which sends nothing,
+    // and asks the join with its second choice of kind.
+    join_requests(&mut script, &mut c, true, &secured_values_with_reset());
+    timeout_events(&mut script, &mut c);
+    let (mut driver, mut bus, mut clock) = up_over(&script);
+    assert!(driver.join_with(SSID, Credential::SaePassword(PASSPHRASE)));
+    assert!(matches!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::Event(_))
+    ));
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::JoinFailed(SAE_REFUSED))
+    );
+    assert_eq!(driver.backoff(), Some(5_000_000));
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::ScanRecord(RECORD_F))
+    );
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::ScanDone {
+            end: ScanEnd::Complete,
+            records: 1
+        })
+    );
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::JoinFailed(JoinFailure::Mismatch {
+            advertised: SECURITY_F
+        }))
+    );
+    assert_eq!(driver.link(), LinkState::Detached);
+    assert!(!driver.disconnect(), "nothing held");
+    assert_eq!(driver.link(), LinkState::Detached);
+    assert!(driver.join_with(SSID, Credential::Passphrase(PASSPHRASE)));
+    assert_eq!(
+        timed_out(&mut driver, &mut bus, &mut clock),
+        Some(5_000_000),
+        "the caller ended the trying: the first rest again"
+    );
+    assert_eq!(bus.remaining(), 0);
+    assert_eq!(bus.fault(), None);
+}
+
+#[test]
+fn the_spread_adds_under_a_fifth_to_a_rest_from_the_seed() {
+    // The generator: a xorshift of 32 bits. Its zero state stays zero; its
+    // first words from the seed 1, by hand.
+    assert_eq!(spread_step(0), 0);
+    assert_eq!(spread_step(1), 0x0004_2021);
+    assert_eq!(spread_step(0x0004_2021), 0x0408_0601);
+    assert_eq!(spread_step(0x0408_0601), 0x9DCC_A8C5);
+    // The band at every rest of the table: the smallest word adds nothing,
+    // the middle one a tenth, and the largest one microsecond under a
+    // fifth.
+    for count in 1..=8 {
+        let rest = refused_rest(count);
+        assert_eq!(spread_of(rest, 0), 0);
+        assert_eq!(spread_of(rest, 0x8000_0000), rest / 10);
+        assert_eq!(spread_of(rest, u32::MAX), rest / 5 - 1);
+    }
+    // Under one seed, three refusals in a row: the rests in microseconds
+    // and their passes, computed apart from the driver.
+    const RESTS: [Micros; 3] = [5_316_593, 11_751_413, 21_933_200];
+    const PASSES: [usize; 3] = [532, 1176, 2194];
+    let (mut script, mut c) = up_script();
+    join_requests(&mut script, &mut c, true, &secured_values());
+    timeout_events(&mut script, &mut c);
+    for (round, passes) in PASSES.iter().enumerate() {
+        repeat(&mut script, *passes as u32);
+        seen_again(&mut script, &mut c, round as u16 + 1);
+        if round + 1 < PASSES.len() {
+            timeout_events(&mut script, &mut c);
+        }
+    }
+    reentry_events(&mut script, &mut c);
+    let (mut driver, mut bus, mut clock) = up_over(&script);
+    driver.seed(0x9E37_79B9);
+    assert!(driver.join(SSID, Some(PASSPHRASE)));
+    for (round, passes) in PASSES.iter().enumerate() {
+        assert_eq!(
+            timed_out(&mut driver, &mut bus, &mut clock),
+            Some(RESTS[round]),
+            "the rest behind the refusal {}",
+            round + 1
+        );
+        assert_eq!(rested(&mut driver, &mut bus, &mut clock, RECORD_A), *passes);
+    }
+    rejoined(&mut driver, &mut bus, &mut clock);
+    assert_eq!(bus.remaining(), 0);
+    assert_eq!(bus.fault(), None);
+    // A seed of zero is taken as one: the first rest is the seed 1's.
+    let (mut script, mut c) = up_script();
+    join_requests(&mut script, &mut c, true, &secured_values());
+    timeout_events(&mut script, &mut c);
+    let (mut driver, mut bus, mut clock) = up_over(&script);
+    driver.seed(0);
+    assert!(driver.join(SSID, Some(PASSPHRASE)));
+    assert_eq!(
+        timed_out(&mut driver, &mut bus, &mut clock),
+        Some(5_000_062)
     );
     assert_eq!(bus.remaining(), 0);
 }
-
 #[test]
 fn a_loss_during_the_attempt_fails_it_and_the_machine_holds_the_network() {
     let (mut script, mut c) = up_script();
@@ -1385,10 +1992,15 @@ fn a_recovery_scan_not_seeing_the_network_rests_and_the_next_cycle_joins() {
     scan_requests(&mut script, &mut c, true, 1);
     scan_event(&mut script, &mut c, true, 1, status::PARTIAL, &[record_b()]);
     scan_event(&mut script, &mut c, true, 1, status::SUCCESS, &[]);
-    repeat(&mut script, 500);
-    scan_requests(&mut script, &mut c, true, 2);
-    scan_event(&mut script, &mut c, true, 2, status::PARTIAL, &[record_a()]);
+    // The scan that asks for the network by its name: its request alone,
+    // under the next sync number. It does not see the network either.
+    named_scan_request(&mut script, &mut c, true, 2, SSID);
+    scan_event(&mut script, &mut c, true, 2, status::PARTIAL, &[record_c()]);
     scan_event(&mut script, &mut c, true, 2, status::SUCCESS, &[]);
+    repeat(&mut script, 500);
+    scan_requests(&mut script, &mut c, true, 3);
+    scan_event(&mut script, &mut c, true, 3, status::PARTIAL, &[record_a()]);
+    scan_event(&mut script, &mut c, true, 3, status::SUCCESS, &[]);
     join_requests(&mut script, &mut c, true, &secured_values()[5..]);
     event(&mut script, &mut c, true, number::AUTH, 0, 0, ADDRESS, &[]);
     event(
@@ -1426,13 +2038,21 @@ fn a_recovery_scan_not_seeing_the_network_rests_and_the_next_cycle_joins() {
     let (o, r) = outcome(&mut driver, &mut bus, &mut clock);
     assert_eq!(o, Some(Outcome::ScanRecord(RECORD_B)));
     assert_eq!(r.deadlines().len(), 100);
+    let (o, r) = outcome(&mut driver, &mut bus, &mut clock);
+    assert_eq!(
+        o,
+        Some(Outcome::ScanRecord(RECORD_C)),
+        "the plain scan's end is no outcome: the named scan's record is next"
+    );
+    assert!(r.deadlines().is_empty(), "no rest between the two scans");
     let (o, _) = outcome(&mut driver, &mut bus, &mut clock);
     assert_eq!(
         o,
         Some(Outcome::ScanDone {
             end: ScanEnd::Complete,
-            records: 1
-        })
+            records: 2
+        }),
+        "one outcome, the records of both scans counted"
     );
     let (o, r) = outcome(&mut driver, &mut bus, &mut clock);
     assert_eq!(o, Some(Outcome::JoinFailed(JoinFailure::NotFound)));
@@ -1464,6 +2084,363 @@ fn a_recovery_scan_not_seeing_the_network_rests_and_the_next_cycle_joins() {
     assert_eq!(driver.link(), LinkState::Up);
     assert_eq!(bus.remaining(), 0);
     assert_eq!(bus.fault(), None);
+}
+
+/// The events of a re-entered join to its completion: the authentication,
+/// the supplicant's word, the association success under the credit the
+/// supplicant's frame carried, and the hold's five empty passes.
+fn reentry_events(script: &mut Vec<Op>, c: &mut Cursor) {
+    event(script, c, true, number::AUTH, 0, 0, ADDRESS, &[]);
+    event(
+        script,
+        c,
+        true,
+        number::PSK_SUP,
+        status::UNSOLICITED,
+        0,
+        ADDRESS,
+        &[],
+    );
+    event_held_credit(script, c, true, number::SET_SSID, 0, 0, ADDRESS, &[]);
+    empty(script, 5);
+}
+
+/// A driver joined over `script` and then lowered by the observed burst:
+/// the link down, the first recovery cycle not yet begun.
+fn lost_over(script: &[Op]) -> (Driver<'static>, FakeTransport<'_>, FakeClock) {
+    let (mut driver, mut bus, mut clock) = up_over(script);
+    assert!(driver.join(SSID, Some(PASSPHRASE)));
+    for _ in 0..6 {
+        outcome(&mut driver, &mut bus, &mut clock);
+    }
+    assert_eq!(driver.link(), LinkState::Up);
+    for _ in 0..5 {
+        outcome(&mut driver, &mut bus, &mut clock);
+    }
+    assert_eq!(driver.link(), LinkState::Down);
+    (driver, bus, clock)
+}
+
+/// The three events of a re-entered join, then its completion.
+fn rejoined<T: Transport>(driver: &mut Driver<'static>, bus: &mut T, clock: &mut FakeClock) {
+    assert_eq!(driver.link(), LinkState::Joining);
+    for _ in 0..3 {
+        assert!(matches!(
+            outcome(driver, bus, clock).0,
+            Some(Outcome::Event(_))
+        ));
+    }
+    assert_eq!(
+        outcome(driver, bus, clock).0,
+        Some(Outcome::Joined { bssid: ADDRESS })
+    );
+    assert_eq!(driver.link(), LinkState::Up);
+}
+
+#[test]
+fn a_recovery_scan_not_seeing_the_network_asks_for_it_by_name_and_joins() {
+    let mut script = open_script(true, true);
+    let mut c = Cursor::AFTER_OPENING;
+    script.extend(up_ops(&mut c, true));
+    script.extend(join_ops(&mut c, true));
+    script.extend(burst_ops(&mut c, true));
+    repeat(&mut script, 100);
+    // The plain scan hears another network alone. The scan that asks for
+    // the network by its name follows at once: the scan start alone, no
+    // scan mode before it, under the next sync number.
+    scan_requests(&mut script, &mut c, true, 1);
+    scan_event(&mut script, &mut c, true, 1, status::PARTIAL, &[record_b()]);
+    scan_event(&mut script, &mut c, true, 1, status::SUCCESS, &[]);
+    named_scan_request(&mut script, &mut c, true, 2, SSID);
+    scan_event(&mut script, &mut c, true, 2, status::PARTIAL, &[record_a()]);
+    scan_event(&mut script, &mut c, true, 2, status::SUCCESS, &[]);
+    join_requests(&mut script, &mut c, true, &secured_values()[5..]);
+    reentry_events(&mut script, &mut c);
+    let (mut driver, mut bus, mut clock) = lost_over(&script);
+    let lost_at = clock.now();
+    let (o, r) = outcome(&mut driver, &mut bus, &mut clock);
+    assert_eq!(o, Some(Outcome::ScanRecord(RECORD_B)));
+    assert_eq!(r.deadlines().len(), 100, "the rest of a second");
+    let (o, r) = outcome(&mut driver, &mut bus, &mut clock);
+    assert_eq!(
+        o,
+        Some(Outcome::ScanRecord(RECORD_A)),
+        "no outcome between the two scans"
+    );
+    assert!(r.deadlines().is_empty(), "and no rest");
+    assert_eq!(driver.link(), LinkState::Down);
+    let (o, _) = outcome(&mut driver, &mut bus, &mut clock);
+    assert_eq!(
+        o,
+        Some(Outcome::ScanDone {
+            end: ScanEnd::Complete,
+            records: 2
+        })
+    );
+    assert_eq!(clock.now(), lost_at + 1_000_000, "in the same cycle");
+    rejoined(&mut driver, &mut bus, &mut clock);
+    assert_eq!(bus.remaining(), 0);
+    assert_eq!(bus.fault(), None);
+}
+
+#[test]
+fn a_named_scan_showing_no_usable_suite_detaches_the_network() {
+    let mut script = open_script(true, true);
+    let mut c = Cursor::AFTER_OPENING;
+    script.extend(up_ops(&mut c, true));
+    script.extend(join_ops(&mut c, true));
+    script.extend(burst_ops(&mut c, true));
+    repeat(&mut script, 100);
+    // The plain scan is silent about the network; the named scan hears
+    // its name on an access point that offers WPA3 alone.
+    scan_requests(&mut script, &mut c, true, 1);
+    scan_event(&mut script, &mut c, true, 1, status::SUCCESS, &[]);
+    named_scan_request(&mut script, &mut c, true, 2, SSID);
+    scan_event(&mut script, &mut c, true, 2, status::PARTIAL, &[record_d()]);
+    scan_event(&mut script, &mut c, true, 2, status::SUCCESS, &[]);
+    let (mut driver, mut bus, mut clock) = lost_over(&script);
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::ScanRecord(RECORD_D))
+    );
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::ScanDone {
+            end: ScanEnd::Complete,
+            records: 1
+        })
+    );
+    assert_eq!(driver.link(), LinkState::Down);
+    let (o, r) = outcome(&mut driver, &mut bus, &mut clock);
+    assert_eq!(
+        o,
+        Some(Outcome::JoinFailed(JoinFailure::Mismatch {
+            advertised: SECURITY_D
+        })),
+        "as a plain scan that sees it does"
+    );
+    assert_eq!(r.polls, 1);
+    assert_eq!(driver.link(), LinkState::Detached, "not retried");
+    assert!(
+        driver.join_with(SSID, Credential::SaePassword(PASSPHRASE)),
+        "the caller joins again with the right kind"
+    );
+    assert_eq!(bus.remaining(), 0);
+    assert_eq!(bus.fault(), None);
+}
+
+#[test]
+fn a_plain_scan_the_firmware_did_not_finish_is_followed_by_no_named_scan() {
+    let mut script = open_script(true, true);
+    let mut c = Cursor::AFTER_OPENING;
+    script.extend(up_ops(&mut c, true));
+    script.extend(join_ops(&mut c, true));
+    script.extend(burst_ops(&mut c, true));
+    repeat(&mut script, 100);
+    // The first cycle: the firmware ends the plain scan with a status, the
+    // network in none of its records. No request follows it: the cycle
+    // ends as it always did, not found, and rests.
+    scan_requests(&mut script, &mut c, true, 1);
+    scan_event(&mut script, &mut c, true, 1, status::PARTIAL, &[record_b()]);
+    scan_event(&mut script, &mut c, true, 1, status::ABORT, &[]);
+    repeat(&mut script, 500);
+    // The next cycle begins with a plain scan; the firmware completes it,
+    // the named scan follows and finds the network: one cycle later.
+    scan_requests(&mut script, &mut c, true, 2);
+    scan_event(&mut script, &mut c, true, 2, status::PARTIAL, &[record_b()]);
+    scan_event(&mut script, &mut c, true, 2, status::SUCCESS, &[]);
+    named_scan_request(&mut script, &mut c, true, 3, SSID);
+    scan_event(&mut script, &mut c, true, 3, status::PARTIAL, &[record_a()]);
+    scan_event(&mut script, &mut c, true, 3, status::SUCCESS, &[]);
+    join_requests(&mut script, &mut c, true, &secured_values()[5..]);
+    reentry_events(&mut script, &mut c);
+    let (mut driver, mut bus, mut clock) = lost_over(&script);
+    let lost_at = clock.now();
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::ScanRecord(RECORD_B))
+    );
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::ScanDone {
+            end: ScanEnd::Ended(4),
+            records: 1
+        }),
+        "the plain scan's end is the cycle's one outcome"
+    );
+    let (o, r) = outcome(&mut driver, &mut bus, &mut clock);
+    assert_eq!(o, Some(Outcome::JoinFailed(JoinFailure::NotFound)));
+    assert_eq!(r.polls, 1, "nothing was asked of the chip in between");
+    assert_eq!(driver.link(), LinkState::Down);
+    let (o, r) = outcome(&mut driver, &mut bus, &mut clock);
+    assert_eq!(o, Some(Outcome::ScanRecord(RECORD_B)));
+    assert_eq!(r.deadlines().len(), 500, "the five-second rest");
+    assert_eq!(r.deadlines()[499], lost_at + 6_000_000);
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::ScanRecord(RECORD_A))
+    );
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::ScanDone {
+            end: ScanEnd::Complete,
+            records: 2
+        })
+    );
+    rejoined(&mut driver, &mut bus, &mut clock);
+    assert_eq!(bus.remaining(), 0);
+    assert_eq!(bus.fault(), None);
+
+    // A scan for a name whose plain scan runs into its bound: that end is
+    // the request's one outcome, and nothing more is sent.
+    let (mut script, mut c) = up_script();
+    scan_requests(&mut script, &mut c, true, 1);
+    repeat(&mut script, 500);
+    let (mut driver, mut bus, mut clock) = up_over(&script);
+    assert!(driver.scan_for(SSID));
+    let (o, r) = outcome(&mut driver, &mut bus, &mut clock);
+    assert_eq!(
+        o,
+        Some(Outcome::ScanDone {
+            end: ScanEnd::TimedOut,
+            records: 0
+        })
+    );
+    assert_eq!(r.deadlines().len(), 500);
+    assert!(driver.is_ready());
+    assert!(driver.scan_for(SSID), "a scan is accepted again");
+    assert_eq!(bus.remaining(), 0);
+    assert_eq!(bus.fault(), None);
+}
+
+#[test]
+fn a_scan_for_a_name_seen_in_the_plain_scan_is_one_scan() {
+    // The plane's own scan, row for row: its first record carries the name.
+    let (mut script, mut c) = up_script();
+    script.extend(scan_ops(&mut c, true));
+    let (mut driver, mut bus, mut clock) = up_over(&script);
+    assert!(driver.scan_for(SSID));
+    let mut got = Vec::new();
+    for _ in 0..4 {
+        got.push(outcome(&mut driver, &mut bus, &mut clock).0);
+    }
+    assert_eq!(
+        got,
+        std::vec![
+            Some(Outcome::ScanRecord(RECORD_A)),
+            Some(Outcome::ScanRecord(RECORD_B)),
+            Some(Outcome::ScanRecord(RECORD_C)),
+            Some(Outcome::ScanDone {
+                end: ScanEnd::Complete,
+                records: 3
+            })
+        ]
+    );
+    assert!(driver.is_ready());
+    assert_eq!(bus.remaining(), 0);
+    assert_eq!(bus.fault(), None);
+}
+
+#[test]
+fn a_scan_for_a_name_not_seen_runs_a_second_scan_that_carries_it() {
+    let (mut script, mut c) = up_script();
+    scan_requests(&mut script, &mut c, true, 1);
+    scan_event(
+        &mut script,
+        &mut c,
+        true,
+        1,
+        status::PARTIAL,
+        &[record_b(), record_c()],
+    );
+    scan_event(&mut script, &mut c, true, 1, status::SUCCESS, &[]);
+    named_scan_request(&mut script, &mut c, true, 2, SSID);
+    scan_event(&mut script, &mut c, true, 2, status::PARTIAL, &[record_e()]);
+    scan_event(&mut script, &mut c, true, 2, status::SUCCESS, &[]);
+    // The same request again, the name in no record of either scan; then
+    // a plain request, which no second scan follows.
+    scan_requests(&mut script, &mut c, true, 3);
+    scan_event(&mut script, &mut c, true, 3, status::SUCCESS, &[]);
+    named_scan_request(&mut script, &mut c, true, 4, SSID);
+    scan_event(&mut script, &mut c, true, 4, status::PARTIAL, &[record_b()]);
+    scan_event(&mut script, &mut c, true, 4, status::SUCCESS, &[]);
+    scan_requests(&mut script, &mut c, true, 5);
+    scan_event(&mut script, &mut c, true, 5, status::SUCCESS, &[]);
+    let (mut driver, mut bus, mut clock) = up_over(&script);
+    assert!(driver.scan_for(SSID));
+    let mut got = Vec::new();
+    for _ in 0..4 {
+        got.push(outcome(&mut driver, &mut bus, &mut clock).0);
+    }
+    assert_eq!(
+        got,
+        std::vec![
+            Some(Outcome::ScanRecord(RECORD_B)),
+            Some(Outcome::ScanRecord(RECORD_C)),
+            Some(Outcome::ScanRecord(RECORD_E)),
+            Some(Outcome::ScanDone {
+                end: ScanEnd::Complete,
+                records: 3
+            })
+        ],
+        "two scans, one outcome, the records of both"
+    );
+    assert_eq!(driver.link(), LinkState::Detached);
+    assert!(driver.scan_for(SSID));
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::ScanRecord(RECORD_B))
+    );
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::ScanDone {
+            end: ScanEnd::Complete,
+            records: 1
+        })
+    );
+    assert!(driver.scan());
+    assert_eq!(
+        outcome(&mut driver, &mut bus, &mut clock).0,
+        Some(Outcome::ScanDone {
+            end: ScanEnd::Complete,
+            records: 0
+        }),
+        "a plain request asks for no name"
+    );
+    assert!(driver.is_ready());
+    assert_eq!(bus.remaining(), 0);
+    assert_eq!(bus.fault(), None);
+}
+
+#[test]
+fn a_scan_for_a_name_outside_its_bounds_is_refused() {
+    let script = plane_script();
+    let (mut driver, _, _) = ready_over(&script);
+    assert!(!driver.scan_for(SSID), "before the radio up");
+    let mut fresh: Driver<'static> = Driver::new();
+    assert!(!fresh.scan_for(SSID), "not before ready");
+
+    let (mut driver, bus, _) = up_over(&script);
+    let left = bus.remaining();
+    assert!(!driver.scan_for(b""), "no bytes");
+    assert!(!driver.scan_for(&[b'a'; 33]), "33 bytes");
+    assert!(driver.scan_for(&[b'a'; 32]), "32 bytes");
+    assert!(!driver.scan_for(SSID), "one request at a time");
+    assert!(!driver.scan(), "one request at a time");
+    assert!(!driver.join(SSID, Some(PASSPHRASE)), "a scan in flight");
+    assert_eq!(bus.remaining(), left, "no row consumed");
+
+    let (mut driver, _, _) = up_over(&script);
+    assert!(driver.scan_for(b"x"), "one byte");
+
+    // The plane's scan hears the name, so the request is that one scan.
+    let (mut driver, mut bus, mut clock) = up_over(&script);
+    assert!(driver.scan_for(SSID));
+    for _ in 0..4 {
+        outcome(&mut driver, &mut bus, &mut clock);
+    }
+    assert!(driver.join(SSID, Some(PASSPHRASE)));
+    assert!(!driver.scan_for(SSID), "while joining");
 }
 
 #[test]

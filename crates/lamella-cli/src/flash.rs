@@ -3,8 +3,9 @@
 use crate::args::{self, Positional, Spec};
 pub use lamella_flash_routes::{can_flash, uf2_family_for_board};
 use lamella_flash_routes::placement::{BootloaderChoice, Placement, placement_for};
+use lamella_flash_routes::region::RegionSpan;
 use lamella_flash_routes::{
-    NoAotTarget, Programmer, Programming, WindowHalf, aot_target_for, prepare_image,
+    NoAotTarget, Programmer, Programming, WindowHalf, aot_target_for, prepare_image, prepare_regions,
     programmer_for, route_for_request, selector_for, wrap_for_route, write, write_set,
 };
 use std::path::{Path, PathBuf};
@@ -107,9 +108,11 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             "--volume",
             "--dfu",
             "--via",
+            REGION,
+            MSBUILD_REGIONS,
             crate::bootprot::RESTORE_USER_ROW,
         ],
-        repeats: &[],
+        repeats: &[REGION],
         flags: &[
             crate::bootprot::CLEAR_BOOTPROT,
             crate::bootprot::DRY_RUN,
@@ -121,6 +124,20 @@ pub fn flash_command(args: &[String]) -> ExitCode {
         Ok(parsed) => parsed,
         Err(halt) => return halt.code(),
     };
+    if let Some(listing) = parsed.value(MSBUILD_REGIONS) {
+        let regions: Vec<PathBuf> = parsed.values(REGION).map(PathBuf::from).collect();
+        if regions.is_empty() || !parsed.positionals().is_empty() {
+            eprintln!("lamella flash: {MSBUILD_REGIONS} lists the files of each region {REGION} names, and takes no image.");
+            return ExitCode::FAILURE;
+        }
+        return match region_files_for_msbuild(&regions, parsed.value("--board"), Path::new(listing)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(why) => {
+                eprintln!("lamella flash: {why}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     if let Some(step) = user_row_step_beside_a_replace(
         parsed.flag(REPLACE_BOOTLOADER),
         parsed.flag(crate::bootprot::CLEAR_BOOTPROT),
@@ -159,15 +176,19 @@ pub fn flash_command(args: &[String]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
-    let path = match parsed.only_positional("flash", POSITIONAL) {
-        Ok(path) => Path::new(path).to_path_buf(),
-        Err(refusal) => {
-            eprintln!("{refusal}");
-            return ExitCode::FAILURE;
-        }
+    let regions: Vec<PathBuf> = parsed.values(REGION).map(PathBuf::from).collect();
+    let path = match (parsed.positionals(), regions.is_empty()) {
+        ([], false) => None,
+        _ => match parsed.only_positional("flash", POSITIONAL) {
+            Ok(path) => Some(Path::new(path).to_path_buf()),
+            Err(refusal) => {
+                eprintln!("{refusal}");
+                return ExitCode::FAILURE;
+            }
+        },
     };
-    let manifest = match lamella_flash_routes::manifest::read(&path) {
-        Ok(manifest) => manifest,
+    let manifest = match path.as_deref().map(lamella_flash_routes::manifest::read).transpose() {
+        Ok(manifest) => manifest.flatten(),
         Err(why) => {
             eprintln!(
                 "lamella flash: {why}\n\n\
@@ -178,22 +199,33 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let board_id = match (parsed.value("--board"), manifest.as_ref()) {
-        (Some(named), Some(manifest)) => {
+    let recorded = match path {
+        Some(_) => None,
+        None => match board_of_regions(&regions) {
+            Ok(board) => board,
+            Err(why) => {
+                eprintln!("lamella flash: {why}");
+                return ExitCode::FAILURE;
+            }
+        },
+    };
+    let board_id = match (parsed.value("--board"), manifest.as_ref(), recorded.as_deref()) {
+        (Some(named), Some(manifest), _) => {
             if let Err(why) = lamella_flash_routes::manifest::check_board(manifest, named) {
                 eprintln!("lamella flash: {why}");
                 return ExitCode::FAILURE;
             }
             named
         }
-        (Some(named), None) => named,
-        (None, Some(manifest)) => manifest.board.as_str(),
-        (None, None) => {
+        (Some(named), None, _) => named,
+        (None, Some(manifest), _) => manifest.board.as_str(),
+        (None, None, Some(board)) => board,
+        (None, None, None) => {
             eprintln!("{}", args::refusal("flash", "--board is required: it says which chip is written"));
             return ExitCode::FAILURE;
         }
     };
-    if let Some(manifest) = manifest.as_ref() {
+    if let (Some(manifest), Some(path)) = (manifest.as_ref(), path.as_ref()) {
         let shipped = match std::fs::read(&path) {
             Ok(bytes) => bytes,
             Err(error) => {
@@ -231,9 +263,10 @@ pub fn flash_command(args: &[String]) -> ExitCode {
         }
     };
 
-    match lamella_flash_routes::artifact::classify(&path) {
-        lamella_flash_routes::artifact::Kind::ChipImage => {}
-        lamella_flash_routes::artifact::Kind::Source => {
+    match path.as_deref().map(lamella_flash_routes::artifact::classify) {
+        None | Some(lamella_flash_routes::artifact::Kind::ChipImage) => {}
+        Some(lamella_flash_routes::artifact::Kind::Source) => {
+            let path = path.as_deref().unwrap_or_else(|| Path::new(""));
             eprintln!(
                 "lamella flash: {} is source, and this verb writes bytes that are already an \
                  image.\n\n\
@@ -246,7 +279,8 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             );
             return ExitCode::FAILURE;
         }
-        lamella_flash_routes::artifact::Kind::WirePayload => {
+        Some(lamella_flash_routes::artifact::Kind::WirePayload) => {
+            let path = path.as_deref().unwrap_or_else(|| Path::new(""));
             eprintln!(
                 "lamella flash: {} is loaded BY firmware rather than written to a chip -- it needs \
                  a board that\nis already running Lamella, not a probe.\n\n\
@@ -270,16 +304,30 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let prepared = match prepare_image(&path, row, chosen, &placement) {
+    let prepared = match path.as_deref().map(|path| prepare_image(path, row, chosen, &placement)).transpose() {
         Ok(prepared) => prepared,
         Err(why) => {
             eprintln!("lamella flash: {why}");
             return ExitCode::FAILURE;
         }
     };
-    println!("read {} from {}", prepared.read, path.display());
-    if let Some(wrapped) = &prepared.wrapped {
-        println!("{wrapped}");
+    if let (Some(prepared), Some(path)) = (&prepared, &path) {
+        println!("read {} from {}", prepared.read, path.display());
+        if let Some(wrapped) = &prepared.wrapped {
+            println!("{wrapped}");
+        }
+    }
+    let read = match prepare_regions(&regions, row, chosen, &placement, prepared.as_ref()) {
+        Ok(read) => read,
+        Err(why) => {
+            eprintln!("lamella flash: {why}");
+            return ExitCode::FAILURE;
+        }
+    };
+    for file in &read {
+        for line in lamella_flash_routes::region::describe(file) {
+            println!("{line}");
+        }
     }
     let selector = match selector_for(
         chosen,
@@ -293,8 +341,197 @@ pub fn flash_command(args: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let window = prepared.window.as_ref().map(|half| (row.board, half));
-    write_image_here("flash", chosen, row.board, &placement, &prepared.bytes, window, selector.as_deref())
+    match (prepared, read.is_empty()) {
+        (Some(prepared), true) => {
+            let window = prepared.window.as_ref().map(|half| (row.board, half));
+            write_image_here("flash", chosen, row.board, &placement, &prepared.bytes, window, selector.as_deref())
+        }
+        (prepared, _) => {
+            let spans: Vec<RegionSpan> = read.into_iter().map(|file| file.span).collect();
+            let image = prepared.as_ref().map(|prepared| prepared.bytes.as_slice());
+            let say = &mut |line: &str| println!("{line}");
+            match write_with_regions(chosen, row.board, &placement, image, &spans, selector.as_deref(), say) {
+                Ok(closing) => {
+                    closing.regions.iter().chain(&closing.image).for_each(|line| println!("{line}"));
+                    ExitCode::SUCCESS
+                }
+                Err(error) => {
+                    eprintln!("lamella flash: {error}");
+                    ExitCode::FAILURE
+                }
+            }
+        }
+    }
+}
+
+/// The board the records of `regions` name, when they all name one: what a write of regions alone
+/// takes for the board, as a write of an image takes its sidecar's.
+///
+/// # Errors
+/// A record that cannot be read, and records that name different boards.
+fn board_of_regions(regions: &[PathBuf]) -> Result<Option<String>, String> {
+    let mut boards: Vec<String> = Vec::new();
+    for region in regions {
+        let sidecar = lamella_flash_routes::manifest::path_for(region);
+        let text = std::fs::read_to_string(&sidecar).map_err(|error| {
+            format!("{}: its record {} could not be read ({error}).", region.display(), sidecar.display())
+        })?;
+        let record = lamella_flash_routes::region::parse_record(&text).map_err(|why| format!("{}: {why}", sidecar.display()))?;
+        if !boards.contains(&record.board) {
+            boards.push(record.board);
+        }
+    }
+    match boards.as_slice() {
+        [] => Ok(None),
+        [one] => Ok(Some(one.clone())),
+        several => Err(format!(
+            "the regions' records name different boards, {}; name the one to write with --board.",
+            several.join(" and ")
+        )),
+    }
+}
+
+/// The files a publish carries for each of `regions` for `board`, or for the board their records name:
+/// the region, its record and the notices its record names, each region checked as a write to the
+/// board checks it, written to `listing` as an MSBuild project whose target `LamellaRegionFiles`
+/// returns them. Nothing is opened.
+///
+/// # Errors
+/// A board that cannot be settled or has no route that writes a region; every refusal of
+/// [`lamella_flash_routes::region::read_region`]; two files of one name from two folders, which one
+/// publish folder cannot hold; and a listing that cannot be written.
+fn region_files_for_msbuild(regions: &[PathBuf], board: Option<&str>, listing: &Path) -> Result<(), String> {
+    let board = match board {
+        Some(board) => board.to_owned(),
+        None => board_of_regions(regions)?.ok_or_else(|| String::from("--board is required: it says which board the regions are for."))?,
+    };
+    let row = programmer_for(&board).map_err(|error| error.trim_end().trim_start_matches("lamella flash: ").to_owned())?;
+    let route = [Some(row.programmer), row.alternate]
+        .into_iter()
+        .flatten()
+        .find(|route| route.writes_regions())
+        .ok_or_else(|| format!("{board} is written through no route that writes a flash region."))?;
+    let placement = placement_for(row, route, BootloaderChoice::Keep)?;
+    let read = prepare_regions(regions, row, route, &placement, None)?;
+    let mut files: Vec<PathBuf> = Vec::new();
+    for read in read {
+        let beside = [read.path.clone(), lamella_flash_routes::manifest::path_for(&read.path)];
+        for path in beside.into_iter().chain(read.span.notices) {
+            if files.contains(&path) {
+                continue;
+            }
+            if let Some(other) = files.iter().find(|other| other.file_name() == path.file_name()) {
+                return Err(format!(
+                    "{} and {} share a name, and one publish folder holds one file of a name.",
+                    other.display(),
+                    path.display()
+                ));
+            }
+            files.push(path);
+        }
+    }
+    let mut text = String::from(
+        "<Project>\n  <!-- Written by the lamella flash command: the files each flash region a publish carries needs. -->\n  \
+         <Target Name=\"LamellaRegionFiles\" Returns=\"@(LamellaRegionFile)\">\n    <ItemGroup>\n",
+    );
+    for file in &files {
+        text.push_str(&format!("      <LamellaRegionFile Include=\"{}\" />\n", crate::devices::attribute(&file.display().to_string())));
+    }
+    text.push_str("    </ItemGroup>\n  </Target>\n</Project>\n");
+    crate::devices::write_whole(listing, &text).map_err(|error| format!("writing {}: {error}", listing.display()))
+}
+
+/// What a write of regions leaves to be said once it is done: each region's outcome, and the image's.
+pub(crate) struct Closing {
+    /// A line for each region: held, written or copied.
+    pub(crate) regions: Vec<String>,
+    /// The image's lines: which part answered, and whether the image was read back -- or, with no image,
+    /// that the board was started again.
+    pub(crate) image: Vec<String>,
+}
+
+/// Write `image`, when there is one, and `regions` through `programmer`, at the places `placement`
+/// and the regions' records give, settling which physical board as [`write_image`] does. The route's
+/// lines go to `say` as it writes; what became of each region and of the image is returned.
+///
+/// # Errors
+/// Anything that stopped the write, worded for a reader.
+pub(crate) fn write_with_regions(
+    programmer: Programmer,
+    board: &str,
+    placement: &Placement,
+    image: Option<&[u8]>,
+    regions: &[RegionSpan],
+    probe: Option<&str>,
+    say: &mut dyn FnMut(&str),
+) -> Result<Closing, String> {
+    let probe = settle_probe(programmer, board, probe)?;
+    let wrapped = image.and_then(|image| wrap_for_route(programmer, image));
+    let image = match &wrapped {
+        Some((bytes, line)) => {
+            say(line);
+            Some(&bytes[..])
+        }
+        None => image,
+    };
+    if let Some(line) = placement_line(placement) {
+        say(&line);
+    }
+    if let Some(line) = route_line(programmer, image.is_some()) {
+        say(&line);
+    }
+    let report = lamella_flash_routes::write_regions(
+        programmer,
+        board,
+        placement,
+        image,
+        regions,
+        probe.as_deref(),
+        &lamella_flash_backend::Allow::Any,
+        &mut *say,
+    )?;
+    let regions = report
+        .regions
+        .iter()
+        .map(|(name, outcome)| lamella_flash_routes::region::outcome_line(name, outcome))
+        .collect();
+    Ok(Closing { regions, image: image_closing(programmer, &report) })
+}
+
+/// The line that names the route before a write of regions, or `None` for a write with no image
+/// through the bootloader volume: that route's description is of an image copy, and its region
+/// step says how it writes each region.
+fn route_line(programmer: Programmer, has_image: bool) -> Option<String> {
+    if !has_image && matches!(programmer, Programmer::Uf2Volume { .. }) {
+        return None;
+    }
+    Some(format!("writing over {}...", programmer.description()))
+}
+
+/// What the closing says of the image `report` holds: the part's answer and how the write ended,
+/// with nothing claimed written when the flash already held the image; or, when the write had no
+/// image, the part's answer where the route asked it, and that the board was started again.
+fn image_closing(programmer: Programmer, report: &lamella_flash_routes::region::RegionsReport) -> Vec<String> {
+    match &report.image {
+        Some(written) => vec![
+            format!("  the part answered {:#x} -- {}", written.identity.value, written.identity.what),
+            if report.image_held {
+                format!(
+                    "Nothing was written: the board already held these {} B, as read back. The board is now running \
+                     the program.",
+                    written.bytes
+                )
+            } else {
+                completion_line(programmer, written)
+            },
+        ],
+        None => report
+            .part
+            .iter()
+            .map(|part| format!("  the part answered {:#x} -- {}", part.value, part.what))
+            .chain([String::from("The board was started again.")])
+            .collect(),
+    }
 }
 
 /// The user-row step asked for alongside `--replace-bootloader`, which the command refuses: the
@@ -430,16 +667,7 @@ pub(crate) fn write_image(
     probe: Option<&str>,
     say: &mut dyn FnMut(&str),
 ) -> Result<(), String> {
-    let environment = std::env::var(lamella_probe::PROBE_SERIAL_ENV).ok();
-    let named = probe_named(probe, environment.as_deref());
-    if named.is_some() && programmer.writes_over_a_probe() {
-        let attached = crate::devices::attached_probes_naming(named.map(lamella_probe_core::selection::serial_named))
-            .map_err(|refusal| format!("{refusal}\n\nNothing was written."))?;
-        named_probe_on_route(named, board, programmer, &attached).map_err(|refusal| {
-            if probe.is_none() { crate::image_run::named_by_the_environment(refusal) } else { refusal }
-        })?;
-    }
-    let probe = choose_board(programmer, probe)?;
+    let probe = settle_probe(programmer, board, probe)?;
     if let Some((board, half)) = window {
         say(&format!("writing over {}, with the board's external flash...", programmer.description()));
         let report = write_set(
@@ -483,6 +711,25 @@ pub(crate) fn write_image(
         say(&format!("  the {} starts it{wait}", bootloader.name));
     }
     Ok(())
+}
+
+/// The probe, drive or bootloader a write through `programmer` to `board` goes through: `probe`, the one
+/// the command line names, checked against the probes attached when the route writes over one, or the
+/// board a person picks where several of its family could be the one ([`choose_board`]).
+///
+/// # Errors
+/// A probe named that is not attached or not of the route's kind, and a pick that cannot be made.
+fn settle_probe(programmer: Programmer, board: &str, probe: Option<&str>) -> Result<Option<String>, String> {
+    let environment = std::env::var(lamella_probe::PROBE_SERIAL_ENV).ok();
+    let named = probe_named(probe, environment.as_deref());
+    if named.is_some() && programmer.writes_over_a_probe() {
+        let attached = crate::devices::attached_probes_naming(named.map(lamella_probe_core::selection::serial_named))
+            .map_err(|refusal| format!("{refusal}\n\nNothing was written."))?;
+        named_probe_on_route(named, board, programmer, &attached).map_err(|refusal| {
+            if probe.is_none() { crate::image_run::named_by_the_environment(refusal) } else { refusal }
+        })?;
+    }
+    choose_board(programmer, probe)
 }
 
 /// The probe a write names: the option, or the environment, whose empty value names none, as in a run and
@@ -551,6 +798,7 @@ pub fn deploy_to_chip(
     tier: Tier,
     libraries: &[Library],
     folders: &crate::folders::Folders,
+    kind: lamella_aot::BuildKind,
 ) -> ExitCode {
     let row = match programmer_for(board_id) {
         Ok(row) => row,
@@ -597,8 +845,8 @@ pub fn deploy_to_chip(
         return ExitCode::FAILURE;
     };
     let built = match &project {
-        Some(project) => build_project_image(project, board_id, aot_target, tier, "deploy", path, folders),
-        None => build_image(path, &source, board_id, aot_target, unsafe_code, tier, libraries, "deploy", folders),
+        Some(project) => build_project_image(project, board_id, aot_target, tier, "deploy", path, folders, kind),
+        None => build_image(path, &source, board_id, aot_target, unsafe_code, tier, libraries, "deploy", folders, kind),
     };
     let image = match built {
         Ok(image) => image,
@@ -613,6 +861,7 @@ pub fn deploy_to_chip(
         aot_target
     );
     println!("  {}", tier.line());
+    println!("  {}", build_kind_line(kind));
     let placement = match deploy_placement(row, chosen) {
         Ok(placement) => placement,
         Err(why) => {
@@ -681,14 +930,15 @@ pub fn image_for_board(
     tier: Tier,
     libraries: &[Library],
     folders: &crate::folders::Folders,
+    kind: lamella_aot::BuildKind,
 ) -> Result<(Vec<u8>, u32), String> {
     let aot_target = target_to_build_for(board_id)?;
     let row = programmer_for(board_id)?;
     let image = if is_project(path) {
         let project = crate::project::Project::read_file(path, "build")?;
-        build_project_image(&project, board_id, aot_target, tier, "build", path, folders)?
+        build_project_image(&project, board_id, aot_target, tier, "build", path, folders, kind)?
     } else {
-        build_image(path, source, board_id, aot_target, unsafe_code, tier, libraries, "build", folders)?
+        build_image(path, source, board_id, aot_target, unsafe_code, tier, libraries, "build", folders, kind)?
     };
     refuse_unless_it_fits("build", board_id, &image)?;
     Ok((image, row.programmer.flash_base()))
@@ -732,7 +982,7 @@ fn target_for(board_id: &str, verb: &str) -> Result<&'static str, String> {
 /// The class-library image for `board_id` as a linked ELF that also carries the program's debug
 /// information, of a program a caller compiled for a debugger: what `dotnet publish` writes for a
 /// `lamella1.0` project, from what MSBuild evaluated, as [`debug_elf_for_board`] writes it for a
-/// file or a project file. `path` is the project.
+/// file or a project file. `path` is the project, and `kind` the build its `Optimize` selects.
 ///
 /// # Errors
 /// As [`debug_elf_for_board`], worded for `verb`.
@@ -742,9 +992,10 @@ pub(crate) fn debug_elf_of(
     verb: &str,
     path: &Path,
     folders: &crate::folders::Folders,
+    kind: lamella_aot::BuildKind,
 ) -> Result<Vec<u8>, String> {
     let aot_target = target_for(board_id, verb)?;
-    debug_elf_from(debuggable, board_id, aot_target, verb, path, folders)
+    debug_elf_from(debuggable, board_id, aot_target, verb, path, folders, kind)
 }
 
 /// The class-library image for `board_id` as a linked ELF that also carries the program's debug
@@ -767,6 +1018,7 @@ pub fn debug_elf_for_board(
     unsafe_code: bool,
     libraries: &[Library],
     folders: &crate::folders::Folders,
+    kind: lamella_aot::BuildKind,
 ) -> Result<Vec<u8>, String> {
     let aot_target = target_to_build_for(board_id)?;
     if is_project(path) {
@@ -779,7 +1031,7 @@ pub fn debug_elf_for_board(
             "build",
             folders,
         )?;
-        debug_elf_from(&debuggable, board_id, aot_target, "build", path, folders)
+        debug_elf_from(&debuggable, board_id, aot_target, "build", path, folders, kind)
     } else {
         let debuggable = crate::program::compile_csharp_for_debugging(
             path,
@@ -790,11 +1042,12 @@ pub fn debug_elf_for_board(
             "build",
             folders,
         )?;
-        debug_elf_from(&debuggable, board_id, aot_target, "build", path, folders)
+        debug_elf_from(&debuggable, board_id, aot_target, "build", path, folders, kind)
     }
 }
 
-/// Link a program compiled for a debugger into the class-library tier's ELF for `aot_target`.
+/// Link a program compiled for a debugger into the class-library tier's ELF for `aot_target`, as a
+/// `kind` build.
 ///
 /// `path` is what the reader named, as for [`image_from_assembly`].
 fn debug_elf_from(
@@ -804,6 +1057,7 @@ fn debug_elf_from(
     verb: &str,
     path: &Path,
     folders: &crate::folders::Folders,
+    kind: lamella_aot::BuildKind,
 ) -> Result<Vec<u8>, String> {
     require_entry_point(&debuggable.assembly, verb, path)?;
     class_library_build(board_id, aot_target, verb, folders, |archive| {
@@ -815,6 +1069,7 @@ fn debug_elf_from(
             archive,
             aot_target,
             lamella_wire_host::boards::bus_table(Some(board_id)),
+            kind,
         )
     })
 }
@@ -840,7 +1095,7 @@ fn cannot_build_for(board_id: &str, verb: &str, reason: &NoAotTarget) -> String 
 "));
             message.push_str("writes an image that already exists, which is the verb this board
 ");
-            message.push_str("supports today.
+            message.push_str("supports.
 
 ");
         }
@@ -1001,6 +1256,52 @@ impl Tier {
     }
 }
 
+/// The option that asks `build` and `deploy` for a Debug build of a chip's image, spelled once.
+///
+/// **A RELEASE BUILD WHERE IT IS ABSENT**, because an image built on the command line is built to be
+/// written to a board: a Debug build keeps every value of every method in a stack slot of its own and
+/// gives every statement an instruction, which is what a debugger needs and costs flash on a small
+/// part. A project built by `dotnet` takes its kind from its own `Optimize` instead, as .NET's builds
+/// do.
+pub const DEBUG_FLAG: &str = "--debug";
+
+/// The build a parsed command line asks for: a Debug build where [`DEBUG_FLAG`] is given, and a Release
+/// build where it is not.
+#[must_use]
+pub fn build_kind(parsed: &crate::args::Options) -> lamella_aot::BuildKind {
+    if parsed.flag(DEBUG_FLAG) { lamella_aot::BuildKind::Debug } else { lamella_aot::BuildKind::Release }
+}
+
+/// The line `deploy` states about the kind of build it wrote, under its tier's.
+///
+/// **STATED ALWAYS, AS THE TIER IS**: the two builds differ in size and in what a debugger can show,
+/// and neither is recoverable from the byte count.
+#[must_use]
+pub fn build_kind_line(kind: lamella_aot::BuildKind) -> &'static str {
+    match kind {
+        lamella_aot::BuildKind::Debug => "build: Debug -- unoptimized, every local kept for a debugger",
+        lamella_aot::BuildKind::Release => "build: Release -- optimized",
+    }
+}
+
+/// The kind of build as `build`'s `Build:` line names it.
+#[must_use]
+pub fn build_kind_summary(kind: lamella_aot::BuildKind) -> &'static str {
+    match kind {
+        lamella_aot::BuildKind::Debug => "Debug (unoptimized; every local kept for a debugger)",
+        lamella_aot::BuildKind::Release => "Release (optimized)",
+    }
+}
+
+/// The refusal for [`DEBUG_FLAG`] on a route that builds no chip image, where it would be taken and have
+/// no effect -- the defect an option dropped in silence always is.
+pub fn debug_flag_where_nothing_is_built(verb: &str, route: &str, instead: &str, outcome: &str) -> String {
+    format!(
+        "lamella {verb}: {DEBUG_FLAG} asks for a Debug build of the image a chip runs, and this route \
+         builds\nno such image.\n\n{route}\n\n{instead}\n\n{outcome}"
+    )
+}
+
 /// A class library named on the command line, with the bytes it was read from.
 ///
 /// **THE PATH TRAVELS WITH THE BYTES BECAUSE EVERY REFUSAL BELOW IT NAMES A FILE.** A library that
@@ -1129,6 +1430,7 @@ fn build_image(
     libraries: &[Library],
     verb: &str,
     folders: &crate::folders::Folders,
+    kind: lamella_aot::BuildKind,
 ) -> Result<Vec<u8>, String> {
     let (assembly, corlib, link) = if compiles_as_debug_build(tier) {
         let compiled = crate::program::compile_csharp_for_debugging(
@@ -1153,7 +1455,7 @@ fn build_image(
         )?;
         (assembly, corlib, Vec::new())
     };
-    image_from_assembly(&assembly, &corlib, board_id, aot_target, tier, &link, verb, path, folders)
+    image_from_assembly(&assembly, &corlib, board_id, aot_target, tier, &link, verb, path, folders, kind)
 }
 
 /// Whether a program built on `tier` is compiled as a debug build is, even for an image that is
@@ -1186,6 +1488,7 @@ fn build_project_image(
     verb: &str,
     path: &Path,
     folders: &crate::folders::Folders,
+    kind: lamella_aot::BuildKind,
 ) -> Result<Vec<u8>, String> {
     let libraries = project_libraries(project, tier, verb)?;
     let (assembly, corlib, link) = if compiles_as_debug_build(tier) {
@@ -1202,7 +1505,7 @@ fn build_project_image(
             crate::program::compile_project_assembly(project, &libraries, Some(board_id), verb, folders)?;
         (assembly, corlib, Vec::new())
     };
-    image_from_assembly(&assembly, &corlib, board_id, aot_target, tier, &link, verb, path, folders)
+    image_from_assembly(&assembly, &corlib, board_id, aot_target, tier, &link, verb, path, folders, kind)
 }
 
 /// The class libraries `project` references, read and in the order it declares them.
@@ -1222,7 +1525,7 @@ fn project_libraries(
     libraries_from(&named, tier, verb)
 }
 
-/// Lower an assembly that is already compiled, on `tier`.
+/// Lower an assembly that is already compiled, on `tier`, as a `kind` build.
 ///
 /// `path` is what the reader named -- a source file or a project -- so a refusal points at the
 /// thing they typed rather than at whichever file inside it happened to be compiled first.
@@ -1236,15 +1539,15 @@ fn image_from_assembly(
     verb: &str,
     path: &Path,
     folders: &crate::folders::Folders,
+    kind: lamella_aot::BuildKind,
 ) -> Result<Vec<u8>, String> {
     require_entry_point(assembly, verb, path)?;
     if tier == Tier::ClassLibrary {
         return class_library_build(board_id, aot_target, verb, folders, |archive| {
-            linked_build(assembly, corlib, libraries, archive, aot_target, lamella_wire_host::boards::bus_table(Some(board_id)))
+            linked_build(assembly, corlib, libraries, archive, aot_target, lamella_wire_host::boards::bus_table(Some(board_id)), kind)
         });
     }
-    lamella_aot::build::build(assembly, aot_target)
-        .map_err(|error| flat_refusal(verb, aot_target, &error))
+    lamella_aot::build::build(assembly, aot_target, kind).map_err(|error| flat_refusal(verb, aot_target, &error))
 }
 
 /// Refuse an assembly with no entry point, naming `path`, the thing the reader typed.
@@ -1330,6 +1633,7 @@ fn linked_build(
     archive: &[u8],
     aot_target: &str,
     board_buses: Option<&[u32]>,
+    kind: lamella_aot::BuildKind,
 ) -> Result<Vec<u8>, String> {
     lamella_aot::build::build_linked_cortex_m_with_board(
         assembly,
@@ -1338,6 +1642,7 @@ fn linked_build(
         archive,
         aot_target,
         board_buses,
+        kind,
     )
     .map_err(|error| format!("{error}"))
 }
@@ -1384,6 +1689,7 @@ fn linked_build(
     _archive: &[u8],
     _aot_target: &str,
     _board_buses: Option<&[u32]>,
+    _kind: lamella_aot::BuildKind,
 ) -> Result<Vec<u8>, String> {
     Err("the class-library tier is not compiled into this build".to_owned())
 }
@@ -1400,6 +1706,7 @@ fn linked_debug_build(
     archive: &[u8],
     aot_target: &str,
     board_buses: Option<&[u32]>,
+    kind: lamella_aot::BuildKind,
 ) -> Result<Vec<u8>, String> {
     let pdb = lamella_metadata::PortablePdb::read(pdb).map_err(|error| {
         format!("the debug information the compiler wrote does not read back: {error:?}")
@@ -1412,6 +1719,7 @@ fn linked_debug_build(
         archive,
         aot_target,
         board_buses,
+        kind,
     )
     .map_err(|error| format!("{error}"))
 }
@@ -1442,6 +1750,7 @@ fn linked_debug_build(
     _archive: &[u8],
     _aot_target: &str,
     _board_buses: Option<&[u32]>,
+    _kind: lamella_aot::BuildKind,
 ) -> Result<Vec<u8>, String> {
     Err("the class-library tier is not compiled into this build".to_owned())
 }
@@ -1555,11 +1864,11 @@ fn is_unresolvable_call(_error: &lamella_aot::build::BuildError) -> bool {
 fn class_library_refusal(verb: &str, aot_target: &str) -> String {
     if !crate::tiers::covers(aot_target) {
         return format!(
-            "lamella {verb}: the class library has no image plan for {aot_target} yet.\n\n\
+            "lamella {verb}: the class library has no image plan for {aot_target}.\n\n\
              The class-library tier lays out a part's RAM explicitly -- where the statics window \
              sits, where the\nheap starts and where it must stop -- so it covers a part only once \
              those addresses are stated.\n\n\
-             Boards it covers today:\n{}\n\n\
+             Boards it covers:\n{}\n\n\
              {FLAT_FLAG} builds this target on the flat tier instead, whose limits are stated \
              when a program\nexceeds them.",
             class_library_boards()
@@ -1636,24 +1945,37 @@ fn has_entry_point(assembly: &[u8]) -> bool {
 /// than behind it.
 const REPLACE_BOOTLOADER: &str = "--replace-bootloader";
 
+/// The option that names a flash region to write beside the image, or alone: a region file, whose
+/// record is beside it. Given once for each region.
+pub(crate) const REGION: &str = "--region";
+
+/// The option the SDK's publish names a file with, for the files each region named with `--region`
+/// needs beside it: no write, and no person's option.
+const MSBUILD_REGIONS: &str = "--msbuild-regions";
+
 const USAGE: &str = "\
 Usage:
   lamella flash <image> [--board <board>] [--via probe|volume]
+  lamella flash [<image>] --region <file>... [--board <board>] [--via probe|volume]
 
 Write an already-built image file to a board.
 
 Arguments:
   <image>  The image: a .hex, .bin, .s19 or .elf file, or a .uf2 for a board with a UF2 bootloader.
+           Optional when --region names a region to write alone.
 
 Options:
   --board <board>       The board ID, as `lamella boards` lists it. Optional when the image has a
-                        sidecar, which names its board.
+                        sidecar, or a region written alone has a record, which names its board.
   --via probe|volume    How the chip is written. Default: the board's own debugger if it has one,
                         and otherwise its bootloader drive, unless --probe names a probe.
   --probe <serial>      Write over this probe. Naming one takes the probe route. Without it, the
                         probe route takes LAMELLA_PROBE_SERIAL, then the only probe attached.
   --volume <name>       Which bootloader drive, on the volume route. Default: the only one.
   --dfu <serial>        Which USB DFU bootloader, on a DFU route. Default: the only one.
+  --region <file>       A flash region to write beside the image, or alone: a file a board
+                        package carries for a fixed place in the board's flash, with its record
+                        beside it. Give it once for each region.
   --replace-bootloader  Write the image over the bootloader a board's product ships in flash,
                         not behind it.
 
@@ -1692,6 +2014,17 @@ Details:
   of its bytes. When one is there, --board is checked against it, and the image against its hash,
   before any probe is opened. A sidecar that cannot be read stops the write; delete it to write the
   image unchecked.
+
+  A flash region, such as a radio's firmware, is written only where the board's facts give it a
+  place. Its record, <file>.manifest.json, names the board, the place, the hash of the region's
+  bytes and of each image inside it, and the license files that must be beside it, and all of that
+  is checked before anything is opened. Each region is its own span, never joined to the image by
+  fill, and a region the flash already holds is left as it is. Its first sector, its directory, is
+  erased first and written last, so a write stopped part way leaves no directory. The probe route
+  reads every region back. On the volume route the regions go through the board's bootloader over
+  USB before the image is copied, and are read back too, which needs the board to be the only one
+  waiting in BOOTSEL. When the bootloader cannot be reached that way, they go in the image's UF2
+  instead, unverified, and the write says so.
 
   On a board whose product ships a bootloader in flash, such as an Arduino Zero, the image is
   written behind the bootloader, which stays and starts it. The write is refused when no
@@ -1737,6 +2070,61 @@ mod probe_named_tests {
         assert_eq!(probe_named(None, Some("probe:/raspberrypi-pico-2")), None);
         assert_eq!(probe_named(None, Some("ABC")), Some("ABC"));
         assert_eq!(probe_named(Some("DEF"), Some("ABC")), Some("DEF"), "the option wins");
+    }
+}
+
+#[cfg(test)]
+mod region_listing_tests {
+    use super::region_files_for_msbuild;
+    use std::path::{Path, PathBuf};
+
+    /// A region of one sector for the Pico 2 W's radio corner, `at` bytes into its flash, in `folder`
+    /// as `name`, whose record names `notice`, written beside it unless `licensed` is false.
+    fn region_in(folder: &Path, name: &str, at: u32, notice: &str, licensed: bool) -> PathBuf {
+        let digest = |bytes: &[u8]| -> String { lamella_pe::sha256::sha256(bytes).iter().map(|byte| format!("{byte:02x}")).collect() };
+        let mut bytes = vec![0xFF; 0x1000];
+        bytes[..4].copy_from_slice(b"LWFD");
+        let path = folder.join(name);
+        std::fs::write(&path, &bytes).expect("the region");
+        let record = format!(
+            "{{\"schema\":1,\"kind\":\"flash-region\",\"board\":\"raspberrypi-pico-2-w\",\"device\":\"flash\",\"base\":\"{at:#x}\",\
+             \"bytes\":4096,\"sha256\":\"{}\",\"images\":[],\"notices\":[\"{notice}\"],\"producer\":\"RHU's packer\"}}",
+            digest(&bytes)
+        );
+        std::fs::write(lamella_flash_routes::manifest::path_for(&path), record).expect("the record");
+        if licensed {
+            std::fs::write(folder.join(notice), "license").expect("the notice");
+        }
+        path
+    }
+
+    /// **A PUBLISH CARRIES EACH REGION WITH ITS RECORD AND ITS NOTICES**, the region checked for the
+    /// board first: the listing names the three, escaped for MSBuild, its board taken from the record
+    /// when none is named; a region whose notice is missing writes no listing; and two files of one name
+    /// from two folders are refused.
+    #[test]
+    fn a_publish_lists_each_region_with_its_record_and_notices_once_the_region_is_checked() {
+        let folder = std::env::temp_dir().join(format!("lamella-region-listing-{}%$@;", std::process::id()));
+        let _ = std::fs::remove_dir_all(&folder);
+        std::fs::create_dir_all(folder.join("other")).expect("a scratch folder");
+        let region = region_in(&folder, "wifi.region.bin", 0x3C_0000, "LICENSE.RP", true);
+        let listing = folder.join("lamella.regions.proj");
+        region_files_for_msbuild(std::slice::from_ref(&region), None, &listing).expect("listed");
+        let text = std::fs::read_to_string(&listing).expect("the listing");
+        let escaped = |path: &Path| crate::devices::attribute(&path.display().to_string());
+        for path in [region.clone(), folder.join("wifi.region.bin.manifest.json"), folder.join("LICENSE.RP")] {
+            assert!(text.contains(&format!("<LamellaRegionFile Include=\"{}\" />", escaped(&path))), "{path:?} in {text}");
+        }
+        assert!(text.contains("%25%24%40%3B"), "the folder's MSBuild characters are escaped: {text}");
+        std::fs::remove_file(&listing).expect("removed");
+        let unlicensed = region_in(&folder.join("other"), "bt.region.bin", 0x3C_1000, "LICENSE.BT", false);
+        let refusal = region_files_for_msbuild(&[region.clone(), unlicensed], Some("raspberrypi-pico-2-w"), &listing).expect_err("unlicensed");
+        assert!(refusal.contains("LICENSE.BT"), "{refusal}");
+        assert!(!listing.exists(), "no listing written");
+        let twin = region_in(&folder.join("other"), "twin.region.bin", 0x3C_1000, "LICENSE.RP", true);
+        let refusal = region_files_for_msbuild(&[region, twin], None, &listing).expect_err("two LICENSE.RP");
+        assert!(refusal.contains("share a name"), "{refusal}");
+        let _ = std::fs::remove_dir_all(&folder);
     }
 }
 
@@ -1930,6 +2318,61 @@ mod tests {
         assert!(USAGE.contains("does not compile"), "it has to say so outright:\n{USAGE}");
     }
 
+    /// **A REGION ALONE THROUGH THE VOLUME COPIES NO IMAGE**, so the volume's line, which says it
+    /// copies one, is not said; a write with an image says it, and the probe says its line either way.
+    #[test]
+    fn the_route_line_names_an_image_copy_only_when_there_is_an_image() {
+        let volume = Programmer::Uf2Volume { family: RP2350_UF2_FAMILY, base: RP2_XIP_BASE };
+        let probe = Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: true };
+        assert_eq!(route_line(volume, false), None);
+        assert_eq!(
+            route_line(volume, true).as_deref(),
+            Some("writing over the board's bootloader volume, by copying the image...")
+        );
+        assert!(route_line(probe, false).is_some_and(|line| line.starts_with("writing over ")));
+    }
+
+    /// **AN IMAGE THE FLASH ALREADY HELD WAS NOT WRITTEN**, and the closing says so instead of
+    /// "Wrote and verified"; a written image keeps the route's own line.
+    #[test]
+    fn an_image_the_flash_already_held_is_not_said_to_be_written() {
+        let probe = Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: true };
+        let mut written = lamella_flash_routes::region::RegionsReport {
+            image: Some(report(2_097_152, lamella_flash_backend::Verification::ReadBack)),
+            image_held: true,
+            part: None,
+            regions: Vec::new(),
+        };
+        assert_eq!(
+            image_closing(probe, &written)[1],
+            "Nothing was written: the board already held these 2097152 B, as read back. The board is now running the \
+             program."
+        );
+        written.image_held = false;
+        assert_eq!(image_closing(probe, &written)[1], "Wrote and verified 2097152 B. The board is now running the program.");
+        written.image = None;
+        assert_eq!(image_closing(probe, &written), ["The board was started again."]);
+    }
+
+    /// **A REGION WRITTEN ALONE SAYS WHICH PART IT WROTE**, as an image's closing does, before it says
+    /// the board was started again; a route that did not ask the part says only that.
+    #[test]
+    fn a_region_alone_says_which_part_it_wrote() {
+        let probe = Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: true };
+        let mut alone = lamella_flash_routes::region::RegionsReport {
+            image: None,
+            image_held: false,
+            part: Some(lamella_flash_backend::PartIdentity { value: 0x5566_7788_1122_3344, what: "an RP2350" }),
+            regions: Vec::new(),
+        };
+        assert_eq!(
+            image_closing(probe, &alone),
+            ["  the part answered 0x5566778811223344 -- an RP2350", "The board was started again."]
+        );
+        alone.part = None;
+        assert_eq!(image_closing(probe, &alone), ["The board was started again."]);
+    }
+
     #[test]
     fn a_write_that_could_not_be_checked_does_not_claim_it_was() {
         let volume = Programmer::Uf2Volume { family: RP2350_UF2_FAMILY, base: RP2_XIP_BASE };
@@ -2117,8 +2560,12 @@ mod tests {
     fn a_board_with_no_class_library_plan_names_the_option_that_builds_it_flat() {
         let refusal = class_library_refusal("build", "rp2040");
         assert!(
-            refusal.starts_with("lamella build: the class library has no image plan for rp2040 yet."),
+            refusal.starts_with("lamella build: the class library has no image plan for rp2040.\n"),
             "{refusal}"
+        );
+        assert!(
+            refusal.contains("\n\nBoards it covers:\n"),
+            "the heading two gates read the list under: {refusal}"
         );
         assert!(
             refusal.contains(&format!("{FLAT_FLAG} builds this target on the flat tier")),
@@ -2157,7 +2604,7 @@ mod tests {
     fn the_refusal_names_the_missing_fact_and_what_still_works() {
         let text = cannot_write("raspberrypi-pico-2");
         assert!(text.contains("bbc-micro-bit-v1"), "it lists what CAN be written: {text}");
-        assert!(text.contains("not yet stated in any board file"), "and why the list is short");
+        assert!(text.contains("no board file states how a board is PROGRAMMED"), "and why the list is short");
         assert!(text.contains("lamella build"), "and what still works for that board");
         assert!(text.contains("raspberrypi-pico-2"), "and names the board asked for");
         assert!(

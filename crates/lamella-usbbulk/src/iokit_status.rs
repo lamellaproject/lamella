@@ -27,6 +27,14 @@ pub(crate) fn open_refused(call: &str, status: i32) -> String {
     format!("{advice} ({call}: {:#010x})", status as u32)
 }
 
+/// What a refused `USBInterfaceOpen` comes to: [`Error::Held`] for `kIOReturnExclusiveAccess`, which an
+/// interface another program has open gives, and [`Error::Os`] for any other, in [`open_refused`]'s
+/// words either way.
+pub(crate) fn interface_open_refused(status: i32) -> Error {
+    let said = open_refused("USBInterfaceOpen", status);
+    if status == kIOReturnExclusiveAccess { Error::Held(said) } else { Error::Os(said) }
+}
+
 /// Whether `status` says that a transfer ran out of time, and nothing else about the device.
 pub(crate) fn is_timeout(status: i32) -> bool {
     status == kIOReturnTimeout || status == kIOUSBTransactionTimeout
@@ -69,6 +77,17 @@ mod tests {
     fn a_refused_open_says_when_another_program_holds_the_device() {
         assert_eq!(open_refused("USBDeviceOpen", kIOReturnExclusiveAccess), "another program holds it; close that program and try again (USBDeviceOpen: 0xe00002c5)");
         assert_eq!(open_refused("USBInterfaceOpen", kIOReturnTimeout), "USBInterfaceOpen returned 0xe00002d6");
+    }
+
+    /// An interface another program has open is typed as held, and keeps the words it had.
+    #[test]
+    fn an_interface_held_by_another_program_is_held_and_keeps_its_words() {
+        let held = interface_open_refused(kIOReturnExclusiveAccess);
+        assert!(matches!(held, Error::Held(_)), "{held:?}");
+        assert_eq!(held.to_string(), "USB error: another program holds it; close that program and try again (USBInterfaceOpen: 0xe00002c5)");
+        let other = interface_open_refused(kIOReturnTimeout);
+        assert!(matches!(other, Error::Os(_)), "{other:?}");
+        assert_eq!(other.to_string(), "USB error: USBInterfaceOpen returned 0xe00002d6");
     }
 
     #[test]

@@ -35,7 +35,7 @@ impl ReplCell {
 pub fn evaluate(slot: &mut Option<ReplCell>, expression: &str) -> Json {
     let cell = slot.get_or_insert_with(ReplCell::init);
     let result = match cell {
-        ReplCell::Unavailable(reason) => format!("REPL unavailable: {reason}"),
+        ReplCell::Unavailable(reason) => format!("The Debug Console cannot evaluate C# here: {reason}"),
         ReplCell::Ready(repl) => match repl.eval(expression) {
             Ok(Outcome::Empty) => String::new(),
             Ok(Outcome::Ran { output, .. }) => output.trim_end_matches('\n').to_owned(),
@@ -57,7 +57,8 @@ impl ReplLink for InProcLink {
 }
 
 /// Load and run a compiled program on a fresh VM, returning its exit code + console output. A
-/// read/load failure is reported as exit -1 with the reason as output; an unhandled trap is exit 70.
+/// read/load failure is reported as exit -1 with the reason as output; an exception the program did
+/// not catch is exit 134, and a trap of the interpreter's own is exit 1.
 fn run_in_proc(program_bytes: &[u8]) -> RunResult {
     let program_bytes = resident_bytes(program_bytes);
     let Ok(assembly) = Assembly::read(program_bytes) else {
@@ -73,7 +74,7 @@ fn run_in_proc(program_bytes: &[u8]) -> RunResult {
     let exit = match outcome {
         Ok(Some(Value::Int32(code))) => code,
         Ok(_) => 0,
-        Err(_) => 70,
+        Err(trap) => trap.exit_code(),
     };
     RunResult { exit, stdout: vm.output_string() }
 }
@@ -86,7 +87,7 @@ mod tests {
     fn an_unavailable_repl_reports_the_reason_as_the_result() {
         let mut slot = Some(ReplCell::Unavailable("no references".to_owned()));
         let body = evaluate(&mut slot, "1 + 1");
-        assert_eq!(body["result"], json!("REPL unavailable: no references"));
+        assert_eq!(body["result"], json!("The Debug Console cannot evaluate C# here: no references"));
         assert_eq!(body["variablesReference"], json!(0));
     }
 }

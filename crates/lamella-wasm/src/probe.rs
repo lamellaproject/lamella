@@ -459,9 +459,14 @@ fn flash(session: &mut Session, family: &str, image: &[u8]) -> Result<Value, Str
         "rp2350" => {
             let idcode = connect_for_write(session, family)?;
             let mut progress: Vec<String> = Vec::new();
-            lamella_cmsis_dap_rp2350::flash_image(session, image, |line| {
-                progress.push(line.to_string());
-            })
+            lamella_cmsis_dap_rp2350::flash_image_with_clock(
+                session,
+                image,
+                lamella_cmsis_dap_rp2350::Erase::Sectors,
+                &mut lamella_cmsis_dap_rp2350::D8hAsFound::default(),
+                |line| progress.push(line.to_string()),
+                crate::clock::monotonic,
+            )
             .map_err(|e| e.to_string())?;
             json!({ "idcode": idcode, "bytes": image.len(), "progress": progress })
         }

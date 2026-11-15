@@ -1,5 +1,7 @@
 // Lamella managed corlib (from scratch). -- System.Single
 #if LAMELLA_SURFACE_FLOAT
+using System.Globalization;
+
 namespace System
 {
     public struct Single : IComparable, IFormattable
@@ -80,147 +82,121 @@ namespace System
 
         [Lamella.Runtime.RuntimeProvided] private static float ParseValid(string s) { return 0; }
 
-        public static float Parse(string s)
-        {
-            if ((object)s == null) throw new ArgumentNullException("s");
-            if (!ParseValidate(s)) throw new FormatException("Input string was not in a correct format.");
-            return ParseValid(s);
-        }
-
-#if LAMELLA_SURFACE_NETFX_2_0
-        public static bool TryParse(string s, out float result)
-        {
-            result = 0f;
-            if ((object)s == null || !ParseValidate(s)) return false;
-            result = ParseValid(s);
-            return true;
-        }
-#endif
-
-        private static bool ParseValidate(string s)
-        {
-            int end = s.Length;
-            while (end > 0 && NumberText.IsPad(s[end - 1])) end = end - 1;
-            int i = 0;
-            while (i < end && NumberText.IsPad(s[i])) i = i + 1;
-            if (i >= end) return false;
-
-            string core = s.Substring(i, end - i);
-            if (EqualsIgnoreCase(core, "NaN")) return true;
-            if (EqualsIgnoreCase(core, "Infinity") || EqualsIgnoreCase(core, "+Infinity")
-                || EqualsIgnoreCase(core, "-Infinity")) return true;
-
-            if (s[i] == '+' || s[i] == '-') i = i + 1;
-            bool sawDigit = false;
-            bool sawDot = false;
-            while (i < end)
-            {
-                char c = s[i];
-                if (c >= '0' && c <= '9') { sawDigit = true; i = i + 1; continue; }
-                if (c == '.') { if (sawDot) return false; sawDot = true; i = i + 1; continue; }
-                if (c == ',') { if (sawDot || !sawDigit) return false; i = i + 1; continue; }
-                if (c == 'e' || c == 'E') break;
-                return false;
-            }
-            if (!sawDigit) return false;
-            if (i >= end) return true;
-
-            i = i + 1;
-            if (i < end && (s[i] == '+' || s[i] == '-')) i = i + 1;
-            bool sawExpDigit = false;
-            while (i < end)
-            {
-                char c = s[i];
-                if (c < '0' || c > '9') return false;
-                sawExpDigit = true;
-                i = i + 1;
-            }
-            return sawExpDigit;
-        }
-
-        private static bool EqualsIgnoreCase(string a, string b)
-        {
-            if (a.Length != b.Length) return false;
-            for (int k = 0; k < a.Length; k++)
-            {
-                char ca = a[k]; char cb = b[k];
-                if (ca >= 'A' && ca <= 'Z') ca = (char)(ca + 32);
-                if (cb >= 'A' && cb <= 'Z') cb = (char)(cb + 32);
-                if (ca != cb) return false;
-            }
-            return true;
-        }
-
         public string ToString(string format)
         {
             return Format(this, format);
         }
 
-        public string ToString(string format, IFormatProvider formatProvider)
+        public string ToString(IFormatProvider provider)
         {
+            NumberParser.AskProvider(provider);
+            return ToString();
+        }
+
+        public string ToString(string format, IFormatProvider provider)
+        {
+            NumberParser.AskProvider(provider);
             return Format(this, format);
         }
 
         private static string Format(float value, string format)
         {
-            char specifier = 'G';
-            int precision = -1;
-            if ((object)format != null && format.Length != 0)
+            if (!IsFinite(value)) return value.ToString();
+            int precision;
+            char specifier = NumberFormatter.Specifier(format, out precision);
+            if (specifier == '\0') return NumberFormatter.CustomFromExponential(format, ToExponential(value, 6, true));
+            if (specifier == 'R' || specifier == 'r') precision = 0;
+            if (specifier == 'G' || specifier == 'g' || specifier == 'R' || specifier == 'r')
             {
-                specifier = format[0];
-                if (!IsLetter(specifier)) throw new FormatException("Format specifier was invalid.");
-                int i = 1;
-                int p = 0;
-                bool sawDigit = false;
-                while (i < format.Length)
+                char general = (specifier == 'G' || specifier == 'R') ? 'G' : 'g';
+                if (precision < 1)
                 {
-                    char c = format[i];
-                    if (c < '0' || c > '9') throw new FormatException("Format specifier was invalid.");
-                    sawDigit = true;
-                    if (p < 1000000) p = p * 10 + (c - '0');
-                    i++;
+                    string shortest = value.ToString();
+                    return general == 'G' ? shortest : shortest.Replace('E', 'e');
                 }
-                if (sawDigit) precision = p;
+                return NumberFormatter.GeneralFromExponential(ToExponential(value, precision - 1, true), precision, general);
             }
-
-            if (specifier == 'G' || specifier == 'g') return value.ToString();
-            if (specifier == 'F' || specifier == 'f') return ToFixed(value, precision < 0 ? 2 : precision);
-            if (specifier == 'N' || specifier == 'n') return Grouped(value, precision < 0 ? 2 : precision);
             if (specifier == 'E' || specifier == 'e') return ToExponential(value, precision < 0 ? 6 : precision, specifier == 'E');
-            if (specifier == 'C' || specifier == 'c') return System.Double.Currency(value, precision < 0 ? 2 : precision);
-            if (specifier == 'P' || specifier == 'p') return System.Double.Percent(value, precision < 0 ? 2 : precision);
+            if (specifier == 'F' || specifier == 'f') return ToFixed(value, precision < 0 ? 2 : precision);
+            if (specifier == 'N' || specifier == 'n' || specifier == 'C' || specifier == 'c')
+            {
+                int places = precision < 0 ? 2 : precision;
+                return NumberFormatter.FromFixed(specifier, places, ToFixed(value, places));
+            }
+            if (specifier == 'P' || specifier == 'p')
+            {
+                int places = precision < 0 ? 2 : precision;
+                return NumberFormatter.FromFixed(specifier, places, ToFixed(value, places + 2));
+            }
             throw new FormatException("Format specifier was invalid.");
         }
 
-        private static bool IsLetter(char c)
+        private static bool IsFinite(float value)
         {
-            return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+            return (value == value) && ((value - value) == 0f);
         }
 
-        private static string Grouped(float value, int decimals)
+        private static float FromText(string text)
         {
-            string fixedText = ToFixed(value, decimals);
-            int probe = 0;
-            if (probe < fixedText.Length && fixedText[probe] == '-') probe++;
-            if (probe >= fixedText.Length || fixedText[probe] < '0' || fixedText[probe] > '9') return fixedText;
-
-            System.Text.StringBuilder result = new System.Text.StringBuilder();
-            int start = 0;
-            if (fixedText[0] == '-') { result.Append('-'); start = 1; }
-            int dot = fixedText.Length;
-            for (int k = start; k < fixedText.Length; k++)
-            {
-                if (fixedText[k] == '.') { dot = k; break; }
-            }
-            int intDigits = dot - start;
-            for (int k = 0; k < intDigits; k++)
-            {
-                if (k != 0 && (intDigits - k) % 3 == 0) result.Append(',');
-                result.Append(fixedText[start + k]);
-            }
-            for (int k = dot; k < fixedText.Length; k++) result.Append(fixedText[k]);
-            return result.ToString();
+            if (text.Length == 3 && text[0] == 'N') return NaN;
+            return ParseValid(text);
         }
+
+        public static float Parse(string s)
+        {
+            if ((object)s == null) throw new ArgumentNullException("s");
+            string text = NumberParser.FloatingPointText(s, (int)(NumberStyles.Float | NumberStyles.AllowThousands));
+            if ((object)text == null) NumberParser.Refuse(NumberParser.Malformed, s, null);
+            return FromText(text);
+        }
+
+        public static float Parse(string s, NumberStyles style)
+        {
+            if ((object)s == null) throw new ArgumentNullException("s");
+            NumberParser.CheckFractionalStyle(style);
+            string text = NumberParser.FloatingPointText(s, (int)style);
+            if ((object)text == null) NumberParser.Refuse(NumberParser.Malformed, s, null);
+            return FromText(text);
+        }
+
+        public static float Parse(string s, IFormatProvider provider)
+        {
+            return Parse(s, NumberStyles.Float | NumberStyles.AllowThousands, provider);
+        }
+
+        public static float Parse(string s, NumberStyles style, IFormatProvider provider)
+        {
+            if ((object)s == null) throw new ArgumentNullException("s");
+            NumberParser.CheckFractionalStyle(style);
+            NumberParser.AskProvider(provider);
+            string text = NumberParser.FloatingPointText(s, (int)style);
+            if ((object)text == null) NumberParser.Refuse(NumberParser.Malformed, s, null);
+            return FromText(text);
+        }
+
+#if LAMELLA_SURFACE_NETFX_2_0
+        public static bool TryParse(string s, out float result)
+        {
+            result = 0;
+            if ((object)s == null) return false;
+            string text = NumberParser.FloatingPointText(s, (int)(NumberStyles.Float | NumberStyles.AllowThousands));
+            if ((object)text == null) return false;
+            result = FromText(text);
+            return true;
+        }
+
+        public static bool TryParse(string s, NumberStyles style, IFormatProvider provider, out float result)
+        {
+            NumberParser.CheckFractionalStyle(style);
+            result = 0;
+            if ((object)s == null) return false;
+            NumberParser.AskProvider(provider);
+            string text = NumberParser.FloatingPointText(s, (int)style);
+            if ((object)text == null) return false;
+            result = FromText(text);
+            return true;
+        }
+#endif
     }
 }
 #endif

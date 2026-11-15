@@ -161,6 +161,7 @@ pub(crate) const ANCHOR_SEAM_EXTERNS: &[&str] = &[
     "lamella_string_substring",
     "lamella_char_to_string",
     "lamella_double_to_string",
+    "lamella_single_to_string",
     "lamella_double_to_fixed",
     "lamella_double_to_exponential",
     "lamella_gc_walk_roots",

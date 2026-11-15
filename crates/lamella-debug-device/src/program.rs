@@ -35,7 +35,15 @@ pub struct DebugProgram {
     /// The Arm exception-handling tables, from which a call stack is computed where `.debug_frame`
     /// has no row. **Empty is ordinary** for the same reason.
     pub unwind: UnwindTables,
+    /// The console ring the image keeps in RAM, which a session follows while the program runs (see
+    /// [`crate::DeviceBackend::with_console`]). `None` for an image that names none -- one whose
+    /// console is semihosting, or that has none -- and for one that names both rings, which cannot
+    /// say which its program writes.
+    pub console: Option<DataObject>,
 }
+
+/// A block of an image's memory its symbol table names: where it starts and how many bytes it covers.
+pub use lamella_elf::symbols::DataObject;
 
 /// The debug sections local variables are read from, owned.
 ///
@@ -64,6 +72,9 @@ pub struct LocalSections {
     pub loclists: Vec<u8>,
     /// The image's executable address ranges, `[start, end)`.
     pub code: Vec<(u64, u64)>,
+    /// What the reader is told about the target: whether its code addresses may carry the ARM Thumb
+    /// bit, which the ELF's machine says and DWARF does not.
+    pub options: lamella_dwarf::Options,
 }
 
 impl LocalSections {
@@ -221,16 +232,20 @@ pub enum ProgramError {
 impl core::fmt::Display for ProgramError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            ProgramError::NotAnElf(error) => write!(f, "not a loadable ELF: {error:?}"),
+            ProgramError::NotAnElf(error) => f.write_str(match error {
+                lamella_elf::ElfError::NoLoadableContent => "it holds nothing to load onto a board",
+                lamella_elf::ElfError::Truncated => "the file is cut short",
+                _ => "it is not a linked program for a board",
+            }),
             ProgramError::NoDebugLine => f.write_str(
-                "the ELF carries no .debug_line section, so no address can be mapped to a source \
-                 line -- build it with debug information",
+                "it carries no debug information, so no address can be matched to a source line. Build \
+                 it with debug information",
             ),
-            ProgramError::Dwarf(error) => write!(f, ".debug_line could not be read: {error:?}"),
+            ProgramError::Dwarf(_) => f.write_str("its debug information could not be read. Build the project again"),
             ProgramError::AddressBelowImage { address, base } => write!(
                 f,
-                "the line table describes address {address:#x}, below the image base {base:#x} -- \
-                 the debug information and the image are not the same program"
+                "its debug information describes address {address:#x}, below where the program starts, at \
+                 {base:#x}: the debug information and the program are not one build. Build the project again"
             ),
         }
     }
@@ -361,6 +376,27 @@ fn add_symbol_names(
 /// broken debugger, and the cause is one sentence long.
 pub fn from_elf(bytes: &[u8]) -> Result<DebugProgram, ProgramError> {
     let flat = lamella_elf::flat_image(bytes).map_err(ProgramError::NotAnElf)?;
+    from_elf_with_image(bytes, flat.base, flat.bytes)
+}
+
+/// Prepares a linked ELF that is written in more than one region, with `image` as the region the
+/// part boots from: the bytes a session writes at `base`, which its tables are relative to.
+///
+/// **THE TABLES DESCRIBE THE CODE OF EVERY REGION, NOT ONLY `image`'s.** A board that runs part of its
+/// program from an external flash maps it far above the part's own: an STM32F769's quad-SPI window is
+/// at 0x90000000, and its own flash at 0x08000000. Flattened into one image, the two would be over two
+/// gigabytes of bytes, nearly all of them the gap between them. So the caller splits the file into its
+/// regions, and here an address in the window is an offset past the end of `image`, which a PC less
+/// the base still reaches: `DeviceBackend` indexes the tables and never the bytes.
+///
+/// # Errors
+/// As [`from_elf`].
+pub fn from_elf_with_image(
+    bytes: &[u8],
+    base: u32,
+    image: Vec<u8>,
+) -> Result<DebugProgram, ProgramError> {
+    let flat = lamella_elf::FlatImage { base, bytes: image };
 
     let mut sections = lamella_dwarf::Sections::default();
     let mut has_line = false;
@@ -395,6 +431,7 @@ pub fn from_elf(bytes: &[u8]) -> Result<DebugProgram, ProgramError> {
     };
     let info =
         lamella_dwarf::DebugInfo::parse_with(&sections, &options).map_err(ProgramError::Dwarf)?;
+    locals.options = options;
 
     let base = u64::from(flat.base);
 
@@ -500,7 +537,58 @@ pub fn from_elf(bytes: &[u8]) -> Result<DebugProgram, ProgramError> {
         frames,
         locals,
         unwind: UnwindTables::from_elf(bytes),
+        console: lamella_probe_console::ring_in(bytes).ok().map(|(_, ring)| ring),
     })
+}
+
+/// Where a stop at the function that starts at `start` belongs: past its prologue, where its
+/// parameters have reached their homes ([`lamella_dwarf::Subprogram::parameters_at_home`]), when that
+/// lies inside the function's first line, and `start` itself otherwise. `lines` are the program's
+/// rows, relative to `image_base`.
+///
+/// **A STOP AT A FUNCTION'S FIRST INSTRUCTION IS A STOP BEFORE ITS FRAME EXISTS.** Its locals' places
+/// count from a frame not built yet, so they show what the stack held before, and its parameters
+/// are still in the registers they arrived in. A .NET native AOT image marks no row `prologue_end`,
+/// and its first row covers the prologue and the first line's own code together, so neither the
+/// first row nor the second is the answer: the second row is the second line. Where the parameters
+/// land is the one place the image says the prologue has finished.
+///
+/// **INSIDE THE FIRST LINE, OR IT IS NOT THE PROLOGUE.** A parameter can also move later, in code a
+/// line produced; such an address is past the function's first row, and is not taken.
+#[must_use]
+pub fn past_the_prologue(
+    locals: &LocalSections,
+    lines: &[crate::LineRow],
+    image_base: u32,
+    start: u32,
+) -> u32 {
+    if locals.is_empty() {
+        return start;
+    }
+    let Ok(parsed) = lamella_dwarf::Locals::parse_within(&locals.view(), &locals.code, &locals.options)
+    else {
+        return start;
+    };
+    let Some(function) = parsed
+        .at(u64::from(start))
+        .filter(|function| function.low_pc == u64::from(start))
+    else {
+        return start;
+    };
+    let Some(home) = function.parameters_at_home() else {
+        return start;
+    };
+    let second_row = lines
+        .iter()
+        .map(|row| u64::from(image_base.wrapping_add(row.offset)))
+        .filter(|&address| address > u64::from(start))
+        .min()
+        .unwrap_or(function.high_pc);
+    if home < second_row.min(function.high_pc) {
+        u32::try_from(home).unwrap_or(start)
+    } else {
+        start
+    }
 }
 
 #[cfg(test)]

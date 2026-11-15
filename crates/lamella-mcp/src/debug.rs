@@ -8,8 +8,7 @@
 
 use lamella_dap::protocol::{Message, Request};
 use lamella_dap::Debugger;
-use lamella_metadata::{Assembly, PortablePdb};
-use lamella_token::Token;
+use lamella_metadata::Assembly;
 use lamella_wire_host::boards::ReferenceSet;
 use lamella_wire_host::debug_backend::WireHostBackend;
 use serde_json::{json, Value};
@@ -18,8 +17,6 @@ use std::time::{Duration, Instant};
 
 use crate::text_result;
 
-/// The `MethodDef` metadata table tag (matches lamella-dap + the wasm srcmap builder).
-const METHOD_DEF: u8 = 0x06;
 /// The compile source path -> the PDB document name -> the breakpoint source basename.
 const DOCUMENT: &str = "input.cs";
 
@@ -57,67 +54,13 @@ fn compile_bake_srcmap(
         t.push_str(&crate::missing_references(&set, code));
         t
     })?;
-    let pdb_bytes = compiled.pdb.ok_or_else(|| "compiler emitted no PDB (needed for source-level debug)".to_owned())?;
-    let pdb = PortablePdb::read(&pdb_bytes).map_err(|e| format!("pdb parse: {e:?}"))?;
-    let app_asm = Assembly::read(&pe).map_err(|e| format!("PE parse: {e:?}"))?;
-    let mut names: HashMap<u32, String> = HashMap::new();
-    for type_def in app_asm.type_defs() {
-        let type_name = type_def.name();
-        for method in type_def.methods() {
-            let leaf = method.name().unwrap_or_default();
-            let qualified = match &type_name {
-                Some(n) if !n.namespace.is_empty() => format!("{}.{}.{}", n.namespace, n.name, leaf),
-                Some(n) => format!("{}.{}", n.name, leaf),
-                None => leaf.to_string(),
-            };
-            names.insert(method.rid(), qualified);
-        }
-    }
+    let pdb = compiled.pdb.ok_or_else(|| "compiler emitted no PDB (needed for source-level debug)".to_owned())?;
     let mut srcmap: Result<Vec<u8>, String> = Err("the bake built no module".to_owned());
     let baked = lamella_wire_host::bake::bake_for_inspecting(&set, pe.clone(), crate::NOT_IN_THE_CLASS_LIBRARY, |module, app| {
-        srcmap = source_map(module, app, &pdb, &names);
+        srcmap = lamella_wire_host::bake::source_map(module, app, &pe, &pdb);
     })
     .map_err(lamella_wire_host::bake::Refused::into_text)?;
     Ok(Built { srcmap: srcmap?, carried: crate::carried_text(&set, &baked), image: baked.image })
-}
-
-/// The source map of the program at assembly id `app` in `module`: for each of its methods with a
-/// sequence point, the image's id for it, its document, its name, its points and its locals.
-fn source_map(
-    module: &lamella_cil_runtime::Module,
-    app: u8,
-    pdb: &PortablePdb,
-    names: &HashMap<u32, String>,
-) -> Result<Vec<u8>, String> {
-    let mut methods = serde_json::Map::new();
-    for rid in 1..=pdb.method_count() {
-        let Some(method_id) = module.resolve(app, Token::new(METHOD_DEF, rid)) else {
-            continue;
-        };
-        let points: Vec<Value> = pdb
-            .sequence_points(rid)
-            .into_iter()
-            .filter(|p| !p.is_hidden)
-            .map(|p| json!({ "o": p.il_offset, "l": p.start_line, "c": p.start_column }))
-            .collect();
-        if points.is_empty() {
-            continue;
-        }
-        let document = pdb.method_document(rid).unwrap_or_default();
-        let name = names.get(&rid).cloned().unwrap_or_default();
-        let locals: Vec<Value> = pdb
-            .local_variables(rid)
-            .into_iter()
-            .map(|lv| json!({ "index": lv.index, "name": lv.name }))
-            .collect();
-        methods.insert(method_id.to_string(), json!({ "document": document, "name": name, "points": points, "locals": locals }));
-    }
-    let entry_point = pdb
-        .entry_point()
-        .and_then(|t| module.resolve(app, t))
-        .map_or(Value::Null, Value::from);
-    serde_json::to_vec(&json!({ "methods": methods, "entryPoint": entry_point, "error": Value::Null }))
-        .map_err(|e| format!("srcmap encode: {e}"))
 }
 
 /// A live debug session: the DAP debugger over a wire backend, and its request seq.

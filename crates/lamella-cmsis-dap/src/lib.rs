@@ -60,6 +60,15 @@ const DORMANT_TO_SWD_ALERT: [u8; 16] = [
     0x92, 0xf3, 0x09, 0x62, 0x95, 0x2d, 0x85, 0x86, 0xe9, 0xaf, 0xdd, 0xe3, 0xa2, 0x0e, 0xbc, 0x19,
 ];
 
+/// The DP registers a session's power requests live in (ADIv5.2, IHI 0031G, B2.2).
+const DP_CTRL_STAT: u8 = 0x4;
+const DP_SELECT: u8 = 0x8;
+/// `SELECT.DPBANKSEL`. DP register `0x4` is `CTRL/STAT` only while it is 0 (IHI 0031G, B2.2.9; IHI 0074E,
+/// B2.2.11); in another bank it is `DLCR`, `TARGETID` or another register.
+const DPBANKSEL: u32 = 0xf;
+/// `CTRL/STAT.CDBGPWRUPREQ` and `CTRL/STAT.CSYSPWRUPREQ`, the debug and system power requests.
+const POWER_REQUESTS: u32 = (1 << 28) | (1 << 30);
+
 /// MEM-AP CSW for 32-bit memory accesses with single auto-increment: reserved bit +
 /// master-type debug + HPROT data + DbgStatus + size-word + single-increment.
 const CSW_WORD: u32 = 0x2300_0052;
@@ -163,7 +172,7 @@ impl std::fmt::Display for DapError {
                     "probe echoed command {got:#04x}, expected {expected:#04x}"
                 )
             }
-            DapError::Ack(ack) => write!(f, "transfer not acknowledged: {ack:?}"),
+            DapError::Ack(ack) => write!(f, "{}", lamella_probe_core::ProbeError::Ack((*ack).into())),
             DapError::Unsupported { command } => write!(
                 f,
                 "the probe does not implement command {command:#04x}"
@@ -217,12 +226,70 @@ impl CallFrame {
 }
 
 /// A connected CMSIS-DAP probe driving a target over SWD.
+///
+/// **A session leaves each debug port's power requests as it found them,** however it ends: through
+/// [`release`](Self::release), or with the `Dap` dropped.
 pub struct Dap<T: Transport> {
     transport: T,
+    /// Why the link to the probe was given up on, once it failed; see [`command`](Self::command).
+    stopped: Option<String>,
     reply: [u8; MAX_PACKET],
     /// The probe's own maximum command/reply size, from `DAP_Info` 0xFF, learned during a connect.
     /// [`PACKET`] until then -- the floor, which is correct for any probe and optimal for some.
     packet_size: usize,
+    /// The debug ports this session has reached, and what it found and wrote in each one's `CTRL/STAT`.
+    ports: Ports,
+}
+
+/// The debug ports a session has reached, as far as it knows them, kept so that every power request it
+/// raises is given back when it ends.
+#[derive(Default)]
+struct Ports {
+    /// The port the wire addresses: the id of the `TARGETSEL` that followed the last line reset, or
+    /// `None` when none did, and a line reset alone reaches the port.
+    addressed: Option<u32>,
+    /// `SELECT` as this session last wrote it to that port, while that is known.
+    select: Option<u32>,
+    /// The power requests of each port whose `CTRL/STAT` this session has reached.
+    requests: Vec<Requests>,
+}
+
+/// One port's power requests, as a session found them and as it last wrote them.
+struct Requests {
+    /// The port, as [`Ports::addressed`] names it.
+    addressed: Option<u32>,
+    /// The requests the port held when the session first reached its `CTRL/STAT`.
+    found: u32,
+    /// The word the session last wrote to its `CTRL/STAT`.
+    written: Option<u32>,
+}
+
+impl Ports {
+    /// Whether DP register `0x4` is `CTRL/STAT` on the port the wire addresses: only while
+    /// `SELECT.DPBANKSEL` is known to be 0.
+    fn at_ctrl_stat(&self) -> bool {
+        self.select.is_some_and(|select| select & DPBANKSEL == 0)
+    }
+
+    /// The requests of the port the wire addresses, once the session has reached its `CTRL/STAT`.
+    fn here(&mut self) -> Option<&mut Requests> {
+        let addressed = self.addressed;
+        self.requests.iter_mut().find(|requests| requests.addressed == addressed)
+    }
+
+    /// The word the addressed port's `CTRL/STAT` was read holding, kept when it is the session's first.
+    fn read_ctrl_stat(&mut self, word: u32) {
+        if self.here().is_none() {
+            self.requests.push(Requests { addressed: self.addressed, found: word & POWER_REQUESTS, written: None });
+        }
+    }
+
+    /// A line reset, then `addressed`: the id of the `TARGETSEL` that followed it, or none.
+    fn line_reset(&mut self, addressed: Option<u32>) {
+        let same = addressed == self.addressed;
+        self.select = self.select.filter(|select| same && select & DPBANKSEL == 0);
+        self.addressed = addressed;
+    }
 }
 
 impl<T: Transport> Dap<T> {
@@ -230,8 +297,10 @@ impl<T: Transport> Dap<T> {
     pub fn new(transport: T) -> Self {
         Dap {
             transport,
+            stopped: None,
             reply: [0; MAX_PACKET],
             packet_size: PACKET,
+            ports: Ports::default(),
         }
     }
 
@@ -309,7 +378,59 @@ impl<T: Transport> Dap<T> {
     /// The two checks stay distinct because they can disagree: a refusal that IS stale backlog is
     /// still recoverable, so a [`proto::INVALID_COMMAND`] reply is only fatal once the loop fails
     /// to find this command's own echo behind it.
+    ///
+    /// # A LINK THAT FAILED IS ASKED NOTHING MORE
+    ///
+    /// A failure of the link itself -- a write or a read the transport could not complete, a reply
+    /// that never came within the read's timeout, replies that never echo the command, a reply too
+    /// short for its command -- ends the session's use of the probe: every later command fails at
+    /// once with the same reason, and nothing more is written to or read from the probe.
+    ///
+    /// Resynchronizing cannot cover this, because the stale reply is not always another command's.
+    /// A reply that arrives after its read gave up waits in the pipe, and when the next command is
+    /// the same one -- a read polled in a loop -- its echo matches: that read returns the previous
+    /// one's data, or a write is acknowledged by a reply that was not its own, and nothing says so.
+    /// And a probe that stopped answering is not helped by more commands; each costs a full timeout.
+    ///
+    /// An acknowledge the target gave -- `WAIT`, `FAULT` -- and a refusal or a failed status the
+    /// probe gave are answers that came, so they never end the session.
     fn command(&mut self, request: &[u8]) -> Result<&[u8], DapError> {
+        if let Some(why) = &self.stopped {
+            return Err(DapError::Transport(TransportError(why.clone())));
+        }
+        match self.exchange(request) {
+            Ok(n) => Ok(&self.reply[..n]),
+            Err(error) => Err(self.give_up_on_a_failed_link(error)),
+        }
+    }
+
+    /// Records `error` as the reason the link was given up on, when it is a failure of the link
+    /// itself rather than an answer that came ([`command`](Self::command)), and hands it back.
+    fn give_up_on_a_failed_link(&mut self, error: DapError) -> DapError {
+        let why = match &error {
+            DapError::Transport(failed) => Some(failed.0.clone()),
+            DapError::Unexpected { .. } | DapError::Proto(_) => Some(error.to_string()),
+            DapError::Ack(_)
+            | DapError::Unsupported { .. }
+            | DapError::Status { .. }
+            | DapError::Timeout(_)
+            | DapError::Device(_) => None,
+        };
+        if self.stopped.is_none() {
+            self.stopped = why;
+        }
+        error
+    }
+
+    /// A reply the transfer that asked for it could not decode is a failure of the link, as a
+    /// reply that never came is ([`command`](Self::command)).
+    fn decoded<V>(&mut self, reply: Result<V, proto::ProtoError>) -> Result<V, DapError> {
+        reply.map_err(|short| self.give_up_on_a_failed_link(short.into()))
+    }
+
+    /// One command's exchange for [`command`](Self::command): the write, then reads until its own
+    /// reply, which is left in the reply buffer; answers that reply's length.
+    fn exchange(&mut self, request: &[u8]) -> Result<usize, DapError> {
         self.transport.write_packet(request)?;
         let want = request.first().copied().unwrap_or(0);
         let mut got = None;
@@ -347,7 +468,7 @@ impl<T: Transport> Dap<T> {
                 return Err(DapError::Status { command: want, status });
             }
         }
-        Ok(&self.reply[..n])
+        Ok(n)
     }
 
     /// Reads a `DAP_Info` string from the probe itself (no target involved): `id` 0x01 vendor,
@@ -454,6 +575,7 @@ impl<T: Transport> Dap<T> {
         self.command(&proto::swd_configure(0, false))?;
         self.command(&proto::transfer_configure(0, 250, 100))?;
         self.adopt_packet_size();
+        self.ports.line_reset(None);
         self.command(&proto::swj_sequence(51, &[0xff; 7]))?;
         self.command(&proto::swj_sequence(16, &[0x9e, 0xe7]))?;
         self.command(&proto::swj_sequence(51, &[0xff; 7]))?;
@@ -472,18 +594,38 @@ impl<T: Transport> Dap<T> {
     ///
     /// This wakes the bus, not a particular port. On a part that puts several debug ports on ONE SWD bus
     /// every port stays tristated until one is addressed, so follow this with
-    /// [`select_multidrop_target`](Self::select_multidrop_target). An ADIv6 DP, which addresses its APs
-    /// by address rather than by the ADIv5 `APSEL` field, is not supported: this crate does not ship wire
-    /// protocol it has not exercised against the part, because a plausible-looking sequence that is wrong
-    /// costs more to find than an absent one.
+    /// [`select_multidrop_target`](Self::select_multidrop_target). An ADIv6 DP addresses its APs by
+    /// address rather than by the ADIv5 `APSEL` field; [`lamella_probe_core::ArmDap`]'s memory
+    /// initialization finds the one that reaches the processor from the port's own ROM table.
     pub fn connect_swd_from_dormant(&mut self) -> Result<(), DapError> {
         self.connect_port(Port::Swd)?;
         self.set_clock(CONNECT_CLOCK_HZ)?;
+        self.wake_swd_from_dormant()
+    }
+
+    /// The wire sequences that bring a DORMANT SWD port to a reset-state SW-DP, and nothing else: no
+    /// `DAP_Connect`, which can drive nRESET and so release a target held in reset, and no
+    /// `DAP_SWJ_Clock`, so the probe stays as its last connect configured it.
+    fn wake_swd_from_dormant(&mut self) -> Result<(), DapError> {
+        self.ports.line_reset(None);
         self.command(&proto::swj_sequence(8, &[0xff]))?;
         self.command(&proto::swj_sequence(128, &DORMANT_TO_SWD_ALERT))?;
         self.command(&proto::swj_sequence(12, &[0xa0, 0x01]))?;
         self.command(&proto::swj_sequence(51, &[0xff; 7]))?;
         self.command(&proto::swj_sequence(8, &[0x00]))?;
+        Ok(())
+    }
+
+    /// Puts an SWD debug port back into the dormant state: a line reset, then the 16-bit SWD-to-dormant
+    /// select sequence, with no idle cycles between them (ADIv6.0, IHI 0074E, B5.3).
+    ///
+    /// A port in the dormant state ignores everything but a selection alert, so
+    /// [`connect_swd_from_dormant`](Self::connect_swd_from_dormant) is what reaches it next. A caller
+    /// that woke a port only to read it uses this to leave the port as it found it.
+    pub fn swd_to_dormant(&mut self) -> Result<(), DapError> {
+        self.ports.line_reset(None);
+        self.command(&proto::swj_sequence(51, &[0xff; 7]))?;
+        self.command(&proto::swj_sequence(16, &[0xbc, 0xe3]))?;
         Ok(())
     }
 
@@ -494,9 +636,80 @@ impl<T: Transport> Dap<T> {
     /// stop the application running and the device enumerating, so the next person sees dead
     /// hardware rather than a tool that did not tidy up. Any tool that only inspects should end
     /// here, and one whose sequence may fail partway should end here on the failing path too.
+    ///
+    /// **It first gives back every power request the session raised,** on the port that got it, so
+    /// each port is left with the requests it was found with. A request left set outlives the session:
+    /// on an RP2350, `CSYSPWRUPREQ` stops the program making any power state transition of its own for
+    /// as long as it stays set (RP2350 datasheet, 6.2.3.3), and on an RP2040's rescue port
+    /// `CDBGPWRUPREQ` holds the whole chip in reset (RP2040 datasheet, 2.3.4.2 and 2.12.1). The
+    /// give-back only ever lowers a request. Its errors are not reported, and the disconnect is still
+    /// sent. A `Dap` dropped without a release gives the requests back too, and sends no disconnect.
+    ///
+    /// **The disconnect is sent even where the link to the probe has failed,** in the give-back or
+    /// before it: it is the one command asked past that failure, sent once, and the release ends with
+    /// its answer or its failure. It is what hands the wires back, so a probe that answers again gets
+    /// it, and one that has gone costs no more than its one try.
     pub fn release(&mut self) -> Result<(), DapError> {
-        self.command(&proto::disconnect())?;
-        Ok(())
+        self.give_back();
+        match self.exchange(&proto::disconnect()) {
+            Ok(_) => Ok(()),
+            Err(error) => Err(self.give_up_on_a_failed_link(error)),
+        }
+    }
+
+    /// Lowers every power request the session raised and did not lower itself, on the port it raised
+    /// it on, then forgets the ports. **It never raises one,** so a request the session found set stays
+    /// set, and one it lowered stays lowered.
+    ///
+    /// A port is reached as it was when the request was made: by its `TARGETSEL`, or by a line reset
+    /// alone. `CTRL/STAT` is written in bank 0, with `SELECT` moved to bank 0 first where the session
+    /// left another. An error leaves that port as it is and goes on to the next, unless the probe itself
+    /// failed, when nothing more is sent: a probe that has gone costs one timeout here, not one a port.
+    fn give_back(&mut self) {
+        let now = self.ports.addressed;
+        let mut owed = std::mem::take(&mut self.ports.requests);
+        owed.sort_by_key(|requests| requests.addressed != now);
+        for requests in owed {
+            let Some(written) = requests.written else { continue };
+            let raised = written & POWER_REQUESTS & !requests.found;
+            if raised == 0 {
+                continue;
+            }
+            let given = self
+                .address(requests.addressed)
+                .and_then(|()| self.select_ctrl_stat())
+                .and_then(|()| self.transfer_write(proto::dp_write(DP_CTRL_STAT), written & !raised));
+            if let Err(DapError::Transport(_)) = given {
+                break;
+            }
+        }
+        self.ports.requests.clear();
+    }
+
+    /// Addresses the port `addressed` names, unless the wire addresses it already: by its `TARGETSEL`,
+    /// or, for a port reached with none, by a line reset and the `DPIDR` read that must follow one.
+    fn address(&mut self, addressed: Option<u32>) -> Result<(), DapError> {
+        if addressed == self.ports.addressed {
+            return Ok(());
+        }
+        match addressed {
+            Some(target_id) => self.select_multidrop_target(target_id).map(drop),
+            None => {
+                self.ports.line_reset(None);
+                self.command(&proto::swj_sequence(51, &[0xff; 7]))?;
+                self.command(&proto::swj_sequence(8, &[0x00]))?;
+                self.read_idcode().map(drop)
+            }
+        }
+    }
+
+    /// Moves `SELECT.DPBANKSEL` to 0, unless it is known to be 0 already.
+    fn select_ctrl_stat(&mut self) -> Result<(), DapError> {
+        if self.ports.at_ctrl_stat() {
+            return Ok(());
+        }
+        let select = self.ports.select.map_or(0, |select| select & !DPBANKSEL);
+        self.write_dp(DP_SELECT, select)
     }
 
     /// Reads the current levels of the probe's SWD pins, without driving anything.
@@ -556,6 +769,7 @@ impl<T: Transport> Dap<T> {
         use proto::SwdPhase;
         const SELECT_REQUEST: u8 = 0x99;
 
+        self.ports.line_reset(Some(target_id));
         self.command(&proto::swj_sequence(51, &[0xff; 7]))?;
         self.command(&proto::swj_sequence(8, &[0x00]))?;
 
@@ -587,6 +801,9 @@ impl<T: Transport> Dap<T> {
 
     /// Powers up the debug and system domains and configures the MEM-AP for 32-bit
     /// access. Call once after connecting, before any memory access.
+    ///
+    /// The session gives both power requests back when it ends ([`release`](Self::release)), so
+    /// `CTRL/STAT` is read once first, to learn what the port held.
     pub fn init_mem(&mut self) -> Result<(), DapError> {
         self.init_mem_select(0x0000_0000)
     }
@@ -605,6 +822,13 @@ impl<T: Transport> Dap<T> {
             }
         }
         Err(DapError::Timeout("debug power-up"))
+    }
+
+    /// Configures the selected MEM-AP for 32-bit memory access: the last step of
+    /// [`init_mem_select`](Self::init_mem_select), for a caller that has made its own debug power
+    /// request and selected the AP itself.
+    pub fn configure_mem_ap(&mut self) -> Result<(), DapError> {
+        self.write_ap(0x0, CSW_WORD)
     }
 
     /// Configures the probe's transfer handling: `wait_retry` is how many times it retries a
@@ -966,11 +1190,31 @@ impl<T: Transport> Dap<T> {
         Err(DapError::Timeout("call_target: the callee did not return"))
     }
 
+    /// Reads a DP register, keeping what `CTRL/STAT` held the first time the session reads it on a port.
     fn read_dp(&mut self, reg: u8) -> Result<u32, DapError> {
-        self.transfer_read(proto::dp_read(reg))
+        let word = self.transfer_read(proto::dp_read(reg))?;
+        if reg == DP_CTRL_STAT && self.ports.at_ctrl_stat() {
+            self.ports.read_ctrl_stat(word);
+        }
+        Ok(word)
     }
+
+    /// Writes a DP register, keeping what a release needs to give back a power request: `SELECT` as
+    /// written, and for `CTRL/STAT` the word written and what the port held before the session's first
+    /// write there. That costs one read, where the session has not read it already.
     fn write_dp(&mut self, reg: u8, value: u32) -> Result<(), DapError> {
-        self.transfer_write(proto::dp_write(reg), value)
+        let ctrl_stat = reg == DP_CTRL_STAT && self.ports.at_ctrl_stat();
+        if ctrl_stat && self.ports.here().is_none() {
+            let found = self.transfer_read(proto::dp_read(DP_CTRL_STAT))?;
+            self.ports.read_ctrl_stat(found);
+        }
+        let written = self.transfer_write(proto::dp_write(reg), value);
+        if reg == DP_SELECT {
+            self.ports.select = written.is_ok().then_some(value);
+        } else if ctrl_stat && let Some(requests) = self.ports.here() {
+            requests.written = Some(value);
+        }
+        written
     }
     fn read_ap(&mut self, reg: u8) -> Result<u32, DapError> {
         self.transfer_read(proto::ap_read(reg))
@@ -982,7 +1226,8 @@ impl<T: Transport> Dap<T> {
     /// Issues one read transfer and returns its data.
     fn transfer_read(&mut self, request: u8) -> Result<u32, DapError> {
         let reply = self.command(&proto::transfer_one(request, None))?;
-        let parsed = proto::parse_read(reply)?;
+        let parsed = proto::parse_read(reply);
+        let parsed = self.decoded(parsed)?;
         match parsed.ack {
             Ack::Ok => Ok(parsed.data.unwrap_or(0)),
             other => Err(DapError::Ack(other)),
@@ -992,10 +1237,21 @@ impl<T: Transport> Dap<T> {
     /// Issues one write transfer.
     fn transfer_write(&mut self, request: u8, value: u32) -> Result<(), DapError> {
         let reply = self.command(&proto::transfer_one(request, Some(value)))?;
-        match proto::parse_read(reply)?.ack {
+        let parsed = proto::parse_read(reply);
+        match self.decoded(parsed)?.ack {
             Ack::Ok => Ok(()),
             other => Err(DapError::Ack(other)),
         }
+    }
+}
+
+/// **A session that ends without a [`release`](Dap::release) still gives back the power requests it
+/// raised,** as a release does, because most sessions end this way: a flash write or a debug session
+/// powers a port up, hands the target back, and drops the probe. Nothing else is sent, so the probe is
+/// not disconnected, and a session that raised no request sends nothing at all.
+impl<T: Transport> Drop for Dap<T> {
+    fn drop(&mut self) {
+        self.give_back();
     }
 }
 
@@ -1045,6 +1301,9 @@ impl<T: Transport> lamella_probe_core::DapAccess for Dap<T> {
     fn connect(&mut self) -> Result<(), lamella_probe_core::ProbeError> {
         Ok(self.connect_swd()?)
     }
+    fn stopped_answering(&self) -> Option<String> {
+        self.stopped.as_deref().map(lamella_probe_core::probe_stopped_answering)
+    }
 
     fn read_dp(&mut self, address: u8) -> Result<u32, lamella_probe_core::ProbeError> {
         Ok(Dap::read_dp(self, address)?)
@@ -1080,6 +1339,13 @@ impl<T: Transport> lamella_probe_core::DapAccess for Dap<T> {
         Ok(true)
     }
 
+    /// A CMSIS-DAP probe sends the wake as `DAP_SWJ_Sequence` packets and nothing else, so the
+    /// answer is `true`; see [`Dap::connect_swd_from_dormant`] for the sequence.
+    fn wake_from_dormant(&mut self) -> Result<bool, lamella_probe_core::ProbeError> {
+        self.wake_swd_from_dormant()?;
+        Ok(true)
+    }
+
     /// Streams the values with `DAP_TransferBlock`, chunked to the probe's packet. The MEM-AP's
     /// 1 KB `TAR` auto-increment window is NOT handled here -- that is the caller's (MEM-AP) concern;
     /// this is purely "write these values to one AP register in as few round-trips as possible".
@@ -1090,7 +1356,8 @@ impl<T: Transport> lamella_probe_core::DapAccess for Dap<T> {
     ) -> Result<(), lamella_probe_core::ProbeError> {
         for chunk in values.chunks(self.words_per_packet()) {
             let reply = self.command(&proto::transfer_block_write(proto::ap_write(address), chunk))?;
-            let (done, ack) = proto::parse_block_write(reply)?;
+            let parsed = proto::parse_block_write(reply);
+            let (done, ack) = self.decoded(parsed)?;
             if ack != Ack::Ok || done as usize != chunk.len() {
                 return Err(lamella_probe_core::ProbeError::Ack(ack.into()));
             }
@@ -1111,7 +1378,8 @@ impl<T: Transport> lamella_probe_core::DapAccess for Dap<T> {
             let batch = remaining.len().min(per_packet);
             let reply =
                 self.command(&proto::transfer_block_read(proto::ap_read(address), batch as u16))?;
-            let (done, ack) = proto::parse_block_read(reply, &mut remaining[..batch])?;
+            let parsed = proto::parse_block_read(reply, &mut remaining[..batch]);
+            let (done, ack) = self.decoded(parsed)?;
             if ack != Ack::Ok || done as usize != batch {
                 return Err(lamella_probe_core::ProbeError::Ack(ack.into()));
             }
@@ -1176,6 +1444,18 @@ mod tests {
     use super::testing::{Mock, echo};
     use super::*;
     use lamella_probe_core::DapAccess;
+
+    /// A transfer the chip did not accept is said in the probe layer's own words, one sentence for
+    /// each answer, whichever crate reports it: never "transfer not acknowledged" or the answer's
+    /// name in the protocol.
+    #[test]
+    fn a_refused_transfer_reads_as_the_probe_layers_words() {
+        for ack in [Ack::Ok, Ack::Wait, Ack::Fault, Ack::NoAck, Ack::Unknown(5)] {
+            let said = DapError::Ack(ack).to_string();
+            assert_eq!(said, lamella_probe_core::ProbeError::Ack(ack.into()).to_string());
+            assert!(!said.contains("acknowledged") && !said.contains(&format!("{ack:?}")), "{said}");
+        }
+    }
 
     /// A `DAP_TransferBlock` read reply: the command byte, the completed count, an OK acknowledge,
     /// then one little-endian word per completed transfer.
@@ -1511,6 +1791,41 @@ mod tests {
         assert_eq!(&activation[2..4], &[0xa0, 0x01], "4 low + activation 0x1A");
     }
 
+    /// **THE WAKE THROUGH THE TRAIT IS THE WIRE SEQUENCES ALONE**: no `DAP_Connect`, which can drive
+    /// nRESET and release a target held in reset for an attach, and no `DAP_SWJ_Clock`.
+    #[test]
+    fn the_wake_through_the_trait_sends_the_wire_sequences_alone() {
+        let replies = vec![echo(proto::cmd::SWJ_SEQUENCE, &[0x00]); 5];
+        let mut dap = Dap::new(Mock::new(replies));
+        assert!(lamella_probe_core::DapAccess::wake_from_dormant(&mut dap).unwrap());
+        let sent = &dap.transport.sent;
+        assert_eq!(sent.len(), 5, "{sent:?}");
+        assert!(sent.iter().all(|packet| packet[0] == proto::cmd::SWJ_SEQUENCE), "{sent:?}");
+        assert_eq!((sent[1][1], &sent[1][2..18]), (128, &DORMANT_TO_SWD_ALERT[..]), "the alert");
+        assert_eq!((sent[2][1], &sent[2][2..4]), (12, &[0xa0, 0x01][..]), "the activation code");
+    }
+
+    /// **BACK TO DORMANT IS A LINE RESET, THEN THE SWD-TO-DORMANT SELECT `0xE3BC`, WITH NOTHING BETWEEN
+    /// THEM**, and a probe that refuses either is an error, never a port left awake in silence.
+    #[test]
+    fn back_to_dormant_is_a_line_reset_then_the_select_with_nothing_between() {
+        let mut dap = Dap::new(Mock::new(vec![echo(proto::cmd::SWJ_SEQUENCE, &[0x00]); 2]));
+        dap.swd_to_dormant().unwrap();
+        assert_eq!(dap.transport.sent, [proto::swj_sequence(51, &[0xff; 7]), proto::swj_sequence(16, &[0xbc, 0xe3])]);
+
+        let mut refused = Dap::new(Mock::new(vec![echo(proto::cmd::SWJ_SEQUENCE, &[proto::DAP_ERROR])]));
+        assert!(refused.swd_to_dormant().is_err());
+    }
+
+    /// **CONFIGURING THE MEM-AP IS ONE `CSW` WRITE AND NOTHING ELSE:** no `SELECT`, no power request and
+    /// no `ABORT`, because its caller makes each of those as it chooses.
+    #[test]
+    fn configuring_the_mem_ap_is_one_csw_write_and_nothing_else() {
+        let mut dap = Dap::new(Mock::new(vec![vec![proto::cmd::TRANSFER, 0x01, 0x01]]));
+        dap.configure_mem_ap().unwrap();
+        assert_eq!(dap.transport.sent, [proto::transfer_one(proto::ap_write(0x0), Some(CSW_WORD))]);
+    }
+
     #[test]
     fn a_stale_reply_is_discarded_and_the_command_still_answers() {
         let replies = vec![
@@ -1546,6 +1861,101 @@ mod tests {
             matches!(err, DapError::Transport(_)),
             "expected the missing reply to surface as an error, got: {err}"
         );
+    }
+
+    /// What a scripted probe does at a read: give up, as a read the probe has not answered within
+    /// the transport's timeout does, or deliver the next reply the probe sent.
+    enum Read {
+        GivesUp,
+        Delivers(Vec<u8>),
+    }
+
+    /// A transport whose reads follow a script, counting the packets written to it.
+    struct Scripted {
+        reads: std::collections::VecDeque<Read>,
+        written: usize,
+    }
+
+    impl Scripted {
+        fn new(reads: Vec<Read>) -> Scripted {
+            Scripted { reads: reads.into(), written: 0 }
+        }
+    }
+
+    impl Transport for Scripted {
+        fn write_packet(&mut self, _data: &[u8]) -> Result<(), TransportError> {
+            self.written += 1;
+            Ok(())
+        }
+        fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+            match self.reads.pop_front() {
+                Some(Read::Delivers(reply)) => {
+                    buf[..reply.len()].copy_from_slice(&reply);
+                    Ok(reply.len())
+                }
+                Some(Read::GivesUp) | None => Err(TransportError("USB read timed out".into())),
+            }
+        }
+    }
+
+    /// The reply to a single-access read `DAP_Transfer`: one transfer done, acknowledged with
+    /// `ack`, and the word read.
+    fn transfer_reply(ack: u8, word: u32) -> Vec<u8> {
+        let mut reply = vec![proto::cmd::TRANSFER, 0x01, ack];
+        reply.extend_from_slice(&word.to_le_bytes());
+        reply
+    }
+
+    #[test]
+    fn a_reply_that_arrives_after_its_read_gave_up_is_never_read_as_the_next_answer() {
+        let mut dap = Dap::new(Scripted::new(vec![
+            Read::GivesUp,
+            Read::Delivers(transfer_reply(0x01, 0x2ba0_1477)),
+        ]));
+        let first = dap.read_dp(0x0);
+        assert!(matches!(first, Err(DapError::Transport(_))), "the read that gave up fails: {first:?}");
+        let second = dap.read_dp(0x4);
+        assert!(
+            matches!(second, Err(DapError::Transport(_))),
+            "after a read gave up, every later call fails; got {second:?}"
+        );
+        assert_eq!(dap.transport().written, 1, "nothing is written to the probe after the read that gave up");
+        assert_eq!(dap.transport().reads.len(), 1, "the late reply is left in the pipe, unread");
+        assert_eq!(
+            second.unwrap_err().to_string(),
+            first.unwrap_err().to_string(),
+            "a later call fails for the reason the link failed"
+        );
+        assert_eq!(
+            dap.stopped_answering(),
+            Some(lamella_probe_core::probe_stopped_answering("USB read timed out"))
+        );
+    }
+
+    #[test]
+    fn a_fault_or_a_wait_the_probe_answered_leaves_the_session_working() {
+        let mut dap = Dap::new(Scripted::new(vec![
+            Read::Delivers(transfer_reply(0x04, 0)),
+            Read::Delivers(transfer_reply(0x02, 0)),
+            Read::Delivers(transfer_reply(0x01, 0x2ba0_1477)),
+        ]));
+        assert!(matches!(dap.read_dp(0x0), Err(DapError::Ack(Ack::Fault))));
+        assert!(matches!(dap.read_dp(0x0), Err(DapError::Ack(Ack::Wait))));
+        assert_eq!(dap.read_dp(0x0).unwrap(), 0x2ba0_1477);
+        assert_eq!(dap.transport().written, 3);
+        assert_eq!(dap.stopped_answering(), None);
+    }
+
+    #[test]
+    fn a_probe_whose_replies_never_echo_the_command_is_given_up_on() {
+        let mut reads: Vec<Read> =
+            (0..=STALE_REPLY_LIMIT).map(|_| Read::Delivers(vec![proto::cmd::INFO, 0x00])).collect();
+        reads.push(Read::Delivers(transfer_reply(0x01, 7)));
+        let mut dap = Dap::new(Scripted::new(reads));
+        assert!(matches!(dap.read_dp(0x0), Err(DapError::Unexpected { .. })));
+        let after = dap.read_dp(0x0);
+        assert!(matches!(after, Err(DapError::Transport(_))), "got {after:?}");
+        assert_eq!(dap.transport().written, 1, "nothing is written after the pairing was lost");
     }
 
     #[test]
@@ -1687,17 +2097,33 @@ mod tests {
         assert_eq!(&dap.transport.sent[1][4..8], &[0xef, 0xbe, 0xad, 0xde]);
     }
 
+    /// **`init_mem` READS `CTRL/STAT` BEFORE ITS POWER REQUEST,** so a release can give back what the
+    /// session raised and nothing it found: `ABORT`, `SELECT`, the read, the request, its acknowledge,
+    /// then `CSW`.
     #[test]
-    fn init_mem_powers_up_then_sets_csw() {
+    fn init_mem_reads_ctrl_stat_then_powers_up_then_sets_csw() {
         let replies = vec![
             echo(proto::cmd::TRANSFER, &[0x01, 0x01]),
             echo(proto::cmd::TRANSFER, &[0x01, 0x01]),
+            vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x40, 0x00, 0x00, 0x00],
             echo(proto::cmd::TRANSFER, &[0x01, 0x01]),
-            vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x00, 0x00, 0x00, 0xf0],
+            vec![proto::cmd::TRANSFER, 0x01, 0x01, 0x40, 0x00, 0x00, 0xf0],
             echo(proto::cmd::TRANSFER, &[0x01, 0x01]),
         ];
         let mut dap = Dap::new(Mock::new(replies));
         dap.init_mem().unwrap();
+        let requests: Vec<u8> = dap.transport.sent.iter().map(|packet| packet[3]).collect();
+        assert_eq!(
+            requests,
+            [
+                proto::dp_write(0x0),
+                proto::dp_write(0x8),
+                proto::dp_read(0x4),
+                proto::dp_write(0x4),
+                proto::dp_read(0x4),
+                proto::ap_write(0x0)
+            ]
+        );
     }
 
     #[test]
@@ -1954,5 +2380,358 @@ mod tests {
         assert_eq!(&dap.transport.sent[5][4..8], &comp0.to_le_bytes());
         assert_eq!(&dap.transport.sent[7][4..8], &comp1.to_le_bytes());
         assert_eq!(&dap.transport.sent[11][4..8], &0u32.to_le_bytes());
+    }
+
+
+    /// `CTRL/STAT.CDBGPWRUPREQ` and `CTRL/STAT.CSYSPWRUPREQ` (ADIv5.2, IHI 0031G, B2.2.3).
+    const DEBUG_POWER: u32 = 1 << 28;
+    const SYSTEM_POWER: u32 = 1 << 30;
+
+    /// One debug port on a model bus: its identity, its `SELECT`, and `CTRL/STAT`'s writable bits.
+    #[derive(Clone, Copy, Debug)]
+    struct BusPort {
+        target_id: u32,
+        dpidr: u32,
+        select: u32,
+        ctrl_stat: u32,
+    }
+
+    impl BusPort {
+        const fn new(target_id: u32, dpidr: u32) -> BusPort {
+            BusPort { target_id, dpidr, select: 0, ctrl_stat: 0 }
+        }
+
+        const fn found(mut self, ctrl_stat: u32) -> BusPort {
+            self.ctrl_stat = ctrl_stat;
+            self
+        }
+    }
+
+    /// A lone debug port, as most parts have.
+    const ONE_PORT: BusPort = BusPort::new(0, 0x0bb1_1477);
+    /// An RP2040's three ports on its one bus, at their documented addresses (RP2040 datasheet, 2.3.4).
+    const CORE_0: BusPort = BusPort::new(0x0100_2927, 0x0bc1_2477);
+    const CORE_1: BusPort = BusPort::new(0x1100_2927, 0x0bc1_2477);
+    const RESCUE: BusPort = BusPort::new(0xf100_2927, 0x1021_2927);
+
+    /// What a [`Bus`] holds.
+    struct BusState {
+        ports: Vec<BusPort>,
+        /// The port the wire reaches: the first after a line reset, as a lone port answers and as an
+        /// RP2040's core 0 does; after a `TARGETSEL`, the port it named, if any.
+        reaching: Option<usize>,
+        /// Every write to a port's register `0x4`: the port, the `DPBANKSEL` it landed in, and the word.
+        register_4: Vec<(usize, u32, u32)>,
+        targetsel: Vec<u32>,
+        sent: Vec<Vec<u8>>,
+        /// How many packets the probe takes before it stops answering.
+        answers: usize,
+        replies: std::collections::VecDeque<Vec<u8>>,
+    }
+
+    /// A model SWD bus behind a CMSIS-DAP probe, answering every command from each port's `SELECT` and
+    /// `CTRL/STAT`. It is shared, so a test can look at it after the `Dap` that drove it is gone.
+    #[derive(Clone)]
+    struct Bus(std::rc::Rc<std::cell::RefCell<BusState>>);
+
+    impl Bus {
+        fn new(ports: &[BusPort]) -> Bus {
+            Bus(std::rc::Rc::new(std::cell::RefCell::new(BusState {
+                ports: ports.to_vec(),
+                reaching: Some(0),
+                register_4: Vec::new(),
+                targetsel: Vec::new(),
+                sent: Vec::new(),
+                answers: usize::MAX,
+                replies: std::collections::VecDeque::new(),
+            })))
+        }
+
+        /// The words written to port `at`'s `CTRL/STAT`, which is its register `0x4` in bank 0.
+        fn ctrl_stat_writes(&self, at: usize) -> Vec<u32> {
+            let state = self.0.borrow();
+            state.register_4.iter().filter(|write| (write.0, write.1) == (at, 0)).map(|write| write.2).collect()
+        }
+
+        /// The power requests port `at` holds now.
+        fn requests(&self, at: usize) -> u32 {
+            self.0.borrow().ports[at].ctrl_stat & (DEBUG_POWER | SYSTEM_POWER)
+        }
+
+        fn sent(&self) -> Vec<Vec<u8>> {
+            self.0.borrow().sent.clone()
+        }
+    }
+
+    impl BusState {
+        fn transfer(&mut self, request: u8, value: Option<u32>) -> Vec<u8> {
+            const OK: u8 = 0b001;
+            const NO_ACK: u8 = 0b111;
+            let word = |word: u32| {
+                let mut reply = vec![proto::cmd::TRANSFER, 1, OK];
+                reply.extend_from_slice(&word.to_le_bytes());
+                reply
+            };
+            let Some(at) = self.reaching else {
+                return vec![proto::cmd::TRANSFER, 0, NO_ACK];
+            };
+            let port = &mut self.ports[at];
+            let register = request & 0x0c;
+            let bank = port.select & 0xf;
+            match (request & 1 != 0, value) {
+                (false, None) => word(match (register, bank) {
+                    (0x0, _) => port.dpidr,
+                    (0x4, 0) => port.ctrl_stat | ((port.ctrl_stat & (DEBUG_POWER | SYSTEM_POWER)) << 1),
+                    (0x4, 2) => port.target_id,
+                    _ => 0,
+                }),
+                (false, Some(value)) => {
+                    match register {
+                        0x4 => {
+                            self.register_4.push((at, bank, value));
+                            if bank == 0 {
+                                port.ctrl_stat = value & 0x57ff_ff0d;
+                            }
+                        }
+                        0x8 => port.select = value,
+                        _ => {}
+                    }
+                    vec![proto::cmd::TRANSFER, 1, OK]
+                }
+                (true, None) => word(0),
+                (true, Some(_)) => vec![proto::cmd::TRANSFER, 1, OK],
+            }
+        }
+    }
+
+    impl Transport for Bus {
+        fn write_packet(&mut self, data: &[u8]) -> Result<(), TransportError> {
+            let mut state = self.0.borrow_mut();
+            state.sent.push(data.to_vec());
+            if state.sent.len() > state.answers {
+                return Err(TransportError("the probe stopped answering".into()));
+            }
+            let reply = match data[0] {
+                proto::cmd::INFO if data[1] == 0xff => vec![proto::cmd::INFO, 2, 0x40, 0x00],
+                proto::cmd::INFO => vec![proto::cmd::INFO, 0],
+                proto::cmd::CONNECT => vec![proto::cmd::CONNECT, data[1]],
+                id @ (proto::cmd::DISCONNECT
+                | proto::cmd::SWJ_CLOCK
+                | proto::cmd::SWD_CONFIGURE
+                | proto::cmd::TRANSFER_CONFIGURE) => vec![id, proto::DAP_OK],
+                proto::cmd::SWJ_SEQUENCE => {
+                    if data[1] >= 50 && data[2..].iter().all(|&byte| byte == 0xff) {
+                        state.reaching = Some(0);
+                    }
+                    vec![proto::cmd::SWJ_SEQUENCE, proto::DAP_OK]
+                }
+                proto::cmd::SWD_SEQUENCE => {
+                    let id = u32::from_le_bytes([data[6], data[7], data[8], data[9]]);
+                    state.targetsel.push(id);
+                    state.reaching = state.ports.iter().position(|port| port.target_id == id);
+                    vec![proto::cmd::SWD_SEQUENCE, proto::DAP_OK, 0xff]
+                }
+                proto::cmd::TRANSFER => {
+                    let request = data[3];
+                    let value = (request & 0b10 == 0).then(|| u32::from_le_bytes([data[4], data[5], data[6], data[7]]));
+                    state.transfer(request, value)
+                }
+                _ => vec![proto::INVALID_COMMAND],
+            };
+            state.replies.push_back(reply);
+            Ok(())
+        }
+
+        fn read_packet(&mut self, buf: &mut [u8]) -> Result<usize, TransportError> {
+            let reply = self.0.borrow_mut().replies.pop_front().ok_or_else(|| TransportError("nothing was asked".into()))?;
+            buf[..reply.len()].copy_from_slice(&reply);
+            Ok(reply.len())
+        }
+    }
+
+    /// A session on `bus` with the wire up and the port's `DPIDR` read.
+    fn opened(bus: &Bus) -> Dap<Bus> {
+        let mut dap = Dap::new(bus.clone());
+        dap.connect_swd().unwrap();
+        dap.read_idcode().unwrap();
+        dap
+    }
+
+    fn dp_read_packet(register: u8) -> Vec<u8> {
+        proto::transfer_one(proto::dp_read(register), None)
+    }
+
+    fn dp_write_packet(register: u8, value: u32) -> Vec<u8> {
+        proto::transfer_one(proto::dp_write(register), Some(value))
+    }
+
+    /// **A SESSION GIVES BACK THE POWER REQUESTS IT RAISED, WHETHER IT IS RELEASED OR DROPPED:** a port
+    /// found with neither request is left with neither. Both ways of powering a port up are covered: this
+    /// crate's own memory setup, and the shared ADIv5 bridge's, which is how a flash route powers a port
+    /// up before it drops the probe. A release disconnects after the give-back; a drop does not.
+    #[test]
+    fn a_session_gives_back_the_power_requests_it_raised_whether_it_is_released_or_dropped() {
+        use lamella_probe_core::{ArmDap, TargetAccess};
+        /// A session on a bus, with its port powered up.
+        type PoweredUp = fn(&Bus) -> Dap<Bus>;
+        let ours: PoweredUp = |bus| {
+            let mut dap = opened(bus);
+            dap.init_mem().unwrap();
+            dap
+        };
+        let bridge: PoweredUp = |bus| {
+            let mut target = ArmDap::new(Dap::new(bus.clone()));
+            TargetAccess::connect(&mut target).unwrap();
+            TargetAccess::init_mem(&mut target).unwrap();
+            target.into_inner()
+        };
+        for (shape, power_up) in [("Dap::init_mem", ours), ("ArmDap", bridge)] {
+            for released in [true, false] {
+                let bus = Bus::new(&[ONE_PORT]);
+                let mut dap = power_up(&bus);
+                if released {
+                    dap.release().unwrap();
+                }
+                drop(dap);
+                assert_eq!(bus.ctrl_stat_writes(0), [DEBUG_POWER | SYSTEM_POWER, 0], "{shape}, released {released}");
+                assert_eq!(bus.requests(0), 0, "{shape}, released {released}");
+                let disconnected = bus.sent().last() == Some(&proto::disconnect().to_vec());
+                assert_eq!(disconnected, released, "{shape}, released {released}");
+            }
+        }
+    }
+
+    /// **A REQUEST THE PORT WAS FOUND WITH IS LEFT AS FOUND, AND ONLY WHAT THE SESSION RAISED IS
+    /// LOWERED:** an earlier session can leave a request set, and the release puts back what was found,
+    /// not a cleared word.
+    #[test]
+    fn a_request_the_port_was_found_with_is_left_as_found() {
+        let bus = Bus::new(&[ONE_PORT.found(DEBUG_POWER | SYSTEM_POWER)]);
+        let mut dap = opened(&bus);
+        dap.init_mem().unwrap();
+        dap.release().unwrap();
+        assert_eq!(bus.ctrl_stat_writes(0), [DEBUG_POWER | SYSTEM_POWER], "nothing to give back");
+        assert_eq!(bus.requests(0), DEBUG_POWER | SYSTEM_POWER);
+
+        let bus = Bus::new(&[ONE_PORT.found(DEBUG_POWER)]);
+        let mut dap = opened(&bus);
+        dap.init_mem().unwrap();
+        dap.release().unwrap();
+        assert_eq!(bus.ctrl_stat_writes(0), [DEBUG_POWER | SYSTEM_POWER, DEBUG_POWER]);
+        assert_eq!(bus.requests(0), DEBUG_POWER);
+    }
+
+    /// **THE GIVE-BACK REACHES `CTRL/STAT` WHATEVER BANK THE SESSION LEFT SELECTED:** register `0x4` is
+    /// `CTRL/STAT` only while `SELECT.DPBANKSEL` is 0 (IHI 0031G, B2.2.9), so a session that ends in
+    /// another bank has bank 0 put back first, and nothing lands in the other bank's register.
+    #[test]
+    fn the_give_back_reaches_ctrl_stat_whatever_bank_the_session_left_selected() {
+        let bus = Bus::new(&[ONE_PORT]);
+        let mut dap = opened(&bus);
+        dap.init_mem().unwrap();
+        DapAccess::write_dp(&mut dap, 0x8, 0x2).unwrap();
+        DapAccess::read_dp(&mut dap, 0x4).unwrap();
+        dap.release().unwrap();
+        assert_eq!(bus.0.borrow().register_4, [(0, 0, DEBUG_POWER | SYSTEM_POWER), (0, 0, 0)]);
+        assert_eq!(bus.0.borrow().ports[0].select & 0xf, 0);
+        assert_eq!(bus.requests(0), 0);
+    }
+
+    /// **ON A MULTIDROP BUS THE REQUEST IS GIVEN BACK ON THE PORT THAT GOT IT,** reached as it was reached
+    /// then: by its `TARGETSEL`, or, for a port a session reached with none, by a line reset alone. Every
+    /// other port is left as it was found. Modeled on an RP2040, whose cores and rescue port share a bus.
+    #[test]
+    fn on_a_multidrop_bus_the_request_is_given_back_on_the_port_that_got_it() {
+        let bus = Bus::new(&[CORE_0, CORE_1, RESCUE]);
+        let mut dap = opened(&bus);
+        assert_eq!(dap.select_multidrop_target(CORE_0.target_id).unwrap(), CORE_0.dpidr);
+        dap.init_mem().unwrap();
+        assert_eq!(dap.select_multidrop_target(CORE_1.target_id).unwrap(), CORE_1.dpidr);
+        dap.release().unwrap();
+        assert_eq!(bus.ctrl_stat_writes(0), [DEBUG_POWER | SYSTEM_POWER, 0]);
+        assert!(bus.ctrl_stat_writes(1).is_empty() && bus.ctrl_stat_writes(2).is_empty());
+        assert_eq!(bus.0.borrow().targetsel, [CORE_0.target_id, CORE_1.target_id, CORE_0.target_id]);
+        assert_eq!(bus.requests(0), 0);
+
+        let bus = Bus::new(&[CORE_0, CORE_1, RESCUE]);
+        let mut dap = opened(&bus);
+        dap.init_mem().unwrap();
+        dap.select_multidrop_target(CORE_1.target_id).unwrap();
+        dap.release().unwrap();
+        assert_eq!(bus.ctrl_stat_writes(0), [DEBUG_POWER | SYSTEM_POWER, 0]);
+        assert!(bus.ctrl_stat_writes(1).is_empty() && bus.ctrl_stat_writes(2).is_empty());
+        assert_eq!(bus.0.borrow().targetsel, [CORE_1.target_id], "a line reset reaches the port again");
+    }
+
+    /// **ON A RESCUE PORT A RELEASE NEVER MAKES A HOLD, AND ENDS ONE THIS SESSION MADE.** A debug power
+    /// request on an RP2040's rescue port holds the chip in reset for as long as it stays set (RP2040
+    /// datasheet, 2.3.4.2 and 2.12.1). A release only ever lowers a request, so one the session found set
+    /// and lowered stays lowered, and one it raised there is lowered too.
+    #[test]
+    fn on_a_rescue_port_a_release_never_makes_a_hold_and_ends_one_this_session_made() {
+        let bus = Bus::new(&[CORE_0, CORE_1, RESCUE.found(DEBUG_POWER)]);
+        let mut dap = opened(&bus);
+        dap.select_multidrop_target(RESCUE.target_id).unwrap();
+        DapAccess::write_dp(&mut dap, 0x8, 0).unwrap();
+        assert_eq!(DapAccess::read_dp(&mut dap, 0x4).unwrap() & DEBUG_POWER, DEBUG_POWER, "found holding");
+        DapAccess::write_dp(&mut dap, 0x4, 0).unwrap();
+        dap.release().unwrap();
+        assert_eq!(bus.ctrl_stat_writes(2), [0], "the release writes no request back");
+        assert_eq!(bus.requests(2), 0);
+
+        let bus = Bus::new(&[CORE_0, CORE_1, RESCUE]);
+        let mut dap = opened(&bus);
+        dap.select_multidrop_target(RESCUE.target_id).unwrap();
+        DapAccess::write_dp(&mut dap, 0x8, 0).unwrap();
+        DapAccess::write_dp(&mut dap, 0x4, DEBUG_POWER).unwrap();
+        dap.release().unwrap();
+        assert_eq!(bus.ctrl_stat_writes(2), [DEBUG_POWER, 0]);
+        assert_eq!(bus.requests(2), 0);
+        assert!(bus.ctrl_stat_writes(0).is_empty() && bus.ctrl_stat_writes(1).is_empty());
+    }
+
+    /// **A SESSION THAT READ `CTRL/STAT` BEFORE IT RAISED A REQUEST IS SENT NO SECOND READ, AND ONE THAT
+    /// ONLY READ IT IS SENT NOTHING FOR IT AT ITS RELEASE:** what a port held is learned from the session's
+    /// own first read where there is one.
+    #[test]
+    fn a_session_that_read_ctrl_stat_first_is_sent_no_extra_read() {
+        let disconnect = proto::disconnect().to_vec();
+        let bus = Bus::new(&[ONE_PORT]);
+        let mut dap = opened(&bus);
+        let before = bus.sent().len();
+        DapAccess::write_dp(&mut dap, 0x8, 0).unwrap();
+        DapAccess::read_dp(&mut dap, 0x4).unwrap();
+        dap.release().unwrap();
+        assert_eq!(bus.sent()[before..], [dp_write_packet(0x8, 0), dp_read_packet(0x4), disconnect.clone()]);
+
+        let bus = Bus::new(&[ONE_PORT]);
+        let mut dap = opened(&bus);
+        let before = bus.sent().len();
+        DapAccess::write_dp(&mut dap, 0x8, 0).unwrap();
+        DapAccess::read_dp(&mut dap, 0x4).unwrap();
+        DapAccess::write_dp(&mut dap, 0x4, DEBUG_POWER).unwrap();
+        DapAccess::write_dp(&mut dap, 0x4, 0).unwrap();
+        dap.release().unwrap();
+        assert_eq!(
+            bus.sent()[before..],
+            [dp_write_packet(0x8, 0), dp_read_packet(0x4), dp_write_packet(0x4, DEBUG_POWER), dp_write_packet(0x4, 0), disconnect]
+        );
+    }
+
+    /// **A PROBE THAT STOPS ANSWERING ENDS THE GIVE-BACK AT ONCE:** after a command the probe did not
+    /// carry, no other give-back is sent, so a session whose probe has gone waits out one timeout for it
+    /// rather than one a port, and the disconnect is still tried.
+    #[test]
+    fn a_probe_that_stops_answering_ends_the_give_back_at_once() {
+        let bus = Bus::new(&[CORE_0, CORE_1, RESCUE]);
+        let mut dap = opened(&bus);
+        dap.select_multidrop_target(CORE_0.target_id).unwrap();
+        dap.init_mem().unwrap();
+        dap.select_multidrop_target(CORE_1.target_id).unwrap();
+        dap.init_mem().unwrap();
+        let answered = bus.sent().len();
+        bus.0.borrow_mut().answers = answered;
+        assert!(dap.release().is_err());
+        assert_eq!(bus.sent()[answered..], [dp_write_packet(0x4, 0), proto::disconnect().to_vec()]);
     }
 }

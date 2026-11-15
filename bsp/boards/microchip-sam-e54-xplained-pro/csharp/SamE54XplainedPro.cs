@@ -87,9 +87,9 @@ namespace Lamella.Boards.Microchip
                 MicrochipSamE54XplainedProBindings.EXT1_I2C_CORE_CLOCK_HZ);
         }
 
-        /// <summary>The logical bus id of EXT1's I2C (SDA PA22, SCL PA23, on SERCOM3), as
-        /// <c>I2cConnectionSettings</c> names it.</summary>
-        public const int Ext1I2cBusId = 0;
+        /// <summary>The bus id of EXT1's I2C (SDA PA22, SCL PA23), as <c>I2cConnectionSettings</c>
+        /// names it: 3, the number of SERCOM3, the block that serves it.</summary>
+        public const int Ext1I2cBusId = 3;
 
         private static I2cDriver MakeExt1I2c() { return new Same54I2cDriver(MakeExt1I2cBinding()); }
 

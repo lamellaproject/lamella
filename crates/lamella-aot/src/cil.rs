@@ -1179,6 +1179,7 @@ fn lower_with_source(
     local_types: &[MirType],
     returns: Returns,
     narrowing: Narrowing<'_>,
+    kind: crate::BuildKind,
 ) -> Result<(Function, CilSourceMap), CilError> {
     let code = &body.code;
     refuse_non_reference_ldind(code, arg_types, local_types, narrowing.pointees)?;
@@ -1236,6 +1237,7 @@ fn lower_with_source(
         list.retain(|&pred| reachable[pred]);
     }
     let (used_args, local_count) = scan_slots(code);
+    let described_locals = local_types.len().max(local_count);
     let arg_count = used_args.max(arg_types.len());
 
     let mut arg_written = alloc::vec![false; arg_count];
@@ -1644,7 +1646,7 @@ fn lower_with_source(
         }
 
         let known_local = |slot: usize, v: Option<ValueId>| -> Option<ValueId> {
-            if mem_elem.get(slot).copied().flatten().is_some() {
+            if mem_elem.get(slot).copied().flatten().is_some() && !kind.is_debug() {
                 None
             } else {
                 v
@@ -1751,10 +1753,13 @@ fn lower_with_source(
             }
         }
         let mut terminator: Option<Terminator> = None;
+        let mut statement: Option<(usize, bool)> = None;
         let mut segment: Option<usize> = None;
         let mut last_local_addr: Option<PendingAddr> = None;
 
         let mut pending_constrained: Option<Operand> = None;
+
+        let mut tested_receivers: Vec<ValueId> = Vec::new();
 
         if b == 0 {
             for n in 0..arg_count {
@@ -1778,6 +1783,15 @@ fn lower_with_source(
                     },
                 ));
                 arg_cells[n] = Some(cell);
+            }
+            if kind.is_debug() {
+                for n in 0..local_count {
+                    if mem_elem.get(n).copied().flatten().is_some()
+                        && locals.get(n).copied().flatten().is_none()
+                    {
+                        addr_base(AddrOf::Local(n), &mut locals, local_types, &args, &mut value_types, &mut insts)?;
+                    }
+                }
             }
             while il_index.len() < insts.len() {
                 il_index.push(byte_offsets[start]);
@@ -1841,8 +1855,114 @@ fn lower_with_source(
         }
 
         for i in start..end {
+            let empty = stack.is_empty() && last_local_addr.is_none() && pending_constrained.is_none();
+            if kind.is_debug() && (empty || (i == start && current_exception.is_some())) {
+                if let Some((at, false)) = statement {
+                    let placeholder = new_value(&mut value_types, MirType::I32);
+                    insts.push((placeholder, Inst::Nop));
+                    il_index.push(byte_offsets[at]);
+                }
+                statement = Some((i, false));
+            }
             let inst = &code[i];
             let is_last = i + 1 == end;
+            if let Some(operands) = constrained_reference_operands(code, i, resolver) {
+                dereference_constrained_receiver(
+                    operands,
+                    &mut last_local_addr,
+                    &mut stack,
+                    &mut locals,
+                    local_types,
+                    &args,
+                    &mut value_types,
+                    &mut insts,
+                )?;
+                while il_index.len() < insts.len() {
+                    il_index.push(byte_offsets[i]);
+                }
+            }
+            if let Some(operands) = null_receiver_operands(code, i, resolver)
+                && last_local_addr.map(|held| recorded_slot(&held, stack.len(), operands))
+                    != Some(RecordedSlot::Deepest)
+            {
+                take_recorded_operand(
+                    &mut last_local_addr,
+                    operands,
+                    false,
+                    &mut stack,
+                    &mut locals,
+                    local_types,
+                    &args,
+                    &mut value_types,
+                    &mut insts,
+                )?;
+                while il_index.len() < insts.len() {
+                    il_index.push(byte_offsets[i]);
+                }
+                let receiver = stack
+                    .len()
+                    .checked_sub(operands)
+                    .and_then(|at| stack.get(at).copied())
+                    .ok_or(CilError::StackUnderflow)?;
+                let untested = value_types.get(receiver.index()) == Some(&MirType::ObjectRef)
+                    && !tested_receivers.contains(&receiver);
+                if untested {
+                    tested_receivers.push(receiver);
+                }
+                if untested && throw_clauses[b].is_empty() && finally_protect[b].is_none() {
+                    let tested = new_value(&mut value_types, MirType::I32);
+                    insts.push((tested, Inst::NullCheck { object: receiver }));
+                    while il_index.len() < insts.len() {
+                        il_index.push(byte_offsets[i]);
+                    }
+                } else if untested {
+                    let continuation = split_blocks.len();
+                    split_blocks.push(BasicBlock {
+                        params: Vec::new(),
+                        insts: Vec::new(),
+                        terminator: None,
+                    });
+                    let check = build_trap_access_check(
+                        original_block_count + continuation,
+                        TrapKind::NullRef,
+                        &[receiver],
+                        &throw_clauses[b],
+                        &catch_clauses,
+                        &handler_block_of_clause,
+                        finally_protect[b],
+                        finally_is_innermost[b],
+                        &finally_handler_block,
+                        resolver,
+                        &locals,
+                        local_count,
+                        local_types,
+                        &mut value_types,
+                        &mut insts,
+                        &mut split_blocks,
+                        original_block_count,
+                        &mut propagate_fixups,
+                    )?;
+                    while il_index.len() < insts.len() {
+                        il_index.push(byte_offsets[i]);
+                    }
+                    close_segment_at_check(
+                        check,
+                        continuation,
+                        &mut segment,
+                        &block_params[b],
+                        &locals,
+                        &known_local,
+                        &mut insts,
+                        &mut il_index,
+                        &mut prev_locals,
+                        &mut segment_changes,
+                        &mut mir_blocks,
+                        &mut source_map,
+                        &mut split_blocks,
+                        &mut split_source,
+                    );
+                }
+            }
             let before = insts.len();
             if is_last
                 && (control_flow::branch_kind(inst.opcode).is_some()
@@ -2043,6 +2163,11 @@ fn lower_with_source(
             for _ in before..insts.len() {
                 il_index.push(byte_offsets[i]);
             }
+            if insts.len() > before {
+                if let Some((_, made)) = statement.as_mut() {
+                    *made = true;
+                }
+            }
 
             for slot in 0..local_count {
                 let now = known_local(slot, locals[slot]);
@@ -2103,42 +2228,28 @@ fn lower_with_source(
                     if_false: BlockId((original_block_count + continuation) as u32),
                     false_args: Vec::new(),
                 };
-                let done = core::mem::take(&mut insts);
-                let done_map = core::mem::take(&mut il_index);
-                prev_locals = locals
-                    .iter()
-                    .enumerate()
-                    .map(|(slot, &v)| known_local(slot, v))
-                    .collect();
-                let restated: Vec<(u32, u16, Option<ValueId>)> = prev_locals
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(slot, &v)| Some((0u32, u16::try_from(slot).ok()?, Some(v?))))
-                    .collect();
-                let done_locals = core::mem::replace(&mut segment_changes, restated);
-                match segment {
-                    None => {
-                        mir_blocks.push(BasicBlock {
-                            params: block_params[b].clone(),
-                            insts: done,
-                            terminator: Some(check),
-                        });
-                        source_map.push((done_map, done_locals));
-                    }
-                    Some(slot) => {
-                        split_blocks[slot] = BasicBlock {
-                            params: Vec::new(),
-                            insts: done,
-                            terminator: Some(check),
-                        };
-                        if split_source.len() <= slot {
-                            split_source.resize(slot + 1, (Vec::new(), Vec::new()));
-                        }
-                        split_source[slot] = (done_map, done_locals);
-                    }
-                }
-                segment = Some(continuation);
+                close_segment_at_check(
+                    check,
+                    continuation,
+                    &mut segment,
+                    &block_params[b],
+                    &locals,
+                    &known_local,
+                    &mut insts,
+                    &mut il_index,
+                    &mut prev_locals,
+                    &mut segment_changes,
+                    &mut mir_blocks,
+                    &mut source_map,
+                    &mut split_blocks,
+                    &mut split_source,
+                );
             }
+        }
+        if let Some((at, false)) = statement {
+            let placeholder = new_value(&mut value_types, MirType::I32);
+            insts.push((placeholder, Inst::Nop));
+            il_index.push(byte_offsets[at]);
         }
 
         let terminator = match terminator {
@@ -2279,6 +2390,15 @@ fn lower_with_source(
         }
     }
 
+    let zero_until_stored: Vec<u16> = if body.init_locals {
+        (0..described_locals)
+            .filter(|&slot| kind.is_debug() || mem_elem.get(slot).copied().flatten().is_none())
+            .filter_map(|slot| u16::try_from(slot).ok())
+            .collect()
+    } else {
+        Vec::new()
+    };
+
     let function = Function {
         params: (0..arg_count)
             .map(|i| arg_types.get(i).copied().unwrap_or(MirType::I32))
@@ -2294,6 +2414,7 @@ fn lower_with_source(
             rows,
             local_changes,
             arg_values,
+            zero_until_stored,
         },
     ))
 }
@@ -2326,8 +2447,10 @@ pub struct CilSourceMap {
     /// An index of `block.insts.len()` is legal and means "from the terminator onward".
     ///
     /// A `None` value means the lowering cannot describe that slot from here on, not that the
-    /// local is dead. An ADDRESS-TAKEN local is `None` throughout -- the lowering's own slot holds
-    /// its backing CELL, and passing that on would give this local's name to another's storage.
+    /// local is dead. In a Release build an ADDRESS-TAKEN local is `None` throughout -- the
+    /// lowering's own slot holds its backing CELL, and passing that on would give this local's name
+    /// to another's storage. A Debug build lays the cell at the method's entry and spills it, so the
+    /// cell's frame slot is the local's home for the whole method, and the cell is recorded.
     pub local_changes: Vec<Vec<(u32, u16, Option<ValueId>)>>,
     /// `arg_values[i]` is the MIR value argument `i` holds for the WHOLE method, or `None` where the
     /// lowering cannot say that.
@@ -2339,6 +2462,16 @@ pub struct CilSourceMap {
     /// program is talking about has moved to a promoted local or into a memory cell. Reporting it
     /// would be a confidently wrong answer rather than a stale one.
     pub arg_values: Vec<Option<ValueId>>,
+    /// The CIL local slots that hold zero until the method first stores to them: every local of a
+    /// method whose header sets `localsinit` (ECMA-335 II.25.4.4), which C# compilers set, except,
+    /// in a Release build, an address-taken one, which [`Self::local_changes`] does not describe
+    /// either. Empty for a method that does not set the flag, whose locals start with whatever the
+    /// stack held.
+    ///
+    /// A block entered with no value recorded for such a slot -- no entry at index 0 of its
+    /// [`Self::local_changes`] -- holds that zero until the slot's first change in the block, which
+    /// is what lets a debugger show the zero there instead of nothing.
+    pub zero_until_stored: Vec<u16>,
 }
 
 impl CilSourceMap {
@@ -2389,6 +2522,7 @@ impl CilSourceMap {
             rows,
             local_changes,
             arg_values: self.arg_values.clone(),
+            zero_until_stored: self.zero_until_stored.clone(),
         }
     }
 }
@@ -2396,14 +2530,14 @@ impl CilSourceMap {
 /// Lowers an integer [`MethodBodyImage`] to a MIR [`Function`]. See
 /// [`lower_method_debug`] for the accompanying [`CilSourceMap`].
 pub fn lower_method(body: &MethodBodyImage) -> Result<Function, CilError> {
-    lower_with_source(body, &NoCalls, &[], &[], Returns::FromBody, Narrowing::default())
+    lower_with_source(body, &NoCalls, &[], &[], Returns::FromBody, Narrowing::default(), crate::BuildKind::Release)
         .map(|(function, _)| function)
 }
 
 /// Lowers a method body, also returning the [`CilSourceMap`] tying each MIR
 /// instruction back to the CIL instruction it came from.
 pub fn lower_method_debug(body: &MethodBodyImage) -> Result<(Function, CilSourceMap), CilError> {
-    lower_with_source(body, &NoCalls, &[], &[], Returns::FromBody, Narrowing::default())
+    lower_with_source(body, &NoCalls, &[], &[], Returns::FromBody, Narrowing::default(), crate::BuildKind::Release)
 }
 
 /// Lowers a method body that makes calls, using `resolver` to map each `call`'s token to
@@ -2413,13 +2547,15 @@ pub fn lower_method_debug_with(
     body: &MethodBodyImage,
     resolver: &dyn CallResolver,
 ) -> Result<(Function, CilSourceMap), CilError> {
-    lower_with_source(body, resolver, &[], &[], Returns::FromBody, Narrowing::default())
+    lower_with_source(body, resolver, &[], &[], Returns::FromBody, Narrowing::default(), crate::BuildKind::Release)
 }
 
 /// Lowers a method body with explicit parameter and local types (mapped from the method's
 /// signature and local-variable signature), so `int64`, value-type, and other non-`int32`
 /// slots type correctly instead of defaulting to `int32`. A slot with no supplied type
 /// defaults to `int32`. The function's result type is `returns`, from the same signature.
+///
+/// The body is lowered as a Release build lowers it; [`lower_method_typed_as`] takes the kind.
 pub fn lower_method_typed(
     body: &MethodBodyImage,
     resolver: &dyn CallResolver,
@@ -2428,7 +2564,34 @@ pub fn lower_method_typed(
     returns: Returns,
     narrowing: Narrowing<'_>,
 ) -> Result<(Function, CilSourceMap), CilError> {
-    lower_with_source(body, resolver, arg_types, local_types, returns, narrowing)
+    lower_method_typed_as(
+        body,
+        resolver,
+        arg_types,
+        local_types,
+        returns,
+        narrowing,
+        crate::BuildKind::Release,
+    )
+}
+
+/// [`lower_method_typed`] for a build of `kind`.
+///
+/// A [`BuildKind::Debug`](crate::BuildKind::Debug) build gives every statement an instruction of
+/// its own, an [`Inst::Nop`] where the statement's IL makes no code (an opening brace's `nop`, a
+/// method's closing brace at its `ret`), so each sequence point the compiler wrote has an address.
+/// It also lays every address-taken local's cell at the method's entry and describes the local by
+/// it. A Release build lowers as [`lower_method_typed`] does.
+pub fn lower_method_typed_as(
+    body: &MethodBodyImage,
+    resolver: &dyn CallResolver,
+    arg_types: &[MirType],
+    local_types: &[MirType],
+    returns: Returns,
+    narrowing: Narrowing<'_>,
+    kind: crate::BuildKind,
+) -> Result<(Function, CilSourceMap), CilError> {
+    lower_with_source(body, resolver, arg_types, local_types, returns, narrowing, kind)
 }
 
 /// What a method's signature says it returns, which the lowering makes the function's result type.
@@ -6439,7 +6602,8 @@ enum TrapKind {
         rank: usize,
     },
     /// A field load, or an array's length, on an object from the stack: `base == 0` ->
-    /// `NullReferenceException`.
+    /// `NullReferenceException`. A `callvirt`'s receiver takes the same test, laid at the call rather
+    /// than leading a block ([`null_receiver_operands`]).
     NullRef,
     /// `unbox T` / `unbox.any T`: the boxed value's TypeDesc must be one of the ACCEPTED descriptors
     /// -> `InvalidCastException`.
@@ -6572,6 +6736,145 @@ fn array_length_leader(code: &[Instruction], i: usize, resolver: &dyn CallResolv
             matches!(next.opcode, Opcode::Call | Opcode::Callvirt)
                 && resolver.array_length_read(&next.operand)
         })
+}
+
+/// How many values a `callvirt` at `code[i]` takes, its receiver included, when that receiver is
+/// tested for null before the call; `None` for any other instruction.
+///
+/// ECMA-335 III.4.2: `callvirt` raises NullReferenceException when its object is null, after the
+/// arguments are evaluated and before the method runs -- for a non-virtual method as for a virtual or
+/// an interface one, which is why C# calls an instance method on a reference through it. No backend
+/// tests a call's receiver, so the lowering lays the test at every such call, inside a try or not.
+///
+/// NOT TESTED, because something else already answers for the receiver: after a `constrained.` prefix
+/// at a value type it is a managed pointer, never null (at a reference type the object it holds has
+/// been read out of it, and that is tested as any receiver is: [`dereference_constrained_receiver`]);
+/// a delegate's `Invoke` tests its delegate where it dispatches; a rectangular array's accessor
+/// carries its own check, and so does `array.GetLength(<constant>)`, whose constant leads it
+/// ([`array_length_leader`]). Nor is a receiver the instruction just before pushed when it cannot be
+/// null: a `newobj` result or a string literal, the call taking no other argument.
+fn null_receiver_operands(
+    code: &[Instruction],
+    i: usize,
+    resolver: &dyn CallResolver,
+) -> Option<usize> {
+    let inst = code.get(i)?;
+    if inst.opcode != Opcode::Callvirt {
+        return None;
+    }
+    let previous = i.checked_sub(1).and_then(|p| code.get(p)).map(|p| p.opcode);
+    if (previous == Some(Opcode::Constrained)
+        && constrained_reference_operands(code, i, resolver).is_none())
+        || resolver.delegate_invoke_args(&inst.operand).is_some()
+        || rectangular_access(resolver, &inst.operand).is_some()
+        || resolver.array_length_read(&inst.operand)
+    {
+        return None;
+    }
+    let info = resolver.resolve(&inst.operand)?;
+    if !info.has_this || info.args == 0 {
+        return None;
+    }
+    if info.args == 1 && matches!(previous, Some(Opcode::Newobj | Opcode::Ldstr)) {
+        return None;
+    }
+    Some(info.args)
+}
+
+/// How many values a `callvirt` at `code[i]` takes, its receiver included, when a `constrained.` prefix
+/// names a REFERENCE type: the receiver is then a reference to the object the call is made on
+/// ([`dereference_constrained_receiver`]). `None` for any other instruction.
+///
+/// [`CallResolver::box_is_noop`] judges the type, as it does where the call decides it has an object to
+/// call on and nothing to box, so the two cannot disagree about one.
+fn constrained_reference_operands(
+    code: &[Instruction],
+    i: usize,
+    resolver: &dyn CallResolver,
+) -> Option<usize> {
+    let inst = code.get(i)?;
+    let prefix = code.get(i.checked_sub(1)?)?;
+    if inst.opcode != Opcode::Callvirt
+        || prefix.opcode != Opcode::Constrained
+        || !resolver.box_is_noop(&prefix.operand)
+    {
+        return None;
+    }
+    let info = resolver
+        .constrained_call(&prefix.operand, &inst.operand)
+        .or_else(|| resolver.resolve(&inst.operand))?;
+    (info.has_this && info.args > 0).then_some(info.args)
+}
+
+/// Puts the OBJECT a `constrained.` call at a reference type is made on where its receiver sits, in
+/// place of the managed pointer CIL passes, and returns it. ECMA-335 III.2.1: when `thisType` is a
+/// reference type, the pointer is dereferenced and the object passed as `this` -- which is also what
+/// makes a null one raise NullReferenceException, as any `callvirt` on null does.
+///
+/// The receiver is the deepest of the call's `operands` values, read the way
+/// [`box_constrained_receiver`] reads a value type's: a recorded `ldloca`/`ldarga` is its base at its
+/// offset -- a reference local's or argument's own value at offset 0, a field of a struct local past
+/// that -- and an address on the stack (an `ldflda`, an `ldelema`, an address-taken local's cell) is
+/// read at zero. A record that is not the receiver is put where the call itself would put it
+/// ([`take_recorded_operand`]).
+#[allow(clippy::too_many_arguments)]
+fn dereference_constrained_receiver(
+    operands: usize,
+    last_local_addr: &mut Option<PendingAddr>,
+    stack: &mut Vec<ValueId>,
+    locals: &mut [Option<ValueId>],
+    local_types: &[MirType],
+    args: &[ValueId],
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+) -> Result<ValueId, CilError> {
+    if let Some(held) = take_recorded_operand(
+        last_local_addr,
+        operands,
+        true,
+        stack,
+        locals,
+        local_types,
+        args,
+        value_types,
+        insts,
+    )? {
+        let base = addr_base(held.source, locals, local_types, args, value_types, insts)?;
+        let object =
+            if held.offset == 0 && value_types.get(base.index()) == Some(&MirType::ObjectRef) {
+                base
+            } else {
+                let loaded = new_value(value_types, MirType::ObjectRef);
+                insts.push((
+                    loaded,
+                    Inst::FieldLoad {
+                        base,
+                        offset: held.offset,
+                    },
+                ));
+                loaded
+            };
+        stack.insert(held.depth.min(stack.len()), object);
+        return Ok(object);
+    }
+    let at = stack
+        .len()
+        .checked_sub(operands)
+        .ok_or(CilError::StackUnderflow)?;
+    let address = stack[at];
+    if value_types.get(address.index()) == Some(&MirType::ObjectRef) {
+        return Ok(address);
+    }
+    let object = new_value(value_types, MirType::ObjectRef);
+    insts.push((
+        object,
+        Inst::FieldLoad {
+            base: address,
+            offset: 0,
+        },
+    ));
+    stack[at] = object;
+    Ok(object)
 }
 
 /// The check a `castclass` to `operand` makes, or `None` where this lowering has none to make.
@@ -7889,6 +8192,72 @@ fn object_is_null(
     is_null
 }
 
+/// The locals a segment rebinds, as `(MIR instruction index within the segment, slot, value)`.
+type LocalChanges = Vec<(u32, u16, Option<ValueId>)>;
+
+/// Ends the segment of a CIL block being built at a check laid in its MIDDLE -- the post-call
+/// exception check, or a call's receiver test -- and makes the reserved split block `continuation`
+/// the segment built next, which is the rest of the block.
+///
+/// The first segment keeps the block's own id and parameters, which every edge into the block
+/// names; a later one fills the slot reserved for it when the previous split happened. Either way
+/// it keeps the local changes recorded against ITS instruction numbering, and the continuation
+/// starts over, restating the locals in force as its own index-0 entries. The continuation takes no
+/// parameters: it is dominated by the segment it continues, so it reads every value where it is.
+#[allow(clippy::too_many_arguments)]
+fn close_segment_at_check(
+    check: Terminator,
+    continuation: usize,
+    segment: &mut Option<usize>,
+    params: &[ValueId],
+    locals: &[Option<ValueId>],
+    known_local: &dyn Fn(usize, Option<ValueId>) -> Option<ValueId>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    il_index: &mut Vec<u32>,
+    prev_locals: &mut Vec<Option<ValueId>>,
+    segment_changes: &mut LocalChanges,
+    mir_blocks: &mut Vec<BasicBlock>,
+    source_map: &mut Vec<(Vec<u32>, LocalChanges)>,
+    split_blocks: &mut [BasicBlock],
+    split_source: &mut Vec<(Vec<u32>, LocalChanges)>,
+) {
+    let done = core::mem::take(insts);
+    let done_map = core::mem::take(il_index);
+    *prev_locals = locals
+        .iter()
+        .enumerate()
+        .map(|(slot, &v)| known_local(slot, v))
+        .collect();
+    let restated: LocalChanges = prev_locals
+        .iter()
+        .enumerate()
+        .filter_map(|(slot, &v)| Some((0u32, u16::try_from(slot).ok()?, Some(v?))))
+        .collect();
+    let done_locals = core::mem::replace(segment_changes, restated);
+    match *segment {
+        None => {
+            mir_blocks.push(BasicBlock {
+                params: params.to_vec(),
+                insts: done,
+                terminator: Some(check),
+            });
+            source_map.push((done_map, done_locals));
+        }
+        Some(slot) => {
+            split_blocks[slot] = BasicBlock {
+                params: Vec::new(),
+                insts: done,
+                terminator: Some(check),
+            };
+            if split_source.len() <= slot {
+                split_source.resize(slot + 1, (Vec::new(), Vec::new()));
+            }
+            split_source[slot] = (done_map, done_locals);
+        }
+    }
+    *segment = Some(continuation);
+}
+
 /// Builds the check that leads a block beginning with a may-trap access: the failure test that `kind`
 /// names, over `operands` (the access's own operands, read off that block's entry stack); a route
 /// that raises the builtin exception on failure, to the enclosing handler or through the protecting
@@ -9155,6 +9524,24 @@ fn build_condition(
     }
 }
 
+/// Whether an instruction of `code` names argument `index`: loads it, stores it, or takes its address.
+/// A body for which this is false cannot observe the value passed in that argument.
+pub(crate) fn names_argument(code: &[Instruction], index: u16) -> bool {
+    code.iter().any(|instruction| match instruction.opcode {
+        Opcode::Ldarg0 => index == 0,
+        Opcode::Ldarg1 => index == 1,
+        Opcode::Ldarg2 => index == 2,
+        Opcode::Ldarg3 => index == 3,
+        Opcode::LdargS
+        | Opcode::Ldarg
+        | Opcode::StargS
+        | Opcode::Starg
+        | Opcode::LdargaS
+        | Opcode::Ldarga => matches!(instruction.operand, Operand::Variable(n) if n == index),
+        _ => false,
+    })
+}
+
 /// Scans a method body for the highest argument and local slot it references, to
 /// size the entry parameters and the locals table.
 fn scan_slots(code: &[Instruction]) -> (usize, usize) {
@@ -10036,6 +10423,38 @@ mod tests {
     use super::*;
 
     #[test]
+    fn names_argument_sees_a_load_a_store_and_an_address_of_that_argument_only() {
+        let simple = |opcode| [Instruction::simple(opcode), Instruction::simple(Opcode::Ret)];
+        assert!(!names_argument(&[Instruction::simple(Opcode::Ret)], 0));
+        assert!(names_argument(&simple(Opcode::Ldarg0), 0));
+        assert!(!names_argument(&simple(Opcode::Ldarg0), 1));
+        for (opcode, index) in [
+            (Opcode::Ldarg1, 1),
+            (Opcode::Ldarg2, 2),
+            (Opcode::Ldarg3, 3),
+        ] {
+            assert!(names_argument(&simple(opcode), index));
+            assert!(!names_argument(&simple(opcode), 0));
+        }
+        for opcode in [
+            Opcode::LdargS,
+            Opcode::Ldarg,
+            Opcode::StargS,
+            Opcode::Starg,
+            Opcode::LdargaS,
+            Opcode::Ldarga,
+        ] {
+            let at = |n| [Instruction::new(opcode, Operand::Variable(n))];
+            assert!(names_argument(&at(0), 0), "{opcode:?} of argument 0");
+            assert!(!names_argument(&at(1), 0), "{opcode:?} of argument 1");
+        }
+        assert!(!names_argument(
+            &[Instruction::new(Opcode::LdlocS, Operand::Variable(0))],
+            0
+        ));
+    }
+
+    #[test]
     fn a_source_map_follows_a_pass_that_expands_an_instruction() {
         let map = CilSourceMap {
             rows: vec![vec![10, 20, 30]],
@@ -10045,6 +10464,7 @@ mod tests {
                 (3, 2, None),
             ]],
             arg_values: vec![Some(ValueId(5))],
+            zero_until_stored: vec![0, 2],
         };
         let expanded = map.expanded(&[vec![0, 1, 1, 1, 2]]);
         assert_eq!(expanded.rows, vec![vec![10, 20, 20, 20, 30]]);
@@ -10404,7 +10824,8 @@ mod tests {
     /// the receiver, so the call's arguments are the receiver and then the two operands in stack
     /// order. Asserted for each way an instance call lowers (a direct call, a vtable slot, an itable
     /// tag, another assembly's method, and a `constrained.` call on a type that declares the method),
-    /// with the address before and after the scalar, below a value left on the stack.
+    /// with the address before and after the scalar, below a value left on the stack. A `callvirt` on
+    /// an object tests it for null ahead of the call, and the address is materialized before that.
     #[test]
     fn a_ref_local_passed_to_an_instance_method_is_an_argument_not_the_receiver() {
         use lamella_token::Token;
@@ -10438,6 +10859,9 @@ mod tests {
             }
             fn constrained_call(&self, _: &Operand, method: &Operand) -> Option<CallInfo> {
                 (self.0 == Dispatch::Constrained).then(|| self.resolve(method)).flatten()
+            }
+            fn builtin_exception_tag(&self, _: &str, _: &str) -> Option<u32> {
+                Some(0x00C0_FFEE)
             }
         }
         let reading = MirType::ValueType {
@@ -10514,6 +10938,14 @@ mod tests {
                     alloc::vec![receiver, five, address]
                 };
                 assert_eq!(call_args, expected, "{case}: the receiver, then the stack's order");
+                let tested = insts
+                    .iter()
+                    .any(|(_, i)| matches!(i, Inst::NullCheck { object } if *object == receiver));
+                let callvirt_on_an_object = matches!(
+                    dispatch,
+                    Dispatch::Virtual | Dispatch::Interface | Dispatch::External
+                );
+                assert_eq!(tested, callvirt_on_an_object, "{case}: the receiver test");
             }
         }
     }
@@ -10546,6 +10978,9 @@ mod tests {
             }
             fn field_offset(&self, _: &Operand) -> Option<u32> {
                 Some(4)
+            }
+            fn builtin_exception_tag(&self, _: &str, _: &str) -> Option<u32> {
+                Some(0x00C0_FFEE)
             }
         }
         let label = MirType::ValueType {
@@ -11225,6 +11660,340 @@ mod tests {
         assert!(
             read.is_some(),
             "p.f = default: `p.X` is read back from the same slot"
+        );
+    }
+
+    /// A `callvirt` tests its receiver for null BEFORE the call (ECMA-335 III.4.2), in one of two
+    /// shapes. With no try around it the test is an `Inst::NullCheck` just ahead of the call, in the
+    /// same block: the backend's compare and branch to the function's one stub. Inside a protected try
+    /// the failure must reach the handler, so the segment ends at a check whose failure edge raises
+    /// NullReferenceException there. A receiver that cannot be null is not tested -- a `newobj` result
+    /// or a string literal, the call taking nothing else -- nor is one behind a `constrained.` prefix,
+    /// which is an address.
+    #[test]
+    fn a_callvirt_tests_its_receiver_before_the_call() {
+        use lamella_token::Token;
+        struct Method(usize);
+        impl CallResolver for Method {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: self.0,
+                    has_result: true,
+                    result_type: Some(MirType::I32),
+                    has_this: true,
+                    target: CallTarget::Internal(6),
+                })
+            }
+            fn virtual_slot(&self, _: &Operand) -> Option<usize> {
+                Some(5)
+            }
+            fn builtin_exception_tag(&self, _: &str, name: &str) -> Option<u32> {
+                (name == "NullReferenceException").then_some(0x0000_4E52)
+            }
+            fn exception_tag(&self, _: &Operand) -> Option<u32> {
+                Some(0x0000_CA7C)
+            }
+            fn is_catch_all_type(&self, _: &Operand) -> bool {
+                true
+            }
+        }
+        let callvirt = Instruction::new(Opcode::Callvirt, Operand::Token(Token::new(0x0A, 2)));
+        let pushed_by = |opcode: Opcode, args: usize| {
+            let code = [Instruction::simple(opcode), callvirt.clone()];
+            null_receiver_operands(&code, 1, &Method(args))
+        };
+        assert_eq!(
+            pushed_by(Opcode::Ldarg1, 1),
+            Some(1),
+            "an argument can be null"
+        );
+        assert_eq!(pushed_by(Opcode::Newobj, 1), None, "a new object cannot");
+        assert_eq!(
+            pushed_by(Opcode::Ldstr, 1),
+            None,
+            "nor can a string literal"
+        );
+        assert_eq!(
+            pushed_by(Opcode::Newobj, 2),
+            Some(2),
+            "a new object ABOVE the receiver is an argument"
+        );
+        assert_eq!(
+            pushed_by(Opcode::Constrained, 1),
+            None,
+            "a `constrained.` receiver is an address"
+        );
+
+        let lower = |code: Vec<Instruction>, handlers: Vec<EhClause>| {
+            let body = MethodBodyImage {
+                max_stack: 2,
+                init_locals: true,
+                local_var_sig: None,
+                code: code.into_boxed_slice(),
+                handlers: handlers.into_boxed_slice(),
+            };
+            let (func, _) = lower_method_typed(
+                &body,
+                &Method(1),
+                &[MirType::ObjectRef],
+                &[],
+                Returns::FromBody,
+                Narrowing::default(),
+            )
+            .unwrap();
+            assert!(lamella_ir::verify(&func).is_ok());
+            func
+        };
+        let raises_from_a_block = |func: &Function| {
+            func.blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .any(|(_, i)| matches!(i, Inst::ConstInt { value: 0x4E52, .. }))
+        };
+
+        let func = lower(
+            vec![
+                Instruction::simple(Opcode::Ldarg0),
+                callvirt.clone(),
+                Instruction::simple(Opcode::Ret),
+            ],
+            Vec::new(),
+        );
+        let entry = &func.blocks[func.entry.index()];
+        let receiver = entry.params[0];
+        let position =
+            |wanted: &dyn Fn(&Inst) -> bool| entry.insts.iter().position(|(_, i)| wanted(i));
+        let test = position(&|i| matches!(i, Inst::NullCheck { object } if *object == receiver));
+        let call = position(&|i| matches!(i, Inst::CallVirtual { slot: 5, .. }));
+        assert!(
+            matches!((test, call), (Some(t), Some(c)) if t < c),
+            "the receiver is tested just ahead of the call, in its block: {test:?}, {call:?}"
+        );
+        assert!(
+            !raises_from_a_block(&func),
+            "the raise is the backend's stub, not a block of this function's"
+        );
+
+        let func = lower(
+            vec![
+                Instruction::simple(Opcode::Ldarg0),
+                callvirt.clone(),
+                Instruction::simple(Opcode::Pop),
+                Instruction::simple(Opcode::Ldarg0),
+                callvirt.clone(),
+                Instruction::simple(Opcode::Ret),
+            ],
+            Vec::new(),
+        );
+        let tests = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|(_, i)| matches!(i, Inst::NullCheck { .. }))
+            .count();
+        assert_eq!(
+            tests, 1,
+            "a value that passed the test is not null later in its block"
+        );
+
+        let func = lower(
+            vec![
+                Instruction::simple(Opcode::Ldarg0),
+                callvirt,
+                Instruction::simple(Opcode::Pop),
+                Instruction::new(Opcode::Leave, Operand::Target(6)),
+                Instruction::simple(Opcode::Pop),
+                Instruction::new(Opcode::Leave, Operand::Target(6)),
+                Instruction::simple(Opcode::LdcI40),
+                Instruction::simple(Opcode::Ret),
+            ],
+            vec![EhClause {
+                try_range: lamella_cil::InstructionRange { start: 0, end: 4 },
+                handler_range: lamella_cil::InstructionRange { start: 4, end: 6 },
+                kind: EhKind::Catch(Token::new(0x01, 1)),
+            }],
+        );
+        let receiver = func.blocks[func.entry.index()].params[0];
+        let insts: Vec<&(ValueId, Inst)> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        assert!(
+            insts.iter().any(
+                |(_, i)| matches!(i, Inst::Compare { op: CmpOp::Eq, lhs, .. } if *lhs == receiver)
+            ),
+            "the receiver is compared with null ahead of the call"
+        );
+        assert!(
+            raises_from_a_block(&func),
+            "the failure edge raises NullReferenceException, routed to the handler"
+        );
+        assert!(
+            !insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::NullCheck { .. })),
+            "a stub that returns would skip the handler"
+        );
+    }
+
+    /// The address a `callvirt`'s receiver test materializes for an `out` argument is mapped to the
+    /// call's offset even where the receiver needs no test, so every block keeps one source row per
+    /// instruction: `o.Read(out a); o.Read(out b);` tests `o` once, and the second call's `&b` is mapped
+    /// all the same. Unmapped, its segment comes out short and every later row of it takes its
+    /// neighbor's offset.
+    #[test]
+    fn a_receiver_tested_once_keeps_one_source_row_per_instruction() {
+        use lamella_token::Token;
+        struct Read;
+        impl CallResolver for Read {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 2,
+                    has_result: true,
+                    result_type: Some(MirType::I32),
+                    has_this: true,
+                    target: CallTarget::Internal(6),
+                })
+            }
+            fn virtual_slot(&self, _: &Operand) -> Option<usize> {
+                Some(5)
+            }
+        }
+        let pair = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(3),
+            size: 8,
+            refs: lamella_ir::RefWords::NONE,
+        };
+        let read = Instruction::new(Opcode::Callvirt, Operand::Token(Token::new(0x0A, 2)));
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: true,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                read.clone(),
+                Instruction::simple(Opcode::Pop),
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(1)),
+                read,
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, source) = lower_method_typed(
+            &body,
+            &Read,
+            &[MirType::ObjectRef],
+            &[pair, pair],
+            Returns::FromBody,
+            Narrowing::default(),
+        )
+        .unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let tests = func
+            .blocks
+            .iter()
+            .flat_map(|b| &b.insts)
+            .filter(|(_, i)| matches!(i, Inst::NullCheck { .. }))
+            .count();
+        assert_eq!(tests, 1, "`o` is tested at its first call only");
+        let second = func
+            .blocks
+            .iter()
+            .rposition(|b| {
+                b.insts
+                    .iter()
+                    .any(|(_, i)| matches!(i, Inst::CallVirtual { .. }))
+            })
+            .expect("the second call");
+        assert!(
+            !source.rows[second].is_empty(),
+            "the second call's segment is mapped"
+        );
+        for (b, block) in func.blocks.iter().enumerate() {
+            let rows = source.rows[b].len();
+            assert!(
+                rows == 0 || rows == block.insts.len(),
+                "block {b}: {rows} source rows for {} instructions",
+                block.insts.len()
+            );
+        }
+    }
+
+    /// A `constrained.` call at a REFERENCE type is made on the object its byref holds (ECMA-335 III.2.1):
+    /// the field's address an `ldflda` leaves is read, and the object read is what the call dispatches on
+    /// and what the receiver test tests. Taken as the object itself, the field's address was dispatched
+    /// on, so `Field.ToString()` in a `Holder<string>` answered the holder's type name.
+    #[test]
+    fn a_constrained_call_at_a_reference_type_calls_on_the_object_its_byref_holds() {
+        use lamella_token::Token;
+        struct Reference;
+        impl CallResolver for Reference {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 1,
+                    has_result: true,
+                    result_type: Some(MirType::ObjectRef),
+                    has_this: true,
+                    target: CallTarget::Internal(6),
+                })
+            }
+            fn virtual_slot(&self, _: &Operand) -> Option<usize> {
+                Some(5)
+            }
+            fn field_offset(&self, _: &Operand) -> Option<u32> {
+                Some(8)
+            }
+            fn box_is_noop(&self, _: &Operand) -> bool {
+                true
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 1,
+            init_locals: true,
+            local_var_sig: None,
+            code: vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::Ldflda, Operand::Token(Token::new(0x04, 1))),
+                Instruction::new(Opcode::Constrained, Operand::Token(Token::new(0x1B, 1))),
+                Instruction::new(Opcode::Callvirt, Operand::Token(Token::new(0x0A, 2))),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        let (func, _) = lower_method_typed(
+            &body,
+            &Reference,
+            &[MirType::ObjectRef],
+            &[],
+            Returns::FromBody,
+            Narrowing::default(),
+        )
+        .unwrap();
+        assert!(lamella_ir::verify(&func).is_ok());
+        let insts: Vec<&(ValueId, Inst)> = func.blocks.iter().flat_map(|b| &b.insts).collect();
+        let field = insts
+            .iter()
+            .find_map(|(id, i)| matches!(i, Inst::FieldAddr { offset: 8, .. }).then_some(*id))
+            .expect("the field's address");
+        let object = insts
+            .iter()
+            .find_map(|(id, i)| {
+                matches!(i, Inst::FieldLoad { base, offset: 0 } if *base == field).then_some(*id)
+            })
+            .expect("the object is read out of the field");
+        assert_eq!(func.value_type(object), Some(MirType::ObjectRef));
+        assert!(
+            insts
+                .iter()
+                .any(|(_, i)| matches!(i, Inst::NullCheck { object: tested } if *tested == object)),
+            "the object is tested for null"
+        );
+        assert!(
+            insts.iter().any(|(_, i)| {
+                matches!(i, Inst::CallVirtual { slot: 5, args, .. } if args.first() == Some(&object))
+            }),
+            "the call dispatches on the object, not on the field's address"
         );
     }
 
@@ -15569,6 +16338,9 @@ mod tests {
         }
         fn virtual_slot(&self, _operand: &Operand) -> Option<usize> {
             Some(3)
+        }
+        fn builtin_exception_tag(&self, _: &str, _: &str) -> Option<u32> {
+            Some(0x00C0_FFEE)
         }
     }
 

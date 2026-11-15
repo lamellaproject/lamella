@@ -1040,6 +1040,138 @@ pub struct BootloaderLayout {
     pub source: String,
 }
 
+/// Where a board keeps its stored settings (`[stored_settings]`): a span of one of its flash
+/// regions, kept as slots of one erase unit each, so one slot can be erased while another holds what
+/// it replaces. No deploy and no firmware update of Lamella's writes the span.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StoredSettings {
+    /// The flash region it lies in, by its `[[memory]]` name.
+    pub memory: String,
+    /// Where it starts, in bytes from the start of that region: a whole number of erase units.
+    pub offset: i64,
+    /// How many bytes it spans: [`Self::slots`] erase units.
+    pub size: i64,
+    /// The span the region's flash erases at once, which is one slot.
+    pub erase_unit: i64,
+    /// How many slots it holds.
+    pub slots: i64,
+    /// Where the claim is stated. Required, as every board fact is.
+    pub source: String,
+}
+
+/// Refuses a `[stored_settings]` record that cannot be checked or does not describe a place a
+/// writer can use: every number stated, at least two slots of one erase unit each, starting on an
+/// erase unit, inside a flash region the board states.
+fn check_stored_settings(table: &BoardTable, record: &StoredSettings) -> Result<(), String> {
+    let board = &table.board;
+    if record.source.is_empty() {
+        return Err(format!(
+            "board {board}: a [stored_settings] record must be SOURCE-CITED -- where a board keeps its stored settings is a claim about its flash, and an uncited one cannot be checked"
+        ));
+    }
+    if record.memory.is_empty() {
+        return Err(format!("board {board}: a [stored_settings] record states no memory -- the flash region it lies in"));
+    }
+    for (name, value) in [("offset", record.offset), ("size", record.size), ("erase_unit", record.erase_unit), ("slots", record.slots)] {
+        let missing = if name == "offset" { value < 0 } else { value <= 0 };
+        if missing {
+            return Err(format!("board {board}: a [stored_settings] record states no {name}"));
+        }
+    }
+    if record.slots < 2 {
+        return Err(format!(
+            "board {board}: [stored_settings] states {} slot(s) -- at least two, so one can be erased while another holds what it replaces",
+            record.slots
+        ));
+    }
+    if record.size != record.slots * record.erase_unit {
+        return Err(format!(
+            "board {board}: [stored_settings] spans {:#x} bytes, not its {} slots of {:#x}",
+            record.size, record.slots, record.erase_unit
+        ));
+    }
+    if record.offset % record.erase_unit != 0 {
+        return Err(format!(
+            "board {board}: [stored_settings] starts at {:#x}, not a whole number of erase units of {:#x}",
+            record.offset, record.erase_unit
+        ));
+    }
+    let Some(region) = table.memory.iter().find(|region| region.name == record.memory && region.kind == "flash") else {
+        return Err(format!("board {board}: [stored_settings] names no flash region named '{}'", record.memory));
+    };
+    if record.offset + record.size > region.size {
+        return Err(format!(
+            "board {board}: [stored_settings] at {:#x} for {:#x} bytes runs past the end of flash region '{}' ({:#x} bytes)",
+            record.offset, record.size, region.name, region.size
+        ));
+    }
+    Ok(())
+}
+
+/// Where a board keeps a flash region a board package writes beside a program (`[flash_region]`),
+/// such as its radio's firmware: a span of one of its flash regions, a whole number of erase units
+/// long and starting on one. A `flash-region` record is written only at the place this states.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FlashRegion {
+    /// The flash region it lies in, by its `[[memory]]` name.
+    pub memory: String,
+    /// Where it starts, in bytes from the start of that region: a whole number of erase units.
+    pub offset: i64,
+    /// How many bytes it spans: a whole number of erase units.
+    pub size: i64,
+    /// The span the region's flash erases at once.
+    pub erase_unit: i64,
+    /// Where the claim is stated. Required, as every board fact is.
+    pub source: String,
+}
+
+/// Refuses a `[flash_region]` record that cannot be checked or does not describe a place a writer
+/// can use: every number stated, whole erase units from an erase unit, inside a flash region the
+/// board states, and clear of the board's stored settings.
+fn check_flash_region(table: &BoardTable, record: &FlashRegion) -> Result<(), String> {
+    let board = &table.board;
+    if record.source.is_empty() {
+        return Err(format!(
+            "board {board}: a [flash_region] record must be SOURCE-CITED -- where a board keeps a flash region is a claim about its flash, and an uncited one cannot be checked"
+        ));
+    }
+    if record.memory.is_empty() {
+        return Err(format!("board {board}: a [flash_region] record states no memory -- the flash region it lies in"));
+    }
+    for (name, value) in [("offset", record.offset), ("size", record.size), ("erase_unit", record.erase_unit)] {
+        let missing = if name == "offset" { value < 0 } else { value <= 0 };
+        if missing {
+            return Err(format!("board {board}: a [flash_region] record states no {name}"));
+        }
+    }
+    if record.offset % record.erase_unit != 0 || record.size % record.erase_unit != 0 {
+        return Err(format!(
+            "board {board}: [flash_region] at {:#x} for {:#x} bytes is not whole erase units of {:#x} from one",
+            record.offset, record.size, record.erase_unit
+        ));
+    }
+    let Some(region) = table.memory.iter().find(|region| region.name == record.memory && region.kind == "flash") else {
+        return Err(format!("board {board}: [flash_region] names no flash region named '{}'", record.memory));
+    };
+    if record.offset + record.size > region.size {
+        return Err(format!(
+            "board {board}: [flash_region] at {:#x} for {:#x} bytes runs past the end of flash region '{}' ({:#x} bytes)",
+            record.offset, record.size, region.name, region.size
+        ));
+    }
+    if let Some(settings) = &table.stored_settings
+        && settings.memory == record.memory
+        && record.offset < settings.offset + settings.size
+        && settings.offset < record.offset + record.size
+    {
+        return Err(format!(
+            "board {board}: [flash_region] at {:#x} for {:#x} bytes overlaps [stored_settings] at {:#x} for {:#x} bytes",
+            record.offset, record.size, settings.offset, settings.size
+        ));
+    }
+    Ok(())
+}
+
 /// The builds a board's C# interpreter firmware can take.
 ///
 /// `speed` is the workspace's `flash-speed` profile: the interpreter's own crates are optimized for
@@ -1328,6 +1460,12 @@ pub struct BoardTable {
     pub bootloader: Option<BootloaderLayout>,
     /// How the board's C# interpreter firmware is built. `None` means the file states no choice.
     pub interpreter: Option<InterpreterBuild>,
+    /// Where the board keeps its stored settings, such as the network it joins. `None` means the
+    /// file states no place, and nothing writes stored settings to the board.
+    pub stored_settings: Option<StoredSettings>,
+    /// Where the board keeps a flash region a board package writes beside a program. `None` means
+    /// the file states no place, and no region is written to the board.
+    pub flash_region: Option<FlashRegion>,
 }
 
 impl BoardTable {
@@ -3859,6 +3997,10 @@ fn build_board(
         Bootloader,
         /// How its C# interpreter firmware is built (`[csharp_interpreter]`).
         Interpreter,
+        /// Where it keeps its stored settings (`[stored_settings]`).
+        StoredSettings,
+        /// Where it keeps a flash region a board package writes (`[flash_region]`).
+        FlashRegion,
     }
     let mut at = At::None;
     let mut memory_source_cited = false;
@@ -3910,6 +4052,29 @@ fn build_board(
                 }
                 table.interpreter = Some(InterpreterBuild::default());
                 at = At::Interpreter;
+            }
+            Item::Section(name) if name == "stored_settings" => {
+                if table.stored_settings.is_some() {
+                    return Err(err(
+                        *line,
+                        "a board states [stored_settings] once -- where it keeps its stored settings is one \
+                         place, and a second section would be a second answer to it",
+                    ));
+                }
+                table.stored_settings =
+                    Some(StoredSettings { offset: -1, size: -1, erase_unit: -1, slots: -1, ..StoredSettings::default() });
+                at = At::StoredSettings;
+            }
+            Item::Section(name) if name == "flash_region" => {
+                if table.flash_region.is_some() {
+                    return Err(err(
+                        *line,
+                        "a board states [flash_region] once -- where it keeps the region is one place, and a \
+                         second section would be a second answer to it",
+                    ));
+                }
+                table.flash_region = Some(FlashRegion { offset: -1, size: -1, erase_unit: -1, ..FlashRegion::default() });
+                at = At::FlashRegion;
             }
             Item::ArraySection(name) if name == "bindings" => {
                 table.bindings.push(build_binding(*line));
@@ -4107,6 +4272,43 @@ fn build_board(
                                 *line,
                                 &format!(
                                     "unexpected csharp_interpreter key '{other}' -- a csharp_interpreter record takes optimization"
+                                ),
+                            ));
+                        }
+                    }
+                }
+                At::StoredSettings => {
+                    let record = table.stored_settings.as_mut().expect("open stored_settings record");
+                    match (key.as_str(), value) {
+                        ("memory", RawValue::Str(s)) => record.memory = s.clone(),
+                        ("offset", RawValue::Int(i)) => record.offset = i.value,
+                        ("size", RawValue::Int(i)) => record.size = i.value,
+                        ("erase_unit", RawValue::Int(i)) => record.erase_unit = i.value,
+                        ("slots", RawValue::Int(i)) => record.slots = i.value,
+                        ("source", RawValue::Str(s)) => record.source = s.clone(),
+                        (other, _) => {
+                            return Err(err(
+                                *line,
+                                &format!(
+                                    "unexpected stored_settings key '{other}' -- a stored_settings record takes memory/offset/size/erase_unit/slots/source"
+                                ),
+                            ));
+                        }
+                    }
+                }
+                At::FlashRegion => {
+                    let record = table.flash_region.as_mut().expect("open flash_region record");
+                    match (key.as_str(), value) {
+                        ("memory", RawValue::Str(s)) => record.memory = s.clone(),
+                        ("offset", RawValue::Int(i)) => record.offset = i.value,
+                        ("size", RawValue::Int(i)) => record.size = i.value,
+                        ("erase_unit", RawValue::Int(i)) => record.erase_unit = i.value,
+                        ("source", RawValue::Str(s)) => record.source = s.clone(),
+                        (other, _) => {
+                            return Err(err(
+                                *line,
+                                &format!(
+                                    "unexpected flash_region key '{other}' -- a flash_region record takes memory/offset/size/erase_unit/source"
                                 ),
                             ));
                         }
@@ -4395,6 +4597,12 @@ fn build_board(
                 INTERPRETER_BUILDS.join("/")
             ));
         }
+    }
+    if let Some(record) = &table.stored_settings {
+        check_stored_settings(&table, record)?;
+    }
+    if let Some(record) = &table.flash_region {
+        check_flash_region(&table, record)?;
     }
     for (at, region) in table.memory.iter().enumerate() {
         if region.name.is_empty() {
@@ -5854,6 +6062,14 @@ pub struct TargetBoardFacts {
     pub spi: Vec<SpiBusFacts>,
 }
 
+/// The slice whose output the RP2350's GPIO `line` carries (datasheet 12.5.2, Table 1130): GPIO0 to GPIO15
+/// are slices 0 to 7, A then B, GPIO16 to GPIO31 the same again, GPIO32 to GPIO39 slices 8 to 11, and
+/// GPIO40 to GPIO47 those again.
+#[must_use]
+pub fn rp2350_pwm_slice(line: i64) -> i64 {
+    if line < 32 { (line / 2) % 8 } else { 8 + ((line - 32) / 2) % 4 }
+}
+
 /// The chip's name as its maker writes it, from the part id: upper case, as `rp2350a` is the
 /// RP2350A and `stm32f769ni` the STM32F769NI, but for the two makers whose names are not: Nordic's
 /// `nRF51822` and Espressif's `ESP32-C6`.
@@ -5905,20 +6121,19 @@ fn spi_rate_range(family: &str, board: &str, plan: Option<&Plan>) -> Result<(i64
     }
 }
 
-/// A bus's number as `Lamella.Hardware.TargetBoard` and the driver table give it: on the RP2350 the
-/// block number its instance ends in (the bus table's numbering); on a family with one bus of a kind
-/// per board, 0, the id its board class binds it at.
-fn facts_bus_number(family: &str, board: &str, binding: &Binding, of_kind: usize) -> Result<i64, String> {
-    if family == "rp2350" {
-        return bus_number(board, &binding.instance).map(i64::from);
+/// A bus's number as `Lamella.Hardware.TargetBoard` and the driver table give it, on every family:
+/// the block number its instance ends in (`sercom3` is bus 3, `spi1` bus 1), which is the id its
+/// board class binds it at. Two bindings of a kind on one block would be one bus listed twice, so
+/// that is refused.
+fn facts_bus_number(board: &str, binding: &Binding, listed: &[i64]) -> Result<i64, String> {
+    let number = i64::from(bus_number(board, &binding.instance)?);
+    if listed.contains(&number) {
+        return Err(format!(
+            "{board}: {} binding '{}' is on block {number}, as another {} binding is, and one block is one bus",
+            binding.kind, binding.role, binding.kind
+        ));
     }
-    if of_kind == 1 {
-        return Ok(0);
-    }
-    Err(format!(
-        "{board}: binds {of_kind} {} buses on the {family} family, whose bus numbers this generator does not state",
-        binding.kind
-    ))
+    Ok(number)
 }
 
 /// The pin names a part's `pins` list states, each range expanded: `PA12-PA15` is PA12 to PA15, and
@@ -6031,13 +6246,12 @@ pub fn target_board_facts(set: &FamilySet, resolved: &ResolvedBoard) -> Result<T
         }
         Ok(number)
     };
-    let i2c_count = resolved.bindings.iter().filter(|b| b.kind == "i2c").count();
-    let spi_count = resolved.bindings.iter().filter(|b| b.kind == "spi").count();
     for binding in &resolved.bindings {
         let signal = |name: &str| binding.pins.iter().find(|(signal, _)| signal == name).map(|(_, pin)| pin);
         match binding.kind.as_str() {
             "i2c" => {
-                let bus = facts_bus_number(family, board, binding, i2c_count)?;
+                let listed: Vec<i64> = facts.i2c.iter().map(|bus| bus.number).collect();
+                let bus = facts_bus_number(board, binding, &listed)?;
                 let mut entry = I2cBusFacts { number: bus, sda: None, scl: None };
                 for (name, flag) in [("sda", pin_function::I2C_SDA), ("scl", pin_function::I2C_SCL)] {
                     let Some(pin) = signal(name) else {
@@ -6051,7 +6265,8 @@ pub fn target_board_facts(set: &FamilySet, resolved: &ResolvedBoard) -> Result<T
                 facts.i2c.push(entry);
             }
             "spi" => {
-                let bus = facts_bus_number(family, board, binding, spi_count)?;
+                let listed: Vec<i64> = facts.spi.iter().map(|bus| bus.number).collect();
+                let bus = facts_bus_number(board, binding, &listed)?;
                 let (min_hz, max_hz) = spi_rate_range(family, board, plan)?;
                 let mut entry = SpiBusFacts { number: bus, sck: None, mosi: None, miso: None, selects: Vec::new(), min_hz, max_hz };
                 for (name, flag) in [
@@ -9954,6 +10169,8 @@ struct BoardEmissions {
     samd21_adcs: Vec<Samd21AdcEmission>,
     samd21_pwms: Vec<Samd21PwmEmission>,
     rp2350_pwms: Vec<Rp2350PwmEmission>,
+    /// How many PWM chips an RP2350 board's part has ([`rp2350_pwm_chips`]); 0 on another family.
+    rp2350_pwm_chips: i64,
     pl022_spis: Vec<SpiPl022Emission>,
     st_spis: Vec<StSpiEmission>,
     nrf_twis: Vec<NrfTwiEmission>,
@@ -9962,6 +10179,27 @@ struct BoardEmissions {
     dw_i2cs: Vec<DwI2cEmission>,
     rp_adcs: Vec<RpAdcEmission>,
     rp_clocks: Vec<RpClockEmission>,
+}
+
+/// How many PWM chips an RP2350 part has, PWM chip n being slice n: the slices its pins carry by
+/// [`rp2350_pwm_slice`], 8 on the RP2350A's GP0 to GP29 and 12 on the RP2350B's GP0 to GP47. 0 for a
+/// part that does not state its whole pin set, whose count this cannot read.
+fn rp2350_pwm_chips(set: &FamilySet, resolved: &ResolvedBoard) -> Result<i64, String> {
+    let board = &resolved.board.board;
+    let part = set
+        .parts
+        .rows
+        .iter()
+        .find(|row| row.part == resolved.part)
+        .ok_or_else(|| format!("{board}: part '{}' is not in parts.toml", resolved.part))?;
+    if !part.pins_complete {
+        return Ok(0);
+    }
+    let mut chips = 0;
+    for name in expand_part_pins(board, &part.pins)? {
+        chips = chips.max(rp2350_pwm_slice(logical_pin(&set.family, board, &name)?) + 1);
+    }
+    Ok(chips)
 }
 
 /// The driver family a role's bound instance belongs to: `<family>-<block>`.
@@ -10101,6 +10339,7 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
         samd21_adcs: Vec::new(),
         samd21_pwms: Vec::new(),
         rp2350_pwms: Vec::new(),
+        rp2350_pwm_chips: 0,
         pl022_spis: Vec::new(),
         st_spis: Vec::new(),
         nrf_twis: Vec::new(),
@@ -10211,6 +10450,9 @@ fn resolve_board_emissions(set: &FamilySet, resolved: &ResolvedBoard) -> Result<
     refuse_colliding_interrupts(&resolved.board.board, &emissions.st_interrupts)?;
     refuse_shared_timer_clocks(&resolved.board.board, &set.instances, &resolved.bindings, &emissions.samd21_pwms)?;
     refuse_shared_slices(&resolved.board.board, &emissions.rp2350_pwms)?;
+    if set.family == "rp2350" {
+        emissions.rp2350_pwm_chips = rp2350_pwm_chips(set, resolved)?;
+    }
     Ok(emissions)
 }
 
@@ -10287,6 +10529,7 @@ pub fn emit_board_csharp(
         samd21_adcs,
         samd21_pwms,
         rp2350_pwms,
+        rp2350_pwm_chips,
         supplies,
         pl022_spis,
         st_spis,
@@ -10758,6 +11001,11 @@ pub fn emit_board_csharp(
         push_const(&mut out, "uint", &format!("{p}_PADS_SCL"), &format!("0x{:X}", i2c.pads_scl));
         push_const(&mut out, "uint", &format!("{p}_FUNCSEL"), &i2c.funcsel.to_string());
         push_const(&mut out, "uint", &format!("{p}_IC_CLK_HZ"), &i2c.ic_clk_hz.to_string());
+    }
+
+    if rp2350_pwm_chips > 0 {
+        out.push_str("\n        // -- the PWM chips: how many the part has, the slices its pins carry, PWM chip n being\n        // slice n --\n");
+        push_const(&mut out, "int", "PWM_CHIP_COUNT", &rp2350_pwm_chips.to_string());
     }
 
     for pwm in &rp2350_pwms {
@@ -11766,6 +12014,7 @@ pub fn emit_board_rust(
         samd21_adcs,
         samd21_pwms,
         rp2350_pwms,
+        rp2350_pwm_chips,
         supplies,
         pl022_spis,
         st_spis,
@@ -12223,6 +12472,11 @@ pub fn emit_board_rust(
         push_rust_const(&mut out, "u32", &format!("{p}_IC_CLK_HZ"), &i2c.ic_clk_hz.to_string());
     }
 
+    if rp2350_pwm_chips > 0 {
+        out.push_str("\n// -- the PWM chips: how many the part has, the slices its pins carry, PWM chip n being\n// slice n --\n");
+        push_rust_const(&mut out, "u32", "PWM_CHIP_COUNT", &rp2350_pwm_chips.to_string());
+    }
+
     for pwm in &rp2350_pwms {
         let p = &pwm.prefix;
         out.push_str(&format!("\n// -- {p}: an rp2350 pwm binding descriptor: one slice of the pwm block, counting on\n// clk_sys, and each output the board routes -- its index in the slice (0 = A, 1 = B)\n// and its pad --\n"));
@@ -12576,6 +12830,7 @@ pub fn emit_board_swift(
         samd21_adcs,
         samd21_pwms,
         rp2350_pwms,
+        rp2350_pwm_chips,
         supplies,
         pl022_spis,
         st_spis,
@@ -13034,6 +13289,11 @@ pub fn emit_board_swift(
         push_swift_const(&mut out, "UInt32", &format!("{p}_IC_CLK_HZ"), &i2c.ic_clk_hz.to_string());
     }
 
+    if rp2350_pwm_chips > 0 {
+        out.push_str("\n    // -- the PWM chips: how many the part has, the slices its pins carry, PWM chip n being\n    // slice n --\n");
+        push_swift_const(&mut out, "UInt32", "PWM_CHIP_COUNT", &rp2350_pwm_chips.to_string());
+    }
+
     for pwm in &rp2350_pwms {
         let p = &pwm.prefix;
         out.push_str(&format!("\n    // -- {p}: an rp2350 pwm binding descriptor: one slice of the pwm block, counting on\n    // clk_sys, and each output the board routes -- its index in the slice (0 = A, 1 = B)\n    // and its pad --\n"));
@@ -13179,6 +13439,7 @@ pub fn emit_board_python(
         samd21_adcs,
         samd21_pwms,
         rp2350_pwms,
+        rp2350_pwm_chips,
         supplies,
         pl022_spis,
         st_spis,
@@ -13205,6 +13466,9 @@ pub fn emit_board_python(
     out.push_str(&format!("BOARD = \"{}\"\n", resolved.board.board));
     out.push_str(&format!("BOARD_MODEL = {}\n", resolved.board.product_model));
     out.push_str(&format!("BOARD_VENDOR = \"{}\"\n", vendor_segment(&resolved.board.vendor)));
+    if rp2350_pwm_chips > 0 {
+        out.push_str(&format!("PWM_CHIP_COUNT = {rp2350_pwm_chips}\n"));
+    }
 
     let mut roles: Vec<(&str, Vec<(String, String)>)> = Vec::new();
     for uart in &sercom_uarts {
@@ -15509,7 +15773,8 @@ value = 0x2
     /// `raspberrypi-pico-2` row's (maker, product, chip, clock, 30 pins labelled GP0 to GP29, I2C bus 0 on GP4 and
     /// GP5, SPI bus 0 on GP18, GP19 and GP16 with GP17's select, 184 Hz to 6 MHz) but for PWM, which a pin
     /// carries, as Lamella's slice and A or B, only on a slice the board binds. The micro:bit v1 numbers
-    /// the nRF51822's 31 GPIOs and prints no label for them. A board whose part states no whole pin set
+    /// the nRF51822's 31 GPIOs and prints no label for them, and numbers each bus by its block: I2C 0 on
+    /// TWI0 and SPI 1 on SPI1. A board whose part states no whole pin set
     /// gets no pin or bus table, and a chip is named as its maker writes it.
     #[test]
     fn target_board_facts_state_each_board_from_its_table() {
@@ -15563,7 +15828,7 @@ value = 0x2
         assert_eq!(microbit.i2c, [I2cBusFacts { number: 0, sda: Some(30), scl: Some(0) }]);
         assert_eq!(
             microbit.spi,
-            [SpiBusFacts { number: 0, sck: Some(23), mosi: Some(21), miso: Some(22), selects: vec![], min_hz: 125_000, max_hz: 4_000_000 }]
+            [SpiBusFacts { number: 1, sck: Some(23), mosi: Some(21), miso: Some(22), selects: vec![], min_hz: 125_000, max_hz: 4_000_000 }]
         );
         assert_eq!(microbit.pins[24].functions, pin_function::GPIO | pin_function::UART_TX);
 
@@ -17429,6 +17694,90 @@ resolution_bits = "16..20, depending only on the oversampling setting"
         ];
         for (section, expected) in cases {
             let error = pico2_w_with(&section).expect_err(expected);
+            assert!(error.contains(expected), "{expected:?} in {error:?}");
+        }
+    }
+
+
+    /// The Pico 2 W's file with `section` in place of its own `[stored_settings]`.
+    fn pico2_w_settings_with(section: &str) -> Result<BoardTable, String> {
+        let (head, rest) = PICO2_W
+            .split_once("\n[stored_settings]")
+            .expect("the Pico 2 W states [stored_settings]");
+        let (_, interpreter) = rest
+            .split_once("\n[csharp_interpreter]")
+            .expect("[csharp_interpreter] follows [stored_settings] in the Pico 2 W's file");
+        board_text(&format!("{head}\n{section}\n[csharp_interpreter]{interpreter}"))
+    }
+
+    const SETTINGS: &str = "[stored_settings]\nmemory = \"flash\"\noffset = 0x3FE000\nsize = 0x2000\nerase_unit = 0x1000\nslots = 2\nsource = \"s\"\n";
+
+    #[test]
+    fn the_pico_2_w_states_where_it_keeps_its_stored_settings() {
+        let settings = board_text(PICO2_W).unwrap().stored_settings.expect("the Pico 2 W states [stored_settings]");
+        assert_eq!(
+            (settings.memory.as_str(), settings.offset, settings.size, settings.erase_unit, settings.slots),
+            ("flash", 0x3F_E000, 0x2000, 0x1000, 2)
+        );
+        assert!(!settings.source.is_empty());
+        assert_eq!(pico2_w_settings_with("").unwrap().stored_settings, None, "a board that states none keeps none");
+        assert_eq!(pico2_w_settings_with(SETTINGS).unwrap().stored_settings.unwrap().offset, 0x3F_E000);
+    }
+
+    #[test]
+    fn a_stored_settings_record_that_cannot_be_checked_or_says_nothing_is_refused() {
+        let cases = [
+            (format!("{SETTINGS}{SETTINGS}"), "states [stored_settings] once"),
+            (SETTINGS.replace("source = \"s\"\n", ""), "SOURCE-CITED"),
+            (SETTINGS.replace("memory = \"flash\"\n", ""), "states no memory"),
+            (SETTINGS.replace("offset = 0x3FE000\n", ""), "states no offset"),
+            (SETTINGS.replace("size = 0x2000\n", ""), "states no size"),
+            (SETTINGS.replace("erase_unit = 0x1000\n", ""), "states no erase_unit"),
+            (SETTINGS.replace("slots = 2", "slots = 1"), "at least two"),
+            (SETTINGS.replace("size = 0x2000", "size = 0x3000"), "not its 2 slots of 0x1000"),
+            (SETTINGS.replace("offset = 0x3FE000", "offset = 0x3FE800"), "not a whole number of erase units"),
+            (SETTINGS.replace("offset = 0x3FE000", "offset = 0x3FF000"), "runs past the end of flash region 'flash'"),
+            (SETTINGS.replace("\"flash\"", "\"sram\""), "no flash region named 'sram'"),
+            (format!("{SETTINGS}page = 256\n"), "unexpected stored_settings key 'page'"),
+        ];
+        for (section, expected) in cases {
+            let error = pico2_w_settings_with(&section).expect_err(expected);
+            assert!(error.contains(expected), "{expected:?} in {error:?}");
+        }
+    }
+
+    const REGION: &str = "[flash_region]\nmemory = \"flash\"\noffset = 0x3C0000\nsize = 0x3E000\nerase_unit = 0x1000\nsource = \"r\"\n";
+
+    #[test]
+    fn the_pico_2_w_states_where_it_keeps_its_flash_region() {
+        let region = board_text(PICO2_W).unwrap().flash_region.expect("the Pico 2 W states [flash_region]");
+        assert_eq!(
+            (region.memory.as_str(), region.offset, region.size, region.erase_unit),
+            ("flash", 0x3C_0000, 0x3_E000, 0x1000)
+        );
+        assert!(!region.source.is_empty());
+        assert_eq!(pico2_w_settings_with(SETTINGS).unwrap().flash_region, None, "a board that states none keeps none");
+        assert_eq!(pico2_w_settings_with(&format!("{SETTINGS}{REGION}")).unwrap().flash_region.unwrap().offset, 0x3C_0000);
+    }
+
+    #[test]
+    fn a_flash_region_record_that_cannot_be_checked_or_says_nothing_is_refused() {
+        let cases = [
+            (format!("{REGION}{REGION}"), "states [flash_region] once"),
+            (REGION.replace("source = \"r\"\n", ""), "SOURCE-CITED"),
+            (REGION.replace("memory = \"flash\"\n", ""), "states no memory"),
+            (REGION.replace("offset = 0x3C0000\n", ""), "states no offset"),
+            (REGION.replace("size = 0x3E000\n", ""), "states no size"),
+            (REGION.replace("erase_unit = 0x1000\n", ""), "states no erase_unit"),
+            (REGION.replace("offset = 0x3C0000", "offset = 0x3C0800"), "not whole erase units of 0x1000"),
+            (REGION.replace("size = 0x3E000", "size = 0x3E800"), "not whole erase units of 0x1000"),
+            (REGION.replace("offset = 0x3C0000", "offset = 0x3D0000"), "runs past the end of flash region 'flash'"),
+            (REGION.replace("offset = 0x3C0000", "offset = 0x3C1000"), "overlaps [stored_settings] at 0x3fe000"),
+            (REGION.replace("\"flash\"", "\"sram\""), "no flash region named 'sram'"),
+            (format!("{REGION}slots = 2\n"), "unexpected flash_region key 'slots'"),
+        ];
+        for (region, expected) in cases {
+            let error = pico2_w_settings_with(&format!("{SETTINGS}{region}")).expect_err(expected);
             assert!(error.contains(expected), "{expected:?} in {error:?}");
         }
     }

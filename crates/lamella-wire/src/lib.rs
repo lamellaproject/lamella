@@ -1566,6 +1566,15 @@ pub mod product_model {
     /// flag: the PSRAM takes GP8 as its chip select, and the two boards share their part, their
     /// flash and their USB identity, so this number is what tells them apart on the wire.
     pub const FEATHER_RP2350_HSTX_PSRAM: u16 = 67;
+    /// Adafruit Metro RP2350 (RP2350B in the QFN-80 package, 16 MB flash), in the Metro format.
+    pub const METRO_RP2350: u16 = 68;
+    /// Adafruit Metro RP2350 with PSRAM. A separate model rather than a variant flag: the PSRAM
+    /// takes GP47 as its chip select, and the two boards share their part, their flash and their
+    /// USB identity, so this number is what tells them apart on the wire.
+    pub const METRO_RP2350_PSRAM: u16 = 69;
+    /// SparkFun IoT RedBoard - RP2350 (RP2350B in the QFN-80 package, 16 MB flash, 8 MB PSRAM, a
+    /// Raspberry Pi RM2 radio module), in the Arduino R4 format.
+    pub const IOT_REDBOARD_RP2350: u16 = 70;
 
     /// The display name for a `product_model` wire value, or `None` for an unrecognized code. This is the one
     /// canonical value -> name map: every surface that displays a board name derives from it rather than
@@ -1643,6 +1652,9 @@ pub mod product_model {
             PICO_LIPO_2_XL_W => "Pimoroni Pico LiPo 2 XL W",
             FEATHER_RP2350_HSTX => "Adafruit Feather RP2350 with HSTX",
             FEATHER_RP2350_HSTX_PSRAM => "Adafruit Feather RP2350 with HSTX and PSRAM",
+            METRO_RP2350 => "Adafruit Metro RP2350",
+            METRO_RP2350_PSRAM => "Adafruit Metro RP2350 with PSRAM",
+            IOT_REDBOARD_RP2350 => "SparkFun IoT RedBoard - RP2350",
             _ => return None,
         })
     }

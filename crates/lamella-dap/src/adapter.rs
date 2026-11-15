@@ -29,9 +29,29 @@ pub struct Debugger {
     /// target to debug. `launch` answers with it instead of starting anything; see
     /// [`Debugger::refusing`].
     refusal: Option<String>,
-    /// Whether a resume-now backend left the target running, so the serve loop polls for
-    /// the async stop. Always false for the synchronous interpreter backend.
+    /// What names this session's target, for a session started without one
+    /// ([`Debugger::choosing`]): asked at `launch` or `attach`, and gone once it has named one.
+    chooser: Option<Chooser>,
+    /// The entry stop the chooser decided, for the `launch` it answered. `None` where the session
+    /// was given its target up front, and reads the request itself.
+    chosen_stop_at_entry: Option<bool>,
+    /// Told the outcome of every `launch` and `attach`, where the host asked to be
+    /// ([`Debugger::reporting_starts`]).
+    start_report: Option<StartReport>,
+    /// Whether the program runs without debugging (`noDebug`): no breakpoint, exception filter or
+    /// entry stop takes effect.
+    no_debug: bool,
+    /// Whether the backend left the target running, so the serve loop polls for the stop to come: a
+    /// device after a resume, or a program a step left running.
     running: bool,
+    /// The step command under way while a single step of it left the target running -- its thread
+    /// waits on another, or for good -- so the poll that brings that single step's end carries the
+    /// command on ([`Debugger::carry_step`]).
+    stepping: Option<Stepping>,
+    /// The threads frame ids have been given for, by slot. A frame's id is its thread's slot times
+    /// [`FRAMES_PER_THREAD`] plus its place in the stack, so thread 1, always in slot 0, keeps the ids
+    /// its frames had before the program's other threads were shown.
+    frame_threads: Vec<u32>,
     /// Source and instruction breakpoints, kept apart so each `setBreakpoints` /
     /// `setInstructionBreakpoints` updates only its own kind. The backend has a single
     /// breakpoint set, so the *union* is what gets programmed -- otherwise an empty
@@ -39,9 +59,15 @@ pub struct Debugger {
     /// wipe the source breakpoints.
     source_breakpoints: Vec<u64>,
     instruction_breakpoints: Vec<u64>,
+    /// What the client was last told of each instruction breakpoint that names an address, in the
+    /// order of `instruction_breakpoints`: so a change in whether it is armed can be told by its id.
+    instruction_answers: Vec<Json>,
     /// Function breakpoints, by the addresses their names resolved to, kept apart from the source and
     /// instruction breakpoints so that each kind's request replaces only that kind.
     function_breakpoints: Vec<u64>,
+    /// What the client was last told of each function breakpoint that resolved, with how many of
+    /// `function_breakpoints` it takes, in their order.
+    function_answers: Vec<(usize, Json)>,
     /// The exception the target is stopped on, which `exceptionInfo` describes; cleared once the
     /// target runs again.
     stopped_exception: Option<ExceptionInfo>,
@@ -51,9 +77,18 @@ pub struct Debugger {
     /// Per-source-breakpoint hit-count / logpoint behavior, by code address. Rebuilt on each
     /// `setBreakpoints`; an address with no entry is an ordinary breakpoint that always stops.
     breakpoint_meta: Vec<BreakpointMeta>,
+    /// Configuration a client sent before the session had a target: each request as it was sent,
+    /// with the ids its pending answers carry. It is set on the target a launch starts
+    /// ([`Debugger::arm_at_start`]), and a `breakpoint` event for each id tells the client how.
+    early: Vec<(Request, Vec<i64>)>,
+    /// The id the next pending answer to early configuration carries.
+    next_breakpoint_id: i64,
     /// The inactive (over-capacity) breakpoint count last reported to the user, so the
     /// run-time "N inactive" note fires only when that count changes -- not on every continue.
     last_inactive_note: usize,
+    /// How the target's source paths map to the client's: a request's path is mapped before the
+    /// backend resolves it, and every path the backend gives is mapped back before the client sees it.
+    path_map: PathMap,
     /// Whether the session has already said in the console that the frame it was asked about
     /// reports no variables, so the note is made once rather than on every hover.
     noted_absent_variables: bool,
@@ -64,14 +99,105 @@ pub struct Debugger {
     repl: Option<crate::repl_eval::ReplCell>,
 }
 
+/// What a session started without a target ([`Debugger::choosing`]) asks when its `launch` or
+/// `attach` arrives. Given the request's command and arguments, it answers with the target they
+/// name, or with why there is none, in words the client shows the user.
+pub type Chooser = Box<dyn FnMut(&str, &Json) -> Result<Chosen, String>>;
+
+/// What a session tells its host about each `launch` or `attach` it answers: `Ok` once the target has
+/// started, or the reason it did not, as the client is told it. See [`Debugger::reporting_starts`].
+pub type StartReport = Box<dyn FnMut(Result<(), &str>)>;
+
+/// The target a [`Chooser`] named, and how the session it starts runs.
+pub struct Chosen {
+    /// The backend the session drives from here on.
+    pub backend: Box<dyn DebugBackend>,
+    /// Whether the program stops at its entry, rather than running to its first breakpoint.
+    pub stop_at_entry: bool,
+    /// Whether the program runs without debugging, as a client's "Run Without Debugging" asks: no
+    /// breakpoint, exception filter or entry stop takes effect.
+    pub no_debug: bool,
+    /// Lines for the debug console before the program starts: whatever the launch asked for that
+    /// the chooser could not take as asked, such as a field it does not know.
+    pub notes: Vec<String>,
+    /// How the source paths the program's build recorded map to the ones on this computer.
+    pub path_map: PathMap,
+}
+
+/// How the source paths a program's build recorded map to the ones on this computer, where the build
+/// rewrote them, as MSBuild's `PathMap` does: pairs of a prefix on this computer and the prefix the
+/// program records in its place, tried in order.
+///
+/// Prefixes compare as the debugger compares paths, ignoring case and which separator a path uses.
+/// A path no pair's prefix starts passes unchanged.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PathMap {
+    pairs: Vec<(String, String)>,
+}
+
+impl PathMap {
+    /// A map of `pairs`, each a prefix on this computer and the prefix the program records for it.
+    #[must_use]
+    pub fn new(pairs: Vec<(String, String)>) -> PathMap {
+        PathMap { pairs }
+    }
+
+    /// `path`, a source on this computer, as the program records it.
+    #[must_use]
+    pub fn to_program(&self, path: &str) -> String {
+        self.pairs
+            .iter()
+            .find_map(|(local, program)| remapped(path, local, program))
+            .unwrap_or_else(|| path.to_owned())
+    }
+
+    /// `path`, a source as the program records it, as it is on this computer.
+    #[must_use]
+    pub fn to_local(&self, path: &str) -> String {
+        self.pairs
+            .iter()
+            .find_map(|(local, program)| remapped(path, program, local))
+            .unwrap_or_else(|| path.to_owned())
+    }
+}
+
+/// `path` with its prefix `from` replaced by `to`, the rest written with `to`'s separator, or `None`
+/// where `from` does not start it.
+fn remapped(path: &str, from: &str, to: &str) -> Option<String> {
+    let compared = |text: &str| text.replace('\\', "/").to_ascii_lowercase();
+    if from.is_empty() || !compared(path).starts_with(&compared(from)) {
+        return None;
+    }
+    let separator = if to.contains('\\') { '\\' } else { '/' };
+    let rest: String = path[from.len()..]
+        .chars()
+        .map(|character| if matches!(character, '\\' | '/') { separator } else { character })
+        .collect();
+    Some(format!("{to}{rest}"))
+}
+
 /// Per-breakpoint behavior for a source breakpoint: a hit-count condition and/or a logpoint
 /// message, with the running hit count. Both fields empty means an ordinary breakpoint that
 /// always stops.
 struct BreakpointMeta {
     address: u64,
+    /// The source a `setBreakpoints` named this breakpoint in, as the client spelled its path: the
+    /// next `setBreakpoints` for that source replaces it, and one for any other source keeps it.
+    document: String,
     hit_condition: Option<String>,
     log_message: Option<String>,
     hits: u32,
+    /// What the client was last told of this breakpoint, its id included, so a later change in
+    /// whether it is armed can be told by that id.
+    answer: Json,
+}
+
+/// The request whose own breakpoints were just answered: a source's, or a kind with no source.
+#[derive(Clone, Copy)]
+enum Settled<'a> {
+    Source(&'a str),
+    Instruction,
+    Function,
 }
 
 /// What to do when execution stops at a source breakpoint, decided from its [`BreakpointMeta`].
@@ -145,14 +271,25 @@ impl Debugger {
             launched: false,
             stop_on_entry: false,
             refusal: None,
+            chooser: None,
+            chosen_stop_at_entry: None,
+            start_report: None,
+            no_debug: false,
             running: false,
+            stepping: None,
+            frame_threads: vec![lamella_debug_backend::MAIN_THREAD],
             source_breakpoints: Vec::new(),
             instruction_breakpoints: Vec::new(),
+            instruction_answers: Vec::new(),
+            function_answers: Vec::new(),
             function_breakpoints: Vec::new(),
             stopped_exception: None,
             terminated: false,
             breakpoint_meta: Vec::new(),
+            early: Vec::new(),
+            next_breakpoint_id: 1,
             last_inactive_note: 0,
+            path_map: PathMap::default(),
             noted_absent_variables: false,
             out_seq: 0,
             #[cfg(feature = "interpreter")]
@@ -174,28 +311,66 @@ impl Debugger {
         debugger
     }
 
+    /// Creates a debugger with no target until its `launch` or `attach` names one: `chooser` is
+    /// asked then, with the request's arguments, and the backend it answers with is the one the
+    /// session drives.
+    ///
+    /// `initialize` is answered before any target is known, so it offers only what every target
+    /// can do. Once the target is chosen, a `capabilities` event offers the rest, ahead of the
+    /// `initialized` event that starts the client's configuration.
+    #[must_use]
+    pub fn choosing(chooser: Chooser) -> Debugger {
+        let mut debugger = Debugger::with_backend(Box::new(Unstartable));
+        debugger.chooser = Some(chooser);
+        debugger
+    }
+
+    /// This session, mapping the target's source paths to the client's with `path_map`, for a
+    /// session given its target up front. A chosen target brings its own (`Chosen::path_map`).
+    #[must_use]
+    pub fn mapping_paths(mut self, path_map: PathMap) -> Debugger {
+        self.path_map = path_map;
+        self
+    }
+
+    /// This session, telling `report` the outcome of every `launch` and `attach` it answers: `Ok`
+    /// once the target has started, or the reason it did not -- a refusal, a chooser's answer that
+    /// names no target, or a target that was chosen and then did not start.
+    ///
+    /// **A TARGET IS STARTED WHEN ITS START SUCCEEDS, NOT WHEN IT IS CHOSEN.** A host that counted the
+    /// chooser's answers would count a board that was named and never written, and would end a
+    /// session that started nothing with the status of one that ran.
+    #[must_use]
+    pub fn reporting_starts(mut self, report: StartReport) -> Debugger {
+        self.start_report = Some(report);
+        self
+    }
+
     /// All console output the program has produced and the adapter has forwarded.
     #[must_use]
     pub fn output_string(&self) -> &str {
         &self.output
     }
 
-    /// Whether a resume-now backend left the target running, so the serve loop should
-    /// [`poll`](Debugger::poll) for the eventual stop. Always false for the synchronous
-    /// interpreter backend (which finishes inside the request that resumed it).
+    /// Whether the backend left the target running, so the serve loop should
+    /// [`poll`](Debugger::poll) for the eventual stop: a device after a resume, an interpreter whose
+    /// host polls it, or a program that runs on with nothing left to stop it but a pause -- every
+    /// thread asleep for good, or a step whose thread waits for good.
     #[must_use]
     pub fn is_running(&self) -> bool {
         self.running
     }
 
-    /// Polls a target a resume-now backend left running: the output + stop events once
-    /// it halts, or empty while it is still going. The serve loop calls this while
-    /// [`is_running`](Debugger::is_running) holds; the backend's `poll` may block until
-    /// the target halts, so this does not busy-wait.
+    /// Polls a target the backend left running: the output + stop events once it stops, or empty
+    /// while it is still going. The serve loop calls this while [`is_running`](Debugger::is_running)
+    /// holds; the backend's `poll` may block until the target halts, so this does not busy-wait.
     ///
     /// A stop at a breakpoint is taken through its hit count and its logpoint first, as a stop a
     /// command comes to is: a logpoint writes its message and the target runs on, and a hit count
     /// not yet met resumes it without a stop being reported.
+    ///
+    /// A step command whose single step left the target running goes on from that single step's
+    /// end, so the step lands where it would have had nothing waited.
     #[must_use]
     pub fn poll(&mut self) -> Vec<Message> {
         let mut events: Vec<(&'static str, Option<Json>)> = Vec::new();
@@ -204,6 +379,10 @@ impl Debugger {
                 Stop::Running => self.flush_output(&mut events),
                 stop => {
                     self.running = false;
+                    let stop = match (stop, self.stepping.take()) {
+                        (Stop::Step, Some(stepping)) => self.carry_step(stepping, &mut events),
+                        (stop, _) => stop,
+                    };
                     self.settle(stop, &mut events);
                 }
             }
@@ -226,6 +405,7 @@ impl Debugger {
     /// The backend's reason, when the target could not be released and may still be stopped.
     pub fn release_target(&mut self) -> Result<(), String> {
         self.running = false;
+        self.stepping = None;
         if self.terminated {
             return Ok(());
         }
@@ -235,6 +415,7 @@ impl Debugger {
     /// Ends the program through the backend, and with it the session's hold on the target.
     fn end_program(&mut self) -> Result<(), String> {
         self.running = false;
+        self.stepping = None;
         let ended = self.backend.terminate();
         if ended.is_ok() {
             self.terminated = true;
@@ -251,22 +432,58 @@ impl Debugger {
             "initialize" => (true, Some(capabilities(self.backend.as_ref()))),
             "launch" | "attach" => {
                 if let Some(reason) = self.refusal.clone() {
+                    self.report_start(Err(&reason));
                     return self.fail_for_user(request, ERROR_SESSION_REFUSED, &reason);
                 }
                 let attaching = request.command == "attach";
+                let mut unchosen: Option<(Chooser, Box<dyn DebugBackend>)> = None;
+                if let Some(mut chooser) = self.chooser.take() {
+                    let arguments = request.arguments.clone().unwrap_or(Json::Null);
+                    match chooser(&request.command, &arguments) {
+                        Ok(chosen) => {
+                            let Chosen { backend, stop_at_entry, no_debug, notes, path_map } = chosen;
+                            self.path_map = path_map;
+                            for note in notes {
+                                events.push((
+                                    "output",
+                                    Some(json!({ "category": "console", "output": format!("{note}\n") })),
+                                ));
+                            }
+                            let before = std::mem::replace(&mut self.backend, backend);
+                            unchosen = Some((chooser, before));
+                            self.no_debug = no_debug;
+                            self.chosen_stop_at_entry = Some(stop_at_entry);
+                        }
+                        Err(reason) => {
+                            self.chooser = Some(chooser);
+                            self.report_start(Err(&reason));
+                            let (id, failed) = start_failure(attaching);
+                            return self.fail_for_user(request, id, &format!("{failed}: {reason}"));
+                        }
+                    }
+                }
                 let started = self.start(request, attaching);
                 self.flush_output(&mut events);
                 if let Err(reason) = started {
+                    if let Some((chooser, before)) = unchosen {
+                        self.unchoose(chooser, before, &mut events);
+                    }
+                    self.report_start(Err(&reason));
                     let mut out: Vec<Message> =
                         events.into_iter().map(|(event, body)| self.event(event, body)).collect();
-                    let (id, failed) = if attaching {
-                        (ERROR_ATTACH_FAILED, "The session could not attach")
-                    } else {
-                        (ERROR_LAUNCH_FAILED, "The session could not start")
-                    };
+                    let (id, failed) = start_failure(attaching);
                     out.extend(self.fail_for_user(request, id, &format!("{failed}: {reason}")));
                     return out;
                 }
+                let chose = unchosen.is_some();
+                if chose {
+                    events.push((
+                        "capabilities",
+                        Some(json!({ "capabilities": capabilities(self.backend.as_ref()) })),
+                    ));
+                }
+                self.arm_at_start(chose, &mut events);
+                self.report_start(Ok(()));
                 events.push(("initialized", None));
                 (true, None)
             }
@@ -291,8 +508,9 @@ impl Debugger {
                 self.stopped_exception = None;
                 self.terminated = false;
                 self.launched = true;
+                self.stepping = None;
                 if self.stop_on_entry {
-                    events.push(("stopped", Some(stopped("entry"))));
+                    events.push(("stopped", Some(stopped("entry", self.backend.selected_thread()))));
                 } else {
                     self.run(Action::Resume, &mut events);
                 }
@@ -316,25 +534,44 @@ impl Debugger {
                 events.push(("terminated", None));
                 (true, None)
             }
+            "setBreakpoints" | "setInstructionBreakpoints" | "setFunctionBreakpoints" | "setExceptionBreakpoints"
+                if self.chooser.is_some() =>
+            {
+                (true, Some(self.keep_until_start(request)))
+            }
+            "setBreakpoints" | "setInstructionBreakpoints" | "setFunctionBreakpoints" if self.no_debug => {
+                (true, Some(unarmed_without_debugging(request, "breakpoints")))
+            }
+            "setExceptionBreakpoints" if self.no_debug => {
+                (true, Some(unarmed_without_debugging(request, "filters")))
+            }
             "setExceptionBreakpoints" => (true, Some(self.set_exception_breakpoints(request))),
             "exceptionInfo" => match &self.stopped_exception {
                 Some(info) => (true, Some(exception_info_body(info))),
                 None => return self.fail(request, "The program is not stopped on an exception."),
             },
-            "setFunctionBreakpoints" => (true, Some(self.set_function_breakpoints(request))),
+            "setFunctionBreakpoints" => (
+                true,
+                Some(self.set_function_breakpoints(request, None, &mut events)),
+            ),
             "configurationDone" => {
                 if self.stop_on_entry {
-                    events.push(("stopped", Some(stopped("entry"))));
+                    events.push(("stopped", Some(stopped("entry", self.backend.selected_thread()))));
                 } else {
                     self.run(Action::Resume, &mut events);
                 }
                 (true, None)
             }
-            "threads" => (
-                true,
-                Some(json!({ "threads": [{ "id": 1, "name": "main" }] })),
-            ),
-            "stackTrace" => (true, Some(self.stack_trace())),
+            "threads" => {
+                let threads: Vec<Json> = self
+                    .backend
+                    .threads()
+                    .iter()
+                    .map(|thread| json!({ "id": thread.id, "name": thread.name }))
+                    .collect();
+                (true, Some(json!({ "threads": threads })))
+            }
+            "stackTrace" => (true, Some(self.stack_trace(arg_opt_u32(request, "threadId")))),
             "scopes" => (true, Some(self.scopes(arg_u32(request, "frameId")))),
             "variables" => (
                 true,
@@ -352,14 +589,17 @@ impl Debugger {
                 (true, Some(json!({ "allThreadsContinued": true })))
             }
             "stepIn" => {
+                self.select_requested_thread(request);
                 self.run(Action::StepIn, &mut events);
                 (true, None)
             }
             "next" => {
+                self.select_requested_thread(request);
                 self.run(Action::StepOver, &mut events);
                 (true, None)
             }
             "stepOut" => {
+                self.select_requested_thread(request);
                 self.run(Action::StepOut, &mut events);
                 (true, None)
             }
@@ -368,13 +608,20 @@ impl Debugger {
                     self.backend.pause();
                     self.running = false;
                 }
+                self.stepping = None;
                 if self.launched {
-                    events.push(("stopped", Some(stopped("pause"))));
+                    events.push(("stopped", Some(stopped("pause", self.backend.selected_thread()))));
                 }
                 (true, None)
             }
-            "setBreakpoints" => (true, Some(self.set_source_breakpoints(request))),
-            "setInstructionBreakpoints" => (true, Some(self.set_instruction_breakpoints(request))),
+            "setBreakpoints" => (
+                true,
+                Some(self.set_source_breakpoints(request, None, &mut events)),
+            ),
+            "setInstructionBreakpoints" => (
+                true,
+                Some(self.set_instruction_breakpoints(request, None, &mut events)),
+            ),
             "disassemble" => (true, Some(self.disassemble(request))),
             "evaluate" => return self.evaluate(request),
             "disconnect" => {
@@ -420,15 +667,182 @@ impl Debugger {
     /// Starts the session's target, launched at its entry point or attached to where it already runs,
     /// and records whether `launch` asked to stop at the entry.
     fn start(&mut self, request: &Request, attaching: bool) -> Result<(), String> {
+        let (stop_at_entry, no_debug) = match self.chosen_stop_at_entry.take() {
+            Some(stop_at_entry) => (stop_at_entry, self.no_debug),
+            None => (arg_bool(request, "stopOnEntry"), arg_bool(request, "noDebug")),
+        };
         let started = if attaching {
-            self.stop_on_entry = false;
             self.backend.attach()
         } else {
-            self.stop_on_entry = arg_bool(request, "stopOnEntry");
             self.backend.launch()
         };
+        if started.is_ok() {
+            self.no_debug = no_debug;
+            self.stop_on_entry = !attaching && stop_at_entry && !no_debug;
+        }
         self.launched = started.is_ok();
         started
+    }
+
+    /// Puts a session back as it was before its chooser named a target that then did not start: the
+    /// chosen target handed back and dropped, `before` its target again, and `chooser` kept to answer
+    /// the next `launch`.
+    fn unchoose(
+        &mut self,
+        chooser: Chooser,
+        before: Box<dyn DebugBackend>,
+        events: &mut Vec<(&'static str, Option<Json>)>,
+    ) {
+        if let Err(reason) = self.backend.release() {
+            events.push((
+                "output",
+                Some(json!({
+                    "category": "console",
+                    "output": format!("The target could not be handed back and may still be stopped: {reason}\n"),
+                })),
+            ));
+        }
+        self.backend = before;
+        self.chooser = Some(chooser);
+        self.no_debug = false;
+        self.chosen_stop_at_entry = None;
+        self.stop_on_entry = false;
+    }
+
+    /// Settles the breakpoints and exception filters set before the session's target started, once it
+    /// has: a session that runs without debugging disarms every one of them, and a target the launch
+    /// has just chosen is given the ones set while the session had no target -- the configuration kept
+    /// for it ([`Debugger::keep_until_start`]) set as though it had just been sent, each pending answer
+    /// settled by a `breakpoint` event with its id.
+    ///
+    /// **A CLIENT MAY CONFIGURE BEFORE IT LAUNCHES.** A breakpoint or filter armed then would stop a
+    /// program the user asked to run without stopping; and one set before the launch named a target
+    /// was answered against no target and armed on none, so without this it never reaches the target
+    /// it was set for.
+    fn arm_at_start(&mut self, chose: bool, events: &mut Vec<(&'static str, Option<Json>)>) {
+        let failed = if self.no_debug {
+            for (_, ids) in std::mem::take(&mut self.early) {
+                for id in ids {
+                    let mut unarmed = unverified(REASON_FAILED, String::from(WITHOUT_DEBUGGING));
+                    unarmed["id"] = json!(id);
+                    events.push(("breakpoint", Some(json!({ "reason": "changed", "breakpoint": unarmed }))));
+                }
+            }
+            self.source_breakpoints.clear();
+            self.instruction_breakpoints.clear();
+            self.instruction_answers.clear();
+            self.function_breakpoints.clear();
+            self.function_answers.clear();
+            self.breakpoint_meta.clear();
+            let disarmed = self
+                .backend
+                .set_breakpoints(&[])
+                .and_then(|()| self.backend.set_exception_filters(&[]));
+            disarmed.err().map(|reason| {
+                format!(
+                    "The breakpoints set before the launch could not be removed from the target, so \
+                     the program may still stop at one: {reason}"
+                )
+            })
+        } else if chose {
+            self.set_early(events);
+            self.apply_breakpoints().err().map(|reason| {
+                format!("The breakpoints set before the launch could not be set on the target: {reason}")
+            })
+        } else {
+            None
+        };
+        if let Some(said) = failed {
+            events.push((
+                "output",
+                Some(json!({ "category": "console", "output": format!("{said}\n") })),
+            ));
+        }
+    }
+
+    /// Keeps `request`, configuration sent before the session had a target, to set on the target a
+    /// launch starts, and answers each thing it asks for as pending, with an id. A later request of
+    /// the same kind -- for `setBreakpoints`, for the same source -- replaces it, as it would replace
+    /// what a target had been given.
+    fn keep_until_start(&mut self, request: &Request) -> Json {
+        let list = if request.command == "setExceptionBreakpoints" {
+            "filters"
+        } else {
+            "breakpoints"
+        };
+        let asked = request
+            .arguments
+            .as_ref()
+            .and_then(|arguments| arguments.get(list))
+            .and_then(Json::as_array)
+            .map_or(0, Vec::len);
+        let source = |request: &Request| {
+            request
+                .arguments
+                .as_ref()
+                .and_then(|arguments| arguments.get("source"))
+                .and_then(|source| source.get("path"))
+                .and_then(Json::as_str)
+                .map(str::to_owned)
+        };
+        let path = source(request);
+        self.early
+            .retain(|(kept, _)| kept.command != request.command || source(kept) != path);
+        let mut ids = Vec::with_capacity(asked);
+        let mut answers = Vec::with_capacity(asked);
+        for _ in 0..asked {
+            let id = self.next_id();
+            let mut answer = unverified(
+                REASON_PENDING,
+                String::from(
+                    "The session has not started its program, so this cannot be resolved yet. It is \
+                     set when the program starts.",
+                ),
+            );
+            answer["id"] = json!(id);
+            ids.push(id);
+            answers.push(answer);
+        }
+        self.early.push((request.clone(), ids));
+        json!({ "breakpoints": answers })
+    }
+
+    /// Sets the configuration kept before the session had a target on the target a launch has just
+    /// started, and tells the client how each pending answer was settled: a `breakpoint` event for
+    /// each, by its id, with what the request would have been answered had it been sent now.
+    fn set_early(&mut self, events: &mut Vec<(&'static str, Option<Json>)>) {
+        let mut early = std::mem::take(&mut self.early);
+        early.sort_by_key(|(request, _)| match request.command.as_str() {
+            "setBreakpoints" => 0,
+            "setInstructionBreakpoints" => 1,
+            "setFunctionBreakpoints" => 2,
+            _ => 3,
+        });
+        for (request, ids) in early {
+            let body = match request.command.as_str() {
+                "setBreakpoints" => self.set_source_breakpoints(&request, Some(&ids), events),
+                "setInstructionBreakpoints" => {
+                    self.set_instruction_breakpoints(&request, Some(&ids), events)
+                }
+                "setFunctionBreakpoints" => {
+                    self.set_function_breakpoints(&request, Some(&ids), events)
+                }
+                _ => self.set_exception_breakpoints(&request),
+            };
+            let answers = body["breakpoints"].as_array().cloned().unwrap_or_default();
+            for (id, mut breakpoint) in ids.into_iter().zip(answers) {
+                breakpoint["id"] = json!(id);
+                events.push(("breakpoint", Some(json!({ "reason": "changed", "breakpoint": breakpoint }))));
+            }
+        }
+    }
+
+    /// Tells the host the outcome of a `launch` or `attach`, where it asked to be told
+    /// ([`Debugger::reporting_starts`]).
+    fn report_start(&mut self, outcome: Result<(), &str>) {
+        if let Some(report) = self.start_report.as_mut() {
+            report(outcome);
+        }
     }
 
     /// Programs the backend with the union of source, instruction and function breakpoints. They
@@ -478,8 +892,14 @@ impl Debugger {
 
     /// Replaces the function breakpoints. Each names a method, and the backend resolves the name to
     /// the first instruction of every method it matches; a name that matches none is reported
-    /// unverified.
-    fn set_function_breakpoints(&mut self, request: &Request) -> Json {
+    /// unverified. `ids` are the ids a pending answer already gave them; otherwise each answer is given
+    /// a new one.
+    fn set_function_breakpoints(
+        &mut self,
+        request: &Request,
+        ids: Option<&[i64]>,
+        events: &mut Vec<(&'static str, Option<Json>)>,
+    ) -> Json {
         let specs = request
             .arguments
             .as_ref()
@@ -492,14 +912,19 @@ impl Debugger {
         let resolves = self.backend.can_break_on_functions();
         let mut addresses: Vec<u64> = Vec::new();
         let mut results = Vec::with_capacity(specs.len());
-        for spec in &specs {
+        let mut kept: Vec<(usize, usize)> = Vec::new();
+        for (index, spec) in specs.iter().enumerate() {
+            let id = answer_id(ids, index).unwrap_or_else(|| self.next_id());
             if !resolves {
-                results.push(unverified(
-                    REASON_FAILED,
-                    String::from(
-                        "This target cannot set a breakpoint on a method by its name. Set one on a \
-                         line of the method instead.",
+                results.push(with_id(
+                    unverified(
+                        REASON_FAILED,
+                        String::from(
+                            "This target cannot set a breakpoint on a method by its name. Set one on \
+                             a line of the method instead.",
+                        ),
                     ),
+                    id,
                 ));
                 continue;
             }
@@ -510,36 +935,50 @@ impl Debugger {
                 self.backend.resolve_function_breakpoint(name)
             };
             let Some(&first) = bound.first() else {
-                results.push(unverified(
-                    REASON_FAILED,
-                    format!("No method named {name} was found, so no breakpoint can be set on it."),
+                results.push(with_id(
+                    unverified(
+                        REASON_FAILED,
+                        format!("No method named {name} was found, so no breakpoint can be set on it."),
+                    ),
+                    id,
                 ));
                 continue;
             };
             let armed = cap.map_or(true, |max| ahead + addresses.len() + bound.len() <= max);
             addresses.extend_from_slice(&bound);
-            let mut breakpoint =
-                json!({ "verified": armed, "instructionReference": first.to_string() });
+            let mut breakpoint = json!({ "id": id, "instructionReference": first.to_string() });
             if let Some(location) = self.backend.source_location(first) {
                 breakpoint["line"] = json!(location.line);
-                breakpoint["source"] = json!({ "path": location.file });
+                breakpoint["source"] = json!({ "path": self.path_map.to_local(&location.file) });
             }
-            if !armed {
-                breakpoint["message"] = json!(over_capacity_message(cap));
-                breakpoint["reason"] = json!(REASON_PENDING);
-            }
+            set_verified(&mut breakpoint, armed, cap);
+            kept.push((results.len(), bound.len()));
             results.push(breakpoint);
         }
         self.function_breakpoints = addresses;
-        if let Err(reason) = self.apply_breakpoints() {
-            withdraw_verification(&mut results, &reason);
+        let applied = self.apply_breakpoints();
+        if let Err(reason) = &applied {
+            withdraw_verification(&mut results, reason);
+        }
+        self.function_answers = kept
+            .into_iter()
+            .map(|(index, takes)| (takes, results[index].clone()))
+            .collect();
+        if applied.is_ok() {
+            self.restate(Settled::Function, events);
         }
         json!({ "breakpoints": results })
     }
 
     /// Replaces the instruction breakpoints. Each is an opaque code address carried in
-    /// the `instructionReference` (the backend interprets it); no source mapping needed.
-    fn set_instruction_breakpoints(&mut self, request: &Request) -> Json {
+    /// the `instructionReference` (the backend interprets it); no source mapping needed. `ids` are
+    /// the ids a pending answer already gave them; otherwise each answer is given a new one.
+    fn set_instruction_breakpoints(
+        &mut self,
+        request: &Request,
+        ids: Option<&[i64]>,
+        events: &mut Vec<(&'static str, Option<Json>)>,
+    ) -> Json {
         let specs = request
             .arguments
             .as_ref()
@@ -551,7 +990,9 @@ impl Debugger {
         let source_count = self.source_breakpoints.len();
         let mut addresses = Vec::new();
         let mut results = Vec::new();
-        for spec in &specs {
+        let mut kept = Vec::new();
+        for (index, spec) in specs.iter().enumerate() {
+            let id = answer_id(ids, index).unwrap_or_else(|| self.next_id());
             let address = spec
                 .get("instructionReference")
                 .and_then(Json::as_str)
@@ -563,32 +1004,49 @@ impl Debugger {
                     let armed = cap.map_or(true, |max| source_count + addresses.len() < max);
                     addresses.push(address);
                     let mut breakpoint =
-                        json!({ "verified": armed, "instructionReference": address.to_string() });
-                    if !armed {
-                        breakpoint["message"] = json!(over_capacity_message(cap));
-                        breakpoint["reason"] = json!(REASON_PENDING);
-                    }
+                        json!({ "id": id, "instructionReference": address.to_string() });
+                    set_verified(&mut breakpoint, armed, cap);
+                    kept.push(results.len());
                     results.push(breakpoint);
                 }
-                None => results.push(unverified(
-                    REASON_FAILED,
-                    String::from(
-                        "This breakpoint's instruction reference is not an address. A client sends                          one it was given by a stack frame or a disassembly.",
+                None => results.push(with_id(
+                    unverified(
+                        REASON_FAILED,
+                        String::from(
+                            "This breakpoint does not name a place in the program.",
+                        ),
                     ),
+                    id,
                 )),
             }
         }
         self.instruction_breakpoints = addresses;
-        if let Err(reason) = self.apply_breakpoints() {
-            withdraw_verification(&mut results, &reason);
+        let applied = self.apply_breakpoints();
+        if let Err(reason) = &applied {
+            withdraw_verification(&mut results, reason);
+        }
+        self.instruction_answers = kept.into_iter().map(|index| results[index].clone()).collect();
+        if applied.is_ok() {
+            self.restate(Settled::Instruction, events);
         }
         json!({ "breakpoints": results })
     }
 
-    /// Replaces the source breakpoints. Each is a `line` in the request's `source`,
-    /// resolved to a code address by the backend's source mapping; a line with no code
-    /// resolves to nothing and is reported unverified.
-    fn set_source_breakpoints(&mut self, request: &Request) -> Json {
+    /// Replaces the source breakpoints of the request's `source`. Each is a `line` in it, resolved
+    /// to a code address by the backend's source mapping; a line with no code resolves to nothing and
+    /// is reported unverified. `ids` are the ids a pending answer already gave them; otherwise each
+    /// answer is given a new one.
+    ///
+    /// **A BREAKPOINT KEEPS ITS PLACE.** Where the target holds fewer than are set, the ones set first
+    /// hold its comparators: a breakpoint this request keeps stays where it was, one it adds goes
+    /// after every other, and one it removes frees its place. Another breakpoint that gains or loses
+    /// a comparator by this is told in a `breakpoint` event.
+    fn set_source_breakpoints(
+        &mut self,
+        request: &Request,
+        ids: Option<&[i64]>,
+        events: &mut Vec<(&'static str, Option<Json>)>,
+    ) -> Json {
         let arguments = request.arguments.as_ref();
         let document = arguments
             .and_then(|args| args.get("source"))
@@ -601,80 +1059,175 @@ impl Debugger {
             .cloned()
             .unwrap_or_default();
         let cap = self.backend.max_breakpoints();
-        let mut addresses = Vec::new();
-        let mut meta = Vec::new();
+        let recorded = self.path_map.to_program(document);
+        let mut fresh: Vec<Option<(usize, BreakpointMeta)>> = Vec::new();
         let mut results = Vec::new();
-        for spec in &specs {
+        for (index, spec) in specs.iter().enumerate() {
+            let id = answer_id(ids, index).unwrap_or_else(|| self.next_id());
             let requested = spec.get("line").and_then(Json::as_u64);
             let address = requested
                 .and_then(|line| u32::try_from(line).ok())
-                .and_then(|line| self.backend.resolve_source_breakpoint(document, line));
+                .and_then(|line| self.backend.resolve_source_breakpoint(&recorded, line));
             match address {
                 Some(address) => {
-                    let armed = cap.map_or(true, |max| addresses.len() < max);
-                    addresses.push(address);
-                    meta.push(BreakpointMeta {
-                        address,
-                        hit_condition: spec
-                            .get("hitCondition")
-                            .and_then(Json::as_str)
-                            .filter(|text| !text.trim().is_empty())
-                            .map(String::from),
-                        log_message: spec
-                            .get("logMessage")
-                            .and_then(Json::as_str)
-                            .filter(|text| !text.is_empty())
-                            .map(String::from),
-                        hits: 0,
-                    });
+                    fresh.push(Some((
+                        results.len(),
+                        BreakpointMeta {
+                            address,
+                            document: document.to_owned(),
+                            hit_condition: spec
+                                .get("hitCondition")
+                                .and_then(Json::as_str)
+                                .filter(|text| !text.trim().is_empty())
+                                .map(String::from),
+                            log_message: spec
+                                .get("logMessage")
+                                .and_then(Json::as_str)
+                                .filter(|text| !text.is_empty())
+                                .map(String::from),
+                            hits: 0,
+                            answer: Json::Null,
+                        },
+                    )));
                     let located = self.backend.source_location(address);
                     let (line, file) = match &located {
-                        Some(location) => (u64::from(location.line), location.file.as_str()),
-                        None => (requested.unwrap_or(0), document),
+                        Some(location) => {
+                            (u64::from(location.line), self.path_map.to_local(&location.file))
+                        }
+                        None => (requested.unwrap_or(0), document.to_owned()),
                     };
                     let mut breakpoint = json!({
-                        "verified": armed,
+                        "id": id,
                         "line": line,
                         "instructionReference": address.to_string(),
                     });
                     if !file.is_empty() {
                         breakpoint["source"] = json!({ "path": file });
                     }
-                    if !armed {
-                        breakpoint["message"] = json!(over_capacity_message(cap));
-                        breakpoint["reason"] = json!(REASON_PENDING);
-                    }
                     results.push(breakpoint);
                 }
-                None if !self.backend.has_source() => results.push(unverified(
-                    REASON_PENDING,
-                    String::from(
-                        "No source mapping is loaded yet, so this line cannot be resolved. It                          binds once the program is running.",
-                    ),
-                )),
-                None => results.push(unverified(
-                    REASON_FAILED,
-                    match requested {
-                        Some(line) => format!(
-                            "There is no code on line {line} of this file, so no breakpoint can be                              set there. Move it to a statement."
+                None if !self.backend.has_source() => results.push(with_id(
+                    unverified(
+                        REASON_PENDING,
+                        String::from(
+                            "No source mapping is loaded yet, so this line cannot be resolved. It \
+                             binds once the program is running.",
                         ),
-                        None => String::from("This breakpoint names no line."),
-                    },
+                    ),
+                    id,
+                )),
+                None => results.push(with_id(
+                    unverified(
+                        REASON_FAILED,
+                        match requested {
+                            Some(line) => format!(
+                                "There is no code on line {line} of this file, so no breakpoint can \
+                                 be set there. Move it to a statement."
+                            ),
+                            None => String::from("This breakpoint names no line."),
+                        },
+                    ),
+                    id,
                 )),
             }
         }
-        self.source_breakpoints = addresses;
-        self.breakpoint_meta = meta;
-        if let Err(reason) = self.apply_breakpoints() {
-            withdraw_verification(&mut results, &reason);
+        let mut placed: Vec<BreakpointMeta> = Vec::with_capacity(self.breakpoint_meta.len() + fresh.len());
+        let mut answering: Vec<Option<usize>> = Vec::with_capacity(placed.capacity());
+        for kept in std::mem::take(&mut self.breakpoint_meta) {
+            if kept.document != document {
+                placed.push(kept);
+                answering.push(None);
+                continue;
+            }
+            let renewed = fresh
+                .iter_mut()
+                .find(|slot| slot.as_ref().is_some_and(|(_, meta)| meta.address == kept.address))
+                .and_then(Option::take);
+            if let Some((index, meta)) = renewed {
+                placed.push(meta);
+                answering.push(Some(index));
+            }
+        }
+        for (index, meta) in fresh.into_iter().flatten() {
+            placed.push(meta);
+            answering.push(Some(index));
+        }
+        for (position, index) in answering.iter().enumerate() {
+            if let Some(index) = *index {
+                set_verified(&mut results[index], cap.map_or(true, |max| position < max), cap);
+            }
+        }
+        self.breakpoint_meta = placed;
+        self.source_breakpoints = self.breakpoint_meta.iter().map(|kept| kept.address).collect();
+        let applied = self.apply_breakpoints();
+        if let Err(reason) = &applied {
+            withdraw_verification(&mut results, reason);
+        }
+        for (meta, index) in self.breakpoint_meta.iter_mut().zip(&answering) {
+            if let Some(index) = *index {
+                meta.answer = results[index].clone();
+            }
+        }
+        if applied.is_ok() {
+            self.restate(Settled::Source(document), events);
         }
         json!({ "breakpoints": results })
+    }
+
+    /// A new id for a breakpoint's answer, which later events about it name it by.
+    fn next_id(&mut self) -> i64 {
+        let id = self.next_breakpoint_id;
+        self.next_breakpoint_id += 1;
+        id
+    }
+
+    /// Tells the client, in a `breakpoint` event, of each breakpoint it was answered for that has
+    /// gained or lost one of the target's comparators since: the target holds the first
+    /// `max_breakpoints` of the set `apply_breakpoints` gives it, in that order, so one request can
+    /// move another's breakpoints past the limit or back within it. `settled` is the request just
+    /// answered, whose own breakpoints are in its answer.
+    fn restate(&mut self, settled: Settled<'_>, events: &mut Vec<(&'static str, Option<Json>)>) {
+        let Some(max) = self.backend.max_breakpoints() else {
+            return;
+        };
+        let mut tell = |answer: &mut Json, armed: bool| {
+            if (answer["verified"] == json!(true)) != armed {
+                set_verified(answer, armed, Some(max));
+                events.push((
+                    "breakpoint",
+                    Some(json!({ "reason": "changed", "breakpoint": answer.clone() })),
+                ));
+            }
+        };
+        let mut position = 0;
+        for meta in &mut self.breakpoint_meta {
+            let armed = position < max;
+            position += 1;
+            if !matches!(settled, Settled::Source(document) if document == meta.document) {
+                tell(&mut meta.answer, armed);
+            }
+        }
+        for answer in &mut self.instruction_answers {
+            let armed = position < max;
+            position += 1;
+            if !matches!(settled, Settled::Instruction) {
+                tell(answer, armed);
+            }
+        }
+        for (takes, answer) in &mut self.function_answers {
+            let armed = position + *takes <= max;
+            position += *takes;
+            if !matches!(settled, Settled::Function) {
+                tell(answer, armed);
+            }
+        }
     }
 
     /// Runs the target for one command and emits the resulting output + stop/terminate
     /// events.
     fn run(&mut self, action: Action, events: &mut Vec<(&'static str, Option<Json>)>) {
         self.stopped_exception = None;
+        self.stepping = None;
         if matches!(action, Action::Resume) {
             self.note_inactive_breakpoints(events);
         }
@@ -687,8 +1240,7 @@ impl Debugger {
             Action::StepOver | Action::StepOut if !self.backend.tracks_depth() => {
                 self.backend.step()
             }
-            Action::StepOver => self.step_to_depth(|depth, start| depth <= start, events),
-            Action::StepOut => self.step_to_depth(|depth, start| depth < start, events),
+            Action::StepOver | Action::StepOut => self.step_to_depth(action, events),
         };
         self.settle(stop, events);
     }
@@ -770,7 +1322,7 @@ impl Debugger {
                     "category": "console",
                     "output": format!(
                         "{max} of {total} breakpoints active: this target has {max} hardware \
-                         breakpoints; {inactive} inactive (shown greyed).\n"
+                         breakpoints; {inactive} inactive (shown grayed).\n"
                     ),
                 })),
             ));
@@ -783,28 +1335,91 @@ impl Debugger {
     ///
     /// Bounded by [`DebugBackend::step_budget`], because a callee that does not return leaves the
     /// depth condition permanently unmet.
-    fn step_to_depth(
-        &mut self,
-        reached: impl Fn(usize, usize) -> bool,
-        events: &mut Vec<(&'static str, Option<Json>)>,
-    ) -> Stop {
-        let start = self.backend.depth();
-        let mut budget = self.backend.step_budget().max(1);
+    fn step_to_depth(&mut self, action: Action, events: &mut Vec<(&'static str, Option<Json>)>) -> Stop {
+        let stepping = Stepping {
+            action,
+            by_source: false,
+            start: self.backend.depth(),
+            budget: self.backend.step_budget().max(1),
+        };
+        self.step_on(stepping, events)
+    }
+
+    /// Takes the next single step of a step command, and carries the command on from it
+    /// ([`Debugger::carry_step`]).
+    ///
+    /// **A SINGLE STEP THAT LEAVES THE TARGET RUNNING KEEPS THE COMMAND**, for the poll that brings its
+    /// end: on a target with threads, a step's thread can wait for another thread, or for good, and
+    /// until it has run its instruction the program runs on, as it does on .NET.
+    fn step_on(&mut self, stepping: Stepping, events: &mut Vec<(&'static str, Option<Json>)>) -> Stop {
+        match self.backend.step() {
+            Stop::Step => self.carry_step(stepping, events),
+            Stop::Running => {
+                self.stepping = Some(stepping);
+                Stop::Running
+            }
+            other => other,
+        }
+    }
+
+    /// Carries a step command on from a single step that has just completed: whether the command is
+    /// done there, and if not, the next single step, until it is done, stops for another reason, or
+    /// leaves the target running.
+    fn carry_step(&mut self, mut stepping: Stepping, events: &mut Vec<(&'static str, Option<Json>)>) -> Stop {
         loop {
+            if let Some(stop) = self.after_step(&mut stepping, events) {
+                return stop;
+            }
             match self.backend.step() {
-                Stop::Step if reached(self.backend.depth(), start) => break Stop::Step,
-                Stop::Step => {
-                    budget -= 1;
-                    if budget == 0 {
-                        break self.give_up_stepping(
-                            "the call being stepped over has not returned",
-                            events,
-                        );
-                    }
+                Stop::Step => {}
+                Stop::Running => {
+                    self.stepping = Some(stepping);
+                    return Stop::Running;
                 }
-                other => break other,
+                other => return other,
             }
         }
+    }
+
+    /// What a step command does after one of its single steps has completed: `Some` stop once the
+    /// command is done, or ends for another reason; `None` to take another single step.
+    fn after_step(
+        &mut self,
+        stepping: &mut Stepping,
+        events: &mut Vec<(&'static str, Option<Json>)>,
+    ) -> Option<Stop> {
+        let Stepping { action, by_source, start, .. } = *stepping;
+        let waiting_for = if by_source {
+            if matches!(action, Action::StepOver | Action::StepOut) && self.backend.depth() > start {
+                match self.backend.run_to_return() {
+                    Stop::Step => {}
+                    other => return Some(other),
+                }
+            }
+            if matches!(action, Action::StepIn)
+                && self.backend.depth() > start
+                && !self.innermost_frame_has_source()
+            {
+                match self.backend.run_to_return() {
+                    Stop::Step => {}
+                    other => return Some(other),
+                }
+            }
+            if stepping_reached(action, self.backend.depth(), start) && self.backend.at_source_boundary() {
+                return Some(Stop::Step);
+            }
+            "no source statement was reached"
+        } else {
+            if stepping_reached(action, self.backend.depth(), start) {
+                return Some(Stop::Step);
+            }
+            "the call being stepped over has not returned"
+        };
+        stepping.budget -= 1;
+        if stepping.budget == 0 {
+            return Some(self.give_up_stepping(waiting_for, events));
+        }
+        None
     }
 
     /// Ends a step that ran out of budget: says so on the console and parks the target where it
@@ -825,10 +1440,9 @@ impl Debugger {
             Some(json!({
                 "category": "console",
                 "output": format!(
-                    "[lamella] Step gave up after {budget} instructions: {waiting_for}. \
-                     Execution is most likely in code with no line information -- a runtime \
-                     helper, or past the end of the program. Stopped where it is; use Continue, \
-                     or set a breakpoint where you want to land.\n"
+                    "The step gave up after {budget} instructions: {waiting_for}. The program is most \
+                     likely in code that has no source lines, or past its end. It stopped where it \
+                     is: Continue, or set a breakpoint where you want to stop.\n"
                 ),
             })),
         ));
@@ -862,41 +1476,13 @@ impl Debugger {
                 return stop;
             }
         }
-        let start = self.backend.depth();
-        let mut budget = self.backend.step_budget().max(1);
-        loop {
-            match self.backend.step() {
-                Stop::Step => {}
-                other => break other,
-            }
-            if matches!(action, Action::StepOver | Action::StepOut) && self.backend.depth() > start {
-                match self.backend.run_to_return() {
-                    Stop::Step => {}
-                    other => break other,
-                }
-            }
-            if matches!(action, Action::StepIn)
-                && self.backend.depth() > start
-                && !self.innermost_frame_has_source()
-            {
-                match self.backend.run_to_return() {
-                    Stop::Step => {}
-                    other => break other,
-                }
-            }
-            let reached = match action {
-                Action::StepIn | Action::Resume => true,
-                Action::StepOver => self.backend.depth() <= start,
-                Action::StepOut => self.backend.depth() < start,
-            };
-            if reached && self.backend.at_source_boundary() {
-                break Stop::Step;
-            }
-            budget -= 1;
-            if budget == 0 {
-                break self.give_up_stepping("no source statement was reached", events);
-            }
-        }
+        let stepping = Stepping {
+            action,
+            by_source: true,
+            start: self.backend.depth(),
+            budget: self.backend.step_budget().max(1),
+        };
+        self.step_on(stepping, events)
     }
 
     /// Whether the frame execution is in right now is one a source file covers.
@@ -904,18 +1490,19 @@ impl Debugger {
         self.backend
             .stack()
             .first()
-            .is_some_and(|frame| self.backend.source_location(frame.address).is_some())
+            .is_some_and(|frame| self.backend.frame_source_location(0, frame.address).is_some())
     }
 
     /// Flushes new program output as an `output` event, then emits the event for the
     /// stop -- so console output precedes the stop or terminate it accompanies.
     fn finish(&mut self, stop: Stop, events: &mut Vec<(&'static str, Option<Json>)>) {
         self.flush_output(events);
+        let thread = self.backend.selected_thread();
         match stop {
-            Stop::Breakpoint => events.push(("stopped", Some(stopped("breakpoint")))),
-            Stop::Step => events.push(("stopped", Some(stopped("step")))),
+            Stop::Breakpoint => events.push(("stopped", Some(stopped("breakpoint", thread)))),
+            Stop::Step => events.push(("stopped", Some(stopped("step", thread)))),
             Stop::Exception(info) => {
-                events.push(("stopped", Some(stopped_on_exception(&info))));
+                events.push(("stopped", Some(stopped_on_exception(&info, thread))));
                 self.stopped_exception = Some(info);
             }
             Stop::Done => {
@@ -929,7 +1516,8 @@ impl Debugger {
                     "output",
                     Some(json!({ "category": "stderr", "output": format!("{message}\n") })),
                 ));
-                events.push(("exited", Some(json!({ "exitCode": -1 }))));
+                let exit_code = self.backend.fault_exit_code().unwrap_or(-1);
+                events.push(("exited", Some(json!({ "exitCode": exit_code }))));
                 events.push(("terminated", None));
             }
         }
@@ -953,20 +1541,36 @@ impl Debugger {
         }
     }
 
-    fn stack_trace(&self) -> Json {
-        let frames = self.backend.stack();
+    /// The call stack of `thread`, or of the selected thread when the request names none.
+    fn stack_trace(&mut self, thread: Option<u32>) -> Json {
+        let thread = thread.unwrap_or_else(|| self.backend.selected_thread());
+        let Some(frames) = self.on_thread(thread, |debugger| {
+            let frames = debugger.backend.stack();
+            frames
+                .into_iter()
+                .enumerate()
+                .map(|(index, frame)| {
+                    let source = debugger.backend.frame_source_location(index, frame.address);
+                    (frame, source)
+                })
+                .collect::<Vec<_>>()
+        }) else {
+            return json!({ "stackFrames": [], "totalFrames": 0 });
+        };
         let mut out = Vec::with_capacity(frames.len());
-        for (index, frame) in frames.iter().enumerate() {
-            let source = self.backend.source_location(frame.address);
+        for (index, (frame, source)) in frames.iter().enumerate() {
+            let Some(id) = self.frame_id(thread, index) else {
+                break;
+            };
             let mut entry = json!({
-                "id": index,
+                "id": id,
                 "name": frame.name,
                 "line": source.as_ref().map_or(0, |location| location.line),
                 "column": source.as_ref().map_or(0, |location| location.column),
                 "instructionPointerReference": frame.address.to_string(),
             });
             if let Some(location) = &source {
-                entry["source"] = json!({ "path": location.file.clone() });
+                entry["source"] = json!({ "path": self.path_map.to_local(&location.file) });
                 entry["endLine"] = json!(location.end_line);
                 entry["endColumn"] = json!(location.end_column);
             }
@@ -974,6 +1578,62 @@ impl Debugger {
         }
         let total = out.len();
         json!({ "stackFrames": out, "totalFrames": total })
+    }
+
+    /// The id the client names frame `index` of `thread` by, or `None` past [`FRAMES_PER_THREAD`].
+    /// A thread is given its slot the first time one of its frames is named.
+    fn frame_id(&mut self, thread: u32, index: usize) -> Option<u32> {
+        if index >= FRAMES_PER_THREAD as usize {
+            return None;
+        }
+        let slot = match self.frame_threads.iter().position(|&known| known == thread) {
+            Some(slot) => slot,
+            None => {
+                self.frame_threads.push(thread);
+                self.frame_threads.len() - 1
+            }
+        };
+        u32::try_from(slot)
+            .ok()?
+            .checked_mul(FRAMES_PER_THREAD)?
+            .checked_add(index as u32)
+            .filter(|&id| id < MAX_FRAME_ID)
+    }
+
+    /// The thread and the stack position a frame id names ([`Debugger::frame_id`]). An id no stack
+    /// trace gave names a frame of thread 1, as every id did before the program's other threads were
+    /// shown.
+    fn frame_of(&self, id: u32) -> (u32, usize) {
+        let thread = self
+            .frame_threads
+            .get((id / FRAMES_PER_THREAD) as usize)
+            .copied()
+            .unwrap_or(lamella_debug_backend::MAIN_THREAD);
+        (thread, (id % FRAMES_PER_THREAD) as usize)
+    }
+
+    /// Runs `read` with `thread` selected, then selects the thread that was selected before, so that
+    /// reading another thread's frames leaves the stop's own thread the one a step moves. `None` when
+    /// the program has no such thread.
+    fn on_thread<T>(&mut self, thread: u32, read: impl FnOnce(&mut Self) -> T) -> Option<T> {
+        let before = self.backend.selected_thread();
+        if thread == before {
+            return Some(read(self));
+        }
+        if !self.backend.select_thread(thread) {
+            return None;
+        }
+        let value = read(self);
+        self.backend.select_thread(before);
+        Some(value)
+    }
+
+    /// Selects the thread a stepping request names, when it names one the program has: the thread a
+    /// step moves. A request naming none leaves the thread of the last stop selected.
+    fn select_requested_thread(&mut self, request: &Request) {
+        if let Some(thread) = arg_opt_u32(request, "threadId") {
+            self.backend.select_thread(thread);
+        }
     }
 
     fn scopes(&self, frame_id: u32) -> Json {
@@ -987,20 +1647,23 @@ impl Debugger {
 
     /// Answers `variables` for either kind of reference this adapter hands out: a frame's scope, or
     /// a value's members at [`CHILDREN_BASE`] and above.
-    fn variables(&self, reference: u32) -> Json {
+    fn variables(&mut self, reference: u32) -> Json {
         if reference == 0 {
             return json!({ "variables": [] });
         }
         let rows = if reference >= CHILDREN_BASE {
             self.backend.children(ChildReference(reference - CHILDREN_BASE))
         } else {
-            let frame_index = ((reference - 1) / 3) as usize;
+            let (thread, frame_index) = self.frame_of((reference - 1) / 3);
             let scope = match (reference - 1) % 3 {
                 0 => Scope::Arguments,
                 1 => Scope::Locals,
                 _ => Scope::Stack,
             };
-            self.backend.variables_with_children(frame_index, scope)
+            self.on_thread(thread, |debugger| {
+                debugger.backend.variables_with_children(frame_index, scope)
+            })
+            .unwrap_or_default()
         };
         let variables: Vec<Json> = rows
             .iter()
@@ -1023,10 +1686,18 @@ impl Debugger {
     /// neither is ever substituted for the other.
     fn evaluate(&mut self, request: &Request) -> Vec<Message> {
         let expression = arg_str(request, "expression").trim().to_owned();
-        match frame_eval::route(arg_opt_u32(request, "frameId"), arg_str(request, "context")) {
+        let frame_id = arg_opt_u32(request, "frameId");
+        match frame_eval::route(frame_id, arg_str(request, "context")) {
             frame_eval::Target::Frame { index, room } => {
-                let (visible, references): (Vec<Variable>, Vec<ChildReference>) =
-                    self.frame_variables(index).into_iter().unzip();
+                let (thread, index) = match frame_id {
+                    Some(id) => self.frame_of(id),
+                    None => (self.backend.selected_thread(), index),
+                };
+                let (visible, references): (Vec<Variable>, Vec<ChildReference>) = self
+                    .on_thread(thread, |debugger| debugger.frame_variables(index))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .unzip();
                 match frame_eval::resolve(&visible, &expression) {
                     Ok(variable) => {
                         let children = visible
@@ -1089,28 +1760,29 @@ impl Debugger {
         visible
     }
 
-    /// Answers an unscoped Debug Console line from the debugger's own evaluation session.
-    #[cfg(feature = "interpreter")]
-    fn session_evaluate(&mut self, request: &Request, expression: &str) -> Vec<Message> {
-        let body = crate::repl_eval::evaluate(&mut self.repl, expression);
-        vec![self.response(request, true, Some(body))]
-    }
-
-    /// Answers an unscoped Debug Console line in a build that carries no evaluation session of its
-    /// own -- a server whose target is a board, where a submission evaluated here would run in this
-    /// process rather than on the thing being debugged.
+    /// Answers an unscoped Debug Console line: from the debugger's own evaluation session where the
+    /// program runs in this process, and with a refusal everywhere else.
+    ///
+    /// **THE TARGET DECIDES, AT RUN TIME, AND THE BUILD DOES NOT.** One build serves this computer's
+    /// interpreter and a board alike, so carrying the session says nothing about where this
+    /// session's program runs; a submission evaluated here for a board would run on this computer
+    /// and be shown as the board's answer. See [`DebugBackend::runs_in_this_process`].
     ///
     /// The refusal names the two ways to read the target's own values, because a console line is
     /// usually someone reaching for a value they can have: a refusal that only says no leaves them
     /// with the impression that the session cannot show them anything.
-    #[cfg(not(feature = "interpreter"))]
     fn session_evaluate(&mut self, request: &Request, expression: &str) -> Vec<Message> {
+        #[cfg(feature = "interpreter")]
+        if self.backend.runs_in_this_process() {
+            let body = crate::repl_eval::evaluate(&mut self.repl, expression);
+            return vec![self.response(request, true, Some(body))];
+        }
         let _ = expression;
         self.fail(
             request,
-            "This debug server evaluates nothing of its own: a submission typed here would run \
-             in this process rather than on the target being debugged. Hover a variable, or add \
-             its name to Watch, to read it from the paused frame.",
+            "This session evaluates nothing of its own: a submission typed here would run in this \
+             process rather than on the target being debugged. Hover a variable, or add its name \
+             to Watch, to read it from the paused frame.",
         )
     }
 
@@ -1152,7 +1824,7 @@ impl Debugger {
         if reference == 0 || reference >= CHILDREN_BASE {
             return None;
         }
-        let frame_index = ((reference - 1) / 3) as usize;
+        let (thread, frame_index) = self.frame_of((reference - 1) / 3);
         let scope = match (reference - 1) % 3 {
             0 => Scope::Arguments,
             1 => Scope::Locals,
@@ -1160,7 +1832,10 @@ impl Debugger {
         };
         let name = arg_str(request, "name");
         let value = arg_str(request, "value");
-        self.backend.set_variable(frame_index, scope, name, value)
+        self.on_thread(thread, |debugger| {
+            debugger.backend.set_variable(frame_index, scope, name, value)
+        })
+        .flatten()
     }
 
     fn response(&mut self, request: &Request, success: bool, body: Option<Json>) -> Message {
@@ -1267,6 +1942,32 @@ fn unverified(reason: &'static str, message: String) -> Json {
     json!({ "verified": false, "reason": reason, "message": message })
 }
 
+/// `answer`, carrying the id later events name it by.
+fn with_id(mut answer: Json, id: i64) -> Json {
+    answer["id"] = json!(id);
+    answer
+}
+
+/// The id the answer at `index` already has, where a pending answer gave it one (`ids`).
+fn answer_id(ids: Option<&[i64]>, index: usize) -> Option<i64> {
+    ids.and_then(|ids| ids.get(index).copied())
+}
+
+/// Says in `answer` whether the target holds it, for a breakpoint the target has a place for: an
+/// armed one carries no reason, and one past the target's `cap` carries the reason it waits.
+fn set_verified(answer: &mut Json, armed: bool, cap: Option<usize>) {
+    answer["verified"] = json!(armed);
+    if armed {
+        if let Some(fields) = answer.as_object_mut() {
+            fields.remove("message");
+            fields.remove("reason");
+        }
+    } else {
+        answer["message"] = json!(over_capacity_message(cap));
+        answer["reason"] = json!(REASON_PENDING);
+    }
+}
+
 /// `Breakpoint.reason` for a breakpoint that may still bind without anyone doing anything.
 const REASON_PENDING: &str = "pending";
 
@@ -1294,14 +1995,16 @@ enum Action {
     StepOut,
 }
 
-fn stopped(reason: &str) -> Json {
-    json!({ "reason": reason, "threadId": 1, "allThreadsStopped": true })
+/// A `stopped` event's body: why, and the thread the stop happened on. Every thread stops with it, as
+/// on .NET.
+fn stopped(reason: &str, thread: u32) -> Json {
+    json!({ "reason": reason, "threadId": thread, "allThreadsStopped": true })
 }
 
 /// The `stopped` event for an exception stop, with the exception's type as the text a client shows
 /// beside the stop.
-fn stopped_on_exception(info: &ExceptionInfo) -> Json {
-    let mut body = stopped("exception");
+fn stopped_on_exception(info: &ExceptionInfo, thread: u32) -> Json {
+    let mut body = stopped("exception", thread);
     body["description"] = json!("Paused on exception");
     body["text"] = json!(info.type_name);
     body
@@ -1368,8 +2071,41 @@ fn filter_offer(filter: ExceptionFilter) -> Json {
 /// below it (`frame * 3 + scope + 1`).
 ///
 /// The two kinds share one number space because DAP gives them one field, so they are kept apart by
-/// range: a scope reference reaches this only in a stack about 350,000 frames deep.
-const CHILDREN_BASE: u32 = 1 << 20;
+/// range: a frame id reaches [`MAX_FRAME_ID`] only after frames of some 87,000 threads have been
+/// named in one session ([`FRAMES_PER_THREAD`]).
+const CHILDREN_BASE: u32 = 1 << 30;
+
+/// The frame ids one thread's stack is given: a frame's id is its thread's slot times this, plus its
+/// place in the stack. As many as the interpreter's deepest call stack has frames.
+const FRAMES_PER_THREAD: u32 = 4096;
+
+/// The first frame id whose scope references would reach [`CHILDREN_BASE`]: a frame is named only
+/// below it.
+const MAX_FRAME_ID: u32 = (CHILDREN_BASE - 1) / 3;
+
+/// A step command a single step of it left waiting ([`Debugger::step_on`]): what it steps, how, from
+/// what depth, and how many single steps it has left.
+#[derive(Clone, Copy)]
+struct Stepping {
+    action: Action,
+    /// Whether it steps by source statement, or by call depth alone.
+    by_source: bool,
+    /// The call depth it started at.
+    start: usize,
+    /// The single steps it may still take before it gives up.
+    budget: usize,
+}
+
+/// Whether a step of `action` that started at depth `start` has reached a depth it may end at:
+/// `stepIn` any, `next` this frame or a caller (a stepped-over call has returned), `stepOut` a caller
+/// (the current method has returned).
+fn stepping_reached(action: Action, depth: usize, start: usize) -> bool {
+    match action {
+        Action::StepIn | Action::Resume => true,
+        Action::StepOver => depth <= start,
+        Action::StepOut => depth < start,
+    }
+}
 
 /// The DAP `variablesReference` for a backend's [`ChildReference`]: 0 for a leaf, and otherwise the
 /// backend's number moved up past the scope references.
@@ -1410,6 +2146,31 @@ const ERROR_TERMINATE_FAILED: u32 = 5;
 /// The identifier of the error shown when the backend could not restart the program
 /// ([`DebugBackend::restart`]).
 const ERROR_RESTART_FAILED: u32 = 6;
+
+/// The error a failed `launch` or `attach` is reported under, and the words that lead its reason.
+fn start_failure(attaching: bool) -> (u32, &'static str) {
+    if attaching {
+        (ERROR_ATTACH_FAILED, "The session could not attach")
+    } else {
+        (ERROR_LAUNCH_FAILED, "The session could not start")
+    }
+}
+
+/// The answer to a breakpoint request in a session that runs without debugging: one unverified
+/// breakpoint for each one the request's `list` names, saying why. Nothing is armed on the target.
+fn unarmed_without_debugging(request: &Request, list: &str) -> Json {
+    let asked = request
+        .arguments
+        .as_ref()
+        .and_then(|arguments| arguments.get(list))
+        .and_then(Json::as_array)
+        .map_or(0, Vec::len);
+    let unarmed = unverified(REASON_FAILED, String::from(WITHOUT_DEBUGGING));
+    json!({ "breakpoints": vec![unarmed; asked] })
+}
+
+/// What a breakpoint or filter is answered with in a session that runs without debugging.
+const WITHOUT_DEBUGGING: &str = "The program runs without debugging, so it stops at no breakpoint.";
 
 /// The backend behind [`Debugger::refusing`]. There is no target: nothing starts, and every question
 /// about a program has an empty answer.
@@ -1803,8 +2564,9 @@ mod tests {
         }
     }
 
-    /// A backend whose program FAULTS on resume -- the trap case.
-    struct FaultingBackend;
+    /// A backend whose program FAULTS on resume -- the trap case -- with the code the target gave for
+    /// it, or none.
+    struct FaultingBackend(Option<i32>);
 
     impl DebugBackend for FaultingBackend {
         fn launch(&mut self) -> Result<(), String> {
@@ -1843,6 +2605,44 @@ mod tests {
         fn take_output(&mut self) -> Option<String> {
             None
         }
+        fn fault_exit_code(&self) -> Option<i32> {
+            self.0
+        }
+    }
+
+    /// A target with no threads of its own -- a board debugged through its probe -- lists its one
+    /// thread as .NET's debugger names a main thread, as the interpreter on this computer lists it.
+    #[test]
+    fn a_target_with_one_thread_names_it_as_dotnet_names_a_main_thread() {
+        let mut dbg = Debugger::with_backend(Box::new(FaultingBackend(None)));
+        dbg.handle(&request(1, "launch", None));
+        let out = dbg.handle(&request(2, "threads", None));
+        let Some(Message::Response(response)) = out.first() else {
+            panic!("threads answered {out:?}");
+        };
+        assert_eq!(
+            response.body,
+            Some(json!({ "threads": [{ "id": 1, "name": "Main Thread" }] }))
+        );
+    }
+
+    /// The `exited` event of a fault carries the code the TARGET gave for it, where it gave one: a
+    /// board's 134 for an exception nothing caught, not the -1 that stands for an end no target
+    /// accounted for.
+    #[test]
+    fn a_fault_reports_the_code_the_target_gave_for_it() {
+        let mut dbg = Debugger::with_backend(Box::new(FaultingBackend(Some(134))));
+        dbg.handle(&request(1, "launch", None));
+        let out = dbg.handle(&request(2, "continue", None));
+        let exited = out.iter().find_map(|m| match m {
+            Message::Event(e) if e.event == "exited" => e.body.clone(),
+            _ => None,
+        });
+        assert_eq!(
+            exited.and_then(|b| b.get("exitCode").and_then(serde_json::Value::as_i64)),
+            Some(134),
+            "the board's own code, not -1"
+        );
     }
 
     /// A FAULTED session must report a NON-ZERO exit, and this is the regression it exists to catch.
@@ -1855,7 +2655,7 @@ mod tests {
     /// trap text is a heuristic every consumer would reimplement slightly differently.
     #[test]
     fn a_faulted_session_reports_a_nonzero_exit_rather_than_a_silent_success() {
-        let mut dbg = Debugger::with_backend(Box::new(FaultingBackend));
+        let mut dbg = Debugger::with_backend(Box::new(FaultingBackend(None)));
         dbg.handle(&request(1, "launch", None));
         let out = dbg.handle(&request(2, "continue", None));
 
@@ -2082,6 +2882,10 @@ mod tests {
             console.contains("gave up after 8 instructions")
                 && console.contains("no source statement was reached"),
             "the give-up must say what it was waiting for, not stop silently: {console:?}"
+        );
+        assert!(
+            !console.contains("[lamella]") && !console.contains("runtime helper"),
+            "{console:?}"
         );
     }
 
@@ -2584,6 +3388,30 @@ mod tests {
         );
     }
 
+    /// **AN UNVERIFIED BREAKPOINT'S MESSAGE READS AS ONE SENTENCE AFTER ANOTHER**, with no run of
+    /// spaces where the source continued a line: the editor shows it as it is sent, on hover.
+    #[test]
+    fn no_unverified_breakpoints_message_carries_a_run_of_spaces() {
+        let message_of = |out: &[Message]| -> String {
+            let breakpoint = out[0].response_body()["breakpoints"][0].clone();
+            breakpoint["message"].as_str().unwrap_or_else(|| panic!("a message: {breakpoint}")).to_owned()
+        };
+        let mut messages = Vec::new();
+        let mut mapped = Debugger::with_backend(Box::new(ResolvesIntoAnotherFile));
+        mapped.handle(&request(1, "launch", None));
+        let no_code = json!({ "source": { "path": "app.cs" }, "breakpoints": [{ "line": 9 }] });
+        messages.push(message_of(&mapped.handle(&request(2, "setBreakpoints", Some(no_code)))));
+        let not_an_address = json!({ "breakpoints": [{ "instructionReference": "here" }] });
+        messages.push(message_of(&mapped.handle(&request(3, "setInstructionBreakpoints", Some(not_an_address)))));
+        let (module, main) = add_program();
+        let mut unmapped = Debugger::new(module, main);
+        let no_mapping = json!({ "source": { "path": "app.cs" }, "breakpoints": [{ "line": 9 }] });
+        messages.push(message_of(&unmapped.handle(&request(1, "setBreakpoints", Some(no_mapping)))));
+        for message in messages {
+            assert!(!message.contains("  "), "{message:?}");
+        }
+    }
+
     /// AN UNVERIFIED BREAKPOINT SAYS WHY, AND SAYS IT TWICE -- once for the person and once for the
     /// client. The two `reason` values are not interchangeable: `pending` invites a client to wait,
     /// `failed` tells someone to change something, and the same refusal means both depending on
@@ -2628,6 +3456,29 @@ mod tests {
         let breakpoint = out[0].response_body()["breakpoints"][0].clone();
         assert_eq!(breakpoint["verified"], json!(true), "{breakpoint}");
         assert!(breakpoint.get("reason").is_none(), "{breakpoint}");
+    }
+
+    /// **A FILE'S BREAKPOINTS REPLACE THAT FILE'S, AND NO OTHER FILE'S.** `setBreakpoints` names one
+    /// source and "clears all previous breakpoints in that source" (DAP), so a client sends one per
+    /// file, and the breakpoints of every file stay armed together.
+    #[test]
+    fn a_files_breakpoints_replace_that_files_and_leave_every_other_file_armed() {
+        let record = std::rc::Rc::new(core::cell::RefCell::new(Record::default()));
+        let mut dbg = Debugger::with_backend(Box::new(Recorded { record: record.clone() }));
+        dbg.handle(&request(1, "launch", None));
+        let armed = |record: &std::rc::Rc<core::cell::RefCell<Record>>| {
+            let mut last = record.borrow().sets.last().cloned().unwrap_or_default();
+            last.sort_unstable();
+            last
+        };
+        let in_a = json!({ "source": { "path": "a.cs" }, "breakpoints": [{ "line": 3 }] });
+        let in_b = json!({ "source": { "path": "b.cs" }, "breakpoints": [{ "line": 7 }] });
+        dbg.handle(&request(2, "setBreakpoints", Some(in_a)));
+        dbg.handle(&request(3, "setBreakpoints", Some(in_b)));
+        assert_eq!(armed(&record), vec![3, 7], "both files' breakpoints are armed");
+        let none_in_a = json!({ "source": { "path": "a.cs" }, "breakpoints": [] });
+        dbg.handle(&request(4, "setBreakpoints", Some(none_in_a)));
+        assert_eq!(armed(&record), vec![7], "b.cs's breakpoint is still armed");
     }
 
     #[test]
@@ -3070,6 +3921,70 @@ mod tests {
         }
     }
 
+    /// A backend that places each frame by where it stands, apart from where its address alone would
+    /// place it: frame `index` at line `100 + index`, while its address maps to line 999.
+    struct PlacesItsFrames;
+
+    impl DebugBackend for PlacesItsFrames {
+        fn launch(&mut self) -> Result<(), String> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Stop {
+            Stop::Done
+        }
+        fn step(&mut self) -> Stop {
+            Stop::Step
+        }
+        fn depth(&self) -> usize {
+            2
+        }
+        fn set_breakpoints(&mut self, _addresses: &[u64]) -> Result<(), String> {
+            Ok(())
+        }
+        fn stack(&self) -> Vec<Frame> {
+            [0x0800_0200u64, 0x0800_0310]
+                .into_iter()
+                .map(|address| Frame { address, name: String::from("f"), line: 0 })
+                .collect()
+        }
+        fn source_location(&self, _address: u64) -> Option<SourceLocation> {
+            Some(SourceLocation { file: String::from("P.cs"), line: 999, column: 1, end_line: 999, end_column: 1 })
+        }
+        fn frame_source_location(&self, index: usize, _address: u64) -> Option<SourceLocation> {
+            let line = 100 + index as u32;
+            Some(SourceLocation { file: String::from("P.cs"), line, column: 1, end_line: line, end_column: 1 })
+        }
+        fn variables(&self, _frame: usize, _scope: Scope) -> Vec<Variable> {
+            Vec::new()
+        }
+        fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
+            Vec::new()
+        }
+        fn read_registers(&self) -> Vec<Register> {
+            Vec::new()
+        }
+        fn disassemble(&self, _address: u64, _offset: i64, _count: usize) -> Vec<Disassembled> {
+            Vec::new()
+        }
+        fn take_output(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    /// Every frame of a `stackTrace` is placed where the backend says that frame stands, never by its
+    /// address alone: a native frame above the innermost stands at a call, and its address is the
+    /// instruction after it, which for a call that ends a statement is the next statement's.
+    #[test]
+    fn a_frame_is_placed_where_the_backend_says_it_stands_not_by_its_address_alone() {
+        let mut dbg = Debugger::with_backend(Box::new(PlacesItsFrames));
+        dbg.handle(&request(1, "launch", None));
+        let trace = dbg.handle(&request(2, "stackTrace", None));
+        let frames = trace[0].response_body()["stackFrames"].clone();
+        assert_eq!(frames[0]["line"], json!(100), "{frames}");
+        assert_eq!(frames[1]["line"], json!(101), "frame 1 by its own place, not line 999: {frames}");
+        assert_eq!(frames[1]["instructionPointerReference"], json!("134218512"), "its address unchanged");
+    }
+
     #[test]
     fn step_in_descends_into_a_call_while_next_steps_over_it() {
         let (module, main) = call_program();
@@ -3382,5 +4297,703 @@ mod tests {
             .find(|scope| scope["name"] == json!(name))
             .and_then(|scope| scope["variablesReference"].as_u64())
             .unwrap() as u32
+    }
+
+    /// What a [`Recorded`] backend was asked to do, readable after the adapter has taken the backend.
+    #[derive(Default)]
+    struct Record {
+        /// Every breakpoint set the adapter programmed, in order.
+        sets: Vec<Vec<u64>>,
+        /// How many exception filters each set the adapter armed held, in order.
+        filter_sets: Vec<usize>,
+        launched: bool,
+        /// Whether the target was handed back.
+        released: bool,
+        /// Why its `launch` and `attach` fail, while this is set.
+        refuses: Option<String>,
+        /// How many breakpoints it holds at once, for a target with a hardware limit.
+        max: Option<usize>,
+        /// Every source a line was resolved in, as the backend was handed it.
+        documents: Vec<String>,
+        /// The source the program records every line in, for a target that maps addresses to source.
+        recorded_file: Option<String>,
+        /// Where the program is stopped, for a target that shows a frame.
+        frame_at: Option<u64>,
+    }
+
+    /// A backend for the sessions a [`Chooser`] starts: it resolves source line N to address N, offers
+    /// Set Value, and records what it is asked into a [`Record`] the test keeps.
+    struct Recorded {
+        record: std::rc::Rc<core::cell::RefCell<Record>>,
+    }
+
+    impl DebugBackend for Recorded {
+        fn launch(&mut self) -> Result<(), String> {
+            if let Some(reason) = self.record.borrow().refuses.clone() {
+                return Err(reason);
+            }
+            self.record.borrow_mut().launched = true;
+            Ok(())
+        }
+        fn attach(&mut self) -> Result<(), String> {
+            self.launch()
+        }
+        fn release(&mut self) -> Result<(), String> {
+            self.record.borrow_mut().released = true;
+            Ok(())
+        }
+        fn resume(&mut self) -> Stop {
+            Stop::Done
+        }
+        fn step(&mut self) -> Stop {
+            Stop::Step
+        }
+        fn depth(&self) -> usize {
+            1
+        }
+        fn set_breakpoints(&mut self, addresses: &[u64]) -> Result<(), String> {
+            self.record.borrow_mut().sets.push(addresses.to_vec());
+            Ok(())
+        }
+        fn max_breakpoints(&self) -> Option<usize> {
+            self.record.borrow().max
+        }
+        fn set_exception_filters(&mut self, filters: &[ExceptionFilter]) -> Result<(), String> {
+            self.record.borrow_mut().filter_sets.push(filters.len());
+            Ok(())
+        }
+        fn resolve_source_breakpoint(&self, document: &str, line: u32) -> Option<u64> {
+            self.record.borrow_mut().documents.push(document.to_owned());
+            Some(u64::from(line))
+        }
+        fn source_location(&self, address: u64) -> Option<SourceLocation> {
+            let file = self.record.borrow().recorded_file.clone()?;
+            let line = u32::try_from(address).ok()?;
+            Some(SourceLocation { file, line, column: 1, end_line: line, end_column: 1 })
+        }
+        fn can_set_variables(&self) -> bool {
+            true
+        }
+        fn stack(&self) -> Vec<Frame> {
+            self.record
+                .borrow()
+                .frame_at
+                .map(|address| Frame { address, name: String::from("Program.Main"), line: 0 })
+                .into_iter()
+                .collect()
+        }
+        fn variables(&self, _frame: usize, _scope: Scope) -> Vec<Variable> {
+            Vec::new()
+        }
+        fn read_memory(&self, _address: u64, _len: usize) -> Vec<u8> {
+            Vec::new()
+        }
+        fn read_registers(&self) -> Vec<Register> {
+            Vec::new()
+        }
+        fn disassemble(&self, _address: u64, _offset: i64, _count: usize) -> Vec<Disassembled> {
+            Vec::new()
+        }
+        fn take_output(&mut self) -> Option<String> {
+            None
+        }
+    }
+
+    /// A session with no target until its `launch`, whose chooser hands back a [`Recorded`] backend
+    /// with `stop_at_entry`, `no_debug` and `notes`, and keeps every `(command, arguments)` it is given.
+    fn chosen_session(
+        stop_at_entry: bool,
+        no_debug: bool,
+        notes: Vec<String>,
+    ) -> (
+        Debugger,
+        std::rc::Rc<core::cell::RefCell<Record>>,
+        std::rc::Rc<core::cell::RefCell<Vec<(String, Json)>>>,
+    ) {
+        let record = std::rc::Rc::new(core::cell::RefCell::new(Record::default()));
+        let asked = std::rc::Rc::new(core::cell::RefCell::new(Vec::new()));
+        let (backend_record, chooser_asked) = (record.clone(), asked.clone());
+        let mut notes = Some(notes);
+        let debugger = Debugger::choosing(Box::new(move |command: &str, arguments: &Json| {
+            chooser_asked.borrow_mut().push((command.to_owned(), arguments.clone()));
+            Ok(Chosen {
+                backend: Box::new(Recorded { record: backend_record.clone() }),
+                stop_at_entry,
+                no_debug,
+                notes: notes.take().unwrap_or_default(),
+                path_map: PathMap::default(),
+            })
+        }));
+        (debugger, record, asked)
+    }
+
+    /// The events in `messages`, by name, in the order they were sent.
+    fn event_names(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Event(event) => Some(event.event.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The body of the first event named `name` in `messages`.
+    fn event_body(messages: &[Message], name: &str) -> Option<Json> {
+        messages.iter().find_map(|message| match message {
+            Message::Event(event) if event.event == name => event.body.clone(),
+            _ => None,
+        })
+    }
+
+    /// The `breakpoint` events in `messages`: each one's `breakpoint`, in the order they were sent.
+    fn breakpoint_events(messages: &[Message]) -> Vec<Json> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::Event(event) if event.event == "breakpoint" => event.body.clone(),
+                _ => None,
+            })
+            .map(|body| {
+                assert_eq!(body["reason"], json!("changed"), "{body}");
+                body["breakpoint"].clone()
+            })
+            .collect()
+    }
+
+    /// **WHAT A CLIENT CONFIGURES BEFORE THE SESSION HAS A TARGET IS KEPT, AND SET WHEN THE TARGET
+    /// STARTS.** Each answer is pending and carries an id, and once the launch has started the target
+    /// a `breakpoint` event with that id says how it was set -- so the promise a pending answer makes is
+    /// kept, for a line, a method's name and an exception filter alike.
+    #[test]
+    fn configuration_sent_before_the_target_is_chosen_is_set_when_it_starts() {
+        let (mut dbg, record, _) = chosen_session(false, false, Vec::new());
+        dbg.handle(&request(1, "initialize", None));
+        let early = [
+            ("setBreakpoints", json!({ "source": { "path": "a.cs" }, "breakpoints": [{ "line": 5 }] })),
+            ("setFunctionBreakpoints", json!({ "breakpoints": [{ "name": "Program.Main" }] })),
+            ("setExceptionBreakpoints", json!({ "filters": ["uncaught"] })),
+        ];
+        let mut ids = Vec::new();
+        for (seq, (command, arguments)) in early.into_iter().enumerate() {
+            let out = dbg.handle(&request(seq as i64 + 2, command, Some(arguments)));
+            let answer = out[0].response_body()["breakpoints"][0].clone();
+            assert_eq!(answer["verified"], json!(false), "{command}: {answer}");
+            assert_eq!(answer["reason"], json!("pending"), "{command}: {answer}");
+            assert!(
+                answer["message"].as_str().is_some_and(|text| !text.contains("  ")),
+                "{command}: {answer}"
+            );
+            ids.push(answer["id"].as_i64().unwrap_or_else(|| panic!("{command}: an id: {answer}")));
+        }
+        assert!(record.borrow().sets.is_empty(), "nothing is armed on a target not yet chosen");
+
+        let launched = dbg.handle(&request(5, "launch", Some(json!({}))));
+        let changed = breakpoint_events(&launched);
+        let reported: Vec<i64> = changed.iter().filter_map(|breakpoint| breakpoint["id"].as_i64()).collect();
+        assert_eq!(reported, ids, "one event for each early answer, by its id: {changed:?}");
+        assert_eq!(changed[0]["verified"], json!(true), "the line is set: {}", changed[0]);
+        assert_eq!(changed[0]["line"], json!(5), "{}", changed[0]);
+        assert!(
+            record.borrow().sets.last().is_some_and(|armed| armed.contains(&5)),
+            "and armed on the target: {:?}",
+            record.borrow().sets
+        );
+        assert_eq!(changed[1]["verified"], json!(false), "{}", changed[1]);
+        assert_eq!(changed[2]["verified"], json!(false), "{}", changed[2]);
+    }
+
+    /// **A RUN WITHOUT DEBUGGING THAT DOES NOT START LEAVES THE SESSION AS IT WAS**: the next
+    /// breakpoint is set, rather than answered as though the program were running without debugging.
+    #[test]
+    fn a_run_without_debugging_that_does_not_start_leaves_breakpoints_settable() {
+        let record = std::rc::Rc::new(core::cell::RefCell::new(Record {
+            refuses: Some(String::from("the board is not attached")),
+            ..Record::default()
+        }));
+        let mut dbg = Debugger::with_backend(Box::new(Recorded { record: record.clone() }));
+        let failed = dbg.handle(&request(1, "launch", Some(json!({ "noDebug": true }))));
+        assert!(
+            failed.iter().any(|message| matches!(message, Message::Response(r) if !r.success)),
+            "the launch failed: {failed:?}"
+        );
+        record.borrow_mut().refuses = None;
+        let args = json!({ "source": { "path": "a.cs" }, "breakpoints": [{ "line": 3 }] });
+        let out = dbg.handle(&request(2, "setBreakpoints", Some(args)));
+        let answer = out[0].response_body()["breakpoints"][0].clone();
+        assert_eq!(answer["verified"], json!(true), "{answer}");
+    }
+
+    #[test]
+    fn a_session_started_without_a_target_takes_the_one_its_launch_names() {
+        let (mut dbg, record, asked) = chosen_session(false, false, Vec::new());
+        let initialized = dbg.handle(&request(1, "initialize", None));
+        assert_eq!(
+            initialized[0].response_body()["supportsSetVariable"],
+            json!(false),
+            "nothing is offered for a target that has not been named yet"
+        );
+        let arguments = json!({ "device": "local", "projectPath": "p.csproj" });
+        let out = dbg.handle(&request(2, "launch", Some(arguments.clone())));
+        assert!(matches!(&out[0], Message::Response(response) if response.success), "{out:?}");
+        assert_eq!(*asked.borrow(), vec![(String::from("launch"), arguments)]);
+        assert!(record.borrow().launched, "the chosen backend is the one launched");
+        let names = event_names(&out);
+        let capabilities = names.iter().position(|name| name == "capabilities");
+        let initialized_at = names.iter().position(|name| name == "initialized");
+        assert!(
+            capabilities.is_some() && capabilities < initialized_at,
+            "the chosen target's capabilities reach the client before it configures: {names:?}"
+        );
+        let body = event_body(&out, "capabilities").expect("a capabilities event");
+        assert_eq!(body["capabilities"]["supportsSetVariable"], json!(true));
+    }
+
+    #[test]
+    fn a_launch_the_chooser_refuses_fails_with_its_reason_for_the_user() {
+        let mut dbg = Debugger::choosing(Box::new(|_: &str, _: &Json| {
+            Err(String::from("no device answers to the id usb:0001"))
+        }));
+        dbg.handle(&request(1, "initialize", None));
+        let out = dbg.handle(&request(2, "launch", Some(json!({ "device": "usb:0001" }))));
+        let Message::Response(response) = &out[0] else { panic!("{out:?}") };
+        assert!(!response.success);
+        let error = &response.body.as_ref().expect("a structured error")["error"];
+        assert_eq!(error["showUser"], json!(true));
+        let shown = error["variables"]["reason"].as_str().unwrap_or_default();
+        assert!(shown.contains("no device answers to the id usb:0001"), "{shown}");
+        assert!(!event_names(&out).contains(&String::from("initialized")));
+    }
+
+    #[test]
+    fn the_choosers_notes_reach_the_console_before_the_program_starts() {
+        let note = String::from("lamella-debug: launch.json names \"stopOnEntery\", which is no field of a Lamella launch");
+        let (mut dbg, _, _) = chosen_session(false, false, vec![note.clone()]);
+        dbg.handle(&request(1, "initialize", None));
+        let out = dbg.handle(&request(2, "launch", Some(json!({}))));
+        let names = event_names(&out);
+        let output = names.iter().position(|name| name == "output");
+        assert!(output.is_some() && output < names.iter().position(|name| name == "initialized"), "{names:?}");
+        let body = event_body(&out, "output").expect("the note");
+        assert_eq!(body["category"], json!("console"));
+        assert!(body["output"].as_str().unwrap_or_default().contains(&note));
+    }
+
+    #[test]
+    fn stop_at_entry_is_the_choosers_answer_not_a_field_the_adapter_reads() {
+        let (mut dbg, _, _) = chosen_session(true, false, Vec::new());
+        dbg.handle(&request(1, "initialize", None));
+        dbg.handle(&request(2, "launch", Some(json!({ "stopOnEntry": false }))));
+        let out = dbg.handle(&request(3, "configurationDone", None));
+        let stopped = event_body(&out, "stopped").expect("a stop at the entry");
+        assert_eq!(stopped["reason"], json!("entry"));
+    }
+
+    #[test]
+    fn run_without_debugging_arms_no_breakpoint_and_says_why_each_is_greyed() {
+        let (mut dbg, record, _) = chosen_session(true, true, Vec::new());
+        dbg.handle(&request(1, "initialize", None));
+        dbg.handle(&request(2, "launch", Some(json!({ "noDebug": true }))));
+        let out = dbg.handle(&request(
+            3,
+            "setBreakpoints",
+            Some(json!({ "source": { "path": "Program.cs" }, "breakpoints": [{ "line": 5 }, { "line": 9 }] })),
+        ));
+        let answered = out[0].response_body()["breakpoints"].as_array().cloned().unwrap_or_default();
+        assert_eq!(answered.len(), 2, "one answer per breakpoint asked for");
+        for breakpoint in &answered {
+            assert_eq!(breakpoint["verified"], json!(false));
+            assert!(breakpoint["message"].as_str().unwrap_or_default().contains("without debugging"), "{breakpoint}");
+        }
+        assert!(
+            record.borrow().sets.iter().all(Vec::is_empty),
+            "nothing is armed on the target: {:?}",
+            record.borrow().sets
+        );
+        let ran = dbg.handle(&request(4, "configurationDone", None));
+        assert!(event_body(&ran, "stopped").is_none(), "no stop at the entry either: {ran:?}");
+    }
+
+    #[test]
+    fn a_session_given_its_backend_up_front_still_honors_no_debug_from_the_request() {
+        let record = std::rc::Rc::new(core::cell::RefCell::new(Record::default()));
+        let mut dbg = Debugger::with_backend(Box::new(Recorded { record: record.clone() }));
+        dbg.handle(&request(1, "initialize", None));
+        dbg.handle(&request(2, "launch", Some(json!({ "noDebug": true, "stopOnEntry": true }))));
+        let out = dbg.handle(&request(
+            3,
+            "setBreakpoints",
+            Some(json!({ "source": { "path": "Program.cs" }, "breakpoints": [{ "line": 5 }] })),
+        ));
+        assert_eq!(out[0].response_body()["breakpoints"][0]["verified"], json!(false));
+        assert!(record.borrow().sets.iter().all(Vec::is_empty));
+        let ran = dbg.handle(&request(4, "configurationDone", None));
+        assert!(event_body(&ran, "stopped").is_none(), "{ran:?}");
+    }
+
+    /// The session a debugger that serves every target runs: this build carries the evaluation
+    /// session, and the target its launch chose is not in this process, so the console line is
+    /// refused rather than answered by the session.
+    #[test]
+    fn a_console_line_on_a_chosen_target_elsewhere_is_refused_though_this_build_can_evaluate() {
+        let (mut dbg, _, _) = chosen_session(false, false, Vec::new());
+        dbg.handle(&request(1, "initialize", None));
+        dbg.handle(&request(2, "launch", Some(json!({}))));
+        dbg.repl = Some(crate::repl_eval::ReplCell::Unavailable(
+            "the session answered a line for a target elsewhere".to_owned(),
+        ));
+        let answer =
+            evaluate_request(&mut dbg, 3, json!({ "expression": "1 + 1", "context": "repl" }));
+        assert!(!answer.success, "{:?}", answer.body);
+        let said = answer.message.unwrap_or_default();
+        assert!(!said.contains("the session answered"), "{said}");
+        assert!(said.contains("Hover") && said.contains("Watch"), "{said}");
+    }
+
+    /// **A CHOSEN TARGET IS THE SESSION'S ONLY ONCE IT HAS STARTED.** One that does not start is
+    /// handed back, no capabilities are offered for it, and the session has no target again, so its
+    /// next `launch` is put to the chooser as the first was.
+    #[test]
+    fn a_chosen_target_that_does_not_start_is_handed_back_and_the_next_launch_chooses_again() {
+        let (mut dbg, record, asked) = chosen_session(true, false, Vec::new());
+        record.borrow_mut().refuses = Some(String::from("the board did not answer the write"));
+        dbg.handle(&request(1, "initialize", None));
+        let out = dbg.handle(&request(2, "launch", Some(json!({ "stopAtEntry": true }))));
+        let Message::Response(response) = &out[0] else { panic!("{out:?}") };
+        assert!(!response.success, "{out:?}");
+        let names = event_names(&out);
+        assert!(
+            !names.contains(&String::from("capabilities")) && !names.contains(&String::from("initialized")),
+            "nothing is offered for a target that did not start: {names:?}"
+        );
+        assert!(record.borrow().released, "the target that did not start is handed back");
+
+        record.borrow_mut().refuses = None;
+        let again = dbg.handle(&request(3, "launch", Some(json!({ "stopAtEntry": true }))));
+        assert!(matches!(&again[0], Message::Response(response) if response.success), "{again:?}");
+        assert_eq!(asked.borrow().len(), 2, "the second launch is the chooser's to answer too");
+        let names = event_names(&again);
+        assert!(names.contains(&String::from("capabilities")), "{names:?}");
+        let ran = dbg.handle(&request(4, "configurationDone", None));
+        let stopped = event_body(&ran, "stopped").expect("the chooser's entry stop, as the launch asked");
+        assert_eq!(stopped["reason"], json!("entry"));
+    }
+
+    /// The host is told each launch's outcome once: a refusal, a target that was chosen and did not
+    /// start, and one that started, in that order here.
+    #[test]
+    fn the_host_is_told_each_launch_that_started_and_why_each_other_did_not() {
+        let record = std::rc::Rc::new(core::cell::RefCell::new(Record::default()));
+        let told = std::rc::Rc::new(core::cell::RefCell::new(Vec::<Result<(), String>>::new()));
+        let (backend_record, mut answers) = (record.clone(), 0);
+        let report = told.clone();
+        let mut dbg = Debugger::choosing(Box::new(move |_: &str, _: &Json| {
+            answers += 1;
+            if answers == 1 {
+                return Err(String::from("no device answers to the id usb:0001"));
+            }
+            Ok(Chosen {
+                backend: Box::new(Recorded { record: backend_record.clone() }),
+                stop_at_entry: false,
+                no_debug: false,
+                notes: Vec::new(),
+                path_map: PathMap::default(),
+            })
+        }))
+        .reporting_starts(Box::new(move |outcome: Result<(), &str>| {
+            report.borrow_mut().push(outcome.map_err(str::to_owned));
+        }));
+        dbg.handle(&request(1, "initialize", None));
+        dbg.handle(&request(2, "launch", Some(json!({}))));
+        record.borrow_mut().refuses = Some(String::from("the board did not answer the write"));
+        dbg.handle(&request(3, "launch", Some(json!({}))));
+        record.borrow_mut().refuses = None;
+        dbg.handle(&request(4, "launch", Some(json!({}))));
+        assert_eq!(
+            *told.borrow(),
+            vec![
+                Err(String::from("no device answers to the id usb:0001")),
+                Err(String::from("the board did not answer the write")),
+                Ok(()),
+            ]
+        );
+    }
+
+    /// **RUN WITHOUT DEBUGGING ARMS NOTHING, INCLUDING WHAT WAS SET BEFORE THE LAUNCH SAID SO.** A
+    /// client may configure before it launches, and a breakpoint or filter armed then would stop a
+    /// program the user asked to run without stopping.
+    #[test]
+    fn breakpoints_and_filters_set_before_a_launch_without_debugging_are_disarmed() {
+        let record = std::rc::Rc::new(core::cell::RefCell::new(Record::default()));
+        let mut dbg = Debugger::with_backend(Box::new(Recorded { record: record.clone() }));
+        dbg.handle(&request(1, "initialize", None));
+        dbg.handle(&request(
+            2,
+            "setBreakpoints",
+            Some(json!({ "source": { "path": "Program.cs" }, "breakpoints": [{ "line": 5 }] })),
+        ));
+        assert_eq!(record.borrow().sets.last(), Some(&vec![5]), "armed before the launch");
+        dbg.handle(&request(3, "launch", Some(json!({ "noDebug": true }))));
+        assert_eq!(
+            record.borrow().sets.last(),
+            Some(&Vec::new()),
+            "the launch that runs without debugging disarms it: {:?}",
+            record.borrow().sets
+        );
+        assert_eq!(record.borrow().filter_sets.last(), Some(&0), "and every exception filter");
+    }
+
+    /// A breakpoint set before the launch named a target was answered against no target, so the
+    /// target the launch chooses is given it: it is armed there before the program runs.
+    #[test]
+    fn an_instruction_breakpoint_set_before_the_target_is_chosen_is_armed_on_it() {
+        let (mut dbg, record, _) = chosen_session(false, false, Vec::new());
+        dbg.handle(&request(1, "initialize", None));
+        dbg.handle(&request(
+            2,
+            "setInstructionBreakpoints",
+            Some(json!({ "breakpoints": [{ "instructionReference": "4096" }] })),
+        ));
+        dbg.handle(&request(3, "launch", Some(json!({}))));
+        assert!(
+            record.borrow().sets.iter().any(|set| set == &vec![4096]),
+            "the chosen target holds the breakpoint set before it was chosen: {:?}",
+            record.borrow().sets
+        );
+    }
+
+    /// The breakpoints the response first in `messages` answered, in the order its request named them.
+    fn answered(messages: &[Message]) -> Vec<Json> {
+        let Some(Message::Response(response)) = messages.first() else {
+            panic!("expected a response first");
+        };
+        response
+            .body
+            .as_ref()
+            .and_then(|body| body["breakpoints"].as_array().cloned())
+            .unwrap_or_default()
+    }
+
+    /// Whether each of `answers` is verified.
+    fn verified(answers: &[Json]) -> Vec<bool> {
+        answers.iter().map(|answer| answer["verified"] == json!(true)).collect()
+    }
+
+    /// A `setBreakpoints` for the source `path` at `lines`.
+    fn set_lines(dbg: &mut Debugger, seq: i64, path: &str, lines: &[u32]) -> Vec<Message> {
+        let breakpoints: Vec<Json> = lines.iter().map(|line| json!({ "line": line })).collect();
+        dbg.handle(&request(
+            seq,
+            "setBreakpoints",
+            Some(json!({ "source": { "path": path }, "breakpoints": breakpoints })),
+        ))
+    }
+
+    /// A `setInstructionBreakpoints` at `addresses`.
+    fn set_instructions(dbg: &mut Debugger, seq: i64, addresses: &[u64]) -> Vec<Message> {
+        let breakpoints: Vec<Json> = addresses
+            .iter()
+            .map(|address| json!({ "instructionReference": address.to_string() }))
+            .collect();
+        dbg.handle(&request(
+            seq,
+            "setInstructionBreakpoints",
+            Some(json!({ "breakpoints": breakpoints })),
+        ))
+    }
+
+    /// A launched session over a [`Recorded`] target that holds `max` breakpoints at once.
+    fn capped_session(max: usize) -> (Debugger, std::rc::Rc<core::cell::RefCell<Record>>) {
+        let record = std::rc::Rc::new(core::cell::RefCell::new(Record {
+            max: Some(max),
+            ..Record::default()
+        }));
+        let mut dbg = Debugger::with_backend(Box::new(Recorded { record: record.clone() }));
+        dbg.handle(&request(1, "launch", None));
+        (dbg, record)
+    }
+
+    /// **ONE FILE'S UPDATE KEEPS THE COMPARATORS WHERE THEY ARE, AND THE CLIENT IS TOLD WHAT A FREED
+    /// ONE ARMED.** On a target holding two, `a.cs` has both and `b.cs`'s two wait. Taking one of
+    /// `a.cs`'s away leaves its other armed and frees a comparator; the first of `b.cs`'s takes it,
+    /// and a `breakpoint` event names it by the id it was answered with.
+    #[test]
+    fn a_files_update_keeps_its_armed_breakpoints_and_says_what_a_freed_comparator_armed() {
+        let (mut dbg, record) = capped_session(2);
+        let a = answered(&set_lines(&mut dbg, 2, "a.cs", &[1, 2]));
+        assert_eq!(verified(&a), [true, true]);
+        let b = answered(&set_lines(&mut dbg, 3, "b.cs", &[10, 20]));
+        assert_eq!(verified(&b), [false, false], "the target is full");
+        assert!(b[0]["id"].is_i64(), "every answer carries an id a later event can name: {b:?}");
+        let out = set_lines(&mut dbg, 4, "a.cs", &[1]);
+        assert_eq!(verified(&answered(&out)), [true], "a.cs keeps the comparator it held");
+        let changed = breakpoint_events(&out);
+        assert_eq!(changed.len(), 1, "only what the freed comparator armed changed: {changed:?}");
+        assert_eq!(changed[0]["id"], b[0]["id"], "b.cs's first");
+        assert_eq!(changed[0]["verified"], json!(true));
+        assert_eq!(
+            record.borrow().sets.last(),
+            Some(&vec![1, 10, 20]),
+            "the target holds the breakpoints the client shows armed first"
+        );
+    }
+
+    /// **A KIND ARMED LATER IN THE SET IS TOLD WHEN IT LOSES ITS COMPARATOR, AND WHEN IT GETS ONE
+    /// BACK.** Source breakpoints come first in the set a target is given, so two set after an
+    /// instruction breakpoint on a target holding two push it past the limit, and taking them away
+    /// gives its comparator back: each is told in a `breakpoint` event.
+    #[test]
+    fn an_instruction_breakpoint_pushed_past_the_limit_and_back_is_told_both_times() {
+        let (mut dbg, record) = capped_session(2);
+        let instruction = answered(&set_instructions(&mut dbg, 2, &[4096]));
+        assert_eq!(verified(&instruction), [true]);
+        let out = set_lines(&mut dbg, 3, "a.cs", &[1, 2]);
+        assert_eq!(verified(&answered(&out)), [true, true]);
+        let changed = breakpoint_events(&out);
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert_eq!(changed[0]["id"], instruction[0]["id"]);
+        assert_eq!(changed[0]["verified"], json!(false));
+        assert!(
+            changed[0]["message"].as_str().is_some_and(|m| m.contains("hardware breakpoints")),
+            "{changed:?}"
+        );
+        assert_eq!(record.borrow().sets.last(), Some(&vec![1, 2, 4096]));
+        let out = set_lines(&mut dbg, 4, "a.cs", &[]);
+        let changed = breakpoint_events(&out);
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert_eq!(changed[0]["id"], instruction[0]["id"]);
+        assert_eq!(changed[0]["verified"], json!(true));
+        assert!(changed[0].get("message").is_none(), "an armed breakpoint carries no reason: {changed:?}");
+    }
+
+    /// **AN INSTRUCTION BREAKPOINT SENT BEFORE THE LAUNCH WAITS FOR THE TARGET, AS EVERY OTHER KIND
+    /// DOES.** It is answered pending, with an id, and settled by a `breakpoint` event once the target
+    /// has started: here inactive, as the two source breakpoints set before it fill the target.
+    #[test]
+    fn an_instruction_breakpoint_set_before_a_chosen_launch_is_settled_when_the_target_starts() {
+        let (mut dbg, record, _) = chosen_session(false, false, Vec::new());
+        record.borrow_mut().max = Some(2);
+        dbg.handle(&request(1, "initialize", None));
+        let source = answered(&set_lines(&mut dbg, 2, "a.cs", &[1, 2]));
+        let instruction = answered(&set_instructions(&mut dbg, 3, &[4096]));
+        assert_eq!(verified(&instruction), [false], "no target yet: {instruction:?}");
+        assert_eq!(instruction[0]["reason"], json!("pending"));
+        let started = dbg.handle(&request(4, "launch", Some(json!({}))));
+        let changed = breakpoint_events(&started);
+        let settled = |answer: &Json| {
+            changed
+                .iter()
+                .find(|breakpoint| breakpoint["id"] == answer["id"])
+                .cloned()
+                .unwrap_or_else(|| panic!("no event settles {answer}: {changed:?}"))
+        };
+        assert_eq!(settled(&source[0])["verified"], json!(true));
+        assert_eq!(settled(&source[1])["verified"], json!(true));
+        assert_eq!(settled(&instruction[0])["verified"], json!(false), "past the two comparators");
+        assert_eq!(record.borrow().sets.last(), Some(&vec![1, 2, 4096]));
+    }
+
+    /// The same instruction breakpoint before a launch that runs without debugging: settled unarmed,
+    /// and never given to the target.
+    #[test]
+    fn an_instruction_breakpoint_set_before_a_chosen_launch_without_debugging_is_settled_unarmed() {
+        let (mut dbg, record, _) = chosen_session(false, true, Vec::new());
+        dbg.handle(&request(1, "initialize", None));
+        let instruction = answered(&set_instructions(&mut dbg, 2, &[4096]));
+        assert_eq!(verified(&instruction), [false]);
+        let started = dbg.handle(&request(3, "launch", Some(json!({}))));
+        let changed = breakpoint_events(&started);
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert_eq!(changed[0]["id"], instruction[0]["id"]);
+        assert_eq!(changed[0]["verified"], json!(false));
+        assert!(
+            record.borrow().sets.iter().all(Vec::is_empty),
+            "nothing reached the target: {:?}",
+            record.borrow().sets
+        );
+    }
+
+    /// A map of one pair, as MSBuild's `PathMap` gives it for a project: the project's folder on this
+    /// computer, and the folder its build records in its place.
+    fn project_map() -> PathMap {
+        PathMap::new(vec![(String::from("C:\\w\\App\\"), String::from("/rhu/src/App/"))])
+    }
+
+    /// A path maps by its prefix both ways, ignoring case and which separator it is written with,
+    /// and comes back in the separators of the side it is mapped to; a path no prefix starts, or that
+    /// a prefix starts only partway into a folder's name, passes unchanged.
+    #[test]
+    fn a_path_maps_by_its_prefix_both_ways() {
+        let map = project_map();
+        assert_eq!(map.to_program("c:\\w\\app\\Sub\\Program.cs"), "/rhu/src/App/Sub/Program.cs");
+        assert_eq!(map.to_program("C:/w/App/Program.cs"), "/rhu/src/App/Program.cs");
+        assert_eq!(map.to_local("/rhu/src/App/Sub/Program.cs"), "C:\\w\\App\\Sub\\Program.cs");
+        assert_eq!(map.to_program("C:\\w\\Apps\\Program.cs"), "C:\\w\\Apps\\Program.cs");
+        assert_eq!(map.to_local("/usr/lib/runtime/Thread.cs"), "/usr/lib/runtime/Thread.cs");
+        let first = PathMap::new(vec![
+            (String::from("C:\\w\\App\\obj\\"), String::from("/rhu/obj/App/")),
+            (String::from("C:\\w\\App\\"), String::from("/rhu/src/App/")),
+        ]);
+        assert_eq!(first.to_program("C:\\w\\App\\obj\\G.cs"), "/rhu/obj/App/G.cs", "the first pair that starts it");
+    }
+
+    /// **A BREAKPOINT IN A SOURCE WHOSE BUILD REWROTE ITS PATH** is resolved in the source as the
+    /// program records it, and answered at the path the client has it at; a frame stopped in that
+    /// source is shown at the client's path too.
+    #[test]
+    fn a_mapped_source_is_resolved_as_the_program_records_it_and_shown_as_the_client_has_it() {
+        let record = std::rc::Rc::new(core::cell::RefCell::new(Record {
+            recorded_file: Some(String::from("/rhu/src/App/Program.cs")),
+            frame_at: Some(7),
+            ..Record::default()
+        }));
+        let mut dbg = Debugger::with_backend(Box::new(Recorded { record: record.clone() }))
+            .mapping_paths(project_map());
+        dbg.handle(&request(1, "launch", None));
+        let answers = answered(&set_lines(&mut dbg, 2, "c:\\w\\App\\Program.cs", &[7]));
+        assert_eq!(record.borrow().documents.last().map(String::as_str), Some("/rhu/src/App/Program.cs"));
+        assert_eq!(answers[0]["source"]["path"], json!("C:\\w\\App\\Program.cs"), "{answers:?}");
+        let out = dbg.handle(&request(3, "stackTrace", Some(json!({ "threadId": 1 }))));
+        let Some(Message::Response(trace)) = out.first() else {
+            panic!("expected a response");
+        };
+        let frames = trace.body.as_ref().expect("a body")["stackFrames"].clone();
+        assert_eq!(frames[0]["source"]["path"], json!("C:\\w\\App\\Program.cs"), "{frames}");
+    }
+
+    /// A session with no map, or a source its map does not cover, resolves and shows paths as they
+    /// are.
+    #[test]
+    fn an_unmapped_source_is_resolved_and_shown_as_it_is() {
+        let record = std::rc::Rc::new(core::cell::RefCell::new(Record {
+            recorded_file: Some(String::from("C:\\w\\Lib\\Util.cs")),
+            ..Record::default()
+        }));
+        let mut dbg = Debugger::with_backend(Box::new(Recorded { record: record.clone() }))
+            .mapping_paths(project_map());
+        dbg.handle(&request(1, "launch", None));
+        let answers = answered(&set_lines(&mut dbg, 2, "C:\\w\\Lib\\Util.cs", &[3]));
+        assert_eq!(record.borrow().documents.last().map(String::as_str), Some("C:\\w\\Lib\\Util.cs"));
+        assert_eq!(answers[0]["source"]["path"], json!("C:\\w\\Lib\\Util.cs"));
+    }
+
+    /// The same breakpoint under a chosen launch that runs without debugging: nothing reaches the
+    /// target, and nothing is counted as an inactive breakpoint of a session that arms none.
+    #[test]
+    fn a_breakpoint_set_before_a_chosen_launch_without_debugging_is_never_armed() {
+        let (mut dbg, record, _) = chosen_session(false, true, Vec::new());
+        dbg.handle(&request(1, "initialize", None));
+        dbg.handle(&request(
+            2,
+            "setInstructionBreakpoints",
+            Some(json!({ "breakpoints": [{ "instructionReference": "4096" }] })),
+        ));
+        dbg.handle(&request(3, "launch", Some(json!({ "noDebug": true }))));
+        assert!(
+            record.borrow().sets.iter().all(Vec::is_empty),
+            "nothing is armed on the target: {:?}",
+            record.borrow().sets
+        );
+        assert!(dbg.instruction_breakpoints.is_empty(), "and the session holds none");
     }
 }

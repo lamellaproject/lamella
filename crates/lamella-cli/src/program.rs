@@ -98,7 +98,7 @@ Details:
   whether it compiles and does what you meant.
 
   A C# program's Main(string[] args) receives each argument whole and in the order given, as
-  `dotnet run` passes them. A program on a board cannot take arguments yet, and neither can a
+  `dotnet run` passes them. A program on a board cannot take arguments, and neither can a
   Python or JavaScript program, so such a run is refused and nothing is sent or run.
 
   A .csproj compiles every .cs beside it as one program, as `lamella build` compiles it. On this
@@ -124,7 +124,7 @@ fn options_and_program_args(args: &[String]) -> (&[String], &[String]) {
     (&args[..separator], args.get(separator + 1..).unwrap_or_default())
 }
 
-/// Whether a run on a board was given arguments, which a program there cannot take yet. When it
+/// Whether a run on a board was given arguments, which a program there cannot take. When it
 /// was, the refusal is said, and the caller ends the run before the board is opened.
 pub(crate) fn refuses_arguments_on_a_board(program_args: &[String]) -> bool {
     if program_args.is_empty() {
@@ -135,12 +135,12 @@ pub(crate) fn refuses_arguments_on_a_board(program_args: &[String]) -> bool {
     true
 }
 
-/// The refusal for a Python or a JavaScript program given arguments, which neither takes yet.
+/// The refusal for a Python or a JavaScript program given arguments, which neither takes.
 fn arguments_refused_here(language: Language, given: &[String]) -> String {
     let name = if language == Language::Python { "Python" } else { "JavaScript" };
     let listed: Vec<String> = given.iter().map(|argument| format!("{argument:?}")).collect();
     format!(
-        "lamella run: a {name} program cannot take arguments yet, so nothing was run (given: {}).",
+        "lamella run: a {name} program cannot take arguments, so nothing was run (given: {}).",
         listed.join(", ")
     )
 }
@@ -398,8 +398,8 @@ pub(crate) struct HostRun {
 /// `program_args` as the program's own arguments, which a `Main(string[] args)` receives.
 ///
 /// **THE STOP SAYS HOW IT ENDED, AND THE CODE ALONE CANNOT.** An exception nothing caught ends a
-/// run with the code a program could return itself, so the code is the program's only when the
-/// run completed; a trap is 1, whatever its code.
+/// run with a code a program could return itself, 134, so the stop's reason says which it was; the
+/// run ends with the stop's code either way, as `dotnet run` ends with the code .NET gives.
 ///
 /// # Errors
 /// A link that failed, which is this tool's failure rather than the program's.
@@ -413,7 +413,7 @@ pub(crate) fn run_here(
     let run = link.run_collected(1, assembly).map_err(ReplError::Transport)?;
     let ended = match (run.stop_reason(), run.exit_value()) {
         (Some(reason::DONE), Some(code)) => Ended::Program(code),
-        (Some(reason::TRAP), _) => Ended::Uncaught,
+        (Some(reason::TRAP), Some(code)) => Ended::Stopped(code),
         _ => Ended::Failed,
     };
     Ok(HostRun { stdout: run.stdout, stderr: run.stderr, ended })
@@ -838,6 +838,7 @@ pub fn build_command(args: &[String]) -> ExitCode {
             || first == crate::msbuild::COMPILE
             || first == crate::msbuild::PUBLISH
             || first == crate::msbuild::PACKAGES
+            || first == crate::msbuild::DEBUG
     }) {
         return crate::msbuild::build(args);
     }
@@ -847,7 +848,7 @@ pub fn build_command(args: &[String]) -> ExitCode {
         usage: Some(&usage),
         values: &["--board", "--out", "--format", REF_DIR, RUNTIME_SUPPORT_DIR],
         repeats: &[],
-        flags: &["--unsafe", crate::flash::CLASS_LIBRARY_FLAG, crate::flash::FLAT_FLAG],
+        flags: &["--unsafe", crate::flash::CLASS_LIBRARY_FLAG, crate::flash::FLAT_FLAG, crate::flash::DEBUG_FLAG],
         positional: Positional::One("source file"),
     };
     let parsed = match args::parse_or_halt(args, &spec) {
@@ -916,7 +917,26 @@ pub fn build_command(args: &[String]) -> ExitCode {
             tier,
             &libraries,
             &folders,
+            crate::flash::build_kind(&parsed),
         );
+    }
+
+    if parsed.flag(crate::flash::DEBUG_FLAG) {
+        eprintln!(
+            "{}",
+            crate::flash::debug_flag_where_nothing_is_built(
+                "build",
+                "Without --format this builds the ordinary artifact -- an assembly, a baked image or \
+                 a\nPython bundle -- and none of those is the image a chip runs.",
+                &format!(
+                    "--format <format> asks for the image a chip takes:\n\n\x20   lamella build \
+                     <file> --board <board> --format bin {}",
+                    crate::flash::DEBUG_FLAG
+                ),
+                "Nothing was built.",
+            )
+        );
+        return ExitCode::FAILURE;
     }
 
     if let Some(flag) = crate::flash::Tier::typed(&parsed) {
@@ -1050,6 +1070,8 @@ Options:
   --out <path>                    The file to write. Default: <file> with the output's extension.
   --nostdlib                      Build the flat tier: the program alone, with no class library.
                                   Only with --format, and not with --format elf.
+  --debug                         Build a Debug image, for a debugger. Default: a Release image.
+                                  Only with --format.
   --unsafe                        Allow C# unsafe code.
   --ref-dir <folder>              The class library's folder. Default: LAMELLA_REF_DIR.
   --runtime-support-dir <folder>  The runtime support archives' folder. Default:
@@ -1074,8 +1096,12 @@ Details:
   On the class-library tier, the collector reclaims an object without finalizing it, so a
   finalizer (a class's ~destructor) never runs there.
 
-  A class-library image is always compiled as a debug build is. --format elf writes the debug
-  information beside the image, and every other format sets it aside, so the image a board is
+  The image is a Release build, optimized, unless --debug asks for a Debug build: every parameter
+  and local kept where a debugger can read it, and every statement given an address, at a cost in
+  size. The output says which. A project built by `dotnet` takes its build from its configuration.
+
+  A class-library image is always compiled with its debug information, Release or Debug. --format
+  elf writes it beside the image, and every other format sets it aside, so the image a board is
   written with is the one --format elf describes. The flat tier has no debug information.
 
   A .lmli image carries the corlib and the libraries the program was compiled against, keeping
@@ -1107,6 +1133,7 @@ fn build_flashable(
     tier: crate::flash::Tier,
     libraries: &[crate::flash::Library],
     folders: &Folders,
+    kind: lamella_aot::BuildKind,
 ) -> ExitCode {
     let output = match lamella_flash_routes::artifact::Output::parse(format_name) {
         Ok(output) => output,
@@ -1126,7 +1153,7 @@ fn build_flashable(
     };
     if language != Language::CSharp {
         eprintln!(
-            "lamella build: --format builds an ahead-of-time C# image today; the Python tier \
+            "lamella build: --format builds an ahead-of-time C# image; the Python tier \
              reaches a\nbare-metal image through a separate lowering."
         );
         return ExitCode::FAILURE;
@@ -1134,12 +1161,12 @@ fn build_flashable(
     let format = match output {
         lamella_flash_routes::artifact::Output::Image(format) => format,
         lamella_flash_routes::artifact::Output::Elf => {
-            return build_debug_elf(path, source, board_id, out, unsafe_code, tier, libraries, folders);
+            return build_debug_elf(path, source, board_id, out, unsafe_code, tier, libraries, folders, kind);
         }
     };
 
     let (image, base) =
-        match crate::flash::image_for_board(path, source, board_id, unsafe_code, tier, libraries, folders) {
+        match crate::flash::image_for_board(path, source, board_id, unsafe_code, tier, libraries, folders, kind) {
             Ok(built) => built,
             Err(error) => {
                 eprintln!("{error}");
@@ -1189,6 +1216,7 @@ fn build_flashable(
         println!("{}", capitalized(&heap));
     }
     println!("Tier: {}", tier.summary());
+    println!("Build: {}", crate::flash::build_kind_summary(kind));
     println!("Next: lamella flash {} --board {board_id}", command_path(&out));
     ExitCode::SUCCESS
 }
@@ -1196,8 +1224,9 @@ fn build_flashable(
 /// `lamella build <file> --board <id> --class-library --format elf`: the image with the program's
 /// debug information, as the linked ELF a debugger takes as the program.
 ///
-/// **ITS LOADED BYTES ARE THE IMAGE `deploy --class-library` WRITES**, because every class-library
-/// image is compiled as a debug build is: the image formats set the debug information aside, and
+/// **ITS LOADED BYTES ARE THE IMAGE `deploy --class-library` WRITES** for the same build kind,
+/// Release or Debug, because every class-library image is compiled with its debug information:
+/// the image formats set the debug information aside, and
 /// this writes it beside the image. So the file is as flashable as the image formats -- `lamella
 /// flash` reads an ELF -- a debugger shown it is shown the program the board runs, and a debugger
 /// can attach to any board a class-library image of the same program was deployed to. The flat
@@ -1211,13 +1240,14 @@ fn build_debug_elf(
     tier: crate::flash::Tier,
     libraries: &[crate::flash::Library],
     folders: &Folders,
+    kind: lamella_aot::BuildKind,
 ) -> ExitCode {
     if let Some(refusal) = elf_refusal(tier) {
         eprintln!("{refusal}");
         return ExitCode::FAILURE;
     }
     let elf =
-        match crate::flash::debug_elf_for_board(path, source, board_id, unsafe_code, libraries, folders) {
+        match crate::flash::debug_elf_for_board(path, source, board_id, unsafe_code, libraries, folders, kind) {
             Ok(elf) => elf,
             Err(error) => {
                 eprintln!("{error}");
@@ -1255,6 +1285,7 @@ fn build_debug_elf(
         println!("{}", capitalized(&heap));
     }
     println!("Tier: {}", tier.summary());
+    println!("Build: {}", crate::flash::build_kind_summary(kind));
     println!("Next: lamella flash {} --board {board_id}", command_path(&out));
     ExitCode::SUCCESS
 }
@@ -1265,8 +1296,8 @@ fn build_debug_elf(
 /// **A RECORD NEVER STATES A CHANNEL ITS IMAGE DOES NOT HAVE.** It states `memory` only where the
 /// image names Lamella's console ring, the board's default channel is `memory`, and the board links
 /// a runtime support archive of its own, which this tree builds with the ring as its only console.
-/// An archive several boards share -- the micro:bits' -- carries whatever console it was built with,
-/// so an image linked against one states no channel.
+/// An archive several boards share carries whatever console it was built with, so an image linked
+/// against one states no channel.
 fn record_channel(board_id: &str, elf: &[u8]) -> Option<&'static str> {
     let own_archive = lamella_flash_routes::programmer_for(board_id)
         .ok()
@@ -1649,7 +1680,7 @@ impl Compiled {
 /// NAME THE SAME ONE.** A relative path names the directory the build happened to run in, which
 /// no editor sends. The `.` and `..` components are resolved from the path alone, not from the
 /// disk, so a symbolic link stays where the developer wrote it.
-fn document_path(path: &Path) -> std::io::Result<String> {
+pub(crate) fn document_path(path: &Path) -> std::io::Result<String> {
     let absolute = std::path::absolute(path)?;
     Ok(without_dot_segments(&absolute).display().to_string())
 }
@@ -2213,22 +2244,32 @@ mod tests {
         lamella_elf::write_debuggable_executable_with_objects(lamella_elf::Machine::Arm, &[0x00, 0xBF], 0, 0x1000_0000, true, &[], &named)
     }
 
-    /// **A RECORD NEVER STATES A CHANNEL ITS IMAGE DOES NOT HAVE.** An RP2350 board's image that names
-    /// Lamella's ring states `memory`; one that names no ring, or RHU's, states none; and a micro:bit's
-    /// image states none even when it names the ring, because the archive it links is shared by both
-    /// micro:bits and keeps whatever console it was built with.
+    /// **A RECORD NEVER STATES A CHANNEL ITS IMAGE DOES NOT HAVE.** The image of a board that links an
+    /// archive of its own -- an RP2350 board or a micro:bit -- states `memory` when it names Lamella's
+    /// ring, and none when it names no ring, or RHU's.
     #[test]
     fn a_record_states_only_the_channel_its_image_has() {
         let ring = elf_naming(&[(lamella_probe_console::LAMELLA_RING, 0x2000_8000, 16 + 16384)]);
         let rhu = elf_naming(&[(lamella_probe_console::RHU_RING, 0x2000_8000, 16 + 16384)]);
         let neither = elf_naming(&[]);
-        for board in ["raspberrypi-pico-2", "raspberrypi-pico-2-w", "pimoroni-pico-plus-2", "pimoroni-pico-plus-2-w"] {
+        for board in [
+            "raspberrypi-pico-2",
+            "raspberrypi-pico-2-w",
+            "pimoroni-pico-plus-2",
+            "pimoroni-pico-plus-2-w",
+            "bbc-micro-bit-v1",
+            "bbc-micro-bit-v2",
+            "adafruit-feather-rp2350-hstx",
+            "adafruit-feather-rp2350-hstx-psram",
+            "adafruit-metro-rp2350",
+            "adafruit-metro-rp2350-psram",
+            "pimoroni-pico-lipo-2",
+            "pimoroni-pico-lipo-2-xl-w",
+            "sparkfun-iot-redboard-rp2350",
+        ] {
             assert_eq!(record_channel(board, &ring), Some("memory"), "{board}");
             assert_eq!(record_channel(board, &neither), None, "{board}: no ring");
             assert_eq!(record_channel(board, &rhu), None, "{board}: RHU's ring");
-        }
-        for board in ["bbc-micro-bit-v1", "bbc-micro-bit-v2"] {
-            assert_eq!(record_channel(board, &ring), None, "{board}: its archive is shared");
         }
     }
 
@@ -2275,9 +2316,9 @@ mod tests {
         let run = HostRun {
             stdout: "hello, with no newline".to_owned(),
             stderr: "TRAP: unhandled exception: System.Exception: boom\n".to_owned(),
-            ended: Ended::Uncaught,
+            ended: Ended::Stopped(134),
         };
-        assert_eq!(print_host_run(&run, &mut out, &mut err), Ended::Uncaught);
+        assert_eq!(print_host_run(&run, &mut out, &mut err), Ended::Stopped(134));
         drop(out);
 
         let shown = String::from_utf8(screen.0.borrow().clone()).expect("text");
@@ -2324,7 +2365,7 @@ mod tests {
 
     /// **A RUN THAT CANNOT GIVE A PROGRAM ITS ARGUMENTS IS REFUSED, NOT RUN WITHOUT THEM:** a run on
     /// a board, from a source file as from `dotnet run`'s built assembly, before the board is
-    /// opened, and a Python or a JavaScript program, which neither takes them yet.
+    /// opened, and a Python or a JavaScript program, which neither takes them.
     #[test]
     fn a_run_that_cannot_give_the_program_its_arguments_is_refused() {
         let line = |items: &[&str]| items.iter().map(|item| (*item).to_owned()).collect::<Vec<String>>();
@@ -2352,7 +2393,7 @@ mod tests {
             assert_eq!(run_command(&line(&[&path, "--"])), Ended::Program(0), "{name}: none given");
         }
         let refusal = arguments_refused_here(Language::JavaScript, &line(&["one", "two words"]));
-        assert!(refusal.contains("a JavaScript program cannot take arguments yet"), "{refusal}");
+        assert!(refusal.contains("a JavaScript program cannot take arguments, so nothing was run"), "{refusal}");
         assert!(refusal.contains("(given: \"one\", \"two words\")"), "{refusal}");
         let _ = std::fs::remove_dir_all(&dir);
     }

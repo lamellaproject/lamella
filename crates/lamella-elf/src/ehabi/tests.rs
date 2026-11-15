@@ -585,6 +585,15 @@ const EM_ARM: u16 = 40;
 /// A little-endian ELF32 executable holding `(name, type, flags, address, bytes)` sections after
 /// the null section, with the section-name table last.
 fn elf(machine: u16, sections: &[(&str, u32, u32, u32, &[u8])]) -> Vec<u8> {
+    let unlinked: Vec<(&str, u32, u32, u32, &[u8], u32)> = sections
+        .iter()
+        .map(|&(name, kind, flags, address, bytes)| (name, kind, flags, address, bytes, 0))
+        .collect();
+    linked_elf(machine, &unlinked)
+}
+
+/// [`elf`], with each section's `sh_link` last: another section's index, the null section being 0.
+fn linked_elf(machine: u16, sections: &[(&str, u32, u32, u32, &[u8], u32)]) -> Vec<u8> {
     const EHDR: usize = 52;
     const SHDR: u16 = 40;
 
@@ -600,7 +609,7 @@ fn elf(machine: u16, sections: &[(&str, u32, u32, u32, &[u8])]) -> Vec<u8> {
 
     let mut body = Vec::new();
     let mut offsets = Vec::new();
-    for (.., bytes) in sections {
+    for (_, _, _, _, bytes, _) in sections {
         offsets.push((EHDR + body.len()) as u32);
         body.extend_from_slice(bytes);
     }
@@ -629,17 +638,53 @@ fn elf(machine: u16, sections: &[(&str, u32, u32, u32, &[u8])]) -> Vec<u8> {
     assert_eq!(out.len(), EHDR);
     out.extend_from_slice(&body);
 
-    let mut header = |name: u32, kind: u32, flags: u32, address: u32, offset: u32, size: u32| {
-        for field in [name, kind, flags, address, offset, size, 0, 0, 1, 0] {
+    let mut header = |name: u32, kind: u32, flags: u32, address: u32, offset: u32, size: u32, link: u32| {
+        for field in [name, kind, flags, address, offset, size, link, 0, 1, 0] {
             out.extend_from_slice(&field.to_le_bytes());
         }
     };
-    header(0, 0, 0, 0, 0, 0);
-    for (position, (_, kind, flags, address, bytes)) in sections.iter().enumerate() {
-        header(name_offsets[position], *kind, *flags, *address, offsets[position], bytes.len() as u32);
+    header(0, 0, 0, 0, 0, 0, 0);
+    for (position, (_, kind, flags, address, bytes, link)) in sections.iter().enumerate() {
+        header(name_offsets[position], *kind, *flags, *address, offsets[position], bytes.len() as u32, *link);
     }
-    header(names_name, 3, 0, 0, names_offset, names.len() as u32);
+    header(names_name, 3, 0, 0, names_offset, names.len() as u32, 0);
     out
+}
+
+/// An index table typed `SHT_PROGBITS` is taken by its link to the code it indexes -- the shape a
+/// linker gave the index of a program's half in a board's quad-SPI flash, an `.xip_exidx` linked to
+/// its `.xip_text` -- and a section that misses any of the other rules is not.
+#[test]
+fn an_index_table_typed_progbits_is_taken_by_its_link_to_the_code_it_indexes() {
+    let text = [0u8; 16];
+    let data = [0u8; 8];
+    let exidx = index(0x9000_0100, &[(0x9000_0040, Second::CantUnwind), (0x9000_0048, Second::CantUnwind)]);
+    let found = |flags: u32, link: u32, bytes: &[u8]| {
+        let file = linked_elf(
+            EM_ARM,
+            &[
+                (".xip_text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, 0x9000_0040, &text, 0),
+                (".xip_rodata", SHT_PROGBITS, SHF_ALLOC, 0x9000_0080, &data, 0),
+                (".xip_exidx", SHT_PROGBITS, flags, 0x9000_0100, bytes, link),
+            ],
+        );
+        tables(&file).indexes.iter().map(|region| region.address).collect::<Vec<_>>()
+    };
+    assert_eq!(found(SHF_ALLOC | SHF_LINK_ORDER, 1, &exidx), vec![0x9000_0100], "linked to its code, it is an index");
+    assert!(found(SHF_ALLOC, 1, &exidx).is_empty(), "without SHF_LINK_ORDER it is not");
+    assert!(found(SHF_ALLOC | SHF_LINK_ORDER, 2, &exidx).is_empty(), "linked to data, it is not");
+    let past = index(0x9000_0100, &[(0x9000_0040, Second::CantUnwind), (0x9000_0400, Second::CantUnwind)]);
+    assert!(found(SHF_ALLOC | SHF_LINK_ORDER, 1, &past).is_empty(), "naming a function past its code, it is not");
+
+    let absolute = words(&[0x0800_0040, 0x0800_0044, 0x0800_0048, 0x0800_004C]);
+    let file = linked_elf(
+        EM_ARM,
+        &[
+            (".text", SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, 0x0800_0040, &text, 0),
+            ("__patchable_function_entries", SHT_PROGBITS, SHF_ALLOC | SHF_LINK_ORDER, 0x0800_0100, &absolute, 1),
+        ],
+    );
+    assert!(tables(&file).indexes.is_empty(), "a table of absolute addresses is not an index");
 }
 
 #[test]

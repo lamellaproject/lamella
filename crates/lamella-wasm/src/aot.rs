@@ -16,13 +16,25 @@
 #![allow(unsafe_code)]
 
 use crate::abi::result_buffer;
+use lamella_aot::BuildKind;
+
+/// The build kind a host names, `"Debug"` or `"Release"`, or the error its payload carries: there is
+/// no default, so a host that names neither is told so rather than given one of the two.
+fn kind_of(name: &str) -> Result<BuildKind, String> {
+    BuildKind::from_name(name).ok_or_else(|| {
+        format!("the build kind must be \"Debug\" or \"Release\", and {name:?} was given")
+    })
+}
 
 /// Builds the payload the ABI returns: `[u32 json_len][JSON {error}][u32 image_len][image bytes]`. Split
 /// from the `extern "C"` wrapper so the envelope is testable without raw pointers (as `bake` does).
-fn build_payload(cil: &[u8], target: &str) -> Vec<u8> {
-    let (image, error) = match lamella_aot::build::build(cil, target) {
+fn build_payload(cil: &[u8], target: &str, kind: &str) -> Vec<u8> {
+    let built = kind_of(kind).and_then(|kind| {
+        lamella_aot::build::build(cil, target, kind).map_err(|e| format!("{e:?}"))
+    });
+    let (image, error) = match built {
         Ok(image) => (image, None),
-        Err(e) => (Vec::new(), Some(format!("{e:?}"))),
+        Err(error) => (Vec::new(), Some(error)),
     };
     let json = serde_json::to_vec(&serde_json::json!({ "error": error })).unwrap_or_default();
     envelope(&json, &image)
@@ -45,13 +57,14 @@ fn build_linked_payload(
     archive: &[u8],
     target: &str,
     board: &str,
+    kind: &str,
 ) -> Vec<u8> {
     let board_buses = if board.is_empty() {
         None
     } else {
         lamella_catalog::bus_table(board)
     };
-    let built = match lamella_elf::read_archive(archive) {
+    let built = kind_of(kind).and_then(|kind| match lamella_elf::read_archive(archive) {
         Err(error) => Err(format!(
             "the runtime-support archive given is not an archive: {error:?}"
         )),
@@ -62,9 +75,10 @@ fn build_linked_payload(
             archive,
             target,
             board_buses,
+            kind,
         )
         .map_err(|e| format!("{e}")),
-    };
+    });
     let (image, error) = match built {
         Ok(image) => (image, None),
         Err(error) => (Vec::new(), Some(error)),
@@ -96,6 +110,7 @@ fn build_linked_debug_payload(
     archive: &[u8],
     target: &str,
     board: &str,
+    kind: &str,
 ) -> Vec<u8> {
     let board_buses = if board.is_empty() {
         None
@@ -103,6 +118,7 @@ fn build_linked_debug_payload(
         lamella_catalog::bus_table(board)
     };
     let built = (|| {
+        let kind = kind_of(kind)?;
         lamella_elf::read_archive(archive).map_err(|error| {
             format!("the runtime-support archive given is not an archive: {error:?}")
         })?;
@@ -117,6 +133,7 @@ fn build_linked_debug_payload(
             archive,
             target,
             board_buses,
+            kind,
         )
         .map_err(|e| format!("{e}"))?;
         let flat = lamella_elf::flat_image(&elf)
@@ -168,6 +185,8 @@ pub unsafe extern "C" fn lamella_aot_build(
     cil_len: usize,
     target_ptr: *const u8,
     target_len: usize,
+    kind_ptr: *const u8,
+    kind_len: usize,
 ) -> *mut u8 {
     let cil = unsafe { core::slice::from_raw_parts(cil_ptr, cil_len) };
     let target_bytes: &[u8] = if target_len == 0 {
@@ -176,7 +195,13 @@ pub unsafe extern "C" fn lamella_aot_build(
         unsafe { core::slice::from_raw_parts(target_ptr, target_len) }
     };
     let target = core::str::from_utf8(target_bytes).unwrap_or("");
-    result_buffer(build_payload(cil, target))
+    let kind_bytes: &[u8] = if kind_len == 0 {
+        &[]
+    } else {
+        unsafe { core::slice::from_raw_parts(kind_ptr, kind_len) }
+    };
+    let kind = core::str::from_utf8(kind_bytes).unwrap_or("");
+    result_buffer(build_payload(cil, target, kind))
 }
 
 /// Compiles the CIL assembly at `cil_ptr..cil_ptr + cil_len` to a board's class-library image: the
@@ -216,6 +241,8 @@ pub unsafe extern "C" fn lamella_aot_build_linked(
     target_len: usize,
     board_ptr: *const u8,
     board_len: usize,
+    kind_ptr: *const u8,
+    kind_len: usize,
 ) -> *mut u8 {
     let read = |ptr: *const u8, len: usize| -> &[u8] {
         if len == 0 {
@@ -227,6 +254,7 @@ pub unsafe extern "C" fn lamella_aot_build_linked(
     let libraries = crate::abi::split_refs(read(libs_ptr, libs_len));
     let target = core::str::from_utf8(read(target_ptr, target_len)).unwrap_or("");
     let board = core::str::from_utf8(read(board_ptr, board_len)).unwrap_or("");
+    let kind = core::str::from_utf8(read(kind_ptr, kind_len)).unwrap_or("");
     result_buffer(build_linked_payload(
         read(cil_ptr, cil_len),
         read(corlib_ptr, corlib_len),
@@ -234,6 +262,7 @@ pub unsafe extern "C" fn lamella_aot_build_linked(
         read(archive_ptr, archive_len),
         target,
         board,
+        kind,
     ))
 }
 
@@ -267,6 +296,8 @@ pub unsafe extern "C" fn lamella_aot_build_linked_debug(
     target_len: usize,
     board_ptr: *const u8,
     board_len: usize,
+    kind_ptr: *const u8,
+    kind_len: usize,
 ) -> *mut u8 {
     let read = |ptr: *const u8, len: usize| -> &[u8] {
         if len == 0 {
@@ -278,6 +309,7 @@ pub unsafe extern "C" fn lamella_aot_build_linked_debug(
     let libraries = crate::abi::split_refs(read(libs_ptr, libs_len));
     let target = core::str::from_utf8(read(target_ptr, target_len)).unwrap_or("");
     let board = core::str::from_utf8(read(board_ptr, board_len)).unwrap_or("");
+    let kind = core::str::from_utf8(read(kind_ptr, kind_len)).unwrap_or("");
     result_buffer(build_linked_debug_payload(
         read(cil_ptr, cil_len),
         read(pdb_ptr, pdb_len),
@@ -286,6 +318,7 @@ pub unsafe extern "C" fn lamella_aot_build_linked_debug(
         read(archive_ptr, archive_len),
         target,
         board,
+        kind,
     ))
 }
 
@@ -311,6 +344,7 @@ mod tests {
             EMPTY_ARCHIVE,
             "totally-not-a-chip",
             "",
+            "Release",
         ));
         assert_eq!(
             json["error"],
@@ -333,6 +367,7 @@ mod tests {
                 EMPTY_ARCHIVE,
                 "rp2350",
                 board,
+                "Release",
             ));
             json["busTable"].clone()
         };
@@ -375,6 +410,7 @@ mod tests {
             EMPTY_ARCHIVE,
             "rp2350",
             "raspberrypi-pico-2",
+            "Release",
         ));
         let error = json["error"].as_str().unwrap();
         assert!(
@@ -400,6 +436,7 @@ mod tests {
             b"<!doctype html>",
             "rp2350",
             "raspberrypi-pico-2",
+            "Release",
         ));
         assert_eq!((image_len, elf_len), (0, 0));
         let error = json["error"].as_str().unwrap();
@@ -418,6 +455,7 @@ mod tests {
             b"<!doctype html>",
             "rp2350",
             "raspberrypi-pico-2",
+            "Release",
         ));
         assert_eq!(image_len, 0);
         let error = json["error"].as_str().unwrap();
@@ -429,14 +467,14 @@ mod tests {
 
     #[test]
     fn an_unsupported_target_reports_why() {
-        let (json, image_len) = parse(&build_payload(b"not a managed assembly", "totally-not-a-chip"));
+        let (json, image_len) = parse(&build_payload(b"not a managed assembly", "totally-not-a-chip", "Release"));
         assert_eq!(json["error"], "UnsupportedTarget");
         assert_eq!(image_len, 0, "a failed build carries no image");
     }
 
     #[test]
     fn unreadable_cil_reports_parse() {
-        let (json, image_len) = parse(&build_payload(b"not a managed assembly", "rp2350"));
+        let (json, image_len) = parse(&build_payload(b"not a managed assembly", "rp2350", "Release"));
         assert_eq!(json["error"], "Parse");
         assert_eq!(image_len, 0);
     }

@@ -87,6 +87,14 @@ block = "spi"
 base = 0x40080000
 reset_bit = 18
 
+# SPI1 carries a board's SPI bus on GP28, GP30 and GP31 (function F1). RP2350 datasheet 2.2 address
+# map: SPI1_BASE 0x40088000; 7.5 Table 535 (RESETS: RESET): bit 19 SPI1.
+[[instances]]
+name = "spi1"
+block = "spi"
+base = 0x40088000
+reset_bit = 19
+
 [[instances]]
 name = "i2c0"
 block = "i2c"

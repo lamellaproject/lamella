@@ -117,6 +117,29 @@ fn the_offsets_are_relative_to_the_image_base() {
     assert_eq!(program.files, vec!["Blink.swift"], "one unit, one file, interned once");
 }
 
+/// A program written in two regions keeps the region the part boots from as its image, and maps
+/// the code of the other region past that image's end, relative to the same base.
+///
+/// The shape of an STM32F769 image that runs its program from the board's quad-SPI flash: the boot
+/// half at 0x08000000 and the code at 0x90000000. Flattened whole, the two are one image of over two
+/// gigabytes; split, a PC in the window less the boot half's base still indexes the tables.
+#[test]
+fn a_program_in_two_regions_maps_the_other_region_past_its_boot_image() {
+    let elf = debuggable(0x9000_0000, 0x9000_0000);
+    let boot = vec![0x00, 0x00, 0x08, 0x20, 0x09, 0x00, 0x00, 0x08];
+    let program =
+        from_elf_with_image(&elf, 0x0800_0000, boot.clone()).expect("the fixture carries .debug_line");
+
+    assert_eq!(program.image_base, 0x0800_0000, "the base is the boot half's");
+    assert_eq!(program.image, boot, "the image is the boot half alone");
+    assert_eq!(
+        program.lines.iter().map(|row| (row.offset, row.line)).collect::<Vec<_>>(),
+        vec![(0x8800_0000, 42), (0x8800_0002, 43)],
+        "both rows of the window's code are mapped, each at its address less the boot half's base"
+    );
+    assert_eq!(program.files, vec!["Blink.swift"]);
+}
+
 /// Rows from different files keep their own file, and the program carries a TABLE of them.
 ///
 /// **THIS IS THE CASE A SINGLE-FILE PROGRAM CANNOT EXHIBIT, WHICH IS WHY IT SHIPPED.** An AOT C#
@@ -600,6 +623,51 @@ fn debug_information_from_another_image_is_refused() {
     }
 }
 
+/// The locals are read with the options the line table and the functions are read with: on an ARM
+/// image a code address may carry the Thumb bit, and on any other machine it carries no tag.
+#[test]
+fn the_locals_are_read_with_the_options_the_images_machine_gives() {
+    let arm = from_elf(&debuggable(0x0800_0100, 0x0800_0100)).expect("parses");
+    assert!(arm.locals.options.arm_thumb_addresses, "an ARM image");
+
+    let line = line_section("blink.c", 0x8000_0100);
+    let risc_v = lamella_elf::write_debuggable_executable(
+        lamella_elf::Machine::RiscV,
+        &[0x13, 0x00, 0x00, 0x00, 0x13, 0x00, 0x00, 0x00],
+        0,
+        0x8000_0100,
+        true,
+        &[(".debug_line", &line)],
+    );
+    let risc_v = from_elf(&risc_v).expect("parses");
+    assert!(!risc_v.locals.options.arm_thumb_addresses, "a RISC-V image");
+}
+
+/// The console ring a program keeps is the one its image's symbol table names, by the name a Lamella
+/// image gives it or the one a Lamella RHU image gives it; an image that names neither keeps none.
+#[test]
+fn the_console_ring_is_the_one_the_image_names() {
+    const TEXT: u32 = 0x1000_0100;
+    let line = line_section("Program.cs", TEXT);
+    let build = |symbols: &[(&str, u32, u32, u8)]| {
+        let (symtab, strtab) = symbol_table(symbols);
+        typed_as_a_symbol_table(lamella_elf::write_debuggable_executable(
+            lamella_elf::Machine::Arm,
+            &[0x00u8, 0xBF].repeat(16),
+            0,
+            TEXT,
+            true,
+            &[(".debug_line", &line), (".symtab", &symtab), (".strtab", &strtab)],
+        ))
+    };
+    for name in ["__lamella_console_log", "__rhu_console_log"] {
+        let program = from_elf(&build(&[(name, 0x2004_1930, 16 + 16384, 0x11)])).expect("parses");
+        assert_eq!(program.console, Some(DataObject { address: 0x2004_1930, size: 16 + 16384 }), "{name}");
+    }
+    let none = from_elf(&build(&[("startup_code", TEXT + 1, 8, 0x12)])).expect("parses");
+    assert_eq!(none.console, None, "an image that names no ring");
+}
+
 
 /// A prel31 offset from `place` to `target`, as an index table stores one.
 fn prel31(target: u32, place: u32) -> u32 {
@@ -810,4 +878,54 @@ fn an_unprintable_linkage_name_is_refused() {
         reported_name(&named(b"write", Some(b"Nrf51\x00Uart.write"))),
         "write"
     );
+}
+
+/// The sections of a DWARF 4 unit with one subprogram, `<Main>$` from 0x90000000 for 0x4c bytes,
+/// whose one parameter, `args`, is in r0 up to `home` and at r11-12 from there to the end.
+fn main_with_args_moving_at(home: u32) -> LocalSections {
+    let abbrev = vec![
+        1, 0x11, 1, 0x11, 0x01, 0, 0, 2, 0x2e, 1, 0x03, 0x08, 0x11, 0x01, 0x12, 0x06, 0, 0, 3, 0x05, 0, 0x03,
+        0x08, 0x02, 0x17, 0, 0, 0,
+    ];
+    let mut entries = vec![1];
+    entries.extend_from_slice(&0u32.to_le_bytes());
+    entries.push(2);
+    inline_string(&mut entries, "<Main>$");
+    entries.extend_from_slice(&0x9000_0000u32.to_le_bytes());
+    entries.extend_from_slice(&0x4cu32.to_le_bytes());
+    entries.push(3);
+    inline_string(&mut entries, "args");
+    entries.extend_from_slice(&0u32.to_le_bytes());
+    entries.extend_from_slice(&[0, 0]);
+    let mut info = ((2 + 4 + 1 + entries.len()) as u32).to_le_bytes().to_vec();
+    info.extend_from_slice(&4u16.to_le_bytes());
+    info.extend_from_slice(&0u32.to_le_bytes());
+    info.push(4);
+    info.extend_from_slice(&entries);
+    let mut loc = Vec::new();
+    for (start, end, expression) in [(0x9000_0000u32, home, &[0x50u8][..]), (home, 0x9000_004c, &[0x7b, 0x74][..])] {
+        loc.extend_from_slice(&start.to_le_bytes());
+        loc.extend_from_slice(&end.to_le_bytes());
+        loc.extend_from_slice(&(expression.len() as u16).to_le_bytes());
+        loc.extend_from_slice(expression);
+    }
+    loc.extend_from_slice(&[0; 8]);
+    LocalSections { info, abbrev, loc, code: vec![(0x9000_0000, 0x9000_0100)], ..LocalSections::default() }
+}
+
+/// A stop at a function is past its prologue, where its parameters reach their homes, when that is
+/// inside its first line; a parameter that moves later, in a line's own code, is not the prologue's
+/// end, and a program with no locals to read stops at the function's first instruction as before.
+#[test]
+fn a_stop_at_a_function_is_past_its_prologue_where_its_parameters_land() {
+    let base = 0x0800_0000u32;
+    let row = |address: u32, line: u32| crate::LineRow { offset: address - base, line, file: 0 };
+    let lines = [row(0x9000_0000, 1), row(0x9000_0018, 2), row(0x9000_001c, 3)];
+    assert_eq!(past_the_prologue(&main_with_args_moving_at(0x9000_0014), &lines, base, 0x9000_0000), 0x9000_0014);
+    assert_eq!(
+        past_the_prologue(&main_with_args_moving_at(0x9000_001c), &lines, base, 0x9000_0000),
+        0x9000_0000,
+        "a move past the first line is not the prologue's end"
+    );
+    assert_eq!(past_the_prologue(&LocalSections::default(), &lines, base, 0x9000_0000), 0x9000_0000);
 }

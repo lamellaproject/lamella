@@ -1491,7 +1491,7 @@ fn to_firmware(
 /// is the route's failure, and the answer is an error.
 #[cfg(feature = "bake")]
 fn ran_its_course(end: &RunEnd) -> bool {
-    matches!(end, RunEnd::Done(_) | RunEnd::Trapped | RunEnd::StillRunning(_))
+    matches!(end, RunEnd::Done(_) | RunEnd::Trapped(_) | RunEnd::StillRunning(_))
 }
 
 /// What a device tool says when the board at `target` did not open a session.
@@ -2433,7 +2433,7 @@ mod tests {
             let mut board = Board::answering_as(v2);
             let answer = to_firmware(&scoped("board:bbc-micro-bit-v2"), &mut board, "COM0", sixteen_bytes, Then::Start);
             assert!(!text(&answer).contains("may not write"), "{}", text(&answer));
-            assert!(text(&answer).contains("COM0 refused the deploy: this target does not implement that message"), "{}", text(&answer));
+            assert!(text(&answer).contains("COM0 refused the deploy: the board's firmware does not support this request"), "{}", text(&answer));
             assert!(board.sent.iter().any(|sent| *sent != msg::HELLO), "the deploy began: {:?}", board.sent);
         }
 
@@ -2699,8 +2699,8 @@ mod tests {
         let body = read_resource("lamella://bcl").expect("the surface resource exists");
         let text = body["contents"][0]["text"].as_str().expect("it has text");
 
-        let supported = section(text, "## Supported today");
-        let unavailable = section(text, "## NOT available yet");
+        let supported = section(text, "## Supported\n");
+        let unavailable = section(text, "## NOT available -- these are compile errors\n");
         assert!(!supported.is_empty() && !unavailable.is_empty(), "the sections moved: {text}");
 
         assert!(
@@ -2732,7 +2732,7 @@ mod tests {
              problem that no longer exists"
         );
         assert!(
-            hardware.contains("70") && hardware.contains("no pins"),
+            hardware.contains("134") && hardware.contains("no pins"),
             "the page has to say WHY a compiling GPIO program produces nothing on the host"
         );
         let sample = hardware.split("```").nth(1).unwrap_or_default();

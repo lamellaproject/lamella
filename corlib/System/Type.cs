@@ -116,6 +116,7 @@ namespace System
         }
 
         [Lamella.Runtime.RuntimeProvided] internal object[] GetPropertyCustomAttributes(string name, bool inherit) { return null; }
+        [Lamella.Runtime.RuntimeProvided] internal object[] GetEventCustomAttributes(string name, bool inherit) { return null; }
 
         public System.Reflection.PropertyInfo GetProperty(string name)
         {
@@ -157,7 +158,8 @@ namespace System
             System.Reflection.MethodInfo add = GetMethod("add_" + name);
             System.Reflection.MethodInfo remove = GetMethod("remove_" + name);
             if ((object)add == null && (object)remove == null) return null;
-            return new System.Reflection.EventInfo(name, add, remove);
+            Type declaringType = (object)add != null ? add.DeclaringType : remove.DeclaringType;
+            return new System.Reflection.EventInfo(name, add, remove, declaringType);
         }
 
         public System.Reflection.EventInfo[] GetEvents()

@@ -56,7 +56,8 @@ namespace System
         public override string ToString()
         {
             string message = Message;
-            string text = GetType().FullName;
+            Type type = GetType();
+            string text = (object)type == null ? base.ToString() : type.FullName;
             if (message != null && message.Length != 0)
             {
                 text = text + ": " + message;

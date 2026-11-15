@@ -208,9 +208,9 @@ mod tests {
         assert!(err.is_empty());
 
         let mut terminal = TerminalOutput::new(Vec::new(), Vec::new());
-        terminal.report_stop(&stopped(reason::TRAP, 70)).unwrap();
+        terminal.report_stop(&stopped(reason::TRAP, 1)).unwrap();
         let (out, _) = terminal.into_writers();
-        assert_eq!(String::from_utf8(out).unwrap(), "stopped: TRAP, exit 70\n");
+        assert_eq!(String::from_utf8(out).unwrap(), "stopped: TRAP, exit 1\n");
     }
 
     #[test]
@@ -228,7 +228,7 @@ mod tests {
         let (out, err) = terminal.into_writers();
         assert!(out.is_empty(), "nothing ran, so nothing stopped");
         let err = String::from_utf8(err).unwrap();
-        assert!(err.contains("nothing at the requested source") && err.contains("NOTHING_TO_RUN"), "{err}");
+        assert!(err.contains("the board did not start the program: it holds no program to start"), "{err}");
     }
 
     /// A writer that remembers whether anything written to it is still waiting for a flush.

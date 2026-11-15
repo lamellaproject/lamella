@@ -63,9 +63,6 @@ fn run_connected(
         fail(err, "The board cannot start a stored program.");
         return Ended::Failed;
     }
-    if let Some(line) = first_line(session.identity.product_model) {
-        say(err, &line);
-    }
     let answered = lamella_wire_host::boards::board_answering(session.identity.product_model);
     let image = match image_for(answered.as_deref()) {
         Ok(image) => image,
@@ -81,7 +78,8 @@ fn run_connected(
     if wording == Wording::Full { say(err, &forever_warning()); }
     let _ = watch();
     let watch = Watch { stop: Some(stop), ..Watch::to_the_end() };
-    match on_device::start_scheduled_worded(transport, target, err, out, program_err, watch, wording) {
+    let introduction = first_line(session.identity.product_model);
+    match on_device::start_scheduled_worded(transport, target, err, out, program_err, watch, wording, introduction.as_deref()) {
         Ok(end) => report_end(&end, target, err, wording),
         Err(refusal) => { failure(err, &refusal, wording); Ended::Failed }
     }
@@ -97,13 +95,17 @@ fn failure(err: &mut dyn Write, refusal: &str, wording: Wording) {
 /// A returned code stays the program's; a project run adds no closing line to it.
 fn report_end(end: &RunEnd, target: &str, err: &mut dyn Write, wording: Wording) -> Ended {
     if wording == Wording::Full || !matches!(end, RunEnd::Done(_)) {
-        if wording == Wording::Brief { fail(err, &end.describe(target)); }
-        else { say(err, &end.describe(target)); }
+        let sentence = match end {
+            RunEnd::Trapped(code) => crate::ending::stopped_sentence(*code),
+            _ => end.describe(target),
+        };
+        if wording == Wording::Brief { fail(err, &sentence); }
+        else { say(err, &sentence); }
     }
     match end {
         RunEnd::Done(code) => Ended::Program(*code),
         RunEnd::Interrupted => Ended::Interrupted,
-        RunEnd::Trapped => Ended::Uncaught,
+        RunEnd::Trapped(code) => Ended::Stopped(*code),
         _ => Ended::Failed,
     }
 }
@@ -119,7 +121,7 @@ fn cannot_run_on_a_target(path: &Path, what: &crate::deploy::Uncompilable) -> St
         crate::deploy::Uncompilable::Python => format!(
             "lamella run: {} is a Python program, and running ON a board compiles C#.\n\n\
              A Python program reaches a board as a BUNDLE, whose host-side send is not a library \
-             call\nthis tool can make yet. What DOES work today is running it on this machine:\n\
+             call\nthis tool can make. What DOES work is running it on this machine:\n\
              \x20   lamella run {}",
             path.display(),
             path.display()
@@ -221,9 +223,9 @@ mod tests {
             identity: lamella_wire::TargetIdentity::default(), max_inbound_payload: None }
     }
 
-    /// The project introduction precedes image preparation and the two program streams stay apart.
+    /// The project introduction follows flashing and the empty line; program streams stay apart.
     #[test]
-    fn a_project_run_prints_before_building_and_adds_no_exit_line() {
+    fn a_project_run_prints_after_flashing_and_adds_no_exit_line() {
         for code in [0, 7] {
             let mut board = Board::new(Some(code));
             let introduction = crate::own_lines::running_interpreted("test board");
@@ -232,13 +234,13 @@ mod tests {
             let (mut out, mut program_err) = (Vec::new(), Vec::new());
             let ended = run_connected(Path::new("App.dll"), "usb", &mut board, &session(),
                 |_| Some(introduction.clone()), |_| {
-                    assert_eq!(before_build.text(), format!("{introduction}\n"));
+                    assert_eq!(before_build.text(), "");
                     Ok(vec![0; 256])
                 }, Wording::Brief, &mut out, &mut err, &mut program_err, &mut || true, &|| false);
             assert_eq!(ended, Ended::Program(code));
             assert_eq!(out, b"attach-out-marker\n");
             assert_eq!(program_err, b"attach-err-marker\n");
-            assert_eq!(err.text(), format!("{introduction}\nErasing the program area of flash...\n\n"));
+            assert_eq!(err.text(), format!("Writing flash: 256 of 256 bytes.\nFlash complete\n\n{introduction}\n"));
         }
     }
 
@@ -253,7 +255,7 @@ mod tests {
             |_| Ok(vec![0; 256]), Wording::Brief, &mut out, &mut err, &mut program_err,
             &mut || true, &|| seen.text().contains("attach-out-marker"));
         assert_eq!(ended, Ended::Interrupted);
-        assert_eq!(String::from_utf8(err).unwrap(), "Erasing the program area of flash...\n\nDisconnected from the board.\n");
+        assert_eq!(String::from_utf8(err).unwrap(), "Writing flash: 256 of 256 bytes.\nFlash complete\n\nDisconnected from the board.\n");
         assert_eq!(board.requests.last(), Some(&lamella_wire_host::exec::EXEC));
         assert_eq!(board.requests.iter().filter(|&&kind| kind == lamella_wire_host::debug::ABORT).count(), 1);
     }
@@ -316,8 +318,9 @@ mod tests {
     }
 
     /// **HOW A RUN ENDED IS THIS TOOL'S LINE, ON STANDARD ERROR, AND THE PROGRAM'S CODE COMES
-    /// BACK.** A program's exit code is the run's, unchanged; a trap is 1; every other end is 1;
-    /// and every line of the end is marked as this tool's.
+    /// BACK.** A program's exit code is the run's, unchanged; a trap ends the run with the code its
+    /// stop carries, said in words; every other end is 1; and every line of the end is marked as
+    /// this tool's.
     #[test]
     fn a_run_end_is_said_on_standard_error_as_this_tools() {
         let said = |end: RunEnd| {
@@ -327,10 +330,11 @@ mod tests {
         };
         assert_eq!(said(RunEnd::Done(0)), (Ended::Program(0), "The program ended, exit code 0.\n".to_owned()));
         assert_eq!(said(RunEnd::Done(3)).0, Ended::Program(3), "exit 3 comes back as 3");
-        assert_eq!(
-            said(RunEnd::Trapped),
-            (Ended::Uncaught, "The program stopped: it trapped, as reported above.\n".to_owned())
-        );
+        for code in [134, 1] {
+            let (ended, err) = said(RunEnd::Trapped(code));
+            assert_eq!((ended, ended.code()), (Ended::Stopped(code), code), "a trap carrying {code}");
+            assert_eq!(err, format!("{}\n", crate::ending::stopped_sentence(code)));
+        }
         let (ended, err) = said(RunEnd::Dropped(lamella_wire::TransportError::Closed));
         assert_eq!(ended, Ended::Failed);
         assert!(err.starts_with("The connection to usb dropped while the program was running"), "{err}");

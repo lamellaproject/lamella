@@ -129,6 +129,11 @@ impl Device {
         Err(Error::NotFound)
     }
 
+    /// Hidraw has no exclusion to ask for ([`crate::Device::open_id_alone`]).
+    pub fn open_id_alone(_id: &str) -> Result<Self> {
+        Err(Error::Unsupported)
+    }
+
     pub fn open_id(id: &str) -> Result<Self> {
         if id.is_empty() || id.contains('/') {
             return Err(Error::NotFound);

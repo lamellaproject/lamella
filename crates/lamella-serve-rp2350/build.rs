@@ -9,9 +9,12 @@ const FLASH_ORIGIN: usize = 0x1000_0000;
 fn main() {
     println!("cargo:rerun-if-changed=memory-rp2350.x");
     println!("cargo:rerun-if-changed=src/rp2350_flash.rs");
-    let whole_flash_bytes = board_flash_bytes(board());
+    let board = board();
+    let facts = board_facts(board);
+    check_psram(board, &facts);
+    let whole_flash_bytes = board_flash_bytes(board, &facts);
     // `rp2350_flash.rs` includes this for `FLASH_END`, so the deploy window runs to the end of
-    // the flash this board solders rather than to one board's figure written down for all four.
+    // the flash this board solders rather than to one board's figure written down for all of them.
     let generated =
         std::path::Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("board_flash.rs");
     std::fs::write(
@@ -30,8 +33,7 @@ fn main() {
         // A firmware built with `serve` shares the part with the deployed-image region and is
         // bounded by that region's base, so an oversized one fails at link time instead of
         // linking cleanly and being silently overwritten by the first deploy. A firmware that
-        // takes no deploys (the wasm bring-up image) never writes that region and owns the
-        // board's whole flash.
+        // takes no deploys never writes that region and owns the board's whole flash.
         // Keyed on `serve` rather than on the other bins' features so that a build carrying
         // both takes the safe bound -- the deploy region is live whenever `serve` is.
         let length = if std::env::var("CARGO_FEATURE_SERVE").is_ok() {
@@ -192,34 +194,82 @@ fn deploy_region_base(whole_flash_bytes: usize) -> usize {
     base
 }
 
-/// The board this build is for, named by its folder in `bsp/boards/`. The features pick it, exactly
-/// as they pick the firmware's board bindings and the identity it answers a host with.
-fn board() -> &'static str {
-    let on = |feature: &str| std::env::var_os(format!("CARGO_FEATURE_{feature}")).is_some();
-    assert!(
-        !(on("PICO_PLUS_2") && on("CYW43")),
-        "the Pimoroni Pico Plus 2 has no radio, so `pico-plus-2` cannot be built with `cyw43`; \
-         the Pico Plus 2 W's feature is `pico-plus-2-w`"
-    );
-    if on("PICO_PLUS_2_W") {
-        "pimoroni-pico-plus-2-w"
-    } else if on("PICO_PLUS_2") {
-        "pimoroni-pico-plus-2"
-    } else if on("CYW43") {
-        "raspberrypi-pico-2-w"
-    } else {
-        "raspberrypi-pico-2"
-    }
+/// A board's radio, as the firmware's `cyw43` feature sees it.
+#[derive(PartialEq)]
+enum Radio {
+    /// The board has none.
+    None,
+    /// The CYW43439 on the Pico 2 W's four lines, GP23, GP24, GP25 and GP29, the lines the Wi-Fi
+    /// driver runs.
+    OnTheDriversLines,
+    /// A radio on other lines, which the driver does not run: they are named here.
+    Elsewhere(&'static str),
 }
 
-/// The flash `board` solders, in bytes: the flash region its `board.toml` states, read by bsp-gen's
-/// own parser, which takes the region in either shape a board file writes it. The RP2350 has no
-/// flash inside it -- it executes in place from a QSPI part on the board -- so the figure is the
-/// board's: 4 MB on the Pico 2 and Pico 2 W, 16 MB on the Pimoroni Pico Plus 2 and Plus 2 W.
-///
-/// A board file this cannot read, or one that states no flash, fails the build: a default here
-/// would be one board's figure applied to another, which is the fault this reads the facts to avoid.
-fn board_flash_bytes(board: &str) -> usize {
+/// Each board feature, by the name a build script sees it under, with its board's folder in
+/// `bsp/boards/` and its radio. The firmware's own board blocks pick the same board from the same
+/// features, and it checks at compile time that the flash this sized it by is its board's.
+const NAMED_BOARDS: &[(&str, &str, Radio)] = &[
+    ("PICO_PLUS_2", "pimoroni-pico-plus-2", Radio::None),
+    ("PICO_PLUS_2_W", "pimoroni-pico-plus-2-w", Radio::OnTheDriversLines),
+    ("PICO_LIPO_2", "pimoroni-pico-lipo-2", Radio::None),
+    ("PICO_LIPO_2_XL_W", "pimoroni-pico-lipo-2-xl-w", Radio::OnTheDriversLines),
+    ("FEATHER_RP2350_HSTX", "adafruit-feather-rp2350-hstx", Radio::None),
+    ("FEATHER_RP2350_HSTX_PSRAM", "adafruit-feather-rp2350-hstx-psram", Radio::None),
+    ("METRO_RP2350", "adafruit-metro-rp2350", Radio::None),
+    ("METRO_RP2350_PSRAM", "adafruit-metro-rp2350-psram", Radio::None),
+    ("IOT_REDBOARD_RP2350", "sparkfun-iot-redboard-rp2350", Radio::Elsewhere("GP24, GP36, GP37 and GP38")),
+];
+
+/// The board this build is for, named by its folder in `bsp/boards/`. The features pick it, exactly
+/// as they pick the firmware's board bindings and the identity it answers a host with: a board
+/// feature names its board, and with none the board is the Pico 2, or with `cyw43` the Pico 2 W.
+fn board() -> &'static str {
+    let on = |feature: &str| std::env::var_os(format!("CARGO_FEATURE_{feature}")).is_some();
+    let feature_name = |feature: &str| feature.to_ascii_lowercase().replace('_', "-");
+    let named: Vec<_> = NAMED_BOARDS.iter().filter(|(feature, ..)| on(feature)).collect();
+    if let [_, _, ..] = named[..] {
+        let features: Vec<String> = named.iter().map(|(feature, ..)| feature_name(feature)).collect();
+        panic!("a firmware is built for one board, and this build names {}", features.join(", "));
+    }
+    let Some(&&(feature, folder, ref radio)) = named.first() else {
+        return if on("CYW43") { "raspberrypi-pico-2-w" } else { "raspberrypi-pico-2" };
+    };
+    if on("CYW43") {
+        let with_radio: Vec<String> = NAMED_BOARDS
+            .iter()
+            .filter(|(.., radio)| *radio == Radio::OnTheDriversLines)
+            .map(|(feature, ..)| format!("`{}`", feature_name(feature)))
+            .collect();
+        match radio {
+            Radio::OnTheDriversLines => {}
+            Radio::None => panic!(
+                "{folder} has no radio, so `{}` cannot be built with `cyw43`; the board features \
+                 with the radio are {}, and with no board feature `cyw43` builds the Pico 2 W",
+                feature_name(feature),
+                with_radio.join(" and ")
+            ),
+            Radio::Elsewhere(lines) => panic!(
+                "{folder}'s radio is on {lines}, and the Wi-Fi driver runs the radio on the Pico 2 \
+                 W's four lines only, GP23, GP24, GP25 and GP29, so `{}` cannot be built with \
+                 `cyw43`: this board's firmware has no Wi-Fi",
+                feature_name(feature)
+            ),
+        }
+    }
+    if on("PYTHON") {
+        panic!(
+            "the Python firmware is built for the Pico 2 and, with `python-net`, the Pico 2 W, so it \
+             takes no board feature, and this build names `{}`",
+            feature_name(feature)
+        );
+    }
+    folder
+}
+
+/// `board`'s facts, read by bsp-gen's own parser from its `board.toml`. A file this cannot read
+/// fails the build.
+fn board_facts(board: &str) -> lamella_bsp_gen::strata::BoardTable {
     use lamella_bsp_gen::strata::{self, Strata};
 
     let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -232,7 +282,42 @@ fn board_flash_bytes(board: &str) -> usize {
     else {
         panic!("{} is not a board's facts", facts.display());
     };
-    let bytes = table.xip_flash();
-    assert!(bytes > 0, "{} states no flash, and this board executes from it", facts.display());
-    usize::try_from(bytes).unwrap_or_else(|_| panic!("{}: {bytes} bytes of flash", facts.display()))
+    table
+}
+
+/// The flash `board` solders, in bytes: the flash region its facts state, which bsp-gen's parser
+/// takes in either shape a board file writes it. The RP2350 has no flash inside it -- it executes
+/// in place from a QSPI part on the board -- so the figure is the board's: 4 MB on the Pico 2 and
+/// Pico 2 W, 8 MB on the two Feathers and 16 MB on the other boards.
+///
+/// A board whose facts state no flash fails the build: a default here would be one board's figure
+/// applied to another, which is the fault this reads the facts to avoid.
+fn board_flash_bytes(board: &str, facts: &lamella_bsp_gen::strata::BoardTable) -> usize {
+    let bytes = facts.xip_flash();
+    assert!(bytes > 0, "{board} states no flash, and this board executes from it");
+    usize::try_from(bytes).unwrap_or_else(|_| panic!("{board}: {bytes} bytes of flash"))
+}
+
+/// Holds `psram-heap` to the board's facts, the Pico 2's and Pico 2 W's among them: the PSRAM joins
+/// the heap exactly when they name the part the board fits, since the bring-up is told that part's
+/// commands and timing. A board feature that left `psram-heap` out would leave a named PSRAM unused,
+/// and one that added it would bring up a part nothing names.
+fn check_psram(board: &str, facts: &lamella_bsp_gen::strata::BoardTable) {
+    let named = facts
+        .memory
+        .iter()
+        .find(|region| region.kind == "ram" && !region.controller.is_empty() && !region.part.is_empty());
+    let on = std::env::var_os("CARGO_FEATURE_PSRAM_HEAP").is_some();
+    match named {
+        Some(region) => assert!(
+            on,
+            "{board}'s facts name its PSRAM, the {}, and this build has no `psram-heap`, so the PSRAM \
+             would sit unused; its board feature pulls `psram-heap`",
+            region.part
+        ),
+        None => assert!(
+            !on,
+            "{board}'s facts name no PSRAM part, so `psram-heap` has no part to bring up"
+        ),
+    }
 }

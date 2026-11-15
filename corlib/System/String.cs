@@ -89,131 +89,79 @@ namespace System
 
         public static string Format(string format, object arg0)
         {
-            return Format(format, new object[] { arg0 });
+            return Composite(null, format, new object[] { arg0 });
         }
 
         public static string Format(string format, object arg0, object arg1)
         {
-            return Format(format, new object[] { arg0, arg1 });
+            return Composite(null, format, new object[] { arg0, arg1 });
         }
 
         public static string Format(string format, object arg0, object arg1, object arg2)
         {
-            return Format(format, new object[] { arg0, arg1, arg2 });
+            return Composite(null, format, new object[] { arg0, arg1, arg2 });
         }
 
         public static string Format(string format, params object[] args)
         {
-            if ((object)format == null) throw new ArgumentNullException("format");
-            if ((object)args == null) throw new ArgumentNullException("args");
-            System.Text.StringBuilder result = new System.Text.StringBuilder();
-            int n = format.Length;
-            int pos = 0;
-            while (pos < n)
-            {
-                char c = format[pos];
-                if (c == '}')
-                {
-                    if (pos + 1 < n && format[pos + 1] == '}')
-                    {
-                        result.Append('}');
-                        pos += 2;
-                    }
-                    else
-                    {
-                        throw new FormatException("Input string was not in a correct format.");
-                    }
-                }
-                else if (c == '{')
-                {
-                    if (pos + 1 < n && format[pos + 1] == '{')
-                    {
-                        result.Append('{');
-                        pos += 2;
-                    }
-                    else
-                    {
-                        pos = AppendFormatItem(result, format, pos, args);
-                    }
-                }
-                else
-                {
-                    result.Append(c);
-                    pos++;
-                }
-            }
-            return result.ToString();
+            return Composite(null, format, args);
         }
 
-        private static int AppendFormatItem(System.Text.StringBuilder result, string format, int start, object[] args)
+        /// <summary>Replaces each format item in <paramref name="format"/> with the text of the argument it
+        /// names, asking <paramref name="provider"/> how to format it.</summary>
+        /// <param name="provider">What supplies an <see cref="ICustomFormatter"/> and the arguments' culture-specific formatting, or null.</param>
+        /// <param name="format">The composite format string.</param>
+        /// <param name="args">The arguments.</param>
+        /// <returns>The text.</returns>
+        public static string Format(IFormatProvider provider, string format, params object[] args)
         {
-            int n = format.Length;
-            int pos = start + 1;
-            if (pos >= n || format[pos] < '0' || format[pos] > '9')
-            {
-                throw new FormatException("Input string was not in a correct format.");
-            }
-            int index = 0;
-            while (pos < n && format[pos] >= '0' && format[pos] <= '9')
-            {
-                index = index * 10 + (format[pos] - '0');
-                pos++;
-            }
-            int alignment = 0;
-            if (pos < n && format[pos] == ',')
-            {
-                pos++;
-                bool negative = false;
-                if (pos < n && format[pos] == '-') { negative = true; pos++; }
-                if (pos >= n || format[pos] < '0' || format[pos] > '9')
-                {
-                    throw new FormatException("Input string was not in a correct format.");
-                }
-                int width = 0;
-                while (pos < n && format[pos] >= '0' && format[pos] <= '9')
-                {
-                    width = width * 10 + (format[pos] - '0');
-                    pos++;
-                }
-                alignment = negative ? -width : width;
-            }
-            string itemFormat = null;
-            if (pos < n && format[pos] == ':')
-            {
-                pos++;
-                int specStart = pos;
-                while (pos < n && format[pos] != '}') pos++;
-                itemFormat = format.Substring(specStart, pos - specStart);
-            }
-            if (pos >= n || format[pos] != '}')
-            {
-                throw new FormatException("Input string was not in a correct format.");
-            }
-            pos++;
-            if (index >= args.Length)
-            {
-                throw new FormatException("Index (zero based) must be greater than or equal to zero and less than the size of the argument list.");
-            }
-            object arg = args[index];
-            string text;
-            if (arg == null)
-            {
-                text = "";
-            }
-            else if ((object)itemFormat != null)
-            {
-                IFormattable formattable = arg as IFormattable;
-                if ((object)formattable != null) text = formattable.ToString(itemFormat, null);
-                else text = arg.ToString();
-            }
-            else
-            {
-                text = arg.ToString();
-            }
-            if (alignment > 0) text = text.PadLeft(alignment);
-            else if (alignment < 0) text = text.PadRight(-alignment);
-            result.Append(text);
-            return pos;
+            return Composite(provider, format, args);
+        }
+
+#if LAMELLA_SURFACE_NETCORE_2_0
+        /// <summary>Replaces the format items in <paramref name="format"/> with the text of the one argument,
+        /// asking <paramref name="provider"/> how to format it.</summary>
+        /// <param name="provider">What supplies an <see cref="ICustomFormatter"/> and the argument's culture-specific formatting, or null.</param>
+        /// <param name="format">The composite format string.</param>
+        /// <param name="arg0">The argument.</param>
+        /// <returns>The text.</returns>
+        public static string Format(IFormatProvider provider, string format, object arg0)
+        {
+            return Composite(provider, format, new object[] { arg0 });
+        }
+
+        /// <summary>Replaces the format items in <paramref name="format"/> with the text of the two arguments,
+        /// asking <paramref name="provider"/> how to format them.</summary>
+        /// <param name="provider">What supplies an <see cref="ICustomFormatter"/> and the arguments' culture-specific formatting, or null.</param>
+        /// <param name="format">The composite format string.</param>
+        /// <param name="arg0">The first argument.</param>
+        /// <param name="arg1">The second argument.</param>
+        /// <returns>The text.</returns>
+        public static string Format(IFormatProvider provider, string format, object arg0, object arg1)
+        {
+            return Composite(provider, format, new object[] { arg0, arg1 });
+        }
+
+        /// <summary>Replaces the format items in <paramref name="format"/> with the text of the three arguments,
+        /// asking <paramref name="provider"/> how to format them.</summary>
+        /// <param name="provider">What supplies an <see cref="ICustomFormatter"/> and the arguments' culture-specific formatting, or null.</param>
+        /// <param name="format">The composite format string.</param>
+        /// <param name="arg0">The first argument.</param>
+        /// <param name="arg1">The second argument.</param>
+        /// <param name="arg2">The third argument.</param>
+        /// <returns>The text.</returns>
+        public static string Format(IFormatProvider provider, string format, object arg0, object arg1, object arg2)
+        {
+            return Composite(provider, format, new object[] { arg0, arg1, arg2 });
+        }
+#endif
+
+        private static string Composite(IFormatProvider provider, string format, object[] args)
+        {
+            if ((object)format == null || (object)args == null) throw new ArgumentNullException((object)format == null ? "format" : "args");
+            System.Text.StringBuilder result = new System.Text.StringBuilder();
+            CompositeFormatter.Append(result, provider, format, args);
+            return result.ToString();
         }
 
         public static bool operator ==(string a, string b)
@@ -516,44 +464,212 @@ namespace System
 
         public string[] Split(params char[] separator)
         {
-            return Split(separator, Int32.MaxValue);
+            return SplitInto(separator, null, IsNullOrNoChars(separator), Int32.MaxValue, false, false);
         }
 
         public string[] Split(char[] separator, int count)
         {
-            if (count < 0) throw new ArgumentOutOfRangeException("count");
+            CheckSplitCount(count);
+            return SplitInto(separator, null, IsNullOrNoChars(separator), count, false, false);
+        }
+
+#if LAMELLA_SURFACE_NETFX_2_0
+        public string[] Split(char[] separator, StringSplitOptions options)
+        {
+            return SplitWithOptions(separator, null, IsNullOrNoChars(separator), Int32.MaxValue, options);
+        }
+
+        public string[] Split(char[] separator, int count, StringSplitOptions options)
+        {
+            return SplitWithOptions(separator, null, IsNullOrNoChars(separator), count, options);
+        }
+
+        public string[] Split(string[] separator, StringSplitOptions options)
+        {
+            return SplitWithOptions(null, separator, IsNullOrNoStrings(separator), Int32.MaxValue, options);
+        }
+
+        public string[] Split(string[] separator, int count, StringSplitOptions options)
+        {
+            return SplitWithOptions(null, separator, IsNullOrNoStrings(separator), count, options);
+        }
+#endif
+
+#if LAMELLA_SURFACE_NETCORE_2_0
+        public string[] Split(char separator, StringSplitOptions options = StringSplitOptions.None)
+        {
+            return SplitWithOptions(new char[] { separator }, null, false, Int32.MaxValue, options);
+        }
+
+        public string[] Split(char separator, int count, StringSplitOptions options = StringSplitOptions.None)
+        {
+            return SplitWithOptions(new char[] { separator }, null, false, count, options);
+        }
+
+        public string[] Split(string separator, StringSplitOptions options = StringSplitOptions.None)
+        {
+            return Split(separator, Int32.MaxValue, options);
+        }
+
+        public string[] Split(string separator, int count, StringSplitOptions options = StringSplitOptions.None)
+        {
+            string[] separators = null;
+            if ((object)separator != null && separator.Length != 0) separators = new string[] { separator };
+            return SplitWithOptions(null, separators, false, count, options);
+        }
+#endif
+
+#if LAMELLA_SURFACE_NETFX_2_0
+        private string[] SplitWithOptions(char[] chars, string[] strings, bool whiteSpace, int count, StringSplitOptions options)
+        {
+            CheckSplitCount(count);
+            int defined = (int)StringSplitOptions.RemoveEmptyEntries;
+#if LAMELLA_SURFACE_NET_5_0
+            defined = defined | (int)StringSplitOptions.TrimEntries;
+#endif
+            if (((int)options & ~defined) != 0) throw new ArgumentException("Value of flags is invalid.", "options");
+            bool removeEmpty = ((int)options & (int)StringSplitOptions.RemoveEmptyEntries) != 0;
+            bool trimEntries = false;
+#if LAMELLA_SURFACE_NET_5_0
+            trimEntries = ((int)options & (int)StringSplitOptions.TrimEntries) != 0;
+#endif
+            return SplitInto(chars, strings, whiteSpace, count, removeEmpty, trimEntries);
+        }
+#endif
+
+        private static void CheckSplitCount(int count)
+        {
+            if (count < 0)
+            {
+                throw new ArgumentOutOfRangeException("count", count, "count ('" + count + "') must be a non-negative value.");
+            }
+        }
+
+        private static bool IsNullOrNoChars(char[] separator)
+        {
+            return (object)separator == null || separator.Length == 0;
+        }
+
+        private static bool IsNullOrNoStrings(string[] separator)
+        {
+            return (object)separator == null || separator.Length == 0;
+        }
+
+        private string[] SplitInto(char[] chars, string[] strings, bool whiteSpace, int count, bool removeEmpty, bool trimEntries)
+        {
             if (count == 0) return new string[0];
-            bool whitespace = (object)separator == null || separator.Length == 0;
-            int n = this.Length;
-            int pieces = 1;
-            for (int i = 0; i < n && pieces < count; i++)
+            if (count == 1)
             {
-                if (IsSeparatorChar(this[i], separator, whitespace)) pieces++;
+                if (removeEmpty && IsBlankSplitField(0, this.Length, trimEntries)) return new string[0];
+                string[] whole = new string[1];
+                whole[0] = SplitField(0, this.Length, trimEntries);
+                return whole;
             }
-            string[] result = new string[pieces];
-            int start = 0;
-            int idx = 0;
-            for (int i = 0; i < n && idx < pieces - 1; i++)
+            char[] set = chars;
+            string[] list = strings;
+            if (whiteSpace)
             {
-                if (IsSeparatorChar(this[i], separator, whitespace))
-                {
-                    result[idx] = this.Substring(start, i - start);
-                    idx++;
-                    start = i + 1;
-                }
+                set = null;
+                list = null;
             }
-            result[pieces - 1] = this.Substring(start, n - start);
+            int entries = SplitFields(null, set, list, whiteSpace, count, removeEmpty, trimEntries);
+            string[] result = new string[entries];
+            SplitFields(result, set, list, whiteSpace, count, removeEmpty, trimEntries);
             return result;
         }
 
-        private static bool IsSeparatorChar(char c, char[] separator, bool whitespace)
+        private int SplitFields(string[] result, char[] chars, string[] strings, bool whiteSpace, int count, bool removeEmpty, bool trimEntries)
         {
-            if (whitespace) return Char.IsWhiteSpace(c);
-            for (int j = 0; j < separator.Length; j++)
+            int length = this.Length;
+            int beforeRest = count - 1;
+            int entries = 0;
+            int start = 0;
+            int at = NextSplitSeparator(0, chars, strings, whiteSpace);
+            while (at >= 0 && entries < beforeRest)
             {
-                if (separator[j] == c) return true;
+                if (!removeEmpty || !IsBlankSplitField(start, at, trimEntries))
+                {
+                    if (result != null) result[entries] = SplitField(start, at, trimEntries);
+                    entries++;
+                }
+                start = at + SplitSeparatorLength(at, strings);
+                at = NextSplitSeparator(start, chars, strings, whiteSpace);
             }
-            return false;
+            while (removeEmpty && at >= 0 && IsBlankSplitField(start, at, trimEntries))
+            {
+                start = at + SplitSeparatorLength(at, strings);
+                at = NextSplitSeparator(start, chars, strings, whiteSpace);
+            }
+            if (!removeEmpty || !IsBlankSplitField(start, length, trimEntries))
+            {
+                if (result != null) result[entries] = SplitField(start, length, trimEntries);
+                entries++;
+            }
+            return entries;
+        }
+
+        private int NextSplitSeparator(int from, char[] chars, string[] strings, bool whiteSpace)
+        {
+            if (!whiteSpace && (object)chars == null && (object)strings == null) return -1;
+            int length = this.Length;
+            for (int i = from; i < length; i++)
+            {
+                char c = this[i];
+                if (whiteSpace)
+                {
+                    if (Char.IsWhiteSpace(c)) return i;
+                }
+                else if ((object)chars != null)
+                {
+                    for (int j = 0; j < chars.Length; j++)
+                    {
+                        if (chars[j] == c) return i;
+                    }
+                }
+                else if ((object)strings != null)
+                {
+                    if (SplitSeparatorLength(i, strings) != 0) return i;
+                }
+            }
+            return -1;
+        }
+
+        private int SplitSeparatorLength(int at, string[] strings)
+        {
+            if ((object)strings == null) return 1;
+            int length = this.Length;
+            for (int j = 0; j < strings.Length; j++)
+            {
+                string candidate = strings[j];
+                if ((object)candidate == null || candidate.Length == 0 || candidate.Length > length - at) continue;
+                int k = 0;
+                while (k < candidate.Length && this[at + k] == candidate[k]) k++;
+                if (k == candidate.Length) return k;
+            }
+            return 0;
+        }
+
+        private bool IsBlankSplitField(int start, int end, bool trimEntries)
+        {
+            if (!trimEntries) return start == end;
+            for (int i = start; i < end; i++)
+            {
+                if (!Char.IsWhiteSpace(this[i])) return false;
+            }
+            return true;
+        }
+
+        private string SplitField(int start, int end, bool trimEntries)
+        {
+            int first = start;
+            int last = end;
+            if (trimEntries)
+            {
+                while (first < last && Char.IsWhiteSpace(this[first])) first++;
+                while (last > first && Char.IsWhiteSpace(this[last - 1])) last--;
+            }
+            if (first == 0 && last == this.Length) return this;
+            return this.Substring(first, last - first);
         }
 
 #if LAMELLA_SURFACE_NETFX_4_0

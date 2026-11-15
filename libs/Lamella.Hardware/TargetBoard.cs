@@ -100,7 +100,7 @@ namespace Lamella.Hardware
         /// <summary>The I2C buses the board serves, with the rates each serves.</summary>
         /// <exception cref="System.NotSupportedException">The board's facts do not state its buses. The
         /// message names the board and the fact.</exception>
-        public IReadOnlyList<I2cBusInfo> I2cBuses
+        public IReadOnlyList<BoardI2cBus> I2cBuses
         {
             get
             {
@@ -113,7 +113,7 @@ namespace Lamella.Hardware
         /// makes.</summary>
         /// <exception cref="System.NotSupportedException">The board's facts do not state its buses. The
         /// message names the board and the fact.</exception>
-        public IReadOnlyList<SpiBusInfo> SpiBuses
+        public IReadOnlyList<BoardSpiBus> SpiBuses
         {
             get
             {

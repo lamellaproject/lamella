@@ -4741,6 +4741,10 @@ fn a_kept_bootloader_on_a_family_that_cannot_keep_one_is_refused() {
 /// the lookup loudly rather than pass.
 struct FakeRp2350 {
     log: Vec<String>,
+    program_clock: Option<(std::rc::Rc<std::cell::Cell<std::time::Instant>>, std::collections::VecDeque<std::time::Instant>)>,
+    flash_ops: Vec<(u32, u32, usize)>,
+    fail_xip_read: bool,
+    corrupt_after_program: Option<usize>,
     /// The flash behind the XIP window, from its base.
     flash: Vec<u8>,
     /// Every word written outside the flash: the stubs, the staged image, the debug registers.
@@ -4749,6 +4753,9 @@ struct FakeRp2350 {
     rom: Vec<u8>,
     /// The length in words of each read of the XIP window, in order.
     xip_reads: Vec<usize>,
+    /// Every erase, program and read of the XIP window, in the order they happened, each with its
+    /// address and its length: `erase 0x10001000 4096`, `program ...` in bytes, `read ...` in words.
+    events: Vec<String>,
     /// What the next staging write fails with, once: the image crossing the wire into RAM is where
     /// most of a write's transfers are, so it is where a fault in them lands.
     fail_staging: Option<ProbeError>,
@@ -4768,6 +4775,11 @@ struct FakeRp2350 {
     /// What the next write through boot RAM's clear alias fails with, once.
     fail_clear: Option<ProbeError>,
     dhcsr: Dhcsr,
+    /// Whether reads of the XIP window go through a cache: after an erase or a program they show
+    /// the flash as it was before it, until `flash_flush_cache` is called (datasheet 5.4.8.9).
+    models_cache: bool,
+    /// The flash as the cache holds it, while it holds bytes an erase or program has changed.
+    xip_cache: Option<Vec<u8>>,
 }
 
 /// Where the fake's ROM table starts, and the addresses its four functions answer at.
@@ -4820,16 +4832,23 @@ impl FakeRp2350 {
         FakeRp2350 {
             dhcsr: Dhcsr::default(),
             log: Vec::new(),
+            program_clock: None,
+            flash_ops: Vec::new(),
+            fail_xip_read: false,
+            corrupt_after_program: None,
             flash: vec![0xFF; bytes],
             ram: std::collections::HashMap::from([(RP2350_DEVINFO & !3, RP2350_DEVINFO_WORD)]),
             rom,
             xip_reads: Vec::new(),
+            events: Vec::new(),
             fail_staging: None,
             erase_polls_per_sector: 0,
             erase_hangs_at: None,
             erase_with_d8h: Vec::new(),
             fail_devinfo_read_while_set: None,
             fail_clear: None,
+            models_cache: false,
+            xip_cache: None,
         }
     }
 
@@ -4869,7 +4888,7 @@ impl TargetAccess for FakeRp2350 {
             }
         }
         if let Some(at) = self.in_flash(address) {
-            let cell = &self.flash[at..at + 4];
+            let cell = &self.xip_cache.as_ref().unwrap_or(&self.flash)[at..at + 4];
             return Ok(u32::from_le_bytes([cell[0], cell[1], cell[2], cell[3]]));
         }
         let at = address as usize;
@@ -4921,6 +4940,10 @@ impl TargetAccess for FakeRp2350 {
     fn read_words_into(&mut self, address: u32, out: &mut [u32]) -> Result<(), ProbeError> {
         if self.in_flash(address).is_some() {
             self.xip_reads.push(out.len());
+            self.events.push(format!("read {address:#010x} {}", out.len()));
+            if self.fail_xip_read {
+                return Err(ProbeError::Device("flash read failed"));
+            }
         }
         for (index, slot) in out.iter_mut().enumerate() {
             *slot = self.read_word(address + (index * 4) as u32)?;
@@ -4962,20 +4985,26 @@ impl TargetAccess for FakeRp2350 {
         frame: &lamella_probe_core::CallFrame,
     ) -> Result<u32, ProbeError> {
         let named = |function: u16| address == u32::from(function);
-        if address == RP2350_STUBS
-            || named(RP2350_CONNECT_INTERNAL_FLASH)
-            || named(RP2350_FLASH_EXIT_XIP)
-            || named(RP2350_FLASH_FLUSH_CACHE)
-        {
+        if named(RP2350_FLASH_FLUSH_CACHE) {
+            self.xip_cache = None;
+            return Ok(0);
+        }
+        if address == RP2350_STUBS || named(RP2350_CONNECT_INTERNAL_FLASH) || named(RP2350_FLASH_EXIT_XIP) {
             return Ok(0);
         }
         if !named(RP2350_FLASH_OP) {
             return Err(ProbeError::Device("a call to an address this fake does not model"));
         }
         let (operation, at, length, from) = (args[0] >> 16, args[1], args[2] as usize, args[3]);
+        self.flash_ops.push((operation, at, length));
+        let step = if operation == 0 { "erase" } else { "program" };
+        self.events.push(format!("{step} {at:#010x} {length}"));
         let offset = self
             .in_flash(at)
             .ok_or(ProbeError::Device("a flash_op outside the modelled flash"))?;
+        if self.models_cache && self.xip_cache.is_none() {
+            self.xip_cache = Some(self.flash.clone());
+        }
         match operation {
             0 => {
                 self.erase_with_d8h.push(self.devinfo_word() & RP2350_DEVINFO_D8H != 0);
@@ -5003,6 +5032,12 @@ impl TargetAccess for FakeRp2350 {
                         .copy_from_slice(&word.to_le_bytes());
                 }
                 self.log.push(format!("program {length}"));
+                if let Some((clock, times)) = &mut self.program_clock {
+                    clock.set(times.pop_front().expect("a completion time per program call"));
+                }
+                if let Some(offset) = self.corrupt_after_program.take() {
+                    self.flash[offset] ^= 1;
+                }
             }
             _ => return Err(ProbeError::Device("a flash_op this fake does not model")),
         }
@@ -5090,6 +5125,14 @@ fn the_rp2350_route_says_its_progress_to_its_caller() {
     );
     assert!(lines.iter().any(|line| line == "  verifying (full read-back over XIP)..."), "{lines:?}");
     assert!(lines.iter().all(|line| line.starts_with("  ")), "{lines:?}");
+    let run_lines: Vec<_> = lines.iter().map(|line| line.trim_start())
+        .filter(|line| line.starts_with("Writing flash:") || *line == "Flash complete"
+            || *line == "Erasing the program area of flash...").collect();
+    assert_eq!(run_lines, ["Erasing the program area of flash...",
+        "Writing flash: 1024 of 1024 bytes.", "Flash complete"]);
+    let verified = first_at(&lines, |line| line.contains("verifying (full read-back"));
+    let completed = first_at(&lines, |line| line.trim() == "Flash complete");
+    assert!(verified < completed);
 }
 
 use lamella_cmsis_dap_rp2350::Erase;
@@ -5111,6 +5154,149 @@ fn rp2350_write(
     };
     let outcome = flash(&mut backend, &image, VerifyPolicy::ReadBack, &Allow::Any);
     (outcome, backend.target, lines.into_inner())
+}
+
+/// A fast write still transfers and verifies every chunk, but reports only its final chunk.
+#[test]
+fn fast_rp2350_probe_chunk_lines_only_report_the_final_chunk() {
+    let bytes = rp2350_image(2 * 320 * 1024 + 256);
+    let board = FakeRp2350::with_flash(1024 * 1024);
+    let (outcome, board, lines) = rp2350_write(board, &bytes, Erase::Sectors);
+    assert_eq!(outcome.unwrap().verification, Verification::ReadBack);
+    assert_eq!(&board.flash[..bytes.len()], &bytes);
+    assert_eq!(board.flash_ops.iter().filter(|op| op.0 == 1).count(), 3);
+    assert_eq!(lines.iter().filter_map(|line| lamella_flash_backend::progress::for_run(line))
+        .collect::<Vec<_>>(), ["Erasing the program area of flash...",
+            "Writing flash: 655616 of 655616 bytes.", "Flash complete"]);
+}
+
+#[test]
+fn rp2350_probe_chunk_lines_follow_completed_chunks_and_the_clock() {
+    use std::time::{Duration, Instant};
+    use lamella_flash_backend::progress;
+
+    for (times, reported) in [
+        (vec![100, 200, 300, 400, 500], vec![5]),
+        (vec![2999, 3000, 5999, 6000, 6100], vec![2, 4, 5]),
+        (vec![3500, 6000, 6500, 6600, 6700], vec![1, 3, 5]),
+        (vec![4000, 8000, 12000, 16000, 20000], vec![1, 2, 3, 4, 5]),
+    ] {
+        let base = Instant::now();
+        let start = base + Duration::from_secs(60);
+        let clock = std::rc::Rc::new(std::cell::Cell::new(base));
+        let mut board = FakeRp2350::with_flash(24 * 4096);
+        let bytes = rp2350_image(board.flash.len());
+        board.flash.copy_from_slice(&bytes);
+        for sector in [1, 5, 9, 13, 17] { board.flash[sector * 4096] ^= 1; }
+        board.program_clock = Some((clock.clone(), times.iter()
+            .map(|&ms| start + Duration::from_millis(ms)).collect()));
+        let mut lines = Vec::new();
+        lamella_cmsis_dap_rp2350::flash_image_with_clock(&mut board, &bytes, Erase::Sectors,
+            &mut Default::default(), |line| {
+                if line == progress::ERASING {
+                    clock.set(start);
+                }
+                if let Some(line) = progress::for_run(line) {
+                    lines.push((clock.get().duration_since(start).as_millis(), line.to_owned()));
+                }
+            }, || clock.get()).unwrap();
+        let mut expected = vec![(0, progress::ERASING.to_owned())];
+        for chunk in reported {
+            expected.push((u128::from(times[chunk - 1]), format!("Writing flash: {} of 20480 bytes.", chunk * 4096)));
+        }
+        expected.push((u128::from(*times.last().unwrap()), progress::COMPLETE.to_owned()));
+        assert_eq!(lines, expected, "{times:?}");
+        assert_eq!(board.flash, bytes);
+        assert_eq!(board.flash_ops.iter().filter(|op| op.0 == 1).count(), 5);
+        assert_eq!(board.xip_reads, [bytes.len() / 4, bytes.len() / 4]);
+        assert!(board.program_clock.unwrap().1.is_empty());
+    }
+}
+
+/// An equal image, including its sector padding, needs no flash operation at all.
+#[test]
+fn an_rp2350_unchanged_image_is_compared_without_erasing_or_programming() {
+    let bytes = rp2350_image(9001);
+    let mut board = FakeRp2350::new();
+    board.flash[..bytes.len()].copy_from_slice(&bytes);
+    let before = board.flash.clone();
+    let (outcome, board, lines) = rp2350_write(board, &bytes, Erase::Blocks);
+    assert_eq!(outcome.unwrap().verification, Verification::ReadBack);
+    assert!(lines.iter().all(|line| lamella_flash_backend::progress::for_run(line).is_none()), "{lines:?}");
+    assert!(board.flash_ops.is_empty(), "{:?}", board.flash_ops);
+    assert_eq!(board.flash, before);
+    assert_eq!(board.xip_reads, [3 * 4096 / 4], "one complete comparison");
+    assert!(board.log.iter().any(|line| line == "reset_and_run"));
+}
+
+/// Two separated differences do not erase or program the matching sectors between them.
+#[test]
+fn an_rp2350_sparse_change_rewrites_only_its_different_sectors() {
+    let bytes = rp2350_image(20 * 4096);
+    let mut board = FakeRp2350::with_flash(24 * 4096);
+    board.flash[..bytes.len()].copy_from_slice(&bytes);
+    board.flash[4096 + 23] ^= 1;
+    board.flash[17 * 4096 + 9] ^= 1;
+    board.flash[bytes.len()..].fill(0x5a);
+    let tail = board.flash[bytes.len()..].to_vec();
+    let (outcome, board, lines) = rp2350_write(board, &bytes, Erase::Blocks);
+    outcome.unwrap();
+    assert_eq!(lines.iter().filter_map(|line| lamella_flash_backend::progress::for_run(line)).collect::<Vec<_>>(),
+        ["Erasing the program area of flash...",
+            "Writing flash: 8192 of 8192 bytes.", "Flash complete"]);
+    assert_eq!(board.flash_ops, [
+        (0, 0x1000_1000, 4096), (0, 0x1001_1000, 4096),
+        (1, 0x1000_1000, 4096), (1, 0x1001_1000, 4096),
+    ]);
+    assert_eq!(&board.flash[..bytes.len()], &bytes);
+    assert_eq!(&board.flash[bytes.len()..], &tail);
+    assert_eq!(board.xip_reads, [bytes.len() / 4, bytes.len() / 4],
+        "comparison, then full verification including unchanged sectors");
+}
+
+/// Padding belongs to the last image sector; bytes beyond that sector belong to neither write.
+#[test]
+fn an_rp2350_change_in_sector_padding_is_erased_but_the_next_sector_is_kept() {
+    let bytes = rp2350_image(257);
+    let mut board = FakeRp2350::new();
+    board.flash[..bytes.len()].copy_from_slice(&bytes);
+    board.flash[4095] = 0;
+    board.flash[4096] = 0x5a;
+    let (outcome, board, _) = rp2350_write(board, &bytes, Erase::Sectors);
+    outcome.unwrap();
+    assert_eq!(board.flash_ops, [(0, 0x1000_0000, 4096), (1, 0x1000_0000, 512)]);
+    assert_eq!(&board.flash[..bytes.len()], &bytes);
+    assert!(board.flash[bytes.len()..4096].iter().all(|&byte| byte == 0xff));
+    assert_eq!(board.flash[4096], 0x5a);
+    assert_eq!(board.xip_reads, [1024, 128]);
+}
+
+/// A failed comparison cannot be treated as a reason to erase unknown flash contents.
+#[test]
+fn an_rp2350_failed_comparison_stops_before_any_erase_or_program() {
+    let bytes = rp2350_image(1000);
+    let mut board = FakeRp2350::new();
+    board.fail_xip_read = true;
+    let (outcome, board, _) = rp2350_write(board, &bytes, Erase::Sectors);
+    assert!(matches!(outcome, Err(FlashError::Probe(ProbeError::Device("flash read failed")))));
+    assert!(board.flash_ops.is_empty(), "{:?}", board.flash_ops);
+    assert!(!board.log.iter().any(|line| line == "reset_and_run"));
+}
+
+/// Verification still covers a sector that matched before the write began.
+#[test]
+fn an_rp2350_partial_write_verifies_the_whole_image_before_booting() {
+    let bytes = rp2350_image(3 * 4096);
+    let mut board = FakeRp2350::new();
+    board.flash[..bytes.len()].copy_from_slice(&bytes);
+    board.flash[17] ^= 1;
+    board.corrupt_after_program = Some(2 * 4096 + 7);
+    let (outcome, board, lines) = rp2350_write(board, &bytes, Erase::Sectors);
+    assert!(matches!(outcome, Err(FlashError::Probe(ProbeError::Timeout("flash verify mismatch")))));
+    assert!(!lines.iter().any(|line| line.trim() == "Flash complete"));
+    assert_eq!(board.flash_ops, [(0, 0x1000_0000, 4096), (1, 0x1000_0000, 4096)]);
+    assert_eq!(board.xip_reads, [3 * 1024, 3 * 1024]);
+    assert!(!board.log.iter().any(|line| line == "reset_and_run"));
 }
 
 /// Where in `log` the first entry `matching` sits.
@@ -5254,8 +5440,8 @@ fn a_clear_that_fails_is_said_and_the_second_attempt_clears_the_bit_the_first_se
     assert_eq!(&board.flash[..bytes.len()], &bytes[..]);
     assert_eq!(board.devinfo_word(), RP2350_DEVINFO_WORD, "{:?}", board.log);
     assert_eq!(board.erase_with_d8h, [true, true], "the second attempt erased by block");
-    let unclear = "  FLASH_DEVINFO's D8h bit could not be cleared (transfer not acknowledged: \
-                   Fault); the chip's next boot sets FLASH_DEVINFO up afresh";
+    let unclear = "  FLASH_DEVINFO's D8h bit could not be cleared (the board's chip refused the debug \
+                   request); the chip's next boot sets FLASH_DEVINFO up afresh";
     assert!(lines.iter().any(|line| line == unclear), "{lines:?}");
     let still = "  FLASH_DEVINFO still has the D8h bit an earlier attempt of this write set, so \
                  it is cleared after the erase";
@@ -5307,7 +5493,7 @@ fn the_rp2350_route_reads_the_image_back_once() {
     .expect("the RP2350 sequence");
 
     assert_eq!(report.verification, Verification::ReadBack);
-    assert_eq!(backend.target.xip_reads, vec![256], "{:?}", backend.target.log);
+    assert_eq!(backend.target.xip_reads, vec![1024, 256], "{:?}", backend.target.log);
     let log = &backend.target.log;
     assert!(!log.iter().any(|step| step == "halt"), "no halt for a second read: {log:?}");
 }
@@ -5419,12 +5605,13 @@ fn a_transfer_fault_at_the_faster_clock_makes_the_whole_write_again_at_the_fallb
         "{:?}",
         board.log
     );
-    assert_eq!(board.xip_reads, vec![256], "the second write read the image back, once");
+    assert_eq!(board.xip_reads, vec![1024, 1024, 256],
+        "each attempt compares first; the second verifies the whole image after writing");
     let said: Vec<&String> = lines.iter().filter(|line| !line.starts_with("  ")).collect();
     assert_eq!(
         said,
         [&format!(
-            "the write at {} MHz failed (transfer not acknowledged: Fault), so it is made again \
+            "the write at {} MHz failed (the board's chip refused the debug request), so it is made again \
              from the start at {} MHz",
             SWD_CLOCK_HZ / 1_000_000,
             FALLBACK_SWD_CLOCK_HZ / 1_000_000
@@ -5490,7 +5677,7 @@ fn a_transfer_fault_at_the_fallback_clock_is_the_answer() {
     });
 
     let why = written.expect_err("a fault at both clocks");
-    assert!(why.contains("NoAck"), "{why}");
+    assert!(why.contains("the board did not answer the probe"), "{why}");
     assert_eq!(clocks, vec![SWD_CLOCK_HZ, FALLBACK_SWD_CLOCK_HZ]);
     assert_eq!(lines.iter().filter(|line| !line.starts_with("  ")).count(), 1, "{lines:?}");
     assert_eq!(rp2350_steps(&board), ["erase 4096", "staging failed", "erase 4096", "staging failed"]);
@@ -5565,6 +5752,590 @@ fn an_erase_call_that_does_not_return_is_named_and_the_next_write_starts_over() 
         .expect("the write after the failed one");
     assert_eq!(report.verification, Verification::ReadBack);
     assert!(backend.target.flash[..new.len()] == new[..], "the new image, whole");
+}
+
+use lamella_cmsis_dap_rp2350::{Span, SpanWrite};
+
+/// The span tests' board's flash: 1 MiB, with an image's place at its start, a region's at
+/// [`REGION_AT`], and a stored network in its last two sectors, [`KEPT`].
+const SPAN_FLASH: usize = 1024 * 1024;
+/// Where the span tests' region starts, in bytes from the start of the flash.
+const REGION_AT: u32 = 0xC_0000;
+/// The two sectors the span tests' board keeps its stored network in.
+const KEPT: core::ops::Range<u32> = 0xF_E000..0x10_0000;
+/// One erase unit.
+const SECTOR: usize = 4096;
+/// DEMCR, which the part routine writes to catch the reset it starts every write with.
+const DEMCR: u32 = 0xe000_edfc;
+
+/// A board for the span tests: erased, but for a program deployed between the image's place and
+/// the region's, and a stored network in its last two sectors.
+fn span_board() -> FakeRp2350 {
+    let mut board = FakeRp2350::with_flash(SPAN_FLASH);
+    board.flash[0x2_0000..0x3_0000].fill(0x5a);
+    for (index, byte) in board.flash[KEPT.start as usize..].iter_mut().enumerate() {
+        *byte = (index % 13) as u8;
+    }
+    board
+}
+
+/// A region's bytes: `sectors` erase units, its first sector its directory, with `seed` making two
+/// regions differ.
+fn region_bytes(sectors: usize, seed: u8) -> Vec<u8> {
+    (0..sectors * SECTOR).map(|index| ((index % 241) as u8) ^ seed).collect()
+}
+
+/// The span of `bytes` from `offset`, its first `header` bytes its directory.
+fn span(offset: u32, bytes: &[u8], header: u32) -> Span<'_> {
+    Span { offset, bytes, header }
+}
+
+/// The region at [`REGION_AT`] with its directory, then the image at the start of the flash: the
+/// order an RP2350 probe write takes them in.
+fn region_then_image<'a>(region: &'a [u8], image: &'a [u8]) -> [Span<'a>; 2] {
+    [
+        Span { offset: REGION_AT, bytes: region, header: SECTOR as u32 },
+        Span { offset: 0, bytes: image, header: 0 },
+    ]
+}
+
+/// What [`Rp2350Probe::write_spans`] answers: the part's identity and what was done to each span.
+type SpansWritten = Result<(PartIdentity, Vec<SpanWrite>), FlashError>;
+
+/// Writes `spans` through an RP2350 probe route over `board`, keeping `keep`, and hands back the
+/// outcome, the board, and the lines the write said.
+fn write_spans_over(
+    board: FakeRp2350,
+    spans: &[Span<'_>],
+    keep: &[core::ops::Range<u32>],
+) -> (SpansWritten, FakeRp2350, Vec<String>) {
+    let lines = std::cell::RefCell::new(Vec::<String>::new());
+    let mut backend = Rp2350Probe::new(board, 0x4c01_3477, "an RP2350")
+        .saying(|line: &str| lines.borrow_mut().push(line.to_owned()));
+    let outcome = backend.write_spans(spans, keep, &Allow::Any);
+    (outcome, backend.target, lines.into_inner())
+}
+
+/// Where in `board`'s events the first one starting with `prefix` sits.
+fn first_event(board: &FakeRp2350, prefix: &str) -> usize {
+    board
+        .events
+        .iter()
+        .position(|event| event.starts_with(prefix))
+        .unwrap_or_else(|| panic!("no `{prefix}`: {:?}", board.events))
+}
+
+/// The bytes the region at [`REGION_AT`] covers on `board`, `len` of them.
+fn region_on(board: &FakeRp2350, len: usize) -> &[u8] {
+    &board.flash[REGION_AT as usize..REGION_AT as usize + len]
+}
+
+/// The part as a refused write leaves it: no flash operation, no read of the flash, no reset, no
+/// stub staged, and every byte of the flash as it was.
+fn assert_untouched(case: &str, board: &FakeRp2350, before: &[u8]) {
+    assert!(board.flash_ops.is_empty(), "{case}: {:?}", board.flash_ops);
+    assert!(board.xip_reads.is_empty(), "{case}: {:?}", board.xip_reads);
+    assert!(!board.ram.contains_key(&DEMCR), "{case}: the part was reset");
+    assert!(!board.ram.contains_key(&RP2350_STUBS), "{case}: a stub was staged");
+    assert!(board.flash == before, "{case}: the flash changed");
+}
+
+/// **AN IMAGE AND A REGION ARE WRITTEN EACH AS ITS OWN SPAN, AND NOTHING BETWEEN OR BESIDE THEM IS
+/// TOUCHED**: the program deployed between them and the stored network above the region keep every
+/// byte, every erase and program lies inside one span's sectors, and the image's last sector is
+/// padded erased.
+#[test]
+fn rp2350_spans_erase_and_program_only_their_own_sectors() {
+    let image = rp2350_image(2 * SECTOR + 100);
+    let region = region_bytes(5, 0x33);
+    let board = span_board();
+    let between = board.flash[3 * SECTOR..REGION_AT as usize].to_vec();
+    let above = board.flash[REGION_AT as usize + region.len()..].to_vec();
+    let spans = region_then_image(&region, &image);
+    let (outcome, board, _) = write_spans_over(board, &spans, &[KEPT]);
+    let (_, written) = outcome.expect("both spans written");
+
+    assert_eq!(&board.flash[..image.len()], &image[..]);
+    assert!(board.flash[image.len()..3 * SECTOR].iter().all(|&byte| byte == 0xFF), "erased padding");
+    assert_eq!(region_on(&board, region.len()), &region[..]);
+    assert!(board.flash[3 * SECTOR..REGION_AT as usize] == between[..], "the program between the spans");
+    assert!(board.flash[REGION_AT as usize + region.len()..] == above[..], "the stored network above");
+    for &(_, at, length) in &board.flash_ops {
+        let inside = spans.iter().any(|span| {
+            let start = XIP_BASE + span.offset;
+            let end = start + (span.bytes.len().div_ceil(SECTOR) * SECTOR) as u32;
+            at >= start && at + length as u32 <= end
+        });
+        assert!(inside, "{at:#x}+{length} is outside every span: {:?}", board.flash_ops);
+    }
+    assert_eq!((written[0].sectors_erased, written[0].bytes_programmed), (5, region.len()));
+    assert_eq!((written[1].sectors_erased, written[1].bytes_programmed), (3, 2 * SECTOR + 256));
+}
+
+/// **A REGION THE FLASH ALREADY HOLDS IS HELD WHOLE**: nothing of it is erased or programmed, and it
+/// is read once, by the comparison, while the image beside it is written.
+#[test]
+fn an_rp2350_region_the_flash_already_holds_is_held_whole() {
+    let image = rp2350_image(SECTOR);
+    let region = region_bytes(5, 0x33);
+    let mut board = span_board();
+    board.flash[REGION_AT as usize..REGION_AT as usize + region.len()].copy_from_slice(&region);
+    let (outcome, board, _) = write_spans_over(board, &region_then_image(&region, &image), &[KEPT]);
+    let (_, written) = outcome.expect("the image written beside the held region");
+
+    assert_eq!((written[0].sectors_erased, written[0].bytes_programmed), (0, 0), "the region held");
+    assert_eq!(written[0].read.len(), region.len() / 4, "its comparison's read, handed back");
+    let read_at = format!("read {:#010x}", XIP_BASE + REGION_AT);
+    let reads = board.events.iter().filter(|event| event.starts_with(&read_at)).count();
+    assert_eq!(reads, 1, "one comparison and no second read: {:?}", board.events);
+    assert!(board.flash_ops.iter().all(|&(_, at, _)| at < XIP_BASE + REGION_AT), "{:?}", board.flash_ops);
+    assert_eq!((written[1].sectors_erased, written[1].bytes_programmed), (1, SECTOR));
+}
+
+/// **A SPAN WITH A DIRECTORY, WRITTEN ALONE AND ALREADY HELD, IS NOT CALLED AN IMAGE**: the part
+/// routine says the flash holds the bytes it compared, and an image written alone and held keeps its
+/// own line.
+#[test]
+fn an_rp2350_region_alone_the_flash_already_holds_is_not_called_an_image() {
+    let held = |lines: &[String], said: &str| lines.iter().any(|line| line.trim_start() == said);
+    let region = region_bytes(5, 0x33);
+    let mut board = span_board();
+    board.flash[REGION_AT as usize..REGION_AT as usize + region.len()].copy_from_slice(&region);
+    let (outcome, _, lines) = write_spans_over(board, &[span(REGION_AT, &region, SECTOR as u32)], &[KEPT]);
+    let (_, written) = outcome.expect("the region alone, held");
+    assert_eq!((written[0].sectors_erased, written[0].bytes_programmed), (0, 0), "the region held");
+    assert!(
+        held(&lines, "the flash already holds these bytes; resetting the chip without erasing or programming."),
+        "{lines:?}"
+    );
+    assert!(lines.iter().all(|line| !line.contains("image")), "{lines:?}");
+
+    let image = rp2350_image(SECTOR);
+    let mut board = span_board();
+    board.flash[..image.len()].copy_from_slice(&image);
+    let (outcome, _, lines) = write_spans_over(board, &[span(0, &image, 0)], &[KEPT]);
+    let (_, written) = outcome.expect("the image alone, held");
+    assert_eq!((written[0].sectors_erased, written[0].bytes_programmed), (0, 0), "the image held");
+    assert!(held(&lines, "image already matches; resetting to boot it without erasing or programming."), "{lines:?}");
+}
+
+/// **A CHANGE TO THE IMAGE ALONE REWRITES THE IMAGE's DIFFERING SECTOR ALONE**, and the region beside
+/// it is held.
+#[test]
+fn an_rp2350_image_only_change_rewrites_only_its_own_sector() {
+    let image = rp2350_image(3 * SECTOR);
+    let region = region_bytes(5, 0x33);
+    let mut board = span_board();
+    board.flash[..image.len()].copy_from_slice(&image);
+    board.flash[SECTOR + 9] ^= 1;
+    board.flash[REGION_AT as usize..REGION_AT as usize + region.len()].copy_from_slice(&region);
+    let (outcome, board, _) = write_spans_over(board, &region_then_image(&region, &image), &[KEPT]);
+    let (_, written) = outcome.expect("the image's one sector");
+
+    let changed = XIP_BASE + SECTOR as u32;
+    assert_eq!(board.flash_ops, [(0, changed, SECTOR), (1, changed, SECTOR)]);
+    assert_eq!((written[0].sectors_erased, written[0].bytes_programmed), (0, 0), "the region held");
+    assert_eq!((written[1].sectors_erased, written[1].bytes_programmed), (1, SECTOR));
+    assert_eq!(&board.flash[..image.len()], &image[..]);
+}
+
+/// **A CHANGE TO THE REGION ALONE REWRITES ITS DIFFERING SECTOR AND ITS DIRECTORY, AND NOTHING
+/// ELSE**: the directory erased first and programmed last, even though its own bytes matched, and the
+/// image held.
+#[test]
+fn an_rp2350_region_only_change_rewrites_its_sector_and_its_directory() {
+    let image = rp2350_image(3 * SECTOR);
+    let region = region_bytes(5, 0x33);
+    let mut board = span_board();
+    board.flash[..image.len()].copy_from_slice(&image);
+    board.flash[REGION_AT as usize..REGION_AT as usize + region.len()].copy_from_slice(&region);
+    board.flash[REGION_AT as usize + 3 * SECTOR + 17] ^= 1;
+    let (outcome, board, _) = write_spans_over(board, &region_then_image(&region, &image), &[KEPT]);
+    let (_, written) = outcome.expect("the region's sector and its directory");
+
+    let directory = XIP_BASE + REGION_AT;
+    let changed = directory + 3 * SECTOR as u32;
+    assert_eq!(
+        board.flash_ops,
+        [(0, directory, SECTOR), (0, changed, SECTOR), (1, changed, SECTOR), (1, directory, SECTOR)]
+    );
+    assert_eq!((written[0].sectors_erased, written[0].bytes_programmed), (2, 2 * SECTOR));
+    assert_eq!((written[1].sectors_erased, written[1].bytes_programmed), (0, 0), "the image held");
+    assert_eq!(region_on(&board, region.len()), &region[..]);
+}
+
+/// **A REGION's DIRECTORY IS ERASED BEFORE ANY OTHER SECTOR OF THE REGION, AND PROGRAMMED ONLY AFTER
+/// EVERY OTHER SECTOR HAS BEEN PROGRAMMED AND READ BACK.**
+#[test]
+fn an_rp2350_region_directory_is_erased_first_and_programmed_last_over_a_verified_body() {
+    let region = region_bytes(5, 0x33);
+    let spans = [Span { offset: REGION_AT, bytes: &region, header: SECTOR as u32 }];
+    let (outcome, board, _) = write_spans_over(span_board(), &spans, &[KEPT]);
+    outcome.expect("the region written");
+
+    let directory = XIP_BASE + REGION_AT;
+    let body = directory + SECTOR as u32;
+    let directory_erased = first_event(&board, &format!("erase {directory:#010x}"));
+    let body_erased = first_event(&board, &format!("erase {body:#010x}"));
+    let body_programmed = first_event(&board, &format!("program {body:#010x}"));
+    let body_read = first_event(&board, &format!("read {body:#010x}"));
+    let directory_programmed = first_event(&board, &format!("program {directory:#010x}"));
+    assert!(directory_erased < body_erased, "{:?}", board.events);
+    assert!(body_erased < body_programmed && body_programmed < body_read, "{:?}", board.events);
+    assert!(body_read < directory_programmed, "the body read back first: {:?}", board.events);
+    assert_eq!(region_on(&board, region.len()), &region[..]);
+}
+
+/// **A WRITE CUT SHORT BEFORE ITS DIRECTORY IS PROGRAMMED LEAVES THE DIRECTORY ERASED**: a body that
+/// does not read back right stops the write with the directory erased and never programmed, and an
+/// erase that does not return stops it the same way.
+#[test]
+fn an_rp2350_write_cut_short_before_its_directory_is_programmed_leaves_it_erased() {
+    let old = region_bytes(5, 0x11);
+    let new = region_bytes(5, 0x33);
+    let spans = [Span { offset: REGION_AT, bytes: &new, header: SECTOR as u32 }];
+    let directory = XIP_BASE + REGION_AT;
+    for cut in ["a body that does not read back", "an erase that does not return"] {
+        let mut board = span_board();
+        board.flash[REGION_AT as usize..REGION_AT as usize + old.len()].copy_from_slice(&old);
+        if cut.starts_with("a body") {
+            board.corrupt_after_program = Some(REGION_AT as usize + 2 * SECTOR + 5);
+        } else {
+            board.erase_hangs_at = Some(directory + 3 * SECTOR as u32);
+        }
+        let (outcome, board, _) = write_spans_over(board, &spans, &[KEPT]);
+        assert!(outcome.is_err(), "{cut}");
+        assert!(region_on(&board, SECTOR).iter().all(|&byte| byte == 0xFF), "{cut}: the directory erased");
+        let programmed = format!("program {directory:#010x}");
+        assert!(!board.events.iter().any(|event| event.starts_with(&programmed)), "{cut}: {:?}", board.events);
+        assert!(!board.log.iter().any(|step| step == "reset_and_run"), "{cut}: {:?}", board.log);
+    }
+}
+
+/// **A SPAN THAT REACHES THE FLASH THE WRITE KEEPS IS REFUSED BEFORE ANYTHING IS RESET**: a region
+/// reaching into the board's stored network leaves every byte as it was, and the part not reset.
+#[test]
+fn an_rp2350_span_reaching_the_stored_network_is_refused_before_anything_is_reset() {
+    let image = rp2350_image(SECTOR);
+    let region = region_bytes(2, 0x33);
+    let board = span_board();
+    let before = board.flash.clone();
+    let spans = [
+        Span { offset: KEPT.start - SECTOR as u32, bytes: &region, header: SECTOR as u32 },
+        Span { offset: 0, bytes: &image, header: 0 },
+    ];
+    let (outcome, board, lines) = write_spans_over(board, &spans, &[KEPT]);
+    let why = outcome.expect_err("a span over the stored network").to_string();
+    assert!(why.contains("keep"), "{why}");
+    assert!(lines.iter().any(|line| line.contains("0x000fe000")), "the line names the place: {lines:?}");
+    assert_untouched("the stored network", &board, &before);
+}
+
+/// **SPANS THAT SHARE A SECTOR, A SPAN THAT STARTS INSIDE ONE OR PASSES THE FLASH's 16 MiB, AND A
+/// DIRECTORY THAT IS NOT WHOLE SECTORS INSIDE ITS SPAN ARE EACH REFUSED BEFORE ANYTHING IS RESET.**
+#[test]
+fn rp2350_spans_that_cannot_be_written_sector_by_sector_are_refused_before_anything_is_reset() {
+    let two = rp2350_image(SECTOR + 1);
+    let one = region_bytes(1, 0x33);
+    let cases = [
+        ("two spans sharing a sector", vec![span(0, &two, 0), span(SECTOR as u32, &one, 0)]),
+        ("a span starting inside a sector", vec![span(0x800, &one, 0)]),
+        ("a span past the flash's 16 MiB", vec![span(0x00FF_F000, &two, 0)]),
+        ("a directory that is not whole sectors", vec![span(REGION_AT, &one, 100)]),
+        ("a directory longer than its span", vec![span(REGION_AT, &one, 2 * SECTOR as u32)]),
+    ];
+    for (case, spans) in cases {
+        let board = span_board();
+        let before = board.flash.clone();
+        let (outcome, board, _) = write_spans_over(board, &spans, &[KEPT]);
+        assert!(outcome.is_err(), "{case}");
+        assert_untouched(case, &board, &before);
+    }
+}
+
+/// **AN RP2350 PROBE WRITE TAKES ITS REGIONS BY THEIR BASES, THEN ITS IMAGE**, each at its offset in
+/// the flash; a region alone is a write, and a piece placed below the flash's window is refused.
+#[test]
+fn an_rp2350_probe_write_takes_its_regions_by_base_then_its_image() {
+    use crate::region::RegionSpan;
+    use crate::Piece::{Image as TheImage, Region};
+
+    let region = |name: &str, base: u32| RegionSpan {
+        name: name.to_owned(),
+        base,
+        bytes: vec![1; SECTOR],
+        sha256: [0; 32],
+        header: SECTOR as u32,
+        notices: Vec::new(),
+    };
+    let regions = [region("high", XIP_BASE + 0xE_0000), region("low", XIP_BASE + REGION_AT)];
+    let image = [7u8; 10];
+    let order = crate::rp2350_order(Some(&image), &regions);
+    assert_eq!(order, [Region(1), Region(0), TheImage]);
+    let spans = crate::rp2350_spans(XIP_BASE, Some(&image), &regions, &order).expect("the spans");
+    let placed: Vec<_> = spans.iter().map(|span| (span.offset, span.bytes.len(), span.header)).collect();
+    assert_eq!(placed, [(REGION_AT, SECTOR, 4096), (0xE_0000, SECTOR, 4096), (0, 10, 0)]);
+    assert_eq!(crate::rp2350_order(None, &regions), [Region(1), Region(0)], "a region alone");
+    let below = [region("low.region.bin", 0x0800_0000)];
+    let why = crate::rp2350_spans(XIP_BASE, None, &below, &crate::rp2350_order(None, &below))
+        .expect_err("below the flash's window");
+    assert!(why.contains("low.region.bin") && why.contains("0x08000000"), "{why}");
+}
+
+/// **THE FLASH AN RP2350 PROBE WRITE KEEPS IS THE BOARD's OWN STORED NETWORK**, at the place its own
+/// facts state: a Pico Plus 2 W's last two sectors of 16 MB, a Pico 2 W's of 4 MB, and nothing on a
+/// board that keeps none.
+#[test]
+fn an_rp2350_probe_write_keeps_the_boards_own_stored_network() {
+    let last_two_of_16_mb = 0xFF_E000..0x100_0000;
+    let last_two_of_4_mb = 0x3F_E000..0x40_0000;
+    assert_eq!(crate::rp2350_kept("pimoroni-pico-plus-2-w").expect("its place"), [last_two_of_16_mb]);
+    assert_eq!(crate::rp2350_kept("raspberrypi-pico-2-w").expect("its place"), [last_two_of_4_mb]);
+    assert_eq!(crate::rp2350_kept("raspberrypi-pico-2").expect("no place"), []);
+    assert!(crate::rp2350_kept("no-such-board").is_err());
+}
+
+/// **EACH REGION's READ-BACK IS CHECKED AGAINST ITS RECORD's SHA-256**, and each piece is reported,
+/// held or written, in the order the write took it.
+#[test]
+fn an_rp2350_probe_write_reports_each_region_and_checks_its_hash() {
+    use crate::region::{RegionOutcome, RegionSpan};
+
+    let bytes = region_bytes(2, 0x33);
+    let region = |name: &str, base: u32, sha256: [u8; 32]| RegionSpan {
+        name: name.to_owned(),
+        base,
+        bytes: bytes.clone(),
+        sha256,
+        header: SECTOR as u32,
+        notices: Vec::new(),
+    };
+    let words = |bytes: &[u8]| -> Vec<u32> {
+        bytes.chunks(4).map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]])).collect()
+    };
+    let good = lamella_pe::sha256::sha256(&bytes);
+    let regions = [region("radio", XIP_BASE + REGION_AT, good), region("extra", XIP_BASE + 0xE_0000, good)];
+    let mut image = rp2350_image(100);
+    let order = crate::rp2350_order(Some(&image), &regions);
+    image.resize(256, 0xFF);
+    let written = [
+        SpanWrite { sectors_erased: 2, bytes_programmed: bytes.len(), read: words(&bytes) },
+        SpanWrite { sectors_erased: 0, bytes_programmed: 0, read: words(&bytes) },
+        SpanWrite { sectors_erased: 1, bytes_programmed: 256, read: words(&image) },
+    ];
+    let identity = PartIdentity { value: 0x5566_7788_1122_3344, what: "an RP2350" };
+    let mechanism = "an SWD probe, by the chip's own bootrom flash API";
+    let report = crate::rp2350_report(identity.clone(), mechanism, XIP_BASE, Some(&image[..100]), &regions, &order, &written)
+        .expect("the report");
+    assert_eq!(
+        report.regions,
+        [
+            ("radio".to_owned(), RegionOutcome::Written { sectors: 2, bytes: bytes.len() }),
+            ("extra".to_owned(), RegionOutcome::Held),
+        ]
+    );
+    assert!(!report.image_held, "the image was programmed");
+    let shown = report.image.expect("the image's report");
+    assert_eq!((shown.base, shown.bytes, shown.verification), (XIP_BASE, 100, Verification::ReadBack));
+
+    let held = [
+        SpanWrite { sectors_erased: 0, bytes_programmed: 0, read: words(&bytes) },
+        SpanWrite { sectors_erased: 0, bytes_programmed: 0, read: words(&bytes) },
+        SpanWrite { sectors_erased: 0, bytes_programmed: 0, read: words(&image) },
+    ];
+    let report = crate::rp2350_report(identity.clone(), mechanism, XIP_BASE, Some(&image[..100]), &regions, &order, &held)
+        .expect("the report");
+    assert!(report.image_held, "the flash already held the image: nothing was erased or programmed");
+
+    let wrong = [region("radio", XIP_BASE + REGION_AT, [0xab; 32])];
+    let why = crate::rp2350_report(identity, mechanism, XIP_BASE, None, &wrong, &crate::rp2350_order(None, &wrong), &written[..1])
+        .expect_err("a read-back whose hash is not the record's");
+    assert!(why.contains("radio") && why.contains(&"ab".repeat(32)) && why.contains(&hex(&good)), "{why}");
+}
+
+/// **A REGION WRITTEN ALONE STILL SAYS WHICH PART IT WROTE**: with no image's report to carry it, the
+/// write's report keeps what the part answered before the write, whether the region was written or held.
+#[test]
+fn an_rp2350_probe_write_of_a_region_alone_reports_the_part() {
+    use crate::region::RegionSpan;
+
+    let bytes = region_bytes(2, 0x33);
+    let regions = [RegionSpan {
+        name: "radio".to_owned(),
+        base: XIP_BASE + REGION_AT,
+        bytes: bytes.clone(),
+        sha256: lamella_pe::sha256::sha256(&bytes),
+        header: SECTOR as u32,
+        notices: Vec::new(),
+    }];
+    let read: Vec<u32> = bytes.chunks(4).map(|word| u32::from_le_bytes([word[0], word[1], word[2], word[3]])).collect();
+    let identity = PartIdentity { value: 0x5566_7788_1122_3344, what: "an RP2350" };
+    let mechanism = "an SWD probe, by the chip's own bootrom flash API";
+    let order = crate::rp2350_order(None, &regions);
+    for (sectors_erased, bytes_programmed) in [(2, bytes.len()), (0, 0)] {
+        let written = [SpanWrite { sectors_erased, bytes_programmed, read: read.clone() }];
+        let report = crate::rp2350_report(identity.clone(), mechanism, XIP_BASE, None, &regions, &order, &written)
+            .expect("the report");
+        assert!(report.image.is_none(), "no image was written");
+        assert_eq!(report.part.as_ref(), Some(&identity), "the part's answer, with {sectors_erased} sectors erased");
+    }
+}
+
+/// `bytes` as lowercase hexadecimal.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+use crate::settings::SettingsFlash;
+use lamella_cmsis_dap_rp2350::{FlashSession, XIP_BASE};
+use lamella_net_core::wifi::{BootConnection, RecordWrite, Reconnection, security};
+use lamella_stored_settings::{Record, RegionStore};
+
+/// Where a Pico 2 W keeps its stored settings: the last two 4 KiB sectors of its 4 MB flash.
+const SETTINGS_AT: u32 = 0x3F_E000;
+/// One slot: one erase unit of the flash.
+const SETTINGS_UNIT: u32 = 0x1000;
+/// The boot ROM's flash lock in boot RAM, as the part crate claims and releases it.
+const BOOTLOCK_FLASH_OP: u32 = 0x400e_0810;
+
+/// A Pico 2 W's flash behind the RP2350 fake, whose XIP reads show what the cache holds until the
+/// cache is flushed, as the part's own do.
+fn settings_board() -> FakeRp2350 {
+    let mut board = FakeRp2350::with_flash(0x40_0000);
+    board.models_cache = true;
+    board
+}
+
+/// A secured network, as `lamella wifi set` stores one.
+fn stored_network(name: &[u8], secret: &[u8]) -> Record {
+    Record::new(name, secret, security::WPA2 | security::WPA3, Reconnection::Automatic, BootConnection::Background)
+        .expect("a network")
+}
+
+/// Runs `work` on the stored-settings slots of `board`'s flash through one session of its probe
+/// route, then closes the session.
+fn through_the_route<R>(board: &mut FakeRp2350, work: impl FnOnce(&mut RegionStore<'_, SettingsFlash<'_, FakeRp2350>>) -> R) -> R {
+    let mut flash = SettingsFlash::Rp2350(FlashSession::open(board).expect("the session opens"));
+    let mut store = RegionStore::open(&mut flash, SETTINGS_AT, SETTINGS_UNIT).expect("both slots read");
+    let outcome = work(&mut store);
+    assert_eq!(store.error(), None, "the flash gave no error");
+    drop(store);
+    flash.close().expect("the board starts again");
+    outcome
+}
+
+/// **A NETWORK STORED THROUGH A PROBE LANDS AT THE PLACE THE BOARD STATES, AND NOWHERE ELSE**: one
+/// page programmed at the first slot, which reads erased and so takes no erase, every other byte of
+/// the flash as it was, the boot ROM's lock released and the board started again.
+#[test]
+fn a_network_stored_through_the_rp2350_route_lands_at_the_boards_place_and_the_board_starts_again() {
+    let mut board = settings_board();
+    let written = through_the_route(&mut board, |store| {
+        lamella_stored_settings::store(store, &stored_network(b"Home Net", b"hunter2hunter2"))
+    });
+    assert_eq!(written, RecordWrite::Written);
+    let at = SETTINGS_AT as usize;
+    assert_eq!(&board.flash[at..at + 4], b"LWFR", "format 1's magic at the first slot");
+    assert_eq!(board.flash_ops, [(1, XIP_BASE + SETTINGS_AT, 256)], "{:?}", board.log);
+    assert!(board.flash[..at].iter().chain(&board.flash[at + 256..]).all(|&byte| byte == 0xFF), "nothing else changed");
+    assert_eq!(board.ram.get(&BOOTLOCK_FLASH_OP), Some(&0), "the boot ROM's flash lock is released");
+    assert_eq!(board.log.last().map(String::as_str), Some("reset_and_run"), "{:?}", board.log);
+}
+
+/// **THE NEW SLOT IS READ BACK BEFORE THE OLD ONE IS ERASED**, over the route as over memory: the
+/// second network is programmed into the other slot, read back through the XIP window, which shows
+/// the new page only because the session flushes the cache after its program, and only then is the
+/// first slot erased.
+#[test]
+fn a_second_network_is_read_back_through_the_route_before_the_first_slot_is_erased() {
+    let mut board = settings_board();
+    through_the_route(&mut board, |store| lamella_stored_settings::store(store, &stored_network(b"Home Net", b"hunter2hunter2")));
+    let written = through_the_route(&mut board, |store| {
+        lamella_stored_settings::store(store, &stored_network(b"Cafe", b"espresso-please"))
+    });
+    assert_eq!(written, RecordWrite::Written);
+    let second = XIP_BASE + SETTINGS_AT + SETTINGS_UNIT;
+    assert_eq!(
+        board.flash_ops[1..],
+        [(1, second, 256), (0, XIP_BASE + SETTINGS_AT, 4096)],
+        "the new slot programmed, then the old one erased: {:?}",
+        board.log
+    );
+    let shown = through_the_route(&mut board, |store| lamella_stored_settings::peek(store)).expect("a network");
+    assert_eq!(shown.ssid(), b"Cafe");
+}
+
+/// **SHOWING WRITES NOTHING**: the stored network is read through the route, and the flash takes no
+/// erase and no program.
+#[test]
+fn reading_the_stored_network_through_the_route_erases_and_programs_nothing() {
+    let mut board = settings_board();
+    through_the_route(&mut board, |store| lamella_stored_settings::store(store, &stored_network(b"Home Net", b"hunter2hunter2")));
+    let before = board.flash_ops.len();
+    let shown = through_the_route(&mut board, |store| lamella_stored_settings::peek(store));
+    assert_eq!(shown.expect("a network").ssid(), b"Home Net");
+    assert_eq!(board.flash_ops.len(), before, "no flash_op: {:?}", &board.flash_ops[before..]);
+    assert_eq!(board.log.last().map(String::as_str), Some("reset_and_run"));
+}
+
+/// **AN ERASE OR PROGRAM THE BOOT ROM WOULD REFUSE IS REFUSED BEFORE IT IS CALLED**: an erase that
+/// is not whole sectors from a sector's start, a program that does not start a page, and a span
+/// past the end of the first chip select's 16 MiB (datasheet 5.4.8.9).
+#[test]
+fn an_erase_or_program_the_boot_rom_would_refuse_is_refused_before_the_call() {
+    let mut board = settings_board();
+    {
+        let mut session = FlashSession::open(&mut board).expect("the session opens");
+        assert!(session.erase(SETTINGS_AT + 0x100, 0x1000).is_err(), "not a sector's start");
+        assert!(session.erase(SETTINGS_AT, 0x800).is_err(), "not whole sectors");
+        assert!(session.erase(SETTINGS_AT, 0).is_err(), "nothing to erase");
+        assert!(session.erase(0xFF_F000, 0x2000).is_err(), "past the chip select");
+        assert!(session.program(SETTINGS_AT + 0x10, &[0x5A; 256]).is_err(), "not a page's start");
+        assert!(session.program(0x100_0000, &[0x5A; 256]).is_err(), "past the chip select");
+        assert!(session.read(0xFF_FFFF, 2).is_err(), "a read past the chip select");
+        session.close().expect("closes");
+    }
+    assert!(board.flash_ops.is_empty(), "no flash_op was called: {:?}", board.flash_ops);
+}
+
+/// **A PROBE WIRED TO ANOTHER PART IS REFUSED WITH THAT PART UNTOUCHED**: the boot ROM's magic is
+/// read before anything is reset, and an RP2040's (its version byte 1) is not an RP2350's.
+#[test]
+fn a_probe_wired_to_another_part_is_refused_before_anything_is_reset() {
+    let mut board = settings_board();
+    board.rom[0x10..0x14].copy_from_slice(&0x0001_754d_u32.to_le_bytes());
+    let why = FlashSession::open(&mut board).err().expect("refused").to_string();
+    assert!(why.contains("not an RP2350"), "{why}");
+    assert!(!board.dhcsr.halted, "the part was not reset into a halt");
+    assert!(!board.ram.contains_key(&0xe000_edfc), "DEMCR was not written");
+    assert!(board.log.is_empty() && board.flash_ops.is_empty(), "{:?}", board.log);
+}
+
+/// **A SESSION LEFT WITHOUT CLOSING STILL STARTS THE BOARD AGAIN**, so a command that stops part way
+/// never leaves the board halted.
+#[test]
+fn a_session_dropped_without_closing_starts_the_board_again() {
+    let mut board = settings_board();
+    drop(FlashSession::open(&mut board).expect("the session opens"));
+    assert_eq!(board.log.last().map(String::as_str), Some("reset_and_run"), "{:?}", board.log);
+    assert_eq!(board.ram.get(&BOOTLOCK_FLASH_OP), Some(&0), "the boot ROM's flash lock is released");
+}
+
+/// **AN ERASE THAT DOES NOT COMPLETE STOPS THE STORE AT ITS ERROR**, which names the place, and the
+/// board still starts again: clearing a stored network whose slot never finishes erasing.
+#[test]
+fn an_erase_that_does_not_complete_is_named_and_the_board_starts_again() {
+    let mut board = settings_board();
+    through_the_route(&mut board, |store| lamella_stored_settings::store(store, &stored_network(b"Home Net", b"hunter2hunter2")));
+    board.erase_hangs_at = Some(XIP_BASE + SETTINGS_AT);
+    let mut flash = SettingsFlash::Rp2350(FlashSession::open(&mut board).expect("the session opens"));
+    let mut store = RegionStore::open(&mut flash, SETTINGS_AT, SETTINGS_UNIT).expect("both slots read");
+    assert!(!lamella_stored_settings::clear(&mut store), "the clear did not complete");
+    let error = store.error().expect("the flash's error is kept").to_owned();
+    assert!(error.contains("erasing 4096 bytes of the flash at 0x3fe000"), "{error}");
+    drop(store);
+    flash.close().expect("the board starts again");
+    assert_eq!(board.log.last().map(String::as_str), Some("reset_and_run"), "{:?}", board.log);
 }
 
 /// An RP2040 as its bootrom flash API shows itself to a probe: the function table its part routine

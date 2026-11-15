@@ -4,6 +4,7 @@
 BOARD = "pimoroni-pico-plus-2-w"
 BOARD_MODEL = 62
 BOARD_VENDOR = "Pimoroni"
+PWM_CHIP_COUNT = 12
 
 # Role handles: the ONLY peripheral names an app sees. The value of a
 # role handle is its role-id string; the runtime resolves role -> facts through FACTS
@@ -250,6 +251,7 @@ INSTANCES = {
     "uart0": {"block": "uart", "base": 0x40070000, "reset_bit": 0x1A},
     "uart1": {"block": "uart", "base": 0x40078000, "reset_bit": 0x1B},
     "spi0": {"block": "spi", "base": 0x40080000, "reset_bit": 0x12},
+    "spi1": {"block": "spi", "base": 0x40088000, "reset_bit": 0x13},
     "i2c0": {"block": "i2c", "base": 0x40090000, "reset_bit": 0x4},
     "i2c1": {"block": "i2c", "base": 0x40098000, "reset_bit": 0x5},
     "adc": {"block": "adc", "base": 0x400A0000, "reset_bit": 0x0},

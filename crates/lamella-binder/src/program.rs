@@ -868,10 +868,7 @@ pub fn bind_compilation_units_with_reference_model(
     }
     let target = options.target;
     let mut binder = Binder::with_model(model);
-    for unit in units {
-        qualify_declared_signatures(&mut binder, &unit.usings, &unit.members, "");
-    }
-    binder.model_mut().link_bases();
+    qualify_compilation_signatures(&mut binder, units);
     resolve_constants(binder.model_mut(), units);
     apply_bind_options(&mut binder, options);
     declare_top_level_statements(&mut binder, units);
@@ -951,19 +948,68 @@ fn attach_top_level_reports(per_unit: &mut [Vec<Diagnostic>], reports: Vec<(usiz
 /// namespace, and the file's `using`s, through [`Binder::canonicalize`]'s scope walk.
 ///
 ///
-/// Runs after [`collect_into`] and BEFORE [`Model::link_bases`], so the base chain links over
-/// qualified names. The walk mirrors [`bind_namespace_body`]'s scope entry (and the emitter's
-/// `emit_namespace` mirrors both) -- reporting nothing: an alias with a bad target, a duplicate
-/// alias, an unresolvable name are all the bind walk's diagnostics to make.
+/// Runs after [`collect_into`]. Base types are qualified and linked before member signatures,
+/// so an inherited nested type retains its declaring type's identity. The walk reports nothing;
+/// declaration and body binding report invalid names and directives. A multi-file compilation
+/// uses [`qualify_compilation_signatures`] to link every file's bases before any file's members.
 pub fn qualify_declared_signatures(
     binder: &mut Binder,
     usings: &[UsingDirective],
     members: &[NamespaceMember],
     namespace: &str,
 ) {
+    qualify_signatures(binder, |binder, bases| {
+        qualify_namespace_signatures(binder, usings, members, namespace, bases)
+    });
+}
+
+/// Qualifies and links all source declarations while preserving each file's import scopes.
+pub fn qualify_compilation_signatures(binder: &mut Binder, units: &[CompilationUnit]) {
+    qualify_signatures(binder, |binder, bases| {
+        let mut changed = false;
+        for unit in units {
+            changed |= qualify_namespace_signatures(binder, &unit.usings, &unit.members, "", bases);
+        }
+        changed
+    });
+}
+
+type DeclaredBases = alloc::collections::BTreeMap<(String, String), Vec<TypeSymbol>>;
+
+fn qualify_signatures(
+    binder: &mut Binder,
+    walk: impl Fn(&mut Binder, Option<&DeclaredBases>) -> bool,
+) {
+    let bases: DeclaredBases = binder.model().type_keys().filter_map(|(namespace, name)| {
+        let info = binder.model().get(namespace, name)?;
+        (!info.is_external).then(|| ((namespace.into(), name.into()), info.bases.clone()))
+    }).collect();
+    // A base name can itself name an inherited nested type. Re-read the original names after
+    // linking, so an early global match cannot conceal an enclosing type's inherited member.
+    // A valid dependency path visits at most every declaration; the bound also ends cycles.
+    for round in 0..=bases.len().max(1) {
+        let changed = walk(binder, Some(&bases));
+        binder.model_mut().link_bases();
+        // The first link can make a previously unqualified inherited name visible even when
+        // every written base name stayed the same during that first walk.
+        if !changed && round != 0 {
+            break;
+        }
+    }
+    walk(binder, None);
+}
+
+fn qualify_namespace_signatures(
+    binder: &mut Binder,
+    usings: &[UsingDirective],
+    members: &[NamespaceMember],
+    namespace: &str,
+    bases: Option<&DeclaredBases>,
+) -> bool {
+    let mut changed = false;
     let scope = binder.import_scope();
     for using in usings {
-        binder.import_using(&using.kind);
+        binder.import_using_in_namespace(&using.kind, namespace);
     }
     let mut prefix = String::new();
     for part in namespace.split('.').filter(|part| !part.is_empty()) {
@@ -977,20 +1023,24 @@ pub fn qualify_declared_signatures(
         match member {
             NamespaceMember::Namespace(declaration) => {
                 let inner = join_namespace(namespace, &declaration.name);
-                qualify_declared_signatures(binder, &declaration.usings, &declaration.members, &inner);
+                changed |= qualify_namespace_signatures(
+                    binder, &declaration.usings, &declaration.members, &inner, bases,
+                );
             }
             NamespaceMember::Type(declaration) => {
-                qualify_type_declaration(binder, namespace, declaration);
+                changed |= qualify_type_declaration(binder, namespace, declaration, bases);
             }
-            NamespaceMember::Delegate(declaration) => {
+            NamespaceMember::Delegate(declaration) if bases.is_none() => {
                 qualify_delegate_declaration(binder, namespace, declaration);
             }
-            NamespaceMember::Enum(declaration) => {
+            NamespaceMember::Enum(declaration) if bases.is_none() => {
                 qualify_model_info(binder, namespace, &declaration.name);
             }
+            NamespaceMember::Delegate(_) | NamespaceMember::Enum(_) => {}
         }
     }
     binder.restore_import_scope(scope);
+    changed
 }
 
 /// Qualifies a delegate's `Invoke` signature with the delegate's OWN type parameters in scope.
@@ -1103,47 +1153,69 @@ fn store_resolved_constraints(
 /// Qualifies one type declaration's model signatures under its scope, then recurses into its
 /// nested type declarations -- which are keyed under the enclosing type's FULL NAME standing in
 /// for the namespace, exactly as `collect_nested_types` registered them.
-fn qualify_type_declaration(binder: &mut Binder, namespace: &str, declaration: &TypeDecl) {
+fn qualify_type_declaration(
+    binder: &mut Binder,
+    namespace: &str,
+    declaration: &TypeDecl,
+    bases: Option<&DeclaredBases>,
+) -> bool {
+    let mut changed = false;
     let declaring = declared_symbol(namespace, declaration);
-    store_inherited_constraints(binder, namespace, &declared_type_name(declaration));
+    let name = declared_type_name(declaration);
+    if bases.is_none() {
+        store_inherited_constraints(binder, namespace, &name);
+    }
     let type_parameters = binder.enter_declared_type_parameters(
         &declaring,
         &declaration.type_parameters,
         &declaration.constraints,
     );
-    store_resolved_constraints(
-        binder,
-        namespace,
-        &declared_type_name(declaration),
-        &declaration.type_parameters,
-        &declaration.constraints,
-    );
-    binder.enter_type(declaring);
-    qualify_model_info(binder, namespace, &declared_type_name(declaration));
-    binder.exit_type();
+    if let Some(originals) = bases {
+        if let Some(original) = originals.get(&(namespace.into(), name.clone())) {
+            let resolved: Vec<TypeSymbol> = binder.in_type_header(&declaring, |binder| {
+                original.iter().map(|base| binder.canonicalize(base)).collect()
+            });
+            if let Some(info) = binder.model_mut().info_mut(namespace, &name)
+                && info.bases != resolved
+            {
+                info.bases = resolved;
+                info.base = None;
+                changed = true;
+            }
+        }
+    } else {
+        store_resolved_constraints(
+            binder, namespace, &name, &declaration.type_parameters, &declaration.constraints,
+        );
+        // Member signatures see their declaring type's own and inherited nested types.
+        binder.enter_type(declaring);
+        qualify_model_info(binder, namespace, &name);
+        binder.exit_type();
+    }
     let enclosing_full = declared_full_name(namespace, declaration);
     for member in &declaration.members {
         if let Member::NestedType(nested) = member {
             match nested.as_ref() {
                 NamespaceMember::Type(inner) => {
-                    qualify_type_declaration(binder, &enclosing_full, inner);
+                    changed |= qualify_type_declaration(binder, &enclosing_full, inner, bases);
                 }
-                NamespaceMember::Delegate(inner) => {
+                NamespaceMember::Delegate(inner) if bases.is_none() => {
                     qualify_delegate_declaration(binder, &enclosing_full, inner);
                 }
-                NamespaceMember::Enum(inner) => {
+                NamespaceMember::Enum(inner) if bases.is_none() => {
                     store_inherited_constraints(binder, &enclosing_full, &inner.name);
                     qualify_model_info(binder, &enclosing_full, &inner.name);
                 }
-                NamespaceMember::Namespace(_) => {}
+                NamespaceMember::Namespace(_) | NamespaceMember::Delegate(_) | NamespaceMember::Enum(_) => {}
             }
         }
     }
     binder.exit_type_parameters(type_parameters);
+    changed
 }
 
 /// Rewrites the signature positions of the model type at `(namespace, name)` through the scoped
-/// [`Binder::canonicalize`]: the base list, field/property/event types, and every method's and
+/// [`Binder::canonicalize`]: field/property/event types, and every method's and
 /// constructor's return and parameter types -- with the METHOD's own type parameters entered
 /// around its rewrite, so `T Id<T>(T x)` keeps its `T`s raw rather than capturing a model type
 /// spelled the same way.
@@ -1151,12 +1223,14 @@ fn qualify_model_info(binder: &mut Binder, namespace: &str, name: &str) {
     let Some(mut info) = binder.model().get(namespace, name).cloned() else {
         return;
     };
-    info.bases = info.bases.iter().map(|base| binder.canonicalize(base)).collect();
     for field in &mut info.fields {
         field.ty = binder.canonicalize(&field.ty);
     }
     for property in &mut info.properties {
         property.ty = binder.canonicalize(&property.ty);
+        if let Some(explicit) = &property.explicit_interface {
+            property.explicit_interface = Some(binder.canonicalize(explicit));
+        }
     }
     for event in &mut info.events {
         event.ty = binder.canonicalize(&event.ty);
@@ -1311,7 +1385,7 @@ fn bind_namespace_body(
             }
         }
         list.note_import(binder, imported, using);
-        binder.import_using(&using.kind);
+        binder.import_using_in_namespace(&using.kind, namespace);
     }
     let mut prefix = String::new();
     for part in namespace.split('.').filter(|part| !part.is_empty()) {
@@ -1422,9 +1496,10 @@ fn check_using_directive(
             namespace_using_target(binder, name, namespace).map(UsingImport::Namespace)
         }
         UsingKind::Static(target) => {
-            let imported = TypeSymbol::Named(qualified_parts(target));
+            let imported = binder.qualify_using_alias_target(
+                &TypeSymbol::Named(target.parts.clone().into()), namespace);
             if binder.resolve_named_type_quietly(&imported, target.span).is_error()
-                && binder.names_a_namespace(&dotted(target))
+                && binder.aliased_namespace(&imported).is_some()
             {
                 binder.report(Diagnostic::new(
                     DiagnosticKind::UsingStaticNamesANamespace {
@@ -1444,7 +1519,8 @@ fn check_using_directive(
             })
         }
         UsingKind::Alias { target, .. } => {
-            let named = TypeSymbol::Named(qualified_parts(target));
+            let named = binder.qualify_using_alias_target(
+                &TypeSymbol::Named(target.parts.clone().into()), namespace);
             if binder.aliased_namespace(&named).is_none() {
                 binder.resolve_named_type(&named, target.span);
             }
@@ -2941,9 +3017,9 @@ fn validate_attribute_arguments(
         .collect();
     let argument_types: Vec<TypeSymbol> =
         arguments.iter().map(|argument| argument.ty.clone()).collect();
-    let arg_constants: Vec<Option<i64>> = arguments
+    let arg_constants: Vec<crate::bound::ArgumentConstant> = arguments
         .iter()
-        .map(crate::bound::constant_int_value)
+        .map(|value| binder.argument_constant(value))
         .collect();
     let Some(constructor) = binder.check_constructor(
         attribute_type,
@@ -2952,6 +3028,7 @@ fn validate_attribute_arguments(
         &argument_types,
         &arg_constants,
         &[],
+        &arguments,
         span,
     ) else {
         return (false, Some(arguments));
@@ -3847,6 +3924,34 @@ fn check_extern_members(binder: &mut Binder, declaration: &TypeDecl) {
     }
     for member in &declaration.members {
         match member {
+            Member::Constructor { modifiers, body, attributes, span, .. }
+            | Member::Operator { modifiers, body, attributes, span, .. }
+            | Member::ConversionOperator { modifiers, body, attributes, span, .. }
+            | Member::Destructor { modifiers, body, attributes, span, .. }
+                if is_extern(modifiers) =>
+            {
+                let rendered = match member {
+                    Member::Constructor { name, parameters, .. } =>
+                        method_signature(&declaration.name, name, parameters),
+                    Member::Operator { operator, parameters, .. } =>
+                        method_signature(&declaration.name, operator.method_name(parameters.len()), parameters),
+                    Member::ConversionOperator { direction, parameters, .. } =>
+                        method_signature(&declaration.name, direction.method_name(), parameters),
+                    _ => alloc::format!("{}.~{}()", declaration.name, declaration.name).into(),
+                };
+                let kind = if body.is_some() {
+                    Some(DiagnosticKind::ExternMemberHasBody { member: rendered })
+                } else if matches!(member, Member::Constructor { .. }) {
+                    Some(DiagnosticKind::ExternConstructor { member: rendered })
+                } else if attributes.is_empty() {
+                    Some(DiagnosticKind::ExternMemberHasNoAttributes { member: rendered })
+                } else {
+                    None
+                };
+                if let Some(kind) = kind {
+                    binder.report(Diagnostic::new(kind, *span));
+                }
+            }
             Member::Method {
                 modifiers,
                 name,
@@ -5334,7 +5439,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                 return_type,
                 operator,
                 parameters,
-                body,
+                body: Some(body),
                 ..
             } => {
                 let params = bound_parameters(parameters);
@@ -5354,7 +5459,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                 direction,
                 target,
                 parameters,
-                body,
+                body: Some(body),
                 ..
             } => {
                 let params = bound_parameters(parameters);
@@ -5373,11 +5478,39 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
             Member::Constructor {
                 modifiers,
                 parameters,
+                initializer: Some(initializer),
+                body: None,
+                ..
+            } if !is_static_member(modifiers) => {
+                // An external implementation does not exempt an explicit initializer from binding.
+                let chain_parameters: Vec<_> = bound_parameters(parameters)
+                    .into_iter()
+                    .map(|(name, ty, _)| (name, ty))
+                    .collect();
+                let _ = binder.bind_constructor_chain(&enclosing, &chain_parameters, initializer);
+            }
+            Member::Constructor {
+                modifiers,
+                parameters,
                 is_vararg,
-                body,
+                initializer,
+                body: Some(body),
                 ..
             } => {
                 let params = bound_parameters(parameters);
+                if let Some(initializer) = initializer {
+                    // A struct's empty this() zero-initializes its storage without a constructor call.
+                    let zero_initialize = declaration.kind == TypeKind::Struct
+                        && initializer.kind == lamella_syntax::ast::ConstructorInitializerKind::This
+                        && initializer.arguments.is_empty();
+                    if !zero_initialize && !is_static_member(modifiers) {
+                        let chain_parameters: Vec<_> = params
+                            .iter()
+                            .map(|(name, ty, _)| (name.clone(), ty.clone()))
+                            .collect();
+                        let _ = binder.bind_constructor_chain(&enclosing, &chain_parameters, initializer);
+                    }
+                }
                 binder.set_next_method_ref_parameters(by_reference_parameter_names(parameters));
                 if *is_vararg {
                     binder.set_next_method_vararg();
@@ -5580,7 +5713,7 @@ fn bind_type_bodies_inner(binder: &mut Binder, namespace: &str, declaration: &Ty
                     }
                 }
             }
-            Member::Destructor { body, .. } => {
+            Member::Destructor { body: Some(body), .. } => {
                 binder.bind_method(
                     Some(enclosing.clone()),
                     "Finalize",
@@ -6218,9 +6351,8 @@ fn join_namespace(outer: &str, name: &QualifiedName) -> String {
     joined
 }
 
-/// A qualified name as one dotted string (`A.B.C`).
-/// The parts of a `using` directive's name, less a leading `global::`: the directive's name is
-/// resolved from the global namespace already, so the qualifier changes nothing it names.
+/// The parts of a name without an explicit `global::` qualifier, for absolute-name consumers.
+/// Namespace-relative alias qualification must retain the original parts.
 pub(crate) fn qualified_parts(name: &QualifiedName) -> Box<[Box<str>]> {
     match name.parts.split_first() {
         Some((first, rest)) if lamella_syntax::ast::alias_qualifier(first) == Some("global") => {
@@ -6253,6 +6385,187 @@ mod tests {
     use crate::diagnostic::CodeNamespace;
     use alloc::vec::Vec;
     use lamella_syntax::parser::parse_compilation_unit;
+
+    #[test]
+    fn inherited_nested_type_signatures_use_the_linked_base_classes() {
+        for (source, namespace, name, expected) in [
+            ("class Reader { static Derived.Inner Read() { return null; } } \
+              class Derived : Root { } class Root { public class Inner { } }",
+             "", "Reader", "Root.Inner"),
+            ("class Base { } namespace N { class Reader { \
+              static Child.Inner Read() { return null; } } class Child : Base { } \
+              class Base { public class Inner { } } }",
+             "N", "Reader", "N.Base.Inner"),
+            ("class Hidden { } class Vault { protected class Hidden { } } \
+              class Open : Vault { class Nest { static Hidden Read() { return null; } } }",
+             "Open", "Nest", "Vault.Hidden"),
+        ] {
+            let unit = parse_compilation_unit(source).unit;
+            let mut model = Model::new();
+            collect_into(&mut model, &unit);
+            let mut binder = Binder::with_model(model);
+            qualify_declared_signatures(&mut binder, &unit.usings, &unit.members, "");
+            let info = binder.model().get(namespace, name).expect("reader type");
+            let method = info.methods.iter().find(|m| &*m.name == "Read").expect("reader method");
+            assert_eq!(method.return_type.to_string(), expected, "{source}");
+        }
+    }
+
+    #[test]
+    fn inherited_nested_type_base_lists_keep_the_enclosing_inherited_identity() {
+        let source = "interface IProtected { } class Open : Vault { \
+            class Item : IProtected { } } class Vault { protected interface IProtected { } }";
+        let unit = parse_compilation_unit(source).unit;
+        let mut model = Model::new();
+        collect_into(&mut model, &unit);
+        let mut binder = Binder::with_model(model);
+        qualify_declared_signatures(&mut binder, &unit.usings, &unit.members, "");
+        let info = binder.model().get("Open", "Item").expect("nested type");
+        assert_eq!(info.bases[0].to_string(), "Vault.IProtected");
+    }
+
+    #[test]
+    fn inherited_nested_type_lexical_lookup_skips_inaccessible_members() {
+        let source = "class Hidden { } class Vault { private class Hidden { } } \
+            class Open : Vault { class Nest { static Hidden Read() { return null; } } }";
+        let unit = parse_compilation_unit(source).unit;
+        let mut model = Model::new();
+        collect_into(&mut model, &unit);
+        let mut binder = Binder::with_model(model);
+        qualify_declared_signatures(&mut binder, &unit.usings, &unit.members, "");
+        let info = binder.model().get("Open", "Nest").expect("nested type");
+        assert_eq!(info.methods[0].return_type.to_string(), "Hidden");
+        assert_eq!(sorted_codes(source), []);
+    }
+
+    #[test]
+    fn inherited_nested_type_lookup_preserves_hiding_access_and_cycle_checks() {
+        for source in [
+            "class Root { protected class Hidden { } } class Derived : Root { } \
+             class Reader { static object Read() { return new Derived.Hidden(); } }",
+            "class Root { public class Inner { } } class Derived : Root { \
+             private new class Inner { } } \
+             class Reader { static object Read() { return new Derived.Inner(); } }",
+        ] {
+            assert!(sorted_codes(source).contains(&122), "{source}");
+        }
+        let hidden = "class Root { public class Inner { public class Leaf { } } } \
+            class Derived : Root { public new class Inner { } } \
+            class Reader { static Derived.Inner.Leaf Read() { return null; } }";
+        assert!(!sorted_codes(hidden).is_empty());
+        let cycle = "class A : B { } class B : A { } \
+            class Reader { static A.Missing Read() { return null; } }";
+        assert!(sorted_codes(cycle).contains(&146));
+    }
+
+    #[test]
+    fn inherited_nested_type_lookup_does_not_import_nested_namespaces() {
+        let source = "using N; namespace N.Inner { public class Item { } } \
+            class Reader { static Inner.Item Read() { return null; } }";
+        assert!(sorted_codes(source).contains(&246));
+        let qualified = "using N; namespace N.Inner { public class Item { } } \
+            class Reader { static N.Inner.Item Read() { return null; } }";
+        assert_eq!(sorted_codes(qualified), []);
+    }
+
+    #[test]
+    fn inherited_nested_type_signatures_bind_across_files_in_either_order() {
+        let sources = [
+            "namespace N { class Reader { static Base.Inner Accept(Child.Inner value) { return value; } } }",
+            "class Base { } namespace N { class Child : Base { } }",
+            "namespace N { class Base { public class Inner { } } }",
+        ];
+        for reverse in [false, true] {
+            let mut ordered = sources;
+            if reverse {
+                ordered.reverse();
+            }
+            let diagnostics = codes_per_unit(&ordered);
+            assert!(diagnostics.iter().all(Vec::is_empty), "{diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn inherited_nested_type_names_bind_in_signatures_and_construction() {
+        for version in [LanguageVersion::CSharp1, LanguageVersion::DEFAULT] {
+            for source in [
+                "class Root { public class Inner { } } class Derived : Root { } \
+                 class Reader { static Derived.Inner Read() { return new Derived.Inner(); } }",
+                "namespace N { class Root { public class Inner { } } class Derived : Root { } } \
+                 class Reader { static N.Derived.Inner Read() { return new N.Derived.Inner(); } }",
+                "class Root { public class Middle { public class Leaf { } } } \
+                 class Derived : Root { } class Reader { \
+                 static Derived.Middle.Leaf Read() { return new Derived.Middle.Leaf(); } }",
+            ] {
+                assert_eq!(sorted_codes_at(source, version), [], "{version:?}: {source}");
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_nested_type_names_are_visible_inside_nested_declarations() {
+        for version in [LanguageVersion::CSharp1, LanguageVersion::DEFAULT] {
+            for source in [
+                "class Vault { protected interface IProtected { } } \
+                 class Open : Vault { class Item : IProtected { } \
+                 public bool Works() { return new Item() is IProtected; } }",
+                "class Vault { protected class Hidden { } } \
+                 class Open : Vault { class Nested { \
+                 static Hidden Read() { return new Hidden(); } } }",
+            ] {
+                assert_eq!(sorted_codes_at(source, version), [], "{version:?}: {source}");
+            }
+        }
+    }
+
+    #[test]
+    fn global_using_alias_is_checked_in_the_global_namespace() {
+        for directive in [
+            "using Item = global::Inner.Beacon;",
+            "using Scope = global::Inner;",
+        ] {
+            let source = alloc::format!(
+                "namespace Inner {{ class Beacon {{ }} }} \
+                 namespace Harbor {{ {directive} namespace Inner {{ class Marker {{ }} }} }}"
+            );
+            assert_eq!(sorted_codes(&source), [], "{source}");
+        }
+        let missing = "namespace Inner { class Marker { } } \
+            namespace Harbor { using Item = global::Inner.Beacon; \
+            namespace Inner { class Beacon { } } }";
+        assert!(!sorted_codes(missing).is_empty(), "a nearer type cannot satisfy a global target");
+    }
+
+    #[test]
+    fn namespace_alias_target_resolves_in_its_declaring_namespace() {
+        for version in [LanguageVersion::CSharp1, LanguageVersion::DEFAULT] {
+            for source in [
+                "namespace Harbor { using Scope = Inner; \
+                 namespace Inner { class Beacon { public const int Code = 29; } } \
+                 class Reader { static int Read() { return Scope.Beacon.Code; } } }",
+                "namespace Harbor { namespace Inner { class Beacon { } } \
+                 namespace Deep { using Scope = Inner; \
+                 class Reader { static Scope.Beacon Read() { return new Scope.Beacon(); } } } }",
+                "namespace Harbor { using Item = Inner.Beacon; \
+                 namespace Inner { class Beacon { } } \
+                 class Reader { static Item Read() { return new Item(); } } }",
+            ] {
+                assert_eq!(sorted_codes_at(source, version), [], "{version:?}: {source}");
+            }
+            for source in [
+                "namespace Inner { class Beacon { } } \
+                 namespace Harbor { using Scope = Inner.Beacon; \
+                 namespace Inner { class Marker { } } }",
+                "namespace Inner.More { class Beacon { } } \
+                 namespace Harbor { using Scope = Inner.More; class Inner { } }",
+            ] {
+                let unit = parse_compilation_unit(source).unit;
+                let diagnostics = bind_compilation_unit_with_dialect(&unit, &[], false, version);
+                assert!(diagnostics.iter().any(|d| d.severity() == lamella_syntax::diagnostic::Severity::Error),
+                    "a nearer declaration must prevent outer fallback: {source}");
+            }
+        }
+    }
 
     /// **A TYPE'S OWN ACCESSIBILITY IS ENFORCED AT A USE SITE (10.5.4), AND IT HAS TWO HALVES.**
     /// Naming a `private` nested type from outside its enclosing class is `CS0122` under csc, and so
@@ -6431,6 +6744,32 @@ mod tests {
             ),
             [122]
         );
+    }
+
+    #[test]
+    fn static_import_directive_checks_use_the_declaring_namespace() {
+        assert_eq!(sorted_codes(
+            "namespace Harbor { using static Inner.M; \
+             namespace Inner { class M { public static int F() { return 2; } } } \
+             class Reader { static int Read() { return F(); } } }"
+        ), []);
+        assert_eq!(sorted_codes(
+            "namespace Harbor { using static Inner; namespace Inner { class M { } } }"
+        ), [7007]);
+        assert_eq!(sorted_codes(
+            "namespace Harbor { using static Inner.M; using static global::Harbor.Inner.M; \
+             namespace Inner { class M { } } }"
+        ), [105]);
+        for shadow in ["namespace Inner { class Other { } }", "class Inner { }"] {
+            let source = alloc::format!(
+                "namespace Inner {{ class M {{ }} }} \
+                 namespace Harbor {{ using static Inner.M; {shadow} }}"
+            );
+            let unit = parse_compilation_unit(&source).unit;
+            assert!(bind_compilation_unit(&unit).iter().any(|diagnostic|
+                diagnostic.severity() == lamella_syntax::diagnostic::Severity::Error),
+                "a nearer first part must prevent global fallback: {source}");
+        }
     }
 
     /// The directive names a `type_name`, and the scope it opens closes with its namespace body.
@@ -8370,6 +8709,70 @@ mod tests {
     }
 
     #[test]
+    fn external_constructor_initializers_bind_arguments_and_targets() {
+        for (source, expected) in [
+            ("class B { public B(int n) { } } class D : B { public extern D() : base(Undefined()); }", 103),
+            ("class B { public B(int n) { } } class D : B { public extern D() : base(\"bad\"); }", 1503),
+            ("class B { public B(int n) { } } class D : B { public extern D() : base(); }", 7036),
+            ("class B { private B(int n) { } } class D : B { public extern D() : base(1); }", 122),
+            ("class D { public D(int n) { } public extern D() : this(\"bad\"); }", 1503),
+        ] {
+            let parsed = parse_compilation_unit(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let diagnostics = bind_compilation_unit_with_dialect(
+                &parsed.unit, &[], false, LanguageVersion::CSharp1,
+            );
+            assert!(diagnostics.iter().any(|d| d.code() == expected),
+                "expected CS{expected:04} for {source}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn external_constructor_initializers_accept_valid_explicit_chains() {
+        for source in [
+            "class B { protected B(int n) { } } class D : B { public extern D(int n) : base(n); }",
+            "class D { private D(int n) { } public extern D() : this(1); }",
+            "class B { public B(int n) { } } class D : B { public extern D(); }",
+        ] {
+            let parsed = parse_compilation_unit(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let diagnostics = bind_compilation_unit_with_dialect(
+                &parsed.unit, &[], false, LanguageVersion::CSharp1,
+            );
+            assert!(diagnostics.iter().all(|d| d.severity() != lamella_syntax::diagnostic::Severity::Error),
+                "{source}: {diagnostics:?}");
+        }
+    }
+
+    /// A class derived from any construction of a generic class reaches its protected members
+    /// (ECMA-334 4th ed 10.5.3): its constructors through `base(...)` and the implicit `base()`, its
+    /// methods and fields by simple name, and an instance member through a qualifier of any
+    /// construction of the deriving class -- csc 10.0.402 compiles all of these.
+    #[test]
+    fn protected_members_of_a_generic_base_are_reachable_from_derived_classes() {
+        for source in [
+            "class B<T> { protected B(int n) { } } class D<T> : B<T> { public D() : base(1) { } }",
+            "class B<T> { protected B() { } } class D<T> : B<T> { }",
+            "class B<T> { protected B() { } } class D<T> : B<T> { public D(int n) { } }",
+            "class B<T> { protected B(int n) { } } class D<U> : B<U[]> { public D() : base(1) { } }",
+            "class B<T> { protected B(int n) { } } class D : B<string> { public D() : base(1) { } }",
+            "class B<T> { protected int M() { return 3; } } class D<T> : B<T> { int N() { return M(); } }",
+            "class B<T> { protected int F = 4; } class D<T> : B<T> { int N(D<T> other) { return other.F; } }",
+            "class B<T> { protected int F = 4; } class D<T> : B<T> { int N(D<int> other) { return other.F; } }",
+        ] {
+            assert_eq!(sorted_codes(source), [], "{source}");
+        }
+        for (source, code) in [
+            ("class B<T> { private B(int n) { } } class D<T> : B<T> { public D() : base(1) { } }", 122),
+            ("class B<T> { protected int F = 4; } class D<T> : B<T> { int N(B<T> other) { return other.F; } }", 1540),
+            ("class B<T> { protected int F = 4; } class D<T> : B<T> { int N(B<int> other) { return other.F; } }", 1540),
+            ("class B<T> { protected int M() { return 3; } } class C { int N(B<int> b) { return b.M(); } }", 122),
+        ] {
+            assert!(sorted_codes(source).contains(&code), "CS{code:04}: {source}");
+        }
+    }
+
+    #[test]
     fn destructor_and_constructor_declaration_rules() {
         assert_eq!(sorted_codes("class C { ~D() { } }"), [574]);
         assert_eq!(sorted_codes("struct S { ~S() { } }"), [575]);
@@ -8378,10 +8781,10 @@ mod tests {
         assert_eq!(sorted_codes("class C { D() { } }"), [1520]);
         assert_eq!(sorted_codes("class C { public static C() { } }"), [515]);
         assert_eq!(sorted_codes("abstract enum E { A }"), [106]);
+        assert_eq!(sorted_codes("class C { extern ~C(); }"), [626]);
 
         for clean in [
             "class C { ~C() { } }",
-            "class C { extern ~C(); }",
             "class C { C() { } }",
             "class C { static C() { } }",
             "public enum E { A }",
@@ -8568,6 +8971,42 @@ mod tests {
     fn a_static_member_marked_virtual_is_cs0112() {
         assert_eq!(sorted_codes("class C { public static virtual void M() { } }"), [112]);
         assert!(sorted_codes("class C { public static void M() { } }").is_empty());
+    }
+
+    #[test]
+    fn enum_initializer_member_types_admit_underlying_integral_operators() {
+        for source in [
+            "enum E : uint { High = 0x80000000U, Half = High >> 1 }",
+            "enum E : uint { High = 0x80000000U, Half = E.High >> 1 }",
+            "enum Source : uint { High = 0x80000000U } \
+             enum Target : uint { Half = Source.High >> 1 }",
+            "enum E : sbyte { Low = -8, Half = Low / 2, Product = Half * 3 }",
+            "enum E { First = 3, Positive = +First, Negative = -First }",
+        ] {
+            assert_eq!(sorted_codes_iso1(source), [], "{source}");
+        }
+    }
+
+    #[test]
+    fn enum_initializer_member_types_leave_other_contexts_and_fields_unchanged() {
+        for source in [
+            "enum E : uint { High = 0x80000000U } \
+             class C { public static uint M() { return E.High >> 1; } }",
+            "enum E : uint { High = 0x80000000U } \
+             class C { public const uint Half = E.High >> 1; }",
+            "enum E : uint { High = 0x80000000U } \
+             class C { public uint Half = E.High >> 1; }",
+            "enum E : uint { High = 0x80000000U } \
+             class C { public const E Saved = E.High; } \
+             enum Other : uint { Half = C.Saved >> 1 }",
+        ] {
+            assert_eq!(sorted_codes_iso1(source), [19], "{source}");
+        }
+        assert_eq!(sorted_codes_iso1(
+            "enum E : uint { High = 0x80000000U, Half = High >> 1 } \
+             class C { public const E Saved = E.Half; \
+                       public static E Get() { return Saved; } }"
+        ), []);
     }
 
     #[test]
@@ -9942,6 +10381,41 @@ mod tests {
     }
 
     #[test]
+    fn extern_declaration_bodies_do_not_require_returns_or_out_assignments() {
+        let source = "class C { public extern C(out int value); \
+            static extern C(); extern ~C(); \
+            public static extern int operator +(C value); \
+            public static extern implicit operator int(C value); }";
+        let unit = parse_compilation_unit(source).unit;
+        let errors: Vec<_> = bind_compilation_unit(&unit).into_iter()
+            .filter(|diagnostic| diagnostic.severity() == lamella_syntax::diagnostic::Severity::Error)
+            .collect();
+        assert!(errors.is_empty(), "{errors:?}");
+    }
+
+    #[test]
+    fn extern_declaration_bodies_have_no_implicit_base_call() {
+        let source = "class Base { protected Base(int value) { } } \
+            class C : Base { public extern C(); }";
+        assert_eq!(sorted_codes(source), [824]);
+        assert!(sorted_codes(&source.replace("extern C();", "C() { }")).contains(&7036));
+    }
+
+    #[test]
+    fn extern_declaration_bodies_cannot_supply_managed_implementations() {
+        for member in [
+            "public extern C() { }",
+            "static extern C() { }",
+            "extern ~C() { }",
+            "public static extern int operator +(C value) { return 1; }",
+            "public static extern implicit operator int(C value) { return 1; }",
+        ] {
+            let source = alloc::format!("class C {{ {member} }}");
+            assert_eq!(sorted_codes(&source), [179], "{member}");
+        }
+    }
+
+    #[test]
     fn member_soundness_diagnostics() {
         assert_eq!(sorted_codes("class C { void M(); }"), [501]);
         assert_eq!(sorted_codes("struct S { void M(); }"), [501]);
@@ -10044,6 +10518,7 @@ mod tests {
             let mut model = Model::new();
             let mut object = TypeInfo::new("System", "Object", TypeKind::Class);
             object.methods.push(MethodSymbol {
+                is_accessor: false,
                 return_tuple_names: Vec::new(),
                 return_required_modifiers: Vec::new(),
                 explicit_interface: None,
@@ -10061,6 +10536,7 @@ mod tests {
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
                 sets_required_members: false,
+                uninstantiated_parameters: None,
                 type_parameters: Vec::new(),
                 type_parameter_constraints: Vec::new(),
             });
@@ -10273,6 +10749,7 @@ mod tests {
             let mut model = Model::new();
             let mut object = TypeInfo::new("System", "Object", TypeKind::Class);
             object.methods.push(MethodSymbol {
+                is_accessor: false,
                 return_tuple_names: Vec::new(),
                 return_required_modifiers: Vec::new(),
                 explicit_interface: None,
@@ -10290,6 +10767,7 @@ mod tests {
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
                 sets_required_members: false,
+                uninstantiated_parameters: None,
                 type_parameters: Vec::new(),
                 type_parameter_constraints: Vec::new(),
             });
@@ -10297,6 +10775,7 @@ mod tests {
             let mut seam = TypeInfo::new("", "Seam", TypeKind::Class);
             seam.is_external = seam_is_external;
             seam.methods.push(MethodSymbol {
+                is_accessor: false,
                 return_tuple_names: Vec::new(),
                 return_required_modifiers: Vec::new(),
                 explicit_interface: None,
@@ -10314,6 +10793,7 @@ mod tests {
                 accessibility: Accessibility::ProtectedInternal,
                 conditional: Vec::new(),
                 sets_required_members: false,
+                uninstantiated_parameters: None,
                 type_parameters: Vec::new(),
                 type_parameter_constraints: Vec::new(),
             });
@@ -10385,6 +10865,7 @@ mod tests {
         let mut bcl = Model::new();
         let mut console = TypeInfo::new("System", "Console", TypeKind::Class);
         console.methods.push(MethodSymbol {
+            is_accessor: false,
             return_tuple_names: Vec::new(),
             return_required_modifiers: Vec::new(),
             explicit_interface: None,
@@ -10402,6 +10883,7 @@ mod tests {
             accessibility: crate::symbols::Accessibility::Public,
             conditional: Vec::new(),
             sets_required_members: false,
+            uninstantiated_parameters: None,
             type_parameters: Vec::new(),
             type_parameter_constraints: Vec::new(),
         });

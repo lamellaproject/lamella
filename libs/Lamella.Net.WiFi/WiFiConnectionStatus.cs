@@ -14,7 +14,10 @@ namespace Lamella.Net.WiFi
         /// <summary>Access to the radio was withdrawn. No board reports it; it keeps Windows' numbering.</summary>
         AccessRevoked = 2,
 
-        /// <summary>The network refused the secret.</summary>
+        /// <summary>
+        /// The credential cannot be used, the WPA2 handshake timed out with reason 15, or WPA3
+        /// authentication failed. A WPA3 failure can have causes other than the secret.
+        /// </summary>
         InvalidCredential = 3,
 
         /// <summary>The network was not found.</summary>

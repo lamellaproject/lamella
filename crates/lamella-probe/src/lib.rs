@@ -4,7 +4,7 @@
 //! `DAP_Info` capabilities, and hands back a connected [`lamella_cmsis_dap::Dap`].
 
 use std::fmt;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use lamella_cmsis_dap::{Dap, Transport};
 pub use lamella_cmsis_dap::{DapError, TransportError};
@@ -412,7 +412,7 @@ pub fn open_hid(
 ) -> Result<lamella_usbhid::Device, ProbeError> {
     let serial = resolve_serial(vendor_id, product_id, requested)?;
     let id = choose_hid_interface(&all_candidates(), vendor_id, product_id, &serial)?;
-    lamella_usbhid::Device::open_id(&id)
+    retrying_while_held(HELD_RETRY_FOR, || lamella_usbhid::Device::open_id(&id), hid_held)
         .map_err(|why| ProbeError::Unopened { device: device_named(vendor_id, product_id, Some(&serial)), why: why.to_string() })
 }
 
@@ -532,7 +532,7 @@ pub fn open_bulk(
     requested: Option<&str>,
 ) -> Result<lamella_usbbulk::Device, ProbeError> {
     let serial = resolve_serial(vendor_id, product_id, requested)?;
-    lamella_usbbulk::Device::open(vendor_id, product_id, Some(&serial))
+    retrying_while_held(HELD_RETRY_FOR, || lamella_usbbulk::Device::open(vendor_id, product_id, Some(&serial)), bulk_held)
         .map_err(|why| ProbeError::Unopened { device: device_named(vendor_id, product_id, Some(&serial)), why: why.to_string() })
 }
 
@@ -634,20 +634,202 @@ pub fn list_reporting(passed_over: &mut Vec<PassedOver>) -> Vec<ProbeInfo> {
 /// port ids, and those two are not one device. So a row keeps the port id of whichever of its interfaces
 /// had one, whichever is its representative, and the second port id starts a second row, in any order.
 fn one_row_per_device(candidates: impl IntoIterator<Item = ProbeInfo>) -> Vec<ProbeInfo> {
-    let mut rows: Vec<ProbeInfo> = Vec::new();
+    grouped_by_device(candidates).into_iter().map(|listed| listed.info).collect()
+}
+
+/// [`one_row_per_device`], each row with every interface that went into it.
+fn grouped_by_device(candidates: impl IntoIterator<Item = ProbeInfo>) -> Vec<Listed> {
+    let mut rows: Vec<Listed> = Vec::new();
     for candidate in candidates {
-        match rows.iter_mut().find(|row| same_device(&row.spelling(), &candidate.spelling())) {
-            Some(row) => {
+        match rows.iter_mut().find(|listed| same_device(&listed.info.spelling(), &candidate.spelling())) {
+            Some(listed) => {
+                listed.interfaces.push(candidate.clone());
+                let row = &mut listed.info;
                 let port_id = row.port_id.take().or_else(|| candidate.port_id.clone());
                 if selection_rank(&candidate) < selection_rank(row) {
                     *row = candidate;
                 }
                 row.port_id = port_id;
             }
-            None => rows.push(candidate),
+            None => rows.push(Listed { interfaces: vec![candidate.clone()], info: candidate }),
         }
     }
     rows
+}
+
+/// A probe as [`list_with_interfaces`] lists it: the row [`list_reporting`] gives, and every interface
+/// of the probe that went into it.
+#[derive(Debug, Clone)]
+pub struct Listed {
+    /// The probe, as [`list_reporting`] gives it.
+    pub info: ProbeInfo,
+    /// Each of its interfaces the filter kept, as it would have been listed alone.
+    interfaces: Vec<ProbeInfo>,
+}
+
+/// [`list_reporting`], each probe with its interfaces, so a caller can hold all of them before it sends
+/// anything ([`Listed::hold_alone`]).
+pub fn list_with_interfaces(passed_over: &mut Vec<PassedOver>) -> Vec<Listed> {
+    grouped_by_device(all_candidates_reporting(passed_over))
+}
+
+/// How long an open refused beside a holder is tried again: long enough to outlast another program
+/// reading the chip behind the probe, and short enough that one really using it is soon reported.
+const HELD_RETRY_FOR: Duration = Duration::from_millis(500);
+
+/// How long an open refused beside a holder waits before it tries again.
+const HELD_RETRY_EVERY: Duration = Duration::from_millis(5);
+
+/// What `open` gives, tried again for `retry_for` while `held` says it was refused beside another
+/// program holding the device: the first open that succeeds, or the last refusal.
+fn retrying_while_held<T, E>(
+    retry_for: Duration,
+    mut open: impl FnMut() -> Result<T, E>,
+    held: impl Fn(&E) -> bool,
+) -> Result<T, E> {
+    let until = Instant::now() + retry_for;
+    loop {
+        match open() {
+            Err(refusal) if held(&refusal) && Instant::now() < until => std::thread::sleep(HELD_RETRY_EVERY),
+            done => return done,
+        }
+    }
+}
+
+/// Whether a HID open was refused beside a holder.
+fn hid_held(error: &lamella_usbhid::Error) -> bool {
+    matches!(error, lamella_usbhid::Error::Held(_))
+}
+
+/// Whether a bulk open was refused beside a holder.
+#[cfg(feature = "usbbulk")]
+fn bulk_held(error: &lamella_usbbulk::Error) -> bool {
+    matches!(error, lamella_usbbulk::Error::Held(_))
+}
+
+/// Every DAP interface of one probe, each open with no other program beside it, and the one a session
+/// talks on. While it lasts no other program reaches the probe, and dropping it lets the probe go.
+pub struct Alone {
+    dap: Dap<AnyTransport>,
+    /// The probe's other DAP interfaces, held open and never written to.
+    _beside: Vec<AnyTransport>,
+}
+
+impl Alone {
+    /// The probe's DAP over its most DAP-like interface, not yet connected.
+    pub fn dap(&mut self) -> &mut Dap<AnyTransport> {
+        &mut self.dap
+    }
+}
+
+/// Why a probe was not held alone. Nothing was sent to it either way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NotAlone {
+    /// Another program holds it: an open was refused beside a holder for as long as it was tried again.
+    InUse,
+    /// It cannot be held alone here; carries why.
+    Cannot(String),
+}
+
+/// Why one interface did not open alone.
+enum Refusal {
+    /// Another program holds it.
+    Held,
+    /// Anything else; carries why.
+    Other(String),
+}
+
+impl Listed {
+    /// Opens every interface of this probe that names itself CMSIS-DAP, each with no other program beside
+    /// it, all before anything is sent to any of them.
+    ///
+    /// **A PROGRAM ON ONE INTERFACE IS NOT SEEN FROM ANOTHER,** so a probe with two holds both, or a
+    /// debugger on one and this on the other would interleave their commands in one probe. An open refused
+    /// beside a holder lets go of every interface and tries again, for half a second, which outlasts
+    /// another listing's read; then the probe is [`NotAlone::InUse`].
+    ///
+    /// # Errors
+    /// [`NotAlone::InUse`] when another program holds an interface. [`NotAlone::Cannot`] when an
+    /// interface's name could not be read, so it may be a DAP interface that cannot be held; when none
+    /// names itself; when this operating system gives an interface's kind no open that keeps others
+    /// out, as it gives HID none on Linux and macOS; and when an open fails for any other reason.
+    pub fn hold_alone(&self) -> Result<Alone, NotAlone> {
+        let interfaces = self.dap_interfaces()?;
+        let mut opened = hold_every(&interfaces, HELD_RETRY_FOR, |interface| open_alone(interface))?;
+        let dap = Dap::new(opened.remove(0));
+        Ok(Alone { dap, _beside: opened })
+    }
+
+    /// The interfaces to hold: every one naming itself CMSIS-DAP, most DAP-like first.
+    fn dap_interfaces(&self) -> Result<Vec<&ProbeInfo>, NotAlone> {
+        let mut named = Vec::new();
+        for interface in &self.interfaces {
+            match interface.interface_name.as_deref() {
+                Some(name) if names_cmsis_dap(name) => named.push(interface),
+                Some(_) => {}
+                None => {
+                    return Err(NotAlone::Cannot(
+                        "the operating system did not give an interface's name, so it may be a debug interface that cannot be held".to_owned(),
+                    ));
+                }
+            }
+        }
+        if named.is_empty() {
+            return Err(NotAlone::Cannot("no interface names itself CMSIS-DAP".to_owned()));
+        }
+        named.sort_by_key(|interface| selection_rank(interface));
+        Ok(named)
+    }
+}
+
+/// Opens each of `interfaces` with `open`, all of them or none. A refusal beside a holder lets go of
+/// what was opened and starts again, for `retry_for`; any other refusal ends it.
+fn hold_every<I, T>(
+    interfaces: &[I],
+    retry_for: Duration,
+    mut open: impl FnMut(&I) -> Result<T, Refusal>,
+) -> Result<Vec<T>, NotAlone> {
+    let until = Instant::now() + retry_for;
+    'again: loop {
+        let mut opened = Vec::with_capacity(interfaces.len());
+        for interface in interfaces {
+            match open(interface) {
+                Ok(one) => opened.push(one),
+                Err(Refusal::Held) => {
+                    drop(opened);
+                    if Instant::now() >= until {
+                        return Err(NotAlone::InUse);
+                    }
+                    std::thread::sleep(HELD_RETRY_EVERY);
+                    continue 'again;
+                }
+                Err(Refusal::Other(why)) => return Err(NotAlone::Cannot(why)),
+            }
+        }
+        return Ok(opened);
+    }
+}
+
+/// Opens one interface with no other program beside it.
+fn open_alone(interface: &ProbeInfo) -> Result<AnyTransport, Refusal> {
+    match &interface.locator {
+        Locator::Hid { id } => lamella_usbhid::Device::open_id_alone(id).map(AnyTransport::Hid).map_err(|error| match error {
+            lamella_usbhid::Error::Held(_) => Refusal::Held,
+            lamella_usbhid::Error::Unsupported => {
+                Refusal::Other("this operating system has no way to open a HID interface alone".to_owned())
+            }
+            other => Refusal::Other(other.to_string()),
+        }),
+        #[cfg(feature = "usbbulk")]
+        Locator::Bulk { vendor_id, product_id, serial } => {
+            let Some(serial) = serial else {
+                return Err(Refusal::Other("it reports no serial number to open it by".to_owned()));
+            };
+            lamella_usbbulk::Device::open(*vendor_id, *product_id, Some(serial))
+                .map(AnyTransport::Bulk)
+                .map_err(|error| if bulk_held(&error) { Refusal::Held } else { Refusal::Other(error.to_string()) })
+        }
+    }
 }
 
 /// One device as one listing spells its identity.
@@ -662,9 +844,9 @@ struct Spelling<'a> {
 /// Whether two listings' spellings are one physical device.
 ///
 /// **THE SAME DEVICE CAN BE SPELLED TWO WAYS BY TWO TRANSPORTS.** One probe's two backends can differ in
-/// case -- a micro:bit's DAPLink reports lowercase over HID and uppercase over its WebUSB bulk interface --
-/// and on Windows a device with no serial is none over HID and a port-derived id over bulk. Read as two
-/// devices, either would show a bench that does not exist and turn a sole probe ambiguous.
+/// case -- a DAPLink writes its serial in lower case, and Windows names the device in upper case -- and on
+/// Windows a device with no serial is none over HID and a port-derived id over bulk. Read as two devices,
+/// either would show a bench that does not exist and turn a sole probe ambiguous.
 fn same_device(a: &Spelling<'_>, b: &Spelling<'_>) -> bool {
     a.vendor_id == b.vendor_id
         && a.product_id == b.product_id
@@ -1074,20 +1256,29 @@ fn selection_rank(p: &ProbeInfo) -> u8 {
 }
 
 /// Opens the transport for one candidate and wraps it in a `Dap` (not yet connected).
+///
+/// An open refused beside another program holding the probe is tried again for half a second, so one
+/// that meets another listing's few milliseconds opens when that ends, and one that meets a debugger
+/// still says why it could not.
 fn open_dap(info: &ProbeInfo) -> Result<Dap<AnyTransport>, ProbeError> {
     let unopened = |why: String| ProbeError::Unopened { device: info.device_named(), why };
     let transport = match &info.locator {
-        Locator::Hid { id } => {
-            AnyTransport::Hid(lamella_usbhid::Device::open_id(id).map_err(|why| unopened(why.to_string()))?)
-        }
+        Locator::Hid { id } => AnyTransport::Hid(
+            retrying_while_held(HELD_RETRY_FOR, || lamella_usbhid::Device::open_id(id), hid_held)
+                .map_err(|why| unopened(why.to_string()))?,
+        ),
         #[cfg(feature = "usbbulk")]
         Locator::Bulk {
             vendor_id,
             product_id,
             serial,
         } => AnyTransport::Bulk(
-            lamella_usbbulk::Device::open(*vendor_id, *product_id, serial.as_deref())
-                .map_err(|why| unopened(why.to_string()))?,
+            retrying_while_held(
+                HELD_RETRY_FOR,
+                || lamella_usbbulk::Device::open(*vendor_id, *product_id, serial.as_deref()),
+                bulk_held,
+            )
+            .map_err(|why| unopened(why.to_string()))?,
         ),
     };
     Ok(Dap::new(transport))
@@ -2104,5 +2295,152 @@ mod tests {
         };
         assert!(caps.supports_swd());
         assert!(caps.supports_jtag());
+    }
+
+    /// **AN OPEN REFUSED BESIDE A HOLDER TRIES AGAIN, AND NO OTHER DOES.** One that meets another
+    /// listing's read opens once the read ends; any other refusal is said at once.
+    #[test]
+    fn an_open_refused_beside_a_holder_tries_again_and_no_other_does() {
+        let mut tries = 0;
+        let opened = retrying_while_held(
+            Duration::from_secs(5),
+            || {
+                tries += 1;
+                if tries < 3 { Err("held") } else { Ok("open") }
+            },
+            |refusal| *refusal == "held",
+        );
+        assert_eq!((opened, tries), (Ok("open"), 3));
+
+        let mut tries = 0;
+        let refused: Result<(), &str> = retrying_while_held(
+            Duration::from_secs(5),
+            || {
+                tries += 1;
+                Err("gone")
+            },
+            |refusal| *refusal == "held",
+        );
+        assert_eq!((refused, tries), (Err("gone"), 1));
+
+        let started = Instant::now();
+        let mut tries = 0;
+        let still: Result<(), &str> = retrying_while_held(
+            Duration::from_millis(30),
+            || {
+                tries += 1;
+                Err("held")
+            },
+            |refusal| *refusal == "held",
+        );
+        assert_eq!(still, Err("held"), "the last refusal is said once the time is up");
+        assert!(tries > 1 && started.elapsed() >= Duration::from_millis(30), "{tries} tries in {:?}", started.elapsed());
+    }
+
+    /// What one interface does when it is opened, in [`hold_every`]'s tests.
+    #[derive(Clone, Copy)]
+    enum Opens {
+        Yes,
+        HeldFor(usize),
+        Never,
+    }
+
+    /// **EVERY INTERFACE IS OPENED, OR NONE IS HELD.** A refusal beside a holder lets go of what opened
+    /// and starts again, so nothing is held while it waits; another refusal ends it, and a holder that
+    /// stays is in use.
+    #[test]
+    fn every_interface_is_held_or_none_is() {
+        use std::cell::RefCell;
+        let events = RefCell::new(Vec::new());
+        struct Open<'a>(&'static str, &'a RefCell<Vec<String>>);
+        impl Drop for Open<'_> {
+            fn drop(&mut self) {
+                self.1.borrow_mut().push(format!("close {}", self.0));
+            }
+        }
+        let run = |plan: &[(&'static str, Opens)], retry_for: Duration| {
+            events.borrow_mut().clear();
+            let mut refused = vec![0; plan.len()];
+            let held = hold_every(plan, retry_for, |(name, opens)| {
+                let at = plan.iter().position(|(other, _)| other == name).unwrap();
+                match *opens {
+                    Opens::HeldFor(times) if refused[at] < times => {
+                        refused[at] += 1;
+                        events.borrow_mut().push(format!("held {name}"));
+                        Err(Refusal::Held)
+                    }
+                    Opens::Never => Err(Refusal::Other(format!("{name} is gone"))),
+                    _ => {
+                        events.borrow_mut().push(format!("open {name}"));
+                        Ok(Open(*name, &events))
+                    }
+                }
+            })
+            .map(|opened| opened.iter().map(|one| one.0).collect::<Vec<_>>());
+            (held, events.borrow().clone())
+        };
+
+        let (held, said) = run(&[("bulk", Opens::Yes), ("hid", Opens::Yes)], Duration::from_secs(5));
+        assert_eq!(held, Ok(vec!["bulk", "hid"]));
+        assert_eq!(said, ["open bulk", "open hid", "close bulk", "close hid"]);
+
+        let (held, said) = run(&[("bulk", Opens::Yes), ("hid", Opens::HeldFor(1))], Duration::from_secs(5));
+        assert_eq!(held, Ok(vec!["bulk", "hid"]));
+        assert_eq!(said, ["open bulk", "held hid", "close bulk", "open bulk", "open hid", "close bulk", "close hid"]);
+
+        let (held, said) = run(&[("bulk", Opens::Yes), ("hid", Opens::HeldFor(usize::MAX))], Duration::from_millis(20));
+        assert_eq!(held, Err(NotAlone::InUse));
+        assert_eq!(said.last().map(String::as_str), Some("close bulk"), "nothing is left open: {said:?}");
+
+        let (held, said) = run(&[("bulk", Opens::Yes), ("hid", Opens::Never)], Duration::from_secs(5));
+        assert_eq!(held, Err(NotAlone::Cannot("hid is gone".to_owned())));
+        assert_eq!(said, ["open bulk", "close bulk"], "tried once, and let go");
+    }
+
+    /// One interface of a listed probe, named as the OS named it.
+    fn interface_named(name: Option<&str>, usage_page: u16, id: &str) -> ProbeInfo {
+        ProbeInfo {
+            interface_name: name.map(str::to_owned),
+            locator: Locator::Hid { id: id.into() },
+            ..hid_probe(Some(usage_page), Some(0x01), Some(64), Some("Probe CMSIS-DAP"))
+        }
+    }
+
+    /// **ONLY AN INTERFACE THAT NAMES ITSELF IS OPENED, AND EVERY ONE THAT DOES IS.** An interface named
+    /// something else is no debug interface and is left alone; one whose name the OS did not give may be
+    /// one, so the probe is not held at all.
+    #[test]
+    fn only_an_interface_that_names_itself_is_held_and_every_one_that_does() {
+        let listed = |interfaces: Vec<ProbeInfo>| Listed { info: interfaces[0].clone(), interfaces };
+        let ids = |listed: &Listed| -> Result<Vec<String>, NotAlone> {
+            listed.dap_interfaces().map(|found| {
+                found.iter().map(|one| match &one.locator { Locator::Hid { id } => id.clone(), #[cfg(feature = "usbbulk")] _ => String::new() }).collect()
+            })
+        };
+        let bridge = interface_named(Some("LPCSIO"), 0xffea, "bridge");
+        let dap = interface_named(Some("CMSIS-DAP"), 0xff00, "dap");
+        let second = interface_named(Some("WebUSB: CMSIS-DAP"), 0xff01, "second");
+        assert_eq!(ids(&listed(vec![bridge.clone(), dap.clone()])), Ok(vec!["dap".to_owned()]));
+        assert_eq!(ids(&listed(vec![second.clone(), dap.clone()])), Ok(vec!["dap".to_owned(), "second".to_owned()]), "most DAP-like first");
+        assert!(matches!(ids(&listed(vec![bridge.clone()])), Err(NotAlone::Cannot(_))));
+        let unread = interface_named(None, 0xff00, "unread");
+        assert!(matches!(ids(&listed(vec![dap, unread])), Err(NotAlone::Cannot(_))));
+    }
+
+    /// **A ROW KEEPS EVERY INTERFACE THAT WENT INTO IT,** and is the row [`list_reporting`] gives.
+    #[test]
+    fn a_listed_probe_keeps_every_interface_and_is_the_row_the_listing_gives() {
+        let a = |id: &str, page: u16| ProbeInfo { serial: Some("SERIAL1".into()), ..interface_named(Some("CMSIS-DAP"), page, id) };
+        let b = ProbeInfo { serial: Some("SERIAL2".into()), ..interface_named(Some("CMSIS-DAP"), 0xff00, "b") };
+        let candidates = vec![a("a-trace", 0xffeb), b, a("a-dap", 0xff00)];
+        let grouped = grouped_by_device(candidates.clone());
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0].interfaces.len(), 2);
+        assert_eq!(grouped[1].interfaces.len(), 1);
+        let rows = one_row_per_device(candidates);
+        for (listed, row) in grouped.iter().zip(&rows) {
+            assert_eq!(format!("{:?}", listed.info), format!("{row:?}"));
+        }
+        assert!(matches!(&grouped[0].info.locator, Locator::Hid { id } if id == "a-dap"), "the most DAP-like leads");
     }
 }

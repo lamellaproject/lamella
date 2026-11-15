@@ -18,13 +18,17 @@ pub enum Error {
     Timeout,
     /// This operating system's backend is not implemented yet.
     Unsupported,
+    /// Another program holds the device: the operating system refused the open in the way it refuses
+    /// one beside a holder, so nothing reached the device. Carries what it said, and reads as
+    /// [`Error::Os`] does.
+    Held(String),
 }
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::NotFound => write!(f, "no matching HID device"),
-            Error::Os(msg) => write!(f, "HID error: {msg}"),
+            Error::Os(msg) | Error::Held(msg) => write!(f, "HID error: {msg}"),
             Error::Timeout => write!(f, "HID read timed out"),
             Error::Unsupported => write!(f, "HID backend not implemented on this platform"),
         }
@@ -65,7 +69,8 @@ pub struct DeviceInfo {
     pub vendor_id: u16,
     /// USB product id.
     pub product_id: u16,
-    /// Serial number string, if the OS reported one.
+    /// Serial number string, if the OS reported one. On Windows it is spelled as Windows names the device,
+    /// where the two differ only in case: that is the spelling every interface of the device is read by there.
     pub serial_number: Option<String>,
     /// Product string, if the OS reported one. Which USB string this is differs by OS, so
     /// [`interface_name`](Self::interface_name) and [`device_name`](Self::device_name) say what each
@@ -124,8 +129,24 @@ impl Device {
     /// interface of a composite probe (e.g. a CMSIS-DAP interface sitting beside a trace or
     /// vendor-bridge interface on the same vid/pid/serial), which [`open`](Self::open) cannot single
     /// out. Like [`open`](Self::open), any stale queued input reports are drained first.
+    ///
+    /// It opens beside a program sharing the device, and an open refused by one that holds it alone is
+    /// [`Error::Held`].
     pub fn open_id(id: &str) -> Result<Self> {
         let device = imp::Device::open_id(id).map(Device)?;
+        Ok(Self::drained(device))
+    }
+
+    /// Opens the exact interface named by an enumerated [`DeviceInfo::id`] only if no other program holds
+    /// it, and keeps every other program out while it stays open.
+    ///
+    /// [`open_id`](Self::open_id) succeeds beside a program holding the device, and two programs sending
+    /// reports to one probe interleave their commands. Here a holder means [`Error::Held`], and nothing
+    /// reaches the device. Only Windows has this: hidraw and IOHIDDevice have no such exclusion short of
+    /// seizing the device from its holder, so elsewhere this is [`Error::Unsupported`], and a caller that
+    /// must not disturb a holder leaves the device closed.
+    pub fn open_id_alone(id: &str) -> Result<Self> {
+        let device = imp::Device::open_id_alone(id).map(Device)?;
         Ok(Self::drained(device))
     }
 

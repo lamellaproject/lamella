@@ -574,7 +574,8 @@ pub enum Served {
 /// caller gets back once they have been assembled, and what an in-process run produces directly.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunResult {
-    /// The program's exit code (its `Main` return, 0 if none, 70 on an unhandled trap).
+    /// The program's exit code: its `Main` return, 0 if none, 134 for an exception it did not catch,
+    /// and 1 for a trap of the interpreter's own (see [`lamella_cil_runtime::exit_code`]).
     pub exit: i32,
     /// The program's captured console (`Console.Out`) output, followed by anything written to the
     /// error stream -- a trap report, a load failure -- in the order the two arrived.
@@ -615,8 +616,8 @@ pub fn stop_exit(payload: &[u8]) -> Option<(i32, u8)> {
 
 /// Run a program assembly against `corlib_bytes`, capturing its console output + exit code. This is the
 /// runner's actual work -- the host reference runner, the browser runner, and the device firmware all call
-/// it. A bad assembly / load failure is reported as exit -1 with the reason in `stdout`; an unhandled
-/// trap is exit 70 (matching the interpreter's abort convention).
+/// it. A bad assembly / load failure is reported as exit -1 with the reason in `stdout`; an exception
+/// the program did not catch is exit 134, as on .NET, and a trap of the interpreter's own is exit 1.
 ///
 /// Installs no seams. An embedder with a clock, a monotonic source or a sleep to offer wants
 /// [`run_program_with`]; see its documentation for what a run without them silently does.
@@ -668,8 +669,8 @@ impl Fault {
 /// [`run_program_with`] with the fault kept apart from the program's own output: the program's
 /// console and its exit code, and why the runner, rather than the program, ended the run.
 ///
-/// **THE FAULT SAYS A RUN TRAPPED, AND THE EXIT CODE CANNOT**: a trapped run ends with 70, and so
-/// does a `Main` that returns 70.
+/// **THE FAULT SAYS A RUN TRAPPED, AND THE EXIT CODE CANNOT**: a trapped run ends with 134 or 1,
+/// and so does a `Main` that returns either.
 fn run_program_reporting(
     corlib_bytes: &[u8],
     program_bytes: &[u8],
@@ -701,7 +702,7 @@ fn run_program_reporting(
         Ok(Some(Value::Int32(code))) => (RunResult { exit: code, stdout }, None),
         Ok(_) => (RunResult { exit: 0, stdout }, None),
         Err(trap) => (
-            RunResult { exit: TRAP_EXIT, stdout },
+            RunResult { exit: trap.exit_code(), stdout },
             Some(Fault::Trapped(format!("TRAP: {trap}"))),
         ),
     }
@@ -1663,11 +1664,12 @@ fn fault(
     transport: &mut impl Transport,
     vm: &Vm,
     text: &str,
+    exit: i32,
 ) -> Result<RunResult, TransportError> {
     send_report(transport, text)?;
     let mut stdout = String::from_utf16_lossy(vm.output());
     push_line(&mut stdout, text);
-    Ok(RunResult { exit: 70, stdout })
+    Ok(RunResult { exit, stdout })
 }
 
 /// Report a fault that ENDS an execution: the reason on the error stream, then a terminal
@@ -1681,15 +1683,18 @@ fn fault_stop(
     transport: &mut impl Transport,
     seq: u16,
     text: &str,
+    exit: i32,
 ) -> Result<(), TransportError> {
     send_report(transport, text)?;
-    send_stopped(transport, seq, debug::reason::TRAP, (0, 0), Some(TRAP_EXIT))
+    send_stopped(transport, seq, debug::reason::TRAP, (0, 0), Some(exit))
 }
 
 /// [`fault_stop`] for a sender that cannot allocate: `text` on the error stream, then a TRAP stop
-/// carrying the trap exit code, written a byte at a time to `sink`.
+/// carrying `exit`, written a byte at a time to `sink`.
 ///
-/// **This is for a firmware's panic handler and fault vector.** The likeliest panic on a small part
+/// **This is for a firmware's panic handler and fault vector.** A panic reports the runtime's fatal
+/// stop, [`lamella_cil_runtime::exit_code::FATAL_STOP`], and the fault vector a processor fault,
+/// [`lamella_cil_runtime::exit_code::PROCESSOR_FAULT`]. The likeliest panic on a small part
 /// is an exhausted heap, so a report that allocated would fail in exactly the case it exists for.
 /// With it, a host ends a debug session or a deployed run with `text` as the reason. Without it, the
 /// host watches the program stop talking and is left to guess why.
@@ -1698,17 +1703,14 @@ fn fault_stop(
 /// know which request the program was running for, or whether it was running for one. `sink` is the
 /// firmware's raw byte output: the carrier its transport writes to.
 #[cfg(feature = "baked-image")]
-pub fn report_abort(text: &str, sink: &mut dyn FnMut(u8)) {
+pub fn report_abort(text: &str, exit: i32, sink: &mut dyn FnMut(u8)) {
     let tail = report_tail(text);
     // The flags describe the frame's whole text, which ends with the tail whenever there is one.
     let header = output_header(debug::output::STDERR, if tail.is_empty() { text } else { tail });
     lamella_wire::write_frame(debug::EVT_OUTPUT, 0, &[&header, text.as_bytes(), tail.as_bytes()], sink);
-    let (stop, len) = stop_payload(debug::reason::TRAP, (0, 0), Some(TRAP_EXIT));
+    let (stop, len) = stop_payload(debug::reason::TRAP, (0, 0), Some(exit));
     lamella_wire::write_frame(debug::EVT_STOPPED, 0, &[&stop[..len]], sink);
 }
-
-/// The exit code a trapped run reports, matching the interpreter's abort convention.
-const TRAP_EXIT: i32 = 70;
 
 /// Step until the call stack is no deeper than `floor`, or -- with `floor` `None` -- exactly one
 /// instruction.
@@ -1744,7 +1746,7 @@ fn step_to_depth(
             }
             Err(trap) => {
                 stream_output(transport, vm)?;
-                return Ok(RunStop::Trap(fault(transport, vm, &format!("TRAP: {trap}"))?));
+                return Ok(RunStop::Trap(fault(transport, vm, &format!("TRAP: {trap}"), trap.exit_code())?));
             }
             Ok(Status::Running | Status::Paused) => {}
         }
@@ -1845,6 +1847,7 @@ fn run_until_stop(
                         transport,
                         vm,
                         &format!("TRAP: {trap}"),
+                        trap.exit_code(),
                     )?));
                 }
                 Ok(Status::Running | Status::Paused) => {
@@ -1871,6 +1874,7 @@ fn run_until_stop(
                             "{what} needs the scheduler, which a debug session does not run: \
                              attach steps ONE thread. Deploy it and EXEC it to use threads."
                         ),
+                        lamella_cil_runtime::exit_code::FATAL_STOP,
                     )?));
                 }
             }
@@ -1979,7 +1983,7 @@ pub fn run_debug_session_static(
 
     let (module, entry) = match load_deployed(image, corlib) {
         Ok(booted) => booted,
-        Err(why) => return fault_stop(transport, image_seq, &why),
+        Err(why) => return fault_stop(transport, image_seq, &why, lamella_cil_runtime::exit_code::FATAL_STOP),
     };
     let mut vm = Vm::default();
     configure_machine(&mut vm, configure);
@@ -1987,13 +1991,13 @@ pub fn run_debug_session_static(
     let entry = match lamella_cil_runtime::boot_baked(&module, &mut vm, entry) {
         Ok(entry) => entry,
         Err(trap) => {
-            return fault_stop(transport, image_seq, &format!("static constructor: {trap}"));
+            return fault_stop(transport, image_seq, &format!("static constructor: {trap}"), trap.exit_code());
         }
     };
     let args = lamella_cil_runtime::entry_args(&module, &mut vm, entry);
     let mut session = match Session::new(&module, entry, args) {
         Ok(session) => session,
-        Err(trap) => return fault_stop(transport, image_seq, &format!("session: {trap}")),
+        Err(trap) => return fault_stop(transport, image_seq, &format!("session: {trap}"), trap.exit_code()),
     };
     let mut at_reported_breakpoint = false;
     stream_output(transport, &mut vm)?;
@@ -2246,8 +2250,8 @@ pub fn run_image_static(
 ///
 /// The reason a run failed is the RUNNER's text, not the program's, and it is the half a host needs
 /// on its error stream. Returning it separately is what lets the serve put each on the stream it
-/// belongs to -- and it is also the fix for a plain run reporting exit 70 and no reason at all,
-/// which was every trap this path ever hit.
+/// belongs to -- and it is also the fix for a plain run that reported a trap's exit code and no
+/// reason at all, which was every trap this path ever hit.
 #[cfg(feature = "baked-image")]
 fn run_image_reporting(
     image: &'static [u8],
@@ -2267,7 +2271,7 @@ fn run_image_reporting(
         Err(trap) => {
             let stdout = String::from_utf16_lossy(vm.output());
             return (
-                RunResult { exit: TRAP_EXIT, stdout },
+                RunResult { exit: trap.exit_code(), stdout },
                 Some(format!("BOOT TRAP (static constructor): {trap}")),
             );
         }
@@ -2278,7 +2282,7 @@ fn run_image_reporting(
         Ok(lamella_cil_runtime::Ran::Finished(Some(Value::Int32(code)))) => (code, None),
         Ok(lamella_cil_runtime::Ran::Finished(_)) => (0, None),
         Ok(lamella_cil_runtime::Ran::Interrupted) => (INTERRUPTED_EXIT, None),
-        Err(trap) => (TRAP_EXIT, Some(format!("TRAP: {trap}"))),
+        Err(trap) => (trap.exit_code(), Some(format!("TRAP: {trap}"))),
     };
     (RunResult { exit, stdout: String::from_utf16_lossy(vm.output()) }, fault)
 }
@@ -3302,7 +3306,7 @@ pub fn run_deployed_with(
         Err(trap) => {
             stream_output(transport, &mut vm)?;
             let result =
-                fault(transport, &vm, &format!("BOOT TRAP (static constructor): {trap}"))?;
+                fault(transport, &vm, &format!("BOOT TRAP (static constructor): {trap}"), trap.exit_code())?;
             return Ok(completed(transport, result, debug::reason::TRAP));
         }
     };
@@ -3347,7 +3351,7 @@ pub fn run_deployed_with(
         }
         Ok(lamella_cil_runtime::Ran::Interrupted) => Ok(Deployed::Interrupted),
         Err(trap) => {
-            let result = fault(transport, &vm, &format!("TRAP: {trap}"))?;
+            let result = fault(transport, &vm, &format!("TRAP: {trap}"), trap.exit_code())?;
             Ok(completed(transport, result, debug::reason::TRAP))
         }
     }
@@ -4493,11 +4497,11 @@ mod tests {
         assert_eq!(run.stderr, "TRAP: x");
         assert!(run.clone().finish().is_none(), "an unfinished run has no result");
 
-        send_stopped_result(&mut target, 9, debug::reason::TRAP, 70).unwrap();
+        send_stopped_result(&mut target, 9, debug::reason::TRAP, lamella_cil_runtime::exit_code::FATAL_STOP).unwrap();
         driver.feed(&target.take_sent());
         assert!(run.poll(&mut driver).unwrap(), "the stop ends it");
         let result = run.finish().expect("a finished run has one");
-        assert_eq!(result.exit, 70);
+        assert_eq!(result.exit, 1);
         assert_eq!(result.stdout, "hi\nTRAP: x");
     }
 
@@ -4655,11 +4659,11 @@ mod tests {
         assert_eq!(run.poll(&mut driver), Ok(false), "none of those three is this run's");
         assert_eq!(run.start_refusal(), None);
 
-        send_stopped_result(&mut target, 0, debug::reason::TRAP, 70).unwrap();
+        send_stopped_result(&mut target, 0, debug::reason::TRAP, lamella_cil_runtime::exit_code::FATAL_STOP).unwrap();
         driver.feed(&target.take_sent());
         assert_eq!(run.poll(&mut driver), Ok(true), "a trap ends it, at any sequence number");
         assert_eq!(run.stop_reason(), Some(debug::reason::TRAP));
-        assert_eq!(run.exit_value(), Some(70));
+        assert_eq!(run.exit_value(), Some(1));
 
         let mut aborted = MemTransport::new();
         let mut abort = vec![debug::reason::ABORTED];
@@ -5050,7 +5054,8 @@ mod tests {
     }
 
     /// What a panic handler writes with [`report_abort`] ends a run the way any trap does: a host
-    /// collecting a run it did not start reads the text as the reason, and exit 70.
+    /// collecting a run it did not start reads the text as the reason, and exit 1, the runtime's
+    /// fatal stop.
     ///
     /// The frames are compared with the ones the allocating path sends for the same report, so the
     /// two cannot drift apart in how a stop or an output payload is laid out.
@@ -5061,10 +5066,10 @@ mod tests {
 
         let text = "PANIC: the board stopped the program\n";
         let mut written = Vec::new();
-        report_abort(text, &mut |byte| written.push(byte));
+        report_abort(text, lamella_cil_runtime::exit_code::FATAL_STOP, &mut |byte| written.push(byte));
 
         let mut allocating = MemTransport::new();
-        fault_stop(&mut allocating, 0, text).unwrap();
+        fault_stop(&mut allocating, 0, text, lamella_cil_runtime::exit_code::FATAL_STOP).unwrap();
         assert_eq!(written, allocating.take_sent(), "the same two frames fault_stop sends at seq 0");
 
         let mut driver = MemTransport::new();
@@ -5073,7 +5078,30 @@ mod tests {
         assert!(run.poll(&mut driver).unwrap(), "the TRAP stop ends the run");
         assert_eq!(run.stderr, text, "the text arrives on the error stream");
         let result = run.finish().expect("an ended run has a result");
-        assert_eq!(result.exit, 70);
+        assert_eq!(result.exit, 1);
+    }
+
+    /// What a fault vector writes with [`report_abort`] ends a run with a processor fault's own code,
+    /// 2, so a host can tell the processor refusing the program from the runtime stopping it.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn a_processor_faults_report_ends_a_run_with_its_own_code() {
+        use lamella_wire::MemTransport;
+
+        let text = "the processor faulted; the board is restarting and will wait for the host\n";
+        let mut written = Vec::new();
+        report_abort(text, lamella_cil_runtime::exit_code::PROCESSOR_FAULT, &mut |byte| written.push(byte));
+        let mut allocating = MemTransport::new();
+        fault_stop(&mut allocating, 0, text, lamella_cil_runtime::exit_code::PROCESSOR_FAULT).unwrap();
+        assert_eq!(written, allocating.take_sent(), "both paths send the same frames");
+
+        let mut driver = MemTransport::new();
+        driver.feed(&written);
+        let mut run = RunCollector::unprompted();
+        assert!(run.poll(&mut driver).unwrap(), "the TRAP stop ends the run");
+        assert_eq!(run.stderr, text, "the text arrives on the error stream");
+        let result = run.finish().expect("an ended run has a result");
+        assert_eq!(result.exit, 2);
     }
 
     /// A report without a newline of its own is sent as a line all the same, by both paths alike, so
@@ -5085,9 +5113,9 @@ mod tests {
 
         let text = "TRAP: the board stopped the program";
         let mut written = Vec::new();
-        report_abort(text, &mut |byte| written.push(byte));
+        report_abort(text, lamella_cil_runtime::exit_code::FATAL_STOP, &mut |byte| written.push(byte));
         let mut allocating = MemTransport::new();
-        fault_stop(&mut allocating, 0, text).unwrap();
+        fault_stop(&mut allocating, 0, text, lamella_cil_runtime::exit_code::FATAL_STOP).unwrap();
         assert_eq!(written, allocating.take_sent(), "both paths send the same frames");
 
         let mut driver = MemTransport::new();

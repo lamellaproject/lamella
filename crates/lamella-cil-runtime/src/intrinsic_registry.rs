@@ -433,6 +433,7 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(string_get_chars),
     entry!(string_get_length),
     entry!(string_get_pinnable_reference),
+    entry!(runtime_helpers_offset_to_string_data),
     #[cfg(feature = "text")]
     entry!(string_index_of_char),
     #[cfg(feature = "text")]
@@ -538,6 +539,8 @@ static REGISTRY: &[(u32, IntrinsicFn)] = &[
     entry!(type_is_public),
     entry!(type_is_value_type),
     entry!(type_property_custom_attributes),
+    #[cfg(feature = "reflection")]
+    entry!(type_event_custom_attributes),
     entry!(value_type_equals),
     entry!(value_type_get_hash_code),
     #[cfg(feature = "finalizers")]

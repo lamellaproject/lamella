@@ -13,7 +13,8 @@
 
   <!-- The image, written under the intermediate output folder by the lamella tool and published in
        place of the assembly and its libraries, which the image carries. The tool is given the
-       compile's inputs, the board, the assembly the build made and the format. -->
+       compile's inputs, the board, the assembly the build made, the format, and the build kind as the
+       project's Optimize, which the C# compiler reads: a Debug build is not optimized. -->
   <Target Name="_LamellaPublishImage"
           AfterTargets="ComputeResolvedFilesToPublishList"
           DependsOnTargets="_LamellaPublishNeedsBoard;_LamellaCheckTool;_LamellaCompileInputs">
@@ -29,6 +30,7 @@
     <ItemGroup>
       <_LamellaPublishInput Include="@(_LamellaCompileInput)" />
       <_LamellaPublishInput Include="format=$(_LamellaImageFormat)" />
+      <_LamellaPublishInput Include="optimize=$([MSBuild]::Escape('$(Optimize)'))" />
       <_LamellaPublishInput Include="built=$([MSBuild]::Escape('$(TargetPath)'))" />
       <_LamellaPublishInput Include="image=$([MSBuild]::Escape('$(_LamellaImage)'))" />
     </ItemGroup>

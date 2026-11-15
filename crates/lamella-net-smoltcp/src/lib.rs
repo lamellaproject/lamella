@@ -61,7 +61,9 @@ pub enum IpSetup {
 /// Construction-time configuration: identity, addressing, and the buffer/pool sizing knobs.
 #[derive(Clone, Debug)]
 pub struct NetConfig {
-    /// The interface MAC address.
+    /// The interface MAC address. Over a Wi-Fi radio ([`SmoltcpNet::with_wifi`]) whose address is
+    /// not known yet -- a radio that is off -- any unicast address will do: the interface takes the
+    /// radio's own once the radio has read it, before the link can carry a frame.
     pub mac: [u8; 6],
     /// The IPv4 addressing mode.
     pub ip: IpSetup,
@@ -265,6 +267,11 @@ impl<D: Device> SmoltcpNet<D> {
         self.iface.ipv4_addr().map(|a| a.octets())
     }
 
+    /// The interface's hardware address: the configured one, or a radio's own once it took it.
+    pub fn mac(&self) -> [u8; 6] {
+        self.config.mac
+    }
+
     fn now(&self) -> Instant {
         Instant::from_millis((self.now_ms)() as i64)
     }
@@ -301,7 +308,7 @@ impl<D: Device> SmoltcpNet<D> {
     /// state that lasts a moment is counted though no poller read it.
     fn count_changes(&mut self) {
         let ipv4 = self.iface.ipv4_addr().map(|addr| addr.octets());
-        let available = ipv4.is_some() && self.link_up != Some(false);
+        let available = self.available();
         let oper_status = Some(self.oper_status(ipv4.is_some()));
         if available != self.seen.available {
             self.seen.available = available;
@@ -316,10 +323,17 @@ impl<D: Device> SmoltcpNet<D> {
         }
     }
 
+    /// Whether the network is available: over a radio, whether its link is up, as .NET's availability
+    /// speaks of the link and not the address -- a lease follows the link a few seconds later, and the
+    /// interface reports it; over any other device, whether the interface holds an address.
+    fn available(&self) -> bool {
+        if self.wifi.is_some() { self.link_up == Some(true) } else { self.iface.ipv4_addr().is_some() }
+    }
+
     /// The interface's operational state, with or without an IPv4 address.
     fn oper_status(&self, has_ipv4: bool) -> OperStatus {
-        if self.link_up == Some(false) {
-            OperStatus::Down
+        if self.wifi.is_some() {
+            if self.link_up == Some(true) { OperStatus::Up } else { OperStatus::Down }
         } else if has_ipv4 {
             OperStatus::Up
         } else if self.dhcp.is_some() {
@@ -332,18 +346,57 @@ impl<D: Device> SmoltcpNet<D> {
     /// Follows the radio's link, when the device is one: a lease belongs to the link it was taken on,
     /// so a lost link takes the address, the route and the gateway with it, and the next link -- the
     /// same network or another -- starts a fresh DHCP exchange at once. A static address is kept.
+    ///
+    /// The interface takes the radio's own hardware address as soon as the radio knows it, so a
+    /// stack made while the radio was off sends its first frame -- the lease's first request, once
+    /// the link is up -- from the radio's address.
     fn follow_link(&mut self) {
         let Some(view) = self.wifi else { return };
-        let up = view(&mut self.device).link() == WifiLink::Connected;
+        let radio = view(&mut self.device);
+        let (address, up) = (radio.hardware_address(), radio.link() == WifiLink::Connected);
+        if let Some(address) = address.map(EthernetAddress).filter(EthernetAddress::is_unicast)
+            && self.iface.hardware_addr() != HardwareAddress::Ethernet(address)
+        {
+            self.iface.set_hardware_addr(HardwareAddress::Ethernet(address));
+            self.config.mac = address.0;
+        }
         if self.link_up == Some(up) {
             return;
         }
         self.link_up = Some(up);
+        if !up {
+            self.end_connections();
+        }
         let Some(dhcp) = self.dhcp else { return };
         self.iface.update_ip_addrs(|addrs| addrs.clear());
         self.iface.routes_mut().remove_default_ipv4_route();
         self.gateway = None;
         self.sockets.get_mut::<dhcpv4::Socket>(dhcp).reset();
+    }
+
+    /// Ends every open TCP connection: connected or connecting, completed in a listener's pool and
+    /// not yet accepted, or closing. A link that goes down takes them with it, so a program's read,
+    /// write or connect check fails at once rather than waiting out a peer it can no longer reach. A
+    /// listener's listening sockets stay, and so does every datagram socket.
+    fn end_connections(&mut self) {
+        let SmoltcpNet { table, sockets, closing, .. } = self;
+        for entry in table.values() {
+            match entry {
+                Entry::Tcp(smol) => sockets.get_mut::<tcp::Socket>(*smol).abort(),
+                Entry::Listener { pool, .. } => {
+                    for &smol in pool {
+                        let socket = sockets.get_mut::<tcp::Socket>(smol);
+                        if socket.state() != tcp::State::Listen {
+                            socket.abort();
+                        }
+                    }
+                }
+                Entry::Udp(_) => {}
+            }
+        }
+        for &smol in closing.iter() {
+            sockets.get_mut::<tcp::Socket>(smol).abort();
+        }
     }
 
     /// Applies a DHCP configure/deconfigure event to the interface, routes, and DNS list.
@@ -811,7 +864,7 @@ impl<D: Device> NetBackend for SmoltcpNet<D> {
 
     fn network_available(&mut self) -> bool {
         self.drive();
-        self.iface.ipv4_addr().is_some() && self.link_up != Some(false)
+        self.available()
     }
 
     fn interface_count(&mut self) -> u32 {

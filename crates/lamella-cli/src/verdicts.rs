@@ -21,7 +21,7 @@ Usage:
 
 Every board this build knows, with the part it carries and whether `lamella flash` can write it.
 
-A `-` in the FLASH column means nobody has stated how that board is programmed yet -- not that it
+A `-` in the FLASH column means nobody has stated how that board is programmed -- not that it
 cannot be. The board ID in the first column is what --board takes everywhere else.";
 
 const FIT_USAGE: &str = "\
@@ -149,7 +149,7 @@ pub fn boards_command(args: &[String]) -> ExitCode {
     println!("{}", boards_table());
     println!(
         "\nFLASH = `lamella flash` can write this board over a probe, with no firmware on it \
-         first.\nA `-` means nobody has stated how that board is programmed yet, not that it \
+         first.\nA `-` means nobody has stated how that board is programmed, not that it \
          cannot be."
     );
     ExitCode::SUCCESS
@@ -482,12 +482,17 @@ mod tests {
         );
         assert_eq!(
             line_of("bbc-micro-bit-v2"),
-            "<LamellaBoard Include=\"bbc-micro-bit-v2\" Name=\"BBC micro:bit v2\" NativeImage=\"true\" ProbeFamilies=\"\" />"
+            "<LamellaBoard Include=\"bbc-micro-bit-v2\" Name=\"BBC micro:bit v2\" NativeImage=\"true\" ProbeFamilies=\"cmsis-dap\" />"
+        );
+        assert_eq!(
+            line_of("raspberrypi-pico"),
+            "<LamellaBoard Include=\"raspberrypi-pico\" Name=\"Raspberry Pi Pico\" NativeImage=\"false\" ProbeFamilies=\"\" />"
         );
     }
 
     /// The four RP2350 boards with a CMSIS-DAP route are written as every board is: the Pico LiPo
-    /// 2 XL W's line is the Pico LiPo 2's shape, and no board carries an attribute of its own.
+    /// 2 XL W's line is the Pico LiPo 2's shape, each builds a native image with an archive of its
+    /// own, and no board carries an attribute of its own.
     #[test]
     fn the_msbuild_boards_file_writes_the_four_rp2350_boards_as_it_writes_every_board() {
         let text = boards_msbuild();
@@ -498,18 +503,18 @@ mod tests {
         assert_eq!(
             line_of("pimoroni-pico-lipo-2-xl-w"),
             "<LamellaBoard Include=\"pimoroni-pico-lipo-2-xl-w\" Name=\"Pimoroni Pico LiPo 2 XL W\" \
-             NativeImage=\"false\" ProbeFamilies=\"cmsis-dap\" />"
+             NativeImage=\"true\" ProbeFamilies=\"cmsis-dap\" />"
         );
         assert_eq!(
             line_of("pimoroni-pico-lipo-2"),
-            "<LamellaBoard Include=\"pimoroni-pico-lipo-2\" Name=\"Pimoroni Pico LiPo 2\" NativeImage=\"false\" \
+            "<LamellaBoard Include=\"pimoroni-pico-lipo-2\" Name=\"Pimoroni Pico LiPo 2\" NativeImage=\"true\" \
              ProbeFamilies=\"cmsis-dap\" />"
         );
         assert!(!text.contains("Advertised="), "no board is marked: {text}");
     }
 
-    /// `lamella boards` lists every board of the catalog, the Pico LiPo 2s and the Feather RP2350s
-    /// among them, each written by `lamella flash`.
+    /// `lamella boards` lists every board of the catalog, the Pico LiPo 2s, the Feather RP2350s,
+    /// the Metro RP2350s and the IoT RedBoard - RP2350 among them, each written by `lamella flash`.
     #[test]
     fn the_boards_table_lists_every_board_of_the_catalog() {
         let table = boards_table();
@@ -520,6 +525,9 @@ mod tests {
             "pimoroni-pico-lipo-2-xl-w",
             "adafruit-feather-rp2350-hstx",
             "adafruit-feather-rp2350-hstx-psram",
+            "adafruit-metro-rp2350",
+            "adafruit-metro-rp2350-psram",
+            "sparkfun-iot-redboard-rp2350",
         ] {
             let line = table
                 .lines()

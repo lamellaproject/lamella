@@ -22,7 +22,8 @@ pub(crate) fn macos_open_failure(status: i32) -> Error {
     } else {
         return Error::Os(format!("IOHIDDeviceOpen returned {:#010x}", status as u32));
     };
-    Error::Os(format!("{advice} (IOHIDDeviceOpen: {:#010x})", status as u32))
+    let said = format!("{advice} (IOHIDDeviceOpen: {:#010x})", status as u32);
+    if status == 0xe000_02c5_u32 as i32 { Error::Held(said) } else { Error::Os(said) }
 }
 
 #[cfg(test)]
@@ -59,6 +60,9 @@ mod tests {
 
     #[test]
     fn a_macos_held_device_says_to_close_its_owner() {
-        assert_eq!(macos_open_failure(0xe000_02c5_u32 as i32).to_string(), "HID error: another program holds it; close that program and try again (IOHIDDeviceOpen: 0xe00002c5)");
+        let held = macos_open_failure(0xe000_02c5_u32 as i32);
+        assert!(matches!(held, Error::Held(_)), "{held:?}");
+        assert_eq!(held.to_string(), "HID error: another program holds it; close that program and try again (IOHIDDeviceOpen: 0xe00002c5)");
+        assert!(matches!(macos_open_failure(0xe000_02c1_u32 as i32), Error::Os(_)), "a permission refusal is no holder");
     }
 }

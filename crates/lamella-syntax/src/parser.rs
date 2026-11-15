@@ -1570,6 +1570,30 @@ impl Parser {
         }
     }
 
+    /// Parses a constructor, destructor or operator body. An extern declaration's
+    /// semicolon denotes no implementation, distinct from an empty managed block.
+    fn parse_member_implementation(
+        &mut self,
+        modifiers: &[Modifier],
+        feature: Feature,
+        returns_value: bool,
+    ) -> (Option<Stmt>, u32) {
+        if modifiers.contains(&Modifier::Extern)
+            && self.current_punctuator() == Some(Punctuator::Semicolon)
+        {
+            let end = self.current().span.end;
+            self.bump();
+            (None, end)
+        } else if self.current_punctuator() == Some(Punctuator::EqualsGreaterThan) {
+            let (body, end) = self.parse_expression_body(feature, returns_value);
+            (Some(body), end)
+        } else {
+            let body = self.parse_required_block();
+            let end = body.span.end;
+            (Some(body), end)
+        }
+    }
+
     /// Parses a `try` statement (15.10): a protected block, then catch clauses
     /// and/or a finally block.
     fn parse_try(&mut self, start: u32) -> Stmt {
@@ -3236,13 +3260,9 @@ impl Parser {
             } else {
                 None
             };
-            let (body, end) = if self.current_punctuator() == Some(Punctuator::EqualsGreaterThan) {
-                self.parse_expression_body(Feature::ExpressionBodiedConstructor, false)
-            } else {
-                let block = self.parse_required_block();
-                let end = block.span.end;
-                (block, end)
-            };
+            let (body, end) = self.parse_member_implementation(
+                &modifiers, Feature::ExpressionBodiedConstructor, false,
+            );
             return Member::Constructor {
                 modifiers,
                 name,
@@ -3758,13 +3778,9 @@ impl Parser {
         if let Some(span) = arglist {
             self.report(DiagnosticKind::ArglistNotValidInThisContext, span);
         }
-        let (body, end) = if self.current_punctuator() == Some(Punctuator::EqualsGreaterThan) {
-            self.parse_expression_body(Feature::ExpressionBodiedMethod, true)
-        } else {
-            let block = self.parse_required_block();
-            let end = block.span.end;
-            (block, end)
-        };
+        let (body, end) = self.parse_member_implementation(
+            &modifiers, Feature::ExpressionBodiedMethod, true,
+        );
         Member::Operator {
             modifiers,
             return_type,
@@ -3792,13 +3808,9 @@ impl Parser {
         if let Some(span) = arglist {
             self.report(DiagnosticKind::ArglistNotValidInThisContext, span);
         }
-        let (body, end) = if self.current_punctuator() == Some(Punctuator::EqualsGreaterThan) {
-            self.parse_expression_body(Feature::ExpressionBodiedMethod, true)
-        } else {
-            let block = self.parse_required_block();
-            let end = block.span.end;
-            (block, end)
-        };
+        let (body, end) = self.parse_member_implementation(
+            &modifiers, Feature::ExpressionBodiedMethod, true,
+        );
         Member::ConversionOperator {
             modifiers,
             direction,
@@ -3855,13 +3867,9 @@ impl Parser {
             DiagnosticKind::TokenExpected { expected: "(" },
         );
         self.expect(Punctuator::CloseParen, DiagnosticKind::CloseParenExpected);
-        let (body, end) = if self.current_punctuator() == Some(Punctuator::EqualsGreaterThan) {
-            self.parse_expression_body(Feature::ExpressionBodiedConstructor, false)
-        } else {
-            let block = self.parse_required_block();
-            let end = block.span.end;
-            (block, end)
-        };
+        let (body, end) = self.parse_member_implementation(
+            &modifiers, Feature::ExpressionBodiedConstructor, false,
+        );
         Member::Destructor {
             modifiers,
             name,
@@ -4784,9 +4792,9 @@ impl Parser {
 
     /// Attempts to parse a cast `( type ) operand` at the current `(`, applying
     /// the disambiguation of 14.6.6: the parenthesized tokens must form a type,
-    /// and either that type cannot also be an expression (a predefined or array
-    /// type) or the token after the `)` can begin a unary operand. Otherwise this
-    /// is a parenthesized expression: the speculative parse is rolled back (its
+    /// and either that type cannot also be an expression (a predefined, array,
+    /// pointer, or nullable type) or the token after the `)` is one listed by the rule.
+    /// Otherwise this is a parenthesized expression: the speculative parse is rolled back (its
     /// position and any diagnostics it emitted) and `None` is returned.
     fn try_parse_cast(&mut self) -> Option<Expr> {
         let start = self.current().span.start;
@@ -4800,6 +4808,7 @@ impl Parser {
             let forces_cast = matches!(
                 target.kind,
                 TypeRefKind::Predefined(_) | TypeRefKind::Array { .. }
+                    | TypeRefKind::Pointer(_) | TypeRefKind::Nullable(_)
             );
             if forces_cast || self.current_begins_cast_operand() {
                 let operand = self.parse_unary();
@@ -5092,8 +5101,9 @@ impl Parser {
         let kind = self.current().kind.clone();
         match kind {
             TokenKind::IntegerLiteral { value, suffix } => {
+                let decimal = self.current().decimal_integer;
                 self.bump();
-                Expr::new(ExprKind::Literal(Literal::Integer { value, suffix }), span)
+                Expr::new(ExprKind::Literal(Literal::Integer { value, suffix, decimal }), span)
             }
             TokenKind::RealLiteral { bits, suffix } => {
                 self.bump();
@@ -5694,7 +5704,7 @@ impl Parser {
 
     /// Parses a `new` expression (14.5.10): object/delegate creation
     /// `new type ( arguments )` or array creation `new element[lengths] ranks`.
-    /// Array initializers (`{ ... }`) are not parsed yet.
+    /// An implicit array omits the type and requires an initializer (C# 3).
     fn parse_new(&mut self, start: u32) -> Expr {
         self.bump();
         if self.current_punctuator() == Some(Punctuator::OpenBrace) {
@@ -5702,13 +5712,10 @@ impl Parser {
             let end = self.skip_balanced(Punctuator::OpenBrace, Punctuator::CloseBrace);
             return Expr::new(ExprKind::Error, Span::new(start, end));
         }
+        // Preserve implicit arrays at every dialect. The binder reports the C# 3 gate so it
+        // can also diagnose a missing best element type at older dialects (CS0826).
         if self.current_punctuator() == Some(Punctuator::OpenBracket) {
-            self.gate_feature(Feature::ImplicitlyTypedArray, Span::empty_at(start));
-            let mut end = self.skip_balanced(Punctuator::OpenBracket, Punctuator::CloseBracket);
-            if self.current_punctuator() == Some(Punctuator::OpenBrace) {
-                end = self.skip_balanced(Punctuator::OpenBrace, Punctuator::CloseBrace);
-            }
-            return Expr::new(ExprKind::Error, Span::new(start, end));
+            return self.parse_implicit_array_creation(start);
         }
         if self.current_punctuator() == Some(Punctuator::OpenParen) {
             let saved_position = self.position;
@@ -5953,10 +5960,51 @@ impl Parser {
         };
         Expr::new(
             ExprKind::ArrayCreation {
-                element,
+                element: Some(element),
                 lengths,
                 rank,
                 extra_ranks,
+                initializer,
+            },
+            Span::new(start, end),
+        )
+    }
+
+    /// An implicit array has exactly one unsized rank specifier and a required initializer.
+    /// The element may itself be an array, but that is inferred from the expressions, not
+    /// written as a trailing rank specifier here (ECMA-334 fifth edition 12.7.11.5).
+    fn parse_implicit_array_creation(&mut self, start: u32) -> Expr {
+        let (rank, mut end) = if let Some(rank) = self.try_rank_specifier() {
+            rank
+        } else {
+            // A size expression is not allowed in the implicit form: CS0178 at that size.
+            let span = self.tokens.get(self.position + 1).unwrap_or(self.current()).span;
+            self.diagnostics.push(Diagnostic::new(DiagnosticKind::InvalidRankSpecifier, span));
+            (
+                1,
+                self.skip_balanced(Punctuator::OpenBracket, Punctuator::CloseBracket),
+            )
+        };
+        let initializer = if self.current_punctuator() == Some(Punctuator::OpenBrace) {
+            let initializer = self.parse_array_initializer();
+            end = initializer.span.end;
+            Some(Box::new(initializer))
+        } else {
+            self.expect(Punctuator::OpenBrace, DiagnosticKind::OpenBraceExpected);
+            self.expect(Punctuator::CloseBrace, DiagnosticKind::CloseBraceExpected);
+            None
+        };
+        // Element access requires a primary-no-array-creation expression (ECMA-334
+        // fifth edition 12.7.7). Parentheses provide that expression around a new array.
+        if initializer.is_some() && self.current_punctuator() == Some(Punctuator::OpenBracket) {
+            self.report(DiagnosticKind::ExpressionExpected, self.current().span);
+        }
+        Expr::new(
+            ExprKind::ArrayCreation {
+                element: None,
+                lengths: Vec::new(),
+                rank,
+                extra_ranks: Vec::new(),
                 initializer,
             },
             Span::new(start, end),
@@ -7254,7 +7302,7 @@ fn synthesize_record_members(declaration: &mut TypeDecl, enclosing: &[Box<str>])
             parameters: parameters.clone(),
             is_vararg: false,
             initializer: None,
-            body,
+            body: Some(body),
             header_span: span,
             attributes: Vec::new(),
             span,
@@ -7377,7 +7425,7 @@ fn synthesize_record_equality(
             parameters: alloc::vec![synth_parameter(record_ty.clone(), "original", span)],
             is_vararg: false,
             initializer: None,
-            body: synth_block(copies, span),
+            body: Some(synth_block(copies, span)),
             header_span: span,
             attributes: Vec::new(),
             span,
@@ -7522,6 +7570,7 @@ fn synthesize_record_equality(
                             operand: Box::new(Expr::new(
                                 ExprKind::Literal(Literal::Integer {
                                     value: 1_521_134_295,
+                                    decimal: false,
                                     suffix: IntegerSuffix::None,
                                 }),
                                 span,
@@ -7592,7 +7641,7 @@ fn synthesize_record_equality(
             return_type: bool_ty(),
             operator: OverloadableOperator::Equality,
             parameters: eq_parameters(),
-            body: synth_return_body(equality_test(), span),
+            body: Some(synth_return_body(equality_test(), span)),
             attributes: Vec::new(),
             span,
         });
@@ -7603,7 +7652,7 @@ fn synthesize_record_equality(
             return_type: bool_ty(),
             operator: OverloadableOperator::Inequality,
             parameters: eq_parameters(),
-            body: synth_return_body(
+            body: Some(synth_return_body(
                 Expr::new(
                     ExprKind::Unary {
                         operator: UnaryOperator::Not,
@@ -7615,7 +7664,7 @@ fn synthesize_record_equality(
                     span,
                 ),
                 span,
-            ),
+            )),
             attributes: Vec::new(),
             span,
         });
@@ -7834,7 +7883,7 @@ fn synthesize_record_equality(
             parameters: Vec::new(),
             is_vararg: false,
             initializer: None,
-            body: synth_block(Vec::new(), span),
+            body: Some(synth_block(Vec::new(), span)),
             header_span: span,
             attributes: Vec::new(),
             span,
@@ -8135,7 +8184,8 @@ mod tests {
                 extra_ranks,
                 initializer,
             } => {
-                let mut text = format!("(newarr {} r{rank}", dump_type(element));
+                let element = element.as_ref().map(dump_type).unwrap_or_else(|| "implicit".into());
+                let mut text = format!("(newarr {element} r{rank}");
                 for length in lengths {
                     text.push(' ');
                     text.push_str(&dump(length));
@@ -9221,6 +9271,55 @@ mod tests {
     }
 
     #[test]
+    fn pointer_casts_before_unary_operators_in_every_language_version() {
+        for version in LanguageVersion::ALL_SELECTABLE {
+            for (source, expected) in [
+                ("(byte*)&frame", "(cast byte* (addressof frame))"),
+                ("(S*)&s", "(cast S* (addressof s))"),
+                ("(N.S**)&p", "(cast N.S** (addressof p))"),
+                ("(void*)*p", "(cast void* (deref p))"),
+                ("(int*)+n", "(cast int* (+ n))"),
+                ("(int*)-n", "(cast int* (- n))"),
+                ("(byte*)++p", "(cast byte* (pre++ p))"),
+                ("(byte*)--p", "(cast byte* (pre-- p))"),
+                ("(byte**)*p", "(cast byte** (deref p))"),
+            ] {
+                assert_eq!(tree_at(source, version), expected, "{version}: {source}");
+            }
+        }
+    }
+
+    #[test]
+    fn nullable_casts_before_unary_operators() {
+        for version in [LanguageVersion::CSharp2, LanguageVersion::CSharp7_3] {
+            for (source, expected) in [
+                ("(S?)*p", "(cast S? (deref p))"),
+                ("(S?)-s", "(cast S? (- s))"),
+                ("(S?)+s", "(cast S? (+ s))"),
+                ("(int?)-n", "(cast int? (- n))"),
+                ("(S?)&s", "(cast S? (addressof s))"),
+            ] {
+                assert_eq!(tree_at(source, version), expected, "{version}: {source}");
+            }
+        }
+    }
+
+    #[test]
+    fn parenthesized_names_before_binary_operators_in_every_language_version() {
+        for version in LanguageVersion::ALL_SELECTABLE {
+            for (source, expected) in [
+                ("(a)&b", "(& (paren a) b)"),
+                ("(a)*b", "(* (paren a) b)"),
+                ("(a)+b", "(+ (paren a) b)"),
+                ("(a)-b", "(- (paren a) b)"),
+                ("(a.b)&c", "(& (paren (. a b)) c)"),
+            ] {
+                assert_eq!(tree_at(source, version), expected, "{version}: {source}");
+            }
+        }
+    }
+
+    #[test]
     fn a_predefined_type_can_begin_a_static_member_access() {
         assert_eq!(tree("int.Parse(s)"), "(call (. int Parse) s)");
         assert_eq!(tree("string.Empty"), "(. string Empty)");
@@ -9576,7 +9675,7 @@ mod tests {
                     }
                     text.push(')');
                 }
-                text.push_str(&format!(" {}", dump_stmt(body)));
+                text.push_str(&format!(" {}", dump_member_body(body.as_ref())));
                 text.push(')');
                 text
             }
@@ -9697,7 +9796,7 @@ mod tests {
                     dump_type(return_type),
                     operator_symbol(*operator),
                     dump_params(parameters),
-                    dump_stmt(body)
+                    dump_member_body(body.as_ref())
                 ));
                 text.push(')');
                 text
@@ -9722,7 +9821,7 @@ mod tests {
                     " {direction} {} ({}) {}",
                     dump_type(target),
                     dump_params(parameters),
-                    dump_stmt(body)
+                    dump_member_body(body.as_ref())
                 ));
                 text.push(')');
                 text
@@ -9737,7 +9836,7 @@ mod tests {
                 for modifier in modifiers {
                     text.push_str(&format!(" {}", modifier_name(*modifier)));
                 }
-                text.push_str(&format!(" {name} {}", dump_stmt(body)));
+                text.push_str(&format!(" {name} {}", dump_member_body(body.as_ref())));
                 text.push(')');
                 text
             }
@@ -10042,6 +10141,10 @@ mod tests {
                 text
             }
         }
+    }
+
+    fn dump_member_body(body: Option<&Stmt>) -> String {
+        body.map(dump_stmt).unwrap_or_else(|| String::from(";"))
     }
 
     fn unit_tree(source: &str) -> String {
@@ -11168,6 +11271,36 @@ mod tests {
     }
 
     #[test]
+    fn extern_declaration_bodies_parse_at_every_language_version() {
+        for version in LanguageVersion::ALL_SELECTABLE {
+            for member in [
+                "public extern C();",
+                "static extern C();",
+                "extern ~C();",
+                "public static extern int operator +(C value);",
+                "public static extern implicit operator int(C value);",
+            ] {
+                let source = format!("class C {{ {member} static void After() {{ }} }}");
+                assert_eq!(unit_codes_at(&source, version), [], "{version}: {source}");
+            }
+        }
+    }
+
+    #[test]
+    fn extern_declaration_bodies_keep_semicolons_distinct_from_empty_blocks() {
+        assert_eq!(unit_tree("class C { extern C(); extern ~C(); }"),
+            "(class C (ctor extern C () ;) (dtor extern C ;))");
+        assert_eq!(unit_tree("class C { extern C() { } extern ~C() { } }"),
+            "(class C (ctor extern C () (block)) (dtor extern C (block)))");
+        for member in ["C();", "static C();", "~C();",
+            "public static int operator +(C value);",
+            "public static implicit operator int(C value);"]
+        {
+            assert!(unit_codes(&format!("class C {{ {member} }}")).contains(&1514), "{member}");
+        }
+    }
+
+    #[test]
     fn constructor_initializers() {
         assert_eq!(
             unit_tree("class C { C() : base() {} }"),
@@ -11814,11 +11947,6 @@ mod tests {
     fn an_unbuilt_construct_is_refused_by_name_at_csc_s_position() {
         let rows: &[(&str, &str, &str)] = &[
             (
-                "class P { void M() { int[] a = new[] { 1, 2 }; } }",
-                "new[",
-                "implicitly typed array",
-            ),
-            (
                 "static class E { public static int Twice(this int v) { return v * 2; } }",
                 "this",
                 "extension method",
@@ -11872,6 +12000,7 @@ mod tests {
     #[test]
     fn the_refusals_leave_the_valid_programs_beside_them_alone() {
         let clean = [
+            "class P { void M() { int[] a = new[] { 1, 2 }; } }",
             "class P { void M() { int yield = 1; yield = yield + 1; } }",
             "class P { void M() { int with = 1; with = with + 1; } }",
             "record class R(int X);",
@@ -11896,12 +12025,6 @@ mod tests {
     #[test]
     fn below_the_rung_the_refusal_is_csc_s_version_gate() {
         let rows: &[(&str, LanguageVersion, &str, &str)] = &[
-            (
-                "class P { void M() { int[] a = new[] { 1 }; } }",
-                LanguageVersion::CSharp2,
-                "CS8023",
-                "Feature 'implicitly typed array' is not available in C# 2. Please use language version 3 or greater.",
-            ),
             (
                 "class P { void M() { int Sq(int a) { return a; } } }",
                 LanguageVersion::CSharp6,

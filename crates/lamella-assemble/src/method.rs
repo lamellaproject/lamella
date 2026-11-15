@@ -8,7 +8,7 @@ use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::vec::Vec;
 use lamella_binder::{
-    BoundCatch, BoundExpr, BoundExprKind, BoundStmt, BoundStmtKind, BoundSwitchLabel, SpecialType,
+    BoundCatch, BoundExpr, BoundExprKind, BoundLabel, BoundStmt, BoundStmtKind, BoundSwitchLabel, SpecialType,
     TypeSymbol, always_exits, is_const_true,
 };
 use lamella_cil::{EhClause, EhKind, Instruction, InstructionRange, Opcode, Operand};
@@ -71,9 +71,9 @@ struct Labels<'a> {
     points: Vec<SequencePoint>,
     handlers: Vec<EhClause>,
     epilogue: Option<Epilogue>,
-    /// Source label names mapped to label ids, so a forward `goto` and its labeled
+    /// Bound label identities mapped to emission ids, so a forward `goto` and its labeled
     /// statement share one id whichever is emitted first.
-    named: BTreeMap<Box<str>, usize>,
+    named: BTreeMap<BoundLabel, usize>,
     /// The enclosing `switch` statements (innermost last), so `goto case`/`goto default`
     /// can branch to a sibling section's label.
     switches: Vec<SwitchContext>,
@@ -109,12 +109,12 @@ impl Labels<'_> {
     }
 
     /// The label id for a source label `name`, allocated on first reference.
-    fn named_label(&mut self, name: &str) -> usize {
+    fn named_label(&mut self, name: &BoundLabel) -> usize {
         if let Some(&id) = self.named.get(name) {
             return id;
         }
         let id = self.label();
-        self.named.insert(name.into(), id);
+        self.named.insert(name.clone(), id);
         id
     }
 
@@ -286,7 +286,7 @@ pub fn emit_method(
     .0)
 }
 
-/// A constructor's prologue: `ldarg.0; <arguments>; call ctor`. Models both the implicit
+/// A constructor's prologue: `<spill>; ldarg.0; <arguments>; call ctor`. Models both the implicit
 /// parameterless base call (empty `arguments`) and an explicit `this(args)`/`base(args)`
 /// chain.
 ///
@@ -301,8 +301,10 @@ pub struct ConstructorPrologue {
     /// sequence point on it (a breakpoint on the chain call). `None` for an implicit or
     /// synthesized base call, which carries no source.
     pub span: Option<Span>,
-    /// The bound chain arguments, in order.
+    /// The bound chain arguments, in parameter order.
     pub arguments: Vec<BoundExpr>,
+    /// Source-order operands evaluated once before the chain arguments use their temporaries.
+    pub spilled: Vec<BoundExpr>,
     /// How many leading statements of the body -- the instance field initializers
     /// (17.11) -- to emit BEFORE this chain call, so a virtual method the base
     /// constructor invokes observes the derived fields already assigned. Zero when the
@@ -462,8 +464,8 @@ fn emit_body_statements(
     Ok(())
 }
 
-/// Emits a constructor's chain call `ldarg.0; <arguments>; call ctor` -- the invocation of
-/// the base or sibling constructor a prologue records (17.11).
+/// Emits a constructor's source-order spill followed by its base or sibling constructor
+/// call, whose arguments use the spill's temporaries in parameter order (17.11).
 fn emit_prologue(
     prologue: &ConstructorPrologue,
     frame: &Frame,
@@ -474,14 +476,18 @@ fn emit_prologue(
     if let Some(span) = prologue.span {
         labels.points.push((out.len() as u32, Some(span)));
     }
-    out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
     if let Some(ty) = prologue.zero_initialize {
+        out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
         out.push(Instruction::new(Opcode::Initobj, Operand::Token(ty)));
         return Ok(());
     }
-    for argument in &prologue.arguments {
-        crate::expr::emit_argument(argument, frame, tokens, out)?;
-    }
+    crate::expr::open_sequence(&prologue.spilled, frame, tokens, out)?;
+    out.push(Instruction::new(Opcode::Ldarg, Operand::Variable(0)));
+    let result = prologue.arguments.iter().try_for_each(|argument| {
+        crate::expr::emit_argument(argument, frame, tokens, out)
+    });
+    frame.close_temp_scope();
+    result?;
     out.push(Instruction::new(Opcode::Call, Operand::Token(prologue.ctor)));
     Ok(())
 }
@@ -1631,8 +1637,19 @@ pub(crate) fn emit_compound(
             if let Some((slot, element)) = frame.byref(name) {
                 out.push(slot.load());
                 emit_local(name, frame, tokens, out)?;
+                if leave == Leave::Old {
+                    out.push(Instruction::simple(Opcode::Dup));
+                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+                }
                 emit_modify(user_step, result_conversion, binary, &target.ty, rhs, checked, frame, tokens, out)?;
+                if leave == Leave::New {
+                    out.push(Instruction::simple(Opcode::Dup));
+                    out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+                }
                 crate::expr::emit_store_indirect(&element, tokens, out)?;
+                if let Some(slot) = kept {
+                    out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
+                }
                 return Ok(());
             }
             emit_local(name, frame, tokens, out)?;
@@ -1800,6 +1817,32 @@ pub(crate) fn emit_compound(
             }
             Ok(())
         }
+        BoundExprKind::ElementAccess { receiver, indices }
+            if indices.len() > 1
+                && matches!(receiver.ty, TypeSymbol::Array { .. })
+                && rhs.is_none()
+                && lamella_binder::nullable_underlying(&target.ty).is_some() =>
+        {
+            // The rectangular array's Address method evaluates the receiver and indices
+            // once. Keep that address across the nullable step, including a user operator.
+            crate::expr::emit_value_type_receiver(target, frame, tokens, out)?;
+            out.push(Instruction::simple(Opcode::Dup));
+            crate::expr::emit_load_indirect(&target.ty, tokens, out)?;
+            if leave == Leave::Old {
+                out.push(Instruction::simple(Opcode::Dup));
+                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+            }
+            emit_modify(user_step, result_conversion, binary, &target.ty, rhs, checked, frame, tokens, out)?;
+            if leave == Leave::New {
+                out.push(Instruction::simple(Opcode::Dup));
+                out.push(Instruction::new(Opcode::Stloc, Operand::Variable(kept.unwrap())));
+            }
+            crate::expr::emit_store_indirect(&target.ty, tokens, out)?;
+            if let Some(slot) = kept {
+                out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(slot)));
+            }
+            Ok(())
+        }
         BoundExprKind::Dereference { operand } => {
             emit_expression(operand, frame, tokens, out)?;
             let address = frame.reserve_local(&operand.ty);
@@ -1915,7 +1958,7 @@ fn emit_combine(
             }
         }
         None => {
-            return crate::expr::emit_step(operand_ty, binary == BinaryOperator::Add, checked, tokens, out);
+            return crate::expr::emit_step(operand_ty, binary == BinaryOperator::Add, checked, frame, tokens, out);
         }
     }
     crate::expr::emit_binary(binary, operand_ty, checked, tokens, out)?;
@@ -2009,6 +2052,22 @@ mod tests {
         match instruction.operand {
             Operand::Target(index) => index,
             _ => panic!("expected a branch target"),
+        }
+    }
+
+    #[test]
+    fn scoped_labels_emit_distinct_branch_targets_for_sibling_blocks() {
+        let code = emit(&[], "{ int x = 0;
+            { goto same; same: x = 2; }
+            { goto same; same: x = 3; }
+            return x; }");
+        let branches: Vec<_> = code.iter().enumerate()
+            .filter(|(_, instruction)| instruction.opcode == Opcode::Br)
+            .collect();
+        assert_eq!(branches.len(), 2, "{code:?}");
+        for (index, branch) in branches {
+            assert_eq!(target(branch) as usize, index + 1, "{code:?}");
+            assert_eq!(code[index + 1].opcode, Opcode::Nop);
         }
     }
 

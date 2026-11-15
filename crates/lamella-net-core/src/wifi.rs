@@ -53,7 +53,8 @@ pub enum JoinStatus {
     Success = 1,
     /// Access to the radio was withdrawn. No board reports it; it keeps the numbering.
     AccessRevoked = 2,
-    /// The network refused the secret.
+    /// The credential cannot be used, the WPA2 handshake timed out with reason 15, or WPA3
+    /// authentication failed. A WPA3 failure can have causes other than the secret.
     InvalidCredential = 3,
     /// The network was not found.
     NetworkNotAvailable = 4,
@@ -99,26 +100,39 @@ impl Reconnection {
     }
 }
 
-/// What a stored network does when the board starts.
+/// What a stored network does when the board starts. No setting holds the program's start for the
+/// network: a program that needs the network waits for it itself.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BootConnection {
     /// Join in the background; the program starts at once.
     Background = 0,
-    /// Join before the program starts, waiting a bounded time for the link and an address.
+    /// Retired: "join before the program starts". A stored record may still hold it, and the board
+    /// follows it as [`BootConnection::Background`]; no seam integer names it, and a write stores
+    /// [`BootConnection::Background`] in its place.
     BeforeMain = 1,
     /// Do not join; the program joins by calling for the stored network.
     OnConnect = 2,
 }
 
 impl BootConnection {
-    /// The setting a seam integer names, or `None` for an integer that names none.
+    /// The setting a seam integer names, or `None` for an integer that names none. The retired 1
+    /// names none.
     #[must_use]
     pub fn from_code(code: i32) -> Option<Self> {
         match code {
             0 => Some(BootConnection::Background),
-            1 => Some(BootConnection::BeforeMain),
             2 => Some(BootConnection::OnConnect),
             _ => None,
+        }
+    }
+
+    /// The setting the board follows for this one: the retired [`BootConnection::BeforeMain`] is
+    /// followed as [`BootConnection::Background`], and every other setting as itself.
+    #[must_use]
+    pub fn in_effect(self) -> Self {
+        match self {
+            BootConnection::BeforeMain => BootConnection::Background,
+            other => other,
         }
     }
 }
@@ -126,7 +140,8 @@ impl BootConnection {
 /// The radio, as far as a program needs to know it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RadioInfo {
-    /// Whether a radio is present and running.
+    /// Whether a radio is fitted and can be used: running, starting, or off until a join asks for
+    /// it. False for a radio that could not be brought up.
     pub present: bool,
     /// Whether the radio's firmware runs WPA3's SAE exchange; `None` until the firmware has said.
     pub wpa3: Option<bool>,
@@ -220,7 +235,8 @@ pub struct StoredNetwork {
     pub security: u8,
     /// What the radio does if the link is lost.
     pub reconnection: Reconnection,
-    /// What the network does when the board starts.
+    /// What the network does when the board starts: the setting the board follows, never the
+    /// retired [`BootConnection::BeforeMain`].
     pub boot: BootConnection,
 }
 
@@ -261,6 +277,13 @@ pub trait WifiControl {
     /// The link, cheaply: what a network backend reads on every pass.
     fn link(&self) -> WifiLink;
 
+    /// The radio's own hardware address, once it is known: a radio that is off has not read it
+    /// yet. A network backend whose interface was made before the radio came up takes its address
+    /// from here.
+    fn hardware_address(&mut self) -> Option<[u8; 6]> {
+        None
+    }
+
     /// Starts a join of the network `request` names, dropping any network held first. Returns the
     /// join's number, which a later [`WifiControl::state`] names while it reports on this join.
     ///
@@ -282,14 +305,37 @@ pub trait WifiControl {
     /// The stored network, or `None` when none is stored.
     fn record_read(&mut self) -> Option<StoredNetwork>;
 
-    /// Stores `network`, keeping the boot setting of a network already stored and taking
-    /// [`BootConnection::Background`] otherwise. The values stored before are erased once the new ones
-    /// are written; a write of the values already stored writes nothing.
+    /// Stores `network`, keeping the boot setting the board follows for a network already stored and
+    /// taking [`BootConnection::Background`] otherwise. The values stored before are erased once the
+    /// new ones are written; a write of the values already stored writes nothing.
     fn record_write(&mut self, network: JoinRequest<'_>) -> RecordWrite;
 
-    /// Changes the boot setting of the stored network.
+    /// Changes the boot setting of the stored network. The retired [`BootConnection::BeforeMain`] is
+    /// stored as [`BootConnection::Background`].
     fn record_set_boot(&mut self, boot: BootConnection) -> RecordWrite;
 
     /// Erases the stored network. Returns whether the storage now holds none.
     fn record_clear(&mut self) -> bool;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A seam integer names the two settings a program may choose, and never the retired 1.
+    #[test]
+    fn a_seam_integer_names_background_or_on_connect_and_never_the_retired_setting() {
+        assert_eq!(BootConnection::from_code(0), Some(BootConnection::Background));
+        assert_eq!(BootConnection::from_code(1), None);
+        assert_eq!(BootConnection::from_code(2), Some(BootConnection::OnConnect));
+        assert_eq!(BootConnection::from_code(3), None);
+    }
+
+    /// The retired setting is followed as background; the others as themselves.
+    #[test]
+    fn the_retired_setting_is_followed_as_background() {
+        assert_eq!(BootConnection::BeforeMain.in_effect(), BootConnection::Background);
+        assert_eq!(BootConnection::Background.in_effect(), BootConnection::Background);
+        assert_eq!(BootConnection::OnConnect.in_effect(), BootConnection::OnConnect);
+    }
 }

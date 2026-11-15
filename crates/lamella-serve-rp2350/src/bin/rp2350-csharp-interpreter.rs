@@ -1,7 +1,9 @@
-//! The C# interpreter firmware for RP2350 boards (the Raspberry Pi Pico 2 and Pico 2 W, and the
-//! Pimoroni Pico Plus 2 and Plus 2 W; Cortex-M33 / ARMv8-M): the on-device half of a Lamella Link
-//! deploy target, taking programs from the lamella CLI. Speaks lamella-wire over UART0 (PL011, TX
-//! GP0 / RX GP1, 115200 8N1, bridged by the Raspberry Pi Debug Probe) and -- with the `usb` feature
+//! The C# interpreter firmware for RP2350 boards (Cortex-M33 / ARMv8-M): the Raspberry Pi Pico 2
+//! and Pico 2 W; the Pimoroni Pico Plus 2, Plus 2 W, Pico LiPo 2 and Pico LiPo 2 XL W; the Adafruit
+//! Feather RP2350 with HSTX and the Metro RP2350, each with and without PSRAM; and the SparkFun IoT
+//! RedBoard - RP2350. It is the on-device half of a Lamella Link deploy target, taking programs from
+//! the lamella CLI. Speaks lamella-wire over UART0 (PL011, TX GP0 / RX GP1, 115200 8N1, on every
+//! one of these boards, bridged on a Pico by the Raspberry Pi Debug Probe) and -- with the `usb` feature
 //! -- over the chip's own USB port as a driverless-WinUSB device (rp2350_usb.rs: a hand-rolled
 //! RP2350 device controller under the shared usb_transport carrier; VID/PID shared with the Lamella
 //! Link family, the product string naming the board and the OTP chip id as the unique serial).
@@ -42,11 +44,25 @@
 //!        --target thumbv8m.main-none-eabihf --features serve,rp2350,usb,pico-plus-2-w,tls,system-roots
 //! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
 //!        --target thumbv8m.main-none-eabi --features serve,rp2350,usb
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
+//!        --target thumbv8m.main-none-eabi --features serve,rp2350,usb,pico-lipo-2
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
+//!        --target thumbv8m.main-none-eabi --features serve,rp2350,usb,pico-lipo-2-xl-w
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
+//!        --target thumbv8m.main-none-eabi --features serve,rp2350,usb,feather-rp2350-hstx
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
+//!        --target thumbv8m.main-none-eabi --features serve,rp2350,usb,feather-rp2350-hstx-psram
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
+//!        --target thumbv8m.main-none-eabi --features serve,rp2350,usb,metro-rp2350
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
+//!        --target thumbv8m.main-none-eabi --features serve,rp2350,usb,metro-rp2350-psram
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-csharp-interpreter --profile flash-speed
+//!        --target thumbv8m.main-none-eabi --features serve,rp2350,usb,iot-redboard-rp2350
 //! The fourth is the Pimoroni Pico Plus 2 W: the third's radio and serve, with that board's own
 //! board file and identity. The fifth is the Pimoroni Pico Plus 2: the Pico 2's firmware, with no
 //! radio, and likewise that board's own board file and identity. Each build's deploy window runs
 //! from 0x10200000 to the end of the flash its board's facts state: 4 MB on the Pico 2 and Pico 2 W,
-//! 16 MB on both Plus boards.
+//! 8 MB on the two Feathers and 16 MB on the other boards.
 //! The sixth and seventh are the third and fourth with TLS: `tls` puts the vendored mbedTLS behind
 //! the runtime's TLS seam, and `system-roots` adds the bundled CA store. They compile mbedTLS and so
 //! need an ARM cross C compiler: `LAMELLA_ARM_GCC`, or `arm-none-eabi-gcc` on PATH (see
@@ -64,6 +80,14 @@
 //! The eleventh is the Pico 2's released firmware: the second without the flash-resident corlib, the
 //! build installed on a Pico 2 that has no Lamella firmware yet. It is listed so that a build gate
 //! compiles the exact firmware users receive, not only the builds around it.
+//! The twelfth to the eighteenth are the released firmware of the other seven boards, one each: the
+//! Pimoroni Pico LiPo 2 and Pico LiPo 2 XL W, the Adafruit Feather RP2350 with HSTX, with and without
+//! PSRAM, the Adafruit Metro RP2350, with and without PSRAM, and the SparkFun IoT RedBoard - RP2350.
+//! The LiPo 2 XL W's runs its radio, which is on the Pico 2 W's four lines. The RedBoard's has no
+//! Wi-Fi: its radio is on GP24, GP36, GP37 and GP38, which the driver does not run.
+//! The PSRAM of the two Plus 2s, the two LiPo 2s and the RedBoard joins the heap at boot. The two
+//! Adafruit boards with PSRAM run from the flash and the chip's SRAM, since no document of their
+//! maker prints the PSRAM's part, and the bring-up is told that part's commands and timing.
 //! Flash: objcopy to .bin; program at 0x10000000 over a debug probe.
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
@@ -84,22 +108,124 @@ mod startup;
 #[path = "../rp2350_flash.rs"]
 mod rp2350_flash;
 
-#[cfg(all(target_os = "none", not(feature = "cyw43"), not(feature = "pico-plus-2")))]
+// THE BOARD, ONE BLOCK EACH: its generated bindings (the board's console pins, clock plan and
+// memory, as its facts state them), the identity the firmware answers a host with, and, on a board
+// whose PSRAM joins the heap, the descriptor that brings the PSRAM up. A board feature picks its
+// block; with none, the board is the Pico 2, or with `cyw43` the Pico 2 W. `build.rs` picks the
+// same board from the same features to size the deploy window by its flash, and the check below
+// the blocks holds the two picks to one board.
+
+// The Raspberry Pi Pico 2.
+#[cfg(all(target_os = "none", not(any(feature = "cyw43", feature = "named-board"))))]
 #[path = "../../../../bsp/boards/raspberrypi-pico-2/rust/raspberrypi_pico_2_bindings.rs"]
 #[allow(dead_code)]
 mod board_bindings;
+#[cfg(not(any(feature = "cyw43", feature = "named-board")))]
+const BOARD: u16 = lamella_wire::product_model::PICO2;
+
+// The Raspberry Pi Pico 2 W.
+#[cfg(all(target_os = "none", feature = "cyw43", not(feature = "named-board")))]
+#[path = "../../../../bsp/boards/raspberrypi-pico-2-w/rust/raspberrypi_pico_2_w_bindings.rs"]
+#[allow(dead_code)]
+mod board_bindings;
+#[cfg(all(feature = "cyw43", not(feature = "named-board")))]
+const BOARD: u16 = lamella_wire::product_model::PICO2_W;
+
+// The Pimoroni Pico Plus 2.
 #[cfg(all(target_os = "none", feature = "pico-plus-2"))]
 #[path = "../../../../bsp/boards/pimoroni-pico-plus-2/rust/pimoroni_pico_plus_2_bindings.rs"]
 #[allow(dead_code)]
 mod board_bindings;
-#[cfg(all(target_os = "none", feature = "cyw43", not(feature = "pico-plus-2-w")))]
-#[path = "../../../../bsp/boards/raspberrypi-pico-2-w/rust/raspberrypi_pico_2_w_bindings.rs"]
-#[allow(dead_code)]
-mod board_bindings;
+#[cfg(feature = "pico-plus-2")]
+const BOARD: u16 = lamella_wire::product_model::PICO_PLUS_2;
+#[cfg(all(target_os = "none", feature = "pico-plus-2"))]
+use lamella_board_support::boards::pimoroni_pico_plus_2::BOARD as DESCRIPTOR;
+
+// The Pimoroni Pico Plus 2 W.
 #[cfg(all(target_os = "none", feature = "pico-plus-2-w"))]
 #[path = "../../../../bsp/boards/pimoroni-pico-plus-2-w/rust/pimoroni_pico_plus_2_w_bindings.rs"]
 #[allow(dead_code)]
 mod board_bindings;
+#[cfg(feature = "pico-plus-2-w")]
+const BOARD: u16 = lamella_wire::product_model::PICO_PLUS_2_W;
+#[cfg(all(target_os = "none", feature = "pico-plus-2-w"))]
+use lamella_board_support::boards::pimoroni_pico_plus_2_w::BOARD as DESCRIPTOR;
+
+// The Pimoroni Pico LiPo 2.
+#[cfg(all(target_os = "none", feature = "pico-lipo-2"))]
+#[path = "../../../../bsp/boards/pimoroni-pico-lipo-2/rust/pimoroni_pico_lipo_2_bindings.rs"]
+#[allow(dead_code)]
+mod board_bindings;
+#[cfg(feature = "pico-lipo-2")]
+const BOARD: u16 = lamella_wire::product_model::PICO_LIPO_2;
+#[cfg(all(target_os = "none", feature = "pico-lipo-2"))]
+use lamella_board_support::boards::pimoroni_pico_lipo_2::BOARD as DESCRIPTOR;
+
+// The Pimoroni Pico LiPo 2 XL W.
+#[cfg(all(target_os = "none", feature = "pico-lipo-2-xl-w"))]
+#[path = "../../../../bsp/boards/pimoroni-pico-lipo-2-xl-w/rust/pimoroni_pico_lipo_2_xl_w_bindings.rs"]
+#[allow(dead_code)]
+mod board_bindings;
+#[cfg(feature = "pico-lipo-2-xl-w")]
+const BOARD: u16 = lamella_wire::product_model::PICO_LIPO_2_XL_W;
+#[cfg(all(target_os = "none", feature = "pico-lipo-2-xl-w"))]
+use lamella_board_support::boards::pimoroni_pico_lipo_2_xl_w::BOARD as DESCRIPTOR;
+
+// The Adafruit Feather RP2350 with HSTX.
+#[cfg(all(target_os = "none", feature = "feather-rp2350-hstx"))]
+#[path = "../../../../bsp/boards/adafruit-feather-rp2350-hstx/rust/adafruit_feather_rp2350_hstx_bindings.rs"]
+#[allow(dead_code)]
+mod board_bindings;
+#[cfg(feature = "feather-rp2350-hstx")]
+const BOARD: u16 = lamella_wire::product_model::FEATHER_RP2350_HSTX;
+
+// The Adafruit Feather RP2350 with HSTX and PSRAM, run from the flash and the chip's SRAM.
+#[cfg(all(target_os = "none", feature = "feather-rp2350-hstx-psram"))]
+#[path = "../../../../bsp/boards/adafruit-feather-rp2350-hstx-psram/rust/adafruit_feather_rp2350_hstx_psram_bindings.rs"]
+#[allow(dead_code)]
+mod board_bindings;
+#[cfg(feature = "feather-rp2350-hstx-psram")]
+const BOARD: u16 = lamella_wire::product_model::FEATHER_RP2350_HSTX_PSRAM;
+
+// The Adafruit Metro RP2350.
+#[cfg(all(target_os = "none", feature = "metro-rp2350"))]
+#[path = "../../../../bsp/boards/adafruit-metro-rp2350/rust/adafruit_metro_rp2350_bindings.rs"]
+#[allow(dead_code)]
+mod board_bindings;
+#[cfg(feature = "metro-rp2350")]
+const BOARD: u16 = lamella_wire::product_model::METRO_RP2350;
+
+// The Adafruit Metro RP2350 with PSRAM, run from the flash and the chip's SRAM.
+#[cfg(all(target_os = "none", feature = "metro-rp2350-psram"))]
+#[path = "../../../../bsp/boards/adafruit-metro-rp2350-psram/rust/adafruit_metro_rp2350_psram_bindings.rs"]
+#[allow(dead_code)]
+mod board_bindings;
+#[cfg(feature = "metro-rp2350-psram")]
+const BOARD: u16 = lamella_wire::product_model::METRO_RP2350_PSRAM;
+
+// The SparkFun IoT RedBoard - RP2350, with no Wi-Fi: its radio is not on the lines the driver runs.
+#[cfg(all(target_os = "none", feature = "iot-redboard-rp2350"))]
+#[path = "../../../../bsp/boards/sparkfun-iot-redboard-rp2350/rust/sparkfun_iot_redboard_rp2350_bindings.rs"]
+#[allow(dead_code)]
+mod board_bindings;
+#[cfg(feature = "iot-redboard-rp2350")]
+const BOARD: u16 = lamella_wire::product_model::IOT_REDBOARD_RP2350;
+#[cfg(all(target_os = "none", feature = "iot-redboard-rp2350"))]
+use lamella_board_support::boards::sparkfun_iot_redboard_rp2350::BOARD as DESCRIPTOR;
+
+// One board, whichever block picked it: the identity is the bindings' own model, and the flash
+// `build.rs` sized the deploy window by is the bindings' flash. A block that paired one board's
+// bindings with another's identity, or a build script that read another board's facts, stops the
+// build here rather than shipping a board that announces itself wrongly or writes past its flash.
+#[cfg(target_os = "none")]
+const _: () = {
+    assert!(BOARD == board_bindings::BOARD_MODEL, "the board block's identity is not its bindings' board");
+    assert!(
+        rp2350_flash::FLASH_END - 0x1000_0000 == board_bindings::MEMORY_FLASH_SIZE as usize,
+        "build.rs sized the deploy window by another board's flash than this firmware's bindings state"
+    );
+};
+
 #[cfg(target_os = "none")]
 #[path = "../../../../csp/rp2350/rust/rp2350_instances.rs"]
 #[allow(dead_code)]
@@ -153,6 +279,7 @@ mod rp2350_xosc_layout;
 #[cfg(target_os = "none")]
 mod serve {
     extern crate alloc;
+    use crate::BOARD;
     use crate::rp2350_flash::Rp2350Flash;
     use lamella_runner::carriers::{Carrier, CarrierSet, Windows};
     use lamella_runner::{Served, run_deployed_with, serve_one_deploy_with_residence};
@@ -191,23 +318,18 @@ mod serve {
     #[global_allocator]
     static ALLOCATOR: lamella_heap::LockedHeap = lamella_heap::LockedHeap::empty();
 
-    /// The heap's bytes beyond SRAM: the PSRAM a Pico Plus 2 board adds at boot, else 0.
+    /// The heap's bytes beyond SRAM: the PSRAM a board adds at boot, else 0.
     static HEAP_BEYOND_SRAM: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
 
-    /// A Pico Plus 2 board's PSRAM, brought up at the final clk_sys, proven and wiped, then handed to
-    /// the heap as its second region, after SRAM: a request is carved from SRAM while it fits, and a
-    /// block SRAM has no room left for comes from the PSRAM. The boot report names both ranges, or
-    /// why the PSRAM is not in use, and the heap then stays SRAM alone.
+    /// The board's PSRAM, as its descriptor states it, brought up at the final clk_sys, proven and
+    /// wiped, then handed to the heap as its second region, after SRAM: a request is carved from SRAM
+    /// while it fits, and a block SRAM has no room left for comes from the PSRAM. The boot report
+    /// names both ranges, or why the PSRAM is not in use, and the heap then stays SRAM alone.
     ///
     /// It runs before the clock starts folding SysTick, because the wipe holds the core for longer
     /// than one SysTick wrap with nothing reading the clock, which would lose wraps from its time base.
-    #[cfg(any(feature = "pico-plus-2", feature = "pico-plus-2-w"))]
+    #[cfg(feature = "psram-heap")]
     fn attach_psram(clk_sys_hz: Option<u32>) {
-        #[cfg(feature = "pico-plus-2")]
-        use lamella_board_support::boards::pimoroni_pico_plus_2::BOARD;
-        #[cfg(feature = "pico-plus-2-w")]
-        use lamella_board_support::boards::pimoroni_pico_plus_2_w::BOARD;
-
         let (start, bytes) = heap();
         let sram = alloc::format!(
             "SRAM {:#010x}..{:#010x} ({} KB)",
@@ -215,7 +337,7 @@ mod serve {
             start as usize + bytes,
             bytes / 1024
         );
-        let Some(psram) = BOARD.psram else {
+        let Some(psram) = crate::DESCRIPTOR.psram else {
             say_psram(&alloc::format!("[lamella] RAM: {sram}"));
             return;
         };
@@ -274,7 +396,7 @@ mod serve {
 
     /// One line of the PSRAM's boot report: said on the UART and, in a `psram-full-walk` flight
     /// build, also kept in RAM, where a probe reads it on a board whose UART is not wired.
-    #[cfg(any(feature = "pico-plus-2", feature = "pico-plus-2-w"))]
+    #[cfg(feature = "psram-heap")]
     fn say_psram(line: &str) {
         narrate(line);
         #[cfg(feature = "psram-full-walk")]
@@ -309,7 +431,7 @@ mod serve {
 
     /// The core's cycle counter (DWT CYCCNT), started on first use. 32 bits at clk_sys: it times
     /// anything under 28 s at 150 MHz.
-    #[cfg(any(feature = "pico-plus-2", feature = "pico-plus-2-w"))]
+    #[cfg(feature = "psram-heap")]
     fn cycles() -> u32 {
         const DEMCR: usize = 0xe000_edfc;
         const DEMCR_TRCENA: u32 = 1 << 24;
@@ -322,7 +444,7 @@ mod serve {
     }
 
     /// Milliseconds since the cycle count `started`, at clk_sys `clk_sys_hz`.
-    #[cfg(any(feature = "pico-plus-2", feature = "pico-plus-2-w"))]
+    #[cfg(feature = "psram-heap")]
     fn elapsed_ms(started: u32, clk_sys_hz: u32) -> u64 {
         u64::from(cycles().wrapping_sub(started)) * 1000 / u64::from(clk_sys_hz)
     }
@@ -659,31 +781,6 @@ mod serve {
         reset_to_serve()
     }
 
-    #[cfg(feature = "cyw43")]
-    mod boot_log {
-        use core::sync::atomic::{AtomicUsize, Ordering};
-        static mut BUF: [u8; 8192] = [0; 8192];
-        static LEN: AtomicUsize = AtomicUsize::new(0);
-
-        pub fn push(line: &str) {
-            let buf = unsafe { &mut *core::ptr::addr_of_mut!(BUF) };
-            let mut at = LEN.load(Ordering::Relaxed);
-            for &byte in line.as_bytes().iter().chain(b"\r\n") {
-                if at >= buf.len() {
-                    break;
-                }
-                buf[at] = byte;
-                at += 1;
-            }
-            LEN.store(at, Ordering::Relaxed);
-        }
-
-        pub fn get() -> &'static str {
-            let buf = unsafe { &*core::ptr::addr_of!(BUF) };
-            core::str::from_utf8(&buf[..LEN.load(Ordering::Relaxed)]).unwrap_or("")
-        }
-    }
-
     static TICKS_PER_MS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(1);
 
     #[cfg(feature = "resident-corlib")]
@@ -707,8 +804,8 @@ mod serve {
     /// Say why the boot path produced no app run, on both voices this board has: the wire's own
     /// terminal event at seq 0 -- the boot path answers no request, so there is no seq to reply to
     /// -- and a plain UART line for a host watching the port rather than speaking the protocol.
-    /// Exit 70 is the interpreter's abort convention: nothing the deployed program chose ran to a
-    /// value.
+    /// The stop carries the runtime's fatal stop, exit 1: nothing the deployed program chose ran to
+    /// a value.
     ///
     /// The reason goes on the error stream and the stop event carries the exit code, because a stop
     /// event has no output tail: a host that read the reason out of the terminal frame would stop
@@ -722,7 +819,7 @@ mod serve {
         let mut stopped = alloc::vec![debug::reason::TRAP];
         stopped.extend_from_slice(&0u32.to_le_bytes());
         stopped.extend_from_slice(&0u32.to_le_bytes());
-        stopped.extend_from_slice(&70i32.to_le_bytes());
+        stopped.extend_from_slice(&lamella_cil_runtime::exit_code::FATAL_STOP.to_le_bytes());
         stopped.push(0);
         let _ = transport.send(debug::EVT_STOPPED, 0, &stopped);
     }
@@ -730,10 +827,11 @@ mod serve {
     pub(crate) use crate::systick_clock as clock;
 
     /// Installs the board seams on a fresh evaluation `Vm` (the runner's `_with` hook). Every
-    /// build gets the board's clock. A cyw43 build also brings the radio up and joins on the first
-    /// evaluation, streams that narration into the run's stdout and -- whenever the radio runs,
-    /// joined or not -- wires a smoltcp NetBackend over the chip's ethernet data channel that lends
-    /// the radio to the program's Wi-Fi classes, plus the TLS engine in a `tls` build.
+    /// build gets the board's clock. A cyw43 build also starts the radio's controller on the first
+    /// evaluation, which powers the radio only when a network joins in the background, and wires
+    /// a smoltcp NetBackend over the radio's ethernet data channel that lends the radio to the
+    /// program's Wi-Fi classes -- whatever the radio is doing, off included -- plus the TLS engine in
+    /// a `tls` build.
     fn configure_vm(vm: &mut lamella_cil_runtime::Vm) {
         vm.set_clock(clock::now_ms, clock::sleep_ms);
         vm.set_pin_event_source(crate::rp2350_pin_events::source_for_a_new_program());
@@ -744,23 +842,8 @@ mod serve {
             use crate::pico_wifi;
             let ticks = TICKS_PER_MS.load(core::sync::atomic::Ordering::Relaxed);
             let settings = alloc::boxed::Box::new(crate::rp2350_flash::SettingsStore::new());
-            pico_wifi::ensure_wifi(ticks.saturating_mul(1000), settings, &mut |line: &str| {
-                for byte in line.bytes() {
-                    uart_tx(byte);
-                }
-                uart_tx(b'\r');
-                uart_tx(b'\n');
-                boot_log::push(line);
-            });
-            let wifi_done = clock::now_ms();
-            let units: alloc::vec::Vec<u16> = boot_log::get().encode_utf16().collect();
-            vm.write(&units);
-            if !pico_wifi::radio_up() {
-                let msg: alloc::vec::Vec<u16> =
-                    "[net] no radio is running; evaluation runs without a backend\r\n"
-                        .encode_utf16()
-                        .collect();
-                vm.write(&msg);
+            pico_wifi::start_wifi(ticks.saturating_mul(1000), settings);
+            if !pico_wifi::fitted() {
                 return;
             }
             let device = pico_wifi::device();
@@ -776,52 +859,16 @@ mod serve {
             let seed = if trng_start() && trng_fill(&mut seed_bytes) {
                 u64::from_le_bytes(seed_bytes)
             } else {
-                let msg: alloc::vec::Vec<u16> =
-                    "[net] the TRNG gave no entropy, so the network seed is the MAC and the uptime\r\n"
-                        .encode_utf16()
-                        .collect();
-                vm.write(&msg);
-                u64::from(u32::from_le_bytes([
-                    pico_wifi::mac()[2],
-                    pico_wifi::mac()[3],
-                    pico_wifi::mac()[4],
-                    pico_wifi::mac()[5],
-                ])) ^ clock::now_ms()
+                let mac = pico_wifi::chip_address().unwrap_or([0; 6]);
+                u64::from(u32::from_le_bytes([mac[2], mac[3], mac[4], mac[5]])) ^ clock::now_ms()
             };
-            let dhcp_started = clock::now_ms();
-            let mut net = lamella_net_smoltcp::SmoltcpNet::new(
+            let net = lamella_net_smoltcp::SmoltcpNet::new(
                 device,
                 config,
                 clock::now_ms,
                 seed,
             )
             .with_wifi(pico_wifi::view);
-            let joined = pico_wifi::wifi_up();
-            if joined {
-                use lamella_cil_runtime::net::NetBackend;
-                let deadline = clock::now_ms().saturating_add(8_000);
-                while net.ipv4_addr().is_none() && clock::now_ms() < deadline {
-                    let _ = net.poll(Some(100));
-                }
-            }
-            let settled = clock::now_ms();
-            let to_dhcp_ms = dhcp_started.saturating_sub(wifi_done);
-            let dhcp_ms = settled.saturating_sub(dhcp_started);
-            let status: alloc::string::String = match net.ipv4_addr() {
-                None if !joined => alloc::string::String::from(
-                    "[net] the radio is up and no network is joined yet; the address follows the link\r\n",
-                ),
-                Some(ip) => alloc::format!(
-                    "[net] up, address {}.{}.{}.{} from DHCP ({} ms from the wifi step to dhcp start, {} ms more to the lease)\r\n",
-                    ip[0], ip[1], ip[2], ip[3], to_dhcp_ms, dhcp_ms
-                ),
-                None => alloc::format!(
-                    "[net] joined, no address YET (dhcp still trying; {} ms from the wifi step to dhcp start, {} ms waited)\r\n",
-                    to_dhcp_ms, dhcp_ms
-                ),
-            };
-            let units: alloc::vec::Vec<u16> = status.encode_utf16().collect();
-            vm.write(&units);
             vm.set_net_backend(alloc::boxed::Box::new(net));
             #[cfg(feature = "tls")]
             attach_tls(vm);
@@ -861,10 +908,6 @@ mod serve {
         lamella_tls_mbedtls::set_time_source(tls_clock_now);
         #[cfg(feature = "system-roots")]
         lamella_tls_mbedtls::set_system_roots(|issuer, index| lamella_tls_roots::roots_for_issuer(issuer).nth(index));
-        let roots = if cfg!(feature = "system-roots") { "the bundled CA store" } else { "pinned certificates only" };
-        let line = alloc::format!("[tls] mbedTLS up, entropy from the TRNG, trusting {roots}\r\n");
-        let units: alloc::vec::Vec<u16> = line.encode_utf16().collect();
-        vm.write(&units);
         vm.set_tls_backend(alloc::boxed::Box::new(lamella_tls_mbedtls::MbedTlsDevice::new()));
     }
 
@@ -889,14 +932,6 @@ mod serve {
 
         const RP2350_DPIDR: u32 = 0x4c01_3477;
         const SYSINFO_CHIP_ID: usize = 0x4000_0000;
-        #[cfg(all(feature = "cyw43", not(feature = "pico-plus-2-w")))]
-        const BOARD: u16 = lamella_wire::product_model::PICO2_W;
-        #[cfg(feature = "pico-plus-2-w")]
-        const BOARD: u16 = lamella_wire::product_model::PICO_PLUS_2_W;
-        #[cfg(feature = "pico-plus-2")]
-        const BOARD: u16 = lamella_wire::product_model::PICO_PLUS_2;
-        #[cfg(not(any(feature = "cyw43", feature = "pico-plus-2")))]
-        const BOARD: u16 = lamella_wire::product_model::PICO2;
         lamella_runner::set_board_identity(BOARD, RP2350_DPIDR, read_register(SYSINFO_CHIP_ID));
 
         {
@@ -906,7 +941,7 @@ mod serve {
                 chip::PLL_USB_BASE as usize,
             );
             let clk_sys_hz = rp2350_clocks::clk_sys_hz_from(&tree, board::XOSC_HZ_PLL_150_48);
-            #[cfg(any(feature = "pico-plus-2", feature = "pico-plus-2-w"))]
+            #[cfg(feature = "psram-heap")]
             attach_psram(clk_sys_hz);
             match clk_sys_hz {
                 Some(clk_sys_hz) => {
@@ -1049,6 +1084,7 @@ mod serve {
 #[cfg(not(target_os = "none"))]
 fn main() {
     println!(
-        "rp2350-csharp-interpreter is a bare-metal target; build for thumbv8m.main-none-eabi with serve,rp2350"
+        "rp2350-csharp-interpreter for the {} is a bare-metal target; build for thumbv8m.main-none-eabi with serve,rp2350",
+        lamella_wire::product_model::name(BOARD).unwrap_or("board")
     );
 }

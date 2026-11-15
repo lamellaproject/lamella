@@ -13,6 +13,7 @@ pub mod frame;
 pub mod info;
 pub mod line;
 pub mod locals;
+pub mod types;
 
 #[cfg(test)]
 mod tests;
@@ -21,6 +22,7 @@ pub use cursor::Format;
 pub use frame::{CfaRule, CieSummary, FrameTable, RegisterRule, UnwindRow};
 pub use info::Function;
 pub use locals::{FrameBase, Local, Locals, Place, Subprogram};
+pub use types::{ScalarType, scalar_type};
 pub use line::{FileEntry, LineProgram, Row};
 
 /// The debug sections a reader needs, borrowed from whatever container held them.

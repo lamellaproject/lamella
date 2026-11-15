@@ -422,5 +422,27 @@ onboard = "none"
 recovery = "mask-rom"
 source = "The schematic carries SWCLK and SWDIO from the MCU to the board's debug connector, so a probe cable lands on it with no tools. There is no on-board debug probe. RP2350 datasheet section 4.1: the mask ROM is a physically immutable memory resource, so the recovery path is in silicon and no image written to flash can remove it."
 
+# --- where the board keeps its stored settings, such as the network it joins: two slots of one
+#     erase unit each, at the flash's end, where no deploy and no firmware update of Lamella's
+#     writes. ---
+
+[stored_settings]
+memory = "flash"
+offset = 0xFFE000           # 0x1000000 - 2 x 0x1000
+size = 0x2000
+erase_unit = 0x1000
+slots = 2
+source = "The place the stored-network format keeps its two slots on this board: the last two 4096-byte sectors of its 16 MB flash, one slot each, past the end of the span a deploy writes. RP2350 datasheet 5.4.8.9: flash_op's erase operations 'must be sector-aligned (4096 bytes) and sector-multiple-sized', and 5.6.4.3: PICOBOOT's FLASH_ERASE erases 'an exact multiple number of sectors (4 kB)', so one sector is the unit a slot is erased in."
+
+# --- where the board keeps the flash region a board package writes beside a program, such as the
+#     radio's firmware: the 62 erase units below the stored settings, from a 64 KiB block. ---
+
+[flash_region]
+memory = "flash"
+offset = 0xFC0000           # 0xFFE000 - 62 x 0x1000
+size = 0x3E000
+erase_unit = 0x1000
+source = "The place this board keeps the flash region a flash-region record describes, such as the radio's firmware: the 253,952 bytes of its 16 MB flash from offset 0xFC0000, a 64 KiB block boundary, to the first sector of its stored settings at 0xFFE000, 62 sectors of 4096 bytes. RP2350 datasheet 5.4.8.9: flash_op's erase operations 'must be sector-aligned (4096 bytes) and sector-multiple-sized', so the region is whole sectors from a sector."
+
 [csharp_interpreter]
 optimization = "speed"

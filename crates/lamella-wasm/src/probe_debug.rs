@@ -223,6 +223,7 @@ fn backend(probe: u32, program: DebugProgram) -> DeviceBackend<ProbeTarget> {
         frames,
         locals,
         unwind,
+        console: _,
     } = program;
     DeviceBackend::new(
         ProbeTarget { probe },
@@ -1121,7 +1122,7 @@ mod tests {
         let undebuggable = debug_session(probe, &bare);
         assert_ne!(undebuggable, 0);
         let why = launch_refusal(undebuggable);
-        assert!(why.contains(".debug_line"), "{why}");
+        assert!(why.contains("carries no debug information"), "{why}");
         let halted = probe_request(probe, &json!({ "op": "halt" }));
         assert_eq!(halted["ok"], json!(true), "it holds nothing: {halted}");
 

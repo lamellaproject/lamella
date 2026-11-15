@@ -50,6 +50,8 @@ mod open_advice_tests {
 
 pub mod coresight;
 
+mod adiv6;
+
 /// The acknowledge a DP/AP transfer returned. `Ok` is success; the others are the ADIv5 wire-level
 /// responses a probe reports back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -125,7 +127,12 @@ impl fmt::Display for ProbeError {
         match self {
             ProbeError::Transport(e) => f.write_str(&probe_stopped_answering(e)),
             ProbeError::Protocol(e) => write!(f, "malformed probe reply: {e}"),
-            ProbeError::Ack(ack) => write!(f, "transfer not acknowledged: {ack:?}"),
+            ProbeError::Ack(ack) => f.write_str(match ack {
+                Ack::Wait => "the board's chip stayed busy and did not take the debug request",
+                Ack::Fault => "the board's chip refused the debug request",
+                Ack::NoAck => "the board did not answer the probe: check that the board is powered and wired to it",
+                Ack::Ok | Ack::Unknown(_) => "the board's chip gave the probe an answer it does not recognize",
+            }),
             ProbeError::Timeout(what) => write!(f, "timed out waiting for {what}"),
             ProbeError::Device(what) => write!(f, "target device error: {what}"),
             ProbeError::Debugger(what) => f.write_str(what),
@@ -211,6 +218,25 @@ pub trait DapAccess {
         Ok(false)
     }
 
+    /// Brings a SWD debug port out of the DORMANT state, and says whether this probe sent the
+    /// sequence that does it.
+    ///
+    /// A port that leaves reset dormant -- an RP2350's SW-DP, for one (RP2350 datasheet, 3.5.1) --
+    /// ignores the JTAG-to-SWD switch [`connect`](Self::connect) sends and answers no transfer. It
+    /// leaves the state on the selection alert and the SWD activation code (IHI 0074E, B5.3.4),
+    /// after which a line reset leaves it a reset-state SW-DP whose `DPIDR` read confirms the link.
+    ///
+    /// **It sends the wire sequences and nothing else.** The probe stays as `connect` configured
+    /// it: in particular a probe's connect command can drive nRESET, which would release a target
+    /// held in reset for an attach.
+    ///
+    /// **`Ok(false)` is an ANSWER AND NOT A FAILURE**, as it is for
+    /// [`reset_extension`](Self::reset_extension): this probe has no way to send the sequence, and
+    /// the caller reports the port's silence as it found it.
+    fn wake_from_dormant(&mut self) -> Result<bool, ProbeError> {
+        Ok(false)
+    }
+
     /// Writes `values` to one Access Port register back to back, in as few probe round-trips as the
     /// probe allows (CMSIS-DAP streams these with `DAP_TransferBlock`).
     ///
@@ -248,6 +274,14 @@ pub trait DapAccess {
             *slot = self.read_ap(address)?;
         }
         Ok(())
+    }
+
+    /// Why this probe was given up on, in the words a reader is told: `Some` once its link has
+    /// failed -- a reply that never came, a pipe that broke, replies that no longer answer the
+    /// commands sent -- after which every call fails without reaching the probe. `None` while the
+    /// link holds, and always for a probe that never gives up on its link.
+    fn stopped_answering(&self) -> Option<String> {
+        None
     }
 }
 
@@ -301,11 +335,17 @@ impl<D: DapAccess + ?Sized> DapAccess for &mut D {
     fn reset_extension(&mut self) -> Result<bool, ProbeError> {
         (**self).reset_extension()
     }
+    fn wake_from_dormant(&mut self) -> Result<bool, ProbeError> {
+        (**self).wake_from_dormant()
+    }
     fn write_ap_block(&mut self, address: u8, values: &[u32]) -> Result<(), ProbeError> {
         (**self).write_ap_block(address, values)
     }
     fn read_ap_block_into(&mut self, address: u8, out: &mut [u32]) -> Result<(), ProbeError> {
         (**self).read_ap_block_into(address, out)
+    }
+    fn stopped_answering(&self) -> Option<String> {
+        (**self).stopped_answering()
     }
 }
 
@@ -424,6 +464,14 @@ pub trait TargetAccess {
     /// Calls a function already resident in target memory and returns its result, running it on the
     /// supplied scratch [`CallFrame`]. Used by flash algorithms that stage a loader into RAM.
     fn call_target(&mut self, address: u32, args: &[u32], frame: &CallFrame) -> Result<u32, ProbeError>;
+
+    /// Why the probe was given up on, in the words a reader is told: `Some` once its link has
+    /// failed, after which every call fails without reaching the probe, so a session that ends
+    /// says this once rather than naming whichever call failed next. `None` while the link holds,
+    /// and always for a probe that never gives up on its link ([`DapAccess::stopped_answering`]).
+    fn stopped_answering(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The allocating conveniences over [`TargetAccess`], provided for every implementation and
@@ -935,8 +983,9 @@ impl DpIdr {
     }
 
     /// Whether this is a DPv3 port, which ADIv6.0 defines and ADIv5.2 does not. Its access ports are
-    /// selected by address, so [`TargetAccess::init_mem`]'s ADIv5 selection of AP 0 does not reach a
-    /// MEM-AP on it; select one with [`ArmDap::init_mem_select`].
+    /// selected by address, so on it [`TargetAccess::init_mem`] finds the one that reaches the
+    /// processor from the debug port's own ROM table ([`ArmDap::core_access_port`]) rather than
+    /// selecting AP 0.
     pub fn is_dpv3(self) -> bool {
         self.version() == 3
     }
@@ -1041,12 +1090,17 @@ pub struct ArmDap<D: DapAccess> {
     /// is what lets that work on an ADIv6 DP too**, where the selection is an AP ADDRESS rather
     /// than an index and no caller of this type would have it to hand.
     select: u32,
+    /// The `DPIDR` this port last answered, so [`init_mem`](TargetAccess::init_mem) knows which debug
+    /// interface architecture it is speaking without another transaction. Forgotten whenever the
+    /// accessor is handed out mutably ([`inner_mut`](Self::inner_mut)), since what is done through it
+    /// can reconnect the wire.
+    dpidr: Option<u32>,
 }
 
 impl<D: DapAccess> ArmDap<D> {
     /// Wraps a raw DP/AP accessor.
     pub fn new(dap: D) -> Self {
-        ArmDap { dap, select: 0 }
+        ArmDap { dap, select: 0, dpidr: None }
     }
 
     /// The underlying accessor, for probe-specific operations outside this trait.
@@ -1056,7 +1110,14 @@ impl<D: DapAccess> ArmDap<D> {
 
     /// The underlying accessor, mutably.
     pub fn inner_mut(&mut self) -> &mut D {
+        self.dpidr = None;
         &mut self.dap
+    }
+
+    /// The DP `SELECT` value the last memory initialization wrote: on an ADIv6 port, the address of
+    /// the access port memory is reached through, plus its register file's offset.
+    pub fn select(&self) -> u32 {
+        self.select
     }
 
     /// Unwraps back to the underlying accessor.
@@ -1068,13 +1129,20 @@ impl<D: DapAccess> ArmDap<D> {
     /// its MEM-AP by base ADDRESS plus the AP register-file offset instead of the ADIv5 `APSEL`
     /// field, e.g. `0x2d00` for an RP2350 core-0 AP at `0x2000` plus the MEM-AP file at `0xd00`.
     pub fn init_mem_select(&mut self, select: u32) -> Result<(), ProbeError> {
+        self.power_up(select)?;
+        self.dap.write_ap(AP_CSW, CSW_WORD)
+    }
+
+    /// Clears the sticky error flags, writes `select` to `SELECT`, and powers the debug and system
+    /// domains up, waiting for both acknowledges.
+    pub(crate) fn power_up(&mut self, select: u32) -> Result<(), ProbeError> {
         self.dap.write_dp(DP_ABORT, ABORT_CLEAR_STICKY)?;
         self.dap.write_dp(DP_SELECT, select)?;
         self.select = select;
         self.dap.write_dp(DP_CTRL_STAT, CTRL_POWERUP_REQ)?;
         for _ in 0..128 {
             if self.dap.read_dp(DP_CTRL_STAT)? & CTRL_POWERUP_ACK == CTRL_POWERUP_ACK {
-                return self.dap.write_ap(AP_CSW, CSW_WORD);
+                return Ok(());
             }
         }
         Err(ProbeError::Timeout("debug power-up"))
@@ -1199,20 +1267,56 @@ impl<D: DapAccess> TargetAccess for ArmDap<D> {
     /// every caller happens to satisfy is not enforced anywhere, and the caller that omits it is
     /// invisible -- the others working is the same coincidence repeated, not evidence.
     ///
-    /// The id itself is discarded here. [`TargetAccess::read_idcode`] is how a caller that wants
-    /// the value asks for it, and asking twice costs one transaction and is not an error.
+    /// The id itself is kept for [`init_mem`](TargetAccess::init_mem), which needs to know which
+    /// debug interface architecture answered. [`TargetAccess::read_idcode`] is how a caller that
+    /// wants the value asks for it, and asking twice costs one transaction and is not an error.
+    ///
+    /// **A PORT THAT ANSWERS NOTHING MAY BE DORMANT**, and only then is it woken: on no
+    /// acknowledge, or one the specification does not define, the probe is asked to send the wake
+    /// ([`DapAccess::wake_from_dormant`]) and `DPIDR` is read again. A port that answered `WAIT` or
+    /// `FAULT` is awake and is not sent it; nor is a port that answered at once, so a part that
+    /// leaves reset in SWD sees exactly the traffic it did before.
     fn connect(&mut self) -> Result<(), ProbeError> {
+        self.dpidr = None;
         self.dap.connect()?;
-        self.dap.read_dp(DP_IDCODE)?;
+        let dpidr = match self.dap.read_dp(DP_IDCODE) {
+            Ok(dpidr) => dpidr,
+            Err(silent @ ProbeError::Ack(Ack::NoAck | Ack::Unknown(_))) => {
+                if !self.dap.wake_from_dormant()? {
+                    return Err(silent);
+                }
+                self.dap.read_dp(DP_IDCODE)?
+            }
+            Err(error) => return Err(error),
+        };
+        self.dpidr = Some(dpidr);
         Ok(())
     }
 
     fn read_idcode(&mut self) -> Result<u32, ProbeError> {
-        self.dap.read_dp(DP_IDCODE)
+        let dpidr = self.dap.read_dp(DP_IDCODE)?;
+        self.dpidr = Some(dpidr);
+        Ok(dpidr)
     }
 
+    /// Powers the debug domain up and selects the MEM-AP memory is reached through.
+    ///
+    /// On an ADIv5 port that is AP 0, as it always was, with the same traffic. **On an ADIv6 port
+    /// (a DPv3) AP 0 is not an access port at all**: its selection is an address in the debug
+    /// address space, and address 0 is wherever the part put its ROM table -- so every word read
+    /// that way is a word of the table. There the port is found from the debug port's own ROM table
+    /// ([`ArmDap::core_access_port`]): the first MEM-AP that reaches an M-profile processor's debug
+    /// unit. A port where none does is refused by name.
     fn init_mem(&mut self) -> Result<(), ProbeError> {
-        self.init_mem_select(0x0000_0000)
+        let dpidr = match self.dpidr {
+            Some(dpidr) => dpidr,
+            None => self.read_idcode()?,
+        };
+        if !DpIdr(dpidr).is_dpv3() {
+            return self.init_mem_select(0x0000_0000);
+        }
+        let select = self.core_access_port()?;
+        self.init_mem_select(select)
     }
 
     fn read_word(&mut self, address: u32) -> Result<u32, ProbeError> {
@@ -1305,6 +1409,10 @@ impl<D: DapAccess> TargetAccess for ArmDap<D> {
 
     fn reset_extension(&mut self) -> Result<bool, ProbeError> {
         self.dap.reset_extension()
+    }
+
+    fn stopped_answering(&self) -> Option<String> {
+        self.dap.stopped_answering()
     }
 
     fn read_core_reg(&mut self, selector: u8) -> Result<u32, ProbeError> {
@@ -1546,6 +1654,44 @@ mod tests {
             "a borrowed probe must not silently fall back to the pulse"
         );
         assert_eq!(probe.log, vec![Pin::Extension]);
+    }
+
+    /// A probe that gave up on its link says so through the bridge and through a borrow, where the
+    /// trait's default would say it still answers: a session reading the default would end naming
+    /// whichever call failed next instead of the probe that stopped.
+    #[test]
+    fn a_probe_that_stopped_answering_says_so_through_the_bridge_and_a_borrow() {
+        struct Stopped;
+        impl DapAccess for Stopped {
+            fn connect(&mut self) -> Result<(), ProbeError> {
+                unreachable!()
+            }
+            fn read_dp(&mut self, _: u8) -> Result<u32, ProbeError> {
+                unreachable!()
+            }
+            fn write_dp(&mut self, _: u8, _: u32) -> Result<(), ProbeError> {
+                unreachable!()
+            }
+            fn read_ap(&mut self, _: u8) -> Result<u32, ProbeError> {
+                unreachable!()
+            }
+            fn write_ap(&mut self, _: u8, _: u32) -> Result<(), ProbeError> {
+                unreachable!()
+            }
+            fn set_reset(&mut self, _: bool) -> Result<u8, ProbeError> {
+                unreachable!()
+            }
+            fn stopped_answering(&self) -> Option<String> {
+                Some(crate::probe_stopped_answering("a read gave up"))
+            }
+        }
+        fn borrowed<D: DapAccess>(probe: D) -> Option<String> {
+            probe.stopped_answering()
+        }
+
+        let words = Some(crate::probe_stopped_answering("a read gave up"));
+        assert_eq!(TargetAccess::stopped_answering(&ArmDap::new(Stopped)), words);
+        assert_eq!(borrowed(&mut Stopped), words);
     }
 }
 

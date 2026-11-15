@@ -9,7 +9,7 @@ use alloc::string::String;
 use alloc::vec;
 use alloc::vec::Vec;
 use lamella_binder::{
-    Accessibility, Binder, BoundCatch, BoundDeclarator, BoundExpr, BoundExprKind, BoundStmt,
+    Accessibility, Binder, BoundCatch, BoundDeclarator, BoundExpr, BoundExprKind, BoundLabel, BoundStmt,
     BoundStmtKind, BoundSwitchArm, FieldReference, MethodReference, SpecialType,
     TypeInstantiation, TypeSymbol,
 };
@@ -129,7 +129,7 @@ pub fn lower_async_method(
         .map(|route| rewriter.dispatch_arm(route, span))
         .collect();
     protected.extend(body.statements);
-    protected.push(stmt(BoundStmtKind::Goto(Box::from(DONE_LABEL)), span));
+    protected.push(stmt(BoundStmtKind::Goto(BoundLabel::generated(DONE_LABEL)), span));
     let catch_body = vec![
         rewriter.set_state(-2, span),
         rewriter.builder_call(
@@ -158,7 +158,7 @@ pub fn lower_async_method(
     ));
     move_next.push(stmt(
         BoundStmtKind::Labeled {
-            label: Box::from(DONE_LABEL),
+            label: BoundLabel::generated(DONE_LABEL),
             body: Box::new(stmt(BoundStmtKind::Empty, span)),
         },
         span,
@@ -415,6 +415,7 @@ fn int_expr(value: i64) -> BoundExpr {
     let magnitude = BoundExpr {
         kind: BoundExprKind::Literal(Literal::Integer {
             value: value.unsigned_abs(),
+            decimal: false,
             suffix: IntegerSuffix::None,
         }),
         ty: TypeSymbol::Special(SpecialType::Int32),
@@ -1004,7 +1005,7 @@ impl Rewriter {
                     ty: TypeSymbol::Special(SpecialType::Boolean),
                 },
                 then_branch: Box::new(stmt(
-                    BoundStmtKind::Goto(Box::from(&*route.target)),
+                    BoundStmtKind::Goto(BoundLabel::generated(&*route.target)),
                     span,
                 )),
                 else_branch: None,
@@ -1066,7 +1067,7 @@ impl Rewriter {
             }
             BoundStmtKind::Return(None) => {
                 out.statements
-                    .push(stmt(BoundStmtKind::Goto(Box::from(DONE_LABEL)), span));
+                    .push(stmt(BoundStmtKind::Goto(BoundLabel::generated(DONE_LABEL)), span));
             }
             BoundStmtKind::Return(Some(value)) => {
                 let Some(result_ty) = self.result_ty.clone() else {
@@ -1078,7 +1079,7 @@ impl Rewriter {
                 out.statements
                     .push(assign(result_local(&result_ty), value, span));
                 out.statements
-                    .push(stmt(BoundStmtKind::Goto(Box::from(DONE_LABEL)), span));
+                    .push(stmt(BoundStmtKind::Goto(BoundLabel::generated(DONE_LABEL)), span));
             }
             BoundStmtKind::If {
                 condition,
@@ -1326,7 +1327,7 @@ impl Rewriter {
                     let label = before_try_label(try_id);
                     out.statements.push(stmt(
                         BoundStmtKind::Labeled {
-                            label: Box::from(&*label),
+                            label: BoundLabel::generated(&*label),
                             body: Box::new(stmt(BoundStmtKind::Empty, span)),
                         },
                         span,
@@ -1991,7 +1992,7 @@ impl Rewriter {
 
         pre.push(stmt(
             BoundStmtKind::Labeled {
-                label: Box::from(&*resume_label(index)),
+                label: BoundLabel::generated(&*resume_label(index)),
                 body: Box::new(stmt(BoundStmtKind::Empty, span)),
             },
             span,

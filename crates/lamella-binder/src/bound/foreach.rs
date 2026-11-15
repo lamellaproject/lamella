@@ -25,6 +25,14 @@ impl PatternDeclaration {
 }
 
 impl Binder {
+    /// Pattern methods may omit arguments in C# 2 through 7.3. At other versions,
+    /// the selected method must be parameterless.
+    pub(super) fn foreach_pattern_accepts_parameter_count(&self, count: usize) -> bool {
+        count == 0
+            || (self.language_version >= LanguageVersion::CSharp2
+                && self.language_version < LanguageVersion::CSharp8)
+    }
+
     /// Combines a parameter's effective base class with its effective interface set. Interfaces
     /// reached only through a class constraint are not in that set (edition 4, 25.7). An ordinary
     /// interface supplies one root, followed by the same inherited-member lookup.
@@ -120,15 +128,22 @@ impl Binder {
                 }
             }
         }
-        // Hiding precedes applicability. In member lookup a method hides only non-methods, a
-        // non-method hides all base members, and class declarations hide interface members
-        // (14.3). Base methods, those with the same signature included, are removed after
-        // applicability, below (14.5.5.1).
+        // Hiding precedes applicability. A method hides non-methods and methods with the same
+        // signature; a non-method hides all base members. The same rule removes interface
+        // members hidden by class declarations (14.3). Different overloads remain candidates
+        // for the foreach pattern's empty argument list (15.8.4).
         let hidden: Vec<_> = declarations
             .iter()
             .map(|candidate| {
                 declarations.iter().any(|other| {
-                    (!other.is_method() || !candidate.is_method())
+                    let hides = match (&other.member, &candidate.member) {
+                        (PatternMember::Method(hider), PatternMember::Method(hidden)) => {
+                            hider.type_parameters.len() == hidden.type_parameters.len()
+                                && hider.parameters == hidden.parameters
+                        }
+                        _ => true,
+                    };
+                    hides
                         && (self.foreach_member_base(&other.declaring, &candidate.declaring)
                             || (other.is_class_member() && candidate.interface))
                 })
@@ -139,6 +154,31 @@ impl Binder {
             .zip(hidden)
             .filter_map(|(declaration, hidden)| (!hidden).then_some(declaration))
             .collect()
+    }
+
+    /// Virtual parameter lists come from the first declaration or override reached from the
+    /// static receiver (12.6.2.2). This does not change the declaration used for member hiding.
+    fn foreach_method_parameters(
+        &self,
+        ty: &TypeSymbol,
+        declaration: &PatternDeclaration,
+        method: &MethodSymbol,
+    ) -> (TypeSymbol, MethodSymbol) {
+        if !declaration.interface && (method.is_virtual || method.is_abstract) {
+            for (declaring, info) in self.member_lookup_walk(&self.lookup_type_of(ty), false) {
+                if declaring == declaration.declaring {
+                    break;
+                }
+                if let Some(overriding) = info.methods_named(&method.name).find(|candidate| {
+                    candidate.is_override
+                        && candidate.type_parameters.len() == method.type_parameters.len()
+                        && candidate.parameters == method.parameters
+                }) {
+                    return (declaring, overriding.clone());
+                }
+            }
+        }
+        (declaration.declaring.clone(), method.clone())
     }
 
     /// The Current and MoveNext of an enumerator that is a type parameter or, at every version,
@@ -175,45 +215,33 @@ impl Binder {
             .iter()
             .filter_map(|declaration| match &declaration.member {
                 // An empty argument list cannot infer any method type argument.
-                PatternMember::Method(method)
-                    if method.type_parameters.is_empty()
-                        && is_applicable(&self.model, method, &[], &[]) =>
-                {
-                    Some((declaration, method))
+                PatternMember::Method(method) if method.type_parameters.is_empty() => {
+                    Some(self.foreach_method_parameters(ty, declaration, method))
                 }
                 _ => None,
             })
-            .collect();
-        // Only an applicable class method removes interface methods (25.7.2).
-        // Applicable declarations in derived types remove base methods (14.5.5.1).
-        let preferred: Vec<_> = applicable
-            .iter()
-            .filter(|(candidate, _)| {
-                !applicable.iter().any(|(other, _)| {
-                    self.foreach_member_base(&other.declaring, &candidate.declaring)
-                        || (other.is_class_member() && candidate.interface)
-                })
+            .filter(|(_, method)| {
+                is_applicable_at(&self.model, method, &[], &[], self.language_version)
             })
             .collect();
-        let methods: Vec<_> = preferred.iter().map(|(_, method)| *method).collect();
-        let chosen = best_candidate(&self.model, &methods, &[], &[])?;
+        // Foreach ranks the whole member-lookup group. The most-derived applicable tier
+        // reduction belongs to invocation expressions, not this pattern selection.
+        let methods: Vec<_> = applicable.iter().map(|(_, method)| method).collect();
+        let chosen = best_candidate(&self.model, &methods, &[], &[], self.language_version)?;
         if chosen.is_static
             || chosen.accessibility != Accessibility::Public
             || chosen.return_type != TypeSymbol::Special(SpecialType::Boolean)
-            || (self
-                .language_version
-                .foreach_incomplete_pattern_uses_interface()
-                && !chosen.parameters.is_empty())
+            || !self.foreach_pattern_accepts_parameter_count(chosen.parameters.len())
         {
             return None;
         }
-        let (declaration, _) = preferred
+        let (declaring, _) = applicable
             .iter()
-            .find(|(_, method)| core::ptr::eq(*method, chosen))?;
+            .find(|(_, method)| core::ptr::eq(method, chosen))?;
         let move_next = MethodReference {
-            declaring_type: declaration.declaring.clone(),
+            declaring_type: declaring.clone(),
             declaring_instantiation: self.declaring_instantiation_of(
-                &declaration.declaring,
+                declaring,
                 &chosen.name,
                 &chosen.parameters,
             ),

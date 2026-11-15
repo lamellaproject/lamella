@@ -1346,6 +1346,7 @@ struct Emitted {
 /// A definition's method as this pass needs to see it.
 struct DefMethod<'pe> {
     name: String,
+    token: Token,
     /// The parameter types AS DECLARED -- still mentioning `!n`, which is also the form the call
     /// site's `MemberRef` carries. Matching happens on this form; the DISPATCH KEY is built from
     /// its substitution.
@@ -1661,7 +1662,13 @@ pub(crate) fn monomorphize<'pe>(
         let mut method_plans: Vec<Vec<OpenSite>> = Vec::with_capacity(methods.len());
         for method in methods {
             let Some(raw) = method.raw else {
-                ids.push(None);
+                let id = (method.name == ".cctor").then(|| {
+                    if let Some(definition) = assembly.method(method.token.row()) {
+                        super::bind_pinvoke_target(assembly, module, asm, method.token, &definition);
+                    }
+                    super::register_external_static_ctor(module, asm, method.token, type_id)
+                });
+                ids.push(id);
                 method_plans.push(Vec::new());
                 continue;
             };
@@ -2853,6 +2860,7 @@ fn read_definition_methods<'pe>(assembly: &Assembly<'pe>, def_row: u32) -> Vec<D
             let signature = method.signature();
             DefMethod {
                 name: method.name().unwrap_or("").into(),
+                token: method.token(),
                 params: signature
                     .as_ref()
                     .map(|sig| sig.parameters.clone())
@@ -4596,6 +4604,11 @@ fn bind_type_operand<'pe>(
     };
 
     module.bind_cast_elem(site_asm, synthetic, cast_elem_of_sig(asm, substituted));
+    if matches!(substituted, SigType::SzArray(_) | SigType::Array { .. } | SigType::Pointer(_)) {
+        // Structural arguments can name element types that no direct operand references.
+        // Bind them in the argument's assembly, including ownership marks for array bases.
+        super::bind_signature_elements(assembly, module, asm, type_index, substituted);
+    }
     if matches!(site.opcode, Opcode::Newarr) {
         let zero = struct_zero_of_sig(module, assembly, asm, type_offset, type_index, substituted)
             .unwrap_or_else(|| default_field_value(Some(substituted.clone())));
@@ -4642,6 +4655,11 @@ fn bind_type_operand<'pe>(
         }
         SigType::Class(token) | SigType::ValueType(token) => {
             let name = assembly.type_token_name(*token).ok_or_else(unbound)?;
+            // A named argument may occur only in a MethodSpec. Give its payload handle the
+            // same classification as a direct type operand, including unresolved array bases.
+            super::classify_type_test_tokens(
+                assembly, module, asm, type_index, &[*token].into_iter().collect(),
+            );
             let own_row = (!meaning.is_empty() && token.table() == TYPE_DEF)
                 .then(|| module.type_id_of(asm, *token))
                 .flatten();

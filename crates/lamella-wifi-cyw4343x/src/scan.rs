@@ -2,7 +2,9 @@
 //! result to the networks it lists, and the record handed to the caller.
 //!
 //! A scan is started by a set of the `escan` variable carrying 74 bytes of
-//! parameters; its results arrive as scan-result events whose payload is a
+//! parameters, which name no network and so ask for any, or name one
+//! network, which then answers even when it does not broadcast its name;
+//! its results arrive as scan-result events whose payload is a
 //! 12-byte head (the buffer length, the version, the sync id the request
 //! carried, the record count) followed by one record per network seen,
 //! each record stepped by its own length field. The fields at stable
@@ -184,6 +186,19 @@ pub fn params(sync: u16) -> [u8; PARAMS_LEN] {
     for at in [52, 56, 60, 64] {
         p[at..at + 4].copy_from_slice(&request::DEFAULT.to_le_bytes());
     }
+    p
+}
+
+/// The parameter bytes of the same scan asking for the network named
+/// `name`: the plain form with the name's length as a 32-bit word at 8 and
+/// its bytes from 12, so that the radio's probe requests carry the name and
+/// a network that does not broadcast it answers. A name longer than 32
+/// bytes is cut at 32.
+pub fn params_for(sync: u16, name: &[u8]) -> [u8; PARAMS_LEN] {
+    let mut p = params(sync);
+    let len = name.len().min(SSID_MAX);
+    p[8..12].copy_from_slice(&(len as u32).to_le_bytes());
+    p[12..12 + len].copy_from_slice(&name[..len]);
     p
 }
 

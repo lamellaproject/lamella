@@ -28,12 +28,13 @@ namespace Lamella.Boards.Bbc
             Buses.BindI2c(I2cBusId, new I2cDriverFactory(MakeI2c), I2cBusHz);
         }
 
-        /// <summary>The logical bus id of the edge connector's SPI (SCK P0.23, MISO P0.22, MOSI
-        /// P0.21), as <c>SpiConnectionSettings</c> names it.</summary>
+        /// <summary>The bus id of the edge connector's SPI (SCK P0.23, MISO P0.22, MOSI P0.21), as
+        /// <c>SpiConnectionSettings</c> names it: 1, the number of SPI1, the block that serves
+        /// it.</summary>
         /// <remarks>The edge connector names no chip select for this bus, so its only line is -1:
         /// a device on it is opened with <c>ChipSelectLine</c> -1 and selected through a pin the
         /// program drives itself. Any other line is refused.</remarks>
-        public const int EdgeSpiBusId = 0;
+        public const int EdgeSpiBusId = 1;
 
         private static SpiDriver MakeSpi() { return new Nrf51SpiDriver(SpiBinding()); }
 
@@ -87,8 +88,9 @@ namespace Lamella.Boards.Bbc
         public static readonly uint I2cFreqWord250k = Nrf51TwiLayout.FREQUENCY_K250;
         public static readonly uint I2cFreqWord400k = Nrf51TwiLayout.FREQUENCY_K400;
 
-        /// <summary>The logical bus id of the board's one I2C bus (TWI0: SCL P0.00, SDA P0.30), as
-        /// <c>I2cConnectionSettings</c> names it. The on-board motion sensor and the edge
+        /// <summary>The bus id of the board's one I2C bus (SCL P0.00, SDA P0.30), as
+        /// <c>I2cConnectionSettings</c> names it: 0, the number of TWI0, the block that serves it.
+        /// The on-board motion sensor and the edge
         /// connector's pins 19 and 20 are the same bus, so a scan of it sees whatever is wired to
         /// the edge as well as what is soldered down. It runs at <see cref="I2cBusHz"/>.</summary>
         public const int I2cBusId = 0;

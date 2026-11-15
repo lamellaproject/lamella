@@ -28,7 +28,7 @@ use crate::link::{
     KEY_LEN, Passphrase, SAE_PASSWORD_LEN, SSID_STRUCT_LEN, SaePassword, key_structure,
     sae_password_structure, ssid_structure,
 };
-use crate::scan::{PARAMS_LEN, params};
+use crate::scan::{PARAMS_LEN, params, params_for};
 use crate::transport::Transport;
 
 /// The control header's length in bytes.
@@ -299,6 +299,14 @@ pub enum Payload<'b> {
         /// The sync id the results echo.
         sync: u16,
     },
+    /// The 74-byte parameters of a scan tagged with a sync id that asks
+    /// for one network by its name.
+    ScanFor {
+        /// The sync id the results echo.
+        sync: u16,
+        /// The network's name, 1 to 32 bytes.
+        name: &'b [u8],
+    },
 }
 
 impl Payload<'_> {
@@ -313,7 +321,7 @@ impl Payload<'_> {
             Payload::Key(_) => KEY_LEN,
             Payload::SaePassword(_) => SAE_PASSWORD_LEN,
             Payload::Ssid(_) => SSID_STRUCT_LEN,
-            Payload::Scan { .. } => PARAMS_LEN,
+            Payload::Scan { .. } | Payload::ScanFor { .. } => PARAMS_LEN,
         }
     }
 
@@ -347,6 +355,9 @@ impl Payload<'_> {
             }
             Payload::Ssid(ssid) => into[..SSID_STRUCT_LEN].copy_from_slice(&ssid_structure(ssid)),
             Payload::Scan { sync } => into[..PARAMS_LEN].copy_from_slice(&params(sync)),
+            Payload::ScanFor { sync, name } => {
+                into[..PARAMS_LEN].copy_from_slice(&params_for(sync, name));
+            }
         }
     }
 }

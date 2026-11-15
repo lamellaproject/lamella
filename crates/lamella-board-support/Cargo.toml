@@ -16,6 +16,13 @@ board-raspberrypi-pico-2 = []
 board-raspberrypi-pico-2-w = []
 board-pimoroni-pico-plus-2 = []
 board-pimoroni-pico-plus-2-w = []
+board-adafruit-feather-rp2350-hstx = []
+board-adafruit-feather-rp2350-hstx-psram = []
+board-adafruit-metro-rp2350 = []
+board-adafruit-metro-rp2350-psram = []
+board-pimoroni-pico-lipo-2 = []
+board-pimoroni-pico-lipo-2-xl-w = []
+board-sparkfun-iot-redboard-rp2350 = []
 
 [dependencies]
 # The bring-up of a QSPI PSRAM a board fits: the part's facts, the window's timing, the RP2350's

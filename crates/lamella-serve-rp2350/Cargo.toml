@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Interpreter firmware for RP2350 boards (the Raspberry Pi Pico 2 and Pico 2 W, and the Pimoroni Pico Plus 2 and Plus 2 W): it runs the C# or Python interpreter, takes programs from the lamella CLI over USB, and brings up the board's flash, USB and Wi-Fi."
+description = "Interpreter firmware for RP2350 boards (the Raspberry Pi Pico 2 and Pico 2 W; the Pimoroni Pico Plus 2, Plus 2 W, Pico LiPo 2 and Pico LiPo 2 XL W; the Adafruit Feather RP2350 with HSTX and the Metro RP2350, each with and without PSRAM; and the SparkFun IoT RedBoard - RP2350): it runs the C# or Python interpreter, takes programs from the lamella CLI over USB, and brings up the board's flash, USB, PSRAM and Wi-Fi."
 publish = false
 
 [dependencies]
@@ -18,9 +18,9 @@ lamella-runner = { path = "../lamella-runner", optional = true, default-features
 # The reclaiming O(1) segregated global allocator: deployed apps run unbounded, and the M33
 # has the atomic CAS its spin lock needs. Pulled by the `rp2350` part feature.
 lamella-heap = { path = "../lamella-heap", optional = true }
-# The board's half of an image, for the PSRAM bring-up the two Pico Plus 2 boards take: the one
-# call that brings the part up, proves it and wipes it, which the AOT startup makes too. Pulled by
-# the `pico-plus-2` and `pico-plus-2-w` board features, each naming its board.
+# The board's half of an image, for the PSRAM bring-up of a board whose PSRAM joins the heap: its
+# descriptor, and the one call that brings the part up, proves it and wipes it, which the AOT
+# startup makes too. Pulled by `psram-heap`; each board feature that takes it names its board.
 lamella-board-support = { path = "../lamella-board-support", optional = true }
 # The PSRAM's own crate, for the full walk the `psram-full-walk` flight aid runs.
 lamella-psram-qspi = { path = "../lamella-psram-qspi", features = ["rp2350-qmi"], optional = true }
@@ -61,15 +61,6 @@ lamella-tls-roots = { path = "../lamella-tls-roots", optional = true }
 # The Python bytecode interpreter (rp2350-python-interpreter). `default-features = false` so every capability this
 # image carries is named by a recipe rather than inherited -- see the `python-float` feature.
 lamella-py-runtime = { path = "../lamella-py-runtime", optional = true, default-features = false }
-# The WebAssembly bring-up image (the `rp2350-wasm-proof` example): the wasm engine plus the
-# interpreter bridge, which serves a guest's bus imports through the C# driver stack. It is a
-# part-gated bare-metal image for this family, so it lives with the family's firmware. Optional,
-# behind `wasm-proof`, so every other build of this crate is unchanged.
-lamella-wasm-interp = { path = "../lamella-wasm-interp", optional = true }
-lamella-wasm-bridge = { path = "../lamella-wasm-bridge", optional = true }
-# The volatile MMIO seam the interpreted I2C driver reaches its registers through; the image
-# installs it on the VM before the harness's Main runs.
-lamella-mmio = { path = "../lamella-mmio", optional = true }
 
 [features]
 # A debugging aid, off by default: mirror every console byte into a RAM buffer so a debug probe
@@ -82,24 +73,25 @@ console-mirror = []
 # classes). It walks the free lists once per line, so it is off in a release image.
 arena-trace = []
 # The firmware that takes programs from the lamella CLI over UART and, with `usb`, over USB:
-# lamella-wire framing and the lamella-runner baked-image core. Combine with the part feature --
-# e.g. `serve,rp2350` (Pico 2), `serve,rp2350,usb,cyw43` (Pico 2 W),
-# `serve,rp2350,usb,pico-plus-2` (Pico Plus 2) or `serve,rp2350,usb,pico-plus-2-w` (Pico Plus 2 W).
+# lamella-wire framing and the lamella-runner baked-image core. Combine with the part feature and,
+# for a board other than the Pico 2 and Pico 2 W, that board's feature (the boards are below) --
+# e.g. `serve,rp2350` (Pico 2), `serve,rp2350,usb,cyw43` (Pico 2 W) or
+# `serve,rp2350,usb,pico-lipo-2` (Pico LiPo 2).
 serve = ["dep:lamella-wire", "dep:lamella-runner", "dep:critical-section", "dep:lamella-pin-events"]
-# The RP2350 part (Cortex-M33 / ARMv8-M, 520 KB SRAM; 4 MB of XIP flash on the Pico 2 and
-# Pico 2 W, 16 MB on the Pimoroni Pico Plus 2 and Plus 2 W): a firmware build takes the runner's
-# full profile and the reclaiming heap.
+# The RP2350 part (Cortex-M33 / ARMv8-M, 520 KB SRAM; XIP flash on the board, 4 MB on the Pico 2
+# and Pico 2 W, 8 MB on the two Feathers and 16 MB on the other boards): a firmware build takes the
+# runner's full profile and the reclaiming heap.
 rp2350 = ["lamella-runner?/profile-full", "dep:lamella-heap"]
 # The native-USB carrier for a firmware build: the RP2350 device controller under the shared
 # usb_transport carrier; the board's own USB port then carries the Lamella Link (no probe,
 # no jumpers). Combine with `serve,rp2350` -- e.g. `serve,rp2350,usb`.
 usb = ["dep:usb-device", "dep:critical-section"]
-# The Pico 2 W's CYW43439 wireless (pico_wifi.rs, gSPI over PIO0): the board identity flips to
-# PICO2_W, the build downloads the radio's images and checks them against their pins, the
-# bring-up and the join of the network the board stores (or, in a development build, the one named
-# at build time) narrate into the first evaluation's stdout, and evaluations get a smoltcp
-# NetBackend over the chip's ethernet data channel that lends the radio to a program's Wi-Fi
-# classes. Combine with `serve,rp2350,usb`.
+# The CYW43439 wireless on the four lines the Pico 2 W gives it, GP23, GP24, GP25 and GP29
+# (pico_wifi.rs, gSPI over PIO0): the build downloads the radio's images and checks them against
+# their pins. A network joins in the background without writing setup diagnostics, and evaluations
+# get a smoltcp NetBackend over the chip's ethernet data channel that lends the radio to a
+# program's Wi-Fi classes. With no board feature, the board is the Pico 2 W. Combine with
+# `serve,rp2350,usb`.
 cyw43 = [
     "dep:smoltcp",
     "dep:lamella-net-core",
@@ -109,22 +101,62 @@ cyw43 = [
     "dep:lamella-wifi-images",
     "lamella-cil-runtime/wifi",
 ]
-# The Pimoroni Pico Plus 2 W: the same firmware and the same CYW43439 radio on the same four lines
-# (its RM2 module), with its own board file and its own identity (PICO_PLUS_2_W). Combine with
-# `serve,rp2350,usb` -- `serve,rp2350,usb,pico-plus-2-w`. Its 8 MB PSRAM joins the heap at boot.
+# THE BOARDS. With none of these features, the firmware is the Raspberry Pi Pico 2's, or with
+# `cyw43` the Pico 2 W's. Each picks its board's file, the identity the firmware answers a host
+# with, and the flash its deploy window runs to; the build refuses two of them together. Combine
+# one with `serve,rp2350,usb` -- e.g. `serve,rp2350,usb,pico-plus-2`. A board without a radio on
+# the Pico 2 W's four lines cannot take `cyw43`, and the build refuses that combination too.
+#
+# The Pimoroni Pico Plus 2: an RP2350B with no radio. Its 8 MB PSRAM joins the heap at boot.
+pico-plus-2 = ["named-board", "psram-heap", "lamella-board-support/board-pimoroni-pico-plus-2"]
+# The Pimoroni Pico Plus 2 W: the Plus 2 with the CYW43439 radio, in its RM2 module, on the Pico
+# 2 W's four lines. Its 8 MB PSRAM joins the heap at boot.
 pico-plus-2-w = [
+    "named-board",
     "cyw43",
-    "dep:lamella-board-support",
+    "psram-heap",
     "lamella-board-support/board-pimoroni-pico-plus-2-w",
 ]
-# The Pimoroni Pico Plus 2: the Pico 2's firmware on an RP2350B with no radio, with its own board
-# file and its own identity (PICO_PLUS_2). Combine with `serve,rp2350,usb` --
-# `serve,rp2350,usb,pico-plus-2`. It cannot take `cyw43`: the board has no radio, and the build
-# refuses the combination. Its 8 MB PSRAM joins the heap at boot.
-pico-plus-2 = ["dep:lamella-board-support", "lamella-board-support/board-pimoroni-pico-plus-2"]
-# A flight aid, off by default: before the heap takes a Pico Plus 2 board's PSRAM, walk every word
-# of it under two patterns, through both views, and say the result and how long it took. It costs
-# seconds at every boot, so it is off in a release image.
+# The Pimoroni Pico LiPo 2: an RP2350B with no radio. Its 8 MB PSRAM joins the heap at boot.
+pico-lipo-2 = ["named-board", "psram-heap", "lamella-board-support/board-pimoroni-pico-lipo-2"]
+# The Pimoroni Pico LiPo 2 XL W: the LiPo 2 with the CYW43439 radio, in its RM2 module, on the
+# Pico 2 W's four lines. Its 8 MB PSRAM joins the heap at boot.
+pico-lipo-2-xl-w = [
+    "named-board",
+    "cyw43",
+    "psram-heap",
+    "lamella-board-support/board-pimoroni-pico-lipo-2-xl-w",
+]
+# The Adafruit Feather RP2350 with HSTX: an RP2350A with no radio and no PSRAM.
+feather-rp2350-hstx = ["named-board"]
+# The Adafruit Feather RP2350 with HSTX and 8 MB PSRAM: an RP2350A with no radio. No document of
+# the board's maker prints its PSRAM's part, so the firmware brings up no PSRAM and runs from the
+# flash and the chip's SRAM, as on the board without one.
+feather-rp2350-hstx-psram = ["named-board"]
+# The Adafruit Metro RP2350: an RP2350B with no radio and no PSRAM.
+metro-rp2350 = ["named-board"]
+# The Adafruit Metro RP2350 with PSRAM: an RP2350B with no radio. Its firmware runs from the flash
+# and the chip's SRAM, for the reason the Feather's with PSRAM does.
+metro-rp2350-psram = ["named-board"]
+# The SparkFun IoT RedBoard - RP2350: an RP2350B whose 8 MB PSRAM joins the heap at boot. ITS
+# FIRMWARE HAS NO WI-FI. The board's radio, in its RM2 module, is on GP24, GP36, GP37 and GP38,
+# and the driver runs the radio on the Pico 2 W's four lines only, so the build refuses `cyw43`
+# with this board, and the radio's four lines stay reserved: a program cannot claim them.
+iot-redboard-rp2350 = [
+    "named-board",
+    "psram-heap",
+    "lamella-board-support/board-sparkfun-iot-redboard-rp2350",
+]
+# Pulled by each board feature above and named by no recipe: with it off, the board is the Pico 2
+# or, with `cyw43`, the Pico 2 W.
+named-board = []
+# The board's PSRAM, brought up at the final clk_sys, proven and wiped, then handed to the heap as
+# its second region, after SRAM. Pulled by the board features above whose board brings its PSRAM
+# up, never on its own: the bring-up reads the PSRAM from the board's descriptor.
+psram-heap = ["dep:lamella-board-support"]
+# A flight aid, off by default: before the heap takes a board's PSRAM, walk every word of it under
+# two patterns, through both views, and say the result and how long it took. It costs seconds at
+# every boot, so it is off in a release image. It walks nothing on a board without `psram-heap`.
 psram-full-walk = ["dep:lamella-psram-qspi"]
 # TLS on the interpreter over the wireless network: mbedTLS behind the runtime's TLS seam, keyed by
 # the RP2350's TRNG. Combine with a cyw43 build -- e.g. `serve,rp2350,usb,cyw43,tls`.
@@ -146,23 +178,10 @@ system-roots = ["tls", "dep:lamella-tls-roots"]
 # reporting a wrong feature combination. Tying the two features together here rules that
 # combination out in the feature graph, before it can reach the RAM budget.
 resident-corlib = ["lamella-runner?/corlib-lazy"]
-# The WebAssembly bring-up image (the `rp2350-wasm-proof` example): a rustc-compiled wasm guest
-# reads the I2C bus through the CIL interpreter running the C# I2C driver. Combine with the part --
-# `rp2350,wasm-proof`. It does not take `serve`: the image reports over UART rather than taking
-# programs from a host.
-wasm-proof = [
-    "dep:lamella-wasm-interp",
-    "dep:lamella-wasm-bridge",
-    "dep:lamella-mmio",
-    # The same execute-in-place level the interpreter firmware's profiles take, and for the same
-    # reason: the embedded assemblies already sit in flash as `include_bytes!` statics, so the
-    # loader borrows the method bodies instead of copying them into the arena.
-    "lamella-wasm-bridge/code-in-place",
-]
 # A diagnostic image (the `rp2350-i2c-scan` example) that walks I2C0 and reports which addresses
 # answer. Combine with the part -- `rp2350,i2c-scan`. It takes no dependency of its own: the whole
 # image is the generated chip and board facts plus raw MMIO, so it builds and flashes without the
-# interpreter, wasm or USB stacks.
+# interpreter or USB stacks.
 i2c-scan = []
 # The Python bytecode interpreter linked bare-metal (rp2350-python-interpreter): the board runs a
 # bundle the host compiled and prints what the program prints. Combine with the part --

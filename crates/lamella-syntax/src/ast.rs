@@ -464,13 +464,11 @@ pub enum ExprKind {
         ///
         initializer: Option<Initializer>,
     },
-    /// An array creation `new element[lengths] extra-ranks` (14.5.10.2). When
-    /// `lengths` is empty the size came from an initializer, which is not yet
-    /// parsed; `rank` is the first dimension's rank and `extra_ranks` the trailing
-    /// jagged ranks.
+    /// An array creation `new element[lengths] extra-ranks` (14.5.10.2), or
+    /// `new[commas] { ... }` (C# 3). Empty `lengths` are inferred from the initializer.
     ArrayCreation {
-        /// The element (non-array) type.
-        element: TypeRef,
+        /// The written non-array element type; `None` for an implicitly typed array.
+        element: Option<TypeRef>,
         /// The size expressions of the first dimension; empty if unsized.
         lengths: Vec<Expr>,
         /// The rank of the first dimension.
@@ -1701,8 +1699,8 @@ pub enum Member {
         is_vararg: bool,
         /// The `: base(...)` or `: this(...)` initializer, if present.
         initializer: Option<ConstructorInitializer>,
-        /// The constructor body.
-        body: Stmt,
+        /// The constructor body, or `None` for an extern declaration's `;`.
+        body: Option<Stmt>,
         /// The signature header -- the declaration start through the parameter list's
         /// close paren -- for the debug sequence point on an implicit `: base()` call
         /// (csc stops there before the body, so `step into` a constructor halts on it).
@@ -1818,8 +1816,8 @@ pub enum Member {
         operator: OverloadableOperator,
         /// The operand parameters (one for unary, two for binary).
         parameters: Vec<Parameter>,
-        /// The operator body.
-        body: Stmt,
+        /// The operator body, or `None` for an extern declaration's `;`.
+        body: Option<Stmt>,
         /// The member's attributes (24.2), carried to the `op_*` method row.
         attributes: Vec<AttributeSection>,
         /// The byte range the member covers.
@@ -1836,8 +1834,8 @@ pub enum Member {
         target: TypeRef,
         /// The single source parameter.
         parameters: Vec<Parameter>,
-        /// The operator body.
-        body: Stmt,
+        /// The operator body, or `None` for an extern declaration's `;`.
+        body: Option<Stmt>,
         /// The member's attributes (24.2), carried to the `op_Implicit`/`op_Explicit` row.
         attributes: Vec<AttributeSection>,
         /// The byte range the member covers.
@@ -1849,8 +1847,8 @@ pub enum Member {
         modifiers: Vec<Modifier>,
         /// The destructor name (the type name).
         name: Box<str>,
-        /// The destructor body.
-        body: Stmt,
+        /// The destructor body, or `None` for an extern declaration's `;`.
+        body: Option<Stmt>,
         /// The member's attributes (24.2), carried to the synthesized `Finalize` row.
         attributes: Vec<AttributeSection>,
         /// The byte range the member covers.
@@ -2368,6 +2366,9 @@ pub enum Literal {
         value: u64,
         /// The `U`/`L` suffix, if any.
         suffix: IntegerSuffix,
+        /// Whether this value is a decimal integer literal in the source. Folded constants and
+        /// synthesized values are false, even when they have the same numeric value.
+        decimal: bool,
     },
     /// A real literal: its value as `f64` bits (see [`f64::from_bits`]; stored as
     /// bits so the AST stays `Eq`) and the type suffix.

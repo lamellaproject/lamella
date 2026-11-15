@@ -95,6 +95,119 @@ pub fn bake_for_inspecting(
     bake_inspecting(program, set.carried(), set.board_buses(), uncarried_advice, inspect).map_err(Refused::Bake)
 }
 
+/// The `MethodDef` metadata table's tag, in a token.
+const METHOD_DEF: u8 = 0x06;
+
+/// The line map of a baked image, for a debugger: built from `module`, the module the image is
+/// written from ([`bake_inspecting`]), where `app` is the id of `program`, the assembly that was
+/// baked, and `pdb` is that assembly's portable PDB. Each method of the program that has a sequence
+/// point is keyed by its id in the image, with the document it is in, its name (`Type.Method`, or
+/// `Namespace.Type.Method`), its sequence points in order (IL offset, line and column), its locals
+/// by slot, each with its name and its class ([`local_entry`]), and the names of its arguments by
+/// number ([`argument_names`]); and the program's entry point is named by its id in the image. A
+/// method the trim removed has no id in the image, and no entry; one the image keeps, such as a
+/// virtual method of a type the program makes, keeps its code and its entry, whether or not
+/// anything calls it.
+///
+/// As JSON, the shape a Lamella Link debugger reads: `{"methods": {"<id>": {"document", "name",
+/// "points": [{"o", "l", "c"}], "locals": [{"index", "name", "kind"}], "arguments": [{"index",
+/// "name"}]}}, "entryPoint", "error"}`. A reader takes the keys it knows and passes over any other,
+/// so an entry can gain a key without a reader that does not know the key reading it differently.
+///
+/// # Errors
+/// A program or a symbol file that does not parse.
+pub fn source_map(module: &lamella_cil_runtime::Module, app: u8, program: &[u8], pdb: &[u8]) -> Result<Vec<u8>, String> {
+    use serde_json::{Map, Value, json};
+    let pdb = lamella_metadata::PortablePdb::read(pdb).map_err(|error| format!("the symbol file does not parse: {error:?}"))?;
+    let assembly = Assembly::read(program).map_err(|error| format!("the program does not parse: {error:?}"))?;
+    let mut names = std::collections::HashMap::new();
+    let mut arguments = std::collections::HashMap::new();
+    let mut local_types = std::collections::HashMap::new();
+    for type_def in assembly.type_defs() {
+        let type_name = type_def.name();
+        for method in type_def.methods() {
+            let leaf = method.name().unwrap_or_default();
+            let qualified = match &type_name {
+                Some(name) if !name.namespace.is_empty() => format!("{}.{}.{leaf}", name.namespace, name.name),
+                Some(name) => format!("{}.{leaf}", name.name),
+                None => leaf.to_string(),
+            };
+            names.insert(method.rid(), qualified);
+            arguments.insert(method.rid(), argument_names(&method));
+            local_types.insert(method.rid(), method.local_variables());
+        }
+    }
+    let mut methods = Map::new();
+    for rid in 1..=pdb.method_count() {
+        let Some(method_id) = module.resolve(app, lamella_token::Token::new(METHOD_DEF, rid)) else {
+            continue;
+        };
+        let points: Vec<Value> = pdb
+            .sequence_points(rid)
+            .into_iter()
+            .filter(|point| !point.is_hidden)
+            .map(|point| json!({ "o": point.il_offset, "l": point.start_line, "c": point.start_column }))
+            .collect();
+        if points.is_empty() {
+            continue;
+        }
+        let types = local_types.get(&rid).map_or(&[][..], Vec::as_slice);
+        let locals: Vec<Value> = pdb
+            .local_variables(rid)
+            .into_iter()
+            .map(|local| local_entry(local.index, local.name, types))
+            .collect();
+        methods.insert(
+            method_id.to_string(),
+            json!({
+                "document": pdb.method_document(rid).unwrap_or_default(),
+                "name": names.get(&rid).cloned().unwrap_or_default(),
+                "points": points,
+                "locals": locals,
+                "arguments": arguments.remove(&rid).unwrap_or_default(),
+            }),
+        );
+    }
+    let entry_point = pdb.entry_point().and_then(|token| module.resolve(app, token)).map_or(Value::Null, Value::from);
+    serde_json::to_vec(&json!({ "methods": methods, "entryPoint": entry_point, "error": Value::Null }))
+        .map_err(|error| format!("the line map does not encode: {error}"))
+}
+
+/// A line map's entry for the local in `slot` named `name`, where `types` are the method's local
+/// types by slot: the slot, the name and, under `kind`, the [`StackClass::keyword`] of the class its
+/// type's values take ([`lamella_metadata::SigType::stack_class`]). That class's zero is what a
+/// debugger shows the local at before the method first stores it. A local whose class its type does
+/// not decide, such as a struct's or an enum's, has no `kind`.
+///
+/// [`StackClass::keyword`]: lamella_metadata::StackClass::keyword
+fn local_entry(slot: u16, name: &str, types: &[lamella_metadata::SigType]) -> serde_json::Value {
+    match types.get(usize::from(slot)).and_then(lamella_metadata::SigType::stack_class) {
+        Some(class) => serde_json::json!({ "index": slot, "name": name, "kind": class.keyword() }),
+        None => serde_json::json!({ "index": slot, "name": name }),
+    }
+}
+
+/// The names of `method`'s arguments, each with its argument number, as the wire numbers a frame's
+/// arguments: `this` is argument 0 of an instance method, and a static method's first parameter is
+/// its argument 0. The names are the assembly's own (its `Param` rows), which a Portable PDB does not
+/// carry; a parameter with no recorded name is left out, for the debugger's own spelling of it.
+fn argument_names(method: &lamella_metadata::Method<'_>) -> Vec<serde_json::Value> {
+    let instance = !method.is_static();
+    let mut named = Vec::new();
+    if instance {
+        named.push(serde_json::json!({ "index": 0, "name": "this" }));
+    }
+    for param in method.params() {
+        let (sequence, Some(name)) = (param.sequence(), param.name()) else { continue };
+        if sequence == 0 || name.is_empty() {
+            continue;
+        }
+        let index = if instance { sequence } else { sequence - 1 };
+        named.push(serde_json::json!({ "index": index, "name": name }));
+    }
+    named
+}
+
 /// Bake a compiled assembly into a `.lmli` flash image, with the corlib and the libraries it was
 /// compiled against.
 ///

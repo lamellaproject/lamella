@@ -381,23 +381,25 @@ namespace System
             return ParseBaseN(value, fromBase, 64, false);
         }
 
-        public static byte ToByte(string value, IFormatProvider provider) { return ToByte(value); }
-        public static sbyte ToSByte(string value, IFormatProvider provider) { return SByte.Parse(value); }
-        public static short ToInt16(string value, IFormatProvider provider) { return ToInt16(value); }
-        public static ushort ToUInt16(string value, IFormatProvider provider) { return ToUInt16(value); }
-        public static int ToInt32(string value, IFormatProvider provider) { return ToInt32(value); }
-        public static uint ToUInt32(string value, IFormatProvider provider) { return ToUInt32(value); }
-        public static long ToInt64(string value, IFormatProvider provider) { return ToInt64(value); }
-        public static ulong ToUInt64(string value, IFormatProvider provider) { return ToUInt64(value); }
+        // Forward the provider to the numeric type even with invariant number settings:
+        // querying a custom provider can have side effects or throw an exception.
+        public static byte ToByte(string value, IFormatProvider provider) { return (object)value == null ? (byte)0 : Byte.Parse(value, provider); }
+        public static sbyte ToSByte(string value, IFormatProvider provider) { return SByte.Parse(value, provider); }
+        public static short ToInt16(string value, IFormatProvider provider) { return (object)value == null ? (short)0 : Int16.Parse(value, provider); }
+        public static ushort ToUInt16(string value, IFormatProvider provider) { return (object)value == null ? (ushort)0 : UInt16.Parse(value, provider); }
+        public static int ToInt32(string value, IFormatProvider provider) { return (object)value == null ? 0 : Int32.Parse(value, provider); }
+        public static uint ToUInt32(string value, IFormatProvider provider) { return (object)value == null ? 0 : UInt32.Parse(value, provider); }
+        public static long ToInt64(string value, IFormatProvider provider) { return (object)value == null ? 0 : Int64.Parse(value, provider); }
+        public static ulong ToUInt64(string value, IFormatProvider provider) { return (object)value == null ? 0 : UInt64.Parse(value, provider); }
 
-        public static string ToString(byte value, IFormatProvider provider) { return ToString(value); }
-        public static string ToString(sbyte value, IFormatProvider provider) { return ToString(value); }
-        public static string ToString(short value, IFormatProvider provider) { return ToString(value); }
-        public static string ToString(ushort value, IFormatProvider provider) { return ToString(value); }
-        public static string ToString(int value, IFormatProvider provider) { return ToString(value); }
-        public static string ToString(uint value, IFormatProvider provider) { return ToString(value); }
-        public static string ToString(long value, IFormatProvider provider) { return ToString(value); }
-        public static string ToString(ulong value, IFormatProvider provider) { return ToString(value); }
+        public static string ToString(byte value, IFormatProvider provider) { return value.ToString(provider); }
+        public static string ToString(sbyte value, IFormatProvider provider) { return value.ToString(provider); }
+        public static string ToString(short value, IFormatProvider provider) { return value.ToString(provider); }
+        public static string ToString(ushort value, IFormatProvider provider) { return value.ToString(provider); }
+        public static string ToString(int value, IFormatProvider provider) { return value.ToString(provider); }
+        public static string ToString(uint value, IFormatProvider provider) { return value.ToString(provider); }
+        public static string ToString(long value, IFormatProvider provider) { return value.ToString(provider); }
+        public static string ToString(ulong value, IFormatProvider provider) { return value.ToString(provider); }
 
 
         public static sbyte ToSByte(bool value)
@@ -997,16 +999,16 @@ namespace System
             return Single.Parse(value);
         }
 
-        public static double ToDouble(string value, IFormatProvider provider) { return ToDouble(value); }
-        public static float ToSingle(string value, IFormatProvider provider) { return ToSingle(value); }
+        public static double ToDouble(string value, IFormatProvider provider) { return (object)value == null ? 0 : Double.Parse(value, provider); }
+        public static float ToSingle(string value, IFormatProvider provider) { return (object)value == null ? 0 : Single.Parse(value, provider); }
 
         public static bool ToBoolean(double value) { return value != 0.0; }
         public static bool ToBoolean(float value) { return value != 0.0f; }
 
         public static string ToString(double value) { return value.ToString(); }
         public static string ToString(float value) { return value.ToString(); }
-        public static string ToString(double value, IFormatProvider provider) { return value.ToString(); }
-        public static string ToString(float value, IFormatProvider provider) { return value.ToString(); }
+        public static string ToString(double value, IFormatProvider provider) { return value.ToString(provider); }
+        public static string ToString(float value, IFormatProvider provider) { return value.ToString(provider); }
 #endif
 
 #if LAMELLA_SURFACE_DECIMAL
@@ -1077,11 +1079,11 @@ namespace System
             return Decimal.Parse(value);
         }
 
-        public static Decimal ToDecimal(string value, IFormatProvider provider) { return ToDecimal(value); }
+        public static Decimal ToDecimal(string value, IFormatProvider provider) { return (object)value == null ? Decimal.Zero : Decimal.Parse(value, provider); }
 
         public static bool ToBoolean(Decimal value) { return value != Decimal.Zero; }
         public static string ToString(Decimal value) { return value.ToString(); }
-        public static string ToString(Decimal value, IFormatProvider provider) { return value.ToString(); }
+        public static string ToString(Decimal value, IFormatProvider provider) { return value.ToString(provider); }
 
 #if LAMELLA_SURFACE_FLOAT
         public static Decimal ToDecimal(double value) { return new Decimal(value); }

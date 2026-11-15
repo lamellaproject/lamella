@@ -20,6 +20,10 @@ pub enum Error {
     NotFound,
     /// The operating system's USB layer failed; carries a description.
     Os(String),
+    /// Another program holds the device: the operating system refused the open in the way it refuses
+    /// one beside a holder, so nothing reached the device. Carries what it said, and reads as
+    /// [`Error::Os`] does.
+    Held(String),
     /// A transfer, a read, a write or a control transfer, did not complete within its timeout.
     Timeout,
     /// This operating system's backend is not implemented yet.
@@ -32,7 +36,7 @@ impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Error::NotFound => write!(f, "no matching USB device"),
-            Error::Os(msg) => write!(f, "USB error: {msg}"),
+            Error::Os(msg) | Error::Held(msg) => write!(f, "USB error: {msg}"),
             Error::Timeout => write!(f, "USB transfer timed out"),
             Error::Unsupported => write!(f, "USB backend not implemented on this platform"),
             Error::InvalidRequest(why) => write!(f, "USB request not sent: {why}"),
@@ -251,10 +255,10 @@ pub(crate) fn open_rank(has_pair: Option<bool>, name: Option<&str>, spec_shape: 
 
 /// What trying to open one interface came to.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
-pub(crate) enum Attempt<T> {
+pub(crate) enum Attempt<T, R = String> {
     Opened(T),
     /// The OS would not give it up, and said this.
-    Refused(String),
+    Refused(R),
     /// Not one to use, which says nothing about the device's others: another serial, or no bulk pair.
     Passed,
 }
@@ -268,10 +272,10 @@ pub(crate) enum Attempt<T> {
 /// Another device is another matter, and it may be the one that was named. Linux gets the same answer by
 /// choosing one interface for each device before it opens anything.
 #[cfg_attr(target_os = "linux", allow(dead_code))]
-pub(crate) fn first_that_opens<D: PartialEq, I, T>(
+pub(crate) fn first_that_opens<D: PartialEq, I, T, R>(
     interfaces: impl IntoIterator<Item = (D, I)>,
-    mut attempt: impl FnMut(I) -> Attempt<T>,
-) -> std::result::Result<Option<T>, String> {
+    mut attempt: impl FnMut(I) -> Attempt<T, R>,
+) -> std::result::Result<Option<T>, R> {
     let mut refused: Vec<D> = Vec::new();
     let mut why = None;
     for (device, interface) in interfaces {
@@ -815,6 +819,63 @@ impl ControlInterface {
             Err(Error::Os(format!("the device took {taken} of the {} bytes sent", data.len())))
         }
     }
+
+    /// Sends `data` as one transfer on the interface's own bulk OUT endpoint, or a zero-length packet
+    /// when `data` is empty. The endpoint is the interface's, found when it was opened, so a device
+    /// with a bulk pair on another interface beside it is driven through the one asked for.
+    ///
+    /// `timeout` bounds the transfer as it does for [`control_in`](Self::control_in).
+    ///
+    /// # Errors
+    /// [`Error::InvalidRequest`], before anything is sent, for an interface with no bulk OUT endpoint.
+    /// [`Error::Timeout`] for a transfer that did not complete in time. [`Error::Os`] for any other
+    /// failure, an endpoint the device halted among them, and for a device that took fewer bytes than
+    /// were sent.
+    pub fn write_bulk(&mut self, data: &[u8], timeout: Duration) -> Result<()> {
+        let taken = self.0.write_bulk(data, bounded_milliseconds(timeout))?;
+        if taken == data.len() {
+            Ok(())
+        } else {
+            Err(Error::Os(format!("the device took {taken} of the {} bytes sent", data.len())))
+        }
+    }
+
+    /// Receives one transfer from the interface's own bulk IN endpoint into `buffer`, and answers how
+    /// many bytes it held: zero for a zero-length packet. A transfer ends when `buffer` is full or
+    /// when the device sends a packet shorter than the endpoint's largest.
+    ///
+    /// `timeout` bounds the transfer as it does for [`control_in`](Self::control_in). This is a read
+    /// of a reply, so a transfer that reaches the bound is a failure, and it is cancelled before this
+    /// returns.
+    ///
+    /// # Errors
+    /// [`Error::InvalidRequest`], before anything is asked of the device, for an interface with no bulk
+    /// IN endpoint. [`Error::Timeout`] for a transfer that did not complete in time. [`Error::Os`] for
+    /// any other failure, an endpoint the device halted among them.
+    pub fn read_bulk(&mut self, buffer: &mut [u8], timeout: Duration) -> Result<usize> {
+        self.0.read_bulk(buffer, bounded_milliseconds(timeout))
+    }
+
+    /// Clears a halt on both of the interface's bulk endpoints at both ends: the host's state for each,
+    /// and the device's, by CLEAR_FEATURE(ENDPOINT_HALT) on the default control pipe (USB 2.0, 9.4.1),
+    /// which also returns each endpoint's data toggle to DATA0 (9.4.5).
+    ///
+    /// For a caller holding evidence that an endpoint halted, such as a transfer the device stalled.
+    /// The request is not harmless on every device: [`Device::reset_endpoint`] names one that stops
+    /// answering an endpoint it was sent for.
+    ///
+    /// # Errors
+    /// [`Error::InvalidRequest`] for an interface without a bulk pair, and [`Error::Os`] for a clear
+    /// the OS reports as failed; both endpoints are tried either way.
+    pub fn clear_bulk_halts(&mut self) -> Result<()> {
+        self.0.clear_bulk_halts()
+    }
+}
+
+/// The refusal of a bulk call on an interface that has no `what` ("bulk OUT endpoint", "bulk pair"),
+/// worded once for every backend.
+pub(crate) fn interface_lacks(what: &str) -> Error {
+    Error::InvalidRequest(format!("the interface has no {what}"))
 }
 
 #[cfg(any(target_os = "macos", test))]

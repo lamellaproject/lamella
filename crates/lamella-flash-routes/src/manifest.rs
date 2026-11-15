@@ -282,12 +282,12 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
 }
 
 /// An optional string field.
-fn optional(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
+pub(crate) fn optional(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Option<String> {
     object.get(key).and_then(serde_json::Value::as_str).map(str::to_owned)
 }
 
 /// A required string field.
-fn string(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Result<String, String> {
+pub(crate) fn string(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Result<String, String> {
     object
         .get(key)
         .and_then(serde_json::Value::as_str)
@@ -296,7 +296,7 @@ fn string(object: &serde_json::Map<String, serde_json::Value>, key: &str) -> Res
 }
 
 /// A `base` as the record spells it: hex, with or without the `0x` a reader expects.
-fn parse_base(text: &str) -> Result<u32, String> {
+pub(crate) fn parse_base(text: &str) -> Result<u32, String> {
     let digits = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")).unwrap_or(text);
     u32::from_str_radix(digits, 16)
         .map_err(|_| format!("`base` {text:?} is not a hex address"))
@@ -320,14 +320,14 @@ pub fn attestation(manifest: &Manifest) -> String {
     }
 }
 
-/// Check `image` against what the sidecar says it is.
+/// Check `image` against what its record says it is.
 ///
 /// `extension` is the artifact's own extension, which is how the file says its format; the record
 /// says the same thing a second time and the two must agree.
 ///
 /// # Errors
 /// A length, digest or format the record disagrees with. Each refusal names the two values, because
-/// "does not match" leaves a reader with no way to tell a stale sidecar from a wrong image.
+/// "does not match" leaves a reader with no way to tell a stale record from a wrong image.
 pub fn check_identity(
     manifest: &Manifest,
     image: &[u8],
@@ -337,16 +337,16 @@ pub fn check_identity(
         Some(extension) if extension == manifest.format => {}
         Some(extension) => {
             return Err(format!(
-                "the sidecar describes a file in {:?} format and this one is {extension:?}.\n\
+                "its record describes a file in {:?} format and this one is {extension:?}.\n\
                  The Lamella RHU record describes `elf` and `bin`; an image in another format has no \
-                 sidecar that can\ndescribe it, so remove the sidecar or point at the artifact it \
+                 record that can\ndescribe it, so remove the record or point at the image it \
                  belongs to.",
                 manifest.format
             ));
         }
         None => {
             return Err(format!(
-                "the sidecar describes a file in {:?} format, and this file has no extension to \
+                "its record describes a file in {:?} format, and this file has no extension to \
                  check it against.",
                 manifest.format
             ));
@@ -356,8 +356,8 @@ pub fn check_identity(
     let length = image.len() as u64;
     if length != manifest.bytes {
         return Err(format!(
-            "the sidecar says {} B and the file is {length} B, so this is not the artifact it \
-             describes.",
+            "its record gives {} bytes and the file has {length} bytes, so the file is not the image \
+             the record describes.",
             manifest.bytes
         ));
     }
@@ -365,11 +365,9 @@ pub fn check_identity(
     let digest = hex(lamella_pe::sha256::sha256(image));
     if digest != manifest.sha256 {
         return Err(format!(
-            "the sidecar's digest does not match these bytes.\n\
-             \x20   sidecar  {}\n\
-             \x20   file     {digest}\n\
-             The record identifies the LINKED ARTIFACT AS SHIPPED, so a rebuild does not produce \
-             the same\ndigest and is not the same artifact.",
+            "the file's contents differ from the ones its record describes, so the file is not the \
+             image that record was written for: its record gives the SHA-256 {}, and the file's is \
+             {digest}.",
             manifest.sha256
         ));
     }
@@ -393,7 +391,7 @@ pub fn check_board(manifest: &Manifest, board_id: &str) -> Result<(), String> {
 }
 
 /// Lowercase hex, the spelling the record uses.
-fn hex(digest: [u8; 32]) -> String {
+pub(crate) fn hex(digest: [u8; 32]) -> String {
     let mut text = String::with_capacity(64);
     for byte in digest {
         text.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
@@ -602,8 +600,9 @@ mod tests {
     /// what a two-party record needs is the other party's bytes. This is the illustrative record
     /// from RHU's build contract, field for field and in its order, with only its two placeholders
     /// filled in -- so nine fields this reader does not know arrive together, an emulator board id
-    /// it cannot route arrives in `board`, and `base` arrives as the padded `0x00000000` rather
-    /// than the `0x0` every test above writes.
+    /// it cannot route arrives in `board`, `base` and `map` arrive as null, and both channel words
+    /// arrive. The same record as a raw image then reads with `base` in the padded `0x00000000`
+    /// spelling rather than the `0x0` every test above writes.
     #[test]
     fn the_other_producers_record_reads() {
         let bytes = b"image";
@@ -611,31 +610,44 @@ mod tests {
   "schema": 1,
   "kind": "flash-image",
   "model": "native",
-  "board": "mps2-an500",
-  "format": "bin",
-  "base": "0x00000000",
+  "board": "arm-mps2-an500",
+  "format": "elf",
+  "base": null,
   "sha256": "<sha256>",
   "bytes": <bytes>,
   "producer": "ilc+rhu-link",
   "elf": "app.elf",
-  "map": "app.map",
+  "map": null,
   "image_kind": "monolith",
   "layout_version": 1,
   "abi": 31,
   "debug_layout_version": 2,
-  "codegen_profile": "ship",
-  "runtime": "11.0.0-preview.7.26381.103",
-  "runtime_tested": true
+  "codegen_profile": "optimized",
+  "program_codegen": "optimized",
+  "runtime": "11.0.0",
+  "runtime_tested": true,
+  "console_channel": "memory",
+  "log_channel": "memory"
 }"#
         .replace("<sha256>", &hex(lamella_pe::sha256::sha256(bytes)))
         .replace("<bytes>", &bytes.len().to_string());
 
         let manifest = parse(&text).expect("the other producer's record reads");
-        assert_eq!(manifest.board, "mps2-an500");
-        assert_eq!(manifest.base, Some(0), "the padded spelling is the same address");
+        assert_eq!(manifest.board, "arm-mps2-an500");
+        assert_eq!(manifest.base, None, "an ELF names its own addresses");
         assert_eq!(manifest.producer.as_deref(), Some("ilc+rhu-link"));
         assert_eq!(manifest.elf.as_deref(), Some("app.elf"));
-        assert_eq!((manifest.console_channel.as_deref(), manifest.log_channel.as_deref()), (None, None));
+        assert_eq!(
+            (manifest.console_channel.as_deref(), manifest.log_channel.as_deref()),
+            (Some("memory"), Some("memory"))
+        );
+        assert!(check_identity(&manifest, bytes, Some("elf")).is_ok());
+
+        let raw = text
+            .replace("\"format\": \"elf\"", "\"format\": \"bin\"")
+            .replace("\"base\": null", "\"base\": \"0x00000000\"");
+        let manifest = parse(&raw).expect("the same record as a raw image reads");
+        assert_eq!(manifest.base, Some(0), "the padded spelling is the same address");
         assert!(check_identity(&manifest, bytes, Some("bin")).is_ok());
     }
 
@@ -665,14 +677,14 @@ mod tests {
     fn a_different_length_is_refused_and_both_numbers_are_named() {
         let manifest = parse(&record_for(b"image", "bin", "\"0x0\"")).unwrap();
         let why = check_identity(&manifest, b"imag", Some("bin")).unwrap_err();
-        assert!(why.contains("5 B") && why.contains("4 B"), "{why}");
+        assert!(why.contains("5 bytes") && why.contains("4 bytes") && !why.contains("sidecar"), "{why}");
     }
 
     #[test]
     fn different_bytes_of_the_same_length_are_refused_by_digest() {
         let manifest = parse(&record_for(b"image", "bin", "\"0x0\"")).unwrap();
         let why = check_identity(&manifest, b"imagf", Some("bin")).unwrap_err();
-        assert!(why.contains("digest does not match"), "{why}");
+        assert!(why.contains("differ from the ones its record describes") && !why.contains("sidecar"), "{why}");
     }
 
     /// A sidecar written for the `.elf` and left beside the `.bin` fails length and digest too, so

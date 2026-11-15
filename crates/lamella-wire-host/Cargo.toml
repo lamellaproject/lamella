@@ -22,6 +22,8 @@ lamella-serial-port = { path = "../lamella-serial-port", optional = true }
 # board with a native USB device peripheral (a WinUSB vendor interface). OPTIONAL, behind the usb feature.
 lamella-usbbulk = { path = "../lamella-usbbulk", optional = true }
 lamella-probe-core = { path = "../lamella-probe-core", optional = true }
+# Progress wording for a program stored on a board, shared with probe writes.
+lamella-flash-backend = { path = "../lamella-flash-backend", optional = true }
 # The project's own C# compiler (lcsc), behind `repl-host`: the engine's [`LcscCompiler`] compiles a
 # submission IN-PROCESS -- the same compiler the `lamella-repl` CLI and the DAP Debug Console drive.
 # (No csc: it resolves BCL types against the .NET reference assemblies, not Microsoft's compiler.)
@@ -64,7 +66,7 @@ tcp = ["carrier"]
 # over ANY carrier cannot say so directly -- gating it on `serial` would hide it from a build that
 # has only the network one, which is the whole point of having moved the dispatch out of the tools.
 # Each carrier enables this, and the tools that go through `open_target` require it instead.
-carrier = []
+carrier = ["dep:lamella-flash-backend"]
 # The host REPL front-end: the interactive engine + the in-process `LcscCompiler` compile seam, and
 # the host REPL integration test over them (#[ignore]'d -- it needs the .NET reference assemblies
 # present). A wasm build leaves this off (the browser compiles in-process via lamella-wasm), keeping
@@ -89,7 +91,7 @@ loopback-board = []
 # compiled PE is loaded + baked host-side and the IMAGE crosses the wire (BakedSerialLink,
 # eval_image_blocking). Forwards the runner's baked-image knob (which pins loads to
 # Assembly<'static>; the link leaks one buffer per evaluation, the accepted host pattern).
-baked = ["lamella-runner/baked-image", "dep:lamella-load", "dep:lamella-metadata", "dep:lamella-token", "boards"]
+baked = ["lamella-runner/baked-image", "dep:lamella-load", "dep:lamella-metadata", "dep:lamella-token", "dep:serde_json", "boards"]
 # A build for a board (`boards`): the reference set it compiles against, with the board's chip-family
 # builds in place of the shared ones, the bus table its image carries, and the board a HELLO answers
 # as. The `lamella` command builds for a board without baking (its linked tier), so this stands apart
@@ -97,8 +99,8 @@ baked = ["lamella-runner/baked-image", "dep:lamella-load", "dep:lamella-metadata
 boards = ["repl-host", "dep:lamella-catalog"]
 # WireHostBackend: the lamella-debug-backend seam over the wire's debug channel (serial
 # carrier). A code location crosses the seam as an opaque address packing the wire's
-# (method_id, offset) pair.
-debug-backend = ["serial", "dep:lamella-debug-backend", "dep:serde", "dep:serde_json"]
+# (method_id, offset) pair. The class a line map records for a local is lamella-metadata's.
+debug-backend = ["serial", "dep:lamella-debug-backend", "dep:lamella-metadata", "dep:serde", "dep:serde_json"]
 
 # (The interactive REPL CLI lives in the dedicated `lamella-repl` crate; lamella-wire-host is
 # the host library that CLI builds on.)

@@ -175,6 +175,105 @@ namespace System.Text
         public StringBuilder AppendLine(string value) { return Append(value).Append("\r\n"); }
 #endif
 
+        /// <summary>Appends <paramref name="format"/> with its format items replaced by the text of the
+        /// argument.</summary>
+        /// <param name="format">The composite format string.</param>
+        /// <param name="arg0">The argument.</param>
+        /// <returns>This instance.</returns>
+        public StringBuilder AppendFormat(string format, object arg0)
+        {
+            return AppendComposite(null, format, new object[] { arg0 });
+        }
+
+        /// <summary>Appends <paramref name="format"/> with its format items replaced by the text of the two
+        /// arguments.</summary>
+        /// <param name="format">The composite format string.</param>
+        /// <param name="arg0">The first argument.</param>
+        /// <param name="arg1">The second argument.</param>
+        /// <returns>This instance.</returns>
+        public StringBuilder AppendFormat(string format, object arg0, object arg1)
+        {
+            return AppendComposite(null, format, new object[] { arg0, arg1 });
+        }
+
+        /// <summary>Appends <paramref name="format"/> with its format items replaced by the text of the three
+        /// arguments.</summary>
+        /// <param name="format">The composite format string.</param>
+        /// <param name="arg0">The first argument.</param>
+        /// <param name="arg1">The second argument.</param>
+        /// <param name="arg2">The third argument.</param>
+        /// <returns>This instance.</returns>
+        public StringBuilder AppendFormat(string format, object arg0, object arg1, object arg2)
+        {
+            return AppendComposite(null, format, new object[] { arg0, arg1, arg2 });
+        }
+
+        /// <summary>Appends <paramref name="format"/> with its format items replaced by the text of the
+        /// arguments.</summary>
+        /// <param name="format">The composite format string.</param>
+        /// <param name="args">The arguments.</param>
+        /// <returns>This instance.</returns>
+        public StringBuilder AppendFormat(string format, params object[] args)
+        {
+            return AppendComposite(null, format, args);
+        }
+
+        /// <summary>Appends <paramref name="format"/> with its format items replaced by the text of the
+        /// arguments, asking <paramref name="provider"/> how to format them.</summary>
+        /// <param name="provider">What supplies an <see cref="ICustomFormatter"/> and the arguments' culture-specific formatting, or null.</param>
+        /// <param name="format">The composite format string.</param>
+        /// <param name="args">The arguments.</param>
+        /// <returns>This instance.</returns>
+        public StringBuilder AppendFormat(IFormatProvider provider, string format, params object[] args)
+        {
+            return AppendComposite(provider, format, args);
+        }
+
+#if LAMELLA_SURFACE_NETCORE_2_0
+        /// <summary>Appends <paramref name="format"/> with its format items replaced by the text of the
+        /// argument, asking <paramref name="provider"/> how to format it.</summary>
+        /// <param name="provider">What supplies an <see cref="ICustomFormatter"/> and the argument's culture-specific formatting, or null.</param>
+        /// <param name="format">The composite format string.</param>
+        /// <param name="arg0">The argument.</param>
+        /// <returns>This instance.</returns>
+        public StringBuilder AppendFormat(IFormatProvider provider, string format, object arg0)
+        {
+            return AppendComposite(provider, format, new object[] { arg0 });
+        }
+
+        /// <summary>Appends <paramref name="format"/> with its format items replaced by the text of the two
+        /// arguments, asking <paramref name="provider"/> how to format them.</summary>
+        /// <param name="provider">What supplies an <see cref="ICustomFormatter"/> and the arguments' culture-specific formatting, or null.</param>
+        /// <param name="format">The composite format string.</param>
+        /// <param name="arg0">The first argument.</param>
+        /// <param name="arg1">The second argument.</param>
+        /// <returns>This instance.</returns>
+        public StringBuilder AppendFormat(IFormatProvider provider, string format, object arg0, object arg1)
+        {
+            return AppendComposite(provider, format, new object[] { arg0, arg1 });
+        }
+
+        /// <summary>Appends <paramref name="format"/> with its format items replaced by the text of the three
+        /// arguments, asking <paramref name="provider"/> how to format them.</summary>
+        /// <param name="provider">What supplies an <see cref="ICustomFormatter"/> and the arguments' culture-specific formatting, or null.</param>
+        /// <param name="format">The composite format string.</param>
+        /// <param name="arg0">The first argument.</param>
+        /// <param name="arg1">The second argument.</param>
+        /// <param name="arg2">The third argument.</param>
+        /// <returns>This instance.</returns>
+        public StringBuilder AppendFormat(IFormatProvider provider, string format, object arg0, object arg1, object arg2)
+        {
+            return AppendComposite(provider, format, new object[] { arg0, arg1, arg2 });
+        }
+#endif
+
+        private StringBuilder AppendComposite(IFormatProvider provider, string format, object[] args)
+        {
+            if ((object)format == null || (object)args == null) throw new ArgumentNullException((object)format == null ? "format" : "args");
+            CompositeFormatter.Append(this, provider, format, args);
+            return this;
+        }
+
         public StringBuilder Append(string value, int startIndex, int count)
         {
             if (startIndex < 0) throw new ArgumentOutOfRangeException("startIndex");

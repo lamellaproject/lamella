@@ -592,7 +592,7 @@ mod tests {
     /// `configurationDone` and halts later, on its own, with no request outstanding.
     ///
     /// Driven through [`serve_polled`] against a client that keeps its stream open, because that is
-    /// the loop `device-dap-server` runs and the only one that can report this.
+    /// the loop `lamella-debug` runs and the only one that can report this.
     #[test]
     fn a_stop_reached_while_running_is_reported_to_the_client() {
         let (mut debugger, resumes, stopped) = free_running(3);

@@ -69,6 +69,7 @@ use lamella_cil_runtime::intrinsics::{
     initialize_array, get_custom_attributes, string_concat, string_concat_object2,
     string_ctor_char_array, string_ctor_char_array_range, string_ctor_char_ptr,
     string_ctor_char_ptr_range, string_ctor_char_repeat, string_get_pinnable_reference,
+    runtime_helpers_offset_to_string_data,
     string_concat_object3, string_concat3,
     string_equals, string_get_chars, string_get_length, string_is_null_or_empty,
     string_intern, string_is_interned,
@@ -162,6 +163,8 @@ use lamella_cil_runtime::intrinsics::{
 };
 #[cfg(feature = "reflection")]
 use lamella_cil_runtime::intrinsics::type_property_custom_attributes;
+#[cfg(feature = "reflection")]
+use lamella_cil_runtime::intrinsics::type_event_custom_attributes;
 #[cfg(feature = "float")]
 use lamella_cil_runtime::intrinsics::{
     console_write_double, console_write_line_double, console_write_line_single, console_write_single,
@@ -197,12 +200,41 @@ use lamella_cil_runtime::{
 
 pub mod monomorphize;
 
+#[cfg(test)]
+mod interface_override_tests;
+#[cfg(test)]
+mod array_shape_tests;
+#[cfg(test)]
+mod array_address_tests;
+#[cfg(test)]
+mod constructed_monitor_tests;
+#[cfg(test)]
+mod reflected_array_tests;
+#[cfg(test)]
+mod nested_array_base_tests;
+#[cfg(test)]
+mod type_operand_ownership_tests;
+#[cfg(test)]
+mod array_base_scope_tests;
+#[cfg(test)]
+mod fixed_string_tests;
+
+#[cfg(test)]
+mod stack_struct_tests;
+#[cfg(test)]
+mod external_cctor_tests;
+#[cfg(all(test, feature = "generics"))]
+mod external_cctor_paths_tests;
+#[cfg(all(test, feature = "reflection"))]
+mod event_attribute_tests;
+
 const TYPE_REF: u8 = 0x01;
 const TYPE_DEF: u8 = 0x02;
 const FIELD: u8 = 0x04;
 const METHOD_DEF: u8 = 0x06;
 const MEMBER_REF: u8 = 0x0A;
 const TYPE_SPEC: u8 = 0x1B;
+const ASSEMBLY_REF: u8 = 0x23;
 const METHOD_SPEC: u8 = 0x2B;
 
 const METHOD_VIRTUAL: u32 = 0x0040;
@@ -377,6 +409,22 @@ fn key_type_name(assembly: &Assembly<'_>, type_def: &TypeDef<'_>) -> Option<(Str
 /// the program gave it, so its slot is recorded as the layout is decided -- see
 /// [`lamella_cil_runtime::Module::bind_exception_message_slot`] for why by name would not do.
 const EXCEPTION_MESSAGE_FIELD: &str = "System.Exception._message";
+
+/// The corlib fields a managed `System.Threading.Thread` keeps the scheduler's id for its thread and
+/// its `Name` in, in the same qualified form. A debugger reads them to show a thread by the name its
+/// program gave it, so their slots are recorded as [`EXCEPTION_MESSAGE_FIELD`]'s is.
+const THREAD_ID_FIELD: &str = "System.Threading.Thread._id";
+const THREAD_NAME_FIELD: &str = "System.Threading.Thread._name";
+
+/// Records the slot of an instance field the RUNTIME reads by itself, where `key` names one.
+fn bind_runtime_field(module: &mut Module, key: &str, slot: u32) {
+    match key {
+        EXCEPTION_MESSAGE_FIELD => module.bind_exception_message_slot(slot),
+        THREAD_ID_FIELD => module.bind_thread_id_slot(slot),
+        THREAD_NAME_FIELD => module.bind_thread_name_slot(slot),
+        _ => {}
+    }
+}
 
 /// [`field_name_key`] over an already-resolved `(namespace, type)` pair -- the form
 /// [`key_type_name`] produces for a nested type, whose namespace is not its own.
@@ -1534,6 +1582,7 @@ fn reaches(opcode: Opcode) -> Reaches {
         | Opcode::Initobj
         | Opcode::Sizeof
         | Opcode::Ldelem
+        | Opcode::Ldelema
         | Opcode::Stelem
         | Opcode::Ldobj
         | Opcode::Stobj
@@ -1836,6 +1885,11 @@ pub fn load_program_lazy_corlib_with_libraries_unfrozen<'c, 'l, 'p>(
         true,
         &mut heirs,
     );
+    let mut override_sources = alloc::vec![(LAZY_CORLIB_ASM, corlib), (program_asm, program)];
+    override_sources.extend(libraries.iter().enumerate().map(|(position, library)| {
+        (library_asm(position), library)
+    }));
+    bind_explicit_overrides(&mut module, &override_sources, &resolution.type_index);
     #[cfg(feature = "generics")]
     {
         let mut sources = alloc::vec![
@@ -2615,6 +2669,7 @@ fn materialize_corlib_method_row<'c>(
             }
 
             let Some((_, raw_il)) = method.body_and_bytes() else {
+                bind_pinvoke_target(corlib, module, LAZY_CORLIB_ASM, token, &method);
                 return;
             };
             let id = module.add_method(LAZY_CORLIB_ASM, flash_cil(raw_il), arg_count(&method));
@@ -2744,13 +2799,16 @@ fn collect_body_tokens(tokens: &mut BodyTokens, opcode: Opcode, operand: Token) 
             if matches!(operand.table(), TYPE_DEF | TYPE_REF | TYPE_SPEC) =>
         {
             tokens.ldtoken_types.insert(operand);
+            // Reflected handles can become array element types through Array.CreateInstance.
+            tokens.type_tests.insert(operand);
         }
         Opcode::Box => {
             tokens.ldtoken_types.insert(operand);
             tokens.type_tests.insert(operand);
             tokens.boxes.insert(operand);
         }
-        Opcode::Castclass | Opcode::Isinst | Opcode::Unbox | Opcode::UnboxAny => {
+        // Writable array addresses require the operand's identity just as casts do.
+        Opcode::Castclass | Opcode::Isinst | Opcode::Unbox | Opcode::UnboxAny | Opcode::Ldelema => {
             tokens.type_tests.insert(operand);
         }
         Opcode::Sizeof => {
@@ -2998,6 +3056,16 @@ fn materialize_corlib_type<'c>(
     let own_token = Token::new(TYPE_DEF, type_row);
     module.bind_type_token(LAZY_CORLIB_ASM, own_token, type_id);
     module.bind_type_name(LAZY_CORLIB_ASM, own_token, name.name.into());
+    // A reflected Type exposes its defining handle even when only a TypeRef occurs in IL.
+    // Keep primitive/enum zeroes; named cast shapes follow the existing type identity.
+    walk.tokens.newarr.insert(own_token);
+    if !matches!(
+        cast_elem_of_name(LAZY_CORLIB_ASM, name.namespace, name.name, own_token),
+        CastElem::Named(_)
+    ) || is_array_base_name(name.namespace, name.name) {
+        // A baked image carries array-base marks in its cast records.
+        walk.tokens.type_tests.insert(own_token);
+    }
     if name.namespace == "System" {
         match name.name {
             "Object" => module.mark_object_type_token(LAZY_CORLIB_ASM, own_token),
@@ -3032,9 +3100,7 @@ fn materialize_corlib_type<'c>(
         module.bind_field(LAZY_CORLIB_ASM, field.token, slot);
         module.bind_field_type(LAZY_CORLIB_ASM, field.token, type_id);
         let key = field_name_key(name, &field.name);
-        if key == EXCEPTION_MESSAGE_FIELD {
-            module.bind_exception_message_slot(slot);
-        }
+        bind_runtime_field(module, &key, slot);
         resolution.field_index.instances.insert(key, slot);
     }
     let statics_start = module.static_field_count() as u32;
@@ -3081,6 +3147,8 @@ fn materialize_corlib_type<'c>(
         );
         if let Some(id) = module.resolve(LAZY_CORLIB_ASM, Token::new(METHOD_DEF, row)) {
             module.add_static_ctor(id);
+        } else {
+            register_external_static_ctor(module, LAZY_CORLIB_ASM, Token::new(METHOD_DEF, row), type_id);
         }
     }
     let wanted = walk.dispatch.wanted.clone();
@@ -3536,6 +3604,11 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
         true,
         &mut heirs,
     );
+    let mut override_sources = alloc::vec![(0, corlib), (program_asm, program)];
+    override_sources.extend(libraries.iter().enumerate().map(|(position, library)| {
+        (1 + position as u8, library)
+    }));
+    bind_explicit_overrides(&mut module, &override_sources, &type_index);
     #[cfg(feature = "generics")]
     let sources: Vec<monomorphize::DefinitionSource<'_>> = {
         let mut sources = Vec::with_capacity(2 + libraries.len());
@@ -3828,6 +3901,19 @@ fn load_assembly_collecting<'pe>(
             own.push((token, default, pending));
         }
         let type_id = module.add_type(Vec::new());
+        // Reflected arrays need defining-token primitive/enum zeroes and special shapes.
+        // An ordinary named element already has a type identity, so needs no extra cast record.
+        let own_token = Token::new(TYPE_DEF, type_row);
+        newarr_tokens.insert(own_token);
+        if type_def.name().is_some_and(|name| {
+            !matches!(
+                cast_elem_of_name(asm, name.namespace, name.name, own_token),
+                CastElem::Named(_)
+            ) || is_array_base_name(name.namespace, name.name)
+        }) {
+            // Array-base records retain their marks when the image is reopened without reflection.
+            type_test_tokens.insert(own_token);
+        }
         module.bind_static_slot_range(
             statics_start as u32,
             module.static_field_count() as u32,
@@ -3951,6 +4037,9 @@ fn load_assembly_collecting<'pe>(
             }
             let Some((body, raw_il)) = method.body_and_bytes() else {
                 bind_pinvoke_target(assembly, module, asm, token, &method);
+                if name == ".cctor" && !is_generic_definition {
+                    register_external_static_ctor(module, asm, token, type_id);
+                }
                 continue;
             };
             for instruction in body.code.iter() {
@@ -4015,7 +4104,8 @@ fn load_assembly_collecting<'pe>(
                         | Opcode::Isinst
                         | Opcode::Box
                         | Opcode::Unbox
-                        | Opcode::UnboxAny => {
+                        | Opcode::UnboxAny
+                        | Opcode::Ldelema => {
                             type_test_tokens.insert(*operand);
                         }
                         Opcode::Sizeof => {
@@ -4200,7 +4290,6 @@ fn load_assembly_collecting<'pe>(
         virtual_methods.retain(|token| module.resolve(asm, *token).is_none());
         bind_call_targets(module, assembly, asm, &virtual_methods, &methoddef_sigs);
     }
-    bind_explicit_overrides(module, assembly, asm, type_offset);
     let mut heir_base: Vec<Option<HeirBase>> = (0..type_extends.len()).map(|_| None).collect();
     for (local, extends) in type_extends.iter().enumerate() {
         if extends.table() == TYPE_SPEC {
@@ -4269,6 +4358,7 @@ fn load_assembly_collecting<'pe>(
         type_index,
         &type_interfaces,
     );
+    bind_explicit_overrides(module, &[(asm, assembly)], type_index);
     record_custom_attributes(assembly, module, asm, type_index);
     record_field_offsets(module, assembly, type_offset, type_index);
     if entry.is_some() {
@@ -4436,6 +4526,10 @@ fn bind_bcl_calls(
                 ".ctor" => {
                     let rank = signature.as_ref().map_or(0, |sig| sig.parameters.len());
                     module.mark_md_array_ctor(asm, *token, u16::try_from(rank).unwrap_or(0));
+                    if let Some(sig @ SigType::Array { .. }) = spec.as_ref() {
+                        module.bind_cast_elem(asm, *token, cast_elem_of_sig(asm, sig));
+                        bind_signature_elements(assembly, module, asm, type_index, sig);
+                    }
                     continue;
                 }
                 "Get" => Some(intrinsic!(md_array_get)),
@@ -4866,6 +4960,7 @@ mod type_baseline_binding_tests {
             "get_IsNotPublic",
             "GetFields",
             "GetMethods",
+            "GetEventCustomAttributes",
         ] {
             assert_eq!(
                 binds(method),
@@ -4897,9 +4992,20 @@ fn bcl_intrinsic(
     }
     if namespace == "System.Runtime.CompilerServices"
         && type_name == "RuntimeHelpers"
-        && method == "InitializeArray"
     {
-        return Some(intrinsic!(initialize_array));
+        if method == "InitializeArray" {
+            return Some(intrinsic!(initialize_array));
+        }
+        if method == "get_OffsetToStringData" {
+            let sig = signature?;
+            if !sig.has_this && !sig.explicit_this && !sig.is_vararg
+                && sig.generic_param_count == 0 && sig.parameters.is_empty()
+                && sig.return_type == SigType::I4 && sig.required_modifiers.is_empty()
+            {
+                return Some(intrinsic!(runtime_helpers_offset_to_string_data));
+            }
+            return None;
+        }
     }
     if namespace == "System.Reflection" && type_name == "MemberInfo" && method == "get_Name" {
         return Some(intrinsic!(type_get_name));
@@ -5386,6 +5492,8 @@ fn bcl_intrinsic(
         #[cfg(feature = "reflection")]
         ("Type", "GetPropertyCustomAttributes") => Some(intrinsic!(type_property_custom_attributes)),
         #[cfg(feature = "reflection")]
+        ("Type", "GetEventCustomAttributes") => Some(intrinsic!(type_event_custom_attributes)),
+        #[cfg(feature = "reflection")]
         ("Type", "GetConstructor") => match parameters_of(signature) {
             [SigType::SzArray(_)] => Some(intrinsic!(type_get_constructor)),
             _ => None,
@@ -5649,6 +5757,7 @@ fn index_enum_zeros(assembly: &Assembly, enum_zeros: &mut BTreeMap<String, Value
 /// to prevent.
 fn default_field_value(signature: Option<SigType>) -> Value {
     match signature {
+        Some(SigType::IntPtr | SigType::UIntPtr | SigType::Pointer(_)) => Value::NativeInt(0),
         Some(SigType::I8 | SigType::U8) => Value::Int64(0),
         #[cfg(feature = "float")]
         Some(SigType::R4) => Value::Single(0.0),
@@ -6335,6 +6444,28 @@ fn record_custom_attributes(
             }
         }
     }
+    // EventMap supplies both the declaring type and each Event token's row range.
+    use lamella_metadata::tables::table::{EVENT, EVENT_MAP};
+    let tables = assembly.tables();
+    for index in 1..=tables.row_count(EVENT_MAP) {
+        let Some(map) = tables.row(EVENT_MAP, index) else { continue };
+        let first = map.raw(1);
+        let end = tables.row(EVENT_MAP, index + 1)
+            .map_or(tables.row_count(EVENT) + 1, |next| next.raw(1));
+        #[cfg(feature = "reflection")]
+        let type_handle = asm_key(asm, Token::new(TYPE_DEF, map.raw(0)).0);
+        for row in first..end {
+            let token = Token::new(EVENT, row);
+            let handle = asm_key(asm, token.0);
+            record_target_attributes(assembly, module, asm, handle, token);
+            #[cfg(feature = "reflection")]
+            if let Some(event) = tables.row(EVENT, row) {
+                if let Ok(name) = assembly.image().strings().get(event.raw(1)) {
+                    module.bind_type_event_name(type_handle, name, handle);
+                }
+            }
+        }
+    }
 }
 
 /// Decodes and records the custom attributes applied to one target (`target_token`), keyed by
@@ -6593,7 +6724,9 @@ fn classify_type_test_tokens(
                 *token,
                 cast_elem_of_name(asm, name.namespace, name.name, *token),
             );
-            if is_array_base_name(name.namespace, name.name) {
+            if is_array_base_name(name.namespace, name.name)
+                && is_core_type_operand(assembly, module, asm, *token)
+            {
                 module.mark_array_base_name(asm, *token);
             }
         } else if let Some(sig) = assembly.type_spec_signature(*token) {
@@ -6603,9 +6736,10 @@ fn classify_type_test_tokens(
     }
 }
 
-/// Binds every named type a type test's signature carries, at any depth of `[]` and of a generic
+/// Binds every named type a type test's signature carries, at any depth of arrays, pointers and a generic
 /// instantiation's arguments, to its type in `type_index`, where the module has none bound yet. A type no
-/// loaded assembly defines stays unbound.
+/// loaded assembly defines stays unbound. Array-base names use the same ownership rules as direct
+/// operands, including core-library references whose definitions are unavailable.
 fn bind_signature_elements(
     assembly: &Assembly,
     module: &mut Module,
@@ -6614,11 +6748,21 @@ fn bind_signature_elements(
     sig: &SigType,
 ) {
     match sig {
-        SigType::SzArray(element) => bind_signature_elements(assembly, module, asm, type_index, element),
+        SigType::SzArray(element) | SigType::Array { element, .. } | SigType::Pointer(element) => {
+            bind_signature_elements(assembly, module, asm, type_index, element);
+        }
         SigType::Class(token) | SigType::ValueType(token) => {
             if module.type_id_of(asm, *token).is_none() {
                 if let Some(id) = type_index_key(assembly, *token).and_then(|key| type_index.get(&key).copied()) {
                     module.bind_type_token(asm, *token, id);
+                }
+            }
+            if let Some(name) = assembly.type_token_name(*token) {
+                module.bind_cast_elem(asm, *token, cast_elem_of_name(asm, name.namespace, name.name, *token));
+                if is_array_base_name(name.namespace, name.name)
+                    && is_core_type_operand(assembly, module, asm, *token)
+                {
+                    module.mark_array_base_name(asm, *token);
                 }
             }
         }
@@ -6631,9 +6775,57 @@ fn bind_signature_elements(
     }
 }
 
-/// Whether `namespace.name` is a type every array is an instance of: `System.Array`, or one of the
-/// six interfaces .NET's `System.Array` implements. A cast of an array to any other named type
-/// fails, so with no corlib to resolve the name against, the name alone decides the cast.
+/// Whether an array-base operand belongs to the core library. Definitions share the CLI's root
+/// `System.Object` (II.22.37); resolved references use their defining handle's mark. A reference
+/// that resolves to nothing belongs to the core library when its scope is an assembly the
+/// referencing assembly takes `System.Object` from, which is a library it was compiled against as
+/// its core whatever that library is named, or when its scope is the core library or one of its
+/// standard facades by name.
+fn is_core_type_operand(assembly: &Assembly, module: &Module, asm: u8, token: Token) -> bool {
+    if token.table() == TYPE_DEF {
+        return assembly.find_type("System", "Object")
+            .is_some_and(|object| object.extends().row() == 0);
+    }
+    if token.table() != TYPE_REF {
+        return false;
+    }
+    if let Some(handle) = module.type_id_of(asm, token).and_then(|id| module.type_handle_of(id)) {
+        return module.cast_names_array_base(handle);
+    }
+    let Some(reference) = assembly.type_ref(token.row()) else { return false; };
+    let Some(scope) = assembly_ref_name(assembly, reference.resolution_scope()) else {
+        return false;
+    };
+    takes_object_from(assembly, scope)
+        || matches!(
+            scope,
+            "mscorlib" | "System.Private.CoreLib" | "System.Runtime" | "netstandard"
+        )
+}
+
+/// The name of the assembly `scope` refers to, when it is an `AssemblyRef` (II.22.5).
+fn assembly_ref_name<'a>(assembly: &Assembly<'a>, scope: Token) -> Option<&'a str> {
+    if scope.table() != ASSEMBLY_REF {
+        return None;
+    }
+    assembly
+        .assembly_ref(scope.row())
+        .and_then(|reference| reference.name())
+}
+
+/// Whether an assembly takes `System.Object` from the assembly named `scope`, which makes that a
+/// library it was compiled against as its core (II.22.38).
+fn takes_object_from(assembly: &Assembly, scope: &str) -> bool {
+    assembly.type_refs().any(|reference| {
+        reference
+            .name()
+            .is_some_and(|name| name.namespace == "System" && name.name == "Object")
+            && assembly_ref_name(assembly, reference.resolution_scope()) == Some(scope)
+    })
+}
+
+/// Whether `namespace.name` is `System.Array` or one of its six built-in interfaces. Ownership is
+/// checked separately: a same-named type in an application is a different type (I.8.5.2).
 fn is_array_base_name(namespace: &str, name: &str) -> bool {
     matches!(
         (namespace, name),
@@ -6672,6 +6864,7 @@ fn cast_elem_of_name(asm: u8, namespace: &str, name: &str, token: Token) -> Cast
         match name {
             "String" => return CastElem::String,
             "Object" => return CastElem::Object,
+            "Void" => return CastElem::Void,
             _ => {}
         }
     }
@@ -6680,8 +6873,8 @@ fn cast_elem_of_name(asm: u8, namespace: &str, name: &str, token: Token) -> Cast
 
 /// The [`CastElem`] shape a `TypeSpec` signature denotes. Tokens inside the signature are in
 /// the same assembly's token space as the spec row itself. A generic instantiation of a value type
-/// becomes [`CastElem::GenericValueType`]; shapes the cast checks do not model (multi-dimensional
-/// arrays, pointers, byrefs, a generic instantiation of a class or an interface) become
+/// becomes [`CastElem::GenericValueType`]; shapes the cast checks do not model (byrefs,
+/// a generic instantiation of a class or an interface) become
 /// [`CastElem::Lenient`].
 fn cast_elem_of_sig(asm: u8, sig: &SigType) -> CastElem {
     match sig {
@@ -6701,10 +6894,16 @@ fn cast_elem_of_sig(asm: u8, sig: &SigType) -> CastElem {
         SigType::UIntPtr => CastElem::Prim(CastPrim::U),
         SigType::String => CastElem::String,
         SigType::Object => CastElem::Object,
+        SigType::Void => CastElem::Void,
         SigType::Class(token) | SigType::ValueType(token) => {
             CastElem::Named(asm_key(asm, token.0))
         }
         SigType::SzArray(element) => CastElem::Array(Box::new(cast_elem_of_sig(asm, element))),
+        SigType::Pointer(element) => CastElem::Pointer(Box::new(cast_elem_of_sig(asm, element))),
+        SigType::Array { element, rank } => CastElem::MdArray {
+            element: Box::new(cast_elem_of_sig(asm, element)),
+            rank: *rank,
+        },
         SigType::GenericInst { definition, .. } if matches!(definition.as_ref(), SigType::ValueType(_)) => {
             CastElem::GenericValueType
         }
@@ -6886,6 +7085,30 @@ fn record_type_field_offsets(
     };
     if offsets.len() == slot_count {
         module.set_type_field_offsets(type_id, end, alignment, &offsets);
+        use lamella_cil_runtime::module::FieldStorage;
+        let inherited = slot_count.saturating_sub(own.len());
+        let storage = (0..inherited)
+            .map(|slot| module.type_field_storage(module.type_base(type_id)?, slot))
+            .chain(own.iter().map(|field| {
+                Some(match field {
+                    SigType::I1 => FieldStorage::Primitive(PrimKind::I1),
+                    SigType::U1 | SigType::Boolean => FieldStorage::Primitive(PrimKind::U1),
+                    SigType::I2 => FieldStorage::Primitive(PrimKind::I2),
+                    SigType::U2 | SigType::Char => FieldStorage::Primitive(PrimKind::U2),
+                    SigType::I4 | SigType::U4 => FieldStorage::Primitive(PrimKind::I4),
+                    SigType::I8 | SigType::U8 => FieldStorage::Primitive(PrimKind::I8),
+                    SigType::R4 => FieldStorage::Primitive(PrimKind::F4),
+                    SigType::R8 => FieldStorage::Primitive(PrimKind::F8),
+                    SigType::IntPtr | SigType::UIntPtr | SigType::Pointer(_) => FieldStorage::Native,
+                    SigType::ValueType(token) => FieldStorage::ValueType(value_type_id(*token)?),
+                    SigType::Object | SigType::String | SigType::Class(_)
+                    | SigType::SzArray(_) | SigType::Array { .. } => FieldStorage::Reference,
+                    _ => return None,
+                })
+            })).collect::<Option<Vec<_>>>();
+        if let Some(storage) = storage {
+            module.set_type_field_storage(type_id, &storage);
+        }
     }
     OffsetRecord::Settled
 }
@@ -7084,9 +7307,7 @@ fn build_field_layouts(
             let slot = (base_count + index) as u32;
             module.bind_field(asm, *token, slot);
             if let Some(key) = instance_field_keys.get(&token.0) {
-                if key == EXCEPTION_MESSAGE_FIELD {
-                    module.bind_exception_message_slot(slot);
-                }
+                bind_runtime_field(module, key, slot);
                 field_index.instances.insert(key.clone(), slot);
             }
         }
@@ -7426,6 +7647,19 @@ fn bind_pinvoke_target(
             returns,
         },
     );
+}
+
+/// Registers a type-initialization trigger for a constructor without a managed body.
+/// Its original token stays unbound so the call reaches the external target, or traps
+/// if none is supplied. Each closed generic type gets its own trigger and initialization state.
+fn register_external_static_ctor(module: &mut Module, asm: u8, token: Token, type_id: TypeId) -> MethodId {
+    let mut raw = alloc::vec![0x1a, 0x28];
+    raw.extend_from_slice(&token.0.to_le_bytes());
+    raw.push(0x2a);
+    let id = module.add_method(asm, ram_cil(&raw), 0);
+    module.set_method_type(id, type_id);
+    module.add_static_ctor(id);
+    id
 }
 
 fn is_enum_type(assembly: &Assembly, extends: Token) -> bool {
@@ -8056,43 +8290,199 @@ fn bind_call_targets(
     }
 }
 
-/// Records each type's explicit interface implementations (II.22.27 `MethodImpl` / the
-/// `.override` directive): the `MethodDeclaration` (an interface/virtual method) maps to the
-/// `MethodBody` defined in this type. An explicit body (`int IA.Value()`) is private and
-/// named after the interface, so a `callvirt` through the interface reference -- which names
-/// the interface method -- cannot reach it by signature; this map provides the dispatch.
-/// `type_defs()` yields rows in order, so the local index `i` is the global `type_offset + i`.
-fn bind_explicit_overrides(module: &mut Module, assembly: &Assembly, asm: u8, type_offset: usize) {
-    let mut rows_by_member: BTreeMap<String, Vec<Token>> = BTreeMap::new();
-    for row in 1..=u32::from(u16::MAX) {
-        let Some(member) = assembly.member_ref(row) else {
-            break;
-        };
-        if let Some(key) = member_ref_row_identity(assembly, &member) {
-            rows_by_member.entry(key).or_default().push(Token::new(MEMBER_REF, row));
-        }
-    }
-    for (local, type_def) in assembly.type_defs().enumerate() {
-        let type_id = (type_offset + local) as TypeId;
-        for (body_token, declaration_token) in type_def.method_impls() {
-            let Some(body) = module.resolve(asm, body_token) else {
-                continue;
+/// Binds MethodImpl bodies and their inherited mappings to every token naming the member.
+/// The shared pass runs after the referenced assemblies and program have loaded: a caller's
+/// MemberRef and the interface's MethodDef must reach the same implementation. Interface
+/// identity and the full signature distinguish members with otherwise identical names.
+fn bind_explicit_overrides(
+    module: &mut Module,
+    assemblies: &[(u8, &Assembly<'_>)],
+    type_index: &TypeNameIndex,
+) {
+    let mut definitions = BTreeMap::new();
+    let mut sites: BTreeMap<(TypeId, String), Vec<(u8, Token)>> = BTreeMap::new();
+    let mut inherited: BTreeMap<(TypeId, String), InterfaceOverride> = BTreeMap::new();
+    for &(asm, assembly) in assemblies {
+        // Preserve local aliases for constructed interfaces not yet assigned a TypeId.
+        let mut rows_by_member: BTreeMap<String, Vec<Token>> = BTreeMap::new();
+        for row in 1..=u32::from(u16::MAX) {
+            let Some(member) = assembly.member_ref(row) else {
+                break;
             };
-            module.add_explicit_override(asm, type_id, declaration_token, body);
-            if declaration_token.table() != MEMBER_REF {
-                continue;
+            let token = Token::new(MEMBER_REF, row);
+            if let Some(key) = member_ref_row_identity(assembly, &member) {
+                rows_by_member.entry(key).or_default().push(token);
             }
-            let identity = assembly
-                .member_ref(declaration_token.row())
-                .and_then(|member| member_ref_row_identity(assembly, &member));
-            let Some(identity) = identity else {
-                continue;
-            };
-            for token in rows_by_member.get(&identity).map(Vec::as_slice).unwrap_or(&[]) {
-                module.add_explicit_override(asm, type_id, *token, body);
+            if let Some(key) = interface_member_identity(module, assembly, asm, token, type_index) {
+                sites.entry(key).or_default().push((asm, token));
             }
         }
+        for type_def in assembly.type_defs() {
+            let Some(type_id) = module.type_id_of(asm, type_def.token()) else {
+                continue;
+            };
+            definitions.insert(type_id, (asm, assembly, type_def.token()));
+            if type_def.is_interface() {
+                for method in type_def.methods() {
+                    if let Some(signature) = method.signature() {
+                        let key = (type_id, interface_override_signature(
+                            assembly, method.name().unwrap_or(""), &signature,
+                        ));
+                        sites.entry(key).or_default().push((asm, method.token()));
+                    }
+                }
+            }
+            for (body_token, declaration_token) in type_def.method_impls() {
+                let Some(body) = module.resolve(asm, body_token) else {
+                    continue;
+                };
+                module.add_explicit_override(asm, type_id, declaration_token, body);
+                let identity = match declaration_token.table() {
+                    METHOD_DEF => method_def_identity(assembly, declaration_token),
+                    MEMBER_REF => assembly.member_ref(declaration_token.row())
+                        .and_then(|member| member_ref_row_identity(assembly, &member)),
+                    _ => None,
+                };
+                if let Some(tokens) = identity.and_then(|key| rows_by_member.get(&key)) {
+                    for &token in tokens {
+                        module.add_explicit_override(asm, type_id, token, body);
+                    }
+                }
+                let Some((interface_id, signature)) = interface_member_identity(
+                    module, assembly, asm, declaration_token, type_index,
+                ) else {
+                    continue;
+                };
+                if !module.implements_interface(type_id, interface_id) {
+                    continue;
+                }
+                let key = (interface_id, signature.clone());
+                let declarations = sites.entry(key.clone()).or_default();
+                if !declarations.contains(&(asm, declaration_token)) {
+                    declarations.push((asm, declaration_token));
+                }
+                let entry = inherited.entry(key).or_insert_with(|| InterfaceOverride {
+                    interface_id,
+                    signature,
+                    bodies: BTreeMap::new(),
+                });
+                entry.bodies.insert(type_id, body);
+            }
+        }
     }
+    for (identity, implementation) in &inherited {
+        for &type_id in definitions.keys() {
+            if let Some(body) = inherited_interface_override(
+                module, &definitions, type_index, type_id, implementation,
+            ) {
+                for &(asm, declaration) in &sites[identity] {
+                    module.add_explicit_override(asm, type_id, declaration, body);
+                }
+            }
+        }
+    }
+}
+
+fn interface_member_identity(
+    module: &Module,
+    assembly: &Assembly<'_>,
+    asm: u8,
+    token: Token,
+    type_index: &TypeNameIndex,
+) -> Option<(TypeId, String)> {
+    let (parent, name, signature) = match token.table() {
+        METHOD_DEF => {
+            let owner = assembly.method_def_owner(token)?;
+            let method = assembly.method(token.row())?;
+            (owner.token(), method.name()?, method.signature()?)
+        }
+        MEMBER_REF => {
+            let member = assembly.member_ref(token.row())?;
+            (member.parent(), member.name()?, member.method_signature()?)
+        }
+        _ => return None,
+    };
+    let type_id = override_type_id(module, assembly, asm, parent, type_index)?;
+    Some((type_id, interface_override_signature(assembly, name, &signature)))
+}
+
+fn override_type_id(
+    module: &Module,
+    assembly: &Assembly<'_>,
+    asm: u8,
+    token: Token,
+    type_index: &TypeNameIndex,
+) -> Option<TypeId> {
+    module.type_id_of(asm, token).or_else(|| {
+        type_index_key(assembly, token).and_then(|key| type_index.get(&key).copied())
+    })
+}
+
+struct InterfaceOverride {
+    interface_id: TypeId,
+    signature: String,
+    bodies: BTreeMap<TypeId, MethodId>,
+}
+
+fn interface_override_signature(assembly: &Assembly, name: &str, signature: &MethodSig) -> String {
+    let mut types = alloc::vec![signature.return_type.clone()];
+    types.extend_from_slice(&signature.parameters);
+    sig_encode(assembly, name, &types, signature.generic_param_count, &[])
+}
+
+/// Inherits a MethodImpl mapping unless a nearer interface reimplementation replaces it.
+/// A fresh mapping searches each class before its base, with explicit bodies preceding
+/// public virtual members in that class. Without re-listing, hiding preserves the mapping.
+fn inherited_interface_override(
+    module: &Module,
+    definitions: &BTreeMap<TypeId, (u8, &Assembly<'_>, Token)>,
+    type_index: &TypeNameIndex,
+    runtime_type: TypeId,
+    implementation: &InterfaceOverride,
+) -> Option<MethodId> {
+    if !module.implements_interface(runtime_type, implementation.interface_id) {
+        return None;
+    }
+    let mut current = Some(runtime_type);
+    let mut fresh_mapping = false;
+    for _ in 0..module.type_count() {
+        let type_id = current?;
+        if let Some(&body) = implementation.bodies.get(&type_id) {
+            return Some(body);
+        }
+        let &(asm, assembly, token) = definitions.get(&type_id)?;
+        let definition = assembly.type_def(token.row())?;
+        fresh_mapping |= definition.interfaces().any(|token| {
+            override_type_id(module, assembly, asm, token, type_index).is_some_and(|interface| {
+                interface == implementation.interface_id
+                    || module.implements_interface(interface, implementation.interface_id)
+            })
+        });
+        if fresh_mapping {
+            for method in definition.methods() {
+                // An implicit CLI interface implementation is a public instance virtual.
+                if method.flags() & (0x0007 | 0x0010 | METHOD_VIRTUAL) != (0x0006 | METHOD_VIRTUAL) {
+                    continue;
+                }
+                let Some(signature) = method.signature() else {
+                    continue;
+                };
+                if interface_override_signature(assembly, method.name().unwrap_or(""), &signature)
+                    != implementation.signature
+                {
+                    continue;
+                }
+                let body = module.resolve(asm, Token::new(METHOD_DEF, method.rid()))?;
+                return Some(
+                    module.method_slot(body)
+                        .and_then(|slot| module.vtable_entry(runtime_type, slot))
+                        .unwrap_or(body),
+                );
+            }
+        }
+        current = module.type_base(type_id);
+    }
+    None
 }
 
 /// What a `MemberRef` row MEANS -- its parent, name and signature -- as a comparable key, so two

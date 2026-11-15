@@ -65,6 +65,10 @@ pub const I2C0_PADS_SCL: u32 = 0x40038018;
 pub const I2C0_FUNCSEL: u32 = 3;
 pub const I2C0_IC_CLK_HZ: u32 = 150000000;
 
+// -- the PWM chips: how many the part has, the slices its pins carry, PWM chip n being
+// slice n --
+pub const PWM_CHIP_COUNT: u32 = 8;
+
 // -- PWM1: an rp2350 pwm binding descriptor: one slice of the pwm block, counting on
 // clk_sys, and each output the board routes -- its index in the slice (0 = A, 1 = B)
 // and its pad --

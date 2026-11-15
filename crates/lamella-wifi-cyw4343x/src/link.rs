@@ -27,6 +27,7 @@
 use core::fmt;
 
 use crate::control::{IFACE_STATION, Payload, Request, cmd, var};
+use crate::event::reason;
 use crate::scan::{Advertised, SSID_MAX};
 
 /// The shortest passphrase.
@@ -519,6 +520,26 @@ pub enum JoinFailure {
         /// What the network advertised.
         advertised: Advertised,
     },
+}
+
+impl JoinFailure {
+    /// Whether the failure is the sign of a secret that the network
+    /// refused, on a join asked as `kind`: on a WPA2 join the supplicant's
+    /// handshake timeout; on a WPA3 join an association failure behind an
+    /// authentication event whose status was not success, whatever that
+    /// status. Neither is a proof -- an exchange lost to a weak signal ends
+    /// the same way -- and no failure of an open join is read so.
+    pub const fn refused_secret(&self, kind: Security) -> bool {
+        match *self {
+            JoinFailure::Supplicant { reason } => {
+                matches!(kind, Security::Wpa2Psk) && reason == reason::supplicant::WPA_PSK_TIMEOUT
+            }
+            JoinFailure::Association { auth_status, .. } => {
+                matches!(kind, Security::Wpa3Sae) && auth_status != 0
+            }
+            _ => false,
+        }
+    }
 }
 
 /// The link's state.

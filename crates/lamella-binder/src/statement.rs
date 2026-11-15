@@ -7,6 +7,7 @@ use lamella_syntax::version::{Feature, LanguageVersion};
 use crate::special::SpecialType;
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -85,6 +86,80 @@ impl BoundStmt {
             | Kind::GotoDefault
             | Kind::Error => Vec::new(),
         }
+    }
+}
+
+/// A branch target's identity, retaining its spelling for diagnostics. Source labels with the
+/// same name in disjoint blocks have different identities (ECMA-334 15.4).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct BoundLabel {
+    name: Box<str>,
+    scope: Option<usize>,
+}
+
+impl BoundLabel {
+    /// Creates a compiler-generated target. Its name must be unique within the generated method.
+    #[must_use]
+    pub fn generated(name: impl Into<Box<str>>) -> Self {
+        Self { name: name.into(), scope: None }
+    }
+
+    /// The source spelling, or the generated name, without its scope identity.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+/// Label spaces follow source blocks and switch blocks, independently of local-variable scopes
+/// and blocks introduced by lowering. A nested function cannot see the spaces below its floor.
+#[derive(Debug, Default)]
+pub(crate) struct LabelScopes {
+    scopes: Vec<BTreeMap<Box<str>, BoundLabel>>,
+    next_scope: usize,
+    floor: usize,
+}
+
+impl LabelScopes {
+    pub(crate) fn enter<'a>(&mut self, statements: impl Iterator<Item = &'a Stmt>) {
+        let scope = self.next_scope;
+        self.next_scope += 1;
+        let mut declared = BTreeMap::new();
+        for statement in statements {
+            let mut current = statement;
+            while let StmtKind::Labeled { label, statement } = &current.kind {
+                // Overlapping declarations share an identity so the duplicate-label check
+                // reports them even when the enclosing declaration follows the nested block.
+                let target = self.find(label).cloned().unwrap_or_else(|| BoundLabel {
+                    name: label.clone(),
+                    scope: Some(scope),
+                });
+                declared.insert(label.clone(), target);
+                current = statement;
+            }
+        }
+        self.scopes.push(declared);
+    }
+
+    pub(crate) fn exit(&mut self) {
+        self.scopes.pop();
+    }
+
+    fn find(&self, name: &str) -> Option<&BoundLabel> {
+        self.scopes[self.floor..].iter().rev().find_map(|scope| scope.get(name))
+    }
+
+    fn resolve(&self, name: &str) -> BoundLabel {
+        self.find(name).cloned().unwrap_or_else(|| BoundLabel { name: name.into(), scope: None })
+    }
+
+    pub(crate) fn enter_function(&mut self) -> usize {
+        core::mem::replace(&mut self.floor, self.scopes.len())
+    }
+
+    pub(crate) fn exit_function(&mut self, outer_floor: usize) {
+        debug_assert_eq!(self.scopes.len(), self.floor);
+        self.floor = outer_floor;
     }
 }
 
@@ -221,13 +296,13 @@ pub enum BoundStmtKind {
     Unchecked(Box<BoundStmt>),
     /// A labeled statement (15.4).
     Labeled {
-        /// The label.
-        label: Box<str>,
+        /// The label's identity within its declaration space.
+        label: BoundLabel,
         /// The labeled statement.
         body: Box<BoundStmt>,
     },
     /// A `goto` statement (15.9.3), naming the label to branch to.
-    Goto(Box<str>),
+    Goto(BoundLabel),
     /// `goto case constant;` -- a jump to a case of the enclosing switch (15.9.3).
     GotoCase(i64),
     /// `goto case "string";` -- a jump to a string case of the enclosing switch.
@@ -433,6 +508,7 @@ impl Binder {
     pub fn bind_statement(&mut self, stmt: &Stmt) -> BoundStmt {
         let kind = match &stmt.kind {
             StmtKind::Block(statements) => {
+                self.label_scopes.enter(statements.iter());
                 self.enter_scope_at(stmt.span);
                 self.declare_local_functions(statements);
                 let contexts = self.take_body_statement_contexts();
@@ -455,6 +531,7 @@ impl Binder {
                     })
                     .collect();
                 self.exit_scope();
+                self.label_scopes.exit();
                 BoundStmtKind::Block(bound)
             }
             StmtKind::Empty => BoundStmtKind::Empty,
@@ -475,9 +552,7 @@ impl Binder {
                 };
                 let bound =
                     self.with_csharp73_stackallocs(assigned, |binder| binder.bind_expression(expr));
-                if !is_statement_expression(&bound.kind)
-                    && !matches!(expr.kind, ExprKind::Assignment { .. })
-                {
+                if !is_statement_expression_as_written(expr, &bound.kind) {
                     self.report(Diagnostic::new(
                         DiagnosticKind::IllegalStatementExpression,
                         expr.span,
@@ -714,6 +789,7 @@ impl Binder {
                 }
                 self.enter_scope_at(stmt.span);
                 self.enter_switch();
+                self.label_scopes.enter(sections.iter().flat_map(|section| &section.statements));
                 let mut seen_values: Vec<i64> = Vec::new();
                 let mut seen_strings: Vec<Box<[u16]>> = Vec::new();
                 let mut seen_null = false;
@@ -788,6 +864,7 @@ impl Binder {
                 }
                 self.exit_switch();
                 self.exit_scope();
+                self.label_scopes.exit();
                 BoundStmtKind::Switch {
                     expression,
                     sections: bound_sections,
@@ -855,11 +932,11 @@ impl Binder {
                 BoundStmtKind::Unchecked(Box::new(bound))
             }
             StmtKind::Labeled { label, statement } => BoundStmtKind::Labeled {
-                label: label.clone(),
+                label: self.label_scopes.resolve(label),
                 body: Box::new(self.bind_statement(statement)),
             },
             StmtKind::Goto(lamella_syntax::ast::GotoTarget::Label(name)) => {
-                BoundStmtKind::Goto(name.clone())
+                BoundStmtKind::Goto(self.label_scopes.resolve(name))
             }
             StmtKind::Goto(lamella_syntax::ast::GotoTarget::Case(expr)) => {
                 if !self.in_switch() {
@@ -1185,6 +1262,13 @@ impl Binder {
                 },
                 statement_span,
             ));
+            // An invalid pattern still binds the body in the iteration variable's loop scope.
+            self.enter_scope_at(span);
+            self.declare_local(name, element_type.clone());
+            self.enter_loop();
+            let _ = self.bind_statement(body);
+            self.exit_loop();
+            self.exit_scope();
             return Some(BoundStmtKind::Block(Vec::new()));
         };
         if self.foreach_needs_generic_interface_calls(&enumerator_type, &move_next, &get_current) {
@@ -1758,6 +1842,9 @@ impl Binder {
         let mut bound = Vec::with_capacity(declarators.len());
         for declarator in declarators {
             self.check_local_name_available(declarator);
+            // The initializer is in the local's scope. Definite assignment still checks
+            // reads, while an assignment in the initializer may write the local itself.
+            self.declare_local(&declarator.name, declared.clone());
             let initializer = declarator.initializer.as_ref().map(|expr| {
                 let outer = self.set_local_initializer_target(true);
                 let target_typed = self.bind_target_typed(expr, &declared);
@@ -1791,7 +1878,6 @@ impl Binder {
                 self.check_assignable(&value, &declared, declarator.span);
                 self.convert(value, &declared)
             });
-            self.declare_local(&declarator.name, declared.clone());
             self.note_stack_bound_local(&declarator.name, initializer.as_ref());
             self.record_local_tuple_names(&declarator.name, crate::bind::tuple_element_names(ty));
             bound.push(BoundDeclarator {
@@ -2243,6 +2329,7 @@ impl Binder {
             switch_span,
         );
         self.enter_switch();
+        self.label_scopes.enter(sections.iter().flat_map(|section| &section.statements));
         let mut covered = PatternCoverage::default();
         let mut seen_default = false;
         let mut declared: Vec<(Box<str>, TypeSymbol)> = Vec::new();
@@ -2315,6 +2402,7 @@ impl Binder {
         }
         self.exit_switch();
         self.exit_scope();
+        self.label_scopes.exit();
         BoundStmtKind::Switch {
             expression: governing,
             sections: bound_sections,
@@ -2528,9 +2616,10 @@ fn section_anchor(section: &SwitchSection, fallback: Span) -> Span {
 }
 
 /// Whether a bound expression is one C# allows to stand alone as a statement
-/// (15.6): assignment, invocation, object/array creation, pre/post
+/// (15.6): assignment, invocation, object creation, pre/post
 /// increment/decrement -- or an `await` expression, which ECMA-334 5th ed 13.7 adds to the
-/// list (`await t;` discards the result, exactly as a call statement does). `checked`/
+/// list (`await t;` discards the result, exactly as a call statement does). An array creation is
+/// not among them, sized or implicitly typed: `new int[3];` is CS0201. `checked`/
 /// `unchecked` wrappers and a binding error are admitted conservatively, so an
 /// odd-but-legal form is a gap, not a false CS0201.
 ///
@@ -2548,7 +2637,6 @@ pub(crate) fn is_statement_expression(kind: &BoundExprKind) -> bool {
         BoundExprKind::Assignment { .. }
             | BoundExprKind::Call { .. }
             | BoundExprKind::ObjectCreation { .. }
-            | BoundExprKind::ArrayCreation { .. }
             | BoundExprKind::Postfix { .. }
             | BoundExprKind::Unary {
                 operator: UnaryOperator::PreIncrement | UnaryOperator::PreDecrement,
@@ -2561,11 +2649,150 @@ pub(crate) fn is_statement_expression(kind: &BoundExprKind) -> bool {
     )
 }
 
+/// Whether `syntax`, bound as `bound`, may stand where only a statement expression may: as an
+/// expression statement, or as the body of a lambda converted to a `void`-returning delegate
+/// (14.5.11). An assignment or a postfix step is one however it binds: `_ = b[2]` binds to the
+/// value alone, and a postfix step on an indexer ends in the old value it saved.
+pub(crate) fn is_statement_expression_as_written(syntax: &Expr, bound: &BoundExprKind) -> bool {
+    matches!(syntax.kind, ExprKind::Assignment { .. } | ExprKind::PostfixUnary { .. })
+        || is_statement_expression(bound)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::resolve::TypeTable;
     use lamella_syntax::parser::parse_statement;
+
+    #[test]
+    fn scoped_labels_in_sibling_blocks_and_switches_have_distinct_targets() {
+        let source = "{ { goto done; done: ; } { goto done; done: ; }
+            switch (1) { case 1: goto done; done: break; }
+            switch (2) { case 2: goto done; done: break; } }";
+        let parsed = parse_statement(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let mut binder = Binder::new();
+        let body = binder.bind_statement(&parsed.statement);
+        assert!(binder.into_diagnostics().is_empty());
+        let diagnostics = crate::flow::check_labels(&body);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        let mut pending = alloc::vec![&body];
+        let mut declarations = alloc::collections::BTreeSet::new();
+        let mut targets = alloc::collections::BTreeSet::new();
+        while let Some(statement) = pending.pop() {
+            match &statement.kind {
+                BoundStmtKind::Labeled { label, .. } => { declarations.insert(label.clone()); }
+                BoundStmtKind::Goto(label) => { targets.insert(label.clone()); }
+                _ => {}
+            }
+            pending.extend(statement.children());
+        }
+        assert_eq!(declarations.len(), 4);
+        assert_eq!(declarations, targets);
+    }
+
+    #[test]
+    fn scoped_labels_do_not_make_a_sibling_label_reachable_or_referenced() {
+        let source = "{ { goto same; same: ; } { return; same: ; } }";
+        let mut binder = Binder::new();
+        let body = binder.bind_statement(&parse_statement(source).statement);
+        let diagnostics = crate::flow::check_labels(&body);
+        assert_eq!(diagnostics.iter().map(Diagnostic::code).collect::<Vec<_>>(), [164]);
+        let unreachable = crate::flow::check_unreachable(&body);
+        assert_eq!(unreachable.len(), 1, "{unreachable:?}");
+        assert_eq!(unreachable[0].span.start as usize, source.rfind("same:").unwrap());
+    }
+
+    #[test]
+    fn scoped_labels_reject_jumps_into_blocks_and_overlapping_declarations() {
+        for source in [
+            "{ goto missing; { missing: ; } }",
+            "{ { goto missing; } { missing: ; } }",
+            "{ switch (1) { case 1: missing: break; } goto missing; }",
+        ] {
+            let body = Binder::new().bind_statement(&parse_statement(source).statement);
+            let diagnostics = crate::flow::check_labels(&body);
+            assert!(diagnostics.iter().any(|item| matches!(
+                &item.kind, DiagnosticKind::UndefinedLabel { label } if &**label == "missing"
+            )), "{source}: {diagnostics:?}");
+        }
+        for source in [
+            "{ same: ; { same: ; } }",
+            "{ { same: ; } same: ; }",
+            "{ same: same: ; }",
+            "{ switch (1) { case 1: same: break; case 2: same: break; } }",
+        ] {
+            let body = Binder::new().bind_statement(&parse_statement(source).statement);
+            let diagnostics = crate::flow::check_labels(&body);
+            assert!(diagnostics.iter().any(|item| matches!(
+                &item.kind, DiagnosticKind::DuplicateLabel { label } if &**label == "same"
+            )), "{source}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn scoped_labels_keep_ancestor_chains_and_switch_sections_visible_in_every_dialect() {
+        for version in LanguageVersion::ALL_SELECTABLE {
+            let source = "{ { { goto leave; } leave: ; } { { goto leave; } leave: ; }
+                switch (1) { case 1: goto shared; case 2: shared: break; }
+                { goto first; first: second: goto second; } }";
+            let parsed = parse_statement(source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let mut binder = Binder::new();
+            binder.set_language_version(version);
+            for _ in 0..2 {
+                binder.bind_method(None, "M", TypeSymbol::Special(SpecialType::Void),
+                    &[], &[], true, false, &parsed.statement);
+            }
+            let diagnostics = binder.into_diagnostics();
+            assert!(diagnostics.is_empty(), "{version:?}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn scoped_labels_keep_nested_function_flow_separate() {
+        let source = "delegate int F(); class C {
+            static int M() { goto done; done: ;
+                int Local() { goto done; done: return 1; }
+                F f = () => { goto done; done: return 2; };
+                return Local() + f(); }
+        }";
+        let parsed = lamella_syntax::parser::parse_compilation_unit(source);
+        assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+        let diagnostics = crate::bind_compilation_unit_with_dialect(
+            &parsed.unit, &[], false, LanguageVersion::CSharp7_3);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn scoped_labels_cannot_be_targeted_from_a_nested_function() {
+        for declaration in [
+            "int Local() { goto outside; } return Local();",
+            "F f = () => { goto outside; }; return f();",
+        ] {
+            let source = format!("delegate int F(); class C {{ static int M() {{
+                goto outside; outside: ; {declaration} }} }}");
+            let parsed = lamella_syntax::parser::parse_compilation_unit(&source);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let diagnostics = crate::bind_compilation_unit_with_dialect(
+                &parsed.unit, &[], false, LanguageVersion::CSharp7_3);
+            assert!(diagnostics.iter().any(|item| matches!(
+                &item.kind, DiagnosticKind::UndefinedLabel { label } if &**label == "outside"
+            )), "{source}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn scoped_labels_in_a_submission_see_only_their_own_or_ancestor_blocks() {
+        let parsed = parse_statement("{ goto outer; outer: ;
+            { goto same; same: goto outer; } { goto same; same: ; } }");
+        let StmtKind::Block(statements) = parsed.statement.kind else { panic!("block") };
+        let mut binder = Binder::new();
+        let submission = binder.bind_submission(TypeSymbol::Named(["Session".into()].into()),
+            "receiver", &statements, None, BTreeMap::new(), BTreeMap::new());
+        let diagnostics = crate::flow::check_labels(&submission.body);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
 
     #[test]
     fn using_an_incomplete_reference_hierarchy_does_not_claim_a_conversion_error() {
@@ -2786,5 +3013,40 @@ mod tests {
                 .collect::<Vec<_>>(),
             [246]
         );
+    }
+
+    #[test]
+    fn own_initializer_assignments_bind_the_declared_local() {
+        for version in [LanguageVersion::CSharp1, LanguageVersion::DEFAULT] {
+            for source in [
+                "{ int value = (value = 17); value = value + 1; }",
+                "{ int first = (first = 3), second = (second = first + 4); first = second; }",
+                "{ int value = (value = 3) + value; value = value + 1; }",
+                "for (int value = (value = 2); value < 4; value++) { }",
+            ] {
+                let mut binder = Binder::new();
+                binder.set_language_version(version);
+                binder.enter_scope();
+                let bound = binder.bind_statement(&parse_statement(source).statement);
+                assert!(binder.diagnostics().is_empty(), "{source}: {:?}", binder.diagnostics());
+                let flow = crate::flow::check_definite_assignment(&bound, &[], &[], binder.model(), &[]);
+                assert!(flow.is_empty(), "{source}: {flow:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn own_initializer_reads_require_definite_assignment() {
+        for version in [LanguageVersion::CSharp1, LanguageVersion::DEFAULT] {
+            for source in ["{ int value = value; }", "{ int value = (value = value + 1); }"] {
+                let mut binder = Binder::new();
+                binder.set_language_version(version);
+                binder.enter_scope();
+                let bound = binder.bind_statement(&parse_statement(source).statement);
+                assert!(binder.diagnostics().is_empty(), "{source}: {:?}", binder.diagnostics());
+                let flow = crate::flow::check_definite_assignment(&bound, &[], &[], binder.model(), &[]);
+                assert_eq!(flow.iter().map(Diagnostic::code).collect::<Vec<_>>(), [165], "{source}");
+            }
+        }
     }
 }

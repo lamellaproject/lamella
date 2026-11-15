@@ -281,3 +281,90 @@ impl fmt::Display for Trap {
         }
     }
 }
+
+/// The codes a run reports when it ends any way other than its entry point returning, and what each
+/// one means: the one table the runtimes, the boards, the command line and the debugger all read.
+///
+/// A program that returns from its entry point reports what it returned, or 0 for an entry point
+/// that returns nothing. A run that ends any other way reports one of these, so a host can tell
+/// from the code alone what ended it: an exception the program did not catch, the runtime stopping
+/// the program itself, or the processor faulting.
+pub use lamella_exit_codes as exit_code;
+
+impl Trap {
+    /// The code a run that ended in this trap reports: [`exit_code::UNHANDLED_EXCEPTION`] for an
+    /// exception that propagated out of the entry method, and [`exit_code::FATAL_STOP`] for every
+    /// other trap, each of which is the interpreter stopping the program itself.
+    ///
+    /// No trap is an [`exit_code::PROCESSOR_FAULT`]: the interpreter refuses an access it cannot make
+    /// rather than letting the processor attempt it. On a build without exception handling, a fault
+    /// such as a null dereference ends the run as a trap of its own, and so reports
+    /// [`exit_code::FATAL_STOP`]: that build stops a program where another raises an exception.
+    #[must_use]
+    pub fn exit_code(&self) -> i32 {
+        match self {
+            Trap::UnhandledException(_) => exit_code::UNHANDLED_EXCEPTION,
+            _ => exit_code::FATAL_STOP,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Trap, UnhandledException, exit_code};
+    use lamella_cil::Opcode;
+
+    /// An exception nothing caught, as a run that ended in one reports it.
+    fn unhandled(type_name: &str) -> Trap {
+        Trap::UnhandledException(UnhandledException {
+            tag: 0,
+            type_name: Some(type_name.into()),
+            message: None,
+            raised_in: None,
+            inner: None,
+        })
+    }
+
+    #[test]
+    fn an_exception_nothing_caught_reports_134_as_on_dotnet() {
+        assert_eq!(unhandled("System.InvalidOperationException").exit_code(), 134);
+        assert_eq!(exit_code::UNHANDLED_EXCEPTION, 134);
+    }
+
+    #[test]
+    fn a_trap_of_the_interpreters_own_reports_the_runtimes_fatal_stop() {
+        for trap in [
+            Trap::TypeMismatch(Opcode::StindI4),
+            Trap::Unsupported(Opcode::Arglist),
+            Trap::UnresolvedCall(lamella_token::Token(0x0A00_0001)),
+            Trap::CallStackOverflow,
+            Trap::StaticCtorsNotRun,
+        ] {
+            assert_eq!(trap.exit_code(), 1, "{trap:?}");
+        }
+        assert_eq!(exit_code::FATAL_STOP, 1);
+    }
+
+    #[test]
+    fn a_processor_fault_has_a_code_of_its_own() {
+        assert_eq!(exit_code::PROCESSOR_FAULT, 2);
+        assert_ne!(exit_code::PROCESSOR_FAULT, exit_code::FATAL_STOP);
+        assert_ne!(exit_code::PROCESSOR_FAULT, exit_code::UNHANDLED_EXCEPTION);
+    }
+
+    #[test]
+    fn no_trap_reports_the_code_a_kernel_gives_when_it_refuses_to_start_a_program() {
+        for trap in [
+            unhandled("System.InvalidOperationException"),
+            Trap::TypeMismatch(Opcode::StindI4),
+            Trap::Unsupported(Opcode::Arglist),
+            Trap::UnresolvedCall(lamella_token::Token(0x0A00_0001)),
+            Trap::CallStackOverflow,
+            Trap::OutOfMemory,
+            Trap::StaticCtorsNotRun,
+        ] {
+            assert_ne!(trap.exit_code(), exit_code::KERNEL_REFUSED_ENTRY, "{trap:?}");
+        }
+        assert_eq!(exit_code::KERNEL_REFUSED_ENTRY, 4);
+    }
+}

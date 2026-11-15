@@ -18,6 +18,7 @@ const USBDEVFS_SUBMITURB: libc::c_ulong = ioctl_encoded(IOC_READ, b'U', 10, std:
 const USBDEVFS_REAPURBNDELAY: libc::c_ulong =
     ioctl_encoded(IOC_WRITE, b'U', 13, std::mem::size_of::<*mut UsbdevfsUrb>());
 const URB_TYPE_BULK: libc::c_uchar = 3;
+const USBDEVFS_CLEAR_HALT: libc::c_ulong = ioctl_encoded(IOC_READ, b'U', 21, std::mem::size_of::<libc::c_uint>());
 
 const IOC_WRITE: libc::c_ulong = 1;
 const IOC_READ: libc::c_ulong = 2;
@@ -615,10 +616,7 @@ fn open_claimed(node: &str, interface: u8) -> Result<fs::File> {
     let iface = libc::c_uint::from(interface);
     let rc = unsafe { libc::ioctl(file.as_raw_fd(), USBDEVFS_CLAIMINTERFACE, &iface) };
     if rc < 0 {
-        return Err(Error::Os(format!(
-            "USBDEVFS_CLAIMINTERFACE: {}",
-            std::io::Error::last_os_error()
-        )));
+        return Err(crate::open_error::claim_refusal(&std::io::Error::last_os_error()));
     }
     Ok(file)
 }
@@ -646,10 +644,25 @@ fn control_candidate(
     )
 }
 
-/// An interface claimed on a usbfs node and driven by `USBDEVFS_CONTROL`.
+/// The error for a bulk transfer on `endpoint` of an interface opened for its control requests, which
+/// failed with `error`: a stall is named as the device's answer, as [`crate::stalled`] names one on the
+/// control pipe, and every other failure as [`bulk_failure`] gives it.
+fn interface_bulk_failure(endpoint: u8, error: &std::io::Error) -> Error {
+    match error.raw_os_error() {
+        Some(libc::EPIPE) => Error::Os(format!("the device stalled endpoint {endpoint:#04x}")),
+        _ => bulk_failure(endpoint, error),
+    }
+}
+
+/// An interface claimed on a usbfs node and driven by `USBDEVFS_CONTROL`, and by `USBDEVFS_BULK` on its
+/// own bulk pair.
 pub struct ControlInterface {
     file: fs::File,
     interface: u8,
+    /// The interface's bulk IN endpoint address, zero when it has none.
+    ep_in: u8,
+    /// The interface's bulk OUT endpoint address, zero when it has none.
+    ep_out: u8,
 }
 
 impl ControlInterface {
@@ -667,7 +680,7 @@ impl ControlInterface {
             serial,
         )?;
         let file = open_claimed(&f.node, f.interface)?;
-        Ok(ControlInterface { file, interface: f.interface })
+        Ok(ControlInterface { file, interface: f.interface, ep_in: f.ep_in, ep_out: f.ep_out })
     }
 
     /// See [`crate::ControlInterface::interface_number`].
@@ -683,6 +696,55 @@ impl ControlInterface {
     /// See [`crate::ControlInterface::control_out`].
     pub fn control_out(&mut self, setup: Setup, data: &[u8], timeout_ms: u32) -> Result<usize> {
         self.control(setup, data.as_ptr().cast_mut().cast(), timeout_ms)
+    }
+
+    /// See [`crate::ControlInterface::write_bulk`].
+    pub fn write_bulk(&mut self, data: &[u8], timeout_ms: u32) -> Result<usize> {
+        if self.ep_out == 0 {
+            return Err(crate::interface_lacks("bulk OUT endpoint"));
+        }
+        self.bulk(self.ep_out, data.as_ptr().cast_mut().cast(), data.len(), timeout_ms)
+    }
+
+    /// See [`crate::ControlInterface::read_bulk`].
+    pub fn read_bulk(&mut self, buffer: &mut [u8], timeout_ms: u32) -> Result<usize> {
+        if self.ep_in == 0 {
+            return Err(crate::interface_lacks("bulk IN endpoint"));
+        }
+        self.bulk(self.ep_in, buffer.as_mut_ptr().cast(), buffer.len(), timeout_ms)
+    }
+
+    /// One `USBDEVFS_BULK` on `endpoint`, which answers the number of bytes transferred. `timeout_ms` is
+    /// never zero, which usbfs takes as no bound at all, and a transfer that reaches it is killed in
+    /// `usbfs_start_wait_urb` before the call returns.
+    fn bulk(&self, endpoint: u8, data: *mut libc::c_void, len: usize, timeout_ms: u32) -> Result<usize> {
+        let len = libc::c_uint::try_from(len)
+            .map_err(|_| Error::InvalidRequest(String::from("a bulk transfer is shorter than 4 GiB")))?;
+        let mut transfer = UsbdevfsBulktransfer { ep: u32::from(endpoint), len, timeout: timeout_ms, data };
+        let rc = unsafe { libc::ioctl(self.file.as_raw_fd(), USBDEVFS_BULK, &mut transfer) };
+        if rc < 0 {
+            return Err(interface_bulk_failure(endpoint, &std::io::Error::last_os_error()));
+        }
+        Ok(rc as usize)
+    }
+
+    /// See [`crate::ControlInterface::clear_bulk_halts`].
+    pub fn clear_bulk_halts(&mut self) -> Result<()> {
+        if self.ep_in == 0 || self.ep_out == 0 {
+            return Err(crate::interface_lacks("bulk pair"));
+        }
+        let mut failed = Vec::new();
+        for endpoint in [self.ep_out, self.ep_in] {
+            let address = libc::c_uint::from(endpoint);
+            if unsafe { libc::ioctl(self.file.as_raw_fd(), USBDEVFS_CLEAR_HALT, &address) } < 0 {
+                failed.push(format!("{endpoint:#04x} ({})", std::io::Error::last_os_error()));
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Os(format!("USBDEVFS_CLEAR_HALT failed for endpoint {}", failed.join(" and "))))
+        }
     }
 
     /// One `USBDEVFS_CONTROL`, which answers the number of bytes transferred (`do_proc_control`).

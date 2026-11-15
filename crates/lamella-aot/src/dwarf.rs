@@ -55,14 +55,29 @@ pub struct LocalRange {
     pub start: u32,
     /// One past the span's last byte, relative to the function's entry.
     pub end: u32,
-    /// Where the local is over that span: this many bytes above the stack pointer.
+    /// Where the local is over that span.
+    pub place: LocalPlace,
+}
+
+/// Where a local is over one [`LocalRange`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LocalPlace {
+    /// In the frame, this many bytes above the stack pointer.
     ///
     /// A frame slot rather than a register, and that is the whole of what this backend will claim.
     /// See `arm32::SpilledHomes`: a spilled slot belongs to one value for the length of the
     /// function, while a register is handed on to the next value the moment the first one dies --
     /// so a register-homed local would read correct until it went dead and then confidently
     /// report somebody else's number.
-    pub frame_offset: u16,
+    Frame(u16),
+    /// Stored nowhere, and holding zero: a local the method has not yet stored to, which its
+    /// `localsinit` flag zeroed. Every bit of the value is zero, whatever its width, so a reader
+    /// shows it as its type's zero: `0`, `false`, `'\0'`, `0.0` or null.
+    ///
+    /// Written as `DW_OP_lit0; DW_OP_stack_value` (DWARF 5 sections 2.5.1.1 and 2.6.1.1.4): the
+    /// value is the constant 0 and is not in memory, so a debugger can show it and cannot write
+    /// through it.
+    Zero,
 }
 
 /// Where one local lives across a function: a list of spans, each with the place it is at.
@@ -508,6 +523,11 @@ const DW_LLE_END_OF_LIST: u8 = 0x00;
 /// the register it means, so a location stays correct however the frame base is later spelled.
 /// It is also what LLVM emits for a plain stack slot on this target, measured on its own output.
 const DW_OP_BREG13: u8 = 0x7d;
+/// `DW_OP_lit0` -- pushes the constant 0 (DWARF 5 table 7.9).
+const DW_OP_LIT0: u8 = 0x30;
+/// `DW_OP_stack_value` -- the value is the number on top of the expression stack rather than the
+/// contents of memory at that address (DWARF 5 table 7.9).
+const DW_OP_STACK_VALUE: u8 = 0x9f;
 /// `DW_FORM_exprloc` -- a ULEB128 length followed by that many bytes of DWARF expression.
 const DW_FORM_EXPRLOC: u64 = 0x18;
 /// `DW_OP_reg13`, the ARM stack pointer: the whole of this back end's frame-base expression.
@@ -925,8 +945,13 @@ fn location_lists(functions: &[FunctionLines]) -> (GeneratedSection, Vec<(usize,
                 data.extend_from_slice(&range.start.to_le_bytes());
                 uleb128(&mut data, u64::from(range.end.saturating_sub(range.start)));
                 let mut expression = Vec::new();
-                expression.push(DW_OP_BREG13);
-                sleb128(&mut expression, i64::from(range.frame_offset));
+                match range.place {
+                    LocalPlace::Frame(offset) => {
+                        expression.push(DW_OP_BREG13);
+                        sleb128(&mut expression, i64::from(offset));
+                    }
+                    LocalPlace::Zero => expression.extend_from_slice(&[DW_OP_LIT0, DW_OP_STACK_VALUE]),
+                }
                 uleb128(&mut data, expression.len() as u64);
                 data.extend_from_slice(&expression);
             }
@@ -1558,6 +1583,33 @@ mod tests {
     }
 
     #[test]
+    fn a_local_not_yet_stored_to_is_the_constant_zero_until_its_slot_takes_over() {
+        let rows = [row(0, 3, 0)];
+        let int = crate::debugmap::base_type_of(&lamella_metadata::SigType::I4).unwrap();
+        let locals = [local(0, "n", Some(int))];
+        let locations = [LocalLocation {
+            slot: 0,
+            ranges: alloc::vec![
+                LocalRange { start: 4, end: 0x10, place: LocalPlace::Zero },
+                LocalRange { start: 0x10, end: 0x40, place: LocalPlace::Frame(8) },
+            ],
+        }];
+        let mut f = func("f", "p.cs", &rows, 0x40);
+        f.locals = &locals;
+        f.locations = &locations;
+        let (_, _, loclists) = compilation_unit("p.cs", "t", None, &[f]);
+        let list = &loclists.data[12..];
+        assert_eq!(list[0], 0x08, "DW_LLE_start_length");
+        assert_eq!(list[5], 0x0c, "length: 0x10 - 4");
+        assert_eq!(&list[6..9], &[2, 0x30, 0x9f], "a two-byte expression: DW_OP_lit0, DW_OP_stack_value");
+        assert_eq!(list[9], 0x08, "the slot's entry follows");
+        assert_eq!(&list[15..18], &[2, 0x7d, 8], "DW_OP_breg13, +8");
+        assert_eq!(list[18], 0x00, "DW_LLE_end_of_list");
+        let (site, _) = loclists.code_relocs[0];
+        assert_eq!(site_addend(&loclists, site), 4);
+    }
+
+    #[test]
     fn a_local_with_two_homes_becomes_a_location_list_the_variable_points_at() {
         let rows = [row(0, 3, 0)];
         let int = crate::debugmap::base_type_of(&lamella_metadata::SigType::I4).unwrap();
@@ -1565,8 +1617,8 @@ mod tests {
         let locations = [LocalLocation {
             slot: 0,
             ranges: alloc::vec![
-                LocalRange { start: 4, end: 0x20, frame_offset: 8 },
-                LocalRange { start: 0x20, end: 0x40, frame_offset: 72 },
+                LocalRange { start: 4, end: 0x20, place: LocalPlace::Frame(8) },
+                LocalRange { start: 0x20, end: 0x40, place: LocalPlace::Frame(72) },
             ],
         }];
         let mut f = func("f", "p.cs", &rows, 0x40);
@@ -1624,7 +1676,7 @@ mod tests {
         let locals = [local(0, "first", Some(int)), local(2, "second", Some(int))];
         let locations = [LocalLocation {
             slot: 2,
-            ranges: alloc::vec![LocalRange { start: 0, end: 0x10, frame_offset: 4 }],
+            ranges: alloc::vec![LocalRange { start: 0, end: 0x10, place: LocalPlace::Frame(4) }],
         }];
         let mut f = func("f", "p.cs", &rows, 0x40);
         f.locals = &locals;

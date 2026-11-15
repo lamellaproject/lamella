@@ -320,6 +320,7 @@ mod tests {
 
     fn method(type_parameters: &[&str], parameters: Vec<TypeSymbol>) -> MethodSymbol {
         MethodSymbol {
+            is_accessor: false,
             return_tuple_names: Vec::new(),
             return_required_modifiers: Vec::new(),
             explicit_interface: None,
@@ -337,6 +338,7 @@ mod tests {
             accessibility: crate::symbols::Accessibility::Public,
             conditional: Vec::new(),
             sets_required_members: false,
+            uninstantiated_parameters: None,
             type_parameters: type_parameters
                 .iter()
                 .map(|name| (*name).to_owned().into_boxed_str())

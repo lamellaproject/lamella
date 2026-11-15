@@ -49,6 +49,14 @@ fn wall_unix_millis() -> u64 {
         .map_or(0, |d| u64::try_from(d.as_millis()).unwrap_or(0))
 }
 
+/// The host's monotonic clock as the time since its origin, for code that paces itself by a clock it is given, such as
+/// a probe write's progress lines: the reading the interpreter's clock seam takes. A page's standard library has no
+/// clock of its own (`Instant::now` panics there), so nothing this crate builds for one reads it.
+#[cfg(feature = "probe")]
+pub(crate) fn monotonic() -> std::time::Duration {
+    std::time::Duration::from_millis(now_millis())
+}
+
 /// Installs the host clock seam on `vm`. Call this on every `Vm` this crate creates -- a `Vm` without it
 /// reports a frozen clock and a `Thread.Sleep` that does not sleep, with no diagnostic.
 pub fn install(module: &lamella_cil_runtime::Module, vm: &mut lamella_cil_runtime::Vm) {

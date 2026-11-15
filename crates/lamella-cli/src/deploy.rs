@@ -47,6 +47,7 @@ const SPEC: Spec<'static> = Spec {
         "--unsafe",
         crate::flash::CLASS_LIBRARY_FLAG,
         crate::flash::FLAT_FLAG,
+        crate::flash::DEBUG_FLAG,
         ERASE_FLAG,
     ],
     positional: Positional::One("source file"),
@@ -133,6 +134,19 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
         );
         return ExitCode::FAILURE;
     }
+    if parsed.flag(crate::flash::DEBUG_FLAG) && parsed.value("--device").is_some() {
+        eprintln!(
+            "{}",
+            crate::flash::debug_flag_where_nothing_is_built(
+                "deploy",
+                "--device sends firmware that is already running an image baked with the corlib \
+                 the program\nwas compiled against.",
+                "Use --board <board> to build the chip's image and write it.",
+                "Nothing was sent.",
+            )
+        );
+        return ExitCode::FAILURE;
+    }
     let libraries: Vec<crate::flash::Library> = Vec::new();
 
     match destination {
@@ -163,6 +177,7 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
                 tier,
                 &libraries,
                 &folders,
+                crate::flash::build_kind(&parsed),
             )
         }
         Destination::Device(target) if kind == lamella_flash_routes::artifact::Kind::WirePayload => {
@@ -230,6 +245,7 @@ fn erase_target(parsed: &args::Options) -> Result<&str, String> {
                 "--unsafe",
                 crate::flash::CLASS_LIBRARY_FLAG,
                 crate::flash::FLAT_FLAG,
+                crate::flash::DEBUG_FLAG,
             ]
             .into_iter()
             .filter(|name| parsed.flag(name)),
@@ -305,6 +321,8 @@ Options:
   --volume <name>                 With --board: which bootloader drive, when several are attached.
   --dfu <serial>                  With --board: which USB DFU bootloader, when several are attached.
   --nostdlib                      With --board: build the flat tier, the program alone.
+  --debug                         With --board: build a Debug image, for a debugger. Default: a
+                                  Release image.
   --unsafe                        With --board: allow C# unsafe code.
   --ref-dir <folder>              The class library's folder. Default: LAMELLA_REF_DIR.
   --runtime-support-dir <folder>  With --board: the runtime support archives' folder. Default:
@@ -349,9 +367,11 @@ Details:
   ~destructor) never runs. It covers fewer boards than the flat tier, and a board it has no plan
   for is refused, naming the boards there are.
 
-  A class-library image is compiled as a debug build is, so
-  `lamella build <file> --board <board> --format elf` describes exactly the image deployed, and a
-  debugger can attach to the board with it. The flat tier has no debug information.
+  The image is a Release build, optimized, unless --debug asks for a Debug build, which keeps
+  every parameter and local where a debugger can read it. A class-library image is compiled with
+  its debug information, so `lamella build <file> --board <board> --format elf`, given --debug when
+  the deploy was, describes exactly the image deployed, and a debugger can attach to the board
+  with it. The flat tier has no debug information.
 
   A .csproj builds every .cs beside it as one program and links the assemblies its <Reference>
   elements name, each by its <HintPath>. A single .cs file binds against the class library alone.
@@ -367,7 +387,7 @@ fn send_payload(path: &Path, target: &str, after: AfterDeploy) -> ExitCode {
         eprintln!(
             "lamella deploy: {} is a Python bundle, which travels by a different wire message \
              (DEPLOY_BUNDLE)\nthan a baked C# image. The host side of that message is not a \
-             library call yet, so this verb\ncannot send one -- and sending it down the image path \
+             library call, so this verb\ncannot send one -- and sending it down the image path \
              would deploy successfully and leave the\nboard unable to boot what it holds.",
             path.display()
         );
@@ -423,7 +443,7 @@ pub fn deploy_refusal(path: &Path, what: &Uncompilable) -> String {
             path.display()
         ),
         Uncompilable::Other => format!(
-            "lamella deploy: {} is not a C# file. This verb deploys the baked C# image today; \
+            "lamella deploy: {} is not a C# file. This verb deploys the baked C# image; \
              `lamella build` produces the Python bundle, whose deploy path is separate.",
             path.display()
         ),

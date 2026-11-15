@@ -218,7 +218,7 @@ pub fn emit_expression(
             }
             BinaryOperator::LogicalOr => emit_short_circuit(left, right, true, frame, tokens, out),
             _ => {
-                if emit_pointer_arithmetic(*operator, left, right, *checked, frame, tokens, out)? {
+                if emit_pointer_arithmetic(*operator, left, right, frame, tokens, out)? {
                     return Ok(());
                 }
                 let reference_equality =
@@ -254,6 +254,7 @@ pub fn emit_expression(
             checked,
         } => emit_step_expression(
             operand,
+            None,
             false,
             *operator == UnaryOperator::PreIncrement,
             *checked,
@@ -291,24 +292,7 @@ pub fn emit_expression(
             checked,
         } => {
             let increment = *operator == PostfixOperator::Increment;
-            if let Some(step) = step {
-                let (user_step, result_conversion) =
-                    crate::method::step_tokens(Some(step), operand, increment, tokens);
-                crate::method::emit_compound(
-                    operand,
-                    crate::method::step_operator(increment),
-                    None,
-                    user_step,
-                    result_conversion,
-                    *checked,
-                    frame,
-                    tokens,
-                    out,
-                    crate::method::Leave::Old,
-                )
-            } else {
-                emit_step_expression(operand, true, increment, *checked, frame, tokens, out)
-            }
+            emit_step_expression(operand, step.as_deref(), true, increment, *checked, frame, tokens, out)
         }
         BoundExprKind::Checked(inner) | BoundExprKind::Unchecked(inner) => {
             emit_expression(inner, frame, tokens, out)
@@ -2353,8 +2337,12 @@ pub(crate) fn open_sequence(
 ) -> Result<(), EmitError> {
     let mut slots = Vec::with_capacity(spilled.len());
     for operand in spilled {
-        emit_expression(operand, frame, tokens, out)?;
-        let slot = frame.reserve_local(&operand.ty);
+        emit_argument(operand, frame, tokens, out)?;
+        let ty = match &operand.kind {
+            BoundExprKind::Ref { operand, .. } => TypeSymbol::ByRef(Box::new(operand.ty.clone())),
+            _ => operand.ty.clone(),
+        };
+        let slot = frame.reserve_local(&ty);
         out.push(Instruction::new(Opcode::Stloc, Operand::Variable(slot)));
         slots.push(slot);
     }
@@ -2849,10 +2837,11 @@ pub(crate) fn emit_local(
 }
 
 /// Lowers `x++`/`x--`/`++x`/`--x` used in EXPRESSION position (leaving its value) for a
-/// non-byref local: load; (postfix) dup; +/-1; (prefix) dup; store. Postfix leaves the
-/// old value on the stack, prefix the new.
+/// local: load; (postfix) dup; step; (prefix) dup; store. Other targets use the shared
+/// read-modify-write path. Postfix leaves the old value on the stack, prefix the new.
 fn emit_step_expression(
     operand: &BoundExpr,
+    step: Option<&lamella_binder::ConvertingStep>,
     postfix: bool,
     increment: bool,
     checked: bool,
@@ -2860,42 +2849,51 @@ fn emit_step_expression(
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
-    let BoundExprKind::Local(name) = &operand.kind else {
-        let user_step = crate::method::user_step_method(operand, increment, tokens);
-        let leave = if postfix {
-            crate::method::Leave::Old
-        } else {
-            crate::method::Leave::New
-        };
-        return crate::method::emit_compound(
-            operand,
-            crate::method::step_operator(increment),
-            None,
-            user_step,
-            None,
-            checked,
-            frame,
-            tokens,
-            out,
-            leave,
-        );
-    };
-    if frame.byref(name).is_some() {
-        return Err(EmitError::Unsupported(
-            "++/-- of a byref variable in expression position",
-        ));
+    let (user_step, result_conversion) = crate::method::step_tokens(step, operand, increment, tokens);
+    if step.is_some() && user_step.is_none() {
+        return Err(EmitError::Unsupported("resolved step operator has no token"));
     }
+    if step.is_some_and(|step| step.result_conversion.is_some()) && result_conversion.is_none() {
+        return Err(EmitError::Unsupported("step result conversion has no token"));
+    }
+    let name = match &operand.kind {
+        BoundExprKind::Local(name) if frame.byref(name).is_none() => name,
+        _ => {
+            // Fields, elements, properties and byref variables keep the result in a temporary
+            // across the store. Their receiver/address is evaluated once by emit_compound.
+            let leave = if postfix {
+                crate::method::Leave::Old
+            } else {
+                crate::method::Leave::New
+            };
+            return crate::method::emit_compound(
+                operand,
+                crate::method::step_operator(increment),
+                None,
+                user_step,
+                result_conversion,
+                checked,
+                frame,
+                tokens,
+                out,
+                leave,
+            );
+        }
+    };
     let store = match frame.slot(name) {
         Some(Slot::Local(slot)) => Instruction::new(Opcode::Stloc, Operand::Variable(slot)),
         Some(Slot::Argument(slot)) => Instruction::new(Opcode::Starg, Operand::Variable(slot)),
         None => return Err(EmitError::Unsupported("++/-- of a name with no frame slot")),
     };
-    if let Some(token) = crate::method::user_step_method(operand, increment, tokens) {
+    if let Some(token) = user_step {
         if postfix {
             emit_local(name, frame, tokens, out)?;
         }
         emit_local(name, frame, tokens, out)?;
         out.push(Instruction::new(Opcode::Call, Operand::Token(token)));
+        if let Some(conversion) = result_conversion {
+            out.push(Instruction::new(Opcode::Call, Operand::Token(conversion)));
+        }
         out.push(store);
         if !postfix {
             emit_local(name, frame, tokens, out)?;
@@ -2906,7 +2904,7 @@ fn emit_step_expression(
     if postfix {
         out.push(Instruction::simple(Opcode::Dup));
     }
-    emit_step(&operand.ty, increment, checked, tokens, out)?;
+    emit_step(&operand.ty, increment, checked, frame, tokens, out)?;
     if !postfix {
         out.push(Instruction::simple(Opcode::Dup));
     }
@@ -2914,18 +2912,59 @@ fn emit_step_expression(
     Ok(())
 }
 
-/// Steps the value on the stack for a numeric, enum or pointer `++`/`--`: pushes a step of the
+/// Steps the value on the stack, lifting through nullable values when necessary.
+/// A numeric, enum or pointer `++`/`--` pushes a step of the
 /// operand's own type, adds or subtracts it, and narrows a result narrower than `int` back to its
-/// width, so the value a prefix step leaves is already narrowed. In a `checked` context the
-/// arithmetic and the narrowing check for overflow in the operand's own signedness; a floating
-/// step never checks (ECMA-334 12.8.19). Every position a step can take lowers through this.
+/// width, so the value a prefix step leaves is already narrowed. In a `checked` context integral
+/// arithmetic and narrowing check for overflow in the operand's own signedness. Floating and
+/// pointer steps never check (ECMA-334, 2nd edition, 14.5.12, 25.5.5 and 25.5.6). Every position
+/// a step can take lowers through this.
 pub(crate) fn emit_step(
     operand_ty: &TypeSymbol,
     increment: bool,
     checked: bool,
+    frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
 ) -> Result<(), EmitError> {
+    if let Some(underlying) = lamella_binder::nullable_underlying(operand_ty) {
+        // A lifted step preserves null and calls the underlying operator only for a value
+        // (ECMA-334 fourth edition 14.2.7). The caller owns the target and old/new result.
+        let has_value = tokens
+            .method(operand_ty, "get_HasValue", &[])
+            .ok_or(EmitError::Unsupported("nullable step HasValue token"))?;
+        let value = tokens
+            .method(operand_ty, "GetValueOrDefault", &[])
+            .ok_or(EmitError::Unsupported("nullable step GetValueOrDefault token"))?;
+        let ctor = tokens
+            .method(operand_ty, ".ctor", core::slice::from_ref(underlying))
+            .ok_or(EmitError::Unsupported("nullable step constructor token"))?;
+        let saved = frame.reserve_local(operand_ty);
+        out.push(Instruction::new(Opcode::Stloc, Operand::Variable(saved)));
+        out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(saved)));
+        out.push(Instruction::new(Opcode::Call, Operand::Token(has_value)));
+        let to_null = out.len();
+        out.push(Instruction::new(Opcode::Brfalse, Operand::Target(0)));
+        out.push(Instruction::new(Opcode::Ldloca, Operand::Variable(saved)));
+        out.push(Instruction::new(Opcode::Call, Operand::Token(value)));
+        let name = if increment { "op_Increment" } else { "op_Decrement" };
+        if let Some(operator) = tokens.method(underlying, name, core::slice::from_ref(underlying)) {
+            out.push(Instruction::new(Opcode::Call, Operand::Token(operator)));
+        } else if tokens.is_enum(underlying)
+            || matches!(underlying, TypeSymbol::Special(s) if s.is_numeric() && *s != SpecialType::Decimal)
+        {
+            emit_step(underlying, increment, checked, frame, tokens, out)?;
+        } else {
+            return Err(EmitError::Unsupported("nullable step underlying operator token"));
+        }
+        out.push(Instruction::new(Opcode::Newobj, Operand::Token(ctor)));
+        let to_end = out.len();
+        out.push(Instruction::new(Opcode::Br, Operand::Target(0)));
+        out[to_null].operand = Operand::Target(out.len() as u32);
+        out.push(Instruction::new(Opcode::Ldloc, Operand::Variable(saved)));
+        out[to_end].operand = Operand::Target(out.len() as u32);
+        return Ok(());
+    }
     let step_ty = tokens
         .enum_underlying(operand_ty)
         .map_or_else(|| operand_ty.clone(), TypeSymbol::Special);
@@ -2947,7 +2986,7 @@ pub(crate) fn emit_step(
     let overflow = match &step_ty {
         TypeSymbol::Special(SpecialType::Single | SpecialType::Double) => Overflow::Never,
         TypeSymbol::Special(special) if special.is_unsigned() => Overflow::Unsigned,
-        TypeSymbol::Pointer(_) => Overflow::Unsigned,
+        TypeSymbol::Pointer(_) => Overflow::Never,
         _ => Overflow::Signed,
     };
     out.push(Instruction::simple(if increment {
@@ -3373,10 +3412,6 @@ pub(crate) fn emit_string_equality(
     Ok(())
 }
 
-/// Lowers pointer arithmetic (18.5.6, unsafe), returning whether it handled the operator:
-/// `p + n` / `n + p` push the pointer then `n * sizeof(T)` and `add`; `p - n` does the same
-/// with `sub`; `p - q` subtracts the pointers and divides by `sizeof(T)` (the element
-/// count). The integer is scaled by the element size, exactly as `p[i]` is.
 /// Widens a pointer-arithmetic offset to native width before it joins the address math
 /// (18.5.6): an unsigned offset zero-extends (`conv.u`), a signed one sign-extends
 /// (`conv.i`). Without this a 32-bit unsigned offset >= 2^31 would ride the i4 add
@@ -3389,11 +3424,46 @@ fn widen_pointer_offset(offset_ty: &TypeSymbol, out: &mut Vec<Instruction>) {
     out.push(Instruction::simple(opcode));
 }
 
+/// Evaluates and scales an explicit pointer offset. Signed 32-bit offsets scale at
+/// native width; unsigned 32-bit and both 64-bit offsets scale at 64 bits before
+/// conversion to an address-sized value. Scaling is part of pointer arithmetic,
+/// which truncates without throwing on overflow (ECMA-334, second edition, 25.5.6).
+/// The offset expression retains its own checked context.
+fn emit_scaled_pointer_offset(
+    offset: &BoundExpr,
+    element: &TypeSymbol,
+    frame: &Frame,
+    tokens: &Tokens,
+    out: &mut Vec<Instruction>,
+) -> Result<(), EmitError> {
+    emit_expression(offset, frame, tokens, out)?;
+    let wide = matches!(offset.ty, TypeSymbol::Special(
+        SpecialType::UInt32 | SpecialType::Int64 | SpecialType::UInt64
+    ));
+    let unsigned = offset.ty == TypeSymbol::Special(SpecialType::UInt64);
+    if offset.ty == TypeSymbol::Special(SpecialType::UInt32) {
+        out.push(Instruction::simple(Opcode::ConvU8));
+    } else if !wide {
+        out.push(Instruction::simple(Opcode::ConvI));
+    }
+    emit_sizeof(element, tokens, out)?;
+    if wide {
+        out.push(Instruction::simple(Opcode::ConvI8));
+    }
+    out.push(Instruction::simple(Opcode::Mul));
+    if wide {
+        out.push(Instruction::simple(if unsigned { Opcode::ConvU } else { Opcode::ConvI }));
+    }
+    Ok(())
+}
+
+/// Lowers explicit pointer addition and subtraction, preserving operand order.
+/// Pointer differences divide the byte difference by the element size.
+/// Address arithmetic does not throw on overflow, even in a checked context.
 fn emit_pointer_arithmetic(
     operator: BinaryOperator,
     left: &BoundExpr,
     right: &BoundExpr,
-    checked: bool,
     frame: &Frame,
     tokens: &Tokens,
     out: &mut Vec<Instruction>,
@@ -3404,23 +3474,21 @@ fn emit_pointer_arithmetic(
     };
     match operator {
         BinaryOperator::Add => {
-            let (pointer, offset, element) = if let Some(element) = pointer_element(&left.ty) {
-                (left, right, element)
+            let (pointer, offset, element, reversed) = if let Some(element) = pointer_element(&left.ty) {
+                (left, right, element, false)
             } else if let Some(element) = pointer_element(&right.ty) {
-                (right, left, element)
+                (right, left, element, true)
             } else {
                 return Ok(false);
             };
-            emit_expression(pointer, frame, tokens, out)?;
-            emit_expression(offset, frame, tokens, out)?;
-            widen_pointer_offset(&offset.ty, out);
-            emit_sizeof(&element, tokens, out)?;
-            out.push(Instruction::simple(Opcode::Mul));
-            out.push(Instruction::simple(if checked {
-                Opcode::AddOvfUn
+            if reversed {
+                emit_scaled_pointer_offset(offset, &element, frame, tokens, out)?;
+                emit_expression(pointer, frame, tokens, out)?;
             } else {
-                Opcode::Add
-            }));
+                emit_expression(pointer, frame, tokens, out)?;
+                emit_scaled_pointer_offset(offset, &element, frame, tokens, out)?;
+            }
+            out.push(Instruction::simple(Opcode::Add));
             Ok(true)
         }
         BinaryOperator::Subtract => {
@@ -3438,15 +3506,8 @@ fn emit_pointer_arithmetic(
             }
             if let Some(element) = pointer_element(&left.ty) {
                 emit_expression(left, frame, tokens, out)?;
-                emit_expression(right, frame, tokens, out)?;
-                widen_pointer_offset(&right.ty, out);
-                emit_sizeof(&element, tokens, out)?;
-                out.push(Instruction::simple(Opcode::Mul));
-                out.push(Instruction::simple(if checked {
-                    Opcode::SubOvfUn
-                } else {
-                    Opcode::Sub
-                }));
+                emit_scaled_pointer_offset(right, &element, frame, tokens, out)?;
+                out.push(Instruction::simple(Opcode::Sub));
                 return Ok(true);
             }
             Ok(false)
@@ -3543,7 +3604,7 @@ fn unsigned_or(unsigned: bool, when_unsigned: Opcode, when_signed: Opcode) -> Op
 /// Which overflow check an arithmetic operation takes in a `checked` context.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Overflow {
-    /// None: a floating operation, which has no overflow-checking form.
+    /// None: arithmetic whose overflow does not produce exceptions.
     Never,
     /// The signed `.ovf` forms.
     Signed,
@@ -3552,7 +3613,7 @@ enum Overflow {
 }
 
 /// Picks the overflow-throwing opcode in a `checked` context -- its `.un` variant for an unsigned
-/// check -- else the plain form, which is also the only form for floating point.
+/// check -- else the plain form, which is also used for floating point and pointers.
 fn checked_or(checked: bool, overflow: Overflow, ovf_un: Opcode, ovf: Opcode, plain: Opcode) -> Opcode {
     match (checked, overflow) {
         (true, Overflow::Signed) => ovf,
@@ -3675,7 +3736,8 @@ mod tests {
     fn a_step_has_its_operands_type_and_checks_in_its_own_signedness() {
         let step = |ty: TypeSymbol, increment: bool, checked: bool| {
             let mut out = Vec::new();
-            emit_step(&ty, increment, checked, &Tokens::new(), &mut out).expect("should lower");
+            emit_step(&ty, increment, checked, &Frame::empty(), &Tokens::new(), &mut out)
+                .expect("should lower");
             out
         };
         let special = TypeSymbol::Special;
@@ -3686,8 +3748,27 @@ mod tests {
         assert_eq!(step(special(SpecialType::Int64), true, true), [i4(1), op(Opcode::ConvI8), op(Opcode::AddOvf)]);
         assert_eq!(step(special(SpecialType::Double), true, true), [Instruction::new(Opcode::LdcR8, Operand::Float64(1.0)), op(Opcode::Add)]);
         assert_eq!(step(special(SpecialType::Single), false, true), [Instruction::new(Opcode::LdcR4, Operand::Float32(1.0)), op(Opcode::Sub)]);
-        let pointer = TypeSymbol::Pointer(Box::new(special(SpecialType::Int32)));
-        assert_eq!(step(pointer, true, true), [i4(4), op(Opcode::AddOvfUn)]);
+    }
+
+    #[test]
+    fn pointer_steps_are_nonthrowing_in_checked_and_unchecked_contexts() {
+        for (element, size) in [
+            (SpecialType::Byte, 1),
+            (SpecialType::Int16, 2),
+            (SpecialType::Int32, 4),
+            (SpecialType::Int64, 8),
+        ] {
+            let pointer = TypeSymbol::Pointer(Box::new(TypeSymbol::Special(element)));
+            for checked in [false, true] {
+                for (increment, opcode) in [(true, Opcode::Add), (false, Opcode::Sub)] {
+                    let mut out = Vec::new();
+                    emit_step(&pointer, increment, checked, &Frame::empty(), &Tokens::new(), &mut out)
+                        .expect("pointer step lowers");
+                    assert_eq!(out, [i4(size), op(opcode)],
+                        "{element:?}, increment={increment}, checked={checked}");
+                }
+            }
+        }
     }
 
     #[test]

@@ -372,6 +372,12 @@ impl Device {
         }
     }
 
+    /// IOHIDDevice has no exclusion short of seizing the device from its holder
+    /// ([`crate::Device::open_id_alone`]).
+    pub fn open_id_alone(_id: &str) -> Result<Self> {
+        Err(Error::Unsupported)
+    }
+
     pub fn open_id(id: &str) -> Result<Self> {
         unsafe {
             let manager = matching_manager()?;

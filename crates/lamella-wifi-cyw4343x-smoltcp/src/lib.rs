@@ -2,8 +2,10 @@
 //! owns the radio -- the driver over its bus, as a [`Chip`] -- and the clock it runs on, and the
 //! station is the device: the stack's own receive and transmit calls pump the driver, so a backend
 //! that owns its device runs the radio inside its drive loop with nothing else to schedule.
-//! [`Station::bring_up`] and [`Station::join`] take the chip from power-up to a joined network
-//! before the stack is built, and after that the station reports the link.
+//! [`Station::start_bring_up`] takes the chip from power-up to a raised radio one rung per pass of
+//! whatever pumps the station, the stack's own calls among them, so nothing waits for the radio;
+//! [`Station::bring_up`] and [`Station::join`] wait for the same here, and the station reports the
+//! link.
 
 #![no_std]
 #![forbid(unsafe_code)]
@@ -12,8 +14,9 @@ extern crate alloc;
 #[cfg(test)]
 extern crate std;
 
-/// The network stored on the board, in two slots that each erase on their own.
-pub mod record;
+/// The network stored on the board, in two slots that each erase on their own: the record the
+/// board's other writers share.
+pub use lamella_stored_settings as record;
 
 /// The station as the Wi-Fi seam a language runtime reaches.
 pub mod controller;
@@ -62,11 +65,18 @@ pub trait Radio {
 
     /// The link's state.
     fn link(&self) -> LinkState;
+
+    /// The rest begun by the last refused secret, including its spread, in microseconds.
+    /// This is a duration, not a countdown; `None` after another failure, a join or a disconnect.
+    fn backoff(&self) -> Option<Micros>;
 }
 
 /// The radio's requests, each recorded at once and carried out by the polls that follow. `'b` is the
 /// life of the images and the credentials the driver holds by reference.
 pub trait Control<'b>: Radio {
+    /// Seeds the driver's spread on refused-secret rests. Without a seed, there is no spread.
+    fn seed(&mut self, seed: u32);
+
     /// Bring the bus up and identify the chip.
     fn attach(&mut self) -> bool;
 
@@ -88,6 +98,10 @@ pub trait Control<'b>: Radio {
 
     /// List the networks in range, one record per outcome, then the scan's end.
     fn scan(&mut self) -> bool;
+
+    /// Look for `ssid`, repeating a completed scan with the name in the probe requests if needed.
+    /// The driver holds the name until the scan ends.
+    fn scan_for(&mut self, ssid: &'b [u8]) -> bool;
 
     /// Ask the firmware which features it has, among them whether it runs WPA3's SAE exchange.
     fn capabilities(&mut self) -> bool;
@@ -162,9 +176,17 @@ impl<T: Transport + Interrupt> Radio for Chip<'_, T> {
     fn link(&self) -> LinkState {
         self.driver.link()
     }
+
+    fn backoff(&self) -> Option<Micros> {
+        self.driver.backoff()
+    }
 }
 
 impl<'b, T: Transport + Interrupt> Control<'b> for Chip<'b, T> {
+    fn seed(&mut self, seed: u32) {
+        self.driver.seed(seed);
+    }
+
     fn attach(&mut self) -> bool {
         self.driver.attach()
     }
@@ -191,6 +213,10 @@ impl<'b, T: Transport + Interrupt> Control<'b> for Chip<'b, T> {
 
     fn scan(&mut self) -> bool {
         self.driver.scan()
+    }
+
+    fn scan_for(&mut self, ssid: &'b [u8]) -> bool {
+        self.driver.scan_for(ssid)
     }
 
     fn capabilities(&mut self) -> bool {
@@ -220,13 +246,48 @@ pub enum Stop {
     Rejected(&'static str),
     /// The driver stopped at a named stage.
     Refused(Refusal),
-    /// The join failed in a way the driver does not retry -- a handshake that timed out, the usual
-    /// sign of a wrong passphrase, or a network advertising no suite the credential can use.
+    /// The driver released the network because its advertised security cannot use the credential.
+    /// Refused secrets remain with the driver for retry and do not produce this stop.
     JoinFailed(JoinFailure),
     /// The time allowed ran out first. A join goes on in the driver, and the link comes up later if
     /// the network is found while the station is pumped.
     TimedOut,
 }
+
+/// A step of the radio's bring-up: the request the station makes, which the step's outcome ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rung {
+    /// Bring the bus up and identify the chip; ends at [`Outcome::Attached`].
+    Attach,
+    /// Write the images and start the firmware; ends at [`Outcome::Uploaded`].
+    Upload,
+    /// Open the control path, the firmware's version checked; ends at [`Outcome::Ready`].
+    Open,
+    /// Bring the radio up and read the chip's own address; ends at [`Outcome::Up`].
+    Up,
+}
+
+/// Where the radio's bring-up is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BringUp {
+    /// Not started: the chip is not running.
+    Off,
+    /// Under way at `rung`; `asked` once the driver has taken the rung's request.
+    Starting {
+        /// The rung under way.
+        rung: Rung,
+        /// Whether the driver has taken its request.
+        asked: bool,
+    },
+    /// The radio is up, and [`Station::address`] holds the chip's own address.
+    Up,
+    /// It stopped short, and the radio does not run.
+    Stopped(Stop),
+}
+
+/// What a bring-up shows as it goes: each outcome the driver hands back on the way, or the stop that
+/// ended it short, with the microseconds since it began.
+pub type Narration = fn(Result<Outcome, Stop>, Micros);
 
 /// What the station has counted since it was built.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -310,6 +371,12 @@ pub struct Station<R, C> {
     /// The name of the network the running scan looks for, and its length; 0 when it looks for none.
     target: [u8; SSID_MAX],
     target_len: usize,
+    bring_up: BringUp,
+    /// When the bring-up began, and the instant it must be up by.
+    bring_up_start: Micros,
+    bring_up_deadline: Micros,
+    narration: Option<Narration>,
+    seed_source: Option<fn() -> Option<u32>>,
 }
 
 impl<R, C> Station<R, C> {
@@ -338,12 +405,41 @@ impl<R, C> Station<R, C> {
             },
             target: [0; SSID_MAX],
             target_len: 0,
+            bring_up: BringUp::Off,
+            bring_up_start: 0,
+            bring_up_deadline: 0,
+            narration: None,
+            seed_source: None,
         }
     }
 
     /// What the station has seen of the driver's requests.
     pub fn journal(&self) -> &Journal {
         &self.journal
+    }
+
+    /// Whether a named scan still holds the caller's name, until its end outcome arrives.
+    pub fn scan_pending(&self) -> bool {
+        self.target_len != 0
+    }
+
+    /// Where the bring-up is.
+    pub fn bring_up_state(&self) -> BringUp {
+        self.bring_up
+    }
+
+    /// Shows a bring-up started with [`Station::start_bring_up`] to `narration` as it goes.
+    pub fn narrate_with(&mut self, narration: Narration) {
+        self.narration = Some(narration);
+    }
+
+    /// Installs the hardware seed source before the radio starts. It is asked once, after the
+    /// attach request is accepted; `None` leaves the driver's rests without spread. Later calls
+    /// cannot reseed a running or failed radio.
+    pub fn seed_with(&mut self, source: fn() -> Option<u32>) {
+        if self.bring_up == BringUp::Off {
+            self.seed_source = Some(source);
+        }
     }
 
     /// The radio.
@@ -380,14 +476,23 @@ impl<R: Radio, C: Clock> Station<R, C> {
 
     /// Poll the driver while it is due, for at most [`POLLS_PER_CALL`] polls, stopping at a frame.
     /// The stack's calls pump by themselves; a caller with no stack running -- between two
-    /// programs, say -- calls this to keep the link serviced.
+    /// programs, say -- calls this to keep the link serviced. Each outcome of a bring-up under way
+    /// is shown to the narration, if one was given.
     pub fn service(&mut self) {
         for _ in 0..POLLS_PER_CALL {
             if !self.due() {
                 return;
             }
+            let starting = matches!(self.bring_up, BringUp::Starting { .. });
             let wake = self.radio.poll(&mut self.clock);
-            if let Some(Outcome::Frame { .. }) = self.settle(wake) {
+            let outcome = self.settle(wake);
+            if let (true, Some(outcome), Some(narration)) = (starting, outcome, self.narration) {
+                narration(Ok(outcome), self.clock.now_us().saturating_sub(self.bring_up_start));
+            }
+            if let Some(Outcome::Frame { .. }) = outcome {
+                return;
+            }
+            if let BringUp::Starting { asked: false, .. } = self.bring_up {
                 return;
             }
         }
@@ -447,6 +552,18 @@ impl<R: Radio, C: Clock> Station<R, C> {
             }
             Outcome::Capabilities(capabilities) => self.journal.capabilities = Some(capabilities),
             _ => {}
+        }
+        if let BringUp::Starting { rung, asked: true } = self.bring_up {
+            let next = match (rung, outcome) {
+                (Rung::Attach, Outcome::Attached { .. }) => Some(BringUp::Starting { rung: Rung::Upload, asked: false }),
+                (Rung::Upload, Outcome::Uploaded { .. }) => Some(BringUp::Starting { rung: Rung::Open, asked: false }),
+                (Rung::Open, Outcome::Ready { .. }) => Some(BringUp::Starting { rung: Rung::Up, asked: false }),
+                (Rung::Up, Outcome::Up { .. }) => Some(BringUp::Up),
+                _ => None,
+            };
+            if let Some(next) = next {
+                self.bring_up = next;
+            }
         }
         Some(outcome)
     }
@@ -515,39 +632,95 @@ impl<R: Radio, C: Clock> Station<R, C> {
 }
 
 impl<'b, R: Control<'b>, C: Clock> Station<R, C> {
-    /// Take the chip from power-up to a raised radio -- the bus attached and the chip identified, the
-    /// images uploaded and the firmware started, the control path opened with the firmware's version
-    /// checked, the radio up -- within `timeout_us`. Returns the chip's own address. Every outcome on
-    /// the way is shown to `seen`, with the microseconds since the call began.
+    /// Start taking the chip from power-up to a raised radio -- the bus attached and the chip
+    /// identified, the images uploaded and the firmware started, the control path opened with the
+    /// firmware's version checked, the radio up -- within `timeout_us`, and return at once. The
+    /// station's own polls carry each rung's outcome in, and [`Station::advance_bring_up`] makes the
+    /// request of the rung after it, so the bring-up goes on beside whatever pumps the station.
+    /// Returns whether it is under way or done; a bring-up is started once, and one that stopped
+    /// short stays stopped.
+    pub fn start_bring_up(&mut self, images: Images<'b>, timeout_us: Micros) -> bool {
+        match self.bring_up {
+            BringUp::Off => {}
+            BringUp::Starting { .. } | BringUp::Up => return true,
+            BringUp::Stopped(_) => return false,
+        }
+        let start = self.clock.now_us();
+        self.bring_up_start = start;
+        self.bring_up_deadline = start.saturating_add(timeout_us);
+        self.bring_up = BringUp::Starting { rung: Rung::Attach, asked: false };
+        self.advance_bring_up(images);
+        !matches!(self.bring_up, BringUp::Stopped(_))
+    }
+
+    /// Moves a bring-up under way on: makes the request of a rung whose outcome has not yet been
+    /// asked for, and ends it at a refusal or at its deadline. Called after each pump of the station;
+    /// it does nothing before a bring-up is started or after it ended.
+    pub fn advance_bring_up(&mut self, images: Images<'b>) {
+        let BringUp::Starting { rung, asked } = self.bring_up else { return };
+        let stop = if let Some(refusal) = self.refusal {
+            Some(Stop::Refused(refusal))
+        } else if self.clock.now_us() >= self.bring_up_deadline {
+            Some(Stop::TimedOut)
+        } else if asked {
+            return;
+        } else {
+            let (taken, request) = match rung {
+                Rung::Attach => (self.radio.attach(), "attach"),
+                Rung::Upload => (self.radio.upload(images.firmware, images.settings), "upload"),
+                Rung::Open => (self.radio.open(images.regulatory, images.version), "open"),
+                Rung::Up => (self.radio.up(), "up"),
+            };
+            if taken {
+                if rung == Rung::Attach {
+                    // Attach replaces the driver's station, so its seed must follow that request.
+                    if let Some(seed) = self.seed_source.take().and_then(|source| source()) {
+                        self.radio.seed(seed);
+                    }
+                }
+                self.bring_up = BringUp::Starting { rung, asked: true };
+                self.due_now();
+                return;
+            }
+            Some(Stop::Rejected(request))
+        };
+        if let Some(stop) = stop {
+            self.bring_up = BringUp::Stopped(stop);
+            if let Some(narration) = self.narration {
+                narration(Err(stop), self.clock.now_us().saturating_sub(self.bring_up_start));
+            }
+        }
+    }
+
+    /// Take the chip from power-up to a raised radio, as [`Station::start_bring_up`] does, waiting
+    /// for it here, within `timeout_us`. Returns the chip's own address. Every outcome on the way is
+    /// shown to `seen`, with the microseconds since the call began, and not to the narration.
     pub fn bring_up(
         &mut self,
         images: Images<'b>,
         timeout_us: Micros,
         seen: &mut dyn FnMut(Outcome, Micros),
     ) -> Result<[u8; 6], Stop> {
+        let narration = self.narration.take();
         let start = self.clock.now_us();
-        let deadline = start.saturating_add(timeout_us);
-        let never = |_: &Outcome, _: LinkState| None;
-        if !self.radio.attach() {
-            return Err(Stop::Rejected("attach"));
-        }
-        self.next_poll = start;
-        self.await_outcome(start, deadline, seen, |o| matches!(o, Outcome::Attached { .. }), never)?;
-        if !self.radio.upload(images.firmware, images.settings) {
-            return Err(Stop::Rejected("upload"));
-        }
-        self.await_outcome(start, deadline, seen, |o| matches!(o, Outcome::Uploaded { .. }), never)?;
-        if !self.radio.open(images.regulatory, images.version) {
-            return Err(Stop::Rejected("open"));
-        }
-        self.await_outcome(start, deadline, seen, |o| matches!(o, Outcome::Ready { .. }), never)?;
-        if !self.radio.up() {
-            return Err(Stop::Rejected("up"));
-        }
-        match self.await_outcome(start, deadline, seen, |o| matches!(o, Outcome::Up { .. }), never)? {
-            Outcome::Up { address } => Ok(address),
-            _ => Err(Stop::TimedOut),
-        }
+        self.start_bring_up(images, timeout_us);
+        let ended = loop {
+            match self.bring_up {
+                BringUp::Starting { .. } => {}
+                BringUp::Up => break self.address.ok_or(Stop::TimedOut),
+                BringUp::Stopped(stop) => break Err(stop),
+                BringUp::Off => break Err(Stop::Rejected("attach")),
+            }
+            if self.due() {
+                let wake = self.radio.poll(&mut self.clock);
+                if let Some(outcome) = self.settle(wake) {
+                    seen(outcome, self.clock.now_us().saturating_sub(start));
+                }
+            }
+            self.advance_bring_up(images);
+        };
+        self.narration = narration;
+        ended
     }
 
     /// Join the network named `ssid` with `credential`, waiting up to `timeout_us` for the link.
@@ -595,12 +768,15 @@ impl<'b, R: Control<'b>, C: Clock> Station<R, C> {
     /// Start a scan that looks for the network named `ssid`, and return at once; when the scan ends,
     /// the [`Journal`]'s sighting holds what it saw of that network. Returns whether the driver took
     /// the request.
-    pub fn start_scan(&mut self, ssid: &[u8]) -> bool {
-        let len = ssid.len().min(SSID_MAX);
-        self.target[..len].copy_from_slice(&ssid[..len]);
+    pub fn start_scan(&mut self, ssid: &'b [u8]) -> bool {
+        let len = ssid.len();
+        if !(1..=SSID_MAX).contains(&len) || self.scan_pending() {
+            return false;
+        }
+        self.target[..len].copy_from_slice(ssid);
         self.journal.sighting = None;
         self.due_now();
-        let accepted = self.radio.scan();
+        let accepted = self.radio.scan_for(ssid);
         self.target_len = if accepted { len } else { 0 };
         accepted
     }

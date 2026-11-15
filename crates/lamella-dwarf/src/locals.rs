@@ -4,7 +4,7 @@ use alloc::vec::Vec;
 
 use crate::cursor::{Cursor, Format};
 use crate::form::{self, Context, Value};
-use crate::{DwarfError, Sections};
+use crate::{DwarfError, Options, Sections};
 
 const DW_TAG_SUBPROGRAM: u64 = 0x2e;
 const DW_TAG_FORMAL_PARAMETER: u64 = 0x05;
@@ -42,6 +42,9 @@ const DW_OP_REG0: u8 = 0x50;
 const DW_OP_REG31: u8 = 0x6f;
 const DW_OP_BREG0: u8 = 0x70;
 const DW_OP_BREG31: u8 = 0x8f;
+const DW_OP_LIT0: u8 = 0x30;
+const DW_OP_LIT31: u8 = 0x4f;
+const DW_OP_STACK_VALUE: u8 = 0x9f;
 
 /// Where one local's value is, at one address.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +67,13 @@ pub enum Place<'a> {
     /// At a fixed address in the image -- `DW_OP_addr`. A static, or a local the compiler
     /// promoted to one. `DW_OP_addrx` is not resolved here and arrives as [`Self::Expression`].
     Address(u64),
+    /// Nowhere in memory, and known: the value itself, from `DW_OP_litN; DW_OP_stack_value`
+    /// (DWARF 5 sections 2.5.1.1 and 2.6.1.1.4), `N` from 0 to 31.
+    ///
+    /// The number is the object's contents, not an address, so a caller reading it shows the
+    /// declared type's value with these bits and reads nothing from the target. There is nothing
+    /// to write through either: a debugger that sets this variable has no place to set it in.
+    Constant(u64),
     /// An expression this crate does not classify, carried whole.
     ///
     /// **A CALLER MUST REFUSE THIS RATHER THAN SKIP IT.** The commonest shape behind it is
@@ -190,6 +200,30 @@ impl<'a> Subprogram<'a> {
     pub fn contains(&self, address: u64) -> bool {
         address >= self.low_pc && address < self.high_pc
     }
+
+    /// Where its parameters have all reached the places the producer describes them in from then on:
+    /// for each parameter whose location list moves it after the subprogram's first address, the
+    /// start of its first range past that address, and the latest of those. `None` where no
+    /// parameter moves after the entry -- none has a location list, or there is no parameter.
+    ///
+    /// A compiler that stores its incoming arguments in its prologue describes each in its argument
+    /// register up to the store and in its home from there, so this is where the prologue has put
+    /// them all.
+    #[must_use]
+    pub fn parameters_at_home(&self) -> Option<u64> {
+        self.locals
+            .iter()
+            .filter(|local| local.is_parameter && local.depth == 0)
+            .filter_map(|local| {
+                local
+                    .ranges()
+                    .iter()
+                    .map(|&(start, _, _)| start)
+                    .filter(|&start| start > self.low_pc)
+                    .min()
+            })
+            .max()
+    }
 }
 
 /// Every subprogram in an image that described any local, with those locals.
@@ -201,12 +235,31 @@ pub struct Locals<'a> {
 impl<'a> Locals<'a> {
     /// Reads `.debug_info` for subprograms and their parameters and variables.
     ///
+    /// Addresses are reported exactly as the sections store them. Use [`Self::parse_with`] on a
+    /// target whose code addresses carry tag bits.
+    ///
     /// # Errors
     /// [`DwarfError`] where the section itself cannot be walked. A single UNIT that cannot be read
     /// is skipped rather than failing the image, for the reason [`crate::info::functions`] gives:
     /// a linked image mixes objects and one unreadable contributor is not a reason to report that
     /// the others described nothing.
     pub fn parse(sections: &Sections<'a>) -> Result<Self, DwarfError> {
+        Self::parse_with(sections, &Options::default())
+    }
+
+    /// Reads `sections` as [`Self::parse`] does, against what the caller knows about the target.
+    ///
+    /// **WHERE THE TARGET'S CODE ADDRESSES MAY CARRY THE ARM THUMB BIT**
+    /// ([`Options::arm_thumb_addresses`]), the bit is cleared from the addresses of code: each
+    /// subprogram's range and each location list's ranges. A range keeps its length, its end
+    /// moved by what its start was. Left set, a subprogram's range begins one byte past its first
+    /// instruction, so the locals at that instruction answer with no subprogram, and a location
+    /// list hands the instruction at each boundary to the range before it. The operand of a
+    /// `DW_OP_addr` is data, and is never changed.
+    ///
+    /// # Errors
+    /// As [`Self::parse`].
+    pub fn parse_with(sections: &Sections<'a>, options: &Options) -> Result<Self, DwarfError> {
         let mut subprograms = Vec::new();
         let mut cursor = Cursor::new(sections.debug_info);
         while !cursor.is_empty() {
@@ -223,11 +276,23 @@ impl<'a> Locals<'a> {
                 subprograms.append(&mut found);
             }
         }
+        if options.arm_thumb_addresses {
+            for program in &mut subprograms {
+                (program.low_pc, program.high_pc) = without_thumb_bit(program.low_pc, program.high_pc);
+                for local in &mut program.locals {
+                    if let Location::List(ranges) = &mut local.location {
+                        for (start, end, _) in ranges.iter_mut() {
+                            (*start, *end) = without_thumb_bit(*start, *end);
+                        }
+                    }
+                }
+            }
+        }
         Ok(Locals { subprograms })
     }
 
-    /// The same, keeping only subprograms that lie inside one of `code` -- the image's executable
-    /// section ranges.
+    /// The same as [`Self::parse_with`], keeping only subprograms that lie inside one of `code` --
+    /// the image's executable section ranges.
     ///
     /// # AN IMAGE DESCRIBES SUBPROGRAMS THE LINKER REMOVED, AND THEY OVERLAP THE ONES IT KEPT
     ///
@@ -252,8 +317,9 @@ impl<'a> Locals<'a> {
     pub fn parse_within(
         sections: &Sections<'a>,
         code: &[(u64, u64)],
+        options: &Options,
     ) -> Result<Self, DwarfError> {
-        let mut locals = Self::parse(sections)?;
+        let mut locals = Self::parse_with(sections, options)?;
         if !code.is_empty() {
             locals.subprograms.retain(|program| {
                 code.iter()
@@ -301,6 +367,9 @@ impl<'a> Locals<'a> {
 /// thing at that place, which is a different value, and treating the two alike reports a pointer's
 /// target as the pointer.
 pub(crate) fn classify(expression: &[u8]) -> Place<'_> {
+    if let [literal @ DW_OP_LIT0..=DW_OP_LIT31, DW_OP_STACK_VALUE] = expression {
+        return Place::Constant(u64::from(literal - DW_OP_LIT0));
+    }
     let Some((&opcode, rest)) = expression.split_first() else {
         return Place::Nowhere;
     };
@@ -361,6 +430,8 @@ fn unit_locals<'a>(
     format: Format,
     sections: &Sections<'a>,
 ) -> Result<Vec<Subprogram<'a>>, DwarfError> {
+    let unit_start = (unit.origin_offset() as u64)
+        .saturating_sub(u64::from(format.offset_size()) + if format == Format::Dwarf64 { 4 } else { 0 });
     let version = unit.u16()?;
     if !(2..=5).contains(&version) {
         return Err(DwarfError::UnsupportedUnitVersion(version));
@@ -442,7 +513,7 @@ fn unit_locals<'a>(
                     high_pc = value.as_u64();
                     high_pc_is_address = form == DW_FORM_ADDR;
                 }
-                DW_AT_TYPE => type_offset = value.as_u64(),
+                DW_AT_TYPE => type_offset = section_reference(form, value, unit_start),
                 DW_AT_FRAME_BASE => {
                     if let Some(bytes) = value.as_bytes() {
                         frame_base = classify_frame_base(bytes);
@@ -523,6 +594,14 @@ fn unit_locals<'a>(
     Ok(out)
 }
 
+/// The code range `[start, end)` with the ARM Thumb bit cleared from its start and its end moved by
+/// the same amount, so the range keeps its length whatever the bit was doing, as
+/// [`crate::DebugInfo::parse_with`] moves a function's.
+fn without_thumb_bit(start: u64, end: u64) -> (u64, u64) {
+    let masked = start & !1;
+    (masked, end.saturating_sub(start - masked))
+}
+
 /// Follows an origin reference to the entry that carries the name.
 ///
 /// A chain is legal -- a concrete inlined instance points at an abstract one, which may itself be a
@@ -542,6 +621,20 @@ pub(crate) fn resolve_name<'a>(entries: &[Entry<'a>], offset: usize, depth: u8) 
 
 /// A reference expressed as an offset from the start of its unit, which is what the `DW_FORM_ref*`
 /// family means -- `DW_FORM_ref_addr` counts from the section instead and is not resolved here.
+/// `DW_FORM_ref_addr`: an offset from the beginning of `.debug_info`.
+const DW_FORM_REF_ADDR: u64 = 0x10;
+
+/// A reference attribute as an offset within `.debug_info`: one counted from its unit's header, which
+/// begins at `unit_start` there, or one counted from the section's start already (`DW_FORM_ref_addr`).
+/// `None` for any other form.
+pub(crate) fn section_reference(form: u64, value: Value<'_>, unit_start: u64) -> Option<u64> {
+    match unit_relative_reference(form, value) {
+        Some(relative) => unit_start.checked_add(u64::try_from(relative).ok()?),
+        None if form == DW_FORM_REF_ADDR => value.as_u64(),
+        None => None,
+    }
+}
+
 pub(crate) fn unit_relative_reference(form: u64, value: Value<'_>) -> Option<usize> {
     match form {
         DW_FORM_REF1 | DW_FORM_REF2 | DW_FORM_REF4 | DW_FORM_REF8 | DW_FORM_REF_UDATA => {
@@ -553,15 +646,15 @@ pub(crate) fn unit_relative_reference(form: u64, value: Value<'_>) -> Option<usi
 
 /// The attributes of a unit's own entry that its later entries are read against.
 #[derive(Default)]
-struct UnitBases {
-    str_offsets_base: Option<u64>,
-    addr_base: Option<u64>,
-    loclists_base: Option<u64>,
-    low_pc: Option<u64>,
+pub(crate) struct UnitBases {
+    pub(crate) str_offsets_base: Option<u64>,
+    pub(crate) addr_base: Option<u64>,
+    pub(crate) loclists_base: Option<u64>,
+    pub(crate) low_pc: Option<u64>,
 }
 
 /// Reads the first entry of a unit for the bases and the base address a location list counts from.
-fn unit_bases<'a>(
+pub(crate) fn unit_bases<'a>(
     unit: &mut Cursor<'a>,
     abbrevs: &[crate::info::Abbrev],
     context: &Context,

@@ -3,6 +3,7 @@
 //! the chip's own bootrom flash API on the halted core -- no flash controller driver on the host.
 
 use lamella_cmsis_dap::{Dap, Transport};
+use lamella_flash_backend::progress::Moment;
 use lamella_probe_core::{ArmDap, CallFrame, ProbeError, TargetAccess, TargetAccessExt};
 
 /// The XIP flash window base -- where a firmware image boots from.
@@ -11,6 +12,32 @@ pub const XIP_BASE: u32 = 0x1000_0000;
 /// DP `SELECT` for the core-0 AHB MEM-AP: AP base `0x2000` + the ADIv6 MEM-AP register file at
 /// `0xd00` (so `TAR`/`DRW`/`CSW` decode at their usual offsets).
 pub const CORE0_MEM_AP_SELECT: u32 = 0x2d00;
+
+/// The `DPIDR` an RP2350's SW-DP answers. It is Arm's port, so a part from another vendor could answer
+/// the same word, and the port's `TARGETID` is what names the chip.
+pub const DPIDR: u32 = 0x4c01_3477;
+
+/// DP `SELECT` for the RP-AP (datasheet 3.5.10.1). The RP-AP is always powered: reaching it needs no
+/// debug power-up request, and the switched core domain may be down.
+pub const RP_AP_SELECT: u32 = 0x8_0000;
+
+/// The RP-AP's `DBG_POW_STATE_SWCORE` register (datasheet 3.5.10.1, table 99): the state of the power
+/// sequencer for the switched core domain.
+pub const RP_AP_DBG_POW_STATE_SWCORE: u8 = 0x08;
+
+/// `DBG_POW_STATE_SWCORE.IS_PU`: the switched core domain has finished powering up.
+pub const POW_STATE_IS_PU: u32 = 1 << 8;
+
+/// `SYSINFO.CHIP_ID` (datasheet 12.15.1): the JEDEC identifier of the chip, with its revision.
+pub const SYSINFO_CHIP_ID: u32 = 0x4000_0000;
+
+/// `SYSINFO.PACKAGE_SEL` (datasheet table 1308): bit 0 is 0 for QFN80, the RP2350B, and 1 for QFN60,
+/// the RP2350A.
+pub const SYSINFO_PACKAGE_SEL: u32 = 0x4000_0004;
+
+/// `OTP_DATA_BASE`, the ECC-corrected alias of the OTP array (datasheet 13): rows `0x000..0x003` hold
+/// the 64-bit chip id, one 32-bit read per two rows, low word first.
+pub const OTP_CHIP_ID: u32 = 0x4013_0000;
 
 /// The erase granule the bootrom API enforces (datasheet 5.4.8.9).
 pub const SECTOR_BYTES: usize = 4096;
@@ -79,8 +106,8 @@ const CALL_TRAP: u32 = 0x2000_0000;
 /// flash device takes the 64 KiB block erase (datasheet 5.4.8.9), and a sector erase is specified
 /// at up to 400 ms on the 16 MB parts these boards carry (the W25Q128JV's tSE: 45 ms typical). So
 /// one call takes at most 6.4 s whatever the image's size, and [`FLASH_OP_POLLS`] covers that
-/// several times over. Every call starts on a 64 KiB boundary, so where the block erase is enabled
-/// a whole call is one block.
+/// several times over. Calls stop at 64 KiB boundaries, so a whole block inside a differing span
+/// takes one block erase where that command is enabled.
 const ERASE_CALL_BYTES: usize = 64 * 1024;
 
 /// How many times a `flash_op` call is polled for its return before it is given up as hung.
@@ -416,14 +443,19 @@ fn allow_block_erase<A: TargetAccess>(
     Ok(true)
 }
 
-/// Flash `image` to the start of QSPI flash (the XIP base) via the bootrom, verify it by
-/// reading back through the coherent (cache-flushed) XIP window, and reset the chip to boot it.
+/// Compare `image` with QSPI flash (the XIP base), rewrite only sectors that differ via the
+/// bootrom, verify the whole image through the coherent XIP window, and reset the chip to boot it.
 /// `log` receives progress lines. Returns the words the verify read: the whole page-padded image,
 /// as the flash holds it now, so a caller can compare them against its own copy of the image
 /// without reading the flash a second time.
 ///
 /// The erase goes a 4 KiB sector at a time, which every flash device takes. [`flash_image_with`]
 /// lets a caller that knows the device erase by 64 KiB block instead.
+///
+/// It paces its progress by the standard library's clock, so a WebAssembly build for a web page,
+/// whose standard library has none, has no `flash_image`: it gives [`flash_image_with_clock`] its
+/// host's clock instead.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub fn flash_image<A: TargetAccess>(
     target: &mut A,
     image: &[u8],
@@ -438,16 +470,112 @@ pub fn flash_image<A: TargetAccess>(
 /// record for a first attempt, and the one an earlier attempt filled for each attempt after it. A
 /// bit this write set is cleared before anything is programmed, whatever stops the erase; a
 /// failed clear fails the write, and when the write already failed, a line says so.
+///
+/// Like [`flash_image`], it is not in a WebAssembly build for a web page.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
 pub fn flash_image_with<A: TargetAccess>(
     target: &mut A,
     image: &[u8],
     erase: Erase,
     as_found: &mut D8hAsFound,
-    mut log: impl FnMut(&str),
+    log: impl FnMut(&str),
 ) -> Result<Vec<u32>, ProbeError> {
-    if image.is_empty() {
+    flash_image_with_clock(target, image, erase, as_found, log, std::time::Instant::now)
+}
+
+/// [`flash_image_with`], pacing its chunk lines and timing its compare by the monotonic clock
+/// `now` reads: [`Instant::now`](std::time::Instant::now), or a host's time since a fixed origin,
+/// as a [`Duration`](std::time::Duration), where the standard library has no clock.
+pub fn flash_image_with_clock<A: TargetAccess, T: Moment>(
+    target: &mut A,
+    image: &[u8],
+    erase: Erase,
+    as_found: &mut D8hAsFound,
+    log: impl FnMut(&str),
+    now: impl FnMut() -> T,
+) -> Result<Vec<u32>, ProbeError> {
+    let whole = Span { offset: 0, bytes: image, header: 0 };
+    let mut written = flash_spans_with_clock(target, &[whole], &[], erase, as_found, log, now)?;
+    Ok(written.pop().map(|span| span.read).unwrap_or_default())
+}
+
+/// One span of a write: bytes that belong in the flash from [`offset`](Self::offset), compared with
+/// the flash, erased and programmed a 4 KiB sector at a time.
+///
+/// A span covers whole sectors. The bytes past its end in its last sector are erased padding, as
+/// they are for a whole image, so two spans of one write never share a sector.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Span<'a> {
+    /// Where the first byte belongs, in bytes from the start of the flash: a sector's start.
+    pub offset: u32,
+    /// The bytes, at least one.
+    pub bytes: &'a [u8],
+    /// How many bytes at the span's start are its directory, in whole sectors, or 0 for a span
+    /// with none.
+    ///
+    /// When any sector of a span with a directory differs from the flash, the directory's sectors
+    /// are erased before every other sector of the span, and programmed only after every other
+    /// sector of the span has been programmed and read back. A write stopped anywhere on the way
+    /// leaves the directory erased, so nothing can read it as describing bytes that are not whole.
+    pub header: u32,
+}
+
+/// What a write does with one [`Span`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpanWrite {
+    /// The 4 KiB sectors erased: none when the flash already held the span.
+    pub sectors_erased: usize,
+    /// The bytes programmed: none when the flash already held the span.
+    pub bytes_programmed: usize,
+    /// The span's words, page-padded, as the flash holds them once the write is done: the
+    /// comparison's read of a span the flash already held, and the read-back of one it wrote.
+    pub read: Vec<u32>,
+}
+
+/// Writes `spans` in one session on the halted core, in the order given, and resets the chip to
+/// run.
+///
+/// The flash is compared with every span first. Then each span that differs has the sectors that
+/// differ erased and programmed, and is read back whole, before the next span is touched. A span
+/// the flash already holds is erased and programmed nowhere. Nothing outside the spans' sectors is
+/// erased or programmed.
+///
+/// `keep` names flash that no span may reach, in bytes from the flash's start. A span that reaches
+/// it, two spans that share a sector, a span that does not start on a sector or passes the end of
+/// the flash's 16 MiB, and a directory that is not whole sectors inside its span are each refused
+/// before anything is reset.
+///
+/// `erase` and `as_found` are [`flash_image_with`]'s. Returns what was done with each span, in the
+/// order given.
+///
+/// Like [`flash_image`], it is not in a WebAssembly build for a web page.
+#[cfg(not(all(target_family = "wasm", target_os = "unknown")))]
+pub fn flash_spans_with<A: TargetAccess>(
+    target: &mut A,
+    spans: &[Span<'_>],
+    keep: &[core::ops::Range<u32>],
+    erase: Erase,
+    as_found: &mut D8hAsFound,
+    log: impl FnMut(&str),
+) -> Result<Vec<SpanWrite>, ProbeError> {
+    flash_spans_with_clock(target, spans, keep, erase, as_found, log, std::time::Instant::now)
+}
+
+/// [`flash_spans_with`], pacing its chunk lines and timing its comparisons by the monotonic clock
+/// `now` reads, as [`flash_image_with_clock`] does.
+pub fn flash_spans_with_clock<A: TargetAccess, T: Moment>(
+    target: &mut A,
+    spans: &[Span<'_>],
+    keep: &[core::ops::Range<u32>],
+    erase: Erase,
+    as_found: &mut D8hAsFound,
+    mut log: impl FnMut(&str),
+    mut now: impl FnMut() -> T,
+) -> Result<Vec<SpanWrite>, ProbeError> {
+    if spans.is_empty() || spans.iter().any(|span| span.bytes.is_empty()) {
         return Err(ProbeError::Timeout("image empty"));
     }
+    refuse_unwritable(spans, keep, &mut log)?;
 
     log("reset-halt into the secure boot context...");
     reset_halt(target)?;
@@ -459,20 +587,9 @@ pub fn flash_image_with<A: TargetAccess>(
     let flash_op = rom_function(target, b'F', b'O')?;
     let flash_flush_cache = rom_function(target, b'F', b'C')?;
 
-    if target.read_word(BOOTLOCK_FLASH_OP)? == 0 {
-        target.write_word(BOOTLOCK_FLASH_OP, 0)?;
-        let _ = target.read_word(BOOTLOCK_FLASH_OP)?;
-    }
+    claim_flash_lock(target)?;
 
-    let mut words: Vec<u32> = image
-        .chunks(4)
-        .map(|c| {
-            let mut w = [0xFFu8; 4];
-            w[..c.len()].copy_from_slice(c);
-            u32::from_le_bytes(w)
-        })
-        .collect();
-    words.resize(image.len().div_ceil(PAGE_BYTES) * (PAGE_BYTES / 4), 0xFFFF_FFFF);
+    let words: Vec<Vec<u32>> = spans.iter().map(|span| page_padded_words(span.bytes)).collect();
 
     let frame = CallFrame::new(CALL_SP, CALL_TRAP);
     let slow = CallFrame { poll_tries: FLASH_OP_POLLS, ..frame };
@@ -480,83 +597,526 @@ pub fn flash_image_with<A: TargetAccess>(
     target.call_target(u32::from(connect_internal_flash), &[], &frame)?;
     target.call_target(u32::from(flash_exit_xip), &[], &frame)?;
 
-    let erase_len = image.len().div_ceil(SECTOR_BYTES) * SECTOR_BYTES;
-    let mut held = HeldD8h { target: &mut *target, bit: None };
-    let by_block = match erase {
-        Erase::Sectors => Ok(false),
-        Erase::Blocks => allow_block_erase(&mut held, as_found, &mut log),
-    };
-    let erased = by_block.and_then(|by_block| {
-        let by_block = if by_block { ", each whole 64 KiB block by one block erase" } else { "" };
+    target.call_target(u32::from(flash_flush_cache), &[], &frame)?;
+    let several = spans.len() > 1;
+    let mut present = Vec::with_capacity(spans.len());
+    let mut changed = Vec::with_capacity(spans.len());
+    for (span, wanted) in spans.iter().zip(&words) {
+        let erase_len = sector_len(span.bytes.len());
+        let compared_at = now();
+        let read = target.read_words(XIP_BASE + span.offset, erase_len / 4)?;
+        let runs = changed_sectors(wanted, &read);
+        let different: usize = runs.iter().map(|run| run.len()).sum();
+        let at = if several { format!(" at {:#010x}", XIP_BASE + span.offset) } else { String::new() };
         log(&format!(
-            "flash_op ERASE {erase_len} bytes at {XIP_BASE:#010x}, {ERASE_CALL_BYTES} bytes a \
-             call{by_block}..."
+            "compared {erase_len} bytes{at} in {:.3} s; {} of {} sectors differ",
+            now().since(compared_at).as_secs_f64(),
+            different / SECTOR_BYTES,
+            erase_len / SECTOR_BYTES
         ));
-        erase_span(&mut *held, flash_op, erase_len, &slow, &mut log)
-    });
-    let released = held.release();
-    if let Err(why) = erased {
-        if let Err(clear) = released {
-            log(&format!(
-                "FLASH_DEVINFO's D8h bit could not be cleared ({clear}); the chip's next boot sets \
-                 FLASH_DEVINFO up afresh"
-            ));
-        }
-        return Err(why);
+        present.push(read);
+        changed.push(runs);
     }
-    released?;
+    if changed.iter().all(Vec::is_empty) {
+        if as_found.0 == Some(false) {
+            let mut held = HeldD8h { target: &mut *target, bit: None };
+            allow_block_erase(&mut held, as_found, &mut log)?;
+            held.release()?;
+        }
+        target.write_word(BOOTLOCK_FLASH_OP, 0)?;
+        log(if several {
+            "the flash already holds every span; resetting the chip without erasing or programming."
+        } else if spans.first().is_some_and(|span| span.header > 0) {
+            "the flash already holds these bytes; resetting the chip without erasing or programming."
+        } else {
+            "image already matches; resetting to boot it without erasing or programming."
+        });
+        target.reset_and_run()?;
+        return Ok(present
+            .into_iter()
+            .zip(&words)
+            .map(|(mut read, wanted)| {
+                read.truncate(wanted.len());
+                SpanWrite { sectors_erased: 0, bytes_programmed: 0, read }
+            })
+            .collect());
+    }
+    let plans: Vec<SpanPlan> = spans.iter().zip(&changed).map(|(span, runs)| SpanPlan::of(span, runs)).collect();
+    let total: usize = plans.iter().zip(&words).map(|(plan, words)| programmed_len(&plan.runs(), words)).sum();
+    let mut chunk_lines = None;
+    let mut written = 0;
+    let mut erasing_said = false;
+    let mut done = Vec::with_capacity(spans.len());
+    for (((span, plan), wanted), compared) in spans.iter().zip(&plans).zip(&words).zip(present) {
+        if plan.is_held() {
+            let mut read = compared;
+            read.truncate(wanted.len());
+            done.push(SpanWrite { sectors_erased: 0, bytes_programmed: 0, read });
+            continue;
+        }
+        let erased_runs: Vec<core::ops::Range<usize>> = plan
+            .runs()
+            .iter()
+            .map(|run| span.offset as usize + run.start..span.offset as usize + run.end)
+            .collect();
+        let different: usize = erased_runs.iter().map(|run| run.len()).sum();
+        let mut held = HeldD8h { target: &mut *target, bit: None };
+        let by_block = match erase {
+            Erase::Sectors => Ok(false),
+            Erase::Blocks => allow_block_erase(&mut held, as_found, &mut log),
+        };
+        let erased = by_block.and_then(|by_block| {
+            let by_block = if by_block { ", each whole 64 KiB block by one block erase" } else { "" };
+            log(&format!(
+                "flash_op ERASE {different} differing bytes from {:#010x}, {ERASE_CALL_BYTES} bytes a \
+                 call{by_block}...",
+                XIP_BASE + span.offset
+            ));
+            if !erasing_said {
+                erasing_said = true;
+                log(lamella_flash_backend::progress::ERASING);
+            }
+            erase_spans(&mut *held, flash_op, &erased_runs, &slow, &mut log)
+        });
+        let released = held.release();
+        if let Err(why) = erased {
+            if let Err(clear) = released {
+                log(&format!(
+                    "FLASH_DEVINFO's D8h bit could not be cleared ({clear}); the chip's next boot sets \
+                     FLASH_DEVINFO up afresh"
+                ));
+            }
+            return Err(why);
+        }
+        released?;
 
-    let stage_words = STAGE_MAX / 4;
-    for (index, slice) in words.chunks(stage_words).enumerate() {
-        let offset = (index * STAGE_MAX) as u32;
+        let chunk_lines = chunk_lines.get_or_insert_with(|| lamella_flash_backend::progress::ChunkLines::new(now()));
+        let mut chunk = |bytes: usize| {
+            written += bytes;
+            chunk_lines.completed(written, total, now())
+        };
+        for run in &plan.body {
+            program_run(&mut *target, flash_op, &slow, span.offset, wanted, run, &mut chunk, &mut log)?;
+        }
+        target.call_target(u32::from(flash_flush_cache), &[], &frame)?;
+        log("verifying (full read-back over XIP)...");
+        let header = plan.directory.as_ref().map_or(0, |directory| directory.end);
+        let body = match &wanted[header / 4..] {
+            [] => Vec::new(),
+            rest => read_back(&mut *target, span.offset + header as u32, rest, &mut log)?,
+        };
+        let read = match &plan.directory {
+            None => body,
+            Some(directory) => {
+                program_run(&mut *target, flash_op, &slow, span.offset, wanted, directory, &mut chunk, &mut log)?;
+                target.call_target(u32::from(flash_flush_cache), &[], &frame)?;
+                log("verifying the directory, programmed last...");
+                let mut read = read_back(&mut *target, span.offset, &wanted[..header / 4], &mut log)?;
+                read.extend(body);
+                read
+            }
+        };
+        done.push(SpanWrite {
+            sectors_erased: different / SECTOR_BYTES,
+            bytes_programmed: programmed_len(&plan.runs(), wanted),
+            read,
+        });
+    }
+
+    target.write_word(BOOTLOCK_FLASH_OP, 0)?;
+    log(lamella_flash_backend::progress::COMPLETE);
+    log("flashed + verified; resetting to boot the image.");
+    target.reset_and_run()?;
+    Ok(done)
+}
+
+/// What a write does to one span, given the runs of its sectors that differ from the flash, in
+/// bytes from the span's start.
+struct SpanPlan {
+    /// The directory's bytes, rewritten whenever any sector of the span differs: erased before the
+    /// body and programmed after it. `None` for a span with no directory, or one the flash holds.
+    directory: Option<core::ops::Range<usize>>,
+    /// The differing runs past the directory, in address order.
+    body: Vec<core::ops::Range<usize>>,
+}
+
+impl SpanPlan {
+    /// The plan for `span`, whose sectors in `runs` differ from the flash.
+    fn of(span: &Span<'_>, runs: &[core::ops::Range<usize>]) -> SpanPlan {
+        let header = span.header as usize;
+        if runs.is_empty() {
+            return SpanPlan { directory: None, body: Vec::new() };
+        }
+        let body = runs
+            .iter()
+            .filter_map(|run| {
+                let start = run.start.max(header);
+                (start < run.end).then_some(start..run.end)
+            })
+            .collect();
+        SpanPlan { directory: (header > 0).then_some(0..header), body }
+    }
+
+    /// Whether the flash already holds the span, so nothing of it is erased or programmed.
+    fn is_held(&self) -> bool {
+        self.directory.is_none() && self.body.is_empty()
+    }
+
+    /// The runs a write erases and programs: the directory's first, then the body's, which is also
+    /// their address order. They are erased in this order and programmed body first.
+    fn runs(&self) -> Vec<core::ops::Range<usize>> {
+        self.directory.iter().cloned().chain(self.body.iter().cloned()).collect()
+    }
+}
+
+/// Refuses `spans` that a write cannot keep inside their own sectors, before anything is reset: a
+/// span that does not start on a sector or passes the end of the flash's 16 MiB, a directory that
+/// is not whole sectors inside its span, a span that reaches `keep`, and two spans that share a
+/// sector. A line to `log` names the span and the place.
+fn refuse_unwritable(
+    spans: &[Span<'_>],
+    keep: &[core::ops::Range<u32>],
+    log: &mut dyn FnMut(&str),
+) -> Result<(), ProbeError> {
+    let sector = SECTOR_BYTES as u64;
+    let mut reaches: Vec<(u64, u64)> = Vec::with_capacity(spans.len());
+    for span in spans {
+        let start = u64::from(span.offset);
+        let end = start + sector_len(span.bytes.len()) as u64;
+        let named = format!("the span at {start:#010x} ({} bytes, to {end:#010x})", span.bytes.len());
+        if start % sector != 0 {
+            log(&format!("{named} does not start on a 4 KiB sector"));
+            return Err(ProbeError::Device("a span starts on a 4 KiB sector's start"));
+        }
+        if end > u64::from(CHIP_SELECT_BYTES) {
+            log(&format!("{named} passes {CHIP_SELECT_BYTES:#010x}, the end of the flash's 16 MiB"));
+            return Err(past_the_flash());
+        }
+        if u64::from(span.header) % sector != 0 || span.header as usize > span.bytes.len() {
+            log(&format!("{named} has a directory of {} bytes", span.header));
+            return Err(ProbeError::Device("a span's directory is whole 4 KiB sectors inside the span"));
+        }
+        if let Some(kept) = keep.iter().find(|kept| start < u64::from(kept.end) && u64::from(kept.start) < end) {
+            log(&format!(
+                "{named} reaches {:#010x} to {:#010x}, which this write keeps",
+                kept.start, kept.end
+            ));
+            return Err(ProbeError::Device("a span reaches flash this write keeps"));
+        }
+        reaches.push((start, end));
+    }
+    reaches.sort_unstable();
+    if let Some(pair) = reaches.windows(2).find(|pair| pair[0].1 > pair[1].0) {
         log(&format!(
-            "staging {} bytes at {STAGE_BASE:#010x}, flash_op PROGRAM at +{offset:#x}...",
+            "the span at {:#010x} reaches {:#010x}, where the span at {:#010x} starts",
+            pair[0].0, pair[0].1, pair[1].0
+        ));
+        return Err(ProbeError::Device("two spans share a 4 KiB sector"));
+    }
+    Ok(())
+}
+
+/// `bytes` as little-endian words, padded with erased bytes to a whole number of 256-byte pages.
+fn page_padded_words(bytes: &[u8]) -> Vec<u32> {
+    let mut words: Vec<u32> = bytes
+        .chunks(4)
+        .map(|chunk| {
+            let mut word = [0xFFu8; 4];
+            word[..chunk.len()].copy_from_slice(chunk);
+            u32::from_le_bytes(word)
+        })
+        .collect();
+    words.resize(bytes.len().div_ceil(PAGE_BYTES) * (PAGE_BYTES / 4), 0xFFFF_FFFF);
+    words
+}
+
+/// The bytes of the whole sectors `len` bytes from a sector's start reach.
+fn sector_len(len: usize) -> usize {
+    len.div_ceil(SECTOR_BYTES) * SECTOR_BYTES
+}
+
+/// How many bytes programming `runs` of a span whose page-padded words are `words` writes: the
+/// runs, each cut at the end of the padded span, since the erased tail past it needs no program.
+fn programmed_len(runs: &[core::ops::Range<usize>], words: &[u32]) -> usize {
+    runs.iter().map(|run| run.end.min(words.len() * 4).saturating_sub(run.start)).sum()
+}
+
+/// Programs `run`, bytes from the start of the span at `offset` whose page-padded words are
+/// `words`, in staging-window slices. Each slice's length goes to `chunk` once it is programmed,
+/// and the progress line `chunk` answers, if any, to `log`.
+#[allow(clippy::too_many_arguments)]
+fn program_run<A: TargetAccess>(
+    target: &mut A,
+    flash_op: u16,
+    slow: &CallFrame,
+    offset: u32,
+    words: &[u32],
+    run: &core::ops::Range<usize>,
+    chunk: &mut dyn FnMut(usize) -> Option<String>,
+    log: &mut dyn FnMut(&str),
+) -> Result<(), ProbeError> {
+    let end = run.end.min(words.len() * 4);
+    if end <= run.start {
+        return Ok(());
+    }
+    for (index, slice) in words[run.start / 4..end / 4].chunks(STAGE_MAX / 4).enumerate() {
+        let at = offset + (run.start + index * STAGE_MAX) as u32;
+        log(&format!(
+            "staging {} bytes at {STAGE_BASE:#010x}, flash_op PROGRAM at +{at:#x}...",
             slice.len() * 4
         ));
         target.write_words(STAGE_BASE, slice)?;
         let status = target.call_target(
             u32::from(flash_op),
-            &[
-                CFLASH_SECURE | CFLASH_OP_PROGRAM,
-                XIP_BASE + offset,
-                (slice.len() * 4) as u32,
-                STAGE_BASE,
-            ],
-            &slow,
+            &[CFLASH_SECURE | CFLASH_OP_PROGRAM, XIP_BASE + at, (slice.len() * 4) as u32, STAGE_BASE],
+            slow,
         )?;
         if status != 0 {
             log(&format!("flash_op program status = {} ({status:#010x})", status as i32));
             return Err(ProbeError::Timeout("flash_op program returned an error status"));
         }
+        if let Some(line) = chunk(slice.len() * 4) {
+            log(&line);
+        }
     }
+    Ok(())
+}
 
-    target.call_target(u32::from(flash_flush_cache), &[], &frame)?;
-    log("verifying (full read-back over XIP)...");
-    let readback = target.read_words(XIP_BASE, words.len())?;
+/// Reads back the span at `offset` whose page-padded words are `words`, and fails at the first word
+/// the flash does not hold, naming it.
+fn read_back<A: TargetAccess>(
+    target: &mut A,
+    offset: u32,
+    words: &[u32],
+    log: &mut dyn FnMut(&str),
+) -> Result<Vec<u32>, ProbeError> {
+    let readback = target.read_words(XIP_BASE + offset, words.len())?;
     if readback != words {
-        let first_bad = readback.iter().zip(&words).position(|(a, b)| a != b).unwrap_or(0);
-        log(&format!("VERIFY FAILED at word {first_bad} (byte offset {:#x})", first_bad * 4));
+        let first_bad = readback.iter().zip(words).position(|(a, b)| a != b).unwrap_or(0);
+        log(&format!(
+            "VERIFY FAILED at word {first_bad} (byte offset {:#x})",
+            offset as usize + first_bad * 4
+        ));
         return Err(ProbeError::Timeout("flash verify mismatch"));
     }
-
-    target.write_word(BOOTLOCK_FLASH_OP, 0)?;
-    log("flashed + verified; resetting to boot the image.");
-    target.reset_and_run()?;
     Ok(readback)
 }
 
-/// Erase the first `erase_len` bytes of flash by [`erase_calls`]' calls to `flash_op`, saying how
-/// far it has got.
-fn erase_span<A: TargetAccess>(
+/// The bytes of the flash a [`FlashSession`] reaches: chip select 0, the board's own flash.
+/// `flash_op` addresses two chip selects of 16 MiB each, told apart by address bits 24 and up, and
+/// an operation made without address translation stays inside one (datasheet 5.4.8.9).
+const CHIP_SELECT_BYTES: u32 = 0x0100_0000;
+
+/// The board's flash at offsets from its start, through the chip's own boot ROM flash API on the
+/// halted core: reads, sector erases and page programs, for data kept apart from the program, such
+/// as the settings a board stores.
+///
+/// [`open`](Self::open) reads the boot ROM's magic before it changes anything, so a probe wired to
+/// another part is refused with that part untouched. Then it resets the chip into its secure boot
+/// context and takes the flash out of execute-in-place, as a whole-image write does. The boot ROM
+/// leaves the flash readable through the XIP window between its operations, and each erase and
+/// program here flushes the XIP cache after it, so a read sees the flash as it now is (datasheet
+/// 5.4.8.9). [`close`](Self::close) releases the boot ROM's flash lock and starts the chip again,
+/// and a session dropped without closing does the same, as far as the probe still answers.
+pub struct FlashSession<'a, A: TargetAccess> {
+    target: &'a mut A,
+    flash_op: u16,
+    flash_flush_cache: u16,
+    closed: bool,
+}
+
+impl<'a, A: TargetAccess> FlashSession<'a, A> {
+    /// Opens the flash of the RP2350 that `target` reaches.
+    ///
+    /// # Errors
+    /// A part whose boot ROM is not an RP2350's, refused before anything is reset; and any step of
+    /// the preparation, after which the chip is started again.
+    pub fn open(target: &'a mut A) -> Result<Self, ProbeError> {
+        if target.read_word(BOOTROM_MAGIC_ADDR)? & 0x00ff_ffff != BOOTROM_MAGIC {
+            return Err(ProbeError::Device(
+                "the part is not an RP2350: its boot ROM does not begin with an RP2350's magic",
+            ));
+        }
+        reset_halt(target)?;
+        let mut session = FlashSession { target, flash_op: 0, flash_flush_cache: 0, closed: false };
+        session.prepare()?;
+        Ok(session)
+    }
+
+    /// The secure context, the four boot ROM functions, the flash lock, and the flash taken out of
+    /// execute-in-place, as a whole-image write prepares them.
+    fn prepare(&mut self) -> Result<(), ProbeError> {
+        secure_setup(self.target)?;
+        let connect_internal_flash = rom_function(self.target, b'I', b'F')?;
+        let flash_exit_xip = rom_function(self.target, b'E', b'X')?;
+        self.flash_op = rom_function(self.target, b'F', b'O')?;
+        self.flash_flush_cache = rom_function(self.target, b'F', b'C')?;
+        claim_flash_lock(self.target)?;
+        let frame = CallFrame::new(CALL_SP, CALL_TRAP);
+        self.target.call_target(u32::from(connect_internal_flash), &[], &frame)?;
+        self.target.call_target(u32::from(flash_exit_xip), &[], &frame)?;
+        self.flush()
+    }
+
+    /// Flushes the XIP cache, so the next read through the XIP window sees the flash as it is.
+    fn flush(&mut self) -> Result<(), ProbeError> {
+        let frame = CallFrame::new(CALL_SP, CALL_TRAP);
+        self.target.call_target(u32::from(self.flash_flush_cache), &[], &frame)?;
+        Ok(())
+    }
+
+    /// Calls `flash_op` with `args`, and fails with the boot ROM's own reason for a status other
+    /// than 0.
+    fn flash_op(&mut self, args: [u32; 4]) -> Result<(), ProbeError> {
+        let slow = CallFrame { poll_tries: FLASH_OP_POLLS, ..CallFrame::new(CALL_SP, CALL_TRAP) };
+        match self.target.call_target(u32::from(self.flash_op), &args, &slow)? {
+            0 => Ok(()),
+            status => Err(ProbeError::Device(flash_op_refusal(status))),
+        }
+    }
+
+    /// The `len` bytes at `offset`.
+    ///
+    /// # Errors
+    /// A span past the end of the flash, and a read the probe did not complete.
+    pub fn read(&mut self, offset: u32, len: usize) -> Result<Vec<u8>, ProbeError> {
+        let length = u32::try_from(len).map_err(|_| past_the_flash())?;
+        let end = within_the_flash(offset, length)?;
+        let first = offset & !3;
+        let words = self.target.read_words(XIP_BASE + first, (end.div_ceil(4) * 4 - first) as usize / 4)?;
+        let skip = (offset - first) as usize;
+        Ok(words.iter().flat_map(|word| word.to_le_bytes()).skip(skip).take(len).collect())
+    }
+
+    /// Erases the `len` bytes at `offset`: whole 4 KiB sectors, from a sector's start.
+    ///
+    /// # Errors
+    /// A span that is not whole sectors from a sector's start, or that passes the end of the flash,
+    /// refused before the boot ROM is called; an erase the boot ROM refused, and a call that did not
+    /// complete.
+    pub fn erase(&mut self, offset: u32, len: u32) -> Result<(), ProbeError> {
+        let sector = SECTOR_BYTES as u32;
+        if len == 0 || !offset.is_multiple_of(sector) || !len.is_multiple_of(sector) {
+            return Err(ProbeError::Device("an erase covers whole 4 KiB sectors, from a sector's start"));
+        }
+        let end = within_the_flash(offset, len)?;
+        for (address, bytes) in erase_calls(offset as usize..end as usize) {
+            self.flash_op([CFLASH_SECURE | CFLASH_OP_ERASE, address, bytes, 0])?;
+        }
+        self.flush()
+    }
+
+    /// Programs `page` at `offset`, a 256-byte page's start, where the flash reads erased.
+    ///
+    /// # Errors
+    /// An offset that is not a page's start, or past the end of the flash, refused before the boot
+    /// ROM is called; a program the boot ROM refused, and a call that did not complete.
+    pub fn program(&mut self, offset: u32, page: &[u8; PAGE_BYTES]) -> Result<(), ProbeError> {
+        if !offset.is_multiple_of(PAGE_BYTES as u32) {
+            return Err(ProbeError::Device("a program starts at a 256-byte page's start"));
+        }
+        within_the_flash(offset, PAGE_BYTES as u32)?;
+        let mut words: Vec<u32> =
+            page.chunks_exact(4).map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]])).collect();
+        let staged = self.target.write_words(STAGE_BASE, &words);
+        words.fill(0);
+        core::hint::black_box(&words);
+        staged?;
+        self.flash_op([CFLASH_SECURE | CFLASH_OP_PROGRAM, XIP_BASE + offset, PAGE_BYTES as u32, STAGE_BASE])?;
+        self.flush()
+    }
+
+    /// Releases the boot ROM's flash lock and starts the chip again.
+    ///
+    /// # Errors
+    /// Either step the probe did not complete; the other is still made.
+    pub fn close(mut self) -> Result<(), ProbeError> {
+        self.closed = true;
+        self.leave()
+    }
+
+    /// Releases the boot ROM's flash lock (a write unclaims it), so the starting program finds boot
+    /// RAM as a power-on boot leaves it, then starts the chip again.
+    fn leave(&mut self) -> Result<(), ProbeError> {
+        let released = self.target.write_word(BOOTLOCK_FLASH_OP, 0);
+        let started = self.target.reset_and_run();
+        released.and(started)
+    }
+}
+
+impl<A: TargetAccess> Drop for FlashSession<'_, A> {
+    fn drop(&mut self) {
+        if !self.closed {
+            let _ = self.leave();
+        }
+    }
+}
+
+/// Claims the boot ROM's flash lock for the calls that follow. The read is the claim. The core
+/// halted at reset runs nothing, so a claim that fails means a program before the reset left the
+/// lock claimed, and it is released and claimed again.
+fn claim_flash_lock<A: TargetAccess>(target: &mut A) -> Result<(), ProbeError> {
+    if target.read_word(BOOTLOCK_FLASH_OP)? == 0 {
+        target.write_word(BOOTLOCK_FLASH_OP, 0)?;
+        let _ = target.read_word(BOOTLOCK_FLASH_OP)?;
+    }
+    Ok(())
+}
+
+/// The end of the `len` bytes at `offset`, when they lie in the flash a [`FlashSession`] reaches.
+fn within_the_flash(offset: u32, len: u32) -> Result<u32, ProbeError> {
+    offset.checked_add(len).filter(|&end| end <= CHIP_SELECT_BYTES).ok_or_else(past_the_flash)
+}
+
+/// The refusal of a span past the first chip select's 16 MiB.
+fn past_the_flash() -> ProbeError {
+    ProbeError::Device("the span passes the end of the flash's 16 MiB")
+}
+
+/// What a `flash_op` status other than 0 says, in the terms of the boot ROM's error codes
+/// (`bootrom_constants.h`).
+fn flash_op_refusal(status: u32) -> &'static str {
+    match status.cast_signed() {
+        -4 => "the boot ROM did not permit the flash operation there: a partition's permissions forbid it",
+        -10 => "the boot ROM refused the flash operation's address as outside the flash",
+        -11 => "the boot ROM refused the flash operation's alignment",
+        -19 => "the boot ROM refused the flash operation: its flash lock was not held",
+        _ => "the boot ROM's flash operation returned an error",
+    }
+}
+
+/// Contiguous byte spans of differing 4 KiB sectors, including the last sector's erased padding.
+fn changed_sectors(wanted: &[u32], present: &[u32]) -> Vec<core::ops::Range<usize>> {
+    let mut spans: Vec<core::ops::Range<usize>> = Vec::new();
+    for (index, sector) in present.chunks(SECTOR_BYTES / 4).enumerate() {
+        let start = index * SECTOR_BYTES;
+        if sector.iter().enumerate().all(|(at, word)| {
+            *word == wanted.get(start / 4 + at).copied().unwrap_or(u32::MAX)
+        }) {
+            continue;
+        }
+        if let Some(last) = spans.last_mut() && last.end == start {
+            last.end += SECTOR_BYTES;
+        } else {
+            spans.push(start..start + SECTOR_BYTES);
+        }
+    }
+    spans
+}
+
+/// Erase the differing sector spans by [`erase_calls`]' bounded calls to `flash_op`.
+fn erase_spans<A: TargetAccess>(
     target: &mut A,
     flash_op: u16,
-    erase_len: usize,
+    spans: &[core::ops::Range<usize>],
     frame: &CallFrame,
     log: &mut dyn FnMut(&str),
 ) -> Result<(), ProbeError> {
-    let calls = erase_calls(erase_len);
+    let calls: Vec<_> = spans.iter().flat_map(|span| erase_calls(span.clone())).collect();
     let count = calls.len();
-    for (index, (address, bytes)) in calls.enumerate() {
+    let erase_len: usize = spans.iter().map(|span| span.len()).sum();
+    let mut erased = 0;
+    for (index, (address, bytes)) in calls.into_iter().enumerate() {
         let call = format!(
             "flash_op ERASE call {} of {count} ({bytes} bytes at {address:#010x})",
             index + 1
@@ -569,7 +1129,7 @@ fn erase_span<A: TargetAccess>(
             log(&format!("{call} returned status {} ({status:#010x})", status as i32));
             return Err(ProbeError::Timeout("flash_op erase returned an error status"));
         }
-        let erased = (address - XIP_BASE) as usize + bytes as usize;
+        erased += bytes as usize;
         if erased.is_multiple_of(ERASE_PROGRESS_BYTES) && erased < erase_len {
             log(&format!("erased {erased} of {erase_len} bytes..."));
         }
@@ -577,17 +1137,26 @@ fn erase_span<A: TargetAccess>(
     Ok(())
 }
 
-/// The `flash_op` erase calls that erase the first `erase_len` bytes of flash, in address order:
-/// each an XIP address on a 64 KiB boundary and a byte count no larger than [`ERASE_CALL_BYTES`].
-fn erase_calls(erase_len: usize) -> impl ExactSizeIterator<Item = (u32, u32)> {
-    (0..erase_len.div_ceil(ERASE_CALL_BYTES)).map(move |index| {
-        let offset = index * ERASE_CALL_BYTES;
-        (XIP_BASE + offset as u32, (erase_len - offset).min(ERASE_CALL_BYTES) as u32)
+/// Erase calls covering `span` exactly, split at 64 KiB boundaries so a full block stays one call.
+fn erase_calls(span: core::ops::Range<usize>) -> impl ExactSizeIterator<Item = (u32, u32)> {
+    (span.start / ERASE_CALL_BYTES..span.end.div_ceil(ERASE_CALL_BYTES)).map(move |index| {
+        let offset = (index * ERASE_CALL_BYTES).max(span.start);
+        let end = ((index + 1) * ERASE_CALL_BYTES).min(span.end);
+        (XIP_BASE + offset as u32, (end - offset) as u32)
     })
 }
 
 #[cfg(test)]
 mod tests {
+    /// An unaligned differing span preserves its neighbours and still permits whole block erases.
+    #[test]
+    fn sparse_erase_calls_stop_at_block_boundaries() {
+        assert_eq!(super::erase_calls(4096..3 * 65536 + 8192).collect::<Vec<_>>(), [
+            (0x1000_1000, 65536 - 4096), (0x1001_0000, 65536),
+            (0x1002_0000, 65536), (0x1003_0000, 8192),
+        ]);
+    }
+
     #[test]
     fn stub_words_decode_to_the_documented_instructions() {
         assert_eq!(0x880a_f380u32.to_le_bytes(), [0x80, 0xf3, 0x0a, 0x88]);
@@ -614,7 +1183,7 @@ mod tests {
         use super::{ERASE_CALL_BYTES, SECTOR_BYTES, XIP_BASE};
 
         for erase_len in [4096, 65536, 65536 + 4096, 6_504_448, 16 * 1024 * 1024] {
-            let calls: Vec<(u32, u32)> = super::erase_calls(erase_len).collect();
+            let calls: Vec<(u32, u32)> = super::erase_calls(0..erase_len).collect();
             assert_eq!(calls.len(), erase_len.div_ceil(ERASE_CALL_BYTES), "{erase_len}");
             let mut next = XIP_BASE;
             for &(address, bytes) in &calls {

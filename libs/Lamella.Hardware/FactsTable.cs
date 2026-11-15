@@ -204,7 +204,7 @@ namespace Lamella.Hardware
         }
 
         /// <summary>The I2C buses the image serves, each made when first read.</summary>
-        internal static IReadOnlyList<I2cBusInfo> I2cBuses
+        internal static IReadOnlyList<BoardI2cBus> I2cBuses
         {
             get
             {
@@ -219,7 +219,7 @@ namespace Lamella.Hardware
         }
 
         /// <summary>The SPI buses the image serves, each made when first read.</summary>
-        internal static IReadOnlyList<SpiBusInfo> SpiBuses
+        internal static IReadOnlyList<BoardSpiBus> SpiBuses
         {
             get
             {
@@ -308,7 +308,7 @@ namespace Lamella.Hardware
         }
 
         /// <summary>The I2C bus whose entry begins at <paramref name="at"/>, made now.</summary>
-        internal static I2cBusInfo MakeI2c(int at)
+        internal static BoardI2cBus MakeI2c(int at)
         {
             string table = TargetBoardFacts.I2cBuses;
             int number = table[at];
@@ -324,18 +324,18 @@ namespace Lamella.Hardware
                 frequencies = new int[rates.Length];
                 for (int index = 0; index < rates.Length; index++) frequencies[index] = rates[index];
             }
-            return new I2cBusInfo(number, PinOrNull(table[at + 1]), PinOrNull(table[at + 2]), new RateList(frequencies));
+            return new BoardI2cBus(number, PinOrNull(table[at + 1]), PinOrNull(table[at + 2]), new RateList(frequencies));
         }
 
         /// <summary>The SPI bus whose entry begins at <paramref name="at"/>, made now.</summary>
-        internal static SpiBusInfo MakeSpi(int at)
+        internal static BoardSpiBus MakeSpi(int at)
         {
             string table = TargetBoardFacts.SpiBuses;
             int selects = table[at + 4];
             BoardPin[] chipSelects = new BoardPin[selects];
             for (int index = 0; index < selects; index++) chipSelects[index] = PinOrNull(table[at + 5 + index]);
             int rates = at + 5 + selects;
-            return new SpiBusInfo(table[at], PinOrNull(table[at + 1]), PinOrNull(table[at + 2]), PinOrNull(table[at + 3]),
+            return new BoardSpiBus(table[at], PinOrNull(table[at + 1]), PinOrNull(table[at + 2]), PinOrNull(table[at + 3]),
                 new PinList(chipSelects), Wide(table, rates), Wide(table, rates + 2));
         }
 
@@ -357,15 +357,15 @@ namespace Lamella.Hardware
 
     /// <summary>The I2C buses the image serves, in the board's order, each made when first
     /// read.</summary>
-    internal sealed class I2cBusList : IReadOnlyList<I2cBusInfo>
+    internal sealed class I2cBusList : IReadOnlyList<BoardI2cBus>
     {
         private readonly int[] _entries;
-        private readonly I2cBusInfo[] _made;
+        private readonly BoardI2cBus[] _made;
 
         internal I2cBusList(int[] entries)
         {
             _entries = entries;
-            _made = new I2cBusInfo[entries.Length];
+            _made = new BoardI2cBus[entries.Length];
         }
 
         /// <summary>How many buses the image serves.</summary>
@@ -375,7 +375,7 @@ namespace Lamella.Hardware
         }
 
         /// <summary>The bus at <paramref name="index"/> in the board's order.</summary>
-        public I2cBusInfo this[int index]
+        public BoardI2cBus this[int index]
         {
             get
             {
@@ -385,7 +385,7 @@ namespace Lamella.Hardware
         }
 
         /// <summary>Walks the buses in order.</summary>
-        public IEnumerator<I2cBusInfo> GetEnumerator()
+        public IEnumerator<BoardI2cBus> GetEnumerator()
         {
             return new I2cBusWalker(All());
         }
@@ -395,17 +395,17 @@ namespace Lamella.Hardware
             return new I2cBusWalker(All());
         }
 
-        /// <summary>The name of the array this list stands for, "Lamella.Hardware.I2cBusInfo[]", which is what a record
+        /// <summary>The name of the array this list stands for, "Lamella.Hardware.BoardI2cBus[]", which is what a record
         /// holding it prints.</summary>
         public override string ToString()
         {
-            return "Lamella.Hardware.I2cBusInfo[]";
+            return "Lamella.Hardware.BoardI2cBus[]";
         }
 
         /// <summary>The bus at <paramref name="index"/>, made now where it was not yet.</summary>
-        private I2cBusInfo Made(int index)
+        private BoardI2cBus Made(int index)
         {
-            I2cBusInfo bus = _made[index];
+            BoardI2cBus bus = _made[index];
             if ((object)bus == null)
             {
                 bus = FactsTable.MakeI2c(_entries[index]);
@@ -415,7 +415,7 @@ namespace Lamella.Hardware
         }
 
         /// <summary>Every bus, in the board's order, each made now where it was not yet.</summary>
-        private I2cBusInfo[] All()
+        private BoardI2cBus[] All()
         {
             for (int index = 0; index < _made.Length; index++) Made(index);
             return _made;
@@ -424,15 +424,15 @@ namespace Lamella.Hardware
 
     /// <summary>The SPI buses the image serves, in the board's order, each made when first
     /// read.</summary>
-    internal sealed class SpiBusList : IReadOnlyList<SpiBusInfo>
+    internal sealed class SpiBusList : IReadOnlyList<BoardSpiBus>
     {
         private readonly int[] _entries;
-        private readonly SpiBusInfo[] _made;
+        private readonly BoardSpiBus[] _made;
 
         internal SpiBusList(int[] entries)
         {
             _entries = entries;
-            _made = new SpiBusInfo[entries.Length];
+            _made = new BoardSpiBus[entries.Length];
         }
 
         /// <summary>How many buses the image serves.</summary>
@@ -442,7 +442,7 @@ namespace Lamella.Hardware
         }
 
         /// <summary>The bus at <paramref name="index"/> in the board's order.</summary>
-        public SpiBusInfo this[int index]
+        public BoardSpiBus this[int index]
         {
             get
             {
@@ -452,7 +452,7 @@ namespace Lamella.Hardware
         }
 
         /// <summary>Walks the buses in order.</summary>
-        public IEnumerator<SpiBusInfo> GetEnumerator()
+        public IEnumerator<BoardSpiBus> GetEnumerator()
         {
             return new SpiBusWalker(All());
         }
@@ -462,17 +462,17 @@ namespace Lamella.Hardware
             return new SpiBusWalker(All());
         }
 
-        /// <summary>The name of the array this list stands for, "Lamella.Hardware.SpiBusInfo[]", which is what a record
+        /// <summary>The name of the array this list stands for, "Lamella.Hardware.BoardSpiBus[]", which is what a record
         /// holding it prints.</summary>
         public override string ToString()
         {
-            return "Lamella.Hardware.SpiBusInfo[]";
+            return "Lamella.Hardware.BoardSpiBus[]";
         }
 
         /// <summary>The bus at <paramref name="index"/>, made now where it was not yet.</summary>
-        private SpiBusInfo Made(int index)
+        private BoardSpiBus Made(int index)
         {
-            SpiBusInfo bus = _made[index];
+            BoardSpiBus bus = _made[index];
             if ((object)bus == null)
             {
                 bus = FactsTable.MakeSpi(_entries[index]);
@@ -482,7 +482,7 @@ namespace Lamella.Hardware
         }
 
         /// <summary>Every bus, in the board's order, each made now where it was not yet.</summary>
-        private SpiBusInfo[] All()
+        private BoardSpiBus[] All()
         {
             for (int index = 0; index < _made.Length; index++) Made(index);
             return _made;
@@ -769,12 +769,12 @@ namespace Lamella.Hardware
     }
 
     /// <summary>Walks I2C buses in order.</summary>
-    internal sealed class I2cBusWalker : IEnumerator<I2cBusInfo>
+    internal sealed class I2cBusWalker : IEnumerator<BoardI2cBus>
     {
-        private readonly I2cBusInfo[] _items;
+        private readonly BoardI2cBus[] _items;
         private int _index;
 
-        internal I2cBusWalker(I2cBusInfo[] items)
+        internal I2cBusWalker(BoardI2cBus[] items)
         {
             _items = items;
             _index = -1;
@@ -783,7 +783,7 @@ namespace Lamella.Hardware
         /// <summary>The bus the walk is at.</summary>
         /// <exception cref="System.InvalidOperationException">The walk has not begun, or has
         /// ended.</exception>
-        public I2cBusInfo Current
+        public BoardI2cBus Current
         {
             get
             {
@@ -817,12 +817,12 @@ namespace Lamella.Hardware
     }
 
     /// <summary>Walks SPI buses in order.</summary>
-    internal sealed class SpiBusWalker : IEnumerator<SpiBusInfo>
+    internal sealed class SpiBusWalker : IEnumerator<BoardSpiBus>
     {
-        private readonly SpiBusInfo[] _items;
+        private readonly BoardSpiBus[] _items;
         private int _index;
 
-        internal SpiBusWalker(SpiBusInfo[] items)
+        internal SpiBusWalker(BoardSpiBus[] items)
         {
             _items = items;
             _index = -1;
@@ -831,7 +831,7 @@ namespace Lamella.Hardware
         /// <summary>The bus the walk is at.</summary>
         /// <exception cref="System.InvalidOperationException">The walk has not begun, or has
         /// ended.</exception>
-        public SpiBusInfo Current
+        public BoardSpiBus Current
         {
             get
             {

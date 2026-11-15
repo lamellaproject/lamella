@@ -29,6 +29,10 @@ lamella-decimal = { path = "../lamella-decimal", default-features = false }
 # for the decimal kernel's reason: both AOT runtime-support archives link it too, so a program rounds
 # the same way previewed here and deployed to a device. Behind `float`.
 lamella-softmath = { path = "../lamella-softmath", optional = true }
+# The end codes a run reports and what each means, re-exported as this crate's `exit_code` module. A
+# leaf like the reactor, for the reactor's reason: the debugger and the command line say how a
+# board's program ended from the same table, and neither should build this interpreter to read it.
+lamella-exit-codes = { path = "../lamella-exit-codes" }
 # The pin-change event queue's RULE -- ordering, capacity, what overflow means, how many events one
 # drain takes. A leaf like the reactor, and for the sharpest version of the same reason: the two
 # tiers store the queue differently and neither may impose on the other, so the rule lives apart

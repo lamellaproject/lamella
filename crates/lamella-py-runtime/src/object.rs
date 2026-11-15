@@ -12160,12 +12160,18 @@ impl ObjectModel {
     }
 
     /// Blocks for `nanos`, or a loud error. A non-positive count returns at once, as a sleep of no
-    /// time should.
+    /// time should. A network backend whose link needs the processor's time -- a radio it drives by
+    /// polling -- spends the wait servicing it instead ([`lamella_net_core::NetBackend::idle`]), so a
+    /// program that sleeps while its board joins a network or renews a lease does not stall them.
     pub(crate) fn sleep_ns(&mut self, nanos: i64) -> Result<(), Trap> {
         match self.sleep_fn {
             Some(sleep) => {
                 if nanos > 0 {
-                    sleep(nanos);
+                    let millis = u64::try_from(nanos).unwrap_or(0).div_ceil(1_000_000);
+                    let serviced = self.net_backend.as_deref_mut().is_some_and(|net| net.idle(millis));
+                    if !serviced {
+                        sleep(nanos);
+                    }
                 }
                 Ok(())
             }

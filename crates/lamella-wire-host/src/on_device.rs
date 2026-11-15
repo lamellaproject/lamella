@@ -13,6 +13,7 @@ use crate::{
     exec, start_execution,
 };
 use lamella_wire::{Capabilities, Negotiated, Transport, TransportError};
+use lamella_flash_backend::progress;
 use std::io::Write;
 use std::time::{Duration, Instant};
 
@@ -20,8 +21,6 @@ use std::time::{Duration, Instant};
 /// writes flash on the board, which is slow in a way a timeout should not be racing.
 pub const TIMEOUT: Duration = Duration::from_secs(20);
 
-/// What a run says before clearing the program's flash area.
-pub const ERASING: &str = "Erasing the program area of flash...";
 /// What a run says when its host stops following the board.
 pub const DISCONNECTED: &str = "Disconnected from the board.";
 
@@ -30,7 +29,7 @@ pub const DISCONNECTED: &str = "Disconnected from the board.";
 pub enum Wording {
     /// Transfer details for an interactive tool.
     Full,
-    /// The erase notice and the program for a project run.
+    /// Flash progress and the program for a project run.
     Brief,
 }
 
@@ -145,6 +144,20 @@ fn store_image_within(
     timeout: Duration,
     wording: Wording,
 ) -> Result<Stored, String> {
+    store_image_with_clock(transport, session, target, image, out, timeout, wording, Instant::now)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_image_with_clock(
+    transport: &mut impl Transport,
+    session: &Negotiated,
+    target: &str,
+    image: &[u8],
+    out: &mut dyn Write,
+    timeout: Duration,
+    wording: Wording,
+    mut now: impl FnMut() -> Instant,
+) -> Result<Stored, String> {
     let name = board_name(session.identity.product_model);
     let board = the_board(name);
     match abort_blocking(transport, TAKE_BACK_SEQ, timeout) {
@@ -180,11 +193,12 @@ fn store_image_within(
     let chunk_len = deploy_chunk_len(session, classify_target(target));
     if wording == Wording::Full {
         let _ = writeln!(out, "Deploying {} B to {target}, {chunk_len} B per chunk", image.len());
-    } else {
-        let _ = writeln!(out, "{ERASING}");
+    } else if held.is_some() {
+        let _ = writeln!(out, "{}", progress::ERASING);
     }
     let _ = out.flush();
-    let started = Instant::now();
+    let started = now();
+    let mut chunk_lines = progress::ChunkLines::new(started);
     let mut quarters = Quarters::of(image.len());
     let mut first_wait = None;
     let mut acknowledged = 0;
@@ -210,12 +224,17 @@ fn store_image_within(
             }
             DeployProgress::Acknowledged(written) => {
                 acknowledged = written;
-                if let Some(quarter) = quarters.passed(written) && wording == Wording::Full {
+                if wording == Wording::Brief {
+                    if let Some(line) = chunk_lines.completed(written, image.len(), now()) {
+                        let _ = writeln!(out, "{line}");
+                        let _ = out.flush();
+                    }
+                } else if let Some(quarter) = quarters.passed(written) {
                     let _ = writeln!(
                         out,
                         "  {:>3}%  {written} B  {:.1} s",
                         quarter * 25,
-                        started.elapsed().as_secs_f64()
+                        now().duration_since(started).as_secs_f64()
                     );
                     let _ = out.flush();
                 }
@@ -225,7 +244,9 @@ fn store_image_within(
     match sent {
         Ok(TransferAck::Accepted) => {
             if wording == Wording::Full {
-                let _ = writeln!(out, "Deployed {} B to {target} in {:.1} s", image.len(), started.elapsed().as_secs_f64());
+                let _ = writeln!(out, "Deployed {} B to {target} in {:.1} s", image.len(), now().duration_since(started).as_secs_f64());
+            } else {
+                let _ = writeln!(out, "{}", progress::COMPLETE);
             }
             Ok(Stored::Written)
         }
@@ -250,6 +271,12 @@ fn store_image_within(
                          again, it stores this program, verified.",
                         capitalized(&board)
                         );
+                    } else {
+                        if acknowledged < image.len()
+                            && let Some(line) = chunk_lines.completed(image.len(), image.len(), now()) {
+                            let _ = writeln!(out, "{line}");
+                        }
+                        let _ = writeln!(out, "{}", progress::COMPLETE);
                     }
                     Ok(Stored::Written)
                 }
@@ -396,9 +423,10 @@ pub enum RunEnd {
     Interrupted,
     /// The program returned, with this exit code.
     Done(i32),
-    /// The program trapped. The trap's own description arrived on its error stream just before the
-    /// stop.
-    Trapped,
+    /// The program trapped, and the board gives this code for it: 134 for an exception nothing caught,
+    /// 1 for a stop of the runtime's own. The trap's own description arrived on its error stream just
+    /// before the stop.
+    Trapped(i32),
     /// Something else connected to the board and aborted the program.
     Aborted,
     /// The program stopped, giving a reason this build has no word for.
@@ -422,7 +450,7 @@ impl RunEnd {
         capitalized(&match self {
             Self::Interrupted => DISCONNECTED.to_owned(),
             Self::Done(code) => format!("the program ended, exit code {code}."),
-            Self::Trapped => "the program stopped: it trapped, as reported above.".to_owned(),
+            Self::Trapped(code) => format!("the program stopped with code {code}: it trapped, as reported above."),
             Self::Aborted => "the program stopped: something else connected to the board and aborted it.".to_owned(),
             Self::Stopped(other) => {
                 format!("the program stopped, giving reason {other}, which this build has no word for.")
@@ -498,10 +526,10 @@ pub fn start_scheduled(
     err: &mut dyn Write,
     watch: Watch<'_>,
 ) -> Result<RunEnd, String> {
-    start_scheduled_worded(transport, target, say, out, err, watch, Wording::Full)
+    start_scheduled_worded(transport, target, say, out, err, watch, Wording::Full, None)
 }
 
-/// Start and follow a stored program with the caller's choice of progress detail.
+/// Start and follow a stored program, saying `introduction` after the blank line before its output.
 ///
 /// # Errors
 /// The same start refusals as [`start_scheduled`].
@@ -514,6 +542,7 @@ pub fn start_scheduled_worded(
     err: &mut dyn Write,
     watch: Watch<'_>,
     wording: Wording,
+    introduction: Option<&str>,
 ) -> Result<RunEnd, String> {
     if watch.stop.is_some_and(|stop| stop()) {
         return Ok(RunEnd::Interrupted);
@@ -536,6 +565,7 @@ pub fn start_scheduled_worded(
         let _ = writeln!(say, "Running on {target}; output follows.");
     }
     let _ = writeln!(say);
+    if let Some(line) = introduction { let _ = writeln!(say, "{line}"); }
     let _ = say.flush();
     Ok(follow(transport, RUN_SEQ, say, out, err, watch))
 }
@@ -657,7 +687,7 @@ fn ended(run: &RunCollector) -> RunEnd {
     match (run.stop_reason(), run.exit_value()) {
         (None, _) if run.start_refusal() == Some(exec::ack::IDLE) => RunEnd::NoLongerRunning,
         (Some(reason::DONE), Some(code)) => RunEnd::Done(code),
-        (Some(reason::TRAP), _) => RunEnd::Trapped,
+        (Some(reason::TRAP), Some(code)) => RunEnd::Trapped(code),
         (Some(reason::ABORTED), _) => RunEnd::Aborted,
         (Some(other), _) => RunEnd::Stopped(other),
         (None, _) => RunEnd::Unsaid,
@@ -713,7 +743,7 @@ mod tests {
 
         let refused = start_deployed(&mut acknowledging(exec::ack::NOTHING_TO_RUN), quick)
             .expect_err("a refused start did not start");
-        assert!(refused.contains("NOTHING_TO_RUN"), "names the board's reason: {refused}");
+        assert!(refused.contains("it holds no program to start"), "names the board's reason: {refused}");
         assert!(refused.contains("the image is on the board"), "and that the store succeeded: {refused}");
 
         let silent = start_deployed(&mut Answering::with(|_| {}), quick).expect_err("silence is not a start");
@@ -736,9 +766,15 @@ mod tests {
     /// Each refusal reason has its own sentence, and one this build does not know is named.
     #[test]
     fn a_refusal_reason_is_a_sentence_with_its_remedy() {
-        assert!(describe_refusal(lamella_wire::error::SESSION_HELD).contains("another carrier already holds"));
-        assert!(describe_refusal(lamella_wire::error::UNKNOWN_MESSAGE_TYPE).contains("Stop asking"));
-        assert_eq!(describe_refusal(200), "refusal reason 200, which this build has no description for");
+        assert!(
+            describe_refusal(lamella_wire::error::SESSION_HELD)
+                .contains("another connection already holds the board's debug session")
+        );
+        assert!(
+            describe_refusal(lamella_wire::error::UNKNOWN_MESSAGE_TYPE)
+                .contains("asking again will not change that")
+        );
+        assert_eq!(describe_refusal(200), "for a reason (code 200) this version of Lamella cannot describe");
         assert_eq!(the_board(Some("Pico 2 W")), "the Pico 2 W");
         assert_eq!(the_board(None), "the board");
         assert_eq!(capitalized("the board"), "The board");
@@ -1171,37 +1207,211 @@ mod tests {
         (crate::debug::EVT_STOPPED, seq, payload)
     }
 
+    /// The `EVT_STOPPED` a program that trapped ends with, at `seq`, carrying the code `exit` the
+    /// board gives for the trap.
+    fn trapped_with(seq: u16, exit: i32) -> (u8, u16, Vec<u8>) {
+        let (kind, seq, mut payload) = ended_with(seq, exit);
+        payload[0] = crate::debug::reason::TRAP;
+        (kind, seq, payload)
+    }
+
+    /// **A TRAPPED PROGRAM's RUN ENDS WITH THE CODE ITS STOP CARRIES**, whichever it is: 134 for an
+    /// exception nothing caught, 1 for a stop of the runtime's own, and any other a board sends.
+    #[test]
+    fn a_trapped_program_ends_with_the_code_its_stop_carries() {
+        for code in [134, 1, 70] {
+            let mut board = Answering::with(move |peer| {
+                Transport::send(peer, exec::EXEC_ACK, RUN_SEQ, &[exec::ack::STARTED]).unwrap();
+                let (kind, seq, payload) = trapped_with(RUN_SEQ, code);
+                Transport::send(peer, kind, seq, &payload).unwrap();
+            });
+            let (mut say, mut out, mut err) = (Vec::new(), Vec::new(), Vec::new());
+            let ended = start_scheduled_worded(&mut board, "usb", &mut say, &mut out, &mut err,
+                Watch::for_at_most(Duration::from_millis(100)), Wording::Brief, None);
+            assert_eq!(ended, Ok(RunEnd::Trapped(code)), "a TRAP stop carrying {code}");
+            assert_eq!(
+                RunEnd::Trapped(code).describe("usb"),
+                format!("The program stopped with code {code}: it trapped, as reported above.")
+            );
+        }
+    }
+
     /// A watch of `quiet` with no limit.
     fn quiet(quiet: Duration) -> Watch<'static> {
         Watch { quiet, limit: None, stop: None }
     }
 
-    /// An SDK run announces the erase before a delayed answer, without transfer chatter.
+    fn fast_store_chunk_lines(target: &str, chunks: usize) {
+        let image = headed(42, 10_000);
+        let mut board = Storing::reporting_no_window();
+        let mut out = Vec::new();
+        assert_eq!(store_image_worded(&mut board, &storing_session(), target, &image,
+            &mut out, Wording::Brief), Ok(Stored::Written));
+        assert_eq!(board.chunks, chunks, "the carrier's actual chunk size");
+        assert_eq!(board.image, image, "every chunk was still sent");
+        assert_eq!(String::from_utf8(out).unwrap(),
+            "Writing flash: 10000 of 10000 bytes.\nFlash complete\n");
+    }
+
     #[test]
-    fn a_brief_store_announces_only_the_erase_before_the_wait() {
+    fn fast_usb_store_chunk_lines_only_report_the_final_chunk() {
+        fast_store_chunk_lines("usb", 2);
+    }
+
+    #[test]
+    fn fast_serial_store_chunk_lines_only_report_the_final_chunk() {
+        fast_store_chunk_lines("usb-serial:stub", 40);
+    }
+
+    #[test]
+    fn fast_tcp_store_chunk_lines_only_report_the_final_chunk() {
+        fast_store_chunk_lines("tcp:127.0.0.1:1234", 2);
+    }
+
+    struct TimedStore {
+        board: Storing,
+        clock: std::rc::Rc<std::cell::Cell<Instant>>,
+        completions: std::collections::VecDeque<Instant>,
+    }
+
+    impl Transport for TimedStore {
+        fn send(&mut self, kind: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
+            self.board.send(kind, seq, payload)
+        }
+
+        fn poll(&mut self) -> Result<Option<lamella_wire::Frame>, TransportError> {
+            let frame = self.board.poll()?;
+            if let Some(frame) = &frame
+                && (frame.msg_type == crate::deploy::XFER_RESULT
+                    || (frame.msg_type == crate::deploy::DEPLOY_STATUS_RESULT
+                        && frame.seq == ASKED_AGAIN_SEQ)) {
+                self.clock.set(self.completions.pop_front().expect("a time for each acknowledgement"));
+            }
+            Ok(frame)
+        }
+    }
+
+    fn timed_store_chunk_lines(target: &str) {
+        let session = storing_session();
+        let chunk_len = deploy_chunk_len(&session, classify_target(target));
+        for (times, reported) in [
+            (vec![100, 200, 300, 400, 500], vec![5]),
+            (vec![2999, 3000, 5999, 6000, 6100], vec![2, 4, 5]),
+            (vec![3500, 6000, 6500, 6600, 6700], vec![1, 3, 5]),
+            (vec![4000, 8000, 12000, 16000, 20000], vec![1, 2, 3, 4, 5]),
+        ] {
+            let start = Instant::now();
+            let clock = std::rc::Rc::new(std::cell::Cell::new(start));
+            let mut carrier = TimedStore {
+                board: Storing::reporting_no_window(), clock: clock.clone(),
+                completions: times.iter().map(|&ms| start + Duration::from_millis(ms)).collect(),
+            };
+            let image = headed(42, chunk_len * 4 + 13);
+            let mut out = Vec::new();
+            assert_eq!(store_image_with_clock(&mut carrier, &session, target, &image, &mut out,
+                TIMEOUT, Wording::Brief, || clock.get()), Ok(Stored::Written));
+            let mut expected = String::new();
+            for chunk in reported {
+                expected.push_str(&format!("Writing flash: {} of {} bytes.\n",
+                    (chunk * chunk_len).min(image.len()), image.len()));
+            }
+            expected.push_str("Flash complete\n");
+            assert_eq!(String::from_utf8(out).unwrap(), expected, "{target}, {times:?}");
+            assert_eq!(carrier.board.chunks, 5);
+            assert_eq!(carrier.board.image, image);
+            assert!(carrier.completions.is_empty());
+        }
+    }
+
+    #[test]
+    fn usb_store_chunk_lines_follow_completed_chunks_and_the_clock() {
+        timed_store_chunk_lines("usb");
+    }
+
+    #[test]
+    fn serial_store_chunk_lines_follow_completed_chunks_and_the_clock() {
+        timed_store_chunk_lines("usb-serial:stub");
+    }
+
+    #[test]
+    fn tcp_store_chunk_lines_follow_completed_chunks_and_the_clock() {
+        timed_store_chunk_lines("tcp:127.0.0.1:1234");
+    }
+
+    #[test]
+    fn a_recovered_final_chunk_line_is_always_said_on_every_carrier() {
+        for target in ["usb", "usb-serial:stub", "tcp:127.0.0.1:1234"] {
+            let session = storing_session();
+            let chunk_len = deploy_chunk_len(&session, classify_target(target));
+            let image = headed(42, chunk_len * 2 + 13);
+            let start = Instant::now();
+            let clock = std::rc::Rc::new(std::cell::Cell::new(start));
+            let mut carrier = TimedStore {
+                board: Storing::losing(2, false), clock: clock.clone(),
+                completions: [3000, 3100, 3200].map(|ms| start + Duration::from_millis(ms)).into(),
+            };
+            let mut out = Vec::new();
+            assert_eq!(store_image_with_clock(&mut carrier, &session, target, &image, &mut out,
+                Duration::from_millis(5), Wording::Brief, || clock.get()), Ok(Stored::Written));
+            assert_eq!(String::from_utf8(out).unwrap(), format!(
+                "Writing flash: {chunk_len} of {0} bytes.\nWriting flash: {0} of {0} bytes.\nFlash complete\n", image.len()));
+            assert_eq!(carrier.board.chunks, 3);
+            assert_eq!(carrier.board.image, image);
+            assert!(carrier.completions.is_empty());
+        }
+    }
+
+    #[test]
+    fn full_stores_keep_their_quarter_lines_on_every_carrier() {
+        for target in ["usb", "usb-serial:stub", "tcp:127.0.0.1:1234"] {
+            let session = storing_session();
+            let chunk_len = deploy_chunk_len(&session, classify_target(target));
+            let image = headed(42, chunk_len * 8);
+            let start = Instant::now();
+            let clock = std::rc::Rc::new(std::cell::Cell::new(start));
+            let mut carrier = TimedStore {
+                board: Storing::reporting_no_window(), clock: clock.clone(),
+                completions: (1..=8).map(|n| start + Duration::from_millis(n * 100)).collect(),
+            };
+            let mut out = Vec::new();
+            assert_eq!(store_image_with_clock(&mut carrier, &session, target, &image, &mut out,
+                TIMEOUT, Wording::Full, || clock.get()), Ok(Stored::Written));
+            assert_eq!(String::from_utf8(out).unwrap(), format!(
+                "Deploying {total} B to {target}, {chunk_len} B per chunk\n   25%  {q1} B  0.2 s\n   50%  {q2} B  0.4 s\n   75%  {q3} B  0.6 s\nDeployed {total} B to {target} in 0.8 s\n",
+                total=image.len(), q1=chunk_len * 2, q2=chunk_len * 4, q3=chunk_len * 6));
+            assert_eq!(carrier.board.image, image);
+            assert!(carrier.completions.is_empty());
+        }
+    }
+
+    /// An SDK run reports the erase, the fast write's final chunk, then successful completion.
+    #[test]
+    fn a_brief_store_reports_the_erase_final_chunk_and_completion() {
         let image = headed(0x1122_3344_5566_7788, 10_000);
         let out = Shared::default();
         let mut board = Storing {
+            image: headed(7, 256), total: 256,
             watching: Some(out.clone()),
             ..Storing::slow_to_answer(0, Duration::from_millis(30))
         };
         let session = storing_session();
         assert_eq!(store_image_worded(&mut board, &session, "usb", &image, &mut out.clone(), Wording::Brief), Ok(Stored::Written));
-        assert_eq!(out.text(), "Erasing the program area of flash...\n");
+        assert_eq!(out.text(), "Erasing the program area of flash...\nWriting flash: 10000 of 10000 bytes.\nFlash complete\n");
         assert_eq!(board.heard.as_deref(), Some("Erasing the program area of flash...\n"));
         let mut again = Vec::new();
         assert_eq!(store_image_worded(&mut board, &session, "usb", &image, &mut again, Wording::Brief), Ok(Stored::AlreadyThere));
         assert!(again.is_empty(), "a stored image needs no erase");
+        assert_eq!(board.chunks, 2, "nothing was sent on the unchanged run");
     }
 
-    /// A store that needs to send an image announces the erase even without a reported window.
+    /// Without a verified prior program, status cannot establish that any sector needs an erase.
     #[test]
-    fn a_brief_store_without_a_window_still_announces_the_erase() {
+    fn a_brief_store_does_not_claim_an_erase_from_an_unknown_flash_state() {
         let mut board = Storing::reporting_no_window();
         let mut out = Vec::new();
         let result = store_image_worded(&mut board, &storing_session(), "usb", &headed(42, 256), &mut out, Wording::Brief);
         assert_eq!(result, Ok(Stored::Written));
-        assert_eq!(out, b"Erasing the program area of flash...\n");
+        assert_eq!(out, b"Writing flash: 256 of 256 bytes.\nFlash complete\n");
     }
 
     /// A project-run failure names the missing program without a protocol timeout.
@@ -1211,6 +1421,20 @@ mod tests {
         let mut out = Vec::new();
         let result = store_image_within(&mut board, &storing_session(), "usb", &headed(42, 10_000), &mut out, Duration::from_millis(5), Wording::Brief);
         assert_eq!(result, Err("The board did not store the program.".to_owned()));
+        assert!(!String::from_utf8(out).unwrap().contains("Flash complete"));
+    }
+
+    /// A lost final acknowledgement is reported only when the board verifies the complete image.
+    #[test]
+    fn a_brief_store_recovers_the_final_chunk_before_saying_complete() {
+        let mut board = Storing::losing(1, false);
+        let mut out = Vec::new();
+        let result = store_image_within(&mut board, &storing_session(), "usb", &headed(42, 10_000),
+            &mut out, Duration::from_millis(5), Wording::Brief);
+        assert_eq!(result, Ok(Stored::Written));
+        assert_eq!(String::from_utf8(out).unwrap(),
+            "Writing flash: 10000 of 10000 bytes.\nFlash complete\n");
+        assert_eq!(board.chunks, 2);
     }
 
     /// A project run keeps the start's blank line and the program's two streams separate.
@@ -1223,7 +1447,7 @@ mod tests {
             }
         });
         let (mut say, mut out, mut err) = (Vec::new(), Vec::new(), Vec::new());
-        let ended = start_scheduled_worded(&mut board, "usb", &mut say, &mut out, &mut err, Watch::for_at_most(Duration::from_millis(100)), Wording::Brief);
+        let ended = start_scheduled_worded(&mut board, "usb", &mut say, &mut out, &mut err, Watch::for_at_most(Duration::from_millis(100)), Wording::Brief, None);
         assert_eq!(ended, Ok(RunEnd::Done(7)));
         assert_eq!(say, b"\n");
         assert_eq!(out, b"sdk-program-marker\n");

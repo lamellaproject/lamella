@@ -386,12 +386,13 @@ pub enum Outcome {
     CompileError(String),
     /// The submission ran. `output` is the NEW console output (the suffix beyond prior runs); `exit`
     /// is the program's exit code (0 for a normal statement/expression, the program's `Main` return in
-    /// raw mode, or 70 if the interpreter aborted on an unhandled exception); `persisted` is whether it
-    /// joined the transcript.
+    /// raw mode, 134 if the program ended on an exception it did not catch, or 1 if the interpreter
+    /// trapped); `persisted` is whether it joined the transcript.
     Ran {
         /// The new console output beyond the previous run.
         output: String,
-        /// The program's exit code (70 = aborted on an unhandled exception).
+        /// The program's exit code (134 = ended on an exception it did not catch; 1 = the
+        /// interpreter trapped).
         exit: i32,
         /// Whether the submission was added to the session transcript.
         persisted: bool,

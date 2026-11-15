@@ -1,4 +1,6 @@
 // Lamella managed corlib (from scratch). -- System.Int32
+using System.Globalization;
+
 namespace System
 {
     public struct Int32 : IComparable, IFormattable
@@ -62,70 +64,69 @@ namespace System
             return NumberFormatter.Format((long)this, 8, format);
         }
 
-        public string ToString(string format, IFormatProvider formatProvider)
+        public string ToString(IFormatProvider provider) { NumberFormatter.Ask(this < 0, null, provider); return Decimal(this); }
+
+        public string ToString(string format, IFormatProvider provider)
         {
+            NumberFormatter.Ask(this < 0, format, provider);
             return NumberFormatter.Format((long)this, 8, format);
         }
 
         public static int Parse(string s)
         {
             if ((object)s == null) throw new ArgumentNullException("s");
-            int end = s.Length;
-            while (end > 0 && NumberText.IsPad(s[end - 1])) end = end - 1;
-            int i = 0;
-            while (i < end && NumberText.IsPad(s[i])) i = i + 1;
-            bool negative = false;
-            if (i < end && s[i] == '-') { negative = true; i = i + 1; }
-            else if (i < end && s[i] == '+') { i = i + 1; }
-            if (i >= end) throw new FormatException("Input string was not in a correct format.");
-            int result = 0;
-            while (i < end)
-            {
-                char c = s[i];
-                if (c < '0' || c > '9') throw new FormatException("Input string was not in a correct format.");
-                int digit = c - '0';
-                if (result < (MinValue + digit) / 10) throw new OverflowException("Value was either too large or too small for an Int32.");
-                result = result * 10 - digit;
-                i = i + 1;
-            }
-            if (!negative)
-            {
-                if (result == MinValue) throw new OverflowException("Value was either too large or too small for an Int32.");
-                return -result;
-            }
-            return result;
+            ulong bits;
+            int outcome = NumberParser.ScanWholeNumber(s, (int)NumberStyles.Integer, 8, 2147483647UL, 2147483648UL, out bits);
+            if (outcome != NumberParser.Done) NumberParser.Refuse(outcome, s, "Value was either too large or too small for an Int32.");
+            return (int)bits;
+        }
+
+        public static int Parse(string s, NumberStyles style)
+        {
+            if ((object)s == null) throw new ArgumentNullException("s");
+            NumberParser.CheckWholeNumberStyle(style);
+            ulong bits;
+            int outcome = NumberParser.ScanWholeNumber(s, (int)style, 8, 2147483647UL, 2147483648UL, out bits);
+            if (outcome != NumberParser.Done) NumberParser.Refuse(outcome, s, "Value was either too large or too small for an Int32.");
+            return (int)bits;
+        }
+
+        public static int Parse(string s, IFormatProvider provider)
+        {
+            return Parse(s, NumberStyles.Integer, provider);
+        }
+
+        public static int Parse(string s, NumberStyles style, IFormatProvider provider)
+        {
+            if ((object)s == null) throw new ArgumentNullException("s");
+            NumberParser.CheckWholeNumberStyle(style);
+            NumberParser.AskProvider(provider);
+            ulong bits;
+            int outcome = NumberParser.ScanWholeNumber(s, (int)style, 8, 2147483647UL, 2147483648UL, out bits);
+            if (outcome != NumberParser.Done) NumberParser.Refuse(outcome, s, "Value was either too large or too small for an Int32.");
+            return (int)bits;
         }
 
 #if LAMELLA_SURFACE_NETFX_2_0
         public static bool TryParse(string s, out int result)
         {
             result = 0;
-            if (s == null || s.Length == 0) return false;
-            int end = s.Length;
-            while (end > 0 && NumberText.IsPad(s[end - 1])) end = end - 1;
-            int i = 0;
-            while (i < end && NumberText.IsPad(s[i])) i = i + 1;
-            bool negative = false;
-            if (i < end && s[i] == '-') { negative = true; i = i + 1; }
-            else if (i < end && s[i] == '+') { i = i + 1; }
-            if (i >= end) return false;
-            int value = 0;
-            while (i < end)
-            {
-                char c = s[i];
-                if (c < '0' || c > '9') return false;
-                int digit = c - '0';
-                if (value < (MinValue + digit) / 10) return false;
-                value = value * 10 - digit;
-                i = i + 1;
-            }
-            if (!negative)
-            {
-                if (value == MinValue) return false;
-                result = -value;
-                return true;
-            }
-            result = value;
+            if ((object)s == null) return false;
+            ulong bits;
+            if (NumberParser.ScanWholeNumber(s, (int)NumberStyles.Integer, 8, 2147483647UL, 2147483648UL, out bits) != NumberParser.Done) return false;
+            result = (int)bits;
+            return true;
+        }
+
+        public static bool TryParse(string s, NumberStyles style, IFormatProvider provider, out int result)
+        {
+            NumberParser.CheckWholeNumberStyle(style);
+            result = 0;
+            if ((object)s == null) return false;
+            NumberParser.AskProvider(provider);
+            ulong bits;
+            if (NumberParser.ScanWholeNumber(s, (int)style, 8, 2147483647UL, 2147483648UL, out bits) != NumberParser.Done) return false;
+            result = (int)bits;
             return true;
         }
 #endif

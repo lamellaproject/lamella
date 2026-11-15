@@ -35,7 +35,8 @@ fn create(bytes: &[u8], pdb: Option<Vec<u8>>, corlib: Option<&[u8]>) -> u32 {
         return 0;
     };
     let backend = match pdb {
-        Some(pdb_bytes) => InterpreterBackend::with_pdb(program.module, program.entry, pdb_bytes),
+        Some(pdb_bytes) => InterpreterBackend::with_pdb(program.module, program.entry, pdb_bytes)
+            .with_local_types(&assembly),
         None => InterpreterBackend::new(program.module, program.entry),
     };
     let debugger =

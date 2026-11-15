@@ -1074,8 +1074,8 @@ impl Feature {
             Feature::RecordClass => true,
             Feature::PatternCaseLabel => true,
             Feature::LocalFunctions | Feature::StaticLocalFunctions => true,
-            Feature::ImplicitlyTypedArray
-            | Feature::ExtensionMethod
+            Feature::ImplicitlyTypedArray => true,
+            Feature::ExtensionMethod
             | Feature::Iterators
             | Feature::TypePattern
             | Feature::WithExpression

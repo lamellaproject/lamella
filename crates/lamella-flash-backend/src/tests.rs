@@ -234,7 +234,11 @@ fn a_probe_failure_is_a_sentence_and_only_a_silent_probe_is_sent_to_the_cable() 
     for (failure, sentence) in [
         (ProbeError::Timeout("the flash to finish"), "timed out waiting for the flash to finish"),
         (ProbeError::Device("the erase failed"), "target device error: the erase failed"),
-        (ProbeError::Ack(lamella_probe_core::Ack::Fault), "transfer not acknowledged: Fault"),
+        (ProbeError::Ack(lamella_probe_core::Ack::Fault), "the board's chip refused the debug request"),
+        (
+            ProbeError::Ack(lamella_probe_core::Ack::NoAck),
+            "the board did not answer the probe: check that the board is powered and wired to it",
+        ),
     ] {
         assert_eq!(FlashError::Probe(failure).to_string(), sentence);
     }

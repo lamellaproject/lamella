@@ -5,7 +5,9 @@
 //! bulk packets over its vendor interface's bulk IN + OUT pipes (WritePipeTO / ReadPipeTO).
 #![allow(non_upper_case_globals, non_snake_case, non_camel_case_types, unsafe_op_in_unsafe_fn)]
 
-use super::iokit_status::{finished_read, is_timeout, kIOUSBPipeStalled, open_refused, pipe_failure};
+use super::iokit_status::{
+    finished_read, interface_open_refused, is_timeout, kIOReturnUnderrun, kIOUSBPipeStalled, open_refused, pipe_failure,
+};
 use super::take_left;
 use super::{Binding, DeviceInfo, Error, Result};
 use core::ffi::c_void;
@@ -162,6 +164,11 @@ struct IOUSBInterfaceInterface500 {
     ControlRequestAsyncTO: *const c_void,
     ReadPipeTO: extern "C" fn(*mut c_void, u8, *mut c_void, *mut u32, u32, u32) -> IOReturn,
     WritePipeTO: extern "C" fn(*mut c_void, u8, *const c_void, u32, u32, u32) -> IOReturn,
+    ReadPipeAsyncTO: *const c_void,
+    WritePipeAsyncTO: *const c_void,
+    USBInterfaceGetStringIndex: *const c_void,
+    USBInterfaceOpenSeize: *const c_void,
+    ClearPipeStallBothEnds: extern "C" fn(*mut c_void, u8) -> IOReturn,
 }
 
 #[link(name = "CoreFoundation", kind = "framework")]
@@ -397,7 +404,7 @@ impl Device {
                 }
                 IOObjectRelease(iter);
             }
-            Err(refused.map_or(Error::NotFound, Error::Os))
+            Err(refused.unwrap_or(Error::NotFound))
         }
     }
 
@@ -566,7 +573,7 @@ unsafe fn open_vendor_interface(
     plugin_id: CFUUIDRef,
     intf_user: CFUUIDRef,
     intf_iid: CFUUIDBytes,
-    refused: &mut Option<String>,
+    refused: &mut Option<Error>,
 ) -> Option<(*mut *mut IOUSBInterfaceInterface500, u8, u8, Vec<(u8, u8)>)> {
     let req = IOUSBFindInterfaceRequest {
         bInterfaceClass: DONT_CARE,
@@ -617,7 +624,7 @@ unsafe fn open_if_it_has_a_bulk_pair(
     plugin_id: CFUUIDRef,
     intf_user: CFUUIDRef,
     intf_iid: CFUUIDBytes,
-    refused: &mut Option<String>,
+    refused: &mut Option<Error>,
 ) -> Option<(*mut *mut IOUSBInterfaceInterface500, u8, u8, Vec<(u8, u8)>)> {
     let mut plugin: *mut *mut IOCFPlugInInterface = null_mut();
     let mut score = 0i32;
@@ -639,7 +646,7 @@ unsafe fn open_if_it_has_a_bulk_pair(
     }
     let opened = ((**intf).USBInterfaceOpen)(intf as *mut c_void);
     if opened != kIOReturnSuccess {
-        *refused = Some(open_refused("USBInterfaceOpen", opened));
+        *refused = Some(interface_open_refused(opened));
         ((**intf).Release)(intf as *mut c_void);
         return None;
     }
@@ -683,7 +690,7 @@ unsafe fn try_device(
     intf_iid: CFUUIDBytes,
     vendor_id: u16,
     product_id: u16,
-    refused: &mut Option<String>,
+    refused: &mut Option<Error>,
 ) -> Option<Device> {
     let mut plugin: *mut *mut IOCFPlugInInterface = null_mut();
     let mut score = 0i32;
@@ -709,7 +716,7 @@ unsafe fn try_device(
 
     let opened = ((**dev).USBDeviceOpen)(dev as *mut c_void);
     if opened != kIOReturnSuccess {
-        *refused = Some(open_refused("USBDeviceOpen", opened));
+        *refused = Some(Error::Os(open_refused("USBDeviceOpen", opened)));
         ((**dev).Release)(dev as *mut c_void);
         return None;
     }
@@ -1002,11 +1009,70 @@ pub fn enumerate_class(class: crate::InterfaceClass) -> Result<Vec<crate::Interf
     Ok(out)
 }
 
+/// An interface of a device that a [`ControlInterface`] holds open, itself opened for its bulk pair.
+struct InterfacePipes {
+    intf: *mut *mut IOUSBInterfaceInterface500,
+    /// The pair's IN pipe reference.
+    ep_in: u8,
+    /// The pair's OUT pipe reference.
+    ep_out: u8,
+}
+
+/// The error for a bulk pipe call on an interface opened for its control requests that returned
+/// `status`, which is not success: a stall is named as the device's answer, as [`crate::stalled`] names
+/// one on the control pipe, and every other status as [`pipe_failure`] gives it.
+fn interface_pipe_failure(call: &str, status: IOReturn) -> Error {
+    if status == kIOUSBPipeStalled {
+        return Error::Os(format!("the device stalled the pipe ({call} returned {:#010x})", status as u32));
+    }
+    pipe_failure(call, status)
+}
+
+/// The interface numbered `number` of the device `dev`, opened, with its bulk pair; it must be
+/// vendor-specific, as the interfaces this crate drives through bulk pipes are.
+unsafe fn open_interface_pipes(dev: *mut *mut IOUSBDeviceInterface500, number: u8) -> Result<InterfacePipes> {
+    let all = IOUSBFindInterfaceRequest {
+        bInterfaceClass: DONT_CARE,
+        bInterfaceSubClass: DONT_CARE,
+        bInterfaceProtocol: DONT_CARE,
+        bAlternateSetting: DONT_CARE,
+    };
+    let mut iter: io_iterator_t = 0;
+    let created = ((**dev).CreateInterfaceIterator)(dev as *mut c_void, &all, &mut iter);
+    if created != kIOReturnSuccess {
+        return Err(Error::Os(format!("CreateInterfaceIterator returned {:#010x}", created as u32)));
+    }
+    let (plugin_id, intf_user) = (cfuuid(&ID_CFPLUGIN), cfuuid(&ID_INTF_USERCLIENT));
+    let intf_iid = CFUUIDBytes { b: ID_INTF_IFACE500 };
+    let (mut listed, mut refused, mut opened) = (false, None, None);
+    loop {
+        let svc = IOIteratorNext(iter);
+        if svc == 0 {
+            break;
+        }
+        if opened.is_none() && registry_u16(svc, "bInterfaceNumber") == Some(u16::from(number)) {
+            listed = true;
+            opened = open_if_it_has_a_bulk_pair(svc, plugin_id, intf_user, intf_iid, &mut refused);
+        }
+        IOObjectRelease(svc);
+    }
+    IOObjectRelease(iter);
+    match (opened, refused) {
+        (Some((intf, ep_in, ep_out, _)), _) => Ok(InterfacePipes { intf, ep_in, ep_out }),
+        (None, Some(why)) => Err(why),
+        (None, None) if listed => Err(crate::interface_lacks("bulk pair")),
+        (None, None) => Err(Error::Os(format!("macOS lists no interface {number} of the device"))),
+    }
+}
+
 /// An opened device, one of whose interfaces is driven through the default control pipe by
-/// `DeviceRequestTO`.
+/// `DeviceRequestTO`, and through its own bulk pair by `ReadPipeTO` and `WritePipeTO`.
 pub struct ControlInterface {
     dev: *mut *mut IOUSBDeviceInterface500,
     interface: u8,
+    /// The interface opened for its bulk pair, at the first call that needs it; `None` until then, so
+    /// an interface used for its control requests alone is never opened.
+    pipes: Option<InterfacePipes>,
 }
 
 impl ControlInterface {
@@ -1068,6 +1134,60 @@ impl ControlInterface {
         self.request(setup, data.as_ptr().cast_mut().cast(), timeout_ms)
     }
 
+    /// The interface's bulk pair, the interface opened for it at the first call that needs it.
+    fn pipes(&mut self) -> Result<&InterfacePipes> {
+        if self.pipes.is_none() {
+            self.pipes = Some(unsafe { open_interface_pipes(self.dev, self.interface) }?);
+        }
+        Ok(self.pipes.as_ref().expect("opened above"))
+    }
+
+    /// See [`crate::ControlInterface::write_bulk`].
+    pub fn write_bulk(&mut self, data: &[u8], timeout_ms: u32) -> Result<usize> {
+        let length = u32::try_from(data.len())
+            .map_err(|_| Error::InvalidRequest(String::from("a bulk transfer is shorter than 4 GiB")))?;
+        let pipes = self.pipes()?;
+        let status = unsafe {
+            ((**pipes.intf).WritePipeTO)(pipes.intf.cast(), pipes.ep_out, data.as_ptr().cast(), length, timeout_ms, timeout_ms)
+        };
+        if status != kIOReturnSuccess {
+            return Err(interface_pipe_failure("WritePipeTO", status));
+        }
+        Ok(data.len())
+    }
+
+    /// See [`crate::ControlInterface::read_bulk`].
+    pub fn read_bulk(&mut self, buffer: &mut [u8], timeout_ms: u32) -> Result<usize> {
+        let mut size = u32::try_from(buffer.len())
+            .map_err(|_| Error::InvalidRequest(String::from("a bulk transfer is shorter than 4 GiB")))?;
+        let pipes = self.pipes()?;
+        let status = unsafe {
+            ((**pipes.intf).ReadPipeTO)(pipes.intf.cast(), pipes.ep_in, buffer.as_mut_ptr().cast(), &mut size, timeout_ms, timeout_ms)
+        };
+        if status != kIOReturnSuccess && status != kIOReturnUnderrun {
+            return Err(interface_pipe_failure("ReadPipeTO", status));
+        }
+        Ok((size as usize).min(buffer.len()))
+    }
+
+    /// See [`crate::ControlInterface::clear_bulk_halts`]. `ClearPipeStallBothEnds` clears the host's state
+    /// for the pipe and sends the device CLEAR_FEATURE(ENDPOINT_HALT) for its endpoint (`IOUSBLib.h`).
+    pub fn clear_bulk_halts(&mut self) -> Result<()> {
+        let pipes = self.pipes()?;
+        let mut failed = Vec::new();
+        for pipe in [pipes.ep_out, pipes.ep_in] {
+            let status = unsafe { ((**pipes.intf).ClearPipeStallBothEnds)(pipes.intf.cast(), pipe) };
+            if status != kIOReturnSuccess {
+                failed.push(format!("pipe {pipe} ({:#010x})", status as u32));
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Os(format!("ClearPipeStallBothEnds failed for {}", failed.join(" and "))))
+        }
+    }
+
     /// One `DeviceRequestTO`, whose `wLenDone` is the number of bytes transferred (`USB.h`).
     fn request(&mut self, setup: crate::Setup, data: *mut c_void, timeout_ms: u32) -> Result<usize> {
         let mut request = IOUSBDevRequestTO {
@@ -1097,6 +1217,10 @@ impl ControlInterface {
 impl Drop for ControlInterface {
     fn drop(&mut self) {
         unsafe {
+            if let Some(pipes) = self.pipes.take() {
+                ((**pipes.intf).USBInterfaceClose)(pipes.intf as *mut c_void);
+                ((**pipes.intf).Release)(pipes.intf as *mut c_void);
+            }
             ((**self.dev).USBDeviceClose)(self.dev as *mut c_void);
             ((**self.dev).Release)(self.dev as *mut c_void);
         }
@@ -1129,5 +1253,5 @@ unsafe fn open_control_interface(
         return None;
     }
     configure_once(dev);
-    Some(ControlInterface { dev, interface })
+    Some(ControlInterface { dev, interface, pipes: None })
 }

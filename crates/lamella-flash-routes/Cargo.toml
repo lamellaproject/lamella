@@ -17,6 +17,9 @@ lamella-probe-core = { path = "../lamella-probe-core" }
 # (HID) probes only, and every RPi Debug Probe is v2 over USB bulk -- so a bench full of them would
 # resolve to nothing while reporting that it had looked.
 lamella-probe = { path = "../lamella-probe", features = ["usbbulk"] }
+# The wire protocol a read of the chip behind a probe speaks. No transport features: a transport comes
+# from `lamella-probe`.
+lamella-cmsis-dap = { path = "../lamella-cmsis-dap", default-features = false }
 # The per-part flash controllers these backends sequence.
 lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf" }
 lamella-cmsis-dap-rp2350 = { path = "../lamella-cmsis-dap-rp2350" }
@@ -48,8 +51,15 @@ lamella-usbbulk = { path = "../lamella-usbbulk" }
 # crate is that caller, and it depends on `lamella-probe` for the same reason. A route that cannot
 # open anything is not a route.
 lamella-stlink = { path = "../lamella-stlink" }
+# The settings a board keeps in its flash: the region a probe route reads, erases and programs for
+# them, and its page.
+lamella-stored-settings = { path = "../lamella-stored-settings" }
 
 [dev-dependencies]
+# An example opens a HID interface by its id, sending it nothing.
+lamella-usbhid = { path = "../lamella-usbhid" }
+# The stored network's plain values, for the tests that store one through a probe route.
+lamella-net-core = { path = "../lamella-net-core" }
 # The ahead-of-time backend, for the census that proves every board in the table names a target it
 # actually knows and builds a bootable image. A DEV dependency: the routes do not compile anything,
 # but a table row that names a target the backend cannot build is a row nothing else would catch.

@@ -37,6 +37,7 @@ namespace Lamella.Boards.Adafruit
             Buses.BindGpio(new GpioDriverFactory(MakeGpio));
             AdcControllers.Bind(new AdcDriverFactory(MakeAdc));
 #if LAMELLA_SURFACE_FLOAT
+            Buses.SetPwmChipCount(AdafruitFeatherRp2350HstxBindings.PWM_CHIP_COUNT);
             Buses.BindPwm(0, new PwmChannelFactory(OpenPwm0));
             Buses.BindPwm(1, new PwmChannelFactory(OpenPwm1));
             Buses.BindPwm(2, new PwmChannelFactory(OpenPwm2));

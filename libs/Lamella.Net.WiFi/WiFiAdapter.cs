@@ -34,6 +34,31 @@ namespace Lamella.Net.WiFi
     /// <see cref="NetworkChange"/>'s events announce a link that comes up or goes down and an address
     /// that arrives or changes.
     /// </para>
+    /// <para>
+    /// The radio is off until a join asks for it, unless the board's stored network joins in the
+    /// background when the board starts. A join powers a radio that is off, and the radio's start,
+    /// about a second, counts against the join's timeout. Reading the state or the stored network, and
+    /// storing or erasing a network, do not power it.
+    /// </para>
+    /// <para>
+    /// Three settings decide how the board uses a network. Whether it is stored is chosen at the join
+    /// (<see cref="WiFiPersistence"/>). <see cref="SetBootConnection"/> says whether the board joins the
+    /// stored network in the background when it starts -- a join that keeps trying until the network
+    /// is there -- or only when the program asks. <see cref="WiFiReconnectionKind"/> says what the radio
+    /// does after a working link drops, and only then: join again by itself, or leave the next join to
+    /// the program. A program's own Connect call, including one that reads the stored record, returns
+    /// InvalidCredential as soon as the radio reports a refusal. A background join keeps trying with
+    /// rests of 5, 10, 20, 40, 80, 160, 300 seconds, then 300 seconds at each later refusal. A completed
+    /// join resets the next rest to five seconds. A hardware random seed, drawn once when the radio
+    /// starts, adds up to 20% to each rest when available. A failed WPA3 authentication uses this rest
+    /// even when its cause is not a wrong password. ConnectionState.LastFailure includes the current
+    /// rest's duration, with its spread rounded up to seconds; it is not a countdown.
+    /// The common setups: connect just
+    /// this once (<see cref="WiFiPersistence.Temporary"/> with <see cref="WiFiReconnectionKind.Manual"/>);
+    /// remember the network and stay on it, the default (<see cref="WiFiPersistence.Persistent"/>,
+    /// <see cref="WiFiBootConnection.Background"/> and <see cref="WiFiReconnectionKind.Automatic"/>);
+    /// or join only when the program has data (stored, with <see cref="WiFiBootConnection.OnConnect"/>).
+    /// </para>
     /// </remarks>
     public sealed class WiFiAdapter
     {
@@ -56,16 +81,18 @@ namespace Lamella.Net.WiFi
         }
 
         /// <summary>
-        /// Whether a Wi-Fi radio is running: false on a board without one, on a board whose radio did
-        /// not start, and on a platform these classes have no radio seam on.
+        /// Whether the board has a Wi-Fi radio these classes can use: true while the radio is off until
+        /// a join, while it starts and while it runs; false on a board without one, on a board whose
+        /// radio could not be started, and on a platform these classes have no radio seam on. Reading
+        /// it does not power the radio.
         /// </summary>
         public static bool IsSupported
         {
             get { return (WiFiNative.Radio() & 1) != 0; }
         }
 
-        /// <summary>The board's radio.</summary>
-        /// <exception cref="PlatformNotSupportedException">No radio is running (<see cref="IsSupported"/> is false).</exception>
+        /// <summary>The board's radio, whether it is off, starting or running.</summary>
+        /// <exception cref="PlatformNotSupportedException">The board has no radio these classes can use (<see cref="IsSupported"/> is false).</exception>
         public static WiFiAdapter Default
         {
             get
@@ -90,7 +117,7 @@ namespace Lamella.Net.WiFi
         /// <returns>How the join ended.</returns>
         /// <exception cref="ArgumentNullException"><paramref name="ssid"/> is null.</exception>
         /// <exception cref="ArgumentException">The name, the secret or the kinds are outside their bounds; see <see cref="WiFiSecurity"/>.</exception>
-        /// <exception cref="PlatformNotSupportedException">No radio is running.</exception>
+        /// <exception cref="PlatformNotSupportedException">The board has no radio these classes can use.</exception>
         /// <exception cref="IOException">The join succeeded and <see cref="WiFiPersistence.Persistent"/> was asked for, but the board could not store the network.</exception>
         public WiFiConnectionResult Connect(string ssid, ReadOnlySpan<byte> secret, WiFiSecurity security, WiFiPersistence persistence)
         {
@@ -108,7 +135,7 @@ namespace Lamella.Net.WiFi
         /// <exception cref="ArgumentNullException"><paramref name="ssid"/> is null.</exception>
         /// <exception cref="ArgumentException">The name, the secret or the kinds are outside their bounds.</exception>
         /// <exception cref="ArgumentOutOfRangeException"><paramref name="persistence"/>, <paramref name="reconnection"/> or <paramref name="timeout"/> is outside its range.</exception>
-        /// <exception cref="PlatformNotSupportedException">No radio is running.</exception>
+        /// <exception cref="PlatformNotSupportedException">The board has no radio these classes can use.</exception>
         /// <exception cref="IOException">The join succeeded and the network was to be stored, but the board could not store it.</exception>
         public WiFiConnectionResult Connect(
             string ssid,
@@ -139,7 +166,7 @@ namespace Lamella.Net.WiFi
         /// <returns>How the join ended.</returns>
         /// <exception cref="ArgumentException">The name, the secret or the kinds are outside their bounds.</exception>
         /// <exception cref="ArgumentOutOfRangeException"><paramref name="persistence"/>, <paramref name="reconnection"/> or <paramref name="timeout"/> is outside its range.</exception>
-        /// <exception cref="PlatformNotSupportedException">No radio is running.</exception>
+        /// <exception cref="PlatformNotSupportedException">The board has no radio these classes can use.</exception>
         /// <exception cref="IOException">The join succeeded and the network was to be stored, but the board could not store it.</exception>
         public WiFiConnectionResult Connect(
             ReadOnlySpan<byte> ssid,
@@ -156,7 +183,7 @@ namespace Lamella.Net.WiFi
         /// <summary>Joins the network stored on the board, waiting up to 20 seconds.</summary>
         /// <returns>How the join ended.</returns>
         /// <exception cref="InvalidOperationException">No network is stored on the board.</exception>
-        /// <exception cref="PlatformNotSupportedException">No radio is running.</exception>
+        /// <exception cref="PlatformNotSupportedException">The board has no radio these classes can use.</exception>
         public WiFiConnectionResult Connect()
         {
             return Connect(DefaultTimeout());
@@ -167,7 +194,7 @@ namespace Lamella.Net.WiFi
         /// <returns>How the join ended.</returns>
         /// <exception cref="ArgumentOutOfRangeException"><paramref name="timeout"/> is outside its range.</exception>
         /// <exception cref="InvalidOperationException">No network is stored on the board.</exception>
-        /// <exception cref="PlatformNotSupportedException">No radio is running.</exception>
+        /// <exception cref="PlatformNotSupportedException">The board has no radio these classes can use.</exception>
         public WiFiConnectionResult Connect(TimeSpan timeout)
         {
             Require();
@@ -184,7 +211,7 @@ namespace Lamella.Net.WiFi
         /// Drops the network held and ends a join in progress. The radio forgets the secret it held for
         /// it; a network stored on the board stays stored.
         /// </summary>
-        /// <exception cref="PlatformNotSupportedException">No radio is running.</exception>
+        /// <exception cref="PlatformNotSupportedException">The board has no radio these classes can use.</exception>
         public void Disconnect()
         {
             Require();
@@ -192,7 +219,7 @@ namespace Lamella.Net.WiFi
         }
 
         /// <summary>The radio's state now.</summary>
-        /// <exception cref="PlatformNotSupportedException">No radio is running.</exception>
+        /// <exception cref="PlatformNotSupportedException">The board has no radio these classes can use.</exception>
         public WiFiConnectionState ConnectionState
         {
             get
@@ -249,7 +276,7 @@ namespace Lamella.Net.WiFi
         /// <param name="timeout">How long to wait: from zero to <see cref="int.MaxValue"/> milliseconds, or -1 millisecond to wait without a bound.</param>
         /// <returns>Whether the board holds an address.</returns>
         /// <exception cref="ArgumentOutOfRangeException"><paramref name="timeout"/> is outside its range.</exception>
-        /// <exception cref="PlatformNotSupportedException">No radio is running.</exception>
+        /// <exception cref="PlatformNotSupportedException">The board has no radio these classes can use.</exception>
         public bool WaitForAddress(TimeSpan timeout)
         {
             Require();
@@ -276,7 +303,7 @@ namespace Lamella.Net.WiFi
         }
 
         /// <summary>The network stored on the board, without its secret; null when none is stored.</summary>
-        /// <exception cref="PlatformNotSupportedException">No radio is running.</exception>
+        /// <exception cref="PlatformNotSupportedException">The board has no radio these classes can use.</exception>
         public WiFiStoredNetwork StoredNetwork
         {
             get
@@ -291,7 +318,9 @@ namespace Lamella.Net.WiFi
                     Encoding.UTF8.GetString(report, WiFiNative.RecordSsid, report[WiFiNative.RecordSsidLength]),
                     (WiFiSecurity)report[WiFiNative.RecordSecurity],
                     (WiFiReconnectionKind)report[WiFiNative.RecordReconnection],
-                    (WiFiBootConnection)report[WiFiNative.RecordBoot]);
+                    report[WiFiNative.RecordBoot] == (byte)WiFiBootConnection.OnConnect
+                        ? WiFiBootConnection.OnConnect
+                        : WiFiBootConnection.Background);
             }
         }
 
@@ -303,11 +332,11 @@ namespace Lamella.Net.WiFi
         /// <exception cref="ArgumentOutOfRangeException"><paramref name="boot"/> is not a <see cref="WiFiBootConnection"/> value.</exception>
         /// <exception cref="InvalidOperationException">No network is stored on the board.</exception>
         /// <exception cref="IOException">The board could not store the change.</exception>
-        /// <exception cref="PlatformNotSupportedException">No radio is running.</exception>
+        /// <exception cref="PlatformNotSupportedException">The board has no radio these classes can use.</exception>
         public void SetBootConnection(WiFiBootConnection boot)
         {
             Require();
-            if (boot != WiFiBootConnection.Background && boot != WiFiBootConnection.BeforeMain && boot != WiFiBootConnection.OnConnect)
+            if (boot != WiFiBootConnection.Background && boot != WiFiBootConnection.OnConnect)
             {
                 throw new ArgumentOutOfRangeException("boot");
             }
@@ -327,7 +356,7 @@ namespace Lamella.Net.WiFi
         /// now stays joined until it is dropped.
         /// </summary>
         /// <exception cref="IOException">The board could not erase its storage.</exception>
-        /// <exception cref="PlatformNotSupportedException">No radio is running.</exception>
+        /// <exception cref="PlatformNotSupportedException">The board has no radio these classes can use.</exception>
         public void ClearStoredNetwork()
         {
             Require();
@@ -537,7 +566,7 @@ namespace Lamella.Net.WiFi
             for (int i = 0; i < interfaces.Length; i++)
             {
                 if (interfaces[i].NetworkInterfaceType == NetworkInterfaceType.Wireless80211
-                    && interfaces[i].OperationalStatus == OperationalStatus.Up)
+                    && interfaces[i].GetIPProperties().UnicastAddresses.Count != 0)
                 {
                     return true;
                 }

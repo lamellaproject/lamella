@@ -113,6 +113,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
             info.bases.push(delegate_base.clone());
             info.base = Some(delegate_base);
             info.methods.push(MethodSymbol {
+                is_accessor: false,
                 return_tuple_names: tuple_element_names(&declaration.return_type),
                 return_required_modifiers: Vec::new(),
                 explicit_interface: None,
@@ -134,6 +135,7 @@ fn collect_namespace_member(member: &NamespaceMember, namespace: &str, model: &m
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
                 sets_required_members: false,
+                uninstantiated_parameters: None,
                 type_parameters: Vec::new(),
                 type_parameter_constraints: Vec::new(),
             });
@@ -452,9 +454,11 @@ pub(crate) fn negated_integer_min_literal(operand: &Literal) -> Option<(Literal,
         Literal::Integer {
             value: 9_223_372_036_854_775_808,
             suffix: IntegerSuffix::None | IntegerSuffix::Long,
+            ..
         } => Some((
             Literal::Integer {
                 value: 9_223_372_036_854_775_808,
+                decimal: false,
                 suffix: IntegerSuffix::Long,
             },
             SpecialType::Int64,
@@ -462,9 +466,11 @@ pub(crate) fn negated_integer_min_literal(operand: &Literal) -> Option<(Literal,
         Literal::Integer {
             value: 2_147_483_648,
             suffix: IntegerSuffix::None,
+            ..
         } => Some((
             Literal::Integer {
                 value: (-2_147_483_648i64) as u64,
+                decimal: false,
                 suffix: IntegerSuffix::None,
             },
             SpecialType::Int32,
@@ -687,7 +693,7 @@ fn constant_namespace(
 ) -> bool {
     let scope = binder.import_scope();
     for using in usings {
-        binder.import_using(&using.kind);
+        binder.import_using_in_namespace(&using.kind, namespace);
     }
     let mut prefix = String::new();
     for part in namespace.split('.').filter(|part| !part.is_empty()) {
@@ -1369,6 +1375,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 attributes,
                 ..
             } => info.methods.push(MethodSymbol {
+                is_accessor: false,
                 return_tuple_names: tuple_element_names(return_type),
                 return_required_modifiers: Vec::new(),
                 name: declared_member_name(name, explicit_interface.as_ref()),
@@ -1389,6 +1396,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 },
                 conditional: conditional_symbols_from_attributes(attributes),
                 sets_required_members: false,
+                uninstantiated_parameters: None,
                 type_parameters: type_parameters
                     .iter()
                     .map(|parameter| parameter.name.clone())
@@ -1407,6 +1415,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 parameters,
                 ..
             } => info.methods.push(MethodSymbol {
+                is_accessor: false,
                 return_tuple_names: tuple_element_names(return_type),
                 return_required_modifiers: Vec::new(),
                 explicit_interface: None,
@@ -1424,6 +1433,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
                 sets_required_members: false,
+                uninstantiated_parameters: None,
                 type_parameters: Vec::new(),
                 type_parameter_constraints: Vec::new(),
             }),
@@ -1433,6 +1443,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 parameters,
                 ..
             } => info.methods.push(MethodSymbol {
+                is_accessor: false,
                 return_tuple_names: tuple_element_names(target),
                 return_required_modifiers: Vec::new(),
                 explicit_interface: None,
@@ -1450,6 +1461,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 accessibility: Accessibility::Public,
                 conditional: Vec::new(),
                 sets_required_members: false,
+                uninstantiated_parameters: None,
                 type_parameters: Vec::new(),
                 type_parameter_constraints: Vec::new(),
             }),
@@ -1525,6 +1537,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                 let indexer_is_sealed = is_sealed_member(modifiers);
                 if getter.is_some() {
                     info.methods.push(MethodSymbol {
+                        is_accessor: true,
                         return_tuple_names: element_tuple_names.clone(),
                         return_required_modifiers: Vec::new(),
                         explicit_interface: interface_symbol.clone(),
@@ -1542,6 +1555,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         accessibility,
                         conditional: Vec::new(),
                         sets_required_members: false,
+                        uninstantiated_parameters: None,
                         type_parameters: Vec::new(),
                         type_parameter_constraints: Vec::new(),
                     });
@@ -1556,6 +1570,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                     let mut parameters = indices;
                     parameters.push(element);
                     info.methods.push(MethodSymbol {
+                        is_accessor: true,
                         return_tuple_names: Vec::new(),
                         return_required_modifiers: Vec::new(),
                         explicit_interface: interface_symbol,
@@ -1573,6 +1588,7 @@ fn type_info(namespace: &str, declaration: &TypeDecl) -> TypeInfo {
                         accessibility,
                         conditional: Vec::new(),
                         sets_required_members: false,
+                        uninstantiated_parameters: None,
                         type_parameters: Vec::new(),
                         type_parameter_constraints: Vec::new(),
                     });
@@ -1617,6 +1633,7 @@ fn constructor(
     accessibility: Accessibility,
 ) -> MethodSymbol {
     MethodSymbol {
+        is_accessor: false,
         return_tuple_names: Vec::new(),
         return_required_modifiers: Vec::new(),
         explicit_interface: None,
@@ -1634,6 +1651,7 @@ fn constructor(
         accessibility,
         conditional: Vec::new(),
         sets_required_members: false,
+        uninstantiated_parameters: None,
         type_parameters: Vec::new(),
         type_parameter_constraints: Vec::new(),
     }
@@ -1973,6 +1991,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn constant_imports_keep_the_namespace_where_the_using_is_declared() {
+        for (directive, reference, expected) in [
+            ("using B;", "K", 2),
+            ("using KA = B.K;", "KA", 2),
+            ("using KA = global::B.K;", "KA", 1),
+        ] {
+            let source = alloc::format!(
+                "namespace B {{ public class K {{ public const int V = 1; }} }} \
+                 namespace A {{ {directive} \
+                   namespace B {{ public class K {{ public const int V = 2; }} }} \
+                   namespace Deep {{ \
+                     namespace B {{ public class K {{ public const int V = 3; }} }} \
+                     public enum E {{ Value = {reference}.V }} \
+                     public class P {{ public const int C = {reference}.V; \
+                       public static void F(int value = {reference}.V) {{ }} }} }} }} \
+                 namespace S {{ using B; public class P {{ public const int C = K.V; }} }}"
+            );
+            let model = resolved(&source);
+            let constant = |namespace: &str, ty: &str, field: &str| {
+                model.get(namespace, ty).unwrap().fields.iter()
+                    .find(|item| &*item.name == field).unwrap().constant.as_ref()
+                    .and_then(literal_int_value)
+            };
+            assert_eq!(constant("A.Deep", "P", "C"), Some(expected), "{directive}");
+            assert_eq!(constant("A.Deep", "E", "Value"), Some(expected), "{directive}");
+            let method = model.get("A.Deep", "P").unwrap().methods.iter()
+                .find(|method| &*method.name == "F").unwrap();
+            assert_eq!(method.parameter_info[0].default.as_ref().and_then(literal_int_value),
+                Some(expected), "{directive}");
+            assert_eq!(constant("S", "P", "C"), Some(1), "{directive}: sibling scope");
+        }
+    }
+
     /// DIAGNOSTIC probe for the const-of-const mis-fold: does the second
     /// pass actually fold these four shapes into the model, or is the loss downstream of it?
     #[test]
@@ -2127,6 +2179,44 @@ mod tests {
         assert_eq!(value("L", "AfterLow"), i64::MIN + 1);
         assert_eq!(value("M", "AfterHigh") as u64, 0x8000_0000_0000_0001);
         assert_eq!(value("M", "All") as u64, u64::MAX);
+    }
+
+    #[test]
+    fn enum_initializer_member_types_preserve_unsigned_values_and_field_identity() {
+        let unit = parse_compilation_unit(
+            "enum E : uint { High = 0x80000000U, Half = High >> 1, Quarter = E.High >> 2 } \
+             enum Other : uint { Half = E.High >> 1 } \
+             enum Forward : uint { Half = High >> 1, High = 0x80000000U } \
+             enum Small : sbyte { Low = -8, Half = Low / 2 } \
+             enum Byte : byte { High = 240, Half = High >> 1 } \
+             enum Short : short { Low = -32768, Half = Low / 2 } \
+             enum Ushort : ushort { High = 0x8000, Half = High >> 1 } \
+             enum Int : int { Low = -2147483648, Half = Low >> 1 } \
+             enum Long : long { Low = -9223372036854775808L, Half = Low >> 1 } \
+             enum Ulong : ulong { High = 0x8000000000000000UL, Half = High >> 1 }",
+        ).unit;
+        let mut model = Model::new();
+        collect_into(&mut model, &unit);
+        model.link_bases();
+        resolve_constants(&mut model, core::slice::from_ref(&unit));
+        for (name, member, expected) in [
+            ("E", "Half", 0x40000000),
+            ("E", "Quarter", 0x20000000),
+            ("Other", "Half", 0x40000000),
+            ("Forward", "Half", 0x40000000),
+            ("Small", "Half", -4),
+            ("Byte", "Half", 120),
+            ("Short", "Half", -16384),
+            ("Ushort", "Half", 16384),
+            ("Int", "Half", -1073741824),
+            ("Long", "Half", -4611686018427387904),
+            ("Ulong", "Half", 4611686018427387904),
+        ] {
+            let field = model.get("", name).unwrap().find_field(member).unwrap();
+            assert_eq!(field.ty.to_string(), name, "the declared field keeps its enum type");
+            assert_eq!(field.constant.as_ref().and_then(literal_int_value), Some(expected),
+                "{name}.{member}");
+        }
     }
 
     #[test]

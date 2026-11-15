@@ -198,6 +198,11 @@ fn check_inst(
                 use_value(func, defined, arg, errors);
             }
         }
+        Inst::NullCheck { object } => {
+            if let Some(found) = use_value(func, defined, *object, errors) {
+                expect(MirType::ObjectRef, found, errors);
+            }
+        }
         Inst::FuncAddr { .. } => {
             if let Some(r) = result_ty {
                 expect(MirType::I32, r, errors);
@@ -253,6 +258,8 @@ fn check_inst(
             }
         }
         Inst::InitStruct => {
+        }
+        Inst::Nop => {
         }
         Inst::FieldLoad { base, .. } => {
             use_value(func, defined, *base, errors);

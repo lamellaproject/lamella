@@ -79,6 +79,12 @@ impl<A: TargetAccess> MicrobitDaplink<A> {
             },
         }
     }
+
+    /// The probe this backend was built over, handed back once a write is done, for a caller that
+    /// goes on to use the part.
+    pub fn into_target(self) -> A {
+        self.target
+    }
 }
 
 impl<A: TargetAccess> FlashBackend for MicrobitDaplink<A> {
@@ -344,6 +350,62 @@ impl<A: TargetAccess, S> Rp2350Probe<A, S> {
     }
 }
 
+impl<A: TargetAccess, S: FnMut(&str)> Rp2350Probe<A, S> {
+    /// Writes `spans` through one session of the part routine, in the order given, with nothing
+    /// written between them and nothing written where `keep` lies, then leaves the part running.
+    ///
+    /// **THE CONTRACT's ORDER, OVER SEVERAL SPANS.** The part is identified and `allow` asked before
+    /// anything is erased. The part routine compares the flash with every span, writes each span
+    /// that differs by the sectors that differ and reads it back before the next span is touched,
+    /// and refuses spans that share a sector or reach `keep` before anything is reset. Each span's
+    /// read-back is then compared here with the caller's own bytes, as [`lamella_flash_backend::flash`]
+    /// compares a whole image's.
+    ///
+    /// Returns the part's identity and what was done with each span, in the order given.
+    ///
+    /// # Errors
+    /// A part `allow` does not permit, refused before anything is erased; a span the part routine
+    /// refuses or cannot write; and a read-back that is short or holds other bytes.
+    pub fn write_spans(
+        &mut self,
+        spans: &[lamella_cmsis_dap_rp2350::Span<'_>],
+        keep: &[core::ops::Range<u32>],
+        allow: &lamella_flash_backend::Allow,
+    ) -> Result<(PartIdentity, Vec<lamella_cmsis_dap_rp2350::SpanWrite>), FlashError> {
+        let identity = self.identify()?;
+        if !allow.permits(&identity) {
+            return Err(FlashError::NotAllowed { found: identity });
+        }
+        let say = &mut self.say;
+        let (target, erase, d8h) = (&mut self.target, self.erase, &mut self.d8h);
+        let written = lamella_cmsis_dap_rp2350::flash_spans_with(target, spans, keep, erase, d8h, |line| {
+            say(&format!("  {line}"));
+        })?;
+        for (span, write) in spans.iter().zip(&written) {
+            let base = lamella_cmsis_dap_rp2350::XIP_BASE.saturating_add(span.offset);
+            compare_read_back(base, span.bytes, &bytes_of(&write.read, span.bytes.len()))?;
+        }
+        leave_running(&mut self.target)?;
+        Ok((identity, written))
+    }
+}
+
+/// Compares `read`, read back from `base`, with `bytes`, the bytes written there, reporting the
+/// first byte that differs, or a read of another length as a broken read rather than a mismatch.
+fn compare_read_back(base: u32, bytes: &[u8], read: &[u8]) -> Result<(), FlashError> {
+    if read.len() != bytes.len() {
+        return Err(FlashError::ShortReadBack { wrote: bytes.len(), read: read.len() });
+    }
+    match bytes.iter().zip(read).position(|(expected, got)| expected != got) {
+        None => Ok(()),
+        Some(at) => Err(FlashError::Verify {
+            address: base.saturating_add(u32::try_from(at).unwrap_or(u32::MAX)),
+            expected: bytes[at],
+            got: read[at],
+        }),
+    }
+}
+
 /// Why a write through the RP2350 route failed.
 pub(crate) enum Rp2350Failure {
     /// A transfer the part did not complete at the faster clock, or the probe not taking that
@@ -386,13 +448,26 @@ pub(crate) fn rp2350_failure(error: FlashError, clock_hz: u32) -> Rp2350Failure 
 /// ([`Rp2350Probe::remembering`]), so a second attempt clears a bit the first set for a block erase
 /// and could not clear.
 pub(crate) fn write_rp2350(
-    mut attempt: impl FnMut(
+    attempt: impl FnMut(
         u32,
         &mut lamella_cmsis_dap_rp2350::D8hAsFound,
         &mut dyn FnMut(&str),
     ) -> Result<Report, Rp2350Failure>,
     say: &mut dyn FnMut(&str),
 ) -> Result<Report, String> {
+    write_rp2350_for(attempt, say)
+}
+
+/// [`write_rp2350`], for an attempt that answers with `R`: a write of several spans answers with
+/// what it did to each.
+pub(crate) fn write_rp2350_for<R>(
+    mut attempt: impl FnMut(
+        u32,
+        &mut lamella_cmsis_dap_rp2350::D8hAsFound,
+        &mut dyn FnMut(&str),
+    ) -> Result<R, Rp2350Failure>,
+    say: &mut dyn FnMut(&str),
+) -> Result<R, String> {
     use lamella_cmsis_dap_rp2350::{FALLBACK_SWD_CLOCK_HZ, SWD_CLOCK_HZ};
 
     let mut d8h = lamella_cmsis_dap_rp2350::D8hAsFound::default();

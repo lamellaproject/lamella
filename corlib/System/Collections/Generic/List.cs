@@ -34,6 +34,36 @@ namespace System.Collections.Generic
             size = 0;
         }
 
+        /// A list holding the elements of `collection`, in order.
+        public List(IEnumerable<T> collection)
+        {
+            if (collection == null) { throw new ArgumentNullException("collection"); }
+            List<T> list = collection as List<T>;
+            ICollection<T> known = collection as ICollection<T>;
+            if (list != null)
+            {
+                items = new T[list.size];
+                Array.Copy(list.items, 0, items, 0, list.size);
+                size = list.size;
+            }
+            else if (known != null)
+            {
+                int count = known.Count;
+                items = new T[count];
+                known.CopyTo(items, 0);
+                size = count;
+            }
+            else
+            {
+                items = new T[0];
+                size = 0;
+                foreach (T item in collection)
+                {
+                    Add(item);
+                }
+            }
+        }
+
         /// How many elements the list holds.
         public int Count { get { return size; } }
 
@@ -102,6 +132,66 @@ namespace System.Collections.Generic
             items[index] = item;
             size = size + 1;
             version = version + 1;
+        }
+
+        /// Appends the elements of `collection`, in order.
+        public void AddRange(IEnumerable<T> collection)
+        {
+            InsertRange(size, collection);
+        }
+
+        /// Inserts the elements of `collection` at `index`, which may be Count; the elements from
+        /// `index` move up to make room.
+        public void InsertRange(int index, IEnumerable<T> collection)
+        {
+            if (collection == null) { throw new ArgumentNullException("collection"); }
+            if (index < 0 || index > size) { throw new ArgumentOutOfRangeException("index", IndexMustBeLessOrEqual); }
+            List<T> list = collection as List<T>;
+            ICollection<T> known = list == null ? collection as ICollection<T> : null;
+            if (list != null || known != null)
+            {
+                int count = list != null ? list.size : known.Count;
+                if (count > 0)
+                {
+                    if (items.Length - size < count) { Grow(size + count); }
+                    int i = size - 1;
+                    while (i >= index)
+                    {
+                        items[i + count] = items[i];
+                        i = i - 1;
+                    }
+                    if ((object)list == (object)this)
+                    {
+                        Array.Copy(items, 0, items, index, index);
+                        Array.Copy(items, index + count, items, index * 2, size - index);
+                    }
+                    else if (list != null)
+                    {
+                        Array.Copy(list.items, 0, items, index, count);
+                    }
+                    else
+                    {
+                        known.CopyTo(items, index);
+                    }
+                    size = size + count;
+                    version = version + 1;
+                }
+            }
+            else if (index < size)
+            {
+                foreach (T item in collection)
+                {
+                    Insert(index, item);
+                    index = index + 1;
+                }
+            }
+            else
+            {
+                foreach (T item in collection)
+                {
+                    Add(item);
+                }
+            }
         }
 
         /// Removes every element. The backing array is kept, and the slots it still holds are
@@ -434,6 +524,57 @@ namespace System.Collections.Generic
                 high = high - 1;
             }
             version = version + 1;
+        }
+
+        /// Sorts the elements by their default order.
+        public void Sort()
+        {
+            Sort(0, size, null);
+        }
+
+        /// Sorts the elements with `comparer`, or by their default order when it is null.
+        public void Sort(IComparer<T> comparer)
+        {
+            Sort(0, size, comparer);
+        }
+
+        /// Sorts `count` elements from `index` on with `comparer`, or by their default order when it is
+        /// null.
+        public void Sort(int index, int count, IComparer<T> comparer)
+        {
+            CheckRange(index, count);
+            if (count > 1) { ArraySortHelper<T>.Sort(items, index, count, comparer); }
+            version = version + 1;
+        }
+
+        /// Sorts the elements with `comparison`.
+        public void Sort(Comparison<T> comparison)
+        {
+            if (comparison == null) { throw new ArgumentNullException("comparison"); }
+            if (size > 1) { ArraySortHelper<T>.Sort(items, 0, size, comparison); }
+            version = version + 1;
+        }
+
+        /// The index of `item` in the sorted list by its default order, or, when it is absent, the
+        /// bitwise complement of the index of the first element that sorts after it.
+        public int BinarySearch(T item)
+        {
+            return BinarySearch(0, size, item, null);
+        }
+
+        /// The index of `item` in the list sorted by `comparer`, or, when it is absent, the bitwise
+        /// complement of the index of the first element that sorts after it.
+        public int BinarySearch(T item, IComparer<T> comparer)
+        {
+            return BinarySearch(0, size, item, comparer);
+        }
+
+        /// The index of `item` among `count` elements from `index` on, sorted by `comparer`, or, when
+        /// it is absent, the bitwise complement of the index of the first element that sorts after it.
+        public int BinarySearch(int index, int count, T item, IComparer<T> comparer)
+        {
+            CheckRange(index, count);
+            return ArraySortHelper<T>.BinarySearch(items, index, count, item, comparer);
         }
 
         /// A new list of `count` elements copied from `index` on.

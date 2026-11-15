@@ -28,6 +28,7 @@ namespace System
 
 #if LAMELLA_SURFACE_FLOAT
         public static void WriteLine(double value) { WriteLine(value.ToString()); }
+        public static void WriteLine(float value) { WriteLine(value.ToString()); }
 #endif
 
 #if LAMELLA_SURFACE_DECIMAL
@@ -49,10 +50,20 @@ namespace System
 
 #if LAMELLA_SURFACE_FLOAT
         public static void Write(double value) { Write(value.ToString()); }
+        public static void Write(float value) { Write(value.ToString()); }
 #endif
 #if LAMELLA_SURFACE_DECIMAL
         public static void Write(decimal value) { Write(value.ToString()); }
 #endif
+
+        public static void Write(string format, object arg0) { Write(String.Format(format, arg0)); }
+        public static void Write(string format, object arg0, object arg1) { Write(String.Format(format, arg0, arg1)); }
+        public static void Write(string format, object arg0, object arg1, object arg2) { Write(String.Format(format, arg0, arg1, arg2)); }
+        public static void Write(string format, params object[] arg) { Write(String.Format(format, (object)arg == null ? new object[2] : arg)); }
+        public static void WriteLine(string format, object arg0) { WriteLine(String.Format(format, arg0)); }
+        public static void WriteLine(string format, object arg0, object arg1) { WriteLine(String.Format(format, arg0, arg1)); }
+        public static void WriteLine(string format, object arg0, object arg1, object arg2) { WriteLine(String.Format(format, arg0, arg1, arg2)); }
+        public static void WriteLine(string format, params object[] arg) { WriteLine(String.Format(format, (object)arg == null ? new object[2] : arg)); }
 
         private static System.IO.TextWriter _out;
         public static System.IO.TextWriter Out

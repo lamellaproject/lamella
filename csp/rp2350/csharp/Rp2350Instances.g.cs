@@ -35,6 +35,9 @@ namespace Lamella.Generated
         public const uint SPI0_BASE = 0x40080000;
         public const uint SPI0_RESET_BIT = 18;
         public const uint SPI0_RESET_MASK = 0x40000;
+        public const uint SPI1_BASE = 0x40088000;
+        public const uint SPI1_RESET_BIT = 19;
+        public const uint SPI1_RESET_MASK = 0x80000;
         public const uint I2C0_BASE = 0x40090000;
         public const uint I2C0_RESET_BIT = 4;
         public const uint I2C0_RESET_MASK = 0x10;

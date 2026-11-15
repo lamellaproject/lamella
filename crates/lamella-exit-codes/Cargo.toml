@@ -1,0 +1,14 @@
+[package]
+name = "lamella-exit-codes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The codes a Lamella run reports when its program ends any way other than its entry point returning, and what each means in plain words: one table for the runtimes, the boards, the command line and the debugger. no_std, with no dependencies."
+publish = false
+
+[dependencies]
+
+[lints]
+workspace = true

@@ -19,8 +19,9 @@
 //! to standard output in that order. Everything this tool says -- what it read, the probe it used,
 //! why it stopped -- goes to standard error without a prefix.
 //!
-//! **A RUN ENDS AS THE PROGRAM ENDED**: with its own exit code, or with 1 and a sentence when the
-//! program was aborted, when the time limit `--timeout` sets ran out, or when this tool failed.
+//! **A RUN ENDS AS THE PROGRAM ENDED**: with its own exit code; with the code the board gives, and a
+//! sentence, when the program was aborted; or with 1 and a sentence when the time limit `--timeout`
+//! sets ran out, or when this tool failed.
 //! Ctrl+C stops following at once and ends as the operating system ends any program stopped by
 //! Ctrl+C. Neither stops the program: the board is let go of, never halted or reset.
 //!
@@ -35,7 +36,7 @@ use crate::own_lines::{blank_line, fail, say};
 use lamella_elf::symbols::DataObject;
 use lamella_flash_routes::manifest::{self, Manifest};
 use lamella_flash_routes::placement::{BootloaderChoice, Placement, placement_for};
-use lamella_flash_routes::{Programmer, Programming, prepare_image, programmer_for};
+use lamella_flash_routes::{Programmer, Programming, prepare_image, prepare_regions, programmer_for};
 use lamella_probe_console::{END_MAGICS, LAMELLA_RING, NoRing, ProgramEnd, RHU_RING, RingReader, Seen, TargetMemory};
 use lamella_probe_core::selection::serial_named;
 use std::borrow::Cow;
@@ -71,8 +72,8 @@ pub(crate) fn run_manifest(options: &[String], after: &[String]) -> Ended {
     let spec = args::Spec {
         verb: "run",
         usage: Some(crate::program::RUN_USAGE),
-        values: &[MANIFEST, "--probe", "--timeout"],
-        repeats: &[],
+        values: &[MANIFEST, "--probe", "--timeout", crate::flash::REGION],
+        repeats: &[crate::flash::REGION],
         flags: &["--no-banner"],
         positional: args::Positional::Own,
     };
@@ -95,14 +96,15 @@ pub(crate) fn run_manifest(options: &[String], after: &[String]) -> Ended {
             return Ended::Failed;
         }
     };
-    run_image(&image, parsed.value("--probe"), parsed.value("--timeout"), !parsed.flag("--no-banner"))
+    let regions: Vec<PathBuf> = parsed.values(crate::flash::REGION).map(PathBuf::from).collect();
+    run_image(&image, &regions, parsed.value("--probe"), parsed.value("--timeout"), !parsed.flag("--no-banner"))
 }
 
-/// The refusal for a program given arguments, which a program on a board cannot take yet.
+/// The refusal for a program given arguments, which a program on a board cannot take.
 pub(crate) fn arguments_refusal(given: &[&String]) -> String {
     let listed: Vec<String> = given.iter().map(|argument| format!("{argument:?}")).collect();
     format!(
-        "a program on a board cannot take arguments yet, so nothing was written (given: {}).",
+        "a program on a board cannot take arguments, so nothing was written (given: {}).",
         listed.join(", ")
     )
 }
@@ -123,10 +125,11 @@ fn image_of(manifest: &Path) -> Result<PathBuf, String> {
     }
 }
 
-/// The run of `image`, whose manifest is beside it, through the probe `probe` names.
-fn run_image(image: &Path, probe: Option<&str>, time_limit: Option<&str>, banner: bool) -> Ended {
+/// The run of `image`, whose manifest is beside it, with the flash regions `regions` written beside
+/// it, through the probe `probe` names.
+fn run_image(image: &Path, regions: &[PathBuf], probe: Option<&str>, time_limit: Option<&str>, banner: bool) -> Ended {
     let mut err = std::io::stderr();
-    let mut plan = match plan(image, time_limit) {
+    let mut plan = match plan(image, regions, time_limit) {
         Ok(plan) => plan,
         Err(refusal) => {
             fail(&mut err, &refusal);
@@ -170,6 +173,8 @@ enum Reach {
     Rp2350,
     /// The ST-LINK on the board, by its USB product id, through the probe's own memory commands.
     StLink(u16),
+    /// The DAPLink on a micro:bit, a CMSIS-DAP probe, through the part's memory access port.
+    Daplink,
 }
 
 impl Reach {
@@ -181,10 +186,11 @@ impl Reach {
         match route {
             Programmer::Rp2350Probe { .. } => Ok(Reach::Rp2350),
             Programmer::StlinkOnboard { probe_id, .. } => Ok(Reach::StLink(probe_id)),
+            Programmer::MicrobitV1Daplink | Programmer::MicrobitV2Daplink => Ok(Reach::Daplink),
             other => Err(format!(
                 "{board} is written through {}, and this build follows a running program only \
-                 through a debug probe\non an RP2350 or the ST-LINK on an ST board, so nothing was \
-                 written.",
+                 through a debug probe\non an RP2350, the ST-LINK on an ST board or the DAPLink on \
+                 a micro:bit, so nothing was written.",
                 other.description()
             )),
         }
@@ -194,21 +200,35 @@ impl Reach {
     /// family.
     fn family(self) -> &'static str {
         match self {
-            Reach::Rp2350 => crate::devices::CMSIS_DAP,
+            Reach::Rp2350 | Reach::Daplink => crate::devices::CMSIS_DAP,
             Reach::StLink(_) => crate::devices::ST_LINK,
         }
     }
 }
 
+/// The debug probe a run by an image's manifest writes a board through and follows its program
+/// through.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RunProbe {
+    /// The probe's family, as `lamella devices` names a probe's family.
+    pub(crate) family: &'static str,
+    /// The USB vendor and product ids of the debugger soldered to the board, which narrow the probes
+    /// of that family to the board's own; `None` where any probe of the family could be wired to it.
+    pub(crate) usb: Option<(u16, u16)>,
+}
+
+/// The probe a run by an image's manifest writes `board` through, by the route [`plan`] takes:
+/// `None` for a board this build cannot run that way.
+pub(crate) fn run_probe(board: &str) -> Option<RunProbe> {
+    let route = programmer_for(board).ok().and_then(|row| probe_route(row).ok())?;
+    let reach = Reach::of(route, board).ok()?;
+    Some(RunProbe { family: reach.family(), usb: route.usb_identity() })
+}
+
 /// The families of debug probe a run by an image's manifest writes `board` through and follows its
 /// program through, by the route [`plan`] takes: none for a board this build cannot run that way.
 pub(crate) fn probe_families(board: &str) -> Vec<&'static str> {
-    programmer_for(board)
-        .ok()
-        .and_then(|row| probe_route(row).ok())
-        .and_then(|route| Reach::of(route, board).ok())
-        .map(|reach| vec![reach.family()])
-        .unwrap_or_default()
+    run_probe(board).map(|probe| vec![probe.family]).unwrap_or_default()
 }
 
 /// A run of an image, settled from files alone: what is written where, and what is followed.
@@ -227,6 +247,8 @@ pub(crate) struct ImagePlan {
     bytes: Vec<u8>,
     /// The image's half for the board's external flash, written with `bytes` as one set.
     window: Option<lamella_flash_routes::WindowHalf>,
+    /// The flash regions written beside the image, each its own span.
+    regions: Vec<lamella_flash_routes::region::RegionFile>,
     /// Where the image keeps its console ring, and how many bytes it gives it.
     ring: DataObject,
     /// Whether the image was built with its console off, so that nothing the program prints is
@@ -236,15 +258,16 @@ pub(crate) struct ImagePlan {
     limit: Option<Duration>,
 }
 
-/// Settles the run of `image`, reading nothing but files.
+/// Settles the run of `image`, with the flash regions in the files `regions` beside it, reading
+/// nothing but files.
 ///
 /// `time_limit` is `--timeout`'s value.
 ///
 /// # Errors
 /// A bad time limit, a missing or unreadable manifest, an image its manifest does not describe, a
-/// board with no route this build can follow a program through, and an image with no console ring
-/// to follow; each worded for a reader.
-fn plan(image: &Path, time_limit: Option<&str>) -> Result<ImagePlan, String> {
+/// board with no route this build can follow a program through, an image with no console ring to
+/// follow, and a region [`prepare_regions`] refuses; each worded for a reader.
+fn plan(image: &Path, regions: &[PathBuf], time_limit: Option<&str>) -> Result<ImagePlan, String> {
     let limit = time_limit.map(parse_time_limit).transpose()?;
     let manifest = match manifest::read(image) {
         Ok(Some(manifest)) => manifest,
@@ -295,6 +318,7 @@ fn plan(image: &Path, time_limit: Option<&str>) -> Result<ImagePlan, String> {
         ));
     }
     let prepared = prepare_image(image, row, route, &placement)?;
+    let regions = prepare_regions(regions, row, route, &placement, Some(&prepared))?;
     Ok(ImagePlan {
         banner: true,
         board: row.board,
@@ -303,6 +327,7 @@ fn plan(image: &Path, time_limit: Option<&str>) -> Result<ImagePlan, String> {
         placement,
         bytes: prepared.bytes,
         window: prepared.window,
+        regions,
         ring,
         console_off: manifest.console_channel.as_deref() == Some("off"),
         limit,
@@ -540,12 +565,13 @@ pub(crate) trait Console {
 
 /// Writing the image.
 pub(crate) trait Writer {
-    /// Writes `plan`'s image through the probe `serial` names, saying each step to `say`.
+    /// Writes `plan`'s image, and its flash regions, through the probe `serial` names, saying each
+    /// step to `say`; answers with what the run says of each region once it is done.
     ///
     /// # Errors
     /// Anything that stopped the write, worded for a reader.
     fn write(&mut self, plan: &ImagePlan, serial: &str, say: &mut dyn FnMut(&str))
-    -> Result<(), String>;
+    -> Result<Vec<String>, String>;
 }
 
 /// Attaching to the program's console, once the image is written and the program runs.
@@ -575,9 +601,15 @@ impl Writer for FlashWrite {
         plan: &ImagePlan,
         serial: &str,
         say: &mut dyn FnMut(&str),
-    ) -> Result<(), String> {
-        let window = plan.window.as_ref().map(|half| (plan.board, half));
-        crate::flash::write_image(plan.route, plan.board, &plan.placement, &plan.bytes, window, Some(serial), say)
+    ) -> Result<Vec<String>, String> {
+        if plan.regions.is_empty() {
+            let window = plan.window.as_ref().map(|half| (plan.board, half));
+            return crate::flash::write_image(plan.route, plan.board, &plan.placement, &plan.bytes, window, Some(serial), say)
+                .map(|()| Vec::new());
+        }
+        let spans: Vec<_> = plan.regions.iter().map(|file| file.span.clone()).collect();
+        crate::flash::write_with_regions(plan.route, plan.board, &plan.placement, Some(&plan.bytes), &spans, Some(serial), say)
+            .map(|closing| closing.regions)
     }
 }
 
@@ -634,19 +666,26 @@ fn run_planned(
     watch: &mut dyn FnMut() -> bool,
     stop: &dyn Fn() -> bool,
 ) -> Ended {
-    if plan.banner {
-        say(err, &crate::own_lines::running_through_probe(plan.board));
-    }
     if plan.console_off {
         say(
             err,
             "The image was built with its console off, so nothing the program prints is kept.",
         );
     }
-    say(err, lamella_wire_host::on_device::ERASING);
-    if let Err(why) = writer.write(plan, &chosen.serial, &mut |_| {}) {
-        fail(err, &why);
-        return Ended::Failed;
+    for file in &plan.regions {
+        for line in lamella_flash_routes::region::describe(file) {
+            say(err, &line);
+        }
+    }
+    let written = writer.write(plan, &chosen.serial, &mut |line| {
+        if let Some(line) = lamella_flash_backend::progress::for_run(line) { say(err, line); }
+    });
+    match written {
+        Ok(lines) => lines.iter().for_each(|line| say(err, line)),
+        Err(why) => {
+            fail(err, &why);
+            return Ended::Failed;
+        }
     }
     let first_look = clock.now() + SETTLE;
     let mut console = match attach.attach(plan, chosen) {
@@ -658,6 +697,9 @@ fn run_planned(
     };
     let _ = watch();
     blank_line(err);
+    if plan.banner {
+        say(err, &crate::own_lines::running_through_probe(plan.board));
+    }
     follow(console.as_mut(), out, err, plan.limit, clock, stop, first_look)
 }
 
@@ -725,8 +767,8 @@ fn follow(
                 }
                 Seen::Ended(ProgramEnd::Returned(code)) => return Ended::Program(code),
                 Seen::Ended(ProgramEnd::Aborted(code)) => {
-                    say(err, &format!("The program was aborted, and the board gives code {code} for it."));
-                    return Ended::Uncaught;
+                    say(err, &crate::ending::stopped_sentence(code));
+                    return Ended::Stopped(code);
                 }
             }
         }
@@ -762,6 +804,16 @@ mod live {
                     format!("entering SWD through the ST-LINK {serial} to follow the program: {why}")
                 })?;
                 Ok(Box::new(Live(stlink)))
+            }
+            Reach::Daplink => {
+                let session = lamella_probe::open(&lamella_probe::Selector::by_serial(serial))
+                    .map_err(|why| format!("opening the DAPLink {serial} to follow the program: {why}"))?;
+                let mut target = lamella_probe_core::ArmDap::new(session.into_dap());
+                target
+                    .connect()
+                    .and_then(|()| target.init_mem())
+                    .map_err(|why| format!("reaching the board through the DAPLink {serial} to follow the program: {why}"))?;
+                Ok(Box::new(Live(target)))
             }
         }
     }
@@ -920,7 +972,7 @@ mod tests {
         let bytes = b"a baked image".to_vec();
         std::fs::write(&image, &bytes).expect("write the image");
         manifest::write(&image, &manifest::for_lmli("raspberrypi-pico-2", &bytes, "a test")).expect("write the manifest");
-        let refusal = plan(&image, None).err().expect("refused");
+        let refusal = plan(&image, &[], None).err().expect("refused");
         let mut err = Vec::new();
         fail(&mut err, &refusal);
         assert_eq!(String::from_utf8(err).unwrap(), format!(
@@ -938,12 +990,12 @@ mod tests {
         let dir = scratch("no-manifest");
         let image = dir.join("app.bin");
         std::fs::write(&image, b"bytes").expect("write the image");
-        let refusal = plan(&image, None).err().expect("refused");
+        let refusal = plan(&image, &[], None).err().expect("refused");
         assert!(refusal.contains("no manifest at") && refusal.contains("app.bin.manifest.json"), "{refusal}");
 
         let lone = image_with_manifest(&dir, "lone.bin", &pico2_image(), "raspberrypi-pico-2", "0x10000000", "");
         std::fs::remove_file(&lone).expect("remove the image");
-        let refusal = plan(&lone, None).err().expect("refused");
+        let refusal = plan(&lone, &[], None).err().expect("refused");
         assert!(refusal.contains("lone.bin") && refusal.contains("named as the manifest is"), "{refusal}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -960,7 +1012,7 @@ mod tests {
         }
     }
 
-    /// **A PROGRAM ON A BOARD TAKES NO ARGUMENTS YET**, and the refusal is one sentence that says
+    /// **A PROGRAM ON A BOARD TAKES NO ARGUMENTS**, and the refusal is one sentence that says
     /// so and names what it was given, quoted, so a space inside one argument stays visible.
     #[test]
     fn a_programs_arguments_are_refused_in_one_sentence() {
@@ -968,7 +1020,7 @@ mod tests {
         let refusal = arguments_refusal(&given.iter().collect::<Vec<_>>());
         assert_eq!(
             refusal,
-            "a program on a board cannot take arguments yet, so nothing was written (given: \"app1\", \
+            "a program on a board cannot take arguments, so nothing was written (given: \"app1\", \
              \"app two\")."
         );
         assert_eq!(refusal.lines().count(), 1);
@@ -980,8 +1032,8 @@ mod tests {
         let dir = scratch("stale-manifest");
         let image = pico2_with_manifest(&dir, "");
         std::fs::write(&image, [1u8; 512]).expect("rewrite the image");
-        let refusal = plan(&image, None).err().expect("refused");
-        assert!(refusal.contains("digest does not match"), "{refusal}");
+        let refusal = plan(&image, &[], None).err().expect("refused");
+        assert!(refusal.contains("differ from the ones its record describes"), "{refusal}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -992,7 +1044,7 @@ mod tests {
     fn a_pico_image_is_planned_over_the_probe_route_with_its_ring() {
         let dir = scratch("pico2");
         let image = pico2_with_manifest(&dir, ",\"console_channel\":\"memory\",\"log_channel\":\"memory\"");
-        let planned = plan(&image, Some("2.5")).expect("planned");
+        let planned = plan(&image, &[], Some("2.5")).expect("planned");
         assert!(planned.route.writes_over_a_probe(), "{:?}", planned.route);
         assert_eq!(planned.reach, Reach::Rp2350);
         assert_eq!(planned.bytes, pico2_image(), "the flat bytes, unwrapped");
@@ -1009,20 +1061,20 @@ mod tests {
     fn a_run_without_a_ring_to_follow_writes_nothing() {
         let dir = scratch("no-ring");
         let unnamed = image_with_manifest(&dir, "app.bin", &pico2_image(), "raspberrypi-pico-2", "0x10000000", "");
-        let refusal = plan(&unnamed, None).err().expect("refused");
+        let refusal = plan(&unnamed, &[], None).err().expect("refused");
         assert!(refusal.contains("names no ELF"), "{refusal}");
 
         let missing = pico2_with_manifest(&dir, "");
         std::fs::remove_file(dir.join("app.elf")).expect("remove the ELF");
-        let refusal = plan(&missing, None).err().expect("refused");
+        let refusal = plan(&missing, &[], None).err().expect("refused");
         assert!(refusal.contains("the ELF the manifest names"), "{refusal}");
 
         std::fs::write(dir.join("app.elf"), elf_naming("other_symbol", RING_AT, RING_BYTES)).expect("an ELF");
-        let refusal = plan(&missing, None).err().expect("refused");
+        let refusal = plan(&missing, &[], None).err().expect("refused");
         assert!(refusal.contains("names neither __lamella_console_log nor __rhu_console_log"), "{refusal}");
 
         std::fs::write(dir.join("app.elf"), elf_naming(RHU_RING, RING_AT, 16)).expect("an ELF");
-        let refusal = plan(&missing, None).err().expect("refused");
+        let refusal = plan(&missing, &[], None).err().expect("refused");
         assert!(refusal.contains("too few for a console ring's header"), "{refusal}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1035,7 +1087,7 @@ mod tests {
         let image = pico2_with_manifest(&dir, "");
         std::fs::write(dir.join("app.elf"), elf_naming("__lamella_console_log", RING_AT, RING_BYTES))
             .expect("an ELF");
-        let planned = plan(&image, None).expect("planned");
+        let planned = plan(&image, &[], None).expect("planned");
         assert_eq!(planned.ring, DataObject { address: RING_AT, size: RING_BYTES });
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1048,7 +1100,7 @@ mod tests {
         let image = pico2_with_manifest(&dir, "");
         let both = [("__lamella_console_log", RING_AT, RING_BYTES), ("__rhu_console_log", 0x2003_0000, RING_BYTES)];
         std::fs::write(dir.join("app.elf"), elf_naming_each(&both)).expect("an ELF");
-        let refusal = plan(&image, None).err().expect("refused");
+        let refusal = plan(&image, &[], None).err().expect("refused");
         assert!(refusal.contains("__lamella_console_log") && refusal.contains("__rhu_console_log"), "{refusal}");
         assert!(refusal.contains("nothing was written"), "{refusal}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1061,7 +1113,7 @@ mod tests {
         let dir = scratch("base");
         let image =
             image_with_manifest(&dir, "app.bin", &pico2_image(), "raspberrypi-pico-2", "0x10004000", ",\"elf\":\"app.elf\"");
-        let refusal = plan(&image, None).err().expect("refused");
+        let refusal = plan(&image, &[], None).err().expect("refused");
         assert!(refusal.contains("0x10004000") && refusal.contains("0x10000000"), "{refusal}");
         assert!(refusal.contains("nothing was written"), "{refusal}");
         let _ = std::fs::remove_dir_all(&dir);
@@ -1088,7 +1140,8 @@ mod tests {
     }
 
     /// **A BOARD THIS BUILD CANNOT FOLLOW A PROGRAM ON IS REFUSED BEFORE ANYTHING IS WRITTEN**; an
-    /// RP2350 over its probe and an ST board over its own ST-LINK are followed.
+    /// RP2350 over its probe, an ST board over its own ST-LINK and a micro:bit over its own DAPLink
+    /// are followed.
     #[test]
     fn only_a_route_the_reader_can_follow_is_planned() {
         assert_eq!(Reach::of(pico_route(), "raspberrypi-pico-2"), Ok(Reach::Rp2350));
@@ -1096,8 +1149,39 @@ mod tests {
             Reach::of(f769_route(), "st-stm32f769i-disco"),
             Ok(Reach::StLink(lamella_stlink::product_id::V2_1))
         );
-        let refusal = Reach::of(Programmer::MicrobitV2Daplink, "bbc-micro-bit-v2").expect_err("refused");
-        assert!(refusal.contains("bbc-micro-bit-v2") && refusal.contains("nothing was written"), "{refusal}");
+        for (route, board) in [
+            (Programmer::MicrobitV1Daplink, "bbc-micro-bit-v1"),
+            (Programmer::MicrobitV2Daplink, "bbc-micro-bit-v2"),
+        ] {
+            assert_eq!(Reach::of(route, board), Ok(Reach::Daplink), "{board}");
+        }
+        let refusal = Reach::of(Programmer::Rp2040Probe { base: 0x1000_0000 }, "raspberrypi-pico").expect_err("refused");
+        assert!(refusal.contains("raspberrypi-pico") && refusal.contains("nothing was written"), "{refusal}");
+    }
+
+    /// A micro:bit's run goes through the DAPLink soldered to it, so a device list offers the board
+    /// a CMSIS-DAP probe, and only one with that DAPLink's USB identity: a probe that could be wired
+    /// to any board is not the board's own.
+    #[test]
+    fn a_microbit_is_run_through_its_own_daplink() {
+        use crate::devices::{CMSIS_DAP, ST_LINK};
+        for board in ["bbc-micro-bit-v1", "bbc-micro-bit-v2"] {
+            assert_eq!(
+                run_probe(board),
+                Some(RunProbe { family: CMSIS_DAP, usb: Some(lamella_cmsis_dap_nrf::MICROBIT_DAPLINK) }),
+                "{board}"
+            );
+            assert_eq!(probe_families(board), [CMSIS_DAP], "{board}");
+        }
+        assert_eq!(run_probe("raspberrypi-pico-2"), Some(RunProbe { family: CMSIS_DAP, usb: None }));
+        assert_eq!(
+            run_probe("st-stm32f769i-disco"),
+            Some(RunProbe {
+                family: ST_LINK,
+                usb: Some((lamella_stlink::ST_VENDOR_ID, lamella_stlink::product_id::V2_1)),
+            })
+        );
+        assert_eq!(run_probe("raspberrypi-pico"), None, "no run goes through an RP2040's probe");
     }
 
     /// The time limit is a positive number of seconds, whole or with a fraction, and nothing else.
@@ -1320,13 +1404,22 @@ mod tests {
         );
     }
 
-    /// **AN ABORTED PROGRAM IS 1, AND SAID WITH THE CODE THE BOARD GIVES.**
+    /// **AN ABORTED PROGRAM ENDS THE RUN WITH THE CODE THE BOARD GIVES, AND SAYS WHAT IT MEANS** --
+    /// whichever code that is, as the end word carries it.
     #[test]
-    fn an_aborted_program_ends_the_run_with_one_and_says_so() {
-        let mut console = scripted(vec![Ok(vec![Seen::Ended(ProgramEnd::Aborted(134))])]);
-        let (ended, out, err) = followed_to_end(&mut console, None, &|| false);
-        assert_eq!((ended, out.as_str()), (Ended::Uncaught, ""));
-        assert_eq!(err, "The program was aborted, and the board gives code 134 for it.\n");
+    fn an_aborted_program_ends_the_run_with_the_boards_code_and_says_so() {
+        for (code, sentence) in [
+            (134, "The program ended with code 134: an exception nothing caught, a fail-fast or an abort ended it."),
+            (2, "The program ended with code 2: the processor faulted."),
+            (1, "The program ended with code 1: the runtime stopped it on a fatal error of its own."),
+            (4, "The program ended with code 4: a Lamella RHU board's kernel refused to start it."),
+            (70_000, "The program was aborted, and the board gives code 70000 for it."),
+        ] {
+            let mut console = scripted(vec![Ok(vec![Seen::Ended(ProgramEnd::Aborted(code))])]);
+            let (ended, out, err) = followed_to_end(&mut console, None, &|| false);
+            assert_eq!((ended, ended.code(), out.as_str()), (Ended::Stopped(code), code, ""), "the end word's {code}");
+            assert_eq!(err, format!("{sentence}\n"));
+        }
     }
 
     /// **A TIME LIMIT EXISTS ONLY WHEN THE CALLER GAVE ONE**, and a run it stops is 1, with the
@@ -1378,10 +1471,14 @@ mod tests {
     }
 
     impl Writer for FakeWriter {
-        fn write(&mut self, plan: &ImagePlan, serial: &str, say: &mut dyn FnMut(&str)) -> Result<(), String> {
+        fn write(&mut self, plan: &ImagePlan, serial: &str, say: &mut dyn FnMut(&str)) -> Result<Vec<String>, String> {
             self.steps.borrow_mut().push(format!("write {} B through {serial}", plan.bytes.len()));
             say("writing over a test's probe...");
-            if self.fails { Err("the part did not answer".to_owned()) } else { Ok(()) }
+            say("  Erasing the program area of flash...");
+            if self.fails { return Err("the part did not answer".to_owned()); }
+            say("  Writing flash: 512 of 512 bytes.");
+            say("  Flash complete");
+            Ok(Vec::new())
         }
     }
 
@@ -1399,7 +1496,7 @@ mod tests {
 
     /// The plan of a Pico 2 image, with `extra` manifest fields.
     fn planned_pico(dir: &Path, extra: &str) -> ImagePlan {
-        plan(&pico2_with_manifest(dir, extra), None).expect("planned")
+        plan(&pico2_with_manifest(dir, extra), &[], None).expect("planned")
     }
 
     /// **A WHOLE RUN, IN ITS ORDER**: the write goes through the chosen probe, the console is
@@ -1430,13 +1527,73 @@ mod tests {
             ["write 512 B through E6610000000000B2", "follow through E6610000000000B2", "watch Ctrl+C"]
         );
         let err = String::from_utf8(err).expect("text");
-        assert_eq!(err, format!("Lamella v{}, RP2350 (AOT)\nErasing the program area of flash...\n\n", env!("CARGO_PKG_VERSION")));
+        assert_eq!(err, format!("Erasing the program area of flash...\nWriting flash: 512 of 512 bytes.\nFlash complete\n\nLamella v{}, RP2350 (AOT)\n", env!("CARGO_PKG_VERSION")));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// The introduction is visible before writing flash; a runtime's own banner is never doubled.
+    /// A region of two sectors for the Pico 2 W's radio corner, with its record and its notice, in
+    /// `dir`: a directory, then one image.
+    fn region_in(dir: &Path) -> PathBuf {
+        let mut bytes = vec![0xFF; 0x2000];
+        bytes[..4].copy_from_slice(b"LWFD");
+        bytes[0x1000..0x1100].fill(0x5A);
+        let path = dir.join("wifi.region.bin");
+        std::fs::write(&path, &bytes).expect("the region");
+        let record = format!(
+            "{{\"schema\":1,\"kind\":\"flash-region\",\"board\":\"raspberrypi-pico-2-w\",\"device\":\"flash\",\
+             \"base\":\"0x3C0000\",\"bytes\":8192,\"sha256\":\"{}\",\"images\":[{{\"name\":\"firmware\",\
+             \"offset\":4096,\"bytes\":256,\"sha256\":\"{}\",\"version\":\"7.95.49\"}}],\"notices\":[\"LICENSE.RP\"]}}",
+            digest(&bytes),
+            digest(&[0x5A; 256])
+        );
+        std::fs::write(manifest::path_for(&path), record).expect("the record");
+        std::fs::write(dir.join("LICENSE.RP"), "license").expect("the notice");
+        path
+    }
+
+    /// **A RUN WRITES ITS REGIONS BESIDE ITS IMAGE AND SAYS EACH**: the plan reads and places the region
+    /// from files alone; the run says the region before the write, hands it to the writer, and says
+    /// what became of it after; and a region for another board is refused by the plan.
     #[test]
-    fn the_banner_precedes_the_write_and_can_belong_to_the_runtime() {
+    fn a_run_says_each_region_before_the_write_and_what_became_of_it_after() {
+        struct RegionWriter(Steps);
+        impl Writer for RegionWriter {
+            fn write(&mut self, plan: &ImagePlan, _: &str, say: &mut dyn FnMut(&str)) -> Result<Vec<String>, String> {
+                let bases: Vec<String> = plan.regions.iter().map(|file| format!("{:#010x}", file.span.base)).collect();
+                self.0.borrow_mut().push(format!("write the image and the regions at {}", bases.join(", ")));
+                say("writing over a test's probe...");
+                say("  Flash complete");
+                Ok(vec![String::from("region wifi.region.bin: the flash already holds it, so none of it was written.")])
+            }
+        }
+        let dir = scratch("run-region");
+        let image = image_with_manifest(&dir, "app.bin", &pico2_image(), "raspberrypi-pico-2-w", "0x10000000", ",\"elf\":\"app.elf\"");
+        let region = region_in(&dir);
+        let planned = plan(&image, std::slice::from_ref(&region), None).expect("planned");
+        let chosen = choose_probe(Some("E6610000000000B2"), None, "raspberrypi-pico-2-w", planned.route, &bench()).expect("chosen");
+        let steps: Steps = Rc::default();
+        let console = scripted(vec![Ok(vec![Seen::Ended(ProgramEnd::Returned(0))])]);
+        let mut attach = FakeAttach { steps: Rc::default(), console: Some(Box::new(console)) };
+        let (mut out, mut err) = (Vec::new(), Vec::new());
+        let ended = run_planned(&planned, &chosen, &mut RegionWriter(Rc::clone(&steps)), &mut attach, &mut out, &mut err, &clock(), &mut || true, &|| false);
+        assert_eq!(ended, Ended::Program(0));
+        assert_eq!(steps.borrow().as_slice(), ["write the image and the regions at 0x103c0000"]);
+        let err = String::from_utf8(err).expect("text");
+        let expected_start = format!(
+            "region wifi.region.bin: 8192 B for 0x103c0000-0x103c1fff\n  firmware, version 7.95.49: 256 B at 0x103c1000\n  notice: {}\n\
+             Flash complete\nregion wifi.region.bin: the flash already holds it, so none of it was written.\n",
+            dir.join("LICENSE.RP").display()
+        );
+        assert!(err.starts_with(&expected_start), "{err}");
+        let pico2 = pico2_with_manifest(&dir, "");
+        let refusal = plan(&pico2, std::slice::from_ref(&region), None).err().expect("refused");
+        assert!(refusal.contains("is for raspberrypi-pico-2-w, and this write is for raspberrypi-pico-2."), "{refusal}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An unchanged image says no flash lines; the banner follows the write and belongs to one runtime.
+    #[test]
+    fn an_unchanged_images_banner_follows_the_write_and_can_belong_to_the_runtime() {
         #[derive(Clone, Default)]
         struct Shared(Rc<std::cell::RefCell<Vec<u8>>>);
         impl Write for Shared {
@@ -1448,10 +1605,10 @@ mod tests {
         }
         struct BeforeWrite { err: Shared, expected: String }
         impl Writer for BeforeWrite {
-            fn write(&mut self, _: &ImagePlan, _: &str, say: &mut dyn FnMut(&str)) -> Result<(), String> {
+            fn write(&mut self, _: &ImagePlan, _: &str, say: &mut dyn FnMut(&str)) -> Result<Vec<String>, String> {
                 assert_eq!(&*self.err.0.borrow(), self.expected.as_bytes());
                 say("a writer's private progress");
-                Ok(())
+                Ok(Vec::new())
             }
         }
         let dir = scratch("runtime-banner");
@@ -1460,7 +1617,7 @@ mod tests {
             planned.banner = banner;
             let chosen = choose_probe(Some("E6610000000000B2"), None, "raspberrypi-pico-2", planned.route, &bench()).unwrap();
             let introduction = if banner { format!("Lamella v{}, RP2350 (AOT)\n", env!("CARGO_PKG_VERSION")) } else { String::new() };
-            let before = format!("{introduction}Erasing the program area of flash...\n");
+            let before = String::new();
             let mut err = Shared::default();
             let mut writer = BeforeWrite { err: err.clone(), expected: before.clone() };
             let console = scripted(vec![Ok(vec![Seen::Out(b"runtime-banner-marker\nprogram-marker\n".to_vec()), Seen::Ended(ProgramEnd::Returned(0))])]);
@@ -1469,7 +1626,7 @@ mod tests {
             let ended = run_planned(&planned, &chosen, &mut writer, &mut attach, &mut out, &mut err, &clock(), &mut || true, &|| false);
             assert_eq!(ended, Ended::Program(0));
             assert_eq!(out, b"runtime-banner-marker\nprogram-marker\n");
-            assert_eq!(&*err.0.borrow(), format!("{before}\n").as_bytes());
+            assert_eq!(&*err.0.borrow(), format!("\n{introduction}").as_bytes());
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1489,7 +1646,8 @@ mod tests {
         assert_eq!(ended, Ended::Failed);
         assert!(out.is_empty());
         assert!(!steps.borrow().iter().any(|step| step.starts_with("follow")), "{:?}", steps.borrow());
-        assert!(String::from_utf8(err).expect("text").ends_with("The part did not answer\n"));
+        let err = String::from_utf8(err).expect("text");
+        assert_eq!(err, "Erasing the program area of flash...\nThe part did not answer\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1554,8 +1712,8 @@ mod tests {
         }
     }
 
-    /// **AN ABORTED PROGRAM, READ FROM ITS RING, ENDS THE RUN WITH ONE AND SAYS SO**: the ring's
-    /// text on standard output, and its code in the sentence on standard error.
+    /// **AN ABORTED PROGRAM, READ FROM ITS RING, ENDS THE RUN WITH THE BOARD's CODE AND SAYS SO**:
+    /// the ring's text on standard output, and its code in the sentence on standard error.
     #[test]
     fn an_aborted_program_arrives_through_its_end_magic() {
         let text = b"Unhandled exception.\n";
@@ -1568,7 +1726,7 @@ mod tests {
         let memory = Box::new(Block { at: 0x2000_8000, bytes });
         let mut console = RingConsole { memory, reader: RingReader::new(ring, END_MAGICS, 3) };
         let (ended, out, err) = followed_to_end(&mut console, None, &|| false);
-        assert_eq!((ended, out.as_str()), (Ended::Uncaught, "Unhandled exception.\n"));
+        assert_eq!((ended, out.as_str()), (Ended::Stopped(134), "Unhandled exception.\n"));
         assert!(err.contains("code 134"), "{err}");
     }
 

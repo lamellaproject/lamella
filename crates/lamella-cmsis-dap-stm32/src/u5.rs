@@ -194,6 +194,27 @@ pub(crate) fn u5_wait_idle<A: TargetAccess>(target: &mut A, phase: FlashWait) ->
     Err(ProbeError::Timeout("STM32U5 flash controller busy"))
 }
 
+/// The runs of whole quad-words in `words` that hold anything but ones, as ranges of word indices:
+/// what a program writes. A quad-word of all ones is left out, because an erased quad-word already
+/// reads that way, and one programmed with ones refuses the next program (RM0456 7.3.7).
+///
+/// `words` is a whole number of quad-words.
+fn runs_holding_data(words: &[u32]) -> Vec<std::ops::Range<usize>> {
+    let per_quad = STM32U5_QUAD_WORD / 4;
+    let mut runs: Vec<std::ops::Range<usize>> = Vec::new();
+    for (index, quad) in words.chunks(per_quad).enumerate() {
+        if quad.iter().all(|&word| word == 0xFFFF_FFFF) {
+            continue;
+        }
+        let start = index * per_quad;
+        match runs.last_mut() {
+            Some(run) if run.end == start => run.end = start + quad.len(),
+            _ => runs.push(start..start + quad.len()),
+        }
+    }
+    runs
+}
+
 /// STM32U5 embedded-flash programming (RM0456), added to ANY [`TargetAccess`] probe. Halt the core
 /// before erasing or writing.
 pub trait Stm32U5Flash {
@@ -260,8 +281,10 @@ impl<A: TargetAccess> Stm32U5Flash for A {
         let per_poll = STM32U5_PAGE as usize / 4;
         let mut at = address;
         for chunk in words.chunks(per_poll) {
-            self.write_words(at, chunk)?;
-            u5_wait_idle(self, FlashWait::AfterOperation)?;
+            for run in runs_holding_data(chunk) {
+                self.write_words(at + (run.start * 4) as u32, &chunk[run])?;
+                u5_wait_idle(self, FlashWait::AfterOperation)?;
+            }
             at += (chunk.len() * 4) as u32;
         }
 
@@ -383,5 +406,242 @@ mod tests {
         assert_eq!(STM32H7_FLASH_WORD, 32);
         assert!(STM32C0_DOUBLE_WORD < STM32U5_QUAD_WORD);
         assert!(STM32U5_QUAD_WORD < STM32H7_FLASH_WORD);
+    }
+
+    /// RM0456's main flash as its controller sees it, one quad-word at a time: a quad-word is
+    /// erased, or holds what was programmed into it, and only an erased one takes a program
+    /// (sections 7.3.7 and 7.3.10). A quad-word programmed with all ones reads 0xFF and is NOT
+    /// erased, because its nine ECC bits were programmed with it.
+    struct U5Part {
+        /// The programmed quad-words, by address. An address not here is erased.
+        programmed: std::collections::HashMap<u32, [u32; 4]>,
+        /// The quad-word whose words are arriving, and how many have.
+        pending: Option<(u32, [u32; 4], usize)>,
+        /// Every address a store reached in the flash array, in order.
+        array_stores: Vec<u32>,
+        cr: u32,
+        sr: u32,
+    }
+
+    const PGSERR: u32 = 1 << 7;
+    const PGAERR: u32 = 1 << 5;
+    const PROGERR: u32 = 1 << 3;
+    const ARRAY: std::ops::Range<u32> = STM32U5_FLASH_BASE..STM32U5_FLASH_BASE + 4 * 1024 * 1024;
+
+    impl U5Part {
+        fn erased() -> Self {
+            U5Part { programmed: Default::default(), pending: None, array_stores: Vec::new(), cr: U5_CR_LOCK, sr: 0 }
+        }
+
+        fn store_in_array(&mut self, address: u32, value: u32) {
+            self.array_stores.push(address);
+            if self.cr & U5_CR_PG == 0 || self.sr & U5_SR_ERRORS != 0 {
+                self.sr |= PGSERR;
+                return;
+            }
+            let quad = address & !0xF;
+            let index = ((address & 0xF) / 4) as usize;
+            let (at, mut words, count) = self.pending.take().unwrap_or((quad, [0; 4], 0));
+            if at != quad || index != count {
+                self.sr |= PGAERR;
+                return;
+            }
+            words[index] = value;
+            if count + 1 < 4 {
+                self.pending = Some((quad, words, count + 1));
+                return;
+            }
+            if self.programmed.contains_key(&quad) && words != [0; 4] {
+                self.sr |= PROGERR;
+                return;
+            }
+            self.programmed.insert(quad, words);
+            self.sr |= U5_SR_EOP;
+        }
+
+        fn erase_page(&mut self, cr: u32) {
+            let page = (cr & U5_CR_PNB_MASK) >> U5_CR_PNB_SHIFT;
+            let bank_base = if cr & U5_CR_BKER != 0 { 0x0820_0000 } else { STM32U5_FLASH_BASE };
+            let first = bank_base + page * STM32U5_PAGE;
+            self.programmed.retain(|&quad, _| !(first..first + STM32U5_PAGE).contains(&quad));
+            self.sr |= U5_SR_EOP;
+        }
+
+        fn reads(&self, address: u32) -> u32 {
+            self.programmed.get(&(address & !0xF)).map_or(0xFFFF_FFFF, |words| words[((address & 0xF) / 4) as usize])
+        }
+    }
+
+    impl TargetAccess for U5Part {
+        fn connect(&mut self) -> Result<(), ProbeError> {
+            Ok(())
+        }
+        fn read_idcode(&mut self) -> Result<u32, ProbeError> {
+            Ok(0x0be1_2477)
+        }
+        fn init_mem(&mut self) -> Result<(), ProbeError> {
+            Ok(())
+        }
+        fn read_word(&mut self, address: u32) -> Result<u32, ProbeError> {
+            Ok(match address {
+                U5_NSSR => self.sr | if self.pending.is_some() { U5_SR_WDW } else { 0 },
+                U5_NSCR => self.cr,
+                U5_OPTR => 0x1FEF_F8AA,
+                STM32U5_FLASH_SIZE_REG => 0xFFFF_1000,
+                a if ARRAY.contains(&a) => self.reads(a),
+                other => panic!("the model has no register at {other:#010x}"),
+            })
+        }
+        fn write_word(&mut self, address: u32, value: u32) -> Result<(), ProbeError> {
+            match address {
+                U5_NSSR => self.sr &= !(value & (U5_SR_ERRORS | U5_SR_EOP)),
+                U5_NSKEYR => {
+                    if value == U5_KEY2 {
+                        self.cr &= !U5_CR_LOCK;
+                    }
+                }
+                U5_NSCR => {
+                    if self.cr & U5_CR_LOCK != 0 && value & U5_CR_LOCK == 0 {
+                        panic!("NSCR written while locked");
+                    }
+                    if value & (U5_CR_PER | U5_CR_STRT) == U5_CR_PER | U5_CR_STRT {
+                        self.erase_page(value);
+                    }
+                    self.cr = value & !U5_CR_STRT;
+                }
+                a if ARRAY.contains(&a) => self.store_in_array(a, value),
+                other => panic!("the model has no register at {other:#010x}"),
+            }
+            Ok(())
+        }
+        fn read_words_into(&mut self, address: u32, out: &mut [u32]) -> Result<(), ProbeError> {
+            for (index, word) in out.iter_mut().enumerate() {
+                *word = self.read_word(address + 4 * index as u32)?;
+            }
+            Ok(())
+        }
+        fn write_words(&mut self, address: u32, words: &[u32]) -> Result<(), ProbeError> {
+            for (index, &word) in words.iter().enumerate() {
+                self.write_word(address + 4 * index as u32, word)?;
+            }
+            Ok(())
+        }
+        fn read_byte(&mut self, _address: u32) -> Result<u8, ProbeError> {
+            unreachable!("the U5 flash is driven by words")
+        }
+        fn write_byte(&mut self, _address: u32, _value: u8) -> Result<(), ProbeError> {
+            unreachable!("the U5 flash is driven by words")
+        }
+        fn read_halfword(&mut self, _address: u32) -> Result<u16, ProbeError> {
+            unreachable!("the U5 flash is driven by words")
+        }
+        fn write_halfword(&mut self, _address: u32, _value: u16) -> Result<(), ProbeError> {
+            unreachable!("the U5 flash is driven by words")
+        }
+        fn halt(&mut self) -> Result<(), ProbeError> {
+            Ok(())
+        }
+        fn resume(&mut self) -> Result<(), ProbeError> {
+            Ok(())
+        }
+        fn step(&mut self) -> Result<(), ProbeError> {
+            unreachable!("no core")
+        }
+        fn is_halted(&mut self) -> Result<bool, ProbeError> {
+            Ok(true)
+        }
+        fn wait_halted(&mut self) -> Result<(), ProbeError> {
+            Ok(())
+        }
+        fn reset_and_run(&mut self) -> Result<(), ProbeError> {
+            unreachable!("no core")
+        }
+        fn reset_and_halt(&mut self) -> Result<(), ProbeError> {
+            unreachable!("no core")
+        }
+        fn set_reset(&mut self, _assert: bool) -> Result<u8, ProbeError> {
+            unreachable!("no reset line")
+        }
+        fn read_core_reg(&mut self, _selector: u8) -> Result<u32, ProbeError> {
+            unreachable!("no core")
+        }
+        fn write_core_reg(&mut self, _selector: u8, _value: u32) -> Result<(), ProbeError> {
+            unreachable!("no core")
+        }
+        fn arm_reset_catch(&mut self) -> Result<(), ProbeError> {
+            unreachable!("no core")
+        }
+        fn disarm_reset_catch(&mut self) -> Result<(), ProbeError> {
+            unreachable!("no core")
+        }
+        fn set_breakpoint(&mut self, _address: u32) -> Result<(), ProbeError> {
+            unreachable!("no core")
+        }
+        fn clear_breakpoint(&mut self) -> Result<(), ProbeError> {
+            unreachable!("no core")
+        }
+        fn set_breakpoints(&mut self, _addresses: &[u32]) -> Result<(), ProbeError> {
+            unreachable!("no core")
+        }
+        fn call_target(
+            &mut self,
+            _address: u32,
+            _args: &[u32],
+            _frame: &lamella_probe_core::CallFrame,
+        ) -> Result<u32, ProbeError> {
+            unreachable!("nothing runs on the target")
+        }
+    }
+
+    /// AN IMAGE WRITTEN OVER ERASED PAGES LEAVES EVERY QUAD-WORD OF ALL ONES ERASED, so the next
+    /// program there is accepted.
+    ///
+    /// A quad-word of ones that is programmed reads exactly as an erased one does, and refuses the
+    /// next program with PROGERR. A whole-flash image is mostly ones, so programming them leaves a
+    /// part where every page that reads blank refuses a write until something erases it -- and a
+    /// writer that skips a page because it reads blank never does.
+    #[test]
+    fn a_written_image_leaves_every_quad_word_of_ones_erased() {
+        let page = STM32U5_PAGE as usize;
+        let mut image = vec![0xFFu8; 3 * page];
+        image[..64].fill(0x5A);
+        image[80..96].fill(0x11);
+        image[2 * page..2 * page + 16].fill(0x22);
+
+        let mut part = U5Part::erased();
+        part.u5_unlock_flash().unwrap();
+        part.u5_program(STM32U5_FLASH_BASE, &image).unwrap();
+
+        let read: Vec<u8> = (0..image.len() / 4)
+            .flat_map(|word| part.reads(STM32U5_FLASH_BASE + 4 * word as u32).to_le_bytes())
+            .collect();
+        assert_eq!(read, image, "the image reads back");
+        for (index, quad) in image.chunks(STM32U5_QUAD_WORD).enumerate() {
+            let at = STM32U5_FLASH_BASE + (index * STM32U5_QUAD_WORD) as u32;
+            if quad.iter().all(|&byte| byte == 0xFF) {
+                assert!(!part.programmed.contains_key(&at), "the quad-word of ones at {at:#010x} was programmed");
+                assert!(
+                    !part.array_stores.iter().any(|&store| store & !0xF == at),
+                    "a store reached the quad-word of ones at {at:#010x}"
+                );
+            }
+        }
+
+        part.u5_program(STM32U5_FLASH_BASE + 64, &[0x33; 16]).expect("a quad-word of ones in a page of code");
+        part.u5_program(STM32U5_FLASH_BASE + STM32U5_PAGE, &[0x44; 16]).expect("the blank page");
+    }
+
+    /// The runs a program writes: whole quad-words, adjacent ones joined, ones left out -- and a
+    /// quad-word that is ones but for one bit is data.
+    #[test]
+    fn the_runs_written_are_the_quad_words_that_hold_data() {
+        let ones = [0xFFFF_FFFFu32; 4];
+        let data = [0x1234_5678u32, 0xFFFF_FFFF, 0xFFFF_FFFF, 0xFFFF_FFFF];
+        let almost = [0xFFFF_FFFFu32, 0xFFFF_FFFF, 0xFFFF_FFFF, 0x7FFF_FFFF];
+        let words: Vec<u32> = [data, ones, data, almost, ones, ones].concat();
+        assert_eq!(runs_holding_data(&words), vec![0..4, 8..16]);
+        assert!(runs_holding_data(&[ones, ones].concat()).is_empty(), "a blank page writes nothing");
+        assert_eq!(runs_holding_data(&[data, data].concat()), vec![0..8], "adjacent quad-words are one run");
+        assert!(runs_holding_data(&[]).is_empty());
     }
 }

@@ -13,6 +13,7 @@ use lamella_debug_backend::{
     ChildReference, DebugBackend, Disassembled, Frame, Register, Scope, SourceLocation, Stop,
     Variable,
 };
+use lamella_metadata::StackClass;
 use lamella_runner::debug::{self, reason};
 use lamella_runner::exec;
 use lamella_wire::{Capabilities, Frame as WireFrame, TargetIdentity, Transport, TransportError};
@@ -41,7 +42,7 @@ fn identity_line(identity: &TargetIdentity) -> Option<String> {
         return None;
     }
     let mut line = String::from("Lamella Link: ");
-    line.push_str(board.unwrap_or("unrecognized product"));
+    line.push_str(board.unwrap_or("unrecognized board"));
     if let Some(chip) = chip {
         line.push_str(&chip);
     }
@@ -70,14 +71,14 @@ fn chip_identity(identity: &TargetIdentity) -> Option<String> {
     match identity.chip_id_kind {
         lamella_wire::chip_id_kind::DEBUG_PORT_AND_DEVICE_ID => {
             let port = word(0)?;
-            let mut out = format!(", chip IDCODE {port:#010x}");
+            let mut out = format!(", its chip identifying itself as {port:#010x}");
             if let Some(devid) = word(4).filter(|d| *d != 0) {
-                out.push_str(&format!(" (devid {devid:#010x})"));
+                out.push_str(&format!(" (device id {devid:#010x})"));
             }
             Some(out)
         }
         lamella_wire::chip_id_kind::RISCV_MVENDOR_MARCH_MIMP => Some(format!(
-            ", chip vendor {:#010x} arch {:#010x} impl {:#010x}",
+            ", its chip identifying itself as vendor {:#010x}, architecture {:#010x}, implementation {:#010x}",
             word(0)?,
             word(4)?,
             word(8)?
@@ -139,14 +140,45 @@ struct MethodSrc {
     /// The method's qualified display name (`Type.Method`), for stack frames. Empty if the map predates names.
     name: String,
     points: Vec<(u32, u32, u32)>,
-    /// `(slot, name)` for the method's source locals, ascending by slot.
+    /// The method's source locals, ascending by slot.
     ///
     /// **THE WIRE IS POSITIONAL AND THIS IS THE ONLY THING THAT NAMES A SLOT.** `DBG_VARS` carries
     /// values in slot order and no names, deliberately -- the host already has them, and a target
     /// carrying a second copy would be carrying the PDB. So a map without this lane can still show
     /// a frame's values, as `local0`, `local1`; it is this that makes them `total` and `count`.
-    locals: Vec<(u32, String)>,
+    locals: Vec<SourceLocal>,
+    /// `(number, name)` for the method's arguments, ascending by number: `this` is argument 0 of an
+    /// instance method. Named as `locals` are, and from the assembly's parameters, which the PDB
+    /// does not carry.
+    arguments: Vec<(u32, String)>,
 }
+
+/// One local a method's source declares, as the map records it.
+struct SourceLocal {
+    /// Its slot, the number the wire sends its value under.
+    slot: u32,
+    /// Its source name.
+    name: String,
+    /// The class of value its type holds ([`StackClass`]), where the map records one: the map's
+    /// `kind`, a [`StackClass::keyword`]. `None` for a type whose class its signature does not
+    /// decide, for a word this reader has no class for, and in a map that records no kinds.
+    class: Option<StackClass>,
+}
+
+/// The value a local of `class` holds before the method first stores it, as the wire would carry it.
+fn zero(class: StackClass) -> WireValue {
+    match class {
+        StackClass::Int32 => WireValue::Int32(0),
+        StackClass::Int64 => WireValue::Int64(0),
+        StackClass::NativeInt => WireValue::NativeInt(0),
+        StackClass::Float32 => WireValue::Single(0.0),
+        StackClass::Float64 => WireValue::Float(0.0),
+        StackClass::ObjectRef => WireValue::Null,
+    }
+}
+
+/// What a row says of a local the method has not stored yet whose class the map does not record.
+const NOT_ASSIGNED_YET: &str = "<not assigned yet>";
 
 /// The deployed image's source map -- `method_id -> (document, qualified name, sequence points)`, parsed from
 /// `lamella_srcmap`'s JSON. Makes a Lamella Link session SOURCE-LEVEL: line lookups, source breakpoints, frame names.
@@ -160,13 +192,18 @@ impl SrcMap {
         #[derive(serde::Deserialize)]
         struct RawPoint { o: u32, l: u32, #[serde(default)] c: u32 }
         #[derive(serde::Deserialize)]
-        struct RawLocal { index: u32, name: String }
+        struct RawLocal {
+            index: u32,
+            name: String,
+            #[serde(default)] kind: Option<String>,
+        }
         #[derive(serde::Deserialize)]
         struct RawMethod {
             document: String,
             #[serde(default)] name: String,
             points: Vec<RawPoint>,
             #[serde(default)] locals: Vec<RawLocal>,
+            #[serde(default)] arguments: Vec<RawLocal>,
         }
         #[derive(serde::Deserialize)]
         struct Raw { methods: std::collections::HashMap<String, RawMethod> }
@@ -176,10 +213,20 @@ impl SrcMap {
             let Ok(id) = id.parse::<u32>() else { continue };
             let mut points: Vec<(u32, u32, u32)> = m.points.into_iter().map(|p| (p.o, p.l, p.c)).collect();
             points.sort_by_key(|point| point.0);
-            let mut locals: Vec<(u32, String)> =
-                m.locals.into_iter().map(|local| (local.index, local.name)).collect();
-            locals.sort_by_key(|local| local.0);
-            methods.insert(id, MethodSrc { document: m.document, name: m.name, points, locals });
+            let mut locals: Vec<SourceLocal> = m
+                .locals
+                .into_iter()
+                .map(|local| SourceLocal {
+                    slot: local.index,
+                    name: local.name,
+                    class: local.kind.as_deref().and_then(StackClass::from_keyword),
+                })
+                .collect();
+            locals.sort_by_key(|local| local.slot);
+            let mut arguments: Vec<(u32, String)> =
+                m.arguments.into_iter().map(|argument| (argument.index, argument.name)).collect();
+            arguments.sort_by_key(|argument| argument.0);
+            methods.insert(id, MethodSrc { document: m.document, name: m.name, points, locals, arguments });
         }
         (!methods.is_empty()).then_some(Self { methods })
     }
@@ -238,9 +285,28 @@ impl SrcMap {
     /// list by the wire's slot number would call slot 0 `total` -- the pane would read plausibly and
     /// name the wrong value, which is the one outcome worse than showing no name at all.
     fn local_name(&self, method: u32, slot: u32) -> Option<&str> {
+        self.declared_local(method, slot)
+            .map(|local| local.name.as_str())
+            .filter(|name| !name.is_empty())
+    }
+
+    /// The local the map records at `slot` in `method`, matched by its slot as [`Self::local_name`]
+    /// matches it.
+    fn declared_local(&self, method: u32, slot: u32) -> Option<&SourceLocal> {
+        self.declared_locals(method).iter().find(|local| local.slot == slot)
+    }
+
+    /// Every local the map records in `method`, ascending by slot; none for a method it has no entry for.
+    fn declared_locals(&self, method: u32) -> &[SourceLocal] {
+        self.methods.get(&method).map_or(&[], |source| source.locals.as_slice())
+    }
+
+    /// The source name of argument `slot` in `method`, if the map names it: matched by the recorded
+    /// number, as [`Self::local_name`] matches a local, for the same reason.
+    fn argument_name(&self, method: u32, slot: u32) -> Option<&str> {
         self.methods
             .get(&method)?
-            .locals
+            .arguments
             .iter()
             .find(|(index, _)| *index == slot)
             .map(|(_, name)| name.as_str())
@@ -290,6 +356,8 @@ pub struct WireHostBackend {
     /// The call stack cached at the last stop, innermost first.
     frames: Vec<(u32, u32)>,
     exit_code: i32,
+    /// The code the target's trap stop carried, for a run that ended in a fault; `None` otherwise.
+    trap_code: Option<i32>,
     pending_output: RefCell<Option<String>>,
     /// The DEBUGGER's channel: what a program writes for a tool rather than for its user.
     ///
@@ -421,7 +489,7 @@ impl WireHostBackend {
         {
             return Err(crate::cannot_debug());
         }
-        let pending_output = identity_line(&session.identity);
+        let connect_line = identity_line(&session.identity);
         Ok(Self {
             transport: RefCell::new(transport),
             image,
@@ -433,8 +501,9 @@ impl WireHostBackend {
             running: false,
             frames: Vec::new(),
             exit_code: 0,
-            pending_output: RefCell::new(pending_output),
-            pending_debug_output: RefCell::new(None),
+            trap_code: None,
+            pending_output: RefCell::new(None),
+            pending_debug_output: RefCell::new(connect_line),
             last_error: RefCell::new(None),
             heard_at: Instant::now(),
             status_asked: None,
@@ -581,6 +650,9 @@ impl WireHostBackend {
                 self.frames.clear();
                 if let Some(exit) = frame.payload.get(9..13) {
                     self.exit_code = i32::from_le_bytes(exit.try_into().unwrap_or_default());
+                    if why == reason::TRAP {
+                        self.trap_code = Some(self.exit_code);
+                    }
                 }
                 if why == reason::DONE {
                     Stop::Done
@@ -643,11 +715,11 @@ impl WireHostBackend {
         }
         let seq = self.next_seq();
         if self.transport.borrow_mut().send(debug::DBG_BREAK, seq, &payload).is_err() {
-            return Err("the wire dropped while sending breakpoints".to_string());
+            return Err("the connection to the board dropped while sending breakpoints".to_string());
         }
         match self.await_type(debug::DBG_ACK) {
             Some(_) => Ok(()),
-            None => Err("the target did not acknowledge the breakpoints".to_string()),
+            None => Err("the board did not confirm the breakpoints".to_string()),
         }
     }
 
@@ -725,8 +797,8 @@ impl WireHostBackend {
             .map(|_| ())
             .map_err(|error| {
                 format!(
-                    "the target did not acknowledge an ABORT ({}): it is neither serving nor \
-                     running a program this host can stop",
+                    "the board did not answer the request to stop its program ({}): it is neither \
+                     waiting for the debugger nor running a program the debugger can stop",
                     crate::link_failure(error)
                 )
             })
@@ -784,14 +856,14 @@ impl WireHostBackend {
         }
         if !self.target_caps.has(Capabilities::LOCALS) {
             return refusal(
-                "this target's firmware does not serve variables (no LOCALS capability in its HELLO)",
+                "this board's firmware does not report variables",
             );
         }
         let Some(&(method, _)) = self.frames.get(frame) else {
             return refusal("that frame is not in the target's current call stack");
         };
         let Ok(index) = u16::try_from(frame) else {
-            return refusal("that frame is deeper than the wire can address");
+            return refusal("that frame is deeper in the call stack than the board can report");
         };
         let Some((locals, arguments)) = self.locals(index) else {
             return refusal("the target did not answer the request for this frame's variables");
@@ -799,17 +871,36 @@ impl WireHostBackend {
 
         let arguments_wanted = matches!(scope, Scope::Arguments);
         let values = if arguments_wanted { arguments } else { locals };
-        values
+        let mut rows: Vec<(Variable, ChildReference)> = values
             .iter()
             .enumerate()
             .map(|(slot, value)| {
                 let name = if arguments_wanted {
-                    format!("arg{slot}")
+                    self.srcmap
+                        .as_ref()
+                        .and_then(|srcmap| srcmap.argument_name(method, slot as u32))
+                        .map_or_else(|| format!("arg{slot}"), str::to_owned)
                 } else {
                     self.srcmap
                         .as_ref()
                         .and_then(|srcmap| srcmap.local_name(method, slot as u32))
                         .map_or_else(|| format!("local{slot}"), str::to_owned)
+                };
+                let class = if arguments_wanted {
+                    None
+                } else {
+                    self.srcmap
+                        .as_ref()
+                        .and_then(|srcmap| srcmap.declared_local(method, slot as u32))
+                        .and_then(|local| local.class)
+                };
+                let unstored;
+                let value = match class {
+                    Some(class) if class != StackClass::Int32 && *value == WireValue::Int32(0) => {
+                        unstored = zero(class);
+                        &unstored
+                    }
+                    _ => value,
                 };
                 let children = match u16::try_from(slot) {
                     Ok(slot) if with_children => self.reference_for(
@@ -820,6 +911,35 @@ impl WireHostBackend {
                 };
                 let (value, kind) = render(value);
                 (Variable { name, value, kind }, children)
+            })
+            .collect();
+        if !arguments_wanted {
+            rows.extend(self.unsent_locals(method, values.len()));
+        }
+        rows
+    }
+
+    /// A row for each local the map names in `method` at a slot the board did not send: at its
+    /// class's zero, or as not assigned yet where the map records no class.
+    ///
+    /// A board sends a frame's locals up to the highest slot the method has stored, so a slot past
+    /// the ones it sent is one the method has not stored yet, and holds the zero every local starts
+    /// at. Without these rows a local is missing from the pane until it, or a local in a slot above
+    /// it, is first stored.
+    fn unsent_locals(&self, method: u32, sent: usize) -> Vec<(Variable, ChildReference)> {
+        let Some(srcmap) = self.srcmap.as_ref() else {
+            return Vec::new();
+        };
+        srcmap
+            .declared_locals(method)
+            .iter()
+            .filter(|local| local.slot as usize >= sent && !local.name.is_empty())
+            .map(|local| {
+                let (value, kind) = match local.class {
+                    Some(class) => render(&zero(class)),
+                    None => (NOT_ASSIGNED_YET.to_string(), String::new()),
+                };
+                (Variable { name: local.name.clone(), value, kind }, ChildReference::NONE)
             })
             .collect()
     }
@@ -1223,6 +1343,7 @@ impl DebugBackend for WireHostBackend {
         self.detach_if_live();
         self.running = false;
         self.exit_code = 0;
+        self.trap_code = None;
         self.last_error.borrow_mut().take();
         self.take_back_the_board()?;
         if self.board_holds_this_image() {
@@ -1256,7 +1377,7 @@ impl DebugBackend for WireHostBackend {
         }
         let seq = self.next_seq();
         if self.transport.borrow_mut().send(debug::DBG_RESUME, seq, &[]).is_err() {
-            return Stop::Fault("the wire dropped".to_string());
+            return Stop::Fault("the connection to the board dropped".to_string());
         }
         self.now_running();
         Stop::Running
@@ -1277,11 +1398,11 @@ impl DebugBackend for WireHostBackend {
             }
             Ok(None) => {
                 if self.ask_whether_running_if_quiet().is_err() {
-                    return Stop::Fault("the wire dropped".to_string());
+                    return Stop::Fault("the connection to the board dropped".to_string());
                 }
                 Stop::Running
             }
-            Err(_) => Stop::Fault("the wire dropped".to_string()),
+            Err(_) => Stop::Fault("the connection to the board dropped".to_string()),
         }
     }
 
@@ -1318,7 +1439,7 @@ impl DebugBackend for WireHostBackend {
             self.transport
                 .borrow_mut()
                 .send(debug::DBG_RESUME, seq, &[])
-                .map_err(|_| "could not resume the program: the wire dropped".to_string())?;
+                .map_err(|_| "could not resume the program: the connection to the board dropped".to_string())?;
         }
         self.session_live = false;
         self.running = false;
@@ -1332,7 +1453,7 @@ impl DebugBackend for WireHostBackend {
         }
         let seq = self.next_seq();
         if self.transport.borrow_mut().send(debug::DBG_STEP, seq, &[debug::step_mode::IN]).is_err() {
-            return Stop::Fault("the wire dropped".to_string());
+            return Stop::Fault("the connection to the board dropped".to_string());
         }
         match self.await_type(debug::EVT_STOPPED) {
             Some(frame) => self.on_stopped(&frame),
@@ -1342,6 +1463,10 @@ impl DebugBackend for WireHostBackend {
 
     fn exit_code(&self) -> i32 {
         self.exit_code
+    }
+
+    fn fault_exit_code(&self) -> Option<i32> {
+        self.trap_code
     }
 
     fn depth(&self) -> usize {
@@ -1387,7 +1512,7 @@ impl DebugBackend for WireHostBackend {
         }
         let seq = self.next_seq();
         if self.transport.borrow_mut().send(debug::DBG_RESUME, seq, &[]).is_err() {
-            return Stop::Fault("the wire dropped".to_string());
+            return Stop::Fault("the connection to the board dropped".to_string());
         }
         self.running = true;
         let stop = match self.await_type(debug::EVT_STOPPED) {
@@ -1590,6 +1715,37 @@ mod tests {
     /// A backend keeps what the target said it is, from the one HELLO it opened with, and the board
     /// name its sentences use is read from that same identity.
     ///
+    /// The line naming the board a session reached is the debugger's, so it goes to the Debug Console
+    /// and not into the program's output, which holds only what the program printed.
+    #[test]
+    fn the_connect_line_goes_to_the_debug_console_not_into_the_programs_output() {
+        let ack = lamella_wire::HelloAck {
+            chosen: lamella_wire::PROTOCOL_VERSION,
+            caps: Capabilities(
+                Capabilities::DEBUG_BASIC | Capabilities::BREAKPOINTS | Capabilities::STEPPING,
+            ),
+            identity: TargetIdentity {
+                product_model: lamella_wire::product_model::MICROBIT_V2,
+                ..TargetIdentity::default()
+            },
+            max_inbound_payload: None,
+        };
+        let mut board = MemTransport::new();
+        board
+            .send(lamella_wire::msg::HELLO_ACK, 0, &ack.encode())
+            .expect("queue the board's HELLO_ACK");
+        let mut host = MemTransport::new();
+        host.feed(&board.take_sent());
+        let mut backend = WireHostBackend::from_transport(
+            WireTransport::Mem(Arc::new(Mutex::new(host))),
+            Vec::new(),
+            Duration::from_millis(200),
+        )
+        .expect("a target that can debug is accepted");
+        assert_eq!(backend.take_output(), None, "the program printed nothing");
+        assert_eq!(backend.take_debug_output().as_deref(), Some("Lamella Link: BBC micro:bit v2\n"));
+    }
+
     /// A host that checks WHICH board an image is about to reach reads it from the backend, so the
     /// model the board reported has to arrive unchanged.
     #[test]
@@ -1656,6 +1812,7 @@ mod tests {
             running: false,
             frames: Vec::new(),
             exit_code: 0,
+            trap_code: None,
             pending_output: RefCell::new(None),
             pending_debug_output: RefCell::new(None),
             last_error: RefCell::new(None),
@@ -1727,7 +1884,7 @@ mod tests {
             panic!("an unacknowledged breakpoint set must not be reported as armed");
         };
         assert!(
-            reason.contains("acknowledge"),
+            reason.contains("did not confirm"),
             "and the reason must distinguish a silent device from a dead wire: {reason}"
         );
     }
@@ -1786,7 +1943,10 @@ mod tests {
             "the refusal is the answer, so nothing waits for a stop after it: {:?}",
             began.elapsed()
         );
-        assert!(reason.contains("NOTHING_TO_RUN"), "and the user is told what the target said: {reason}");
+        assert!(
+            reason.contains("it holds no program to start") && !reason.contains("NOTHING_TO_RUN"),
+            "and the user is told what the board said, in words: {reason}"
+        );
     }
 
     #[test]
@@ -1836,7 +1996,10 @@ mod tests {
         let Err(reason) = backend.launch() else {
             panic!("a board that answers nothing must not be reported as launched");
         };
-        assert!(reason.contains("ABORT"), "the question that went unanswered is named: {reason}");
+        assert!(
+            reason.contains("the request to stop its program") && !reason.contains("ABORT"),
+            "the question that went unanswered is named, in words: {reason}"
+        );
         assert_eq!(sent_types(&shared), vec![debug::ABORT], "and nothing is sent after it");
     }
 
@@ -2039,7 +2202,7 @@ mod tests {
         let Stop::Fault(reason) = backend.poll() else {
             panic!("a carrier that cannot send is not a program running");
         };
-        assert!(reason.contains("the wire dropped"), "{reason}");
+        assert!(reason.contains("the connection to the board dropped"), "{reason}");
     }
 
     #[test]
@@ -2073,8 +2236,9 @@ mod tests {
         payload
     }
 
-    /// A trap stop: reason, a location, the exit code, flags.
-    const TRAPPED: &[u8] = &[reason::TRAP, 0, 0, 0, 0, 0, 0, 0, 0, 70, 0, 0, 0, 0];
+    /// A trap stop: reason, a location, the exit code -- 1, the runtime's fatal stop, which an image
+    /// that does not boot reports -- and flags.
+    const TRAPPED: &[u8] = &[reason::TRAP, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0];
 
     #[test]
     fn a_trap_quotes_the_reason_the_target_sent_before_it() {
@@ -2089,6 +2253,7 @@ mod tests {
             panic!("a trap ends the run as a fault");
         };
         assert_eq!(reason, "the target reported: image does not boot: NotAnImage");
+        assert_eq!(backend.fault_exit_code(), Some(1), "the code the trap stop carried");
         assert_eq!(
             backend.take_output(),
             None,
@@ -2190,7 +2355,7 @@ mod tests {
         let Err(reason) = backend.release() else {
             panic!("breakpoints nobody acknowledged removing may still be armed");
         };
-        assert!(reason.contains("acknowledge"), "{reason}");
+        assert!(reason.contains("did not confirm"), "{reason}");
         assert_eq!(sent_types(&shared), vec![debug::DBG_BREAK], "nothing resumes past a failed removal");
         drop(backend);
         assert_eq!(sent_types(&shared), vec![debug::DBG_DETACH]);
@@ -2241,6 +2406,14 @@ mod tests {
 
         let line = super::identity_line(&arm(6, 0x0bc11477)).unwrap();
         assert!(line.contains("ATSAMW25 Xplained Pro") && line.contains("0x0bc11477"), "{line}");
+        assert!(line.contains("its chip identifying itself as 0x0bc11477") && !line.contains("IDCODE"), "{line}");
+
+        let both = TargetIdentity { product_model: 6, ..TargetIdentity::default() }.with_chip_id(
+            chip_id_kind::DEBUG_PORT_AND_DEVICE_ID,
+            &[0x0bc1_1477u32.to_le_bytes(), 0x1001_0305u32.to_le_bytes()].concat(),
+        );
+        let line = super::identity_line(&both).unwrap();
+        assert!(line.contains("(device id 0x10010305)") && !line.contains("devid"), "{line}");
 
         let bare = TargetIdentity { product_model: 4, ..TargetIdentity::default() };
         assert_eq!(super::identity_line(&bare).unwrap(), "Lamella Link: SAM E54 Xplained Pro\n");
@@ -2248,10 +2421,10 @@ mod tests {
         assert!(super::identity_line(&TargetIdentity::default()).is_none());
 
         let line = super::identity_line(&arm(0xffff, 0x2ba01477)).unwrap();
-        assert!(line.contains("unrecognized product") && line.contains("0x2ba01477"), "{line}");
+        assert!(line.contains("unrecognized board") && line.contains("0x2ba01477"), "{line}");
 
         let dated = TargetIdentity { firmware_version: [9734, 0], ..TargetIdentity::default() };
-        assert_eq!(super::identity_line(&dated).unwrap(), "Lamella Link: unrecognized product, firmware 9734.0\n");
+        assert_eq!(super::identity_line(&dated).unwrap(), "Lamella Link: unrecognized board, firmware 9734.0\n");
 
         let mut riscv_id = Vec::new();
         for word in [0x0000_0489u32, 0x8000_0001, 0x0000_0007] {
@@ -2260,7 +2433,7 @@ mod tests {
         let riscv = TargetIdentity::default()
             .with_chip_id(chip_id_kind::RISCV_MVENDOR_MARCH_MIMP, &riscv_id);
         let line = super::identity_line(&riscv).unwrap();
-        assert!(line.contains("vendor 0x00000489") && line.contains("impl 0x00000007"), "{line}");
+        assert!(line.contains("vendor 0x00000489") && line.contains("implementation 0x00000007"), "{line}");
     }
 
     #[test]
@@ -2342,6 +2515,10 @@ mod variables_tests {
                 out.push(val::INT32);
                 out.extend_from_slice(&value.to_le_bytes());
             }
+            WireValue::Int64(value) => {
+                out.push(val::INT64);
+                out.extend_from_slice(&value.to_le_bytes());
+            }
             WireValue::Object { handle, type_token } => {
                 out.push(val::OBJECT);
                 out.extend_from_slice(&handle.to_le_bytes());
@@ -2391,6 +2568,20 @@ mod variables_tests {
         SrcMap::parse(json.as_bytes()).expect("the source map parses")
     }
 
+    /// A source map naming `arguments` (as `(slot, name)`) in method 7, and no locals.
+    fn srcmap_naming_arguments(arguments: &[(u32, &str)]) -> SrcMap {
+        let named: Vec<String> = arguments
+            .iter()
+            .map(|(slot, name)| format!("{{\"index\":{slot},\"name\":\"{name}\"}}"))
+            .collect();
+        let json = format!(
+            "{{\"methods\":{{\"7\":{{\"document\":\"Program.cs\",\"name\":\"Calc.Add\",\
+             \"points\":[{{\"o\":0,\"l\":9,\"c\":5}}],\"locals\":[],\"arguments\":[{}]}}}}}}",
+            named.join(",")
+        );
+        SrcMap::parse(json.as_bytes()).expect("the source map parses")
+    }
+
     /// Every debug capability, for a test that is not about capabilities.
     const ALL_CAPS: u64 = u64::MAX;
 
@@ -2433,6 +2624,7 @@ mod variables_tests {
             running: false,
             frames,
             exit_code: 0,
+            trap_code: None,
             pending_output: RefCell::new(None),
             pending_debug_output: RefCell::new(None),
             last_error: RefCell::new(None),
@@ -2507,10 +2699,208 @@ mod variables_tests {
         assert_eq!(rows(&backend, Scope::Locals)[0].0, "local0");
     }
 
-    /// Arguments come from the same reply's second half, and are spelled `argN`.
-    ///
-    /// A parameter's name is in the assembly's `Param` table rather than in the Portable PDB, so
-    /// the source map cannot name one and this does not pretend otherwise.
+    /// A source map declaring `locals` in method 7 as `(slot, name, kind)`: the map's `kind` key
+    /// where one is given, and no `kind` key where none is.
+    fn srcmap_declaring(locals: &[(u32, &str, Option<&str>)]) -> SrcMap {
+        let declared: Vec<String> = locals
+            .iter()
+            .map(|(slot, name, kind)| match kind {
+                Some(kind) => format!("{{\"index\":{slot},\"name\":\"{name}\",\"kind\":\"{kind}\"}}"),
+                None => format!("{{\"index\":{slot},\"name\":\"{name}\"}}"),
+            })
+            .collect();
+        let json = format!(
+            "{{\"methods\":{{\"7\":{{\"document\":\"Program.cs\",\"name\":\"P.Main\",\
+             \"points\":[{{\"o\":0,\"l\":3,\"c\":1}}],\"locals\":[{}]}}}}}}",
+            declared.join(",")
+        );
+        SrcMap::parse(json.as_bytes()).expect("the source map parses")
+    }
+
+    /// One pane row, as [`rows`] gives it.
+    fn row(name: &str, value: &str, kind: &str) -> (String, String, String) {
+        (name.to_string(), value.to_string(), kind.to_string())
+    }
+
+    /// **EVERY LOCAL THE SOURCE DECLARES IS LISTED, STORED OR NOT.** A board's interpreter sends a
+    /// frame's locals up to the highest slot the method has stored, so stopped on the line after
+    /// `int a = 6;` it sends `a` alone. The rest are listed from the map: a local whose class the
+    /// map records at that class's zero, the value a local holds before its first store, and one
+    /// with no class as not assigned yet. Stopped after `b`'s first store, the board sends `b`, and
+    /// `b` shows its value.
+    #[test]
+    fn a_local_is_listed_before_its_first_store_and_shows_its_value_after_it() {
+        let declared = [
+            (0, "a", Some("int")),
+            (1, "b", Some("int")),
+            (2, "c", Some("int")),
+            (3, "text", Some("object")),
+            (4, "point", None),
+        ];
+        let before = halted_in_method_7(
+            Some(&vars_payload(&[WireValue::Int32(6)], &[])),
+            Some(srcmap_declaring(&declared)),
+            ALL_CAPS,
+        );
+        assert_eq!(
+            rows(&before, Scope::Locals),
+            vec![
+                row("a", "6", "int"),
+                row("b", "0", "int"),
+                row("c", "0", "int"),
+                row("text", "null", "object"),
+                row("point", "<not assigned yet>", ""),
+            ],
+        );
+        let after = halted_in_method_7(
+            Some(&vars_payload(&[WireValue::Int32(6), WireValue::Int32(7)], &[])),
+            Some(srcmap_declaring(&declared)),
+            ALL_CAPS,
+        );
+        assert_eq!(
+            rows(&after, Scope::Locals),
+            vec![
+                row("a", "6", "int"),
+                row("b", "7", "int"),
+                row("c", "0", "int"),
+                row("text", "null", "object"),
+                row("point", "<not assigned yet>", ""),
+            ],
+        );
+    }
+
+    /// **A SLOT BELOW THE HIGHEST ONE STORED CROSSES AS A 32-BIT 0 WHATEVER ITS TYPE** until it is
+    /// stored: the interpreter's placeholder. Where the map records the slot's class, the row shows
+    /// that class's zero instead, since a stored `long` crosses as a 64-bit integer and a stored
+    /// reference as a reference or null, never as a 32-bit 0. Where the map records no class, the row
+    /// is the value the board sent: an enum's 0 crosses as that same 32-bit 0, stored or not.
+    #[test]
+    fn a_slot_the_board_sends_as_its_placeholder_shows_its_classs_zero() {
+        let declared = [
+            (0, "count", Some("long")),
+            (1, "name", Some("object")),
+            (2, "ratio", Some("double")),
+            (3, "scale", Some("float")),
+            (4, "address", Some("nint")),
+            (5, "mode", None),
+            (6, "last", Some("int")),
+        ];
+        let mut sent = vec![WireValue::Int32(0); 6];
+        sent.push(WireValue::Int32(9));
+        let backend = halted_in_method_7(
+            Some(&vars_payload(&sent, &[])),
+            Some(srcmap_declaring(&declared)),
+            ALL_CAPS,
+        );
+        assert_eq!(
+            rows(&backend, Scope::Locals),
+            vec![
+                row("count", "0", "long"),
+                row("name", "null", "object"),
+                row("ratio", "0", "double"),
+                row("scale", "0", "float"),
+                row("address", "0", "nint"),
+                row("mode", "0", "int"),
+                row("last", "9", "int"),
+            ],
+        );
+    }
+
+    /// A slot the board sends with a stored value shows that value: the class decides only what the
+    /// placeholder means.
+    #[test]
+    fn a_stored_value_is_shown_as_the_board_sent_it() {
+        let declared = [(0, "name", Some("object")), (1, "count", Some("long")), (2, "empty", Some("object"))];
+        let sent = [WireValue::Object { handle: 3, type_token: 0 }, WireValue::Int64(5), WireValue::Null];
+        let backend = halted_in_method_7(
+            Some(&vars_payload(&sent, &[])),
+            Some(srcmap_declaring(&declared)),
+            ALL_CAPS,
+        );
+        assert_eq!(
+            rows(&backend, Scope::Locals),
+            vec![row("name", "object #3", "object"), row("count", "5", "long"), row("empty", "null", "object")],
+        );
+    }
+
+    /// A map that records no classes still lists each local it names: one the board did not send
+    /// as not assigned yet, never a guessed value.
+    #[test]
+    fn a_map_without_classes_lists_a_local_not_yet_stored_as_not_assigned() {
+        let backend = halted_in_method_7(
+            Some(&vars_payload(&[WireValue::Int32(6)], &[])),
+            Some(srcmap_naming(&[(0, "a"), (1, "b")])),
+            ALL_CAPS,
+        );
+        assert_eq!(
+            rows(&backend, Scope::Locals),
+            vec![row("a", "6", "int"), row("b", "<not assigned yet>", "")],
+        );
+    }
+
+    /// A local whose entry carries what this reader does not know, a key it has no field for or a
+    /// class word it has no class for, is still listed and named, as a local with no class.
+    #[test]
+    fn a_map_entry_carrying_more_than_this_reader_knows_still_names_its_local() {
+        let json = "{\"methods\":{\"7\":{\"document\":\"Program.cs\",\"name\":\"P.Main\",\
+                    \"points\":[{\"o\":0,\"l\":3,\"c\":1}],\
+                    \"locals\":[{\"index\":0,\"name\":\"amount\",\"kind\":\"decimal\",\"scope\":[0,12]}]}}}";
+        let backend = halted_in_method_7(
+            Some(&vars_payload(&[], &[])),
+            Some(SrcMap::parse(json.as_bytes()).expect("the source map parses")),
+            ALL_CAPS,
+        );
+        assert_eq!(rows(&backend, Scope::Locals), vec![row("amount", "<not assigned yet>", "")]);
+    }
+
+    /// A reader that knows only a local's slot and name reads a map whose locals carry a `kind`,
+    /// and names the same locals: an added key costs such a reader nothing but the key.
+    #[test]
+    fn a_reader_of_slots_and_names_alone_reads_a_map_whose_locals_carry_kinds() {
+        #[derive(serde::Deserialize)]
+        struct RawPoint { o: u32, l: u32, #[serde(default)] c: u32 }
+        #[derive(serde::Deserialize)]
+        struct RawLocal { index: u32, name: String }
+        #[derive(serde::Deserialize)]
+        struct RawMethod {
+            document: String,
+            #[serde(default)] name: String,
+            points: Vec<RawPoint>,
+            #[serde(default)] locals: Vec<RawLocal>,
+        }
+        #[derive(serde::Deserialize)]
+        struct Raw { methods: std::collections::HashMap<String, RawMethod> }
+        let json = "{\"methods\":{\"7\":{\"document\":\"Program.cs\",\"name\":\"P.Main\",\
+                    \"points\":[{\"o\":0,\"l\":3,\"c\":1}],\
+                    \"locals\":[{\"index\":0,\"name\":\"a\",\"kind\":\"int\"},{\"index\":1,\"name\":\"text\",\"kind\":\"object\"},\
+                    {\"index\":2,\"name\":\"point\"}],\
+                    \"arguments\":[]}},\"entryPoint\":7,\"error\":null}";
+        let raw: Raw = serde_json::from_str(json).expect("the map parses in the older shape");
+        let method = &raw.methods["7"];
+        let named: Vec<(u32, &str)> = method.locals.iter().map(|local| (local.index, local.name.as_str())).collect();
+        assert_eq!(named, [(0, "a"), (1, "text"), (2, "point")]);
+        assert_eq!((method.document.as_str(), method.name.as_str()), ("Program.cs", "P.Main"));
+        assert_eq!(method.points.iter().map(|point| (point.o, point.l, point.c)).collect::<Vec<_>>(), [(0, 3, 1)]);
+    }
+
+    /// Arguments are named by the map's `arguments` lane, by slot, as locals are by `locals`:
+    /// `Add(int x, int y)` stopped in its body reads `x` and `y`.
+    #[test]
+    fn arguments_arrive_named_by_their_slot() {
+        let payload = vars_payload(&[], &[WireValue::Int32(6), WireValue::Int32(7)]);
+        let backend =
+            halted_in_method_7(Some(&payload), Some(srcmap_naming_arguments(&[(0, "x"), (1, "y")])), ALL_CAPS);
+        assert_eq!(
+            rows(&backend, Scope::Arguments),
+            vec![
+                ("x".to_string(), "6".to_string(), "int".to_string()),
+                ("y".to_string(), "7".to_string(), "int".to_string()),
+            ],
+        );
+    }
+
+    /// Arguments come from the same reply's second half, and a map that names none spells them
+    /// `argN`.
     #[test]
     fn arguments_come_from_the_replys_second_half() {
         let payload =
@@ -2581,8 +2971,8 @@ mod variables_tests {
         let rows = rows(&backend, Scope::Locals);
         assert_eq!(rows.len(), 1);
         assert!(
-            rows[0].1.contains("LOCALS"),
-            "and it names the missing capability: {}",
+            rows[0].1.contains("does not report variables"),
+            "and it says the board's firmware cannot show them: {}",
             rows[0].1,
         );
     }

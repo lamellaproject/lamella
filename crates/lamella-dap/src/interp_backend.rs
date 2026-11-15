@@ -5,28 +5,73 @@
 use lamella_cil::{Instruction, Operand};
 use std::borrow::Cow;
 use lamella_debug_backend::{
-    DebugBackend, Disassembled, Frame, Register, Scope, SourceLocation, Stop, Variable,
+    DebugBackend, Disassembled, Frame, Register, Scope, SourceLocation, Stop, ThreadInfo, Variable,
 };
-use lamella_metadata::PortablePdb;
+use lamella_metadata::{Assembly, PortablePdb, SigType, StackClass};
 use lamella_token::Token;
-use lamella_cil_runtime::{
-    MethodId, Module, PendingOp, Session, Status, Value, Vm, take_pending_op,
-};
+use lamella_cil_runtime::{MethodId, Module, Session, Slice, Threads, Value, Vm, Watch};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The `MethodDef` metadata table tag, for rebuilding a method token to map a PDB
 /// `method_rid` to the interpreter's `MethodId`.
 const METHOD_DEF: u8 = 0x06;
 
+/// How long one slice of the program runs, in the machine's milliseconds, before the backend
+/// answers: long enough that a polling host's own wait between polls costs the program little of its
+/// time, short enough that a pause is answered at once.
+const SLICE_MILLIS: u64 = 50;
+
+/// The most instructions one slice runs, which is how a slice ends on a machine with no clock.
+const SLICE_BUDGET: u32 = 1 << 20;
+
+/// What .NET's debugger names a program's main thread.
+const MAIN_THREAD_NAME: &str = "Main Thread";
+
+/// What .NET's debugger names a thread its program has not named.
+const UNNAMED_THREAD_NAME: &str = "<No Name>";
+
+/// What the program is doing for the debugger between the backend's calls.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    /// Nothing: the program is stopped, or has ended.
+    Nothing,
+    /// Running until a thread reaches a breakpoint, or the program ends.
+    Resume,
+    /// Running until this thread (the scheduler's id) has run one instruction: a step.
+    Step(u32),
+}
+
+/// What one slice of the program came to ([`InterpreterBackend::run_slice`]).
+enum Outcome {
+    /// A stop to report.
+    Stopped(Stop),
+    /// The program runs on.
+    Running,
+    /// The program runs on, and only a pause or its end will change that: no thread can run and
+    /// nothing will wake one.
+    Waiting,
+}
+
 /// A [`DebugBackend`] over the interpreter: it owns the module being debugged, the
-/// runtime context, and the running `Session` once launched.
+/// runtime context, and the program's threads once launched.
+///
+/// The program's threads run as they do without the debugger, under the interpreter's scheduler: a
+/// started thread runs, a breakpoint stops the program on whichever thread reaches it, and a thread
+/// asleep for good blocks only itself. A step moves one thread while the others run, as on .NET.
+///
+/// By default the backend runs the program inside each call that resumes it, until it stops, for a
+/// host that never polls -- a page answering one request at a time. Such a host is told the program
+/// is running only when nothing but a pause can change it. A host that polls between requests makes
+/// the backend [`polled`](InterpreterBackend::polled), so a pause reaches a program that never
+/// stops.
 pub struct InterpreterBackend {
     module: Module,
     entry: u32,
     vm: Vm,
-    session: Option<Session>,
+    /// The program's threads, once launched.
+    threads: Option<Threads>,
     /// Instruction breakpoints as `(method, instruction)`, kept so they survive the
-    /// `launch` that (re)creates the session.
+    /// `launch` that (re)creates the threads.
     breakpoints: Vec<(u32, u32)>,
     /// UTF-16 code units of console output already drained by [`Self::take_output`].
     output_sent: usize,
@@ -40,14 +85,29 @@ pub struct InterpreterBackend {
     /// Per method, the CIL byte offsets carrying a (non-hidden) sequence point: the
     /// statement boundaries a source-level step may land on. Empty without a PDB.
     seq_boundaries: BTreeMap<MethodId, BTreeSet<u32>>,
-    /// True when execution is parked on a breakpoint already reported to the client, so
-    /// the next `resume` steps off it before running on. False at launch -- so a
-    /// breakpoint on the entry instruction fires rather than being stepped over.
-    at_reported_breakpoint: bool,
+    /// The thread (the scheduler's id) stopped on a breakpoint already reported to the client, which
+    /// steps off it when the program goes on. `None` at launch -- so a breakpoint on the entry
+    /// instruction fires rather than being stepped over.
+    reported: Option<u32>,
+    /// The thread (the scheduler's id) the calls that read or move one thread act on
+    /// ([`DebugBackend::selected_thread`]): at every stop, the one the stop happened on.
+    selected: u32,
+    /// Whether the host polls this backend between requests ([`InterpreterBackend::polled`]).
+    polled: bool,
+    /// What the program is doing between the backend's calls.
+    pending: Pending,
     /// The program's exit code: the entry method's `int` return (else 0), captured when the
     /// session reports `Status::Done`. Reported in the adapter's `exited` event, so a debug run
     /// surfaces the real exit code (not a hardcoded 0).
     exit_code: i32,
+    /// The code a run that ended in a fault ends with, captured when it faults: the trap's own code
+    /// (134 for an exception the program did not catch, 1 for a trap of the interpreter's own).
+    /// `None` until a run faults.
+    fault_exit_code: Option<i32>,
+    /// Per method, the [`StackClass`] of each local's type by slot, from the program's local
+    /// signatures ([`InterpreterBackend::with_local_types`]): `None` for a type whose class its
+    /// signature does not decide. Empty until the backend is given the program.
+    local_classes: BTreeMap<MethodId, Vec<Option<StackClass>>>,
 }
 
 /// The process exit code an entry method's return maps to: its `int` return, or 0 for a `void` (or
@@ -56,61 +116,6 @@ fn exit_code_of(returned: &Option<Value>) -> i32 {
     match returned {
         Some(Value::Int32(code)) => *code,
         _ => 0,
-    }
-}
-
-/// Runs one instruction of `session`, then the thread operation it raised, if any: the session's
-/// status after it, or why the run cannot go on -- the instruction trapped, or it raised an
-/// operation a debug session cannot perform ([`perform_thread_op`]).
-fn step_and_perform_thread_op(
-    session: &mut Session,
-    module: &Module,
-    vm: &mut Vm,
-) -> Result<Status, String> {
-    let status = session.step(module, vm).map_err(|trap| format!("{trap}"))?;
-    if !matches!(status, Status::Done(_)) {
-        perform_thread_op(vm)?;
-    }
-    Ok(status)
-}
-
-/// Performs the thread operation the instruction just run raised, where a debug session can.
-///
-/// A debug session runs the program's main thread alone, with no scheduler beside it. A sleep
-/// waits out its time on the machine's clock, and a yield carries on, there being no other thread
-/// to yield to. Everything else a scheduler does for a thread -- starting or joining one, waiting
-/// for a lock another thread holds, blocking on a socket, sleeping for good -- ends the run with
-/// the reason, because the program would otherwise carry on as though the operation had worked.
-fn perform_thread_op(vm: &mut Vm) -> Result<(), String> {
-    match take_pending_op(vm) {
-        PendingOp::None | PendingOp::Yield => Ok(()),
-        PendingOp::SleepUntil(u64::MAX) => Err(String::from(
-            "Thread.Sleep(Timeout.Infinite) never returns in a debug session: the debugger runs \
-             the program's main thread alone, so nothing can wake it. Run the program without the \
-             debugger, where its other threads run.",
-        )),
-        PendingOp::SleepUntil(deadline) => {
-            sleep_until(vm, deadline);
-            Ok(())
-        }
-        PendingOp::NeedsScheduler(what) => Err(format!(
-            "{what} needs the scheduler, which a debug session does not run: the debugger runs the \
-             program's main thread alone. Run the program without the debugger to use it."
-        )),
-    }
-}
-
-/// Holds the program until the machine's monotonic clock reaches `deadline`.
-///
-/// Through the machine's own sleep, never the standard library's: this backend also runs in a
-/// browser, where only the page knows whether its thread may block. A sleep that may not block
-/// returns early, so the clock is asked again after each one.
-fn sleep_until(vm: &mut Vm, deadline: u64) {
-    while let Some(now) = vm.now_millis() {
-        if now >= deadline {
-            return;
-        }
-        vm.sleep_millis(deadline - now);
     }
 }
 
@@ -124,15 +129,20 @@ impl InterpreterBackend {
             module,
             entry,
             vm: Vm::new(),
-            session: None,
+            threads: None,
             breakpoints: Vec::new(),
             output_sent: 0,
             debug_sent: 0,
             pdb: None,
             method_rid: BTreeMap::new(),
             seq_boundaries: BTreeMap::new(),
-            at_reported_breakpoint: false,
+            reported: None,
+            selected: 0,
+            polled: false,
+            pending: Pending::Nothing,
             exit_code: 0,
+            fault_exit_code: None,
+            local_classes: BTreeMap::new(),
         }
     }
 
@@ -140,12 +150,18 @@ impl InterpreterBackend {
     /// (`pdb_bytes`), building the `MethodId` -> `method_rid` reverse map from the
     /// module's token binding so frames and breakpoints map to and from source.
     ///
+    /// Bytes that are not a Portable PDB map nothing, so the backend has no source and is debugged
+    /// by CIL instruction, as one made by [`InterpreterBackend::new`] is. A caller that must not
+    /// serve a session without its source reads the PDB first and refuses it there.
+    ///
     /// Its program has no clock until [`InterpreterBackend::configure_machine`] gives it one.
     #[must_use]
     pub fn with_pdb(module: Module, entry: u32, pdb_bytes: Vec<u8>) -> InterpreterBackend {
         let mut method_rid = BTreeMap::new();
         let mut seq_boundaries = BTreeMap::new();
-        if let Ok(pdb) = PortablePdb::read(&pdb_bytes) {
+        let read = PortablePdb::read(&pdb_bytes);
+        let mapped = read.is_ok();
+        if let Ok(pdb) = read {
             let program_asm = module.method_asm(entry);
             for rid in 1..=pdb.method_count() {
                 if let Some(id) = module.resolve(program_asm, Token::new(METHOD_DEF, rid)) {
@@ -166,16 +182,43 @@ impl InterpreterBackend {
             module,
             entry,
             vm: Vm::new(),
-            session: None,
+            threads: None,
             breakpoints: Vec::new(),
             output_sent: 0,
             debug_sent: 0,
-            pdb: Some(pdb_bytes),
+            pdb: mapped.then_some(pdb_bytes),
             method_rid,
             seq_boundaries,
-            at_reported_breakpoint: false,
+            reported: None,
+            selected: 0,
+            polled: false,
+            pending: Pending::Nothing,
             exit_code: 0,
+            fault_exit_code: None,
+            local_classes: BTreeMap::new(),
         }
+    }
+
+    /// This backend with the class of each local of `program`'s methods, from their local
+    /// signatures, so a frame's variables list each local its PDB names, stored or not: one the
+    /// method has not stored yet at its class's zero, the value every local starts at, or as not
+    /// assigned yet where its type decides no class ([`SigType::stack_class`]).
+    ///
+    /// `program` is the assembly the backend's module was loaded from, whose portable PDB
+    /// [`InterpreterBackend::with_pdb`] was given. A backend without that PDB names no local, and
+    /// gains nothing from this.
+    #[must_use]
+    pub fn with_local_types(mut self, program: &Assembly<'_>) -> InterpreterBackend {
+        let ids: BTreeMap<u32, MethodId> = self.method_rid.iter().map(|(&id, &rid)| (rid, id)).collect();
+        for type_def in program.type_defs() {
+            for method in type_def.methods() {
+                if let Some(&id) = ids.get(&method.rid()) {
+                    let classes = method.local_variables().iter().map(SigType::stack_class).collect();
+                    self.local_classes.insert(id, classes);
+                }
+            }
+        }
+        self
     }
 
     /// This backend with its program's machine set up by `configure`, which is handed the module
@@ -194,18 +237,115 @@ impl InterpreterBackend {
         self
     }
 
+    /// This backend, for a host that polls it between requests, as `lamella_dap::serve_polled` does:
+    /// a continue leaves the program running, each [`DebugBackend::poll`] runs it a slice, and a
+    /// `pause` stops it wherever it is -- a program that never stops included.
+    ///
+    /// A host that does not poll must not ask for this: nothing would run the program.
+    #[must_use]
+    pub fn polled(mut self) -> InterpreterBackend {
+        self.polled = true;
+        self
+    }
+
     fn apply_breakpoints(&mut self) {
+        if let Some(threads) = self.threads.as_mut() {
+            threads.set_breakpoints(&self.breakpoints);
+        }
+    }
+
+    /// The selected thread's session, while that thread has not finished.
+    fn session(&self) -> Option<&Session> {
+        self.threads.as_ref()?.session(self.selected)
+    }
+
+    /// Runs the program one slice for what is pending, and says what came of it. A stop selects the
+    /// thread it happened on.
+    fn run_slice(&mut self) -> Outcome {
         let InterpreterBackend {
-            session,
-            breakpoints,
+            threads,
+            module,
+            vm,
+            pending,
+            selected,
+            reported,
+            exit_code,
+            fault_exit_code,
+            polled,
             ..
         } = self;
-        if let Some(session) = session.as_mut() {
-            session.clear_breakpoints();
-            for (method, instruction) in breakpoints.iter() {
-                session.add_breakpoint(*method, *instruction);
+        let Some(threads) = threads.as_mut() else {
+            return Outcome::Stopped(Stop::Done);
+        };
+        let step = match *pending {
+            Pending::Nothing => return Outcome::Waiting,
+            Pending::Resume => None,
+            Pending::Step(thread) => Some(thread),
+        };
+        let watch = Watch {
+            step,
+            budget: SLICE_BUDGET,
+            until: if *polled {
+                vm.now_millis().map(|now| now.saturating_add(SLICE_MILLIS))
+            } else {
+                None
+            },
+        };
+        let stop = match threads.debug_run(module, vm, &watch) {
+            Ok(Slice::Running) => return Outcome::Running,
+            Ok(Slice::Waiting) => return Outcome::Waiting,
+            Ok(Slice::Breakpoint(thread)) => {
+                *selected = thread;
+                *reported = Some(thread);
+                Stop::Breakpoint
+            }
+            Ok(Slice::Stepped(thread)) => {
+                let at_breakpoint = !threads.is_waiting(thread)
+                    && threads.session(thread).is_some_and(Session::is_at_breakpoint);
+                if at_breakpoint {
+                    *reported = Some(thread);
+                    Stop::Breakpoint
+                } else {
+                    Stop::Step
+                }
+            }
+            Ok(Slice::Finished(value)) => {
+                *exit_code = exit_code_of(&value);
+                Stop::Done
+            }
+            Err(trap) => {
+                *fault_exit_code = Some(trap.exit_code());
+                Stop::Fault(format!("{trap}"))
+            }
+        };
+        *pending = Pending::Nothing;
+        Outcome::Stopped(stop)
+    }
+
+    /// Runs the program for what is now pending: to its stop, slice after slice, for a host that does
+    /// not poll; one slice for one that does. `Running` while it runs on.
+    fn run_pending(&mut self) -> Stop {
+        loop {
+            match self.run_slice() {
+                Outcome::Stopped(stop) => return stop,
+                Outcome::Waiting => return Stop::Running,
+                Outcome::Running if self.polled => return Stop::Running,
+                Outcome::Running => {}
             }
         }
+    }
+
+    /// The ip of the call a frame at `ip` in `method` is inside: the instruction before `ip`.
+    ///
+    /// A frame that called another is past its call, and so is a thread waiting inside one; .NET
+    /// shows both at the call, on its line.
+    fn call_site(&self, method: MethodId, ip: u32) -> u32 {
+        if !lamella_cil_runtime::interp::IP_IS_IL_OFFSET {
+            return ip.saturating_sub(1);
+        }
+        self.offsets(method)
+            .and_then(|offsets| offsets.iter().rev().find(|&&offset| offset < ip).copied())
+            .unwrap_or(ip)
     }
 
     /// The CIL of a loaded method, or `None` for an intrinsic or unknown method.
@@ -266,11 +406,46 @@ impl InterpreterBackend {
         Some(names)
     }
 
+    /// The class `method`'s local signature gives local `slot`, where its type decides one.
+    fn local_class(&self, method: MethodId, slot: usize) -> Option<StackClass> {
+        self.local_classes.get(&method)?.get(slot).copied().flatten()
+    }
+
+    /// Local `slot` of `method`, holding `value`, as a variables view shows it.
+    ///
+    /// A slot below the highest one the method has stored, and not stored itself, holds a 32-bit 0
+    /// whatever its type. Under any class but `int` such a 0 is only that, since a stored `long` is
+    /// 64 bits and a stored reference a reference or null, so it is shown as its class's zero, the
+    /// value the local holds. With no class it is shown as held: an enum's 0 is that same 32-bit 0,
+    /// stored or not.
+    fn shown_local(&self, method: MethodId, slot: usize, value: &Value) -> Value {
+        match self.local_class(method, slot) {
+            Some(class) if class != StackClass::Int32 && *value == Value::Int32(0) => zero(class),
+            _ => value.clone(),
+        }
+    }
+
+    /// A row for each local `names` names in `method` at or past slot `stored`, the count of slots
+    /// the frame holds: locals the method has not stored yet, at their class's zero, or as not
+    /// assigned yet where their type decides no class.
+    fn unstored_locals(&self, method: MethodId, stored: usize, names: &BTreeMap<u16, String>) -> Vec<Variable> {
+        names
+            .iter()
+            .filter(|&(&slot, name)| usize::from(slot) >= stored && !name.is_empty())
+            .map(|(&slot, name)| {
+                let (value, kind) = match self.local_class(method, usize::from(slot)) {
+                    Some(class) => format_value(&self.vm, zero(class)),
+                    None => (NOT_ASSIGNED_YET.to_owned(), String::new()),
+                };
+                Variable { name: name.clone(), value, kind }
+            })
+            .collect()
+    }
+
     /// The session's index for frame `frame`, counted as [`DebugBackend::stack`] lists the frames:
     /// `frame` 0 is the innermost, while the session counts from the entry frame.
     fn session_frame(&self, frame: usize) -> Option<usize> {
-        self.session
-            .as_ref()?
+        self.session()?
             .depth()
             .checked_sub(frame.checked_add(1)?)
     }
@@ -291,10 +466,13 @@ pub fn host_machine(module: &Module, vm: &mut Vm) {
 impl DebugBackend for InterpreterBackend {
     fn launch(&mut self) -> Result<(), String> {
         let args = lamella_cil_runtime::entry_args(&self.module, &mut self.vm, self.entry);
-        match Session::new(&self.module, self.entry, args) {
-            Ok(session) => {
-                self.session = Some(session);
-                self.at_reported_breakpoint = false;
+        match Threads::new(&self.module, self.entry, args) {
+            Ok(threads) => {
+                self.threads = Some(threads);
+                self.reported = None;
+                self.selected = 0;
+                self.pending = Pending::Nothing;
+                self.fault_exit_code = None;
                 self.apply_breakpoints();
                 Ok(())
             }
@@ -302,70 +480,117 @@ impl DebugBackend for InterpreterBackend {
         }
     }
 
+    /// The program runs on the interpreter in this process, so the adapter's own evaluation session
+    /// runs where the program does.
+    fn runs_in_this_process(&self) -> bool {
+        true
+    }
+
+    /// Every thread runs on until one reaches a breakpoint or the program ends. Run inside the call for
+    /// a host that does not poll; left to [`DebugBackend::poll`] for one that does.
     fn resume(&mut self) -> Stop {
-        let InterpreterBackend {
-            session,
-            vm,
-            module,
-            at_reported_breakpoint,
-            exit_code,
-            ..
-        } = self;
-        let Some(session) = session.as_mut() else {
+        let Some(threads) = self.threads.as_mut() else {
             return Stop::Done;
         };
-        let mut stepping_off = *at_reported_breakpoint && session.is_at_breakpoint();
-        *at_reported_breakpoint = false;
-        loop {
-            if !stepping_off && session.is_at_breakpoint() {
-                *at_reported_breakpoint = true;
-                return Stop::Breakpoint;
-            }
-            stepping_off = false;
-            match step_and_perform_thread_op(session, module, vm) {
-                Ok(Status::Done(value)) => {
-                    *exit_code = exit_code_of(&value);
-                    return Stop::Done;
-                }
-                Ok(Status::Running | Status::Paused) => {}
-                Err(reason) => return Stop::Fault(reason),
-            }
+        if let Some(thread) = self.reported.take() {
+            threads.step_off(thread);
+        }
+        self.pending = Pending::Resume;
+        if self.polled {
+            return Stop::Running;
+        }
+        self.run_pending()
+    }
+
+    /// The selected thread runs one instruction, and every other thread runs meanwhile, as the
+    /// scheduler interleaves them: a thread that waits -- on a sleep, another thread, a lock -- takes
+    /// its one instruction once the wait is over. The adapter composes every source-level step from
+    /// this one. A step of a thread that has finished goes on as a continue, as the program does on
+    /// .NET once the thread it was stepping ends.
+    fn step(&mut self) -> Stop {
+        let Some(threads) = self.threads.as_mut() else {
+            return Stop::Done;
+        };
+        if let Some(thread) = self.reported.take() {
+            threads.step_off(thread);
+        }
+        self.pending = if threads.session(self.selected).is_some() {
+            Pending::Step(self.selected)
+        } else {
+            Pending::Resume
+        };
+        self.run_pending()
+    }
+
+    /// The program runs on for one more slice, after a call answered [`Stop::Running`].
+    fn poll(&mut self) -> Stop {
+        match self.run_slice() {
+            Outcome::Stopped(stop) => stop,
+            Outcome::Running | Outcome::Waiting => Stop::Running,
         }
     }
 
-    fn step(&mut self) -> Stop {
-        let InterpreterBackend {
-            session,
-            vm,
-            module,
-            at_reported_breakpoint,
-            exit_code,
-            ..
-        } = self;
-        let Some(session) = session.as_mut() else {
-            return Stop::Done;
-        };
-        *at_reported_breakpoint = false;
-        match step_and_perform_thread_op(session, module, vm) {
-            Ok(Status::Done(value)) => {
-                *exit_code = exit_code_of(&value);
-                Stop::Done
-            }
-            Ok(Status::Running | Status::Paused) if session.is_at_breakpoint() => {
-                *at_reported_breakpoint = true;
-                Stop::Breakpoint
-            }
-            Ok(Status::Running | Status::Paused) => Stop::Step,
-            Err(reason) => Stop::Fault(reason),
+    /// Stops the program where it is, which needs nothing more than not running it: it runs only
+    /// inside this backend's calls. The thread the scheduler ran last is the one the stop names.
+    fn pause(&mut self) -> bool {
+        self.pending = Pending::Nothing;
+        if let Some(thread) = self.threads.as_ref().and_then(Threads::current) {
+            self.selected = thread;
         }
+        true
     }
 
     fn exit_code(&self) -> i32 {
         self.exit_code
     }
 
+    fn fault_exit_code(&self) -> Option<i32> {
+        self.fault_exit_code
+    }
+
     fn depth(&self) -> usize {
-        self.session.as_ref().map_or(0, Session::depth)
+        self.session().map_or(0, Session::depth)
+    }
+
+    /// The threads that have not finished, by the scheduler's id plus one, so the main thread is 1,
+    /// each named as .NET's debugger names it: the main thread, a thread by the `Thread.Name` its
+    /// program gave it, and an unnamed one.
+    fn threads(&self) -> Vec<ThreadInfo> {
+        let Some(threads) = self.threads.as_ref() else {
+            return vec![ThreadInfo { id: 1, name: String::from(MAIN_THREAD_NAME) }];
+        };
+        threads
+            .ids()
+            .into_iter()
+            .map(|thread| ThreadInfo {
+                id: thread + 1,
+                name: if thread == 0 {
+                    String::from(MAIN_THREAD_NAME)
+                } else {
+                    threads
+                        .thread_name(&self.module, &self.vm, thread)
+                        .unwrap_or_else(|| String::from(UNNAMED_THREAD_NAME))
+                },
+            })
+            .collect()
+    }
+
+    fn selected_thread(&self) -> u32 {
+        self.selected + 1
+    }
+
+    fn select_thread(&mut self, id: u32) -> bool {
+        let Some(thread) = id.checked_sub(1) else {
+            return false;
+        };
+        let known = match self.threads.as_ref() {
+            Some(threads) => threads.session(thread).is_some(),
+            None => thread == 0,
+        };
+        if known {
+            self.selected = thread;
+        }
+        known
     }
 
     /// Always `Ok`: the breakpoint set is a list the session owns, there is no unit with a
@@ -381,7 +606,7 @@ impl DebugBackend for InterpreterBackend {
     }
 
     fn stack(&self) -> Vec<Frame> {
-        let Some(session) = self.session.as_ref() else {
+        let Some(session) = self.session() else {
             return Vec::new();
         };
         (0..session.depth())
@@ -398,6 +623,22 @@ impl DebugBackend for InterpreterBackend {
                 })
             })
             .collect()
+    }
+
+    /// Frame `index`'s source location, AT THE CALL for a frame inside one: every frame but the
+    /// innermost, and the innermost of a thread waiting inside the call that blocks it. Such a
+    /// frame's address is the instruction after its call, which can be the next statement's first --
+    /// and a frame shown there reads as having finished the line it is in.
+    fn frame_source_location(&self, index: usize, address: u64) -> Option<SourceLocation> {
+        let waiting = self
+            .threads
+            .as_ref()
+            .is_some_and(|threads| threads.is_waiting(self.selected));
+        if index == 0 && !waiting {
+            return self.source_location(address);
+        }
+        let (method, ip) = decode_address(address);
+        self.source_location(encode_address(method, self.call_site(method, ip)))
     }
 
     fn resolve_source_breakpoint(&self, document: &str, line: u32) -> Option<u64> {
@@ -441,7 +682,7 @@ impl DebugBackend for InterpreterBackend {
     }
 
     fn at_source_boundary(&self) -> bool {
-        let Some(session) = self.session.as_ref() else {
+        let Some(session) = self.session() else {
             return false;
         };
         let Some(frame) = session
@@ -459,7 +700,7 @@ impl DebugBackend for InterpreterBackend {
     }
 
     fn variables(&self, frame_index: usize, scope: Scope) -> Vec<Variable> {
-        let Some(session) = self.session.as_ref() else {
+        let Some(session) = self.session() else {
             return Vec::new();
         };
         let Some(frame) = self
@@ -478,11 +719,13 @@ impl DebugBackend for InterpreterBackend {
             .then(|| self.local_names(method))
             .flatten();
         let arguments = matches!(scope, Scope::Arguments);
-        values
+        let locals = matches!(scope, Scope::Locals);
+        let mut rows: Vec<Variable> = values
             .iter()
             .enumerate()
             .map(|(index, value)| {
-                let (text, kind) = format_value(&self.vm, value.clone());
+                let shown = if locals { self.shown_local(method, index, value) } else { value.clone() };
+                let (text, kind) = format_value(&self.vm, shown);
                 let name = names
                     .as_ref()
                     .and_then(|names| names.get(&(index as u16)))
@@ -499,7 +742,11 @@ impl DebugBackend for InterpreterBackend {
                     kind,
                 }
             })
-            .collect()
+            .collect();
+        if let Some(names) = names.as_ref().filter(|_| locals) {
+            rows.extend(self.unstored_locals(method, values.len(), names));
+        }
+        rows
     }
 
     fn can_set_variables(&self) -> bool {
@@ -521,13 +768,15 @@ impl DebugBackend for InterpreterBackend {
             .iter()
             .position(|variable| variable.name == name)?;
         let at = self.session_frame(frame_index)?;
-        let frame = self.session.as_ref()?.frame(at)?;
+        let frame = self.session()?.frame(at)?;
         let current = match scope {
-            Scope::Arguments => frame.args.get(slot),
-            Scope::Locals => frame.locals.get(slot),
+            Scope::Arguments => frame.args.get(slot).cloned(),
+            Scope::Locals => frame
+                .locals
+                .get(slot)
+                .map(|value| self.shown_local(frame.method, slot, value)),
             Scope::Stack => None,
-        }?
-        .clone();
+        }?;
         let new_value = match &current {
             Value::Object(reference) if self.vm.heap().as_string(*reference).is_some() => {
                 let text = strip_one_quote_pair(value);
@@ -535,7 +784,7 @@ impl DebugBackend for InterpreterBackend {
             }
             _ => parse_value(&current, value)?,
         };
-        let session = self.session.as_mut()?;
+        let session = self.threads.as_mut()?.session_mut(self.selected)?;
         let written = match scope {
             Scope::Arguments => session.set_arg(at, slot, new_value.clone()),
             Scope::Locals => session.set_local(at, slot, new_value.clone()),
@@ -617,6 +866,22 @@ pub fn decode_address(address: u64) -> (u32, u32) {
 fn alloc_method_name(method: MethodId, ip: u32) -> String {
     format!("method#{method} @{ip}")
 }
+
+/// The value a local of `class` holds before its method first stores it: every local starts zeroed.
+fn zero(class: StackClass) -> Value {
+    match class {
+        StackClass::Int32 => Value::Int32(0),
+        StackClass::Int64 => Value::Int64(0),
+        StackClass::NativeInt => Value::NativeInt(0),
+        StackClass::Float32 => Value::Single(0.0),
+        StackClass::Float64 => Value::Float(0.0),
+        StackClass::ObjectRef => Value::Null,
+    }
+}
+
+/// What a variables view says of a local the method has not stored yet whose class its type does
+/// not decide.
+const NOT_ASSIGNED_YET: &str = "<not assigned yet>";
 
 /// Renders a value as `(display text, type name)` for the variables view.
 fn format_value(vm: &Vm, value: Value) -> (String, String) {

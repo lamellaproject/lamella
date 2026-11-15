@@ -264,3 +264,6 @@ fitted = "yes"
 onboard = "none"
 recovery = "mask-rom"
 source = "The schematic's DEBUG, a three-pin JST SH connector, carries SWCLK on pin 1, ground on pin 2 and SWDIO on pin 3, so a probe cable lands on it with no tools; the pinout diagram draws it with SWCLK, GND and SWDIO, and product 6130 lists a Pico Probe 3-pin JST SH connector for SWD debugging. There is no on-board debug probe. RP2350 datasheet section 4.1: the mask ROM is a physically immutable memory resource, so the recovery path is in silicon and no image written to flash can remove it."
+
+[csharp_interpreter]
+optimization = "speed"

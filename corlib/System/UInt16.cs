@@ -1,7 +1,9 @@
 // Lamella managed corlib (from scratch). -- System.UInt16
+using System.Globalization;
+
 namespace System
 {
-    public struct UInt16 : IComparable
+    public struct UInt16 : IComparable, IFormattable
     {
         public const ushort MaxValue = 65535;
         public const ushort MinValue = 0;
@@ -23,6 +25,10 @@ namespace System
             for (int i = pos; i < buffer.Length; i++) result.Append(buffer[i]);
             return result.ToString();
         }
+
+        public string ToString(string format) { return NumberFormatter.Format(this, 4, format); }
+        public string ToString(IFormatProvider provider) { NumberFormatter.Ask(false, null, provider); return ToString(); }
+        public string ToString(string format, IFormatProvider provider) { NumberFormatter.Ask(false, format, provider); return NumberFormatter.Format(this, 4, format); }
 
         public bool Equals(ushort obj) { return this == obj; }
 
@@ -51,26 +57,60 @@ namespace System
         public static ushort Parse(string s)
         {
             if ((object)s == null) throw new ArgumentNullException("s");
-            int end = s.Length;
-            while (end > 0 && NumberText.IsPad(s[end - 1])) end = end - 1;
-            int i = 0;
-            while (i < end && NumberText.IsPad(s[i])) i = i + 1;
-            bool negative = false;
-            if (i < end && s[i] == '-') { negative = true; i = i + 1; }
-            else if (i < end && s[i] == '+') { i = i + 1; }
-            if (i >= end) throw new FormatException("Input string was not in a correct format.");
-            long result = 0;
-            while (i < end)
-            {
-                char c = s[i];
-                if (c < '0' || c > '9') throw new FormatException("Input string was not in a correct format.");
-                long digit = (long)(c - '0');
-                if (result > (65535L - digit) / 10) throw new OverflowException("Value was either too large or too small for a UInt16.");
-                result = result * 10 + digit;
-                i = i + 1;
-            }
-            if (negative && result != 0) throw new OverflowException("Value was either too large or too small for a UInt16.");
-            return (ushort)result;
+            ulong bits;
+            int outcome = NumberParser.ScanWholeNumber(s, (int)NumberStyles.Integer, 4, 65535UL, 0UL, out bits);
+            if (outcome != NumberParser.Done) NumberParser.Refuse(outcome, s, "Value was either too large or too small for a UInt16.");
+            return (ushort)bits;
         }
+
+        public static ushort Parse(string s, NumberStyles style)
+        {
+            if ((object)s == null) throw new ArgumentNullException("s");
+            NumberParser.CheckWholeNumberStyle(style);
+            ulong bits;
+            int outcome = NumberParser.ScanWholeNumber(s, (int)style, 4, 65535UL, 0UL, out bits);
+            if (outcome != NumberParser.Done) NumberParser.Refuse(outcome, s, "Value was either too large or too small for a UInt16.");
+            return (ushort)bits;
+        }
+
+        public static ushort Parse(string s, IFormatProvider provider)
+        {
+            return Parse(s, NumberStyles.Integer, provider);
+        }
+
+        public static ushort Parse(string s, NumberStyles style, IFormatProvider provider)
+        {
+            if ((object)s == null) throw new ArgumentNullException("s");
+            NumberParser.CheckWholeNumberStyle(style);
+            NumberParser.AskProvider(provider);
+            ulong bits;
+            int outcome = NumberParser.ScanWholeNumber(s, (int)style, 4, 65535UL, 0UL, out bits);
+            if (outcome != NumberParser.Done) NumberParser.Refuse(outcome, s, "Value was either too large or too small for a UInt16.");
+            return (ushort)bits;
+        }
+
+#if LAMELLA_SURFACE_NETFX_2_0
+        public static bool TryParse(string s, out ushort result)
+        {
+            result = 0;
+            if ((object)s == null) return false;
+            ulong bits;
+            if (NumberParser.ScanWholeNumber(s, (int)NumberStyles.Integer, 4, 65535UL, 0UL, out bits) != NumberParser.Done) return false;
+            result = (ushort)bits;
+            return true;
+        }
+
+        public static bool TryParse(string s, NumberStyles style, IFormatProvider provider, out ushort result)
+        {
+            NumberParser.CheckWholeNumberStyle(style);
+            result = 0;
+            if ((object)s == null) return false;
+            NumberParser.AskProvider(provider);
+            ulong bits;
+            if (NumberParser.ScanWholeNumber(s, (int)style, 4, 65535UL, 0UL, out bits) != NumberParser.Done) return false;
+            result = (ushort)bits;
+            return true;
+        }
+#endif
     }
 }

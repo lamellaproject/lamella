@@ -1,9 +1,11 @@
 //! Implicit conversions (ECMA-334 1st ed, 13.1).
 
 use crate::special::SpecialType;
-use crate::symbols::{Model, TypeKind};
+use crate::symbols::{Model, TypeKind, Variance};
 use crate::types::TypeSymbol;
+use alloc::boxed::Box;
 use alloc::vec::Vec;
+use lamella_syntax::version::LanguageVersion;
 
 /// Whether `ty` is BY-REF-LIKE -- a `ref struct` (C# 7.2), declared here or imported.
 ///
@@ -41,6 +43,16 @@ fn is_reference_target(model: &Model, to: &TypeSymbol) -> bool {
 /// reference conversions that walk `model`'s inheritance graph (13.1).
 #[must_use]
 pub fn converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+    converts_at_version(model, from, to, model.language_version)
+}
+
+/// The value conversion relation under an explicitly selected language version.
+pub(crate) fn converts_at_version(
+    model: &Model,
+    from: &TypeSymbol,
+    to: &TypeSymbol,
+    version: LanguageVersion,
+) -> bool {
     if matches!(from, TypeSymbol::Special(SpecialType::Void)) {
         return false;
     }
@@ -59,7 +71,7 @@ pub fn converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
     // use the same relation, including interfaces implemented by T.
     if let Some(underlying) = nullable_underlying(from)
         && is_reference_target(model, to)
-        && converts(model, underlying, to)
+        && converts_at_version(model, underlying, to, version)
     {
         return true;
     }
@@ -76,8 +88,7 @@ pub fn converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
         return from == to_underlying || has_implicit_conversion(from, to_underlying);
     }
     has_implicit_conversion(from, to)
-        || reference_conversion(model, from, to)
-        || delegate_to_base(model, from, to)
+        || reference_conversion(model, from, to, version, &mut Vec::new())
 }
 
 /// The UNDERLYING type of `T?`, or `None` when `ty` is not a nullable value type.
@@ -267,9 +278,50 @@ pub(crate) fn is_reference_type(model: &Model, ty: &TypeSymbol) -> bool {
     }
 }
 
-/// An implicit reference conversion from `from` to a base class or implemented
-/// interface, transitively (13.1.4).
-fn reference_conversion(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+/// Identity or an implicit reference conversion, excluding boxing, numeric and
+/// user-defined conversions even when this is an element of a larger conversion.
+fn identity_or_reference_conversion(
+    model: &Model,
+    from: &TypeSymbol,
+    to: &TypeSymbol,
+    version: LanguageVersion,
+    path: &mut Vec<(TypeSymbol, TypeSymbol)>,
+) -> bool {
+    from == to
+        || (is_reference_type(model, from)
+            && is_reference_type(model, to)
+            && reference_conversion(model, from, to, version, path))
+}
+
+/// Reference conversions, and boxing through an implemented interface. Only the
+/// outer conversion may box: array elements and variant arguments recurse through
+/// identity or reference conversions.
+fn reference_conversion(
+    model: &Model,
+    from: &TypeSymbol,
+    to: &TypeSymbol,
+    version: LanguageVersion,
+    path: &mut Vec<(TypeSymbol, TypeSymbol)>,
+) -> bool {
+    if is_object(to) || delegate_to_base(model, from, to) {
+        return true;
+    }
+    if path.iter().any(|(source, target)| source == from && target == to) {
+        return false;
+    }
+    path.push((from.clone(), to.clone()));
+    let answer = reference_conversion_inner(model, from, to, version, path);
+    path.pop();
+    answer
+}
+
+fn reference_conversion_inner(
+    model: &Model,
+    from: &TypeSymbol,
+    to: &TypeSymbol,
+    version: LanguageVersion,
+    path: &mut Vec<(TypeSymbol, TypeSymbol)>,
+) -> bool {
     if let TypeSymbol::Array {
         element: from_element,
         rank: from_rank,
@@ -281,21 +333,96 @@ fn reference_conversion(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bo
         } = to
         {
             return from_rank == to_rank
-                && is_reference_type(model, from_element)
-                && is_reference_type(model, to_element)
-                && converts(model, from_element, to_element);
+                && identity_or_reference_conversion(model, from_element, to_element, version, path);
+        }
+        if let TypeSymbol::Instantiation { definition, arguments } = to {
+            return *from_rank == 1
+                && array_interface(model, definition, version)
+                && matches!(&arguments[..], [target]
+                    if identity_or_reference_conversion(model, from_element, target, version, path));
         }
         return is_array_base_type(to);
     }
-    is_base_type_of(model, to, from)
+
+    let mut stack = alloc::vec![from.clone()];
+    let mut seen = Vec::new();
+    while let Some(ty) = stack.pop() {
+        if &ty == to || variant_conversion(model, &ty, to, version, path) {
+            return true;
+        }
+        if seen.contains(&ty) {
+            continue;
+        }
+        if let Some(info) = model.get_by_symbol(&ty) {
+            stack.extend(info.bases.iter().cloned());
+        }
+        seen.push(ty);
+    }
+    false
+}
+
+/// The vector's generic interfaces, including their base interfaces, by edition.
+fn array_interface(model: &Model, definition: &[Box<str>], version: LanguageVersion) -> bool {
+    let name_matches = matches!(definition, [a, b, c, name]
+        if &**a == "System" && &**b == "Collections" && &**c == "Generic"
+            && ((version >= LanguageVersion::CSharp2
+                    && matches!(&**name, "IList" | "ICollection" | "IEnumerable"))
+                || (version >= LanguageVersion::CSharp5
+                    && matches!(&**name, "IReadOnlyList" | "IReadOnlyCollection"))));
+    if !name_matches {
+        return false;
+    }
+    // A matching name in another assembly is not an interface implemented by an
+    // array. Object identifies the core library, including one compiled from source.
+    let symbol = crate::symbols::definition_symbol(definition, 1);
+    model.get_by_symbol(&symbol).is_some_and(|info| {
+        info.kind == TypeKind::Interface
+            && model.get("System", "Object").is_some_and(|object| info.assembly == object.assembly)
+    })
+}
+
+fn variant_conversion(
+    model: &Model,
+    from: &TypeSymbol,
+    to: &TypeSymbol,
+    version: LanguageVersion,
+    path: &mut Vec<(TypeSymbol, TypeSymbol)>,
+) -> bool {
+    if version < LanguageVersion::CSharp4 {
+        return false;
+    }
+    let (
+        TypeSymbol::Instantiation { definition: source, arguments: from_args },
+        TypeSymbol::Instantiation { definition: target, arguments: to_args },
+    ) = (from, to) else {
+        return false;
+    };
+    if source != target || from_args.len() != to_args.len() {
+        return false;
+    }
+    let definition = crate::symbols::definition_symbol(source, from_args.len());
+    let Some(info) = model.get_by_symbol(&definition) else {
+        return false;
+    };
+    if !matches!(info.kind, TypeKind::Interface | TypeKind::Delegate)
+        || info.type_parameters.len() != from_args.len()
+    {
+        return false;
+    }
+    from_args.iter().zip(to_args).enumerate().all(|(index, (source, target))| {
+        match info.type_parameter_variance.get(index).copied().unwrap_or(Variance::Invariant) {
+            Variance::Invariant => source == target,
+            Variance::Covariant => identity_or_reference_conversion(model, source, target, version, path),
+            Variance::Contravariant => identity_or_reference_conversion(model, target, source, version, path),
+        }
+    })
 }
 
 /// Whether `base` is reachable from `derived` through the model's base list, transitively --
 /// a base class, or an interface `derived` implements (the model carries both in `bases`).
 ///
-/// One walk with two callers on purpose: the implicit reference conversion (13.1.4) and the
-/// test in [`no_conversion_operator_can_exist`] ask the same question of the same graph, and
-/// two spellings of it would be free to drift apart.
+/// This is declared inheritance, without array or variance conversions. The
+/// restrictions on user-defined conversion operators ask about this base list.
 fn is_base_type_of(model: &Model, base: &TypeSymbol, derived: &TypeSymbol) -> bool {
     let mut stack: Vec<TypeSymbol> = match model.get_by_symbol(derived) {
         Some(info) => info.bases.to_vec(),

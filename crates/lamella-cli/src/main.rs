@@ -27,6 +27,7 @@ mod rendered;
 mod text;
 mod tiers;
 mod verdicts;
+mod wifi;
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -56,6 +57,7 @@ fn command(verb: &str, rest: &[String]) -> Option<ExitCode> {
         "boards" => verdicts::boards_command(rest),
         "fit" => verdicts::fit_command(rest),
         "reconcile" => verdicts::reconcile_command(rest),
+        "wifi" => wifi::wifi_command(rest),
         "--version" | "-V" | "version" => version_command(rest),
         _ => return None,
     })
@@ -123,6 +125,10 @@ Usage:
   lamella boards
   lamella fit --board <board> --image-bytes <bytes>
   lamella reconcile --board <board> [--read <name>=<value>...]
+  lamella wifi set <network> --device <device> [--passphrase-stdin | --open] [<settings>]
+  lamella wifi set --device <device> <settings>
+  lamella wifi clear --device <device>
+  lamella wifi show --device <device>
   lamella version
 
 Where should the program go?
@@ -150,7 +156,11 @@ fn syntax(verb: &str) -> Option<String> {
     let lines: Vec<&str> = USAGE
         .lines()
         .map(str::trim_start)
-        .filter(|line| line.strip_prefix("lamella ").and_then(|rest| rest.split(' ').next()) == Some(verb))
+        .filter(|line| {
+            line.strip_prefix("lamella ")
+                .and_then(|rest| rest.strip_prefix(verb))
+                .is_some_and(|after| after.is_empty() || after.starts_with(' '))
+        })
         .collect();
     let (first, rest) = lines.split_first()?;
     Some(rest.iter().fold(format!("Usage: {first}"), |text, line| format!("{text}\n       {line}")))
@@ -165,7 +175,7 @@ mod tests {
     #[test]
     fn the_usage_names_every_verb_the_dispatcher_accepts() {
         for verb in
-            ["devices", "run", "build", "flash", "deploy", "boards", "fit", "reconcile", "version"]
+            ["devices", "run", "build", "flash", "deploy", "boards", "fit", "reconcile", "wifi", "version"]
         {
             assert!(
                 super::USAGE.contains(&format!("lamella {verb}")),
@@ -231,6 +241,20 @@ mod tests {
         assert_eq!(super::syntax("help"), None);
     }
 
+    /// **A COMMAND OF A VERB SHOWS ITS OWN LINES**: `wifi set` its two, and `wifi` all four.
+    #[test]
+    fn a_command_of_a_verb_shows_its_own_line_of_the_usage() {
+        assert_eq!(
+            super::syntax("wifi set").as_deref(),
+            Some(
+                "Usage: lamella wifi set <network> --device <device> [--passphrase-stdin | --open] [<settings>]\n       \
+                 lamella wifi set --device <device> <settings>"
+            )
+        );
+        assert_eq!(super::syntax("wifi").map(|syntax| syntax.lines().count()), Some(4));
+        assert_eq!(super::syntax("wifi sideways"), None);
+    }
+
     /// **EVERY VERB ANSWERS `--help`, INCLUDING ONE THAT TAKES NO OPTIONS.** A verb reading no
     /// arguments would print its table for `--help` and for `--nonsense` alike and exit 0 both
     /// times -- a verb silently swallowing an option, which is the single thing `args`'s own
@@ -252,7 +276,7 @@ mod tests {
 
         let help = vec!["--help".to_owned()];
         let junk = vec!["--surely-no-verb-takes-this".to_owned()];
-        let verbs: [(&str, fn(&[String]) -> std::process::ExitCode); 9] = [
+        let verbs: [(&str, fn(&[String]) -> std::process::ExitCode); 10] = [
             ("version", super::version_command),
             ("boards", super::verdicts::boards_command),
             ("fit", super::verdicts::fit_command),
@@ -262,6 +286,7 @@ mod tests {
             ("flash", super::flash::flash_command),
             ("devices", super::devices::devices_command),
             ("deploy", super::deploy::deploy_command),
+            ("wifi", super::wifi::wifi_command),
         ];
         for (verb, command) in verbs {
             assert_eq!(code(command(&help)), ok, "`lamella {verb} --help` must succeed");

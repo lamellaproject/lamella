@@ -95,10 +95,10 @@
       <_LamellaRhuUnreached>@(_LamellaUnreachedBoard)</_LamellaRhuUnreached>
       <_LamellaRhuBoardUnreached Condition="'$(LamellaTargetBoard)' != '' and $([System.String]::Copy(';$(_LamellaRhuUnreached);').Contains(';$(LamellaTargetBoard);'))">true</_LamellaRhuBoardUnreached>
     </PropertyGroup>
-    <Warning Condition="'$(_LamellaRhuBoardUnreached)' == 'true' and '$(_LamellaRhuBoardFromDevice)' != 'true'" Code="LAMSDK0017" Text="$(LamellaTargetBoard) has no probe route in this SDK yet." />
+    <Warning Condition="'$(_LamellaRhuBoardUnreached)' == 'true' and '$(_LamellaRhuBoardFromDevice)' != 'true'" Code="LAMSDK0017" Text="$(LamellaTargetBoard) has no probe route in this SDK." />
     <Warning Condition="'$(LamellaTargetBoard)' == '' and '@(_LamellaDevice)' == '' and '$(_LamellaListExit)' == '0'"
              Code="LAMSDK0018"
-             Text="This project names no board, and no debug probe or emulator that reaches one of Lamella RHU's boards was found. Attach a debug probe wired to the board, and dotnet run lists it once for each board it reaches; or name the board as LamellaTargetBoard, in the project file or with -p:LamellaTargetBoard=&lt;id&gt; on the dotnet run command line." />
+             Text="This project names no board, and no debug probe or emulator that reaches one of Lamella RHU's boards was found. Attach a debug probe wired to the board, or name the board as LamellaTargetBoard, in the project file or with -p:LamellaTargetBoard=&lt;id&gt; on the dotnet run command line." />
   </Target>
 
   <!-- Lamella RHU's routes (RhuRunRoutes), or, when RHU's targets cannot be read, one item, fault, whose Text says why.
@@ -173,9 +173,9 @@
        with the list, before anything is written to a device. This computer, for a lamella1.0 project
        that names no board, is the list's own first device, and is taken without asking the lamella
        tool. A net11.0 device qualified by the board the project names is that device's unqualified
-       id; a probe for a board that has no probe route in this SDK yet is refused in
+       id; a probe for a board that has no probe route in this SDK is refused in
        those words. -->
-  <Target Name="_LamellaNamedDevice" DependsOnTargets="_LamellaNamedLocalDevice;_LamellaNamedListedDevice" />
+  <Target Name="_LamellaNamedDevice" DependsOnTargets="_LamellaNamedLocalDevice;_LamellaNamedListedDevice;_LamellaRunDeviceBoard" />
 
   <Target Name="_LamellaNamedLocalDevice" Condition="'$(Device)' == 'local' and '$(LamellaTargetBoard)' == '' and '$(TargetFrameworkIdentifier)' == 'Lamella'">
     <ItemGroup>
@@ -208,13 +208,32 @@
     <Error Condition="'@(_LamellaRunDevice)' == '' and '$(_LamellaListFailure)' != ''" Code="LAMSDK0026" Text="$(_LamellaListFailure)" />
     <Error Condition="'@(_LamellaRunDevice)' == '' and '$(_LamellaRhuBoardUnreached)' == 'true' and $(Device.ToLowerInvariant().StartsWith('probe:'))"
            Code="LAMSDK0017"
-           Text="Unable to run this project on the device '$(Device)', which is not one of its devices: $(LamellaTargetBoard) has no probe route in this SDK yet." />
+           Text="Unable to run this project on the device '$(Device)', which is not one of its devices: $(LamellaTargetBoard) has no probe route in this SDK." />
     <Error Condition="'@(_LamellaRunDevice)' == '' and '$(_LamellaDeviceCount)' == '0'"
            Code="LAMSDK0021"
            Text="Unable to run this project on the device '$(Device)', which is not one of its devices. No devices are available for this project." />
     <Error Condition="'@(_LamellaRunDevice)' == '' and '$(_LamellaDeviceCount)' != '0'"
            Code="LAMSDK0021"
            Text="Unable to run this project on the device '$(Device)', which is not one of its devices. Please specify which device to use by passing $(_LamellaDeviceOption) with one of the following values:%0A$(_LamellaDeviceList)%0A%0AExample: $(_LamellaDeviceExample)" />
+  </Target>
+
+  <!-- A debug probe cannot say which board it is wired to, so a project that names no board is not run through one
+       until the board is named: in the device, with each board the list says the probe reaches, or as
+       LamellaTargetBoard. dotnet run cannot ask which board, so it is refused here, for a device named or a file-based
+       app's lone device, before anything is published or written to a board. -->
+  <Target Name="_LamellaRunDeviceBoard" Condition="'$(LamellaTargetBoard)' == ''">
+    <ItemGroup>
+      <_LamellaProbeRunDevice Include="@(_LamellaRunDevice)" Condition="'%(_LamellaRunDevice.Route)' == 'probe'" />
+      <_LamellaProbeBoard Include="%(_LamellaProbeRunDevice.Boards)" />
+    </ItemGroup>
+    <PropertyGroup Condition="'@(_LamellaProbeRunDevice)' != ''">
+      <_LamellaProbeRunDeviceId>@(_LamellaProbeRunDevice)</_LamellaProbeRunDeviceId>
+      <_LamellaProbeBoardList>@(_LamellaProbeBoard->'  $(_LamellaProbeRunDeviceId)/%(Identity)', '%0A')</_LamellaProbeBoardList>
+      <_LamellaDeviceOption Condition="'$(_LamellaDeviceOption)' == ''">the --device argument</_LamellaDeviceOption>
+    </PropertyGroup>
+    <Error Condition="'@(_LamellaProbeRunDevice)' != ''"
+           Code="LAMSDK0031"
+           Text="Unable to run this project on the device '$(_LamellaProbeRunDeviceId)': this project names no board, and a debug probe cannot say which board it is wired to. Please specify the board by passing $(_LamellaDeviceOption) with one of the following values:%0A$(_LamellaProbeBoardList)%0A%0AOr name the board as LamellaTargetBoard, in the project file or with -p:LamellaTargetBoard=&lt;id&gt; on the dotnet run command line." />
   </Target>
 
   <!-- A run on a debug probe runs the image dotnet publish writes, so the run's build ends in a
@@ -243,8 +262,10 @@
   <!-- The command dotnet run starts, after the build.
 
        On a debug probe: the lamella tool, given the manifest of the image the run published and the
-       probe's USB serial number. It writes the image to the board over the probe, starts the program,
-       prints what the program prints, and ends with the program's exit code. A file-based app whose
+       probe's USB serial number, and each flash region the board's package declares as a
+       LamellaFlashRegion item, by its full path. It writes the image to the board over the probe, each
+       region beside it, starts the program, prints what the program prints, and ends with the program's
+       exit code. A file-based app whose
        lone device is a probe has published nothing yet, since dotnet run named no device to its
        build, so the image is published here first.
 
@@ -260,23 +281,38 @@
        Either way the bare double dash ends the tool's arguments, so anything dotnet run appends after
        it is the program's. -->
   <Target Name="_LamellaComputeRunArguments"
-          DependsOnTargets="_LamellaCheckTool;_LamellaFileBasedDevice;_LamellaNamedDevice"
-          Condition="'$(TargetFrameworkIdentifier)' == 'Lamella'">
+          DependsOnTargets="_LamellaRunDeviceChosen;_LamellaProbeRun;_LamellaInterpreterRun"
+          Condition="'$(TargetFrameworkIdentifier)' == 'Lamella'" />
+
+  <Target Name="_LamellaRunDeviceChosen" DependsOnTargets="_LamellaCheckTool;_LamellaFileBasedDevice;_LamellaNamedDevice">
     <PropertyGroup>
       <_LamellaRunDeviceId>@(_LamellaRunDevice)</_LamellaRunDeviceId>
       <_LamellaRunNative>@(_LamellaRunDevice->WithMetadataValue('Model', 'native')->Count())</_LamellaRunNative>
     </PropertyGroup>
-    <MSBuild Condition="'$(_LamellaRunNative)' == '1' and '$(Device)' == ''" Projects="$(MSBuildProjectFullPath)" Targets="Publish" Properties="_IsPublishing=true;PublishAot=true" />
-    <PropertyGroup Condition="'$(_LamellaRunNative)' == '1'">
+  </Target>
+
+  <!-- Both probe routes require a published image before a package prepares regions for the run.
+       A lamella1.0 file-based app publishes here; a net11.0 file-based app publishes when it chooses its device. -->
+  <Target Name="_LamellaProbeRunImage" DependsOnTargets="_LamellaCheckTool">
+    <MSBuild Condition="'$(TargetFrameworkIdentifier)' == 'Lamella' and '$(Device)' == ''" Projects="$(MSBuildProjectFullPath)" Targets="Publish" Properties="_IsPublishing=true;PublishAot=true" />
+    <PropertyGroup>
       <_LamellaRunManifest>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '$(PublishDir)', '$(AssemblyName).elf.manifest.json'))</_LamellaRunManifest>
-      <RunCommand>$(_LamellaTool)</RunCommand>
-      <RunArguments>run --manifest &quot;$(_LamellaRunManifest)&quot; --probe &quot;@(_LamellaRunDevice->'%(Serial)')&quot; --</RunArguments>
-      <RunWorkingDirectory>$(MSBuildProjectDirectory)</RunWorkingDirectory>
     </PropertyGroup>
-    <Error Condition="'$(_LamellaRunNative)' == '1' and !Exists('$(_LamellaRunManifest)')"
+    <Error Condition="!Exists('$(_LamellaRunManifest)')"
            Code="LAMSDK0022"
            Text="There is no image to run on $(_LamellaRunDeviceId): no manifest at '$(_LamellaRunManifest)'. A run on a debug probe publishes the program and runs the image it writes, and a run with the no-build option publishes nothing; run without it." />
-    <PropertyGroup Condition="'$(_LamellaRunNative)' != '1'">
+  </Target>
+
+  <Target Name="_LamellaProbeRun" DependsOnTargets="_LamellaProbeRunImage;_LamellaPrepareFlashRegions" Condition="'$(_LamellaRunNative)' == '1'">
+    <PropertyGroup>
+      <RunCommand>$(_LamellaTool)</RunCommand>
+      <RunArguments>run --manifest &quot;$(_LamellaRunManifest)&quot; --probe &quot;@(_LamellaRunDevice->'%(Serial)')&quot;@(LamellaFlashRegion->' --region &quot;%(FullPath)&quot;', '') --</RunArguments>
+      <RunWorkingDirectory>$(MSBuildProjectDirectory)</RunWorkingDirectory>
+    </PropertyGroup>
+  </Target>
+
+  <Target Name="_LamellaInterpreterRun" Condition="'$(_LamellaRunNative)' != '1'">
+    <PropertyGroup>
       <_LamellaRunDeviceId Condition="'$(_LamellaRunDeviceId)' == ''">$(Device)</_LamellaRunDeviceId>
       <_LamellaRefDirArgument>$([System.Text.RegularExpressions.Regex]::Replace('$(LamellaRefDir)', '(\\+)$', '$1$1'))</_LamellaRefDirArgument>
       <_LamellaRuntimeSupportDirArgument>$([System.Text.RegularExpressions.Regex]::Replace('$(LamellaRuntimeSupportDir)', '(\\+)$', '$1$1'))</_LamellaRuntimeSupportDirArgument>
@@ -292,8 +328,8 @@
        contract, sections 3.3 and 3.4).
 
        On a debug probe, the probe route is this SDK's, as for a lamella1.0 program: the lamella tool, given the
-       manifest in the publish folder and the probe's USB serial number, then the bare double dash, in the project's
-       folder. On an emulator, Lamella RHU composes the command, an executable and its arguments, in its
+       manifest in the publish folder, the probe's USB serial number and each flash region the board's package
+       declares as a LamellaFlashRegion item, then the bare double dash, in the project's folder. On an emulator, Lamella RHU composes the command, an executable and its arguments, in its
        RhuComputeRunCommand, handed the route and the emulator's machine as LamellaDeviceRoute and
        LamellaEmulatorMachine; the lamella tool starts that command, so that the run first says how the program runs,
        as it does on a probe.
@@ -322,16 +358,12 @@
     <MSBuild Condition="'$(Device)' == ''" Projects="$(MSBuildProjectFullPath)" Targets="Publish" Properties="_IsPublishing=true" />
   </Target>
 
-  <Target Name="_LamellaRhuProbeRun" DependsOnTargets="_LamellaCheckTool" Condition="'$(_LamellaRunRoute)' == 'probe'">
+  <Target Name="_LamellaRhuProbeRun" DependsOnTargets="_LamellaProbeRunImage;_LamellaPrepareFlashRegions" Condition="'$(_LamellaRunRoute)' == 'probe'">
     <PropertyGroup>
-      <_LamellaRunManifest>$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '$(PublishDir)', '$(AssemblyName).elf.manifest.json'))</_LamellaRunManifest>
       <RunCommand>$(_LamellaTool)</RunCommand>
-      <RunArguments>run --manifest &quot;$(_LamellaRunManifest)&quot; --probe &quot;@(_LamellaRunDevice->'%(Serial)')&quot; --no-banner --</RunArguments>
+      <RunArguments>run --manifest &quot;$(_LamellaRunManifest)&quot; --probe &quot;@(_LamellaRunDevice->'%(Serial)')&quot; --no-banner@(LamellaFlashRegion->' --region &quot;%(FullPath)&quot;', '') --</RunArguments>
       <RunWorkingDirectory>$(MSBuildProjectDirectory)</RunWorkingDirectory>
     </PropertyGroup>
-    <Error Condition="!Exists('$(_LamellaRunManifest)')"
-           Code="LAMSDK0022"
-           Text="There is no image to run on $(_LamellaRunDeviceId): no manifest at '$(_LamellaRunManifest)'. A run on a debug probe publishes the program and runs the image it writes, and a run with the no-build option publishes nothing; run without it." />
   </Target>
 
   <Target Name="_LamellaRhuEmulatorRoute" Condition="'$(_LamellaRunRoute)' == 'emulator'">

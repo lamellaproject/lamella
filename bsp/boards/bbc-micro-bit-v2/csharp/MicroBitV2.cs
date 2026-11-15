@@ -33,8 +33,9 @@ namespace Lamella.Boards.Bbc
         public static readonly int AccelerometerAddress = (int)BbcMicroBitV2Bindings.LSM303AGR_ADDRESS;
         public static readonly int MagnetometerAddress = (int)BbcMicroBitV2Bindings.LSM303AGR_MAG_ADDRESS;
 
-        /// <summary>The logical bus id of the internal I2C bus (TWI0: SCL P0.08, SDA P0.16), as
-        /// <c>I2cConnectionSettings</c> names it. The on-board sensors and the KL27 interface chip
+        /// <summary>The bus id of the internal I2C bus (SCL P0.08, SDA P0.16), as
+        /// <c>I2cConnectionSettings</c> names it: 0, the number of TWI0, the block that serves it.
+        /// The on-board sensors and the KL27 interface chip
         /// share it, and it runs at <see cref="I2cBusHz"/>.</summary>
         public const int InternalI2cBusId = 0;
 
@@ -82,12 +83,13 @@ namespace Lamella.Boards.Bbc
             Buses.BindI2c(InternalI2cBusId, new I2cDriverFactory(MakeInternalI2c), I2cBusHz);
         }
 
-        /// <summary>The logical bus id of the edge connector's SPI (edge pins 13, 14 and 15: SCK,
-        /// MISO, MOSI), as <c>SpiConnectionSettings</c> names it.</summary>
+        /// <summary>The bus id of the edge connector's SPI (edge pins 13, 14 and 15: SCK, MISO,
+        /// MOSI), as <c>SpiConnectionSettings</c> names it: 2, the number of SPI2, the block that
+        /// serves it.</summary>
         /// <remarks>The edge connector names no chip select for this bus, so its only line is -1:
         /// a device on it is opened with <c>ChipSelectLine</c> -1 and selected through a pin the
         /// program drives itself. Any other line is refused.</remarks>
-        public const int EdgeSpiBusId = 0;
+        public const int EdgeSpiBusId = 2;
 
         private static SpiDriver MakeSpi() { return new Nrf52833SpiDriver(SpiBinding()); }
 

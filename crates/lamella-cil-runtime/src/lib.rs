@@ -41,12 +41,19 @@ pub mod tls;
 pub mod trap;
 pub mod value;
 
+#[cfg(test)]
+mod rectangular_array_tests;
+
+#[cfg(test)]
+mod array_cast_tests;
+
 #[cfg(feature = "exceptions")]
 pub use exception::{exception_tag, tag_is_exact, tag_is_subtype};
 pub use interp::{
     CodeLocation, FrameView, NamedValue, PInvokeArg, PInvokeHostFn, PendingOp, PinEventSource, Ran,
-    Session, Status, Stop, StopReason, Vm, boot_baked, entry_args, run, run_interruptible,
-    run_method, run_serviced, set_wall_clock, take_pending_op, wall_clock_source,
+    Session, Slice, Status, Stop, StopReason, Threads, Vm, Watch, boot_baked, entry_args, run,
+    run_interruptible, run_method, run_serviced, set_wall_clock, take_pending_op,
+    wall_clock_source,
 };
 /// The pin-change event a board's interrupt handler queues, re-exported from the crate that owns
 /// the queue's RULE so an embedder installing a [`PinEventSource`] can name it without taking a
@@ -60,5 +67,5 @@ pub use module::{
 pub use module::verified_image_checksum;
 pub use mount::{DriveType, MountTable, StorageProvider};
 pub use object::{ArrayStorage, Heap, Object, ObjectRef, PrimKind, UnencodableChar};
-pub use trap::{RefusedWith, Trap};
+pub use trap::{RefusedWith, Trap, exit_code};
 pub use value::{Location, Value};

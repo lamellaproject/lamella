@@ -282,7 +282,7 @@ impl DeviceArchitecture {
     /// IHI 0029G, B2.3.4.1: with `PRESENT` clear, *"Bits[31:0] must be RAZ"* -- so a zero word is
     /// the register saying it is not implemented, which is the ordinary case on a component that
     /// predates the register.
-    fn decode(word: u32) -> Option<DeviceArchitecture> {
+    pub(crate) fn decode(word: u32) -> Option<DeviceArchitecture> {
         (word & (1 << 20) != 0).then(|| DeviceArchitecture {
             architect: (word >> 21) as u16 & 0x7ff,
             revision: (word >> 16) as u8 & 0xf,

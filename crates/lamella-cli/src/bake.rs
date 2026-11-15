@@ -91,6 +91,48 @@ pub fn image_of_built(
     board: Option<&str>,
     folders: &crate::folders::Folders,
 ) -> Result<Vec<u8>, String> {
+    let (assembly, references) = built_and_references(path, verb, board, folders)?;
+    bake(assembly, &references, lamella_wire_host::boards::bus_table(board))
+}
+
+/// The baked image of `path`, an assembly a build already made, for `board`, as [`image_of_built`]
+/// bakes it, and the line map of that image ([`shared::source_map`]), from `pdb`, the assembly's
+/// portable PDB: what a debugger is given for a board running Lamella's firmware. The map is built
+/// from the module the image is written from, so its method ids are the image's.
+///
+/// # Errors
+/// As [`image_of_built`], and a symbol file that does not parse.
+pub fn debug_image_of_built(
+    path: &std::path::Path,
+    pdb: &[u8],
+    verb: &str,
+    board: &str,
+    folders: &crate::folders::Folders,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let (assembly, references) = built_and_references(path, verb, Some(board), folders)?;
+    let program = assembly.clone();
+    let mut map = Err("the bake built no module".to_owned());
+    let baked = shared::bake_inspecting(
+        assembly,
+        &references,
+        lamella_wire_host::boards::bus_table(Some(board)),
+        NAME_EACH_LIBRARY,
+        |module, app| map = shared::source_map(module, app, &program, pdb),
+    )?;
+    Ok((baked.image, map?))
+}
+
+/// The assembly at `path`, a build already made, and every assembly its image carries beside it:
+/// the class library's set for `board`, and the libraries beside the program that it references.
+///
+/// # Errors
+/// As [`image_of_built`], but for the bake itself.
+fn built_and_references(
+    path: &std::path::Path,
+    verb: &str,
+    board: Option<&str>,
+    folders: &crate::folders::Folders,
+) -> Result<(Vec<u8>, Vec<Vec<u8>>), String> {
     let read = |path: &std::path::Path| {
         std::fs::read(path).map_err(|error| format!("lamella {verb}: read {}: {error}", path.display()))
     };
@@ -122,7 +164,7 @@ pub fn image_of_built(
         }
     }
     set.refuse_unmet(&assembly, &references).map_err(|why| format!("lamella {verb}: {why}"))?;
-    bake(assembly, &references, lamella_wire_host::boards::bus_table(board))
+    Ok((assembly, references))
 }
 
 #[cfg(test)]

@@ -511,7 +511,12 @@ impl<'a> Lexer<'a> {
         }
 
         let verbatim = c == '@' && matches!(kind, TokenKind::Identifier(_));
-        Token::with_verbatim(kind, Span::new(start as u32, self.position as u32), verbatim)
+        let decimal_integer = matches!(kind, TokenKind::IntegerLiteral { .. })
+            && !matches!(self.source.as_bytes().get(start + 1), Some(b'x' | b'X' | b'b' | b'B'));
+        let mut token =
+            Token::with_verbatim(kind, Span::new(start as u32, self.position as u32), verbatim);
+        token.decimal_integer = decimal_integer;
+        token
     }
 
     /// Whether source at the current position is being included rather than

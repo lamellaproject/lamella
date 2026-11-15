@@ -157,7 +157,8 @@ pub unsafe extern "C" fn lamella_repl_new(
 ///
 /// - a run: `{ "output": string, "exit": number, "kind": string, "persisted": bool }`,
 ///   where `output` is the NEW console output beyond the previous run, `exit` is the
-///   program's exit code (0 for a clean statement/expression, 70 on an unhandled trap),
+///   program's exit code (0 for a clean statement/expression, 134 for an exception it did not
+///   catch, 1 for a trap of the interpreter's own),
 ///   `kind` is `"ran"` (or `"empty"` for a whitespace-only submission), and `persisted`
 ///   says whether the submission joined the transcript;
 /// - a compile failure (or no session yet): `{ "compileError": string }`.

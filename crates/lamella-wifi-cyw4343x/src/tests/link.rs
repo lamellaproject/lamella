@@ -660,3 +660,56 @@ fn the_numbers_the_names_and_the_classes() {
     assert_ne!(LinkState::Down, LinkState::Detached);
     assert_ne!(Security::Wpa2Psk, Security::Wpa3Sae);
 }
+
+#[test]
+fn the_sign_of_a_refused_secret_is_read_by_the_joins_kind() {
+    let timeout = JoinFailure::Supplicant { reason: 15 };
+    let unauthenticated = JoinFailure::Association {
+        status: 1,
+        assoc_status: 0,
+        auth_status: 1,
+    };
+    let others = [
+        JoinFailure::Supplicant { reason: 14 },
+        JoinFailure::Association {
+            status: 1,
+            assoc_status: 5,
+            auth_status: 0,
+        },
+        JoinFailure::Association {
+            status: 3,
+            assoc_status: 0,
+            auth_status: 0,
+        },
+        JoinFailure::Lost {
+            number: 6,
+            reason: 2,
+        },
+        JoinFailure::Timeout,
+        JoinFailure::NotFound,
+        JoinFailure::Mismatch {
+            advertised: Advertised::default(),
+        },
+    ];
+    // A WPA2 join: the handshake's timeout, and nothing else.
+    assert!(timeout.refused_secret(Security::Wpa2Psk));
+    assert!(!unauthenticated.refused_secret(Security::Wpa2Psk));
+    // A WPA3 join: an association failure behind a failed authentication,
+    // whatever the status, and nothing else.
+    assert!(unauthenticated.refused_secret(Security::Wpa3Sae));
+    let another_status = JoinFailure::Association {
+        status: 2,
+        assoc_status: 0,
+        auth_status: 16,
+    };
+    assert!(another_status.refused_secret(Security::Wpa3Sae));
+    assert!(!timeout.refused_secret(Security::Wpa3Sae));
+    // An open join has no secret to refuse.
+    assert!(!timeout.refused_secret(Security::Open));
+    assert!(!unauthenticated.refused_secret(Security::Open));
+    for kind in [Security::Open, Security::Wpa2Psk, Security::Wpa3Sae] {
+        for failure in others {
+            assert!(!failure.refused_secret(kind), "{failure:?} on {kind:?}");
+        }
+    }
+}

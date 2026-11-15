@@ -70,17 +70,16 @@ pub enum LowerError {
         /// The imported seam symbol whose presence made the descriptor necessary.
         seam: alloc::string::String,
     },
-    /// A DISPATCHED call -- `callvirt`, an interface call, `calli`, a delegate invoke -- whose result
-    /// is a value type too wide to return in registers. `Call` and `CallNative` pass a hidden result
-    /// pointer (sret); these four do not, because their own first register is already spoken for by
-    /// the receiver or the target.
+    /// A DISPATCHED call -- `calli` or a delegate invoke -- whose result is a value type too wide to
+    /// return in registers. A direct, virtual or interface call passes a hidden result pointer (sret);
+    /// these two do not, because their own first register is already spoken for by the target.
     ///
     /// **REFUSED RATHER THAN EMITTED, AND THE REASON IS THAT THE WRONG ANSWER IS SILENT.** Without
     /// the convention the callee writes its result through whatever r0 happens to hold and reads
-    /// every argument one register off. Nothing traps; the program computes something. These calls
-    /// were unreachable while a cross-assembly value-type return was mistyped `int32` and the
-    /// verifier rejected the method for that instead -- so this refusal is what keeps a TYPING
-    /// repair from turning a loud refusal into a quiet wrong answer.
+    /// every argument one register off. Nothing traps; the program computes something. A result
+    /// typed as the struct it is, rather than as a word, is what makes these calls reachable, so
+    /// this refusal is what keeps correct typing from turning a loud refusal into a quiet wrong
+    /// answer.
     ///
     /// Carries the call kind, so the message names what cannot be lowered rather than a condition.
     BigStructResultUnsupported {
@@ -304,6 +303,7 @@ fn lower_inst(
         Inst::CopyBlock { .. } | Inst::FillBlock { .. } => {
             return Err(LowerError::CallUnsupported);
         }
+        Inst::Nop => enc.nop(),
         Inst::ConstInt { value, .. } => {
             if let Ok(imm) = u8::try_from(*value) {
                 enc.movs_imm(assign(result), imm)
@@ -384,6 +384,7 @@ fn lower_inst(
         | Inst::FieldLoadNarrow { .. }
         | Inst::FieldStoreNarrow { .. }
         | Inst::FieldAddr { .. }
+        | Inst::NullCheck { .. }
         | Inst::CopyStruct { .. } => return Err(LowerError::CallUnsupported),
         Inst::Call { .. }
         | Inst::CallVirtual { .. }
@@ -770,15 +771,19 @@ fn outgoing_stack_bytes(value_types: &[MirType], args: &[ValueId], start_reg: u8
 /// call is measured at the SAME `start_reg` its lowering hands to [`load_call_args`], so the
 /// reservation always covers the actual overflow: the dispatch kinds (`CallVirtual`/`CallInterface`/
 /// `CallIndirect`) pass their receiver as `args[0]` from r0 (start_reg 0), while an `InvokeDelegate`
-/// to an instance target and a big-struct (sret) `Call` both reserve r0 for the `this`/return pointer
-/// and shift their args to r1.. (start_reg 1). For <=3 args both starts spill zero words, so only a
-/// 4+-arg delegate or sret call grows the area -- every existing frame stays byte-identical.
+/// to an instance target and any big-struct (sret) call -- `Call`, `CallNative`, `CallVirtual` or
+/// `CallInterface` -- reserve r0 for the `this`/return pointer and shift their args to r1..
+/// (start_reg 1). For <=3 args both starts spill zero words, so only a 4+-arg delegate or sret call
+/// grows the area -- every existing frame stays byte-identical.
 fn out_args_bytes(func: &Function) -> u16 {
     func.blocks
         .iter()
         .flat_map(|b| &b.insts)
         .filter_map(|(result, i)| match i {
-            Inst::Call { args, .. } | Inst::CallNative { args, .. }
+            Inst::Call { args, .. }
+            | Inst::CallNative { args, .. }
+            | Inst::CallVirtual { args, .. }
+            | Inst::CallInterface { args, .. }
                 if matches!(
                     func.value_type(*result),
                     Some(MirType::ValueType { size, .. }) if size > 4
@@ -895,6 +900,37 @@ fn emit_reference_null_test(
     enc.cmp_imm(reg, 0).map_err(|_| LowerError::TooManyValues)?;
     enc.b_cond(Cond::Eq, stub);
     Ok(())
+}
+
+/// Leaves in r0 the code pointer of the object in the frame slot `receiver`'s implementation of
+/// vtable slot `vtable_slot` (the Thumb bit set). The descriptor sits in the word below the object,
+/// and the slot's entry `4 * (vtable_slot + 1)` bytes below the descriptor, as an offset from it.
+/// ONE sequence for both forms of [`Inst::CallVirtual`], so a call that returns its result through a
+/// hidden pointer reaches the same slot as one that returns it in registers. Clobbers r1.
+fn emit_virtual_target(
+    enc: &mut Encoder,
+    receiver: u16,
+    vtable_slot: u32,
+) -> Result<(), LowerError> {
+    let entry_offset = vtable_slot
+        .checked_mul(4)
+        .and_then(|x| x.checked_add(4))
+        .filter(|&offset| offset <= 255)
+        .ok_or(LowerError::TooManyValues)?;
+    slot_load(enc, Reg::R0, receiver)?;
+    enc.subs_imm8(Reg::R0, 4)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.ldr_imm(Reg::R0, Reg::R0, 0)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.mov_reg(Reg::R1, Reg::R0);
+    enc.subs_imm8(Reg::R1, entry_offset as u8)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.ldr_imm(Reg::R1, Reg::R1, 0)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.adds(Reg::R0, Reg::R0, Reg::R1)
+        .map_err(|_| LowerError::TooManyValues)?;
+    enc.adds_imm8(Reg::R0, 1)
+        .map_err(|_| LowerError::TooManyValues)
 }
 
 /// Leaves in r0 the code pointer of `tag`'s implementation for the object in the frame slot
@@ -1066,6 +1102,7 @@ fn lower_spilled_inst(
 ) -> Result<Option<u32>, LowerError> {
     match inst {
         Inst::PyIntrinsic { .. } => return Err(LowerError::CallUnsupported),
+        Inst::Nop => enc.nop(),
         Inst::ConstInt {
             ty: MirType::I64 | MirType::F64,
             value,
@@ -1369,25 +1406,7 @@ fn lower_spilled_inst(
             ..
         } => {
             let receiver = *args.first().ok_or(LowerError::CallUnsupported)?;
-            let entry_offset = vtable_slot
-                .checked_mul(4)
-                .and_then(|x| x.checked_add(4))
-                .filter(|&offset| offset <= 255)
-                .ok_or(LowerError::TooManyValues)?;
-            slot_load(enc, Reg::R0, slot(receiver))?;
-            enc.subs_imm8(Reg::R0, 4)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_imm(Reg::R0, Reg::R0, 0)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.mov_reg(Reg::R1, Reg::R0);
-            enc.subs_imm8(Reg::R1, entry_offset as u8)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.ldr_imm(Reg::R1, Reg::R1, 0)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.adds(Reg::R0, Reg::R0, Reg::R1)
-                .map_err(|_| LowerError::TooManyValues)?;
-            enc.adds_imm8(Reg::R0, 1)
-                .map_err(|_| LowerError::TooManyValues)?;
+            emit_virtual_target(enc, slot(receiver), *vtable_slot)?;
             enc.mov_reg(Reg::R12, Reg::R0);
             load_call_args(enc, value_types, slot, args, 0)?;
             enc.blx(Reg::R12);
@@ -1570,6 +1589,10 @@ fn lower_spilled_inst(
             enc.cmp_imm(Reg::R2, 0)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.b_cond(Cond::Ne, body);
+        }
+        Inst::NullCheck { object } => {
+            slot_load(enc, Reg::R0, slot(*object))?;
+            emit_null_test(enc, value_types, *object, Reg::R0, stubs)?;
         }
         Inst::FieldLoad { base, offset } => {
             let two_words = matches!(result_ty, Some(MirType::I64 | MirType::F64));
@@ -2804,6 +2827,7 @@ fn resolve_local_locations(
     func: &Function,
     homes: &SpilledHomes,
     changes: &[Vec<(u32, u16, Option<ValueId>)>],
+    zeroed: &[u16],
     assembled: &lamella_asm_arm32::Assembled,
     func_start: u32,
     transitions: &[(u32, u32)],
@@ -2814,7 +2838,7 @@ fn resolve_local_locations(
     };
     let body_end = body_end.saturating_sub(func_start);
     let spans = frame_spans(transitions, settled, body_end);
-    let mut rows: Vec<(u16, u32, u32, u16)> = Vec::new();
+    let mut rows: Vec<(u16, u32, u32, crate::dwarf::LocalPlace)> = Vec::new();
     for b in 0..func.blocks.len() {
         let Some(block_changes) = changes.get(b) else {
             continue;
@@ -2847,6 +2871,27 @@ fn resolve_local_locations(
             at_slot.push((slot, position.saturating_sub(func_start), value));
         }
         at_slot.sort_by_key(|&(slot, at, _)| (slot, at));
+        for &slot in zeroed {
+            let entered_with_value = block_changes
+                .iter()
+                .any(|&(index, changed, _)| changed == slot && index == 0);
+            if entered_with_value {
+                continue;
+            }
+            let first_change = at_slot
+                .iter()
+                .find(|&&(changed, ..)| changed == slot)
+                .map(|&(_, at, _)| at);
+            let changes_here = block_changes.iter().any(|&(_, changed, _)| changed == slot);
+            let until = match (first_change, changes_here) {
+                (Some(at), _) => at,
+                (None, false) => block_end,
+                (None, true) => continue,
+            };
+            for (start, end, _) in clip_to((block_start, until), &spans) {
+                rows.push((slot, start, end, crate::dwarf::LocalPlace::Zero));
+            }
+        }
         for i in 0..at_slot.len() {
             let (slot, at, value) = at_slot[i];
             let until = at_slot
@@ -2864,13 +2909,13 @@ fn resolve_local_locations(
                 let Ok(here) = u16::try_from(u32::from(offset) + delta) else {
                     continue;
                 };
-                rows.push((slot, start, end, here));
+                rows.push((slot, start, end, crate::dwarf::LocalPlace::Frame(here)));
             }
         }
     }
-    rows.sort_unstable();
+    rows.sort_unstable_by_key(|&(slot, start, ..)| (slot, start));
     let mut located: Vec<crate::dwarf::LocalLocation> = Vec::new();
-    for (slot, start, end, offset) in rows {
+    for (slot, start, end, place) in rows {
         let entry = match located.last_mut() {
             Some(last) if last.slot == slot => last,
             _ => {
@@ -2882,12 +2927,8 @@ fn resolve_local_locations(
             }
         };
         match entry.ranges.last_mut() {
-            Some(last) if last.end == start && last.frame_offset == offset => last.end = end,
-            _ => entry.ranges.push(crate::dwarf::LocalRange {
-                start,
-                end,
-                frame_offset: offset,
-            }),
+            Some(last) if last.end == start && last.place == place => last.end = end,
+            _ => entry.ranges.push(crate::dwarf::LocalRange { start, end, place }),
         }
     }
     located
@@ -2933,22 +2974,15 @@ fn resolve_param_locations(
         let Some(&offset) = homes.slots.get(value.index()) else {
             continue;
         };
-        let mut ranges = Vec::new();
+        let mut ranges: Vec<crate::dwarf::LocalRange> = Vec::new();
         for (start, end, delta) in clip_to((entry, body_end), &spans) {
             let Ok(here) = u16::try_from(u32::from(offset) + delta) else {
                 continue;
             };
+            let place = crate::dwarf::LocalPlace::Frame(here);
             match ranges.last_mut() {
-                Some(crate::dwarf::LocalRange {
-                    end: last_end,
-                    frame_offset,
-                    ..
-                }) if *last_end == start && *frame_offset == here => *last_end = end,
-                _ => ranges.push(crate::dwarf::LocalRange {
-                    start,
-                    end,
-                    frame_offset: here,
-                }),
+                Some(last) if last.end == start && last.place == place => last.end = end,
+                _ => ranges.push(crate::dwarf::LocalRange { start, end, place }),
             }
         }
         if !ranges.is_empty() {
@@ -2969,12 +3003,26 @@ fn spilled_slot_offsets(func: &Function) -> (Vec<u16>, u16) {
         if matches!(func.ret, Some(MirType::ValueType { size, .. }) if size > 4) { 4 } else { 0 };
     let mut used = out.saturating_add(sret_bytes);
     let storage = crate::struct_storage::StorageClasses::of(func);
+    let mut placeholder = alloc::vec![false; func.value_types.len()];
+    for block in &func.blocks {
+        for (result, inst) in &block.insts {
+            if matches!(inst, Inst::Nop) {
+                if let Some(flag) = placeholder.get_mut(result.index()) {
+                    *flag = true;
+                }
+            }
+        }
+    }
     for (value, ty) in func.value_types.iter().enumerate() {
         if let Some(owner) = storage
             .slot_owner(ValueId(value as u32))
             .filter(|owner| owner.index() < value)
         {
             offsets.push(offsets[owner.index()]);
+            continue;
+        }
+        if placeholder[value] {
+            offsets.push(used);
             continue;
         }
         offsets.push(used);
@@ -3368,6 +3416,34 @@ fn lower_spilled_into(
                     continue;
                 }
             }
+            if matches!(func.value_type(*result), Some(MirType::ValueType { size, .. }) if size > 4)
+            {
+                let dispatched = match inst {
+                    Inst::CallVirtual {
+                        slot: vtable_slot,
+                        args,
+                        ..
+                    } => {
+                        let receiver = *args.first().ok_or(LowerError::CallUnsupported)?;
+                        emit_virtual_target(enc, slot(receiver), *vtable_slot)?;
+                        Some(args)
+                    }
+                    Inst::CallInterface { tag, args, .. } => {
+                        let receiver = *args.first().ok_or(LowerError::CallUnsupported)?;
+                        emit_interface_target(enc, &mut pool, slot(receiver), *tag)?;
+                        Some(args)
+                    }
+                    _ => None,
+                };
+                if let Some(args) = dispatched {
+                    enc.mov_reg(Reg::R12, Reg::R0);
+                    slot_addr(enc, Reg::R0, slot(*result))?;
+                    load_call_args(enc, &func.value_types, &slot, args, 1)?;
+                    enc.blx(Reg::R12);
+                    record_safepoint(stack_maps, index, inst_pos, enc.safepoint_label());
+                    continue;
+                }
+            }
             if let Inst::PyIntrinsic { op, args, cache } = inst {
                 match op {
                     lamella_ir::PyOp::Getattr { name } => {
@@ -3732,6 +3808,12 @@ fn lower_spilled_into(
             if let Some(return_pc) = call_pc {
                 record_safepoint(stack_maps, index, inst_pos, return_pc);
             }
+            if matches!(inst, Inst::NullCheck { .. }) {
+                continue;
+            }
+            if matches!(inst, Inst::Nop) {
+                continue;
+            }
             slot_store(enc, Reg::R0, slot(*result), Reg::R2)?;
             if matches!(func.value_type(*result), Some(MirType::I64 | MirType::F64)) {
                 slot_store(enc, Reg::R1, slot(*result) + 4, Reg::R2)?;
@@ -4035,14 +4117,15 @@ enum Assignment {
     Spilled,
 }
 
-/// The first DISPATCHED call in `func` whose result is a value type too wide to return in registers,
-/// named in CIL terms -- or `None`, which is every function today.
+/// The first DISPATCHED call in `func` whose result is a value type too wide to return in registers
+/// and that has no hidden result pointer, named in CIL terms -- or `None`.
 ///
-/// `Call` and `CallNative` implement the sret convention (r0 = &result, arguments shifted to r1..);
-/// `CallVirtual`, `CallInterface`, `CallIndirect` and `InvokeDelegate` do not, because their first
-/// register already carries the receiver or the dispatch target. Emitting one anyway is a SILENT
-/// wrong answer -- see [`LowerError::BigStructResultUnsupported`] -- so it is refused here, where a
-/// program build fails loudly and a library build stubs the method into its report.
+/// `Call`, `CallNative`, `CallVirtual` and `CallInterface` implement the sret convention (r0 =
+/// &result, arguments shifted to r1..); a virtual or interface call finds its target before r0 is
+/// given the pointer. `CallIndirect` and `InvokeDelegate` do not, because their first register
+/// already carries the dispatch target. Emitting one anyway is a SILENT wrong answer -- see
+/// [`LowerError::BigStructResultUnsupported`] -- so it is refused here, where a program build fails
+/// loudly and a library build stubs the method into its report.
 fn big_struct_result_without_sret(func: &Function) -> Option<&'static str> {
     func.blocks
         .iter()
@@ -4053,8 +4136,6 @@ fn big_struct_result_without_sret(func: &Function) -> Option<&'static str> {
                 return None;
             }
             match inst {
-                Inst::CallVirtual { .. } => Some("callvirt"),
-                Inst::CallInterface { .. } => Some("interface call"),
                 Inst::CallIndirect { .. } => Some("calli"),
                 Inst::InvokeDelegate { .. } => Some("delegate invoke"),
                 _ => None,
@@ -4064,11 +4145,26 @@ fn big_struct_result_without_sret(func: &Function) -> Option<&'static str> {
 
 /// Verifies `func` and decides where its values live.
 fn prepare(func: &Function) -> Result<Assignment, LowerError> {
+    prepare_as(func, false)
+}
+
+/// [`prepare`], and with `debug` the rule a Debug build lowers its program's methods by: every value
+/// spilled, so each has a frame slot of its own for the whole function and a debugger can read every
+/// parameter and local wherever it stops, as a .NET Debug build keeps each local in its own home.
+///
+/// The verifier and the wide-result guard run first either way, so a body refused in one build is
+/// refused in the other. EVERY caller deciding a function's assignment must pass the same `debug`:
+/// the stack-map record builder ([`method_record_roots`]) reads its roots from this answer, and a
+/// record built for the register path describes a spilled frame as holding no references.
+fn prepare_as(func: &Function, debug: bool) -> Result<Assignment, LowerError> {
     if let Err(errors) = lamella_ir::verify(func) {
         return Err(LowerError::NotWellFormed { errors });
     }
     if let Some(call) = big_struct_result_without_sret(func) {
         return Err(LowerError::BigStructResultUnsupported { call });
+    }
+    if debug {
+        return Ok(Assignment::Spilled);
     }
     if func.value_types.iter().any(|ty| ty.is_float()) {
         return Ok(Assignment::Spilled);
@@ -4965,8 +5061,8 @@ use crate::stackmaps::{encode_stackmap_record, pinned_values};
 /// live across a safepoint (`any_value_live_across_call`), so a Registers/Mixed frame provably
 /// holds no live reference at any PC a stack walk can observe it at. The record still matters for
 /// those frames: its `frame_words`/`ret_lr_word` carry the walk PAST them.
-fn method_record_roots(func: &Function, externs: &[alloc::string::String]) -> Vec<u16> {
-    if !matches!(prepare(func), Ok(Assignment::Spilled)) {
+fn method_record_roots(func: &Function, externs: &[alloc::string::String], debug: bool) -> Vec<u16> {
+    if !matches!(prepare_as(func, debug), Ok(Assignment::Spilled)) {
         return Vec::new();
     }
     let (offsets, _) = spilled_slot_offsets(func);
@@ -5216,6 +5312,9 @@ pub struct ObjectBuildMode<'a> {
     /// [`Encoder::set_wide_thumb2`]). `false` (an ARMv6-M target) keeps every path byte-identical,
     /// since the widen fires only for an out-of-reach ref.
     pub wide: bool,
+    /// The indices of the functions lowered as a Debug build lowers them (see [`prepare_as`]):
+    /// a program's own methods in a Debug build, and empty otherwise.
+    pub debug_bodies: core::ops::Range<usize>,
 }
 
 /// The `__aeabi_*` soft-float helper for a float arithmetic `Binary` op, keyed by the operand type;
@@ -5840,7 +5939,7 @@ pub fn lower_object(
     extern_syms: &[&str],
 ) -> Result<Vec<u8>, LowerError> {
     let mode =
-        ObjectBuildMode { emit_entry: true, defer_encode: false, qualifiers: &DescQualifiers::default(), wide: false };
+        ObjectBuildMode { emit_entry: true, defer_encode: false, qualifiers: &DescQualifiers::default(), wide: false, debug_bodies: 0..0 };
     lower_object_inner(funcs, names, extern_syms, &[], None, &mode, None).map(|(bytes, ..)| bytes)
 }
 
@@ -5856,7 +5955,7 @@ pub fn lower_object_vtables(
     descriptors: &[TypeMeta],
 ) -> Result<Vec<u8>, LowerError> {
     let mode =
-        ObjectBuildMode { emit_entry: true, defer_encode: false, qualifiers: &DescQualifiers::default(), wide: false };
+        ObjectBuildMode { emit_entry: true, defer_encode: false, qualifiers: &DescQualifiers::default(), wide: false, debug_bodies: 0..0 };
     lower_object_inner(funcs, names, extern_syms, descriptors, None, &mode, None).map(|(bytes, ..)| bytes)
 }
 
@@ -5872,7 +5971,7 @@ pub fn lower_object_vtables_statics(
     statics: &AssemblyStatics,
     qualifiers: &DescQualifiers,
 ) -> Result<Vec<u8>, LowerError> {
-    let mode = ObjectBuildMode { emit_entry: true, defer_encode: false, qualifiers, wide: false };
+    let mode = ObjectBuildMode { emit_entry: true, defer_encode: false, qualifiers, wide: false, debug_bodies: 0..0 };
     lower_object_inner(funcs, names, extern_syms, descriptors, Some(statics), &mode, None)
         .map(|(bytes, ..)| bytes)
 }
@@ -5901,7 +6000,7 @@ pub fn lower_object_vtables_statics_debug(
     qualifiers: &DescQualifiers,
     debug: &crate::debugmap::ObjectDebug,
 ) -> Result<(Vec<u8>, MethodLineTables), LowerError> {
-    let mode = ObjectBuildMode { emit_entry: true, defer_encode: false, qualifiers, wide: false };
+    let mode = ObjectBuildMode { emit_entry: true, defer_encode: false, qualifiers, wide: false, debug_bodies: 0..0 };
     lower_object_inner(
         funcs,
         names,
@@ -5912,6 +6011,33 @@ pub fn lower_object_vtables_statics_debug(
         Some(debug),
     )
     .map(|(bytes, _, lines)| (bytes, lines))
+}
+
+/// The strict PROGRAM object of a build of either kind: [`lower_object_vtables_statics`]'s object,
+/// and with `debug` its debug information too, as [`lower_object_vtables_statics_debug`] emits it.
+///
+/// `debug_bodies` names the functions lowered as a Debug build lowers them: every value in a frame
+/// slot of its own for the whole function, and each local described from the method's entry,
+/// holding zero until it is first stored to. A Release build passes an empty range, and its object
+/// is then the one those two functions produce.
+///
+/// The code does not depend on `debug`. The same `debug_bodies` with and without debug information
+/// lower to the same bytes, which is what lets the ELF a debugger reads and the image a board is
+/// written with come from one lowering.
+#[allow(clippy::too_many_arguments)]
+pub fn lower_program_object(
+    funcs: &[Function],
+    names: &[&str],
+    extern_syms: &[&str],
+    descriptors: &[TypeMeta],
+    statics: &AssemblyStatics,
+    qualifiers: &DescQualifiers,
+    debug: Option<&crate::debugmap::ObjectDebug>,
+    debug_bodies: core::ops::Range<usize>,
+) -> Result<(Vec<u8>, MethodLineTables), LowerError> {
+    let mode = ObjectBuildMode { emit_entry: true, defer_encode: false, qualifiers, wide: false, debug_bodies };
+    lower_object_inner(funcs, names, extern_syms, descriptors, Some(statics), &mode, debug)
+        .map(|(bytes, _, lines)| (bytes, lines))
 }
 
 /// As [`lower_object_vtables_statics`], but DEFERRING instead of failing: a program method whose
@@ -5930,7 +6056,7 @@ pub fn lower_object_vtables_statics_report(
     qualifiers: &DescQualifiers,
     wide: bool,
 ) -> Result<(Vec<u8>, LibraryStubReport), LowerError> {
-    let mode = ObjectBuildMode { emit_entry: true, defer_encode: true, qualifiers, wide };
+    let mode = ObjectBuildMode { emit_entry: true, defer_encode: true, qualifiers, wide, debug_bodies: 0..0 };
     lower_object_inner(funcs, names, extern_syms, descriptors, Some(statics), &mode, None)
         .map(|(bytes, report, _)| (bytes, report))
 }
@@ -5944,7 +6070,7 @@ pub fn lower_object_library(
     extern_syms: &[&str],
 ) -> Result<Vec<u8>, LowerError> {
     let mode =
-        ObjectBuildMode { emit_entry: false, defer_encode: false, qualifiers: &DescQualifiers::default(), wide: false };
+        ObjectBuildMode { emit_entry: false, defer_encode: false, qualifiers: &DescQualifiers::default(), wide: false, debug_bodies: 0..0 };
     lower_object_inner(funcs, names, extern_syms, &[], None, &mode, None).map(|(bytes, ..)| bytes)
 }
 
@@ -5965,7 +6091,7 @@ pub fn lower_object_library_vtables_report(
     qualifiers: &DescQualifiers,
     wide: bool,
 ) -> Result<(Vec<u8>, LibraryStubReport), LowerError> {
-    let mode = ObjectBuildMode { emit_entry: false, defer_encode: false, qualifiers, wide };
+    let mode = ObjectBuildMode { emit_entry: false, defer_encode: false, qualifiers, wide, debug_bodies: 0..0 };
     lower_object_inner(funcs, names, extern_syms, descriptors, statics, &mode, None)
         .map(|(bytes, report, _)| (bytes, report))
 }
@@ -5983,7 +6109,7 @@ pub fn lower_object_library_vtables_deferring(
     qualifiers: &DescQualifiers,
     wide: bool,
 ) -> Result<(Vec<u8>, LibraryStubReport), LowerError> {
-    let mode = ObjectBuildMode { emit_entry: false, defer_encode: true, qualifiers, wide };
+    let mode = ObjectBuildMode { emit_entry: false, defer_encode: true, qualifiers, wide, debug_bodies: 0..0 };
     lower_object_inner(funcs, names, extern_syms, descriptors, statics, &mode, None)
         .map(|(bytes, report, _)| (bytes, report))
 }
@@ -5998,7 +6124,7 @@ pub fn lower_object_library_vtables(
     descriptors: &[TypeMeta],
 ) -> Result<Vec<u8>, LowerError> {
     let mode =
-        ObjectBuildMode { emit_entry: false, defer_encode: false, qualifiers: &DescQualifiers::default(), wide: false };
+        ObjectBuildMode { emit_entry: false, defer_encode: false, qualifiers: &DescQualifiers::default(), wide: false, debug_bodies: 0..0 };
     lower_object_inner(funcs, names, extern_syms, descriptors, None, &mode, None).map(|(bytes, ..)| bytes)
 }
 
@@ -6022,11 +6148,12 @@ fn lower_one_func(
     lines: &mut PendingRows,
     spilled_homes: &mut Option<SpilledHomes>,
     string_header: Option<(u32, i32)>,
+    debug: bool,
 ) -> Result<(), LowerError> {
     if let Err(errors) = lamella_ir::verify(func) {
         return Err(LowerError::NotWellFormed { errors });
     }
-    match prepare(func)? {
+    match prepare_as(func, debug)? {
         Assignment::Registers { regs, saved } => lower_into(
             func,
             enc,
@@ -6405,6 +6532,7 @@ fn emit_object_pass(
             .unwrap_or(&empty_source);
         let mut lines = PendingRows::new();
         let mut spilled_homes: Option<SpilledHomes> = None;
+        let debug_body = mode.debug_bodies.contains(&index);
         if emit_entry && !defer_encode {
             lower_one_func(
                 func,
@@ -6417,6 +6545,7 @@ fn emit_object_pass(
                 &mut lines,
                 &mut spilled_homes,
                 string_header,
+                debug_body,
             )?;
         } else if stubbed.contains(&index) {
             if defer_encode {
@@ -6440,6 +6569,7 @@ fn emit_object_pass(
                 &mut Vec::new(),
                 &mut None,
                 string_header,
+                debug_body,
             ) {
                 Ok(()) => {
                     lower_one_func(
@@ -6453,6 +6583,7 @@ fn emit_object_pass(
                         &mut lines,
                         &mut spilled_homes,
                         string_header,
+                        debug_body,
                     )
                     .expect("a method that lowered in the dry run lowers for real");
                 }
@@ -6667,16 +6798,19 @@ fn emit_object_pass(
             let (Some(homes), Some(func)) = (homes.as_ref(), funcs.get(index)) else {
                 return Vec::new();
             };
-            let Some(changes) = debug
-                .and_then(|d| d.source_maps.get(index))
-                .map(|m| m.local_changes.as_slice())
-            else {
+            let Some(map) = debug.and_then(|d| d.source_maps.get(index)) else {
                 return Vec::new();
+            };
+            let zeroed: &[u16] = if mode.debug_bodies.contains(&index) {
+                &map.zero_until_stored
+            } else {
+                &[]
             };
             resolve_local_locations(
                 func,
                 homes,
-                changes,
+                &map.local_changes,
+                zeroed,
                 &assembled,
                 offsets.get(index).copied().unwrap_or(0),
                 &method_transitions[index],
@@ -6749,7 +6883,7 @@ fn emit_object_pass(
         let ret_lr_word = frame_words - 1;
         let end_off = offsets.get(i + 1).copied().unwrap_or(code_end);
         let code_size = end_off - offsets[i];
-        let roots = method_record_roots(&funcs[i], externs);
+        let roots = method_record_roots(&funcs[i], externs, mode.debug_bodies.contains(&i));
         method_records.push((i, code_size, frame_words, ret_lr_word, roots));
     }
     let smrec_names: Vec<alloc::string::String> = method_records
@@ -8244,6 +8378,7 @@ mod tests {
             rows: vec![vec![2u32, 4, 6]],
             local_changes: vec![Vec::new()],
             arg_values: Vec::new(),
+            zero_until_stored: Vec::new(),
         };
         let (bytes, table) = lower_debug(&func, &source_map).unwrap();
         assert!(!bytes.is_empty());
@@ -12279,7 +12414,7 @@ mod tests {
                 terminator: Some(Terminator::Return(Some(ValueId(0)))),
             }],
         };
-        let record_slots: Vec<u16> = method_record_roots(&func, &[])
+        let record_slots: Vec<u16> = method_record_roots(&func, &[], false)
             .iter()
             .map(|r| (r & 0x3FFF) * 4)
             .collect();
@@ -12343,7 +12478,7 @@ mod tests {
             out_args_bytes(&func) + 4,
             "value 0 must sit above the reserved sret word"
         );
-        let record_slots: Vec<u16> = method_record_roots(&func, &[])
+        let record_slots: Vec<u16> = method_record_roots(&func, &[], false)
             .iter()
             .map(|r| (r & 0x3FFF) * 4)
             .collect();
@@ -12604,10 +12739,10 @@ mod tests {
             }],
         };
         let externs = [alloc::string::String::from("lamella_thread_recv_poll")];
-        let roots = method_record_roots(&seam, &externs);
+        let roots = method_record_roots(&seam, &externs, false);
         assert_eq!(roots, vec![STACKMAP_KIND_PINNED << 14]);
         let externs = [alloc::string::String::from("lamella_console_write")];
-        let roots = method_record_roots(&seam, &externs);
+        let roots = method_record_roots(&seam, &externs, false);
         assert_eq!(roots, vec![STACKMAP_KIND_OBJECT_REF << 14]);
     }
 
@@ -13484,8 +13619,8 @@ mod tests {
             roots: Vec::new(),
         };
         let maps = [
-            crate::cil::CilSourceMap { rows: vec![vec![7]], local_changes: vec![Vec::new()], arg_values: Vec::new() },
-            crate::cil::CilSourceMap { rows: vec![vec![7]], local_changes: vec![Vec::new()], arg_values: Vec::new() },
+            crate::cil::CilSourceMap { rows: vec![vec![7]], local_changes: vec![Vec::new()], arg_values: Vec::new(), zero_until_stored: Vec::new() },
+            crate::cil::CilSourceMap { rows: vec![vec![7]], local_changes: vec![Vec::new()], arg_values: Vec::new(), zero_until_stored: Vec::new() },
         ];
         let points = [(7u32, 11u32, 5u32)];
         let sources = [
@@ -13658,6 +13793,7 @@ mod tests {
             rows: vec![entry_rows, filler_rows, last_rows],
             local_changes: vec![Vec::new(); 3],
             arg_values: Vec::new(),
+            zero_until_stored: Vec::new(),
         };
         (func, source)
     }
@@ -13845,6 +13981,7 @@ mod tests {
             rows: vec![vec![0, 2, 4]],
             local_changes: vec![vec![(2, 0, Some(ValueId(1))), (3, 1, Some(ValueId(2)))]],
             arg_values: Vec::new(),
+            zero_until_stored: Vec::new(),
         }];
         let points = [(0u32, 10u32, 9u32), (2, 11, 9), (4, 12, 9)];
         let methods = [crate::debugmap::MethodSource {
@@ -13926,6 +14063,7 @@ mod tests {
             rows: vec![vec![300, 7, 9]],
             local_changes: vec![Vec::new()],
             arg_values: Vec::new(),
+            zero_until_stored: Vec::new(),
         }];
         let points = [(7u32, 11u32, 9u32)];
         let methods = [crate::debugmap::MethodSource {

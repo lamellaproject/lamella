@@ -52,10 +52,19 @@ a sleep inside.
   join are the same situation: the driver returns to a scan and, when
   the network is seen, re-enters the join at its disassociation step
   with the secret re-supplied, without a ceiling, until the caller
-  disconnects; the two failures it does not retry are the handshake's
-  timeout, the usual sign of a wrong passphrase, and a recovery scan
+  disconnects. A network that does not broadcast its name answers only
+  a scan that asks for it: when a completed scan has not seen the held
+  network, the driver scans once more with the network's name in its
+  probe requests, and the caller's own scan can ask for one name the
+  same way. The one failure the driver does not retry is a recovery scan
   that finds the network advertising no suite the credential can use,
-  which ends the join with that reason. The firmware's own capability
+  which ends the join with that reason. A failed attempt that is the
+  sign of a refused secret -- the handshake's timeout on a WPA2 join, a
+  failed authentication on a WPA3 join -- is retried behind a rest of
+  its own: five seconds, doubled at each such failure in a row up to
+  five minutes, and put back by a join that completes; the caller reads
+  that rest for its own message, and a seed it hands in spreads the
+  rests by up to a fifth. The firmware's own capability
   string can be read once ready. The credentials are the caller's
   slices, held by reference and never printed.
 - **Frames both ways.** While the link is up, every data frame the chip
@@ -129,4 +138,4 @@ feature.
 
 ## License
 
-MIT OR Apache-2.0. Copyright (c) Lamella LLC.
+MIT OR Apache-2.0. Copyright (c) 2026 Lamella LLC.

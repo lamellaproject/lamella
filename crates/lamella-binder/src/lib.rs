@@ -55,7 +55,7 @@ pub use reference::{load_assembly, load_references};
 pub use resolve::{TypeTable, resolve_type};
 pub use special::SpecialType;
 pub use statement::{
-    BoundCatch, BoundDeclarator, BoundStmt, BoundStmtKind, BoundSwitchLabel, BoundSwitchSection,
+    BoundCatch, BoundDeclarator, BoundLabel, BoundStmt, BoundStmtKind, BoundSwitchLabel, BoundSwitchSection,
 };
 pub use symbols::{
     Accessibility, EventSymbol, FieldSymbol, MethodSymbol, Model, PropertySymbol, SignatureCanon,

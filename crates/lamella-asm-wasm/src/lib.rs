@@ -1328,8 +1328,6 @@ mod tests {
 
     /// The saturating truncations are `0xFC` then their index in the core spec's order (5.4.8):
     /// `i32.trunc_sat_f32_s` 0, `_f32_u` 1, `_f64_s` 2, `_f64_u` 3, then the `i64` four at 4..7.
-    /// `lamella-wasm-interp`'s decoder reads the same eight in the same order (`TRUNC_SAT_OPS` in
-    /// its `decode.rs`), so an index off by one here would run as its unsigned or narrower neighbour.
     #[test]
     fn the_saturating_truncations_encode_as_the_fc_prefix_and_their_spec_index() {
         let mut body = Func::new(0);

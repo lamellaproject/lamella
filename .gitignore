@@ -4,8 +4,8 @@
 # Build output of the separate Cargo workspaces under tools/, at any depth.
 /tools/**/target/
 
-# The assemblies that build-managed.ps1 and build-managed.sh write here by default. They are built
-# from the C# sources in this repository and are never committed.
+# The assemblies that csharp/build-managed.ps1 and csharp/build-managed.sh write here by default.
+# They are built from the C# sources in this repository and are never committed.
 /managed/
 
 # Reference specifications. They are fetched locally and never committed.

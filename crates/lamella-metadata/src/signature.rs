@@ -369,6 +369,103 @@ pub enum SigType {
     },
 }
 
+/// The class of value a local of a type holds on the CLI's evaluation stack (III.1.1), where every
+/// integer narrower than 32 bits is widened to [`StackClass::Int32`] and the stack's one
+/// floating-point type, `F`, is kept at its two widths.
+///
+/// What a debugger takes from it is a local's ZERO. A method's locals start zeroed: an object
+/// reference null, and, under the `localsinit` flag C# compilers set, every integer 0 and every
+/// floating-point value 0.0 (I.12.4.1). So a local the method has not stored yet holds its class's
+/// zero, which is the value .NET's own debugger shows for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StackClass {
+    /// `int32`: `bool`, `char`, and each integer type of 32 bits or fewer, signed or not.
+    Int32,
+    /// `int64`: `long` and `ulong`.
+    Int64,
+    /// `native int`: `nint`, `nuint` and an unmanaged pointer.
+    NativeInt,
+    /// `F` at 32 bits: `float`.
+    Float32,
+    /// `F` at 64 bits: `double`.
+    Float64,
+    /// `O`, an object reference: a class, an interface, a delegate, an array, `string` or `object`.
+    ObjectRef,
+}
+
+impl StackClass {
+    /// Every class, in declaration order.
+    pub const ALL: [StackClass; 6] = [
+        StackClass::Int32,
+        StackClass::Int64,
+        StackClass::NativeInt,
+        StackClass::Float32,
+        StackClass::Float64,
+        StackClass::ObjectRef,
+    ];
+
+    /// The C# keyword naming the class's own type: `int`, `long`, `nint`, `float`, `double` or
+    /// `object`.
+    #[must_use]
+    pub const fn keyword(self) -> &'static str {
+        match self {
+            StackClass::Int32 => "int",
+            StackClass::Int64 => "long",
+            StackClass::NativeInt => "nint",
+            StackClass::Float32 => "float",
+            StackClass::Float64 => "double",
+            StackClass::ObjectRef => "object",
+        }
+    }
+
+    /// The class [`Self::keyword`] spells as `word`, or `None` for any other word.
+    #[must_use]
+    pub fn from_keyword(word: &str) -> Option<StackClass> {
+        StackClass::ALL.into_iter().find(|class| class.keyword() == word)
+    }
+}
+
+impl SigType {
+    /// The [`StackClass`] of a value of this type, where the signature alone decides it.
+    ///
+    /// `None` where it does not: for a value type, since an enum's values are integers and any other
+    /// value type's are instances of it, and its token does not say which it names; for a generic
+    /// parameter, which may name a value type or a reference type; and for a managed pointer, a typed
+    /// reference or `void`, which no class here holds.
+    #[must_use]
+    pub fn stack_class(&self) -> Option<StackClass> {
+        match self {
+            SigType::Boolean
+            | SigType::Char
+            | SigType::I1
+            | SigType::U1
+            | SigType::I2
+            | SigType::U2
+            | SigType::I4
+            | SigType::U4 => Some(StackClass::Int32),
+            SigType::I8 | SigType::U8 => Some(StackClass::Int64),
+            SigType::IntPtr | SigType::UIntPtr | SigType::Pointer(_) => Some(StackClass::NativeInt),
+            SigType::R4 => Some(StackClass::Float32),
+            SigType::R8 => Some(StackClass::Float64),
+            SigType::String
+            | SigType::Object
+            | SigType::Class(_)
+            | SigType::SzArray(_)
+            | SigType::Array { .. } => Some(StackClass::ObjectRef),
+            SigType::GenericInst { definition, .. } => match **definition {
+                SigType::Class(_) => Some(StackClass::ObjectRef),
+                _ => None,
+            },
+            SigType::ValueType(_)
+            | SigType::Var(_)
+            | SigType::MVar(_)
+            | SigType::ByRef(_)
+            | SigType::TypedByRef
+            | SigType::Void => None,
+        }
+    }
+}
+
 /// Reads a `TypeDefOrRef` token compressed into a signature (II.23.2.8): a
 /// compressed integer whose low two bits are the tag (TypeDef/TypeRef/TypeSpec).
 fn read_type_def_or_ref(reader: &mut Reader) -> Result<Token, SigError> {
@@ -653,6 +750,71 @@ pub fn parse_local_var_sig(blob: &[u8]) -> Result<Vec<SigType>, SigError> {
 mod tests {
     use super::*;
     use crate::tables::table;
+
+    /// Each type a local can be declared with takes the class its values have on the stack, and a
+    /// type whose class its signature does not decide takes none.
+    #[test]
+    fn a_types_stack_class_is_the_one_its_values_take() {
+        let class = |token: Token| SigType::Class(token);
+        let value_type = |token: Token| SigType::ValueType(token);
+        let a_type = Token::new(table::TYPE_REF, 1);
+        let int32 = [
+            SigType::Boolean,
+            SigType::Char,
+            SigType::I1,
+            SigType::U1,
+            SigType::I2,
+            SigType::U2,
+            SigType::I4,
+            SigType::U4,
+        ];
+        for ty in int32 {
+            assert_eq!(ty.stack_class(), Some(StackClass::Int32), "{ty:?}");
+        }
+        assert_eq!(SigType::I8.stack_class(), Some(StackClass::Int64));
+        assert_eq!(SigType::U8.stack_class(), Some(StackClass::Int64));
+        assert_eq!(SigType::IntPtr.stack_class(), Some(StackClass::NativeInt));
+        assert_eq!(SigType::UIntPtr.stack_class(), Some(StackClass::NativeInt));
+        assert_eq!(SigType::Pointer(Box::new(SigType::I4)).stack_class(), Some(StackClass::NativeInt));
+        assert_eq!(SigType::R4.stack_class(), Some(StackClass::Float32));
+        assert_eq!(SigType::R8.stack_class(), Some(StackClass::Float64));
+        let references = [
+            SigType::String,
+            SigType::Object,
+            class(a_type),
+            SigType::SzArray(Box::new(SigType::I4)),
+            SigType::Array { element: Box::new(SigType::I4), rank: 2 },
+            SigType::GenericInst { definition: Box::new(class(a_type)), arguments: vec![SigType::I4] },
+        ];
+        for ty in references {
+            assert_eq!(ty.stack_class(), Some(StackClass::ObjectRef), "{ty:?}");
+        }
+        let undecided = [
+            value_type(a_type),
+            SigType::GenericInst { definition: Box::new(value_type(a_type)), arguments: vec![SigType::I4] },
+            SigType::Var(0),
+            SigType::MVar(0),
+            SigType::ByRef(Box::new(SigType::I4)),
+            SigType::TypedByRef,
+            SigType::Void,
+        ];
+        for ty in undecided {
+            assert_eq!(ty.stack_class(), None, "{ty:?}");
+        }
+    }
+
+    /// Each class's keyword names it and no other, and a word that is no class's keyword names none.
+    #[test]
+    fn a_stack_class_is_named_by_its_keyword() {
+        let keywords: Vec<&str> = StackClass::ALL.into_iter().map(StackClass::keyword).collect();
+        assert_eq!(keywords, ["int", "long", "nint", "float", "double", "object"]);
+        for class in StackClass::ALL {
+            assert_eq!(StackClass::from_keyword(class.keyword()), Some(class));
+        }
+        for word in ["", "Int32", "struct", "string", "bool", "int "] {
+            assert_eq!(StackClass::from_keyword(word), None, "{word:?}");
+        }
+    }
 
     #[test]
     fn primitive_types() {

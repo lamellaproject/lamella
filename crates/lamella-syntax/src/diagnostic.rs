@@ -211,6 +211,8 @@ pub enum DiagnosticKind {
     EmbeddedStatementCannotBeDeclaration,
     /// A block or similar construct was not closed by the required `}`.
     CloseBraceExpected,
+    /// CS0178: an implicit array rank contains a size expression.
+    InvalidRankSpecifier,
     /// A token appeared in a class/struct/interface member declaration where a member name
     /// (or `operator`/`this`) was required, so it can begin no member (clause 17).
     InvalidTokenInMemberDeclaration {
@@ -428,6 +430,7 @@ impl DiagnosticKind {
             DiagnosticKind::SemicolonExpected => 1002,
             DiagnosticKind::EmbeddedStatementCannotBeDeclaration => 1023,
             DiagnosticKind::CloseBraceExpected => 1513,
+            DiagnosticKind::InvalidRankSpecifier => 178,
             DiagnosticKind::InvalidTokenInMemberDeclaration { .. } => 1519,
             DiagnosticKind::DuplicateModifier { .. } => 1004,
             DiagnosticKind::PartialModifierPosition => 267,
@@ -590,6 +593,9 @@ impl fmt::Display for DiagnosticKind {
                 f.write_str("Embedded statement cannot be a declaration or labeled statement")
             }
             DiagnosticKind::CloseBraceExpected => f.write_str("} expected"),
+            DiagnosticKind::InvalidRankSpecifier => {
+                f.write_str("Invalid rank specifier: expected ',' or ']'")
+            }
             DiagnosticKind::InvalidTokenInMemberDeclaration { token } => {
                 write!(f, "Invalid token '{token}' in a member declaration")
             }

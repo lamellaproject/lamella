@@ -14,5 +14,8 @@ lamella-syntax = { path = "../lamella-syntax" }
 lamella-metadata = { path = "../lamella-metadata" }
 lamella-token = { path = "../lamella-token" }
 
+[dev-dependencies]
+lamella-pe = { path = "../lamella-pe" }
+
 [lints]
 workspace = true

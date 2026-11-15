@@ -1,0 +1,303 @@
+# BOARD binding: the Adafruit Metro RP2350 with PSRAM (product 6267), an RP2350B board in the Metro
+# format. Board truth ONLY: role bindings and the wiring. Chip truth lives in csp/rp2350/.
+#
+# This is bsp/boards/adafruit-metro-rp2350 with its PSRAM spot fitted, and the part is the one
+# difference: an 8 MB QSPI PSRAM on the flash's clock and data lines, its select on GP47. A separate
+# board rather than a variant flag, because the two answer one USB identity and the board's model
+# number is what tells them apart.
+#
+# The PSRAM region states no part. The schematic is shared with the product that leaves the spot
+# empty and values it DNP, and product 6267's page gives the PSRAM's size and no part, so the row
+# gives the window and the size and leaves the part's name to a document that prints one.
+#
+# The I2C bus is I2C0 on GP20 and GP21, not on GP4 and GP5. The header's SDA and SCL positions, the
+# STEMMA QT connector and the HSTX connector are one bus there, so a program opens bus 0; GP4 and GP5
+# are the header's D4 and D5.
+#
+# The SPI bus is SPI1, on the six-pin ICSP header alone: MISO on GP28, SCK on GP30 and MOSI on GP31,
+# with no chip select of the board's, so a device is opened on bus 1 with ChipSelectLine -1 and the
+# program drives the select pin it chose. The header's D10 to D13 positions are plain GPIO lines here
+# (GP10, GP11, GP22 and GP23), where an UNO carries its SPI bus.
+#
+# The red LED is on GP23, the header's 13 position, not on the Pico's GP25: GP25 is the NeoPixel's
+# data line. The BOOT button reads on GP24, and the same press pulls the flash's select low through a
+# diode, which is how the ROM sees it at reset.
+#
+# The converter's channels follow the header: A0 to A5 are GP41 to GP46, channels 1 to 6. Channel 0's
+# pad, GP40, is the microSD socket's card-detect line, and channel 7's, GP47, is the PSRAM's select,
+# so neither is offered as an analog input.
+#
+# Not modeled: the microSD socket's SPI (SPI0 on GP34 to GP39) as a bus a program opens, the 22-pin
+# HSTX connector, the USB host port (its power switch on GP29 and its data lines on GP32 and GP33),
+# and which way the RX/TX switch is set.
+
+[table]
+kind = "board"
+board = "adafruit-metro-rp2350-psram"
+vendor = "adafruit"
+maker = "Adafruit"
+product = "Metro RP2350 with PSRAM"
+family = "rp2350"
+part = "rp2350b"
+product_model = 69          # lamella_wire::product_model::METRO_RP2350_PSRAM
+sources = [
+    "Adafruit Metro RP2350 schematic: the EAGLE file 'Adafruit Metro RP2350.sch' of the board's published design files (github.com/adafruit/Adafruit-Metro-RP2350-PCB at commit d8e135da6ee3383372035fb6ac2bb9387eec1233), shared by products 6003 and 6267. Its parts and nets are read below by designator and net name: X4 is the RP2350 in its RP2350B package, U6 the flash, U3 the PSRAM, Y1 the crystal, L the red LED, LED2 the NeoPixel, SW3 the BOOT button, SW4 the RX/TX switch, X1 the microSD socket, CONN1 the STEMMA QT connector, CN1 the HSTX connector, IOL, IOH and AD the header's digital-low, digital-high and analog strips, ICSP the six-pin SPI header, X3 the USB Type C socket, DEBUG the SWD connector.",
+    "Adafruit product 6267 (Adafruit Metro RP2350 with PSRAM), offered beside product 6003 as the version 'with PSRAM': 'RP2350 main chip, 150MHz clock, 3.3V logic', '16 MB of QSPI Flash for program storage', '8 MB of QSPI PSRAM for extra dynamic memory', and a 'Pico Probe debug port - 3 pin JST SH compatible'.",
+]
+notes = [
+    "GP47 is the PSRAM's chip select. In the schematic the net PSRAM_CS joins GPIO47, the select of U3 and R6 (10K) to 3.3V, so the select rests high.",
+    "The header's positions, by the schematic's three strips: IOL pins 1 to 6 are D7 down to D2 on GPIO7 down to GPIO2, and its pins 7 and 8 are the nets TXD and RXD, which reach GPIO0 and GPIO1 only through SW4; IOH pins 10 down to 7 are D8 to D11 on GPIO8 to GPIO11, pins 6 and 5 the nets D22 and D23 on GPIO22 and GPIO23, pin 2 SDA and pin 1 SCL on GPIO20 and GPIO21; AD pins 1 to 6 are A0 to A5 on GPIO41 to GPIO46.",
+    "The RX/TX switch SW4 is a two-pole, two-throw part between the header and the chip's UART0. Its pole P1 is the net RXD (IOL pin 8) and P2 the net TXD (IOL pin 7); one throw joins RXD to GPIO0 and TXD to GPIO1, the other RXD to GPIO1 and TXD to GPIO0. Which pin of the chip sits behind each of the two positions is therefore the switch's to say, not this row's.",
+    "The I2C lines carry the board's own pull-ups: R10 (10K) holds SDA and R13 (10K) holds SCL at 3.3V.",
+    "The microSD socket X1 is on SPI0's pads: the nets SCK/SDIO_CLK on GPIO34, MOSI/SDIO_CMD on GPIO35, MISO/SDIO_DAT0 on GPIO36, SDIO_DAT1 on GPIO37, SDIO_DAT2 on GPIO38 and SDCS/SDIO_DAT3 on GPIO39, which R3 (10K) holds at 3.3V; its CARD_DETECT contact is the net SD_DETECT on GPIO40.",
+    "Y1 is a 12 MHz crystal: the schematic values it '12MHz_10pF_50ohm' across XIN and XOUT (XOUT through R23).",
+]
+
+# --- memory: what the board fits beside the chip. The RP2350B's own SRAM is chip truth, stated in
+#     csp/rp2350/parts.toml. ---
+
+[[memory]]                  # the RP2350 has NO internal flash (chip flash = 0, gate-pinned) --
+name = "flash"              # the 16 MB QSPI chip it XIPs from is BOARD truth.
+kind = "flash"
+size = 0x1000000
+source = "The schematic's U6, an eight-pin QSPI flash valued W25Q128 on the RP2350's QSPI lines with the net QSPI_CS (the RP2350's QSPI_CS pin) as its select. Product 6267: 16 MB of QSPI Flash. 16 MB = 0x1000000."
+
+# The PSRAM shares the flash's clock and four data lines and has a select of its own, GP47 (the
+# `psram-cs` row below), so it answers in the QSPI memory interface's second window: 0x11000000,
+# chip select 1's, beside the flash's 0x10000000. That address is the window's cached view; the XIP
+# cache sits in front of both windows, and the same bytes read uncached at 0x15000000. Nothing
+# answers there at reset: the interface's window 1 must first be told the part's commands and
+# timing and GP47 routed to it, and writes reach the part only once XIP_CTRL.WRITABLE_M1 is set.
+[[memory]]
+name = "psram"
+kind = "ram"
+base = 0x11000000
+size = 0x800000             # 8 MB: the whole part.
+controller = "qmi"
+optional = true             # the board boots and runs from its flash and the chip's SRAM without it.
+source = "The schematic's U3, an eight-pin QSPI part, shares QSPI_SCK and QSPI_DATA[0] to QSPI_DATA[3] with the flash U6, and its select is the net PSRAM_CS on GPIO47. Product 6267: 8 MB of QSPI PSRAM, so 8 MB = 0x800000. RP2350 datasheet 4.4.1: the lower half of the XIP address space holds two 16 MB windows, one for each QMI chip select, read cached at 0x10... and uncached at 0x14..., and the XIP_CTRL register's WRITABLE_M1 bit names window 1 as 0x11000000 through 0x11ffffff, which must be made writable 'if a RAM device is attached on QSPI chip select 1'."
+
+# --- the wires, and the peripherals the header names. ---
+
+[[carriers]]
+kind = "native-usb"         # the RP2350B's own USB device controller on the USB-C socket -- no
+                            # bridge, and so no board-fixed bridge identity to state.
+plan = "pll-150-48"
+default = true
+
+[[carriers]]
+kind = "uart"               # the second wire: uart0 on GP0/GP1 through an EXTERNAL bridge (a debug
+role = "uart0"              # probe's UART cable, any USB-UART dongle), at the same operating point
+baud = 115200               # as the usb wire.
+plan = "pll-150-48"
+
+# The schematic's nets D0 and D1 join GPIO0 and GPIO1 to the RX/TX switch SW4, which sends them to the
+# header's RX and TX positions straight or crossed.
+[[bindings]]
+role = "uart0"
+kind = "uart"
+instance = "uart0"
+function = "F2"
+tx = { pin = "GP0" }
+rx = { pin = "GP1" }
+
+# The schematic's nets MISO, SCK and MOSI join GPIO28, GPIO30 and GPIO31 to the ICSP header's pins 1,
+# 3 and 4, and no net joins a select of SPI1's to any position.
+[[bindings]]
+role = "spi1"
+kind = "spi"
+instance = "spi1"
+function = "F1"
+mosi = { pin = "GP31" }
+sck = { pin = "GP30" }
+miso = { pin = "GP28" }
+
+[[bindings]]
+role = "i2c0"
+kind = "i2c"
+instance = "i2c0"
+function = "F3"
+sda = { pin = "GP20" }
+scl = { pin = "GP21" }
+
+[[bindings]]
+role = "adc"
+kind = "adc"
+instance = "adc"
+reference_uv = 3300000
+source = "The schematic: the RP2350's ADC_AVDD pin is the net ADC_AVDD, fed from 3.3V through R4 (200) with C1 (2.2uF) to ground. The analog strip AD carries A0 to A5 on GPIO41 to GPIO46, the converter's ADC1 to ADC6."
+
+# --- PWM: each slice on the pair of GPIOs no other line here claims ---------------------------------
+#
+# Each output of slices 0 to 7 appears on two GPIOs, GPn and GPn+16 (datasheet 12.5.2, Table 1130),
+# so which one a slice drives is a board's choice. Each pair below is clear of the uart0, spi1 and
+# i2c0 pins and of the board's own lines, the lower pair where it is clear: slices 1 to 5 drive the
+# header's D2 to D11. PWM0 is on GP16/GP17 because GP0/GP1 is uart0; GP12 to GP17 are HSTX connector
+# pins. Slices 8 to 11, on GP32 to GP47, are not bound: their pairs are the USB host port's, the
+# microSD socket's and the converter's pads. The chip a program passes to PwmChannel.Create is the
+# slice.
+
+[[bindings]]
+role = "pwm0"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 0
+a = { pin = "GP16" }
+b = { pin = "GP17" }
+
+[[bindings]]
+role = "pwm1"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 1
+a = { pin = "GP2" }
+b = { pin = "GP3" }
+
+[[bindings]]
+role = "pwm2"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 2
+a = { pin = "GP4" }
+b = { pin = "GP5" }
+
+[[bindings]]
+role = "pwm3"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 3
+a = { pin = "GP6" }
+b = { pin = "GP7" }
+
+[[bindings]]
+role = "pwm4"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 4
+a = { pin = "GP8" }
+b = { pin = "GP9" }
+
+[[bindings]]
+role = "pwm5"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 5
+a = { pin = "GP10" }
+b = { pin = "GP11" }
+
+[[bindings]]
+role = "pwm6"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 6
+a = { pin = "GP12" }
+b = { pin = "GP13" }
+
+[[bindings]]
+role = "pwm7"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 7
+a = { pin = "GP14" }
+b = { pin = "GP15" }
+
+# --- control lines -----------------------------------------------------------------------------
+#
+# The red LED is active high: GP23 reaches the LED's anode through R11 and the cathode is at ground,
+# so the pin sources the current and a one lights it. The NeoPixel's data line carries a timed
+# serial protocol rather than a level, so its row states the pin and no level, and a driver -- not
+# this row -- owns the waveform.
+#
+# The BOOT button's line has no pull-up of the board's: SW3 grounds it and the diode D3 points into
+# it, so the pad needs the chip's own pull-up to read high while the button is up.
+#
+# The PSRAM's select is `reserved`. Once the PSRAM is brought up, the QSPI memory interface drives
+# GP47 as its chip select 1, and a program that opened the pin as a GPIO would take the select away
+# from the PSRAM and from everything held in it; so a program's GPIO controller refuses it, as it
+# refuses a radio's lines. The card-detect line is stated because it is a converter pad the board
+# spends on the socket; it is not reserved, so a program may open it as a GPIO.
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "GP23"
+active = "high"
+source = "The schematic: the net D23 joins GPIO23, the header strip IOH's pin 5 (the 13 position), and R11 (2.2K), whose other end is the anode of L, a RED LED whose cathode is at ground. A one on the pin lights it."
+
+[[devices]]
+name = "neopixel"
+kind = "gpio-out"
+pin = "GP25"
+active = "none"
+source = "The schematic: the net NEOPIX joins GPIO25 to the data input DI of LED2, a WS2812B addressable RGB LED on 3.3V. The line carries the LED's timed serial protocol, which has no asserted level, so none is stated."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "GP24"
+active = "low"
+pull = "up"
+source = "The schematic: the net USBBOOT joins GPIO24, one side of SW3 (whose other side is ground), the test point TP1 and the cathode of D3, a 1N4148 whose anode reaches the flash's select QSPI_CS through R26 (1K). No resistor holds USBBOOT, so the pin reads LOW while the button is held and needs a pull-up to read high otherwise; the same press pulls QSPI_CS low through D3 and R26, which the RP2350 samples at reset."
+
+[[devices]]
+name = "sd-card-detect"
+kind = "gpio-in"
+pin = "GP40"
+active = "unknown"
+source = "The schematic: the net SD_DETECT joins GPIO40 to the CARD_DETECT contact (pad 9) of X1, the microSD socket (part 104031-0811), and to nothing else, so no resistor of the board's holds it. The schematic does not give the contact's level with a card seated."
+
+[[devices]]
+name = "psram-cs"
+kind = "gpio-out"
+pin = "GP47"
+active = "low"
+reserved = true
+source = "The schematic: the net PSRAM_CS joins GPIO47 to the select of U3, the PSRAM, and to R6 (10K) on 3.3V, so the select rests high, which deselects the part, and a low selects it. RP2350 datasheet: GPIO47_CTRL's FUNCSEL 0x09 is XIP_SS_N_1, the QSPI memory interface's chip select 1, and section 5.2.8 calls the QSPI chip select 'an active-low signal'."
+
+# --- the STEMMA QT connector: the I2C0 bus, brought out whole -----------------------------------
+
+[[connectors]]
+name = "qt"
+standard = "stemma-qt"
+source = "The schematic's CONN1, a STEMMA QT connector, carries the nets SDA (GPIO20) and SCL (GPIO21), 3.3V and ground; the same two nets reach the header strip IOH's pins 2 and 1 and the HSTX connector CN1's pins 21 and 20."
+
+[[connectors.qt.buses]]
+signal = "i2c"
+role = "i2c0"
+
+# --- the clock plan: Y1 is a 12 MHz crystal, as the schematic states. ---
+
+[[plans]]
+name = "pll-150-48"         # the operating point: clk_sys 150 MHz off
+default = true              # PLL_SYS, clk_usb/clk_adc 48 MHz off PLL_USB, clk_peri left
+source = "xosc"             # crystal-exact (state-and-verify: generation checks
+xosc_hz = 12000000          # hz == xosc * fbdiv / (postdiv1 * postdiv2) per PLL).
+clk_peri_hz = 12000000
+clk_sys_hz = 150000000
+clk_usb_hz = 48000000
+clk_adc_hz = 48000000
+pll_sys_fbdiv = 125
+pll_sys_postdiv1 = 5
+pll_sys_postdiv2 = 2
+pll_usb_fbdiv = 100
+pll_usb_postdiv1 = 5
+pll_usb_postdiv2 = 5
+
+[debug]
+signals = ["swd"]
+exposure = "header"
+fitted = "yes"
+onboard = "none"
+recovery = "mask-rom"
+source = "The schematic's DEBUG, a three-pin JST SH connector, carries the net SWCLK on pin 1, ground on pin 2 and the net SWDIO on pin 3, each net from the RP2350's pin of the same name, so a probe cable lands on it with no tools; product 6267 lists a Pico Probe debug port, 3 pin JST SH compatible. There is no on-board debug probe. RP2350 datasheet section 4.1: the mask ROM is a physically immutable memory resource, so the recovery path is in silicon and no image written to flash can remove it."
+
+[csharp_interpreter]
+optimization = "speed"

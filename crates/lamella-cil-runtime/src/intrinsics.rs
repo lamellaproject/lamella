@@ -686,6 +686,16 @@ pub fn string_create_from_chars(
     Ok(Some(Value::Object(reference)))
 }
 
+/// Offset from a string's logical native address to its first UTF-16 code unit.
+/// Native conversions already name that unit, so no object-header adjustment is needed.
+pub fn runtime_helpers_offset_to_string_data(
+    _vm: &mut Vm,
+    _module: &Module,
+    _args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    Ok(Some(Value::Int32(0)))
+}
+
 /// `System.String.GetPinnableReference()`: the managed pointer to the string's first UTF-16
 /// code unit -- what modern C# `fixed (char* p = s)` lowers to and pins. The pointer is
 /// symbolic ([`Location::StringChar`]): `conv.u` keeps it, pointer arithmetic walks its byte
@@ -2782,17 +2792,21 @@ pub use extended::*;
 
 /// `System.Object.ReferenceEquals(object, object)`: reference identity (two nulls are
 /// equal; a null and an object are not). Value-type arguments arrive boxed, so distinct
-/// boxes compare unequal -- matching .NET. A Kernel-Profile member.
+/// boxes compare unequal -- matching .NET. Reflection handles name their canonical
+/// objects across assembly references. A Kernel-Profile member.
 ///
 /// # Errors
 /// Never; the signature matches the intrinsic ABI.
 pub fn object_reference_equals(
     _vm: &mut Vm,
-    _module: &Module,
+    module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
     let same = match (args.first(), args.get(1)) {
         (Some(Value::Object(left)), Some(Value::Object(right))) => left == right,
+        (Some(Value::NativeInt(left)), Some(Value::NativeInt(right))) => {
+            reflect_handles_equal(module, *left, *right)
+        }
         (Some(Value::Null), Some(Value::Null)) => true,
         _ => false,
     };
@@ -3558,7 +3572,7 @@ fn scalar_text(value: &Value) -> String {
 }
 
 /// `System.Delegate.Combine(a, b)`: a delegate whose invocation list is a's followed by
-/// b's (multicast, the `+=` operator). A null operand contributes nothing.
+/// b's (multicast, the `+=` operator). A null operand leaves the other operand unchanged.
 ///
 /// The result's TYPE is the first operand's, falling back to the second's, so combining onto a
 /// null source still carries one. That is what makes the cast in `(D)Delegate.Combine(a, b)` --
@@ -3572,13 +3586,17 @@ pub fn delegate_combine(
     _module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
+    let mut invocations = delegate_list(vm, args.first());
+    let following = delegate_list(vm, args.get(1));
+    if invocations.is_empty() {
+        return Ok(Some(if following.is_empty() { Value::Null } else { args[1].clone() }));
+    }
+    if following.is_empty() {
+        return Ok(Some(args[0].clone()));
+    }
     let type_id = delegate_operand_type(vm, args.first())
         .or_else(|| delegate_operand_type(vm, args.get(1)));
-    let mut invocations = delegate_list(vm, args.first());
-    invocations.extend(delegate_list(vm, args.get(1)));
-    if invocations.is_empty() {
-        return Ok(Some(Value::Null));
-    }
+    invocations.extend(following);
     let reference = vm.heap_mut().alloc_multicast(invocations, type_id);
     Ok(Some(Value::Object(reference)))
 }
@@ -6184,6 +6202,21 @@ pub fn aead_import_key(
     Ok(Some(Value::Int32(vm.insert_native_key(key))))
 }
 
+/// Resolves both managed reference representations to a heap-backed monitor identity.
+/// Reflection handles use the same canonical identity as `Object.ReferenceEquals`.
+/// A constructed type handle requires a resolved type identity.
+fn monitor_object(vm: &mut Vm, module: &Module, value: Option<&Value>) -> Result<ObjectRef, Trap> {
+    match value {
+        Some(Value::Object(object)) => Ok(*object),
+        Some(Value::NativeInt(handle)) => {
+            let identity = canonical_reflect_handle(module, *handle)
+                .ok_or(Trap::TypeMismatch(Opcode::Call))?;
+            Ok(vm.reflection_monitor(identity))
+        }
+        _ => Err(Trap::TypeMismatch(Opcode::Call)),
+    }
+}
+
 /// `System.Threading.Monitor.EnterLock(object)`: acquires the per-object lock for the running
 /// thread. If the object is free or already owned by this thread (a recursive `lock`) the thread
 /// holds it and proceeds into the critical section. On contention the thread is queued in the lock's
@@ -6194,12 +6227,10 @@ pub fn aead_import_key(
 /// [`Trap::TypeMismatch`] if the argument is not an object reference.
 pub fn monitor_enter(
     vm: &mut Vm,
-    _module: &Module,
+    module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
-    let Some(&Value::Object(obj)) = args.first() else {
-        return Err(Trap::TypeMismatch(Opcode::Call));
-    };
+    let obj = monitor_object(vm, module, args.first())?;
     let thread = vm.current_thread_id();
     if !vm.lock_acquire(obj.0, thread) {
         vm.request_block_on_lock(None);
@@ -6219,12 +6250,10 @@ pub fn monitor_enter(
 /// if the running thread does not own the lock.
 pub fn monitor_exit(
     vm: &mut Vm,
-    _module: &Module,
+    module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
-    let Some(&Value::Object(obj)) = args.first() else {
-        return Err(Trap::TypeMismatch(Opcode::Call));
-    };
+    let obj = monitor_object(vm, module, args.first())?;
     let thread = vm.current_thread_id();
     if !vm.lock_is_owner(obj.0, thread) {
         return Err(Trap::SynchronizationLock);
@@ -6243,12 +6272,10 @@ pub fn monitor_exit(
 /// [`Trap::TypeMismatch`] if the argument is not an object reference.
 pub fn monitor_try_enter(
     vm: &mut Vm,
-    _module: &Module,
+    module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
-    let Some(&Value::Object(obj)) = args.first() else {
-        return Err(Trap::TypeMismatch(Opcode::Call));
-    };
+    let obj = monitor_object(vm, module, args.first())?;
     let thread = vm.current_thread_id();
     Ok(Some(Value::Int32(i32::from(vm.lock_try(obj.0, thread)))))
 }
@@ -6262,10 +6289,8 @@ pub fn monitor_try_enter(
 /// # Errors
 /// [`Trap::TypeMismatch`] if the argument is not an object reference; [`Trap::SynchronizationLock`]
 /// if the running thread does not own the lock (the `SynchronizationLockException` site).
-pub fn monitor_wait(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
-    let Some(&Value::Object(obj)) = args.first() else {
-        return Err(Trap::TypeMismatch(Opcode::Call));
-    };
+pub fn monitor_wait(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let obj = monitor_object(vm, module, args.first())?;
     let thread = vm.current_thread_id();
     if !vm.lock_is_owner(obj.0, thread) {
         return Err(Trap::SynchronizationLock);
@@ -6291,12 +6316,10 @@ pub fn monitor_wait(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Opt
 /// [`Trap::TypeMismatch`] if the arguments are not `(object, int)`.
 pub fn monitor_try_enter_timeout(
     vm: &mut Vm,
-    _module: &Module,
+    module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
-    let Some(&Value::Object(obj)) = args.first() else {
-        return Err(Trap::TypeMismatch(Opcode::Call));
-    };
+    let obj = monitor_object(vm, module, args.first())?;
     let Some(&Value::Int32(millis)) = args.get(1) else {
         return Err(Trap::TypeMismatch(Opcode::Call));
     };
@@ -6326,10 +6349,8 @@ pub fn monitor_try_enter_timeout(
 /// # Errors
 /// [`Trap::TypeMismatch`] if the arguments are not `(object, int)`; [`Trap::SynchronizationLock`]
 /// if the running thread does not own the lock.
-pub fn monitor_wait_timeout(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
-    let Some(&Value::Object(obj)) = args.first() else {
-        return Err(Trap::TypeMismatch(Opcode::Call));
-    };
+pub fn monitor_wait_timeout(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let obj = monitor_object(vm, module, args.first())?;
     let Some(&Value::Int32(millis)) = args.get(1) else {
         return Err(Trap::TypeMismatch(Opcode::Call));
     };
@@ -6365,10 +6386,8 @@ pub fn monitor_wait_timed_out(vm: &mut Vm, _module: &Module, _args: &[Value]) ->
 /// # Errors
 /// [`Trap::TypeMismatch`] for a non-object argument; [`Trap::SynchronizationLock`] if the running
 /// thread does not own the lock.
-pub fn monitor_pulse(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
-    let Some(&Value::Object(obj)) = args.first() else {
-        return Err(Trap::TypeMismatch(Opcode::Call));
-    };
+pub fn monitor_pulse(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+    let obj = monitor_object(vm, module, args.first())?;
     let thread = vm.current_thread_id();
     if !vm.lock_is_owner(obj.0, thread) {
         return Err(Trap::SynchronizationLock);
@@ -6385,12 +6404,10 @@ pub fn monitor_pulse(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Op
 /// thread does not own the lock.
 pub fn monitor_pulse_all(
     vm: &mut Vm,
-    _module: &Module,
+    module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
-    let Some(&Value::Object(obj)) = args.first() else {
-        return Err(Trap::TypeMismatch(Opcode::Call));
-    };
+    let obj = monitor_object(vm, module, args.first())?;
     let thread = vm.current_thread_id();
     if !vm.lock_is_owner(obj.0, thread) {
         return Err(Trap::SynchronizationLock);
@@ -6413,17 +6430,34 @@ pub fn wait_for_pending_finalizers(
     Ok(None)
 }
 
-/// `System.Type.GetTypeFromHandle(RuntimeTypeHandle)`: a type handle IS the Type in this
-/// runtime (the type's token); identity.
+/// `System.Type.GetTypeFromHandle(RuntimeTypeHandle)`: a Type reference is a representative
+/// metadata handle. Equal resolved types share that handle even when named by different rows
+/// or assemblies, so an object-reference comparison also observes the same Type.
 ///
 /// # Errors
 /// Never errors.
 pub fn type_from_handle(
-    _vm: &mut Vm,
-    _module: &Module,
+    vm: &mut Vm,
+    module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
+    if let Some(&Value::NativeInt(handle)) = args.first() {
+        return Ok(Some(type_reference(vm, module, handle as u64)));
+    }
     Ok(Some(args.first().cloned().unwrap_or(Value::Null)))
+}
+
+/// Produces one reference per resolved type, regardless of the token that supplied it.
+/// Metadata tokens stay unchanged: their consumers still check a direct record before a
+/// canonical fallback. Only the Type value handed to managed code is interned here.
+fn type_reference(vm: &mut Vm, module: &Module, handle: u64) -> Value {
+    let handle = handle as i64;
+    let representative = match canonical_reflect_handle(module, handle) {
+        Some(CastElem::Named(canonical)) => canonical as i64,
+        Some(identity) => vm.reflection_type_handle(identity, handle),
+        None => handle,
+    };
+    Value::NativeInt(representative)
 }
 
 /// `System.Object.GetType()`: the receiver's runtime `Type`, modeled (like `typeof`) as the
@@ -6476,7 +6510,7 @@ pub fn object_get_type(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<O
             }
         })
         .ok_or(Trap::TypeMismatch(Opcode::Callvirt))?;
-    Ok(Some(Value::NativeInt(handle as i64)))
+    Ok(Some(type_reference(vm, module, handle)))
 }
 
 /// `System.Enum.Parse(Type, string)`: the enum constant named by the string, boxed.
@@ -6524,11 +6558,11 @@ pub fn enum_is_defined(
                 )
                 .is_some(),
             Some(Object::Boxed { value, .. }) => enum_underlying(value)
-                .is_some_and(|n| module.enum_value_name_by_handle(token, n).is_some()),
+                .is_some_and(|n| module.enum_value_name_resolved(token, n).is_some()),
             _ => false,
         },
         Some(other) => enum_underlying(other)
-            .is_some_and(|n| module.enum_value_name_by_handle(token, n).is_some()),
+            .is_some_and(|n| module.enum_value_name_resolved(token, n).is_some()),
         None => false,
     };
     Ok(Some(Value::Int32(i32::from(defined))))
@@ -6981,7 +7015,8 @@ fn element_is_value_type(module: &Module, handle: u64) -> Option<bool> {
     match module.cast_elem(handle) {
         Some(CastElem::Prim(_) | CastElem::GenericValueType) => return Some(true),
         Some(
-            CastElem::String | CastElem::Object | CastElem::Array(_) | CastElem::VectorInterface(_),
+            CastElem::String | CastElem::Object | CastElem::Array(_) | CastElem::MdArray { .. }
+            | CastElem::VectorInterface(_),
         ) => return Some(false),
         _ => {}
     }
@@ -7562,7 +7597,7 @@ pub fn type_get_methods(
 /// [`Trap::TypeMismatch`] if `this` is not a member handle.
 #[cfg(feature = "reflection")]
 pub fn member_declaring_type(
-    _vm: &mut Vm,
+    vm: &mut Vm,
     module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
@@ -7574,13 +7609,13 @@ pub fn member_declaring_type(
         .and_then(|method| module.method_type(method))
         .and_then(|type_id| module.type_handle_of(type_id));
     Ok(Some(match declaring {
-        Some(type_handle) => Value::NativeInt(type_handle as i64),
+        Some(type_handle) => type_reference(vm, module, type_handle),
         None => Value::Null,
     }))
 }
 
 pub fn member_get_type(
-    _vm: &mut Vm,
+    vm: &mut Vm,
     module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
@@ -7588,7 +7623,7 @@ pub fn member_get_type(
         return Err(Trap::TypeMismatch(Opcode::Callvirt));
     };
     Ok(Some(match module.member_type(handle as u64) {
-        Some(type_handle) => Value::NativeInt(type_handle as i64),
+        Some(type_handle) => type_reference(vm, module, type_handle),
         None => Value::Null,
     }))
 }
@@ -7599,7 +7634,7 @@ pub fn member_get_type(
 /// # Errors
 /// [`Trap::TypeMismatch`] if the receiver is not a recorded type handle.
 pub fn type_get_base_type(
-    _vm: &mut Vm,
+    vm: &mut Vm,
     module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
@@ -7607,7 +7642,7 @@ pub fn type_get_base_type(
     Ok(Some(if info.base_handle == 0 {
         Value::Null
     } else {
-        Value::NativeInt(info.base_handle as i64)
+        type_reference(vm, module, info.base_handle)
     }))
 }
 
@@ -7695,7 +7730,7 @@ pub fn assembly_get_type(
         return Ok(Some(Value::Null));
     };
     Ok(Some(match module.type_handle_by_name(&name) {
-        Some(handle) => Value::NativeInt(handle as i64),
+        Some(handle) => type_reference(vm, module, handle),
         None => Value::Null,
     }))
 }
@@ -7786,7 +7821,7 @@ pub fn assembly_get_types(
     let elements: Vec<Value> = module
         .assembly_types(asm)
         .iter()
-        .map(|&handle| Value::NativeInt(handle as i64))
+        .map(|&handle| type_reference(vm, module, handle))
         .collect();
     let array = vm.heap_mut().alloc_array(elements);
     Ok(Some(Value::Object(array)))
@@ -8188,7 +8223,7 @@ pub fn method_parameter_count(
 /// Never errors.
 #[cfg(feature = "reflection")]
 pub fn method_parameter_type(
-    _vm: &mut Vm,
+    vm: &mut Vm,
     module: &Module,
     args: &[Value],
 ) -> Result<Option<Value>, Trap> {
@@ -8198,7 +8233,7 @@ pub fn method_parameter_type(
         _ => return Ok(Some(Value::Null)),
     };
     Ok(Some(match module.method_params(handle as u64).get(index) {
-        Some(param) => Value::NativeInt(param.type_handle as i64),
+        Some(param) => type_reference(vm, module, param.type_handle),
         None => Value::Null,
     }))
 }
@@ -8257,7 +8292,7 @@ fn reflect_operand(arg: Option<&Value>) -> ReflectOperand {
 fn reflect_operands_equal(module: &Module, left: Option<&Value>, right: Option<&Value>) -> bool {
     match (reflect_operand(left), reflect_operand(right)) {
         (ReflectOperand::Handle(left), ReflectOperand::Handle(right)) => {
-            canonical_reflect_handle(module, left) == canonical_reflect_handle(module, right)
+            reflect_handles_equal(module, left, right)
         }
         (ReflectOperand::Reference(left), ReflectOperand::Reference(right)) => left == right,
         (ReflectOperand::Null, ReflectOperand::Null) => true,
@@ -8265,17 +8300,45 @@ fn reflect_operands_equal(module: &Module, left: Option<&Value>, right: Option<&
     }
 }
 
-/// Canonicalizes a reflection handle for `==`/`!=`. A `Type` reference can arrive via different
-/// tokens for the SAME type (a `TypeRef` vs the defining `TypeDef`, across assemblies -- e.g. a
-/// program's `typeof(int)` vs the corlib `Int32` a field's `FieldType` / a boxed value's `GetType`
-/// resolves to). Resolving each handle to the type's defining-`TypeDef` handle makes `Type ==`
-/// exact type identity, matching .NET's reference equality. A non-type handle (a member's `Field`/
-/// `MethodDef` token, an `Assembly`, an untracked array/pointer `TypeSpec`) has no `TypeId` and is
-/// compared by its own token -- which is exactly the member/assembly identity reflection wants.
-fn canonical_reflect_handle(module: &Module, handle: i64) -> i64 {
-    module
-        .canonical_type_handle(handle as u64)
-        .map_or(handle, |canonical| canonical as i64)
+/// The shared identity of reflection equality and monitors. Declared types use their defining
+/// handle; arrays and pointers use their exact shape with canonical named elements. An unmodeled
+/// constructed type has no proven identity. Member and assembly handles keep their own tokens.
+fn canonical_reflect_handle(module: &Module, handle: i64) -> Option<CastElem> {
+    let handle = handle as u64;
+    if lamella_token::Token(handle as u32).table() == 0x1b
+        && module.type_id_by_handle(handle).is_none()
+    {
+        return canonical_reflect_shape(module, module.cast_elem(handle)?);
+    }
+    Some(CastElem::Named(module.canonical_type_handle(handle).unwrap_or(handle)))
+}
+
+fn reflect_handles_equal(module: &Module, left: i64, right: i64) -> bool {
+    left == right || canonical_reflect_handle(module, left)
+        .zip(canonical_reflect_handle(module, right))
+        .is_some_and(|(left, right)| left == right)
+}
+
+fn canonical_reflect_shape(module: &Module, shape: CastElem) -> Option<CastElem> {
+    use alloc::boxed::Box;
+    Some(match shape {
+        CastElem::Prim(_) | CastElem::String | CastElem::Object | CastElem::Void => shape,
+        CastElem::Named(handle) => {
+            match module.cast_elem(handle) {
+                Some(leaf @ (CastElem::Prim(_) | CastElem::String | CastElem::Object | CastElem::Void)) => leaf,
+                _ => {
+                    module.type_id_by_handle(handle)?;
+                    CastElem::Named(module.canonical_type_handle(handle).unwrap_or(handle))
+                }
+            }
+        }
+        CastElem::Array(element) => CastElem::Array(Box::new(canonical_reflect_shape(module, *element)?)),
+        CastElem::Pointer(element) => CastElem::Pointer(Box::new(canonical_reflect_shape(module, *element)?)),
+        CastElem::MdArray { element, rank } => CastElem::MdArray {
+            element: Box::new(canonical_reflect_shape(module, *element)?), rank,
+        },
+        CastElem::Lenient | CastElem::GenericValueType | CastElem::VectorInterface(_) => return None,
+    })
 }
 
 /// `System.Type.op_Equality` / `System.Reflection.{MemberInfo,FieldInfo,MethodInfo,Assembly}
@@ -8754,7 +8817,7 @@ pub fn constructor_invoke(
 /// Propagates the string-storage refusal for a `Str` argument: an attribute's string comes
 /// from metadata the program wrote, so on the well-formed UTF-8 tier it can name a code unit
 /// that tier cannot hold, exactly as a literal can.
-fn materialize_attr_value(vm: &mut Vm, value: &AttrValue) -> Result<Value, Trap> {
+fn materialize_attr_value(vm: &mut Vm, module: &Module, value: &AttrValue) -> Result<Value, Trap> {
     Ok(match value {
         AttrValue::Int { value, wide } => {
             if *wide {
@@ -8770,11 +8833,11 @@ fn materialize_attr_value(vm: &mut Vm, value: &AttrValue) -> Result<Value, Trap>
         #[cfg(not(feature = "float"))]
         AttrValue::R4(_) | AttrValue::R8(_) => Value::Null,
         AttrValue::Str(units) => Value::Object(vm.heap_mut().alloc_string(units)?),
-        AttrValue::Type(handle) => Value::NativeInt(*handle as i64),
+        AttrValue::Type(handle) => type_reference(vm, module, *handle),
         AttrValue::Array(elements) => {
             let values: Vec<Value> = elements
                 .iter()
-                .map(|element| materialize_attr_value(vm, element))
+                .map(|element| materialize_attr_value(vm, module, element))
                 .collect::<Result<Vec<Value>, Trap>>()?;
             Value::Object(vm.heap_mut().alloc_array(values))
         }
@@ -8799,16 +8862,16 @@ fn instantiate_attribute(
     let mut ctor_args = Vec::with_capacity(attribute.positional.len() + 1);
     ctor_args.push(Value::Object(instance));
     for argument in &attribute.positional {
-        ctor_args.push(materialize_attr_value(vm, argument)?);
+        ctor_args.push(materialize_attr_value(vm, module, argument)?);
     }
     Session::new(module, attribute.ctor, ctor_args)?.run(module, vm)?;
     for (slot, value) in &attribute.named_fields {
-        let materialized = materialize_attr_value(vm, value)?;
+        let materialized = materialize_attr_value(vm, module, value)?;
         vm.heap_mut()
             .set_instance_field(instance, *slot, materialized);
     }
     for (setter, value) in &attribute.named_properties {
-        let materialized = materialize_attr_value(vm, value)?;
+        let materialized = materialize_attr_value(vm, module, value)?;
         Session::new(module, *setter, alloc::vec![Value::Object(instance), materialized])?
             .run(module, vm)?;
     }
@@ -8837,6 +8900,29 @@ pub fn type_property_custom_attributes(
         Some(property_token) => {
             get_custom_attributes(vm, module, &[Value::NativeInt(property_token as i64)])
         }
+        None => Ok(Some(Value::Object(vm.heap_mut().alloc_array(Vec::new())))),
+    }
+}
+
+/// `Type.GetEventCustomAttributes(string, bool)`: instantiates the named event's attributes.
+/// The managed `EventInfo` supplies the declaring type and event name. As with .NET's
+/// `EventInfo.GetCustomAttributes`, the inheritance flag does not traverse overridden events.
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a type handle; propagates attribute ctor traps.
+#[cfg(feature = "reflection")]
+pub fn type_event_custom_attributes(
+    vm: &mut Vm,
+    module: &Module,
+    args: &[Value],
+) -> Result<Option<Value>, Trap> {
+    let Some(&Value::NativeInt(type_handle)) = args.first() else {
+        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+    };
+    match string_value(vm, args.get(1))
+        .and_then(|name| module.type_event_handle(type_handle as u64, &name))
+    {
+        Some(event) => get_custom_attributes(vm, module, &[Value::NativeInt(event as i64)]),
         None => Ok(Some(Value::Object(vm.heap_mut().alloc_array(Vec::new())))),
     }
 }
@@ -9085,14 +9171,26 @@ pub fn md_array_get(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Opt
 ///
 /// # Errors
 /// [`Trap::NullReference`] for a null array; [`Trap::IndexOutOfRange`] if an index is out of
-/// range (or the rank does not match).
-pub fn md_array_set(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+/// range (or the rank does not match); [`Trap::ArrayTypeMismatch`] for a reference incompatible
+/// with the array's recorded element type.
+pub fn md_array_set(vm: &mut Vm, module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
     let Some(&Value::Object(array)) = args.first() else {
         return Err(Trap::NullReference);
     };
     let split = args.len().saturating_sub(1);
     let indices = int_indices(&args[1..split]);
     let value = args.get(split).cloned().unwrap_or(Value::Null);
+    vm.heap().md_array_flat_index(array, &indices)
+        .ok_or_else(|| Trap::IndexOutOfRange(indices.first().copied().unwrap_or(0)))?;
+    if let (Value::Object(reference), Some((_, array_type))) =
+        (&value, vm.heap().md_array_type(array))
+    {
+        if let Some(CastElem::MdArray { element, .. }) = module.cast_elem(array_type) {
+            if !crate::interp::reference_matches_element(module, vm, *reference, &element) {
+                return Err(Trap::ArrayTypeMismatch);
+            }
+        }
+    }
     if vm.heap_mut().md_array_set(array, &indices, value) {
         Ok(None)
     } else {
@@ -9704,6 +9802,10 @@ pub fn decimal_to_double(
 }
 
 #[cfg(test)]
+#[path = "type_identity_tests.rs"]
+mod type_identity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::module::Module;
@@ -9712,6 +9814,162 @@ mod tests {
     use alloc::vec;
     use lamella_cil::{Instruction, MethodBodyImage, Operand};
     use lamella_token::Token;
+
+    #[cfg(feature = "reflection")]
+    #[test]
+    fn event_attributes_have_a_registered_runtime_bridge() {
+        use crate::intrinsic_registry::{intrinsic_by_id, intrinsic_id};
+        let bridge = intrinsic_by_id(intrinsic_id("type_event_custom_attributes"))
+            .expect("event custom attributes need a runtime bridge");
+        let mut vm = Vm::new();
+        let module = Module::new();
+        let name = vm.heap_mut().alloc_string(&"Missing".encode_utf16().collect::<Vec<_>>()).unwrap();
+        let value = bridge(&mut vm, &module, &[
+            Value::NativeInt(0x0200_0001), Value::Object(name), Value::Int32(0),
+        ]).expect("missing event returns an empty attribute array");
+        let Some(Value::Object(array)) = value else { panic!("attribute array") };
+        assert_eq!(vm.heap().array_len(array), Some(0));
+        assert_eq!(bridge(&mut vm, &module, &[Value::Null]), Err(Trap::TypeMismatch(Opcode::Callvirt)));
+    }
+
+    #[test]
+    fn reference_equals_recognizes_type_handle_identity() {
+        let mut module = Module::new();
+        let first = module.add_type(vec![]);
+        let second = module.add_type(vec![]);
+        module.bind_type_token(0, Token(0x0200_0001), first);
+        module.bind_type_token(1, Token(0x0100_0001), first);
+        module.bind_type_token(1, Token(0x0200_0001), second);
+        let mut vm = Vm::new();
+        let handle = |asm, token| Value::NativeInt(crate::module::asm_key(asm, token) as i64);
+        let first_type = type_from_handle(&mut vm, &module, &[handle(0, 0x0200_0001)])
+            .unwrap().unwrap();
+        let alias = type_from_handle(&mut vm, &module, &[handle(1, 0x0100_0001)])
+            .unwrap().unwrap();
+        let other = type_from_handle(&mut vm, &module, &[handle(1, 0x0200_0001)])
+            .unwrap().unwrap();
+        for (a, b, expected) in [
+            (first_type.clone(), first_type.clone(), 1),
+            (first_type.clone(), alias.clone(), 1),
+            (alias, first_type.clone(), 1),
+            (first_type.clone(), other, 0),
+            (first_type.clone(), Value::Null, 0),
+            (Value::Null, first_type, 0),
+        ] {
+            assert_eq!(
+                object_reference_equals(&mut vm, &module, &[a, b]),
+                Ok(Some(Value::Int32(expected)))
+            );
+        }
+    }
+
+    #[test]
+    fn type_from_handle_returns_one_reference_for_each_resolved_type() {
+        for frozen in [false, true] {
+            for reverse in [false, true] {
+                let mut module = Module::new();
+                let named = module.add_type(vec![]);
+                module.bind_type_token(0, Token(0x0200_0001), named);
+                module.bind_type_token(1, Token(0x0100_0007), named);
+                let mut handles = vec![(0x0200_0001, crate::asm_key(1, 0x0100_0007))];
+                for (row, element) in [
+                    CastElem::Array(Box::new(CastElem::Prim(crate::CastPrim::I4))),
+                    CastElem::Array(Box::new(CastElem::Prim(crate::CastPrim::U4))),
+                    CastElem::MdArray { element: Box::new(CastElem::String), rank: 2 },
+                    CastElem::MdArray { element: Box::new(CastElem::String), rank: 3 },
+                    CastElem::Pointer(Box::new(CastElem::Prim(crate::CastPrim::I4))),
+                    CastElem::Pointer(Box::new(CastElem::Prim(crate::CastPrim::U4))),
+                ].into_iter().enumerate() {
+                    let row = row as u32;
+                    let first = Token(0x1b00_0001 + row);
+                    let alias = Token(0x1b00_0011 + row);
+                    module.bind_cast_elem(0, first, element.clone());
+                    module.bind_cast_elem(1, alias, element);
+                    handles.push((u64::from(first.0), crate::asm_key(1, alias.0)));
+                }
+                for asm in [0, 1] {
+                    module.bind_cast_elem(asm, Token(0x1b00_00ff), CastElem::Lenient);
+                }
+                if frozen { module.freeze(); }
+                let mut vm = Vm::new();
+                let instance = Value::Object(vm.heap_mut().alloc_instance(named, vec![]));
+                let runtime_type = object_get_type(&mut vm, &module, &[instance]).unwrap();
+                assert_eq!(type_from_handle(&mut vm, &module, &[
+                    Value::NativeInt(crate::asm_key(1, 0x0100_0007) as i64),
+                ]).unwrap(), runtime_type);
+                let mut references = Vec::new();
+                for (first, alias) in handles {
+                    let (first, alias) = if reverse { (alias, first) } else { (first, alias) };
+                    let a = type_from_handle(&mut vm, &module, &[Value::NativeInt(first as i64)]).unwrap();
+                    let b = type_from_handle(&mut vm, &module, &[Value::NativeInt(alias as i64)]).unwrap();
+                    assert_eq!(a, b, "raw reference identity, frozen={frozen}, reverse={reverse}");
+                    assert!(!references.contains(&a), "different exact types must stay distinct");
+                    references.push(a);
+                }
+                for asm in [0, 1] {
+                    let unknown = Value::NativeInt(crate::asm_key(asm, 0x1b00_00ff) as i64);
+                    assert_eq!(type_from_handle(&mut vm, &module, &[unknown.clone()]), Ok(Some(unknown)));
+                }
+                assert_eq!(type_from_handle(&mut vm, &module, &[Value::Null]), Ok(Some(Value::Null)));
+            }
+        }
+    }
+
+    #[test]
+    fn reference_equals_keeps_boxed_native_values_distinct() {
+        let module = Module::new();
+        let mut vm = Vm::new();
+        let first = Value::Object(vm.heap_mut().alloc_boxed(7, Value::NativeInt(42)));
+        let second = Value::Object(vm.heap_mut().alloc_boxed(7, Value::NativeInt(42)));
+        for (a, b, expected) in [
+            (first.clone(), first.clone(), 1),
+            (first.clone(), second, 0),
+            (first, Value::NativeInt(42), 0),
+            (Value::Null, Value::Null, 1),
+        ] {
+            assert_eq!(
+                object_reference_equals(&mut vm, &module, &[a, b]),
+                Ok(Some(Value::Int32(expected)))
+            );
+        }
+    }
+
+    #[test]
+    fn delegate_combination_with_null_preserves_operand_identity() {
+        let module = Module::new();
+        let mut vm = Vm::new();
+        let single = vm.heap_mut().alloc_delegate(Value::Null, 7, Some(1));
+        let multiple = vm.heap_mut()
+            .alloc_multicast(vec![(Value::Null, 7), (Value::Null, 8)], Some(1));
+        for reference in [single, multiple] {
+            let operand = Value::Object(reference);
+            for arguments in [[Value::Null, operand.clone()], [operand.clone(), Value::Null]] {
+                assert_eq!(delegate_combine(&mut vm, &module, &arguments), Ok(Some(operand.clone())));
+            }
+        }
+        assert_eq!(
+            delegate_combine(&mut vm, &module, &[Value::Null, Value::Null]),
+            Ok(Some(Value::Null)),
+        );
+    }
+
+    #[test]
+    fn delegate_combination_of_non_null_operands_creates_an_ordered_copy() {
+        let module = Module::new();
+        let mut vm = Vm::new();
+        let left = vm.heap_mut().alloc_delegate(Value::Null, 7, Some(1));
+        let right = vm.heap_mut().alloc_delegate(Value::Null, 8, Some(1));
+        let combined = delegate_combine(&mut vm, &module, &[Value::Object(left), Value::Object(right)]);
+        let Ok(Some(Value::Object(result))) = combined else {
+            panic!("expected a delegate");
+        };
+        assert_ne!(result, left);
+        assert_ne!(result, right);
+        assert_eq!(vm.heap().delegate_invocations(result), Some(&[(Value::Null, 7), (Value::Null, 8)][..]));
+        assert_eq!(vm.heap().delegate_type_id(result), Some(1));
+        assert_eq!(vm.heap().delegate_invocations(left), Some(&[(Value::Null, 7)][..]));
+        assert_eq!(vm.heap().delegate_invocations(right), Some(&[(Value::Null, 8)][..]));
+    }
 
     /// The bit table in [`widens`] answers exactly the relation it encodes -- the widening .NET 8
     /// applies to Array.SetValue and Array.Copy, measured for every pair of the twelve numeric

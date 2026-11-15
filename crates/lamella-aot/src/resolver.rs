@@ -272,10 +272,11 @@ pub(crate) const STRING_TYPEDESC_SYMBOL: &str = "__lamella_string_typedesc";
 /// The runtime seams that ALLOCATE a `System.String` and therefore need [`STRING_TYPEDESC_SYMBOL`]
 /// to hold a real descriptor. Named here so a host refusal can say which one forced the build to
 /// need it.
-pub(crate) const STRING_ALLOCATING_SEAMS: [&str; 5] = [
+pub(crate) const STRING_ALLOCATING_SEAMS: [&str; 6] = [
     "lamella_string_substring",
     "lamella_char_to_string",
     "lamella_double_to_string",
+    "lamella_single_to_string",
     "lamella_double_to_fixed",
     "lamella_double_to_exponential",
 ];
@@ -927,10 +928,18 @@ impl<'a> MetadataResolver<'a> {
     /// **THE PLACEHOLDER MUST NOT BE [`Self::own_call_target`] THERE, AND THAT IS THE WHOLE
     /// JUDGEMENT.** `rid` indexes the OWNER's `MethodDef` table, so a this-assembly function index
     /// names whatever sits at that row HERE -- an unrelated method, and one that LINKS. The
-    /// reference arm names the interface method's own extern symbol instead, which NOTHING EXPORTS,
-    /// an interface method having no body in any object. The ordinary path discards it, since the
-    /// itable routing replaces the instruction; the one path that would use it -- a tag that failed
-    /// to compute, falling through to a direct call -- is a link error rather than a wrong answer.
+    /// reference arm names the interface method's own extern symbol instead.
+    ///
+    /// **A BODY REBASED ONTO ITS OWNER TAKES THE SAME PLACEHOLDER.** It reads the interface's
+    /// assembly as its own, but [`Self::own_call_target`] answers there from the symbols the owner
+    /// exports, and those withhold every method of an open generic type. The corlib's
+    /// `Dictionary<TKey, TValue>` calling through `IEqualityComparer<TKey>` is that shape.
+    ///
+    /// **A CALL WHOSE INTERFACE TAG DOES NOT COMPUTE IS REFUSED, BECAUSE EVERY PLACEHOLDER IS
+    /// CALLABLE.** The itable routing replaces the instruction, so the ordinary path never calls
+    /// the placeholder. But each one names a function that exists and returns -- the interface
+    /// method's stub in the object that declares it -- so a call that fell through to a direct
+    /// call would answer zero rather than fail to link.
     fn instantiated_interface_call(
         &self,
         token: Token,
@@ -948,7 +957,11 @@ impl<'a> MetadataResolver<'a> {
         if !type_def.is_interface() {
             return None;
         }
+        if self.interface_call_tag(&Operand::Token(token)).is_none() {
+            return None;
+        }
         let own = core::ptr::eq(owner, self.assembly);
+        let rebased = own && self.reference_owner.is_some();
         let name = member.name()?;
         let key = param_key(
             self.assembly,
@@ -977,7 +990,7 @@ impl<'a> MetadataResolver<'a> {
         } else {
             None
         };
-        let target = if own {
+        let target = if own && !rebased {
             self.own_call_target(rid)?
         } else {
             let iface_name = owner.type_token_name(type_def.token())?;
@@ -1000,6 +1013,55 @@ impl<'a> MetadataResolver<'a> {
             has_this: signature.has_this,
             result_type,
             target,
+        })
+    }
+
+    /// A `constrained.` call whose constraint is a VALUE-type INSTANTIATION that provides the method
+    /// itself -- `foreach` disposing `Dictionary<TKey, TValue>.Enumerator`, `using` on a generic
+    /// struct -- bound to that instantiation's monomorphized body and called on the byref, with no
+    /// box (ECMA-335 III.2.1's first case).
+    ///
+    /// **THE CALL IS TYPED BY WHAT THE CALL SITE NAMES, AND ONLY ITS TARGET COMES FROM THE STRUCT.**
+    /// The `callvirt` names the declaration it dispatches on -- `IDisposable::Dispose()`,
+    /// `object::ToString()` -- in the caller's own tables, so the arguments and the result are read
+    /// from it exactly as an unconstrained call to it reads them. The body is then the plan's, found
+    /// by the struct's own declaration: the method of the definition with the call's name and
+    /// parameter key, under its declared parameters, which is how the plan records a body.
+    ///
+    /// `None` -- and the box the lowering then takes -- when the constraint is not a value type, the
+    /// definition does not declare the method under that name (an explicit implementation is named
+    /// for its interface), or the plan does not carry the body.
+    fn constrained_instantiation_call(&self, spec: Token, method: Token) -> Option<CallInfo> {
+        let (owner, type_def, _) = self.instantiated_parent(spec)?;
+        if !type_def.is_value_type() {
+            return None;
+        }
+        let named = self.method_owners.resolve_method(method)?;
+        let name = named.name?;
+        let signature = named.signature.as_ref()?;
+        let key = param_key(
+            self.assembly,
+            signature.generic_param_count,
+            &signature.parameters,
+        );
+        let provided = type_def.methods().find(|candidate| {
+            candidate.is_virtual()
+                && candidate.name() == Some(name)
+                && decodable_signature(candidate).is_some_and(|sig| {
+                    param_key(owner, sig.generic_param_count, &sig.parameters) == key
+                })
+        })?;
+        let declared = decodable_signature(&provided)?;
+        let index = self
+            .mono
+            .index_of(&self.spelled_spec(spec)?, name, &declared.parameters)?;
+        let call = self.resolve(&Operand::Token(method))?;
+        Some(CallInfo {
+            args: signature.parameters.len() + 1,
+            has_result: call.has_result,
+            has_this: true,
+            result_type: call.result_type,
+            target: CallTarget::Internal(index),
         })
     }
 
@@ -2318,6 +2380,34 @@ impl<'a> MetadataResolver<'a> {
                 .is_some_and(|name| name.namespace == "System" && name.name == "String")
         })?;
         Some(self.qualified_type_handle(type_ref.token()))
+    }
+
+    /// The identity this build gives a row-free `System` type (a primitive, `String` or `Object`):
+    /// this assembly's definition, else the first reference's. Resolved own-assembly first, as
+    /// [`resolve_value_type_def`] resolves a value type, because a body lowered out of the corlib is
+    /// read against the corlib itself with no references attached. `None` when no assembly in the
+    /// build defines the type.
+    fn row_free_definition(&self, namespace: &str, name: &str) -> Option<TypeHandle> {
+        self.assembly
+            .find_type(namespace, name)
+            .map(|type_def| TypeHandle(type_def.token().0))
+            .or_else(|| {
+                self.find_reference_type(namespace, name)
+                    .map(|(ordinal, _, type_def)| reference_handle(ordinal, type_def.token().0))
+            })
+    }
+
+    /// The description of a `string[]` that no instruction names, as the startup allocates for a
+    /// program's `Main(string[] args)`: the same descriptor a `new string[n]` in the program names,
+    /// so the array is a `string[]` and an `object[]` to every cast. `System.String`'s identity is
+    /// its definition in the build ([`row_free_definition`](Self::row_free_definition)), else the
+    /// one [`string_type_handle`](Self::string_type_handle) gives a build with no references. `None`
+    /// when the build neither defines nor references `System.String`.
+    pub(crate) fn string_array_element(&self) -> Option<ArrayElement> {
+        let string = self
+            .row_free_definition("System", "String")
+            .or_else(|| self.string_type_handle())?;
+        Some(row_free_array_element("System", "String", string))
     }
 
     /// `System.Array`'s own [`TypeMeta`] -- the vtable EVERY array type dispatches through.
@@ -4557,23 +4647,8 @@ impl<'a> MetadataResolver<'a> {
     fn substituted_array_element(&self, spec: Token) -> Option<ArrayElement> {
         let closed = self.closed_operand_sig(spec)?;
         if let Some((namespace, name)) = row_free_element_name(&closed) {
-            let element = self
-                .assembly
-                .find_type(namespace, name)
-                .map(|type_def| TypeHandle(type_def.token().0))
-                .or_else(|| {
-                    self.find_reference_type(namespace, name)
-                        .map(|(ordinal, _, type_def)| reference_handle(ordinal, type_def.token().0))
-                })?;
-            return Some(ArrayElement {
-                handle: lamella_ir::array_handle(element),
-                element: Some(element),
-                element_size: primitive_value_size(namespace, name).unwrap_or(4),
-                element_cast_class: array_element_cast_class_by_name(namespace, name)
-                    .map_or(ARRAY_CAST_CLASS_NONE, u32::from),
-                element_kind: primitive_element_kind(namespace, name)
-                    .unwrap_or(ELEMENT_KIND_REFERENCE),
-            });
+            let element = self.row_free_definition(namespace, name)?;
+            return Some(row_free_array_element(namespace, name, element));
         }
         match &closed {
             SigType::Class(token) => {
@@ -5932,11 +6007,34 @@ impl CallResolver for MetadataResolver<'_> {
                         .map(|layout| layout.size)
                 })
         };
+        let instantiation_size = if token.table() == table::TYPE_SPEC {
+            let spec = self
+                .closed_operand_sig(*token)
+                .or_else(|| self.assembly.type_spec_signature(*token));
+            match spec {
+                Some(spec) if crate::generics::is_value_type_instantiation(&spec) => {
+                    match mir_type_across(
+                        &spec,
+                        self.assembly,
+                        self.argument_assembly,
+                        self.references(),
+                        &TargetLayout::ilp32(),
+                    )? {
+                        MirType::ValueType { size, .. } => Some(size),
+                        _ => return None,
+                    }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
         let element_size = self
             .assembly
             .type_token_name(*token)
             .and_then(|name| primitive_value_size(name.namespace, name.name))
             .or_else(value_type_size)
+            .or(instantiation_size)
             .unwrap_or(4);
         let element_kind = match self.assembly.type_token_name(*token) {
             Some(name) => primitive_element_kind(name.namespace, name.name).unwrap_or({
@@ -6838,6 +6936,9 @@ impl CallResolver for MetadataResolver<'_> {
         else {
             return None;
         };
+        if type_token.table() == table::TYPE_SPEC {
+            return self.constrained_instantiation_call(*type_token, *method_token);
+        }
         if type_token.table() != table::TYPE_DEF {
             return None;
         }
@@ -7288,7 +7389,7 @@ pub(crate) fn generic_static_slots<'x>(
     let mut next = non_generic_region_words(assembly, references);
     for (name, spec) in plan.instantiations() {
         let carried = plan.carried(name);
-        let (definition_token, arguments) = match (
+        let (declaring, declaring_references, type_def, arguments) = match (
             assembly.type_spec_signature(spec),
             carried,
         ) {
@@ -7298,44 +7399,50 @@ pub(crate) fn generic_static_slots<'x>(
                     arguments,
                 }),
                 _,
-            ) => match definition.as_ref() {
-                SigType::Class(token) | SigType::ValueType(token) => (*token, arguments),
-                _ => continue,
-            },
+            ) => {
+                let token = match definition.as_ref() {
+                    SigType::Class(token) | SigType::ValueType(token) => *token,
+                    _ => continue,
+                };
+                match token.table() {
+                    table::TYPE_DEF => {
+                        let Some(type_def) = assembly.type_def(token.row()) else {
+                            continue;
+                        };
+                        (assembly, references, type_def, arguments)
+                    }
+                    table::TYPE_REF => {
+                        let Some((namespace, name)) = assembly.type_token_full_name(token) else {
+                            continue;
+                        };
+                        let Some((ordinal, type_def)) =
+                            Assembly::find_in_references_identified(references, &namespace, &name)
+                        else {
+                            continue;
+                        };
+                        (references[ordinal], &references[..ordinal], type_def, arguments)
+                    }
+                    _ => continue,
+                }
+            }
             (_, Some((definition, carried_arguments))) => {
                 let (namespace, simple) = definition.rsplit_once('.').unwrap_or(("", definition));
-                let Some(token) = assembly
-                    .find_type(namespace, simple)
-                    .map(|type_def| type_def.token())
-                    .or_else(|| {
-                        Assembly::find_in_references(references, namespace, simple)
-                            .map(|(_, type_def)| type_def.token())
-                    })
-                else {
-                    continue;
-                };
-                (token, carried_arguments.to_vec())
-            }
-            _ => continue,
-        };
-        let token = &definition_token;
-        let (declaring, declaring_references, type_def) = match token.table() {
-            table::TYPE_DEF => {
-                let Some(type_def) = assembly.type_def(token.row()) else {
-                    continue;
-                };
-                (assembly, references, type_def)
-            }
-            table::TYPE_REF => {
-                let Some((namespace, name)) = assembly.type_token_full_name(*token) else {
-                    continue;
-                };
-                let Some((ordinal, type_def)) =
-                    Assembly::find_in_references_identified(references, &namespace, &name)
-                else {
-                    continue;
-                };
-                (references[ordinal], &references[..ordinal], type_def)
+                match assembly.find_type(namespace, simple) {
+                    Some(type_def) => (assembly, references, type_def, carried_arguments.to_vec()),
+                    None => {
+                        let Some((ordinal, type_def)) =
+                            Assembly::find_in_references(references, namespace, simple)
+                        else {
+                            continue;
+                        };
+                        (
+                            references[ordinal],
+                            &references[..ordinal],
+                            type_def,
+                            carried_arguments.to_vec(),
+                        )
+                    }
+                }
             }
             _ => continue,
         };
@@ -8277,6 +8384,24 @@ fn row_free_element_name(sig: &SigType) -> Option<(&'static str, &'static str)> 
     match sig {
         SigType::Object => Some(("System", "Object")),
         other => primitive_sig_name(other),
+    }
+}
+
+/// The description of an array whose element is the row-free `System` type `namespace.name`
+/// ([`row_free_element_name`]), under the identity `element` a build gives that type.
+///
+/// The width, kind and cast class are read from the frozen tables by name rather than restated, so
+/// an element allocated through a type parameter and one allocated with no instruction naming it
+/// cannot disagree. `String` and `Object` are in none of the tables and take the reference answer:
+/// one traced word, whose only partner in a cast is its own identity.
+fn row_free_array_element(namespace: &str, name: &str, element: TypeHandle) -> ArrayElement {
+    ArrayElement {
+        handle: lamella_ir::array_handle(element),
+        element: Some(element),
+        element_size: primitive_value_size(namespace, name).unwrap_or(4),
+        element_cast_class: array_element_cast_class_by_name(namespace, name)
+            .map_or(ARRAY_CAST_CLASS_NONE, u32::from),
+        element_kind: primitive_element_kind(namespace, name).unwrap_or(ELEMENT_KIND_REFERENCE),
     }
 }
 

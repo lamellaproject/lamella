@@ -490,6 +490,19 @@ fn is_synthesized_instance_id(id: &str) -> bool {
     id.contains('&')
 }
 
+/// What an open Windows refused with `error` comes to: [`Error::Held`] for the two refusals it gives
+/// beside another program holding the device, `ERROR_ACCESS_DENIED` and `ERROR_SHARING_VIOLATION`, and
+/// [`Error::Os`] for any other, each in the words Windows gave.
+fn refused(error: &std::io::Error) -> Error {
+    const ERROR_ACCESS_DENIED: i32 = 5;
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    let said = error.to_string();
+    if matches!(error.raw_os_error(), Some(ERROR_ACCESS_DENIED | ERROR_SHARING_VIOLATION)) {
+        Error::Held(said)
+    } else {
+        Error::Os(said)
+    }
+}
 
 /// What a device path alone can say about whether this is the requested board.
 enum PathVerdict {
@@ -962,7 +975,36 @@ unsafe fn winusb_interface_of_class(
     None
 }
 
-/// An interface opened through WinUSB and driven by `WinUsb_ControlTransfer`.
+/// The bulk pair of the interface `handle` reaches, at its first alternate setting, as `(in, out)`
+/// endpoint addresses, zero for a direction it has none in. WinUSB's `PipeId` is the endpoint address,
+/// and `WinUsb_QueryPipe` gives the pipes in the order of the interface's endpoint descriptors.
+unsafe fn bulk_pair_of(handle: WINUSB_INTERFACE_HANDLE) -> (u8, u8) {
+    let mut descriptor: USB_INTERFACE_DESCRIPTOR = std::mem::zeroed();
+    if WinUsb_QueryInterfaceSettings(handle, 0, &mut descriptor) == 0 {
+        return (0, 0);
+    }
+    let mut bulk = Vec::new();
+    for pipe in 0..descriptor.bNumEndpoints {
+        let mut information: WINUSB_PIPE_INFORMATION = std::mem::zeroed();
+        if WinUsb_QueryPipe(handle, 0, pipe, &mut information) != 0 && information.PipeType == UsbdPipeTypeBulk {
+            bulk.push(information.PipeId);
+        }
+    }
+    let spec_shape = descriptor.bInterfaceClass == 0xFF
+        && crate::is_spec_shape(descriptor.bInterfaceSubClass, descriptor.bInterfaceProtocol);
+    crate::bulk_pair(&bulk, spec_shape)
+}
+
+/// A bulk transfer on the endpoint `pipe` that WinUSB completed with the error `code`.
+fn bulk_failed(pipe: u8, code: u32) -> Error {
+    if code == ERROR_SEM_TIMEOUT {
+        return Error::Timeout;
+    }
+    Error::Os(format!("a bulk transfer on endpoint {pipe:#04x} failed (WinUSB error {code})"))
+}
+
+/// An interface opened through WinUSB and driven by `WinUsb_ControlTransfer`, and by `WinUsb_ReadPipe`
+/// and `WinUsb_WritePipe` on its own bulk pair.
 pub struct ControlInterface {
     file: HANDLE,
     /// The handle `WinUsb_Initialize` returned, for the device's first interface.
@@ -971,6 +1013,10 @@ pub struct ControlInterface {
     associated: Option<WINUSB_INTERFACE_HANDLE>,
     event: HANDLE,
     interface: u8,
+    /// The interface's bulk IN endpoint address, zero when it has none.
+    ep_in: u8,
+    /// The interface's bulk OUT endpoint address, zero when it has none.
+    ep_out: u8,
 }
 
 impl ControlInterface {
@@ -1016,6 +1062,8 @@ impl ControlInterface {
             associated: None,
             event: null_mut(),
             interface: 0,
+            ep_in: 0,
+            ep_out: 0,
         };
         opened.file = CreateFileW(
             path.as_ptr(),
@@ -1046,6 +1094,7 @@ impl ControlInterface {
         };
         opened.associated = associated;
         opened.interface = interface;
+        (opened.ep_in, opened.ep_out) = bulk_pair_of(opened.own_handle());
         opened.event = CreateEventW(null(), 1, 0, null());
         if opened.event.is_null() {
             return Err(Error::Os(format!("CreateEventW failed (error {})", GetLastError())));
@@ -1068,12 +1117,100 @@ impl ControlInterface {
         unsafe { self.control(setup, data.as_ptr().cast_mut(), timeout_ms) }
     }
 
+    /// The opened interface's own handle, which its pipes and the requests addressed to it go through.
+    fn own_handle(&self) -> WINUSB_INTERFACE_HANDLE {
+        self.associated.unwrap_or(self.first)
+    }
+
+    /// See [`crate::ControlInterface::write_bulk`].
+    pub fn write_bulk(&mut self, data: &[u8], timeout_ms: u32) -> Result<usize> {
+        if self.ep_out == 0 {
+            return Err(crate::interface_lacks("bulk OUT endpoint"));
+        }
+        let length = u32::try_from(data.len())
+            .map_err(|_| Error::InvalidRequest(String::from("a bulk transfer is shorter than 4 GiB")))?;
+        unsafe { self.bulk(self.ep_out, data.as_ptr().cast_mut(), length, timeout_ms) }
+    }
+
+    /// See [`crate::ControlInterface::read_bulk`].
+    pub fn read_bulk(&mut self, buffer: &mut [u8], timeout_ms: u32) -> Result<usize> {
+        if self.ep_in == 0 {
+            return Err(crate::interface_lacks("bulk IN endpoint"));
+        }
+        let length = u32::try_from(buffer.len())
+            .map_err(|_| Error::InvalidRequest(String::from("a bulk transfer is shorter than 4 GiB")))?;
+        unsafe { self.bulk(self.ep_in, buffer.as_mut_ptr(), length, timeout_ms) }
+    }
+
+    /// One overlapped transfer on the bulk endpoint `pipe` -- `WinUsb_ReadPipe` for an IN address,
+    /// `WinUsb_WritePipe` for an OUT one -- bounded by `timeout_ms`: a transfer still pending at the
+    /// bound is aborted and reaped before this returns, and is a timeout.
+    unsafe fn bulk(&mut self, pipe: u8, buffer: *mut u8, length: u32, timeout_ms: u32) -> Result<usize> {
+        let handle = self.own_handle();
+        let none: u32 = 0;
+        WinUsb_SetPipePolicy(handle, pipe, PIPE_TRANSFER_TIMEOUT, 4, (&raw const none).cast::<core::ffi::c_void>());
+        ResetEvent(self.event);
+        let mut overlapped: OVERLAPPED = std::mem::zeroed();
+        overlapped.hEvent = self.event;
+        let mut transferred = 0u32;
+        let finished = if pipe & 0x80 != 0 {
+            WinUsb_ReadPipe(handle, pipe, buffer, length, &mut transferred, &overlapped)
+        } else {
+            WinUsb_WritePipe(handle, pipe, buffer, length, &mut transferred, &overlapped)
+        };
+        if finished != 0 {
+            return Ok(transferred as usize);
+        }
+        let code = GetLastError();
+        if code != ERROR_IO_PENDING {
+            return Err(bulk_failed(pipe, code));
+        }
+        let waited = WaitForSingleObject(self.event, wait_milliseconds(timeout_ms));
+        if waited == WAIT_OBJECT_0 {
+            if WinUsb_GetOverlappedResult(self.first, &overlapped, &mut transferred, 0) != 0 {
+                return Ok(transferred as usize);
+            }
+            return Err(bulk_failed(pipe, GetLastError()));
+        }
+        let wait_failure = (waited != WAIT_TIMEOUT).then(|| GetLastError());
+        WinUsb_AbortPipe(handle, pipe);
+        if WinUsb_GetOverlappedResult(self.first, &overlapped, &mut transferred, 1) != 0 {
+            return Ok(transferred as usize);
+        }
+        Err(match wait_failure {
+            None => Error::Timeout,
+            Some(code) => Error::Os(format!("waiting for the bulk transfer failed (error {code})")),
+        })
+    }
+
+    /// See [`crate::ControlInterface::clear_bulk_halts`].
+    ///
+    /// `WinUsb_ResetPipe` "resets the data toggle and clears the stall condition on a pipe", and sends
+    /// the device CLEAR_FEATURE(ENDPOINT_HALT) for it, so one call clears both ends.
+    pub fn clear_bulk_halts(&mut self) -> Result<()> {
+        if self.ep_in == 0 || self.ep_out == 0 {
+            return Err(crate::interface_lacks("bulk pair"));
+        }
+        let handle = self.own_handle();
+        let mut failed = Vec::new();
+        for pipe in [self.ep_out, self.ep_in] {
+            if unsafe { WinUsb_ResetPipe(handle, pipe) } == 0 {
+                failed.push(format!("{pipe:#04x} (error {})", unsafe { GetLastError() }));
+            }
+        }
+        if failed.is_empty() {
+            Ok(())
+        } else {
+            Err(Error::Os(format!("WinUsb_ResetPipe failed for endpoint {}", failed.join(" and "))))
+        }
+    }
+
     /// One overlapped `WinUsb_ControlTransfer`, bounded by `timeout_ms`: a transfer still pending at
     /// the bound is aborted on the default pipe and reaped before this returns.
     unsafe fn control(&mut self, setup: crate::Setup, buffer: *mut u8, timeout_ms: u32) -> Result<usize> {
         winusb_takes_length(setup.length)?;
         let handle = if addressed_through_interface(setup.request_type) {
-            self.associated.unwrap_or(self.first)
+            self.own_handle()
         } else {
             self.first
         };
@@ -1316,11 +1453,11 @@ interface {} alt {} class {:#04x}/{:#04x}/{:#04x}, {} endpoint(s)",
                     null_mut(),
                 );
                 if h == INVALID_HANDLE_VALUE {
-                    return crate::Attempt::Refused(std::io::Error::last_os_error().to_string());
+                    return crate::Attempt::Refused(refused(&std::io::Error::last_os_error()));
                 }
                 let mut wu: WINUSB_INTERFACE_HANDLE = null_mut();
                 if WinUsb_Initialize(h, &mut wu) == 0 {
-                    let why = std::io::Error::last_os_error().to_string();
+                    let why = refused(&std::io::Error::last_os_error());
                     CloseHandle(h);
                     return crate::Attempt::Refused(why);
                 }
@@ -1358,7 +1495,7 @@ interface {} alt {} class {:#04x}/{:#04x}/{:#04x}, {} endpoint(s)",
             match crate::first_that_opens(interfaces, attempt) {
                 Ok(Some(device)) => Ok(device),
                 Ok(None) => Err(Error::NotFound),
-                Err(why) => Err(Error::Os(why)),
+                Err(why) => Err(why),
             }
         }
     }
@@ -1545,10 +1682,28 @@ mod tests {
     use super::{
         addressed_through_interface, guids_from_wide_list, instance_id_is_for,
         interface_number_from_instance_id, judge_path, names_class, no_winusb_interface,
-        read_finished_with, serial_from_instance_id, transfer_failed, utf16_until_nul, wait_milliseconds,
+        read_finished_with, refused, serial_from_instance_id, transfer_failed, utf16_until_nul, wait_milliseconds,
         winusb_takes_length, Error, PathVerdict, ERROR_SEM_TIMEOUT, INFINITE,
     };
     use windows_sys::Win32::Foundation::ERROR_GEN_FAILURE;
+
+    /// **AN OPEN REFUSED BESIDE A HOLDER IS TYPED, AND SAYS WHAT IT ALWAYS SAID.** Access denied and a
+    /// sharing violation are a holder; any other refusal is not, and both read as the OS's words did.
+    #[test]
+    fn an_open_refused_beside_a_holder_is_held_and_keeps_its_words() {
+        for code in [5, 32] {
+            let error = std::io::Error::from_raw_os_error(code);
+            let typed = refused(&error);
+            assert!(matches!(typed, Error::Held(_)), "{code}: {typed:?}");
+            assert_eq!(typed.to_string(), format!("USB error: {error}"));
+        }
+        for code in [2, 31, 1167] {
+            let error = std::io::Error::from_raw_os_error(code);
+            let typed = refused(&error);
+            assert!(matches!(typed, Error::Os(_)), "{code}: {typed:?}");
+            assert_eq!(typed.to_string(), format!("USB error: {error}"));
+        }
+    }
 
     /// **A READ THAT RAN OUT OF TIME DELIVERS WHAT IT HELD**, whichever timer ended it. Only one that
     /// delivered nothing timed out, and any other failure keeps its code, whatever it delivered.

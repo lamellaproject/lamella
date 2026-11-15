@@ -1,0 +1,121 @@
+<!--
+  The debug manifest: what a build made, for the debugger, lamella-debug. A build writes it when it is given the
+  file to write as _LamellaDebugManifest, together with the device as Device, as dotnet run names a device. The
+  Lamella extension for Visual Studio Code builds a project that way when a debug session starts, and starts the
+  lamella-debug the manifest names, handing it the manifest.
+
+  The device decides what is debugged, as it decides how dotnet run runs the program:
+  - through a debug probe, the native image the build published for the device, whose ELF carries its debug
+    information: a lamella1.0 program's, which this SDK publishes, or a net11.0 program's, which Lamella RHU
+    publishes, with the record beside it either way;
+  - on this computer, the device local, the assembly the build made, with its symbol file;
+  - on a board running Lamella's firmware, the assembly the build made, baked into the image that board runs, with
+    the line map of that image.
+
+  Sdk.targets imports this file last, after Lamella RHU's targets, so the manifest is written after whichever
+  product published the image. The lamella tool writes it, from the facts the build hands over in
+  lamella.debug.txt, so every path in it is written exactly. The debugger it names is the one beside the lamella
+  tool: in the package of the tool, at the same version, run only when its SHA-256 is the one this SDK carries
+  for it, as the tool's is; or beside the file LamellaToolPath names, which is the project's own choice.
+-->
+<Project>
+
+  <!-- The file is the debugged project's alone: a project it references is built for it, and is not given the
+       file to write. -->
+  <PropertyGroup>
+    <_GlobalPropertiesToRemoveFromProjectReferences>$(_GlobalPropertiesToRemoveFromProjectReferences);_LamellaDebugManifest</_GlobalPropertiesToRemoveFromProjectReferences>
+  </PropertyGroup>
+
+  <!-- The debugger beside the lamella tool, and why it cannot be run, or nothing when it can. -->
+  <Target Name="_LamellaDebuggerFault" DependsOnTargets="_LamellaToolFault">
+    <PropertyGroup>
+      <_LamellaDebuggerFileName>lamella-debug</_LamellaDebuggerFileName>
+      <_LamellaDebuggerFileName Condition="$([MSBuild]::IsOSPlatform('Windows'))">lamella-debug.exe</_LamellaDebuggerFileName>
+      <_LamellaDebugger Condition="'$(_LamellaToolFault)' == ''">$([MSBuild]::NormalizePath('$([System.IO.Path]::GetDirectoryName('$(_LamellaTool)'))', '$(_LamellaDebuggerFileName)'))</_LamellaDebugger>
+      <_LamellaDebuggerPinnedSha256 Condition="'$(LamellaToolPath)' == ''">@(_LamellaToolPack->WithMetadataValue('Identity', '$(_LamellaToolPackageId)')->'%(DebuggerSha256)')</_LamellaDebuggerPinnedSha256>
+      <_LamellaDebuggerFaultCode Condition="'$(_LamellaDebugger)' != '' and !Exists('$(_LamellaDebugger)') and '$(LamellaToolPath)' != ''">LAMSDK0027</_LamellaDebuggerFaultCode>
+      <_LamellaDebuggerFault Condition="'$(_LamellaDebugger)' != '' and !Exists('$(_LamellaDebugger)') and '$(LamellaToolPath)' != ''">There is no lamella-debug beside the lamella tool LamellaToolPath names: no file at '$(_LamellaDebugger)'. Put the lamella-debug built with that tool beside it, or remove LamellaToolPath to use the tools restored with this SDK.</_LamellaDebuggerFault>
+      <_LamellaDebuggerFaultCode Condition="'$(_LamellaDebugger)' != '' and !Exists('$(_LamellaDebugger)') and '$(LamellaToolPath)' == ''">LAMSDK0027</_LamellaDebuggerFaultCode>
+      <_LamellaDebuggerFault Condition="'$(_LamellaDebugger)' != '' and !Exists('$(_LamellaDebugger)') and '$(LamellaToolPath)' == ''">The debugger lamella-debug was not found at '$(_LamellaDebugger)', beside the lamella tool, where restore puts the package $(_LamellaToolPackageId) $(LamellaSdkVersion). Delete the folder '$([MSBuild]::NormalizeDirectory('$(_LamellaDebugger)', '..', '..'))' and restore the project again (dotnet restore).</_LamellaDebuggerFault>
+    </PropertyGroup>
+    <!-- A file that cannot be read is reported below with the rest. -->
+    <GetFileHash Condition="'$(LamellaToolPath)' == '' and '$(_LamellaDebugger)' != '' and '$(_LamellaDebuggerFault)' == ''" Files="$(_LamellaDebugger)" Algorithm="SHA256" ContinueOnError="true">
+      <Output TaskParameter="Hash" PropertyName="_LamellaDebuggerSha256" />
+    </GetFileHash>
+    <PropertyGroup Condition="'$(LamellaToolPath)' == '' and '$(_LamellaDebugger)' != '' and '$(_LamellaDebuggerFault)' == ''">
+      <_LamellaDebuggerPackageDir>$([MSBuild]::NormalizeDirectory('$(_LamellaDebugger)', '..', '..'))</_LamellaDebuggerPackageDir>
+      <_LamellaDebuggerFaultCode Condition="'$(_LamellaDebuggerSha256)' == ''">LAMSDK0028</_LamellaDebuggerFaultCode>
+      <_LamellaDebuggerFault Condition="'$(_LamellaDebuggerSha256)' == ''">The debugger lamella-debug at '$(_LamellaDebugger)' could not be read to check its SHA-256 against the one Lamella.Sdk $(LamellaSdkVersion) carries for the package $(_LamellaToolPackageId), so it is not run.</_LamellaDebuggerFault>
+      <_LamellaDebuggerFaultCode Condition="'$(_LamellaDebuggerSha256)' != '' and '$(_LamellaDebuggerSha256)' != '$(_LamellaDebuggerPinnedSha256)'">LAMSDK0028</_LamellaDebuggerFaultCode>
+      <_LamellaDebuggerFault Condition="'$(_LamellaDebuggerSha256)' != '' and '$(_LamellaDebuggerSha256)' != '$(_LamellaDebuggerPinnedSha256)'">The debugger lamella-debug at '$(_LamellaDebugger)' is not the one Lamella.Sdk $(LamellaSdkVersion) was packed with: its SHA-256 is $(_LamellaDebuggerSha256.ToLowerInvariant()), and the debugger in the package $(_LamellaToolPackageId) $(LamellaSdkVersion) has the SHA-256 $(_LamellaDebuggerPinnedSha256). Delete the folder '$(_LamellaDebuggerPackageDir)' and restore the project again (dotnet restore).</_LamellaDebuggerFault>
+    </PropertyGroup>
+  </Target>
+
+  <!-- The package Lamella.Tools.RID records no file mode, so on a machine other than Windows the debugger restored
+       from it is made executable before an editor is given it, as the tool is before it runs. -->
+  <Target Name="_LamellaDebuggerExecutable" DependsOnTargets="_LamellaDebuggerFault">
+    <Exec Condition="'$(_LamellaDebuggerFault)' == '' and '$(_LamellaDebugger)' != '' and '$(LamellaToolPath)' == '' and !$([MSBuild]::IsOSPlatform('Windows'))"
+          Command="chmod u+x &quot;$(_LamellaDebugger)&quot;"
+          ContinueOnError="true"
+          StandardOutputImportance="low" />
+  </Target>
+
+  <!-- Before a debug session's build makes anything: the manifest an earlier build wrote goes, so a build that fails
+       leaves none for the debugger to read; and a class library, which has no entry point to start, is refused. -->
+  <Target Name="_LamellaBeginDebugBuild"
+          BeforeTargets="BeforeBuild"
+          Condition="'$(_LamellaDebugManifest)' != '' and '$(_IsPublishing)' != 'true'">
+    <Delete Files="$(_LamellaDebugManifest)" />
+    <Error Condition="'$(_LamellaServesRun)' == 'true' and '$(OutputType)' != 'Exe'"
+           Code="LAMSDK0030"
+           Text="$(MSBuildProjectName) is a class library (OutputType $(OutputType)), and a debug session starts a program: debug the program that references it." />
+  </Target>
+
+  <!-- The manifest, once the build is done and, for a debug probe, once the image is published. The device must be
+       one of the project's devices, as for dotnet run, and nothing is written for an id the project cannot run on.
+       The tool is told the build kind as the project's Optimize, as the publish is. -->
+  <Target Name="_LamellaWriteDebugManifest"
+          AfterTargets="Build"
+          DependsOnTargets="_LamellaNamedDevice;_LamellaCheckTool;_LamellaDebuggerFault;_LamellaDebuggerExecutable"
+          Condition="'$(_LamellaDebugManifest)' != '' and '$(_IsPublishing)' != 'true' and '$(_LamellaServesRun)' == 'true'">
+    <PropertyGroup>
+      <_LamellaDebugInputsFile>$(_LamellaIntermediateDir)lamella.debug.txt</_LamellaDebugInputsFile>
+      <_LamellaDebugType>@(_LamellaRunDevice->'%(Type)')</_LamellaDebugType>
+      <_LamellaDebugModel>@(_LamellaRunDevice->'%(Model)')</_LamellaDebugModel>
+      <_LamellaDebugRoute>@(_LamellaRunDevice->'%(Route)')</_LamellaDebugRoute>
+      <_LamellaDebugKind Condition="'$(_LamellaDebugType)' == 'Local'">host</_LamellaDebugKind>
+      <_LamellaDebugKind Condition="'$(_LamellaDebugKind)' == '' and ('$(_LamellaDebugModel)' == 'native' or '$(_LamellaDebugRoute)' == 'probe')">native</_LamellaDebugKind>
+      <_LamellaDebugKind Condition="'$(_LamellaDebugKind)' == '' and '$(_LamellaDebugModel)' == 'interpreter' and '$(TargetFrameworkIdentifier)' == 'Lamella'">interpreted</_LamellaDebugKind>
+      <_LamellaDebugImage Condition="'$(_LamellaDebugKind)' == 'native'">$([MSBuild]::NormalizePath('$(MSBuildProjectDirectory)', '$(PublishDir)', '$(AssemblyName).elf'))</_LamellaDebugImage>
+      <!-- The image a board running Lamella's firmware takes is baked by the tool, here, with its line map beside it. -->
+      <_LamellaDebugImage Condition="'$(_LamellaDebugKind)' == 'interpreted'">$(_LamellaIntermediateDir)$(AssemblyName).debug.lmli</_LamellaDebugImage>
+    </PropertyGroup>
+    <Error Condition="'$(Device)' == ''" Code="LAMSDK0029" Text="A debug build names its device as Device, as dotnet run names one: dotnet run --list-devices lists them." />
+    <Error Condition="'$(_LamellaDebugKind)' == ''"
+           Code="LAMSDK0029"
+           Text="The device '$(Device)' runs the program in an emulator, and a $(TargetFramework) program is debugged on its board, through a debug probe. Choose a debug probe: dotnet run --list-devices lists the devices." />
+    <Error Condition="'$(_LamellaDebuggerFault)' != ''" Code="$(_LamellaDebuggerFaultCode)" Text="$(_LamellaDebuggerFault)" />
+    <ItemGroup>
+      <_LamellaDebugInput Include="project=$([MSBuild]::Escape('$(MSBuildProjectFullPath)'))" />
+      <_LamellaDebugInput Include="framework=$([MSBuild]::Escape('$(TargetFramework)'))" />
+      <_LamellaDebugInput Include="kind=$(_LamellaDebugKind)" />
+      <_LamellaDebugInput Include="device=$([MSBuild]::Escape('$(Device)'))" />
+      <_LamellaDebugInput Include="board=$([MSBuild]::Escape('$(LamellaTargetBoard)'))" Condition="'$(LamellaTargetBoard)' != ''" />
+      <_LamellaDebugInput Include="built=$([MSBuild]::Escape('$(TargetPath)'))" />
+      <_LamellaDebugInput Include="optimize=$([MSBuild]::Escape('$(Optimize)'))" />
+      <_LamellaDebugInput Include="@(_DebugSymbolsOutputPath->'pdb=%(FullPath)')" Condition="'$(_DebugSymbolsProduced)' == 'true' and '$(TargetFrameworkIdentifier)' == 'Lamella'" />
+      <_LamellaDebugInput Include="image=$([MSBuild]::Escape('$(_LamellaDebugImage)'))" Condition="'$(_LamellaDebugImage)' != ''" />
+      <_LamellaDebugInput Include="pathmap=$([MSBuild]::Escape('$(PathMap)'))" Condition="'$(PathMap)' != ''" />
+      <_LamellaDebugInput Include="debugger=$([MSBuild]::Escape('$(_LamellaDebugger)'))" />
+      <_LamellaDebugInput Include="manifest=$([MSBuild]::Escape('$(_LamellaDebugManifest)'))" />
+    </ItemGroup>
+    <Delete Files="$(_LamellaDebugManifest)" />
+    <MakeDir Directories="$(_LamellaIntermediateDir)" />
+    <WriteLinesToFile File="$(_LamellaDebugInputsFile)" Lines="@(_LamellaDebugInput)" Overwrite="true" />
+    <Exec Command="&quot;$(_LamellaTool)&quot; build --msbuild-debug &quot;$(_LamellaDebugInputsFile)&quot;"
+          EnvironmentVariables="LAMELLA_REF_DIR=$(LamellaRefDir);LAMELLA_RUNTIME_SUPPORT_DIR=$(LamellaRuntimeSupportDir)"
+          StandardOutputImportance="normal"
+          StandardErrorImportance="normal" />
+  </Target>
+
+</Project>

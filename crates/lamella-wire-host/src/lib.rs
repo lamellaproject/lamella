@@ -407,16 +407,15 @@ pub fn board_named_by_link(product: &str) -> Option<&str> {
 pub fn describe_refusal(reason: u8) -> String {
     match reason {
         lamella_wire::error::SESSION_HELD => String::from(concat!(
-            "another carrier already holds the debug session -- typically somebody at the ",
-            "board with a cable, or a host that did not let go. The request was well formed ",
-            "and this target implements it, so the answer changes when the other carrier ",
-            "releases it; a reset clears a session whose host is gone.",
+            "another connection already holds the board's debug session -- typically someone at ",
+            "the board with a cable, or a computer that did not let go of it. Try again once it ",
+            "lets go; resetting the board ends a session whose computer is gone.",
         )),
         lamella_wire::error::UNKNOWN_MESSAGE_TYPE => String::from(concat!(
-            "this target does not implement that message. Stop asking rather than retrying ",
-            "-- the answer will not change without different firmware.",
+            "the board's firmware does not support this request, and asking again will not ",
+            "change that: only firmware that supports it will.",
         )),
-        other => format!("refusal reason {other}, which this build has no description for"),
+        other => format!("for a reason (code {other}) this version of Lamella cannot describe"),
     }
 }
 
@@ -429,7 +428,9 @@ pub fn link_failure(error: TransportError) -> String {
         TransportError::Stalled => "it stopped taking data".to_owned(),
         TransportError::PayloadTooLarge => "the message is too long for one frame on this link".to_owned(),
         TransportError::Refused { reason, .. } => describe_refusal(reason),
-        TransportError::MalformedReply { msg_type } => format!("its reply to message {msg_type:#04x} did not decode"),
+        TransportError::MalformedReply { .. } => {
+            "it answered in a form this version of Lamella cannot read".to_owned()
+        }
         TransportError::VersionMismatch { target_min, target_max } => {
             version_mismatch(lamella_wire::PROTOCOL_VERSION, target_min, target_max)
         }
@@ -1082,7 +1083,7 @@ pub fn version_mismatch(host: u16, target_min: u16, target_max: u16) -> String {
         format!("versions {target_min} to {target_max}")
     };
     let remedy = if target_max < host {
-        "the BOARD is behind this tool -- reflash its serve firmware"
+        "the BOARD is behind this tool -- flash it with current Lamella firmware"
     } else {
         "this TOOL is behind the board -- update the tools, the board is newer"
     };
@@ -1286,17 +1287,15 @@ impl TransferAck {
     pub fn describe(self, board: Option<&str>) -> String {
         let place = the_board(board);
         match self {
-            Self::Accepted => format!("{place} accepted every chunk of the image"),
-            Self::Rejected { chunk } => format!("{place} could not write chunk {chunk} of the image"),
-            Self::Mismatched { chunk, sent, reported } => format!(
-                "{place} does not hold the image that was sent: after chunk {chunk}, the CRC over what it \
-                 holds is {reported:#010x}, and over what was sent {sent:#010x}"
-            ),
+            Self::Accepted => format!("{place} accepted the whole image"),
+            Self::Rejected { .. } => format!("{place} could not store the image"),
+            Self::Mismatched { .. } => {
+                format!("{place} does not hold the image that was sent: what it stored differs from it")
+            }
             Self::TooLarge { image, window } => image_too_large(board, image, window),
-            Self::OutOfRange { chunk } => format!(
-                "the image is too large for {place}: it refused chunk {chunk} as reaching past its \
-                 program area"
-            ),
+            Self::OutOfRange { .. } => {
+                format!("the image is too large for {place}: it reaches past its program area")
+            }
         }
     }
 }
@@ -2318,25 +2317,20 @@ pub fn start_execution(
     answered.unwrap_or(Err(StartFailure::NoAnswer))
 }
 
-/// The sentence saying why the target did not start a run, from the code its [`exec::EXEC_ACK`]
-/// gave, or `None` when the acknowledgement carried no code.
+/// The sentence saying why the board did not start a program, from the code its
+/// [`exec::EXEC_ACK`] gave, or `None` when the acknowledgment carried no code.
 pub(crate) fn describe_start_refusal(code: Option<u8>) -> String {
     let why = match code {
-        Some(exec::ack::NOTHING_TO_RUN) => {
-            "there is nothing at the requested source to start (NOTHING_TO_RUN)".to_string()
-        }
+        Some(exec::ack::NOTHING_TO_RUN) => "it holds no program to start".to_string(),
         Some(exec::ack::HALTED_UNSUPPORTED) => {
-            "starting halted needs a debug capability this target does not offer (HALTED_UNSUPPORTED)"
-                .to_string()
+            "its firmware cannot start a program paused for the debugger".to_string()
         }
-        Some(exec::ack::NO_SUCH_SOURCE) => {
-            "this target does not run artifacts from the requested source (NO_SUCH_SOURCE)".to_string()
-        }
-        Some(exec::ack::IDLE) => "it answered that nothing is executing (IDLE)".to_string(),
-        Some(other) => format!("it answered with acknowledgement code {other}"),
-        None => "its acknowledgement carried no code".to_string(),
+        Some(exec::ack::NO_SUCH_SOURCE) => "it cannot run a program from where it was asked to".to_string(),
+        Some(exec::ack::IDLE) => "it answered that no program is running".to_string(),
+        Some(other) => format!("it answered with a code ({other}) this version of Lamella does not know"),
+        None => "its answer gave no reason".to_string(),
     };
-    format!("the target did not start the run: {why}")
+    format!("the board did not start the program: {why}")
 }
 
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
@@ -2680,19 +2674,60 @@ mod tests {
         );
         assert_eq!(
             TransferAck::OutOfRange { chunk: 0 }.describe(board),
-            "the image is too large for the BBC micro:bit v2: it refused chunk 0 as reaching past \
-             its program area"
+            "the image is too large for the BBC micro:bit v2: it reaches past its program area"
         );
         assert_eq!(
             TransferAck::Rejected { chunk: 3 }.describe(board),
-            "the BBC micro:bit v2 could not write chunk 3 of the image"
+            "the BBC micro:bit v2 could not store the image"
         );
         assert_eq!(
             TransferAck::Mismatched { chunk: 2, sent: 0x1234_5678, reported: 0x0BAD_F00D }.describe(None),
-            "this board does not hold the image that was sent: after chunk 2, the CRC over what it holds is \
-             0x0badf00d, and over what was sent 0x12345678"
+            "this board does not hold the image that was sent: what it stored differs from it"
         );
-        assert_eq!(TransferAck::Accepted.describe(None), "this board accepted every chunk of the image");
+        assert_eq!(TransferAck::Accepted.describe(None), "this board accepted the whole image");
+    }
+
+    /// **A START THE BOARD REFUSED IS SAID IN WORDS**: each answer has its own sentence, and none names
+    /// the protocol's code for it or calls the board a target.
+    #[test]
+    fn a_refused_start_says_why_in_words_and_never_the_protocols_name() {
+        use crate::exec::ack;
+        assert_eq!(
+            describe_start_refusal(Some(ack::NOTHING_TO_RUN)),
+            "the board did not start the program: it holds no program to start"
+        );
+        assert_eq!(
+            describe_start_refusal(Some(200)),
+            "the board did not start the program: it answered with a code (200) this version of \
+             Lamella does not know"
+        );
+        for code in [
+            Some(ack::NOTHING_TO_RUN),
+            Some(ack::HALTED_UNSUPPORTED),
+            Some(ack::NO_SUCH_SOURCE),
+            Some(ack::IDLE),
+            Some(200),
+            None,
+        ] {
+            let why = describe_start_refusal(code);
+            assert!(why.starts_with("the board did not start the program: "), "{why}");
+            for word in ["NOTHING", "HALTED", "SOURCE", "IDLE", "target", "acknowledgement"] {
+                assert!(!why.contains(word), "{why}");
+            }
+        }
+    }
+
+    /// **A REPLY THAT DOES NOT DECODE IS SAID WITHOUT ITS MESSAGE'S NUMBER**, which nobody can act on,
+    /// and a board behind this tool is sent to current firmware in words.
+    #[test]
+    fn an_unreadable_reply_and_an_old_board_are_said_in_words() {
+        assert_eq!(
+            link_failure(TransportError::MalformedReply { msg_type: 0x21 }),
+            "it answered in a form this version of Lamella cannot read"
+        );
+        let old = version_mismatch(5, 3, 4);
+        assert!(old.contains("the BOARD is behind this tool -- flash it with current Lamella firmware"), "{old}");
+        assert!(!old.contains("serve firmware"), "{old}");
     }
 
     /// **A board that does not report its window has each refusal read in its own words too**,
@@ -2718,8 +2753,7 @@ mod tests {
         assert_eq!(ack, TransferAck::OutOfRange { chunk: 0 });
         assert_eq!(
             ack.describe(board),
-            "the image is too large for the BBC micro:bit v2: it refused chunk 0 as reaching past \
-             its program area"
+            "the image is too large for the BBC micro:bit v2: it reaches past its program area"
         );
 
         let mut transport = MemTransport::new();
@@ -2729,7 +2763,7 @@ mod tests {
         let ack = deploy_image_blocking(&mut transport, 4, &image, 1024, Duration::from_secs(5), none)
             .expect("the in-memory carrier never errors");
         assert_eq!(ack, TransferAck::Rejected { chunk: 1 });
-        assert_eq!(ack.describe(board), "the BBC micro:bit v2 could not write chunk 1 of the image");
+        assert_eq!(ack.describe(board), "the BBC micro:bit v2 could not store the image");
     }
 
     /// A TARGET THAT REFUSES THE VERSION IS REPORTED AS A VERSION REFUSAL, NOT AS A CLOSED LINK.
@@ -2823,7 +2857,7 @@ mod tests {
     fn the_version_sentence_says_which_end_has_to_move() {
         let behind = version_mismatch(3, 1, 1);
         assert!(behind.contains("BOARD is behind"), "got {behind}");
-        assert!(behind.contains("reflash"), "and says what to do: {behind}");
+        assert!(behind.contains("flash it with current Lamella firmware"), "and says what to do: {behind}");
         assert!(behind.contains("version 1"), "a single version does not read as a range: {behind}");
 
         let ahead = version_mismatch(1, 4, 6);

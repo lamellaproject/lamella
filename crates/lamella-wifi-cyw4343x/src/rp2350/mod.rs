@@ -282,7 +282,7 @@ pub mod instr {
 /// A program of the family: its words and their count.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Program {
-    /// The words, from instruction memory 0.
+    /// The words, from the instruction memory's address 0.
     pub words: [u16; PROGRAM_WORDS],
     /// How many of them the program uses.
     pub len: u8,

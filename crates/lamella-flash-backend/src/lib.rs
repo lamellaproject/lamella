@@ -2,6 +2,8 @@
 
 #![forbid(unsafe_code)]
 
+pub mod progress;
+
 use lamella_probe_core::ProbeError;
 
 /// An image that is ready to be written: flat bytes and the address they belong at.

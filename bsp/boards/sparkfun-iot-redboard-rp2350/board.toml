@@ -1,0 +1,341 @@
+# BOARD binding: the SparkFun IoT RedBoard - RP2350 (WRL-27708), an RP2350B board in the Arduino R4
+# format with a Raspberry Pi RM2 radio module. Board truth ONLY: role bindings and the wiring. Chip
+# truth lives in csp/rp2350/.
+#
+# The radio is NOT on the Pico 2 W's pins. The hardware overview says the board gives the radio
+# module the pins the Pico W and Pico 2 W use; the schematic (rev v10) gives it GP24 (power on), GP36
+# (select), GP37 (clock) and GP38 (data), and GP23 and GP25, which the Pico 2 W spends on the radio,
+# are the SPI bus's MOSI and the blue STAT LED here. This row follows the schematic. The four lines
+# are reserved for the radio's driver. The interpreter firmware has no Wi-Fi on this board: its Wi-Fi
+# driver runs the radio on the Pico 2 W's four lines only.
+#
+# The I2C bus is I2C0 on GP4 and GP5: the header's SDA and SCL positions, the Qwiic connector, the
+# HSTX connector and the board's battery fuel gauge, which answers at 0x36, share it. The SPI bus is
+# SPI0 on the header's D10 to D13 (GP21 select, GP23 MOSI, GP20 MISO, GP22 SCK), and GP21 is the
+# board's chip select for it.
+#
+# The STAT LED on GP25 lights on a HIGH level, although the schematic's label for its net carries an
+# overbar: the LED's anode is on that net and its cathode reaches ground through R31.
+#
+# GP7 switches the peripheral 3.3 V rail: the microSD socket, the RGB LED, the Qwiic connector and the
+# I2C bus's 2.2k pull-ups all hang off it. The board holds it on; a program that drives GP7 low turns
+# all four off, the bus's pull-ups with them.
+#
+# Not modeled: the microSD socket's SPI (SPI1 on GP8 to GP11) as a bus a program opens, the 22-pin
+# HSTX connector, the two power selectors' status lines on GP26 and GP27, and the battery charger.
+
+[table]
+kind = "board"
+board = "sparkfun-iot-redboard-rp2350"
+vendor = "sparkfun"
+maker = "SparkFun"
+product = "IoT RedBoard - RP2350"
+family = "rp2350"
+part = "rp2350b"
+product_model = 70          # lamella_wire::product_model::IOT_REDBOARD_RP2350
+sources = [
+    "SparkFun IoT RedBoard - RP2350 design files (github.com/sparkfun/SparkFun_IoT_RedBoard-RP2350 at commit 46926c417395f6b195cc8077b2b0012884b60475): the KiCad core sheet, whose symbols are read below by reference and value -- U1 the RP2350B, U3 the flash W25Q128JVPIM, U4 the PSRAM APS6404L-3SQR-ZR, Y1 a 12MHz crystal -- and the schematic as the same design files print it (rev v10, four sheets: the top level and connectors, the core processor and wireless, power and battery management, and peripheral components), whose labels give each net's pin of U1. Read below by reference: U2 the RM2 radio module, U8 the battery fuel gauge, U10 the peripheral rail's regulator, D4 the RGB LED, D6 the STAT LED, SW3 the USER button, J13 the Qwiic connector, J14 the microSD socket, H1 the header's Arduino layout.",
+    "The hardware overview in the same design files' documentation: the board uses the B version of the RP2350; 'The W25Q128 Flash IC adds 16MB of storage space on the RedBoard IoT. This connects to the RP2350 over QSPI'; 'the board also includes an 8MB PSRAM IC for dynamic storage. This also connects to the RP2350 over QSPI', with the APS6404L-3SQR datasheet as its datasheet; and 'a dedicated 1mm 3-pin connector tied to the RP2350's debug pins (SWDIO, SWCK & Ground)'.",
+    "SparkFun product WRL-27708 (SparkFun IoT RedBoard - RP2350): the RP2350B variant, '16MB of external Flash and 8MB of PSRAM connected to the RP2350's QSPI interface', and a '3-pin 1mm Vertical Debug Connector'.",
+]
+notes = [
+    "GP47 is the PSRAM's chip select. The printed schematic labels the RP2350B's pin 58, ADC7/GPIO47, PSRAM_~{CS}, and the label PSRAM_~{CS} is U4's select on the core sheet. The flash's select is the label FLASH_~{CS}, the RP2350B's pin 75, QSPI_~{CS}.",
+    "The radio's lines, by the printed schematic's core sheet: GPIO24 (pin 25) is WRL_ON, GPIO36 (pin 45) WRL_~{CS}, GPIO37 (pin 46) WRL_CLK and GPIO38 (pin 47) WRL_DAT. The hardware overview's sentence that the board uses the radio pins of the Pico W and Pico 2 W does not match: on this schematic GPIO23 is IO23_PICO, SPI0's transmit line, and GPIO25 is the STAT LED's ~{STAT}.",
+    "The header's positions, by the printed schematic's H1: D0/RX is IO1_RXD (GPIO1) and D1/TX IO0_TXD (GPIO0); D2 to D9 are IO28 to IO35 (GPIO28 to GPIO35); D10 is IO21_~{CS}, D11 IO23_PICO, D12 IO20_POCI and D13 IO22_SCK (GPIO21, GPIO23, GPIO20 and GPIO22); D18/SDA and D19/SCL are IO4_SDA and IO5_SCL (GPIO4 and GPIO5); A0 to A5 are the nets A0 to A5 (GPIO40 to GPIO45); and the position H1 calls NC/LEDO carries RGB_DOUT, the RGB LED's data output. The analog strip J2 numbers its pins in the other order, A5 on pin 1 to A0 on pin 6, so which GPIO a shield's analog position meets depends on which end of J2 the shield's A0 lands on, which the schematic does not draw.",
+    "The peripheral rail 3.3V_P is U10's output, an RT9080-3.3 whose enable is the net PERI_POW on GPIO7. R24 (10K) holds PERI_POW at 3.3V through the LP jumper JP5, closed as built, and R25 (1M) pulls it to ground, so the rail is on until a program drives GPIO7 low. 3.3V_P feeds the microSD socket J14, the RGB LED D4, the Qwiic connector J13's 3V3 pin, the I2C pull-ups R5 and R6 (2.2k each, through the I2C jumper JP3) and the card-detect pull-up R33.",
+    "The microSD socket J14 is on SPI1's pads: IO8_POCI (GPIO8) on its DAT0/SDO, IO9_~{CS} (GPIO9) on DAT3/~{CS}, IO10_SCK (GPIO10) on CLK/SCK and IO11_PICO (GPIO11) on CMD/SDI; its ~{DET} contact is ~{SD_DET} on GPIO2, which R33 (10k) holds at 3.3V_P. The board's documentation asks that these lines be held LOW while the socket's rail is off.",
+    "GPIO46, the converter's channel 6, reads the barrel-jack input VRAW through R28 (41.2k) over R29 (10k): the schematic's note gives VIN_MEAS = 2.93V at VIN = 15V. It is a plain converter channel, so the row states no line for it.",
+    "Y1 is a 12 MHz crystal: the core sheet values it 12MHz (Crystal_12MHz_2.5x2.0mm), and the printed schematic draws it at the RP2350B's XIN and XOUT.",
+]
+
+# --- memory: what the board fits beside the chip. The RP2350B's own SRAM is chip truth, stated in
+#     csp/rp2350/parts.toml. ---
+
+[[memory]]                  # the RP2350 has NO internal flash (chip flash = 0, gate-pinned) --
+name = "flash"              # the 16 MB QSPI chip it XIPs from is BOARD truth.
+kind = "flash"
+size = 0x1000000
+source = "The core sheet's U3, a W25Q128JVPIM, on the RP2350B's QSPI lines with the label FLASH_~{CS}, the RP2350B's QSPI_~{CS} pin, as its select. The hardware overview: 'The W25Q128 Flash IC adds 16MB of storage space'; WRL-27708: 16MB of external Flash. 16 MB = 0x1000000."
+
+# The PSRAM shares the flash's clock and four data lines and has a select of its own, GP47 (the
+# `psram-cs` row below), so it answers in the QSPI memory interface's second window: 0x11000000,
+# chip select 1's, beside the flash's 0x10000000. That address is the window's cached view; the XIP
+# cache sits in front of both windows, and the same bytes read uncached at 0x15000000. Nothing
+# answers there at reset: the interface's window 1 must first be told the part's commands and
+# timing and GP47 routed to it, and writes reach the part only once XIP_CTRL.WRITABLE_M1 is set.
+[[memory]]
+name = "psram"
+kind = "ram"
+base = 0x11000000
+size = 0x800000             # 8 MB: the whole part.
+controller = "qmi"
+optional = true             # the board boots and runs from its flash and the chip's SRAM without it.
+source = "The core sheet's U4, an APS6404L-3SQR-ZR, on the RP2350B's QSPI clock and data labels QSPI_CLK and QSPI_D0 to QSPI_D3 with the flash, its select the label PSRAM_~{CS}, which the printed schematic lands on GPIO47. The hardware overview: an 8MB PSRAM IC on QSPI; WRL-27708: 8MB of PSRAM. The APS6404L-3SQR datasheet (APM_PSRAM_E3_QSPI v2.7), Features: 'Organization: 64Mb, 8M x 8bits', so 8 MB = 0x800000. RP2350 datasheet 4.4.1: the lower half of the XIP address space holds two 16 MB windows, one for each QMI chip select, read cached at 0x10... and uncached at 0x14..., and the XIP_CTRL register's WRITABLE_M1 bit names window 1 as 0x11000000 through 0x11ffffff, which must be made writable 'if a RAM device is attached on QSPI chip select 1'."
+
+[memory.psram.device]
+part = "APS6404L-3SQR-ZR"
+
+# --- the wires, and the peripherals the header names. ---
+
+[[carriers]]
+kind = "native-usb"         # the RP2350B's own USB device controller on the USB-C socket -- no
+                            # bridge, and so no board-fixed bridge identity to state.
+plan = "pll-150-48"
+default = true
+
+[[carriers]]
+kind = "uart"               # the second wire: uart0 on GP0/GP1 through an EXTERNAL bridge (a debug
+role = "uart0"              # probe's UART cable, any USB-UART dongle), at the same operating point
+baud = 115200               # as the usb wire.
+plan = "pll-150-48"
+
+# The printed schematic's labels IO0_TXD and IO1_RXD join GPIO0 and GPIO1 to the header's D1/TX and
+# D0/RX.
+[[bindings]]
+role = "uart0"
+kind = "uart"
+instance = "uart0"
+function = "F2"
+tx = { pin = "GP0" }
+rx = { pin = "GP1" }
+
+# The labels IO22_SCK, IO23_PICO, IO20_POCI and IO21_~{CS} join GPIO22, GPIO23, GPIO20 and GPIO21 to
+# the header's D13, D11, D12 and D10, and to the side header J8's pins 5 to 8. GPIO21 is SPI0's own
+# chip select (function F1, CSn), so the board's select for the bus is D10.
+[[bindings]]
+role = "spi0"
+kind = "spi"
+instance = "spi0"
+function = "F1"
+mosi = { pin = "GP23" }
+sck = { pin = "GP22" }
+miso = { pin = "GP20" }
+cs = { pin = "GP21" }
+
+[[bindings]]
+role = "i2c0"
+kind = "i2c"
+instance = "i2c0"
+function = "F3"
+sda = { pin = "GP4" }
+scl = { pin = "GP5" }
+
+[[bindings]]
+role = "adc"
+kind = "adc"
+instance = "adc"
+reference_uv = 3300000
+source = "The printed schematic's core sheet: the RP2350B's ADC_AVDD pin (59) is fed from 3.3V through R7 (200) with C3 (4.7uF) to ground. The header's A0 to A5 are the nets A0 to A5 on ADC0/GPIO40 to ADC5/GPIO45, and VIN_MEAS is on ADC6/GPIO46."
+
+# --- PWM: slices 6 to 9 on the header's D2 to D9 ------------------------------------------------
+#
+# Each output of slices 0 to 7 appears on two GPIOs, GPn and GPn+16, and each output of slices 8 to 11
+# on GP32 to GP39 and again on GP40 to GP47 (datasheet 12.5.2, Table 1130), so which one a slice drives
+# is a board's choice. Slices 6 and 7 drive the header's D2 to D5 (GP28 to GP31) rather than the HSTX
+# connector's GP12 to GP15: the header is where a program on a board of this format drives PWM. Slices
+# 8 and 9 drive the header's D6 to D9 (GP32 to GP35) rather than GP40 to GP43, which are the header's
+# A0 to A3 and the converter's. Slices 0 and 1 are on GP16 to GP19, HSTX connector pins, because their
+# lower pairs are uart0 and the card-detect and RGB LED lines. Slices 2 to 5 are not bound: each of
+# their pairs holds the i2c0 or spi0 pins, a radio line or a board line. Slices 10 and 11 are not
+# bound: GP36 to GP38 are the radio's and GP39 the USER button, and GP44 to GP47 are A4, A5, the barrel
+# jack's divider and the PSRAM's select. The chip a program passes to PwmChannel.Create is the slice.
+
+[[bindings]]
+role = "pwm0"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 0
+a = { pin = "GP16" }
+b = { pin = "GP17" }
+
+[[bindings]]
+role = "pwm1"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 1
+a = { pin = "GP18" }
+b = { pin = "GP19" }
+
+[[bindings]]
+role = "pwm6"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 6
+a = { pin = "GP28" }
+b = { pin = "GP29" }
+
+[[bindings]]
+role = "pwm7"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 7
+a = { pin = "GP30" }
+b = { pin = "GP31" }
+
+[[bindings]]
+role = "pwm8"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 8
+a = { pin = "GP32" }
+b = { pin = "GP33" }
+
+[[bindings]]
+role = "pwm9"
+kind = "pwm"
+instance = "pwm"
+function = "F4"
+slice = 9
+a = { pin = "GP34" }
+b = { pin = "GP35" }
+
+# --- control lines -----------------------------------------------------------------------------
+#
+# The RGB LED's data line carries a timed serial protocol rather than a level, so its row states the
+# pin and no level, and a driver -- not this row -- owns the waveform.
+#
+# The PSRAM's select is `reserved`. Once the PSRAM is brought up, the QSPI memory interface drives
+# GP47 as its chip select 1, and a program that opened the pin as a GPIO would take the select away
+# from the PSRAM and from everything held in it; so a program's GPIO controller refuses it, as it
+# refuses the radio's lines.
+
+[[devices]]
+name = "led0"
+kind = "gpio-out"
+pin = "GP25"
+active = "high"
+source = "The printed schematic: the core sheet labels GPIO25 (pin 26) ~{STAT}, and on the peripherals sheet ~{STAT} is the anode of D6, a Blue LED whose cathode reaches ground through R31 (2.2k). A one on the pin lights it, whatever the label's overbar suggests. The hardware overview calls it STAT/25, a blue LED tied to the RP2350's IO25."
+
+[[devices]]
+name = "neopixel"
+kind = "gpio-out"
+pin = "GP3"
+active = "none"
+source = "The printed schematic: the core sheet labels GPIO3 (pin 80) RGB_DIN, the data input DIN of D4, a WS2812B on the peripheral rail 3.3V_P, whose data output RGB_DOUT reaches the header's NC/LEDO position. The line carries the LED's timed serial protocol, which has no asserted level, so none is stated."
+
+[[devices]]
+name = "button0"
+kind = "gpio-in"
+pin = "GP39"
+active = "low"
+pull = "none"
+source = "The printed schematic: the core sheet labels GPIO39 (pin 48) ~{USER_BTN}, and on the peripherals sheet ~{USER_BTN} is held at 3.3V by R35 (10k), shorted to ground by SW3 USER and filtered by C36 (0.1uF). So the pin rests HIGH, reads LOW while the button is held, and needs no pull of the chip's."
+
+[[devices]]
+name = "sd-card-detect"
+kind = "gpio-in"
+pin = "GP2"
+active = "low"
+source = "The printed schematic: the core sheet labels GPIO2 (pin 79) ~{SD_DET}, and on the peripherals sheet ~{SD_DET} is the ~{DET} contact (pin 9) of J14, the microSD socket, held at 3.3V_P by R33 (10k)."
+
+[[devices]]
+name = "fuel-gauge"
+kind = "i2c-device"
+role = "i2c0"
+address = 0x36
+source = "The printed schematic's power sheet: U8, a MAX17048 battery fuel gauge, has its SDA and SCL on IO4_SDA and IO5_SCL, the I2C0 bus, and the sheet prints its 7-bit address, 0x36."
+
+[[devices]]
+name = "fuel-gauge-alert"
+kind = "gpio-in"
+pin = "GP6"
+active = "low"
+pull = "none"
+source = "The printed schematic: the core sheet labels GPIO6 (pin 3) ~{BALRT}, and on the power sheet ~{BALRT} is the ~{ALRT} output (pin 5) of U8, the MAX17048, held at 3.3V by R22 (10k)."
+
+[[devices]]
+name = "peripheral-power"
+kind = "gpio-out"
+pin = "GP7"
+active = "high"
+source = "The printed schematic: the core sheet labels GPIO7 (pin 4) PERI_POW, and on the power sheet PERI_POW is the enable EN (pin 3) of U10, the RT9080-3.3 that makes the peripheral rail 3.3V_P. R24 (10k) holds it at 3.3V through the LP jumper JP5, which the sheet's note says to cut to default the peripherals to off, and R25 (1M) pulls it to ground; so a high level turns the rail on."
+
+# --- the RM2 module's control lines. The DATA line is a SHARED half-duplex line and CLK is a clock:
+#     neither has an asserted level, so neither states one (the Pico 2 W's rows take the same shape
+#     for the same reason). All four are `reserved`: the radio's driver runs them, so a program's
+#     GPIO controller refuses them. ---
+
+[[devices]]
+name = "rm2-wl-on"
+kind = "gpio-out"
+pin = "GP24"
+active = "high"
+reserved = true
+source = "The printed schematic's core sheet: GPIO24 (pin 25) is WRL_ON, which lands on both the RM2 module U2's WLON (B5) and its BTON (B6). It is the module's power-on enable, driven high to bring the radio up."
+
+[[devices]]
+name = "rm2-cs"
+kind = "gpio-out"
+pin = "GP36"
+active = "low"
+reserved = true
+source = "The printed schematic's core sheet: GPIO36 (pin 45) is WRL_~{CS}, which lands on the RM2 module U2's pad B2, CS. The module symbol names its pads in rows A, B and C, and B1 GPIO0, B2 CS, B3 IRQ, B5 WLON, B6 BTON and B7 VDDIO match pins 8 to 14 of the Raspberry Pi Radio Module 2 datasheet (RP-008943-DS-7) Table 2 function for function, where pin 9 is 'gSPI CS'. The same datasheet names the module's radio as the Infineon CYW43439KUBG, reached over gSPI. The CYW43439 datasheet (002-30348 Rev. *D) page 19 fixes the level: the host puts the first bit on the bus 'before the first active edge following the CS going low', and between a read's command and its data 'chip selects go high'."
+
+[[devices]]
+name = "rm2-clk"
+kind = "gpio-out"
+pin = "GP37"
+active = "none"
+reserved = true
+source = "The printed schematic's core sheet: GPIO37 (pin 46) is WRL_CLK, which lands on the RM2 module U2's SCLK (A3). A clock has no asserted level, so none is stated."
+
+[[devices]]
+name = "rm2-data"
+kind = "gpio-out"
+pin = "GP38"
+active = "none"
+reserved = true
+source = "The printed schematic's core sheet: GPIO38 (pin 47) is WRL_DAT, which lands on the RM2 module U2's PICO (A5) directly, on its POCI (A6) through R13 (470) and on its IRQ (B3) through R14 (10k) -- one wire carrying host-to-module data, module-to-host data and the interrupt. A half-duplex line that changes direction has no asserted level, so none is stated."
+
+[[devices]]
+name = "psram-cs"
+kind = "gpio-out"
+pin = "GP47"
+active = "low"
+reserved = true
+source = "The printed schematic labels the RP2350B's ADC7/GPIO47 (pin 58) PSRAM_~{CS}, the select of U4, an APS6404L-3SQR-ZR, on the core sheet. The level is the chip's own: the APMemory APS6404L-3SQR datasheet (APM_PSRAM_E3_QSPI v2.7), section 6, Table 2 'Signals Table', gives CE# as an input, 'Chip select, active low. When CE#=1, chip is in standby state'."
+
+# --- the Qwiic connector: the I2C0 bus, brought out whole ---------------------------------------
+
+[[connectors]]
+name = "qwiic"
+standard = "qwiic"
+source = "The printed schematic's J13, a Qwiic connector, carries IO5_SCL (GPIO5) on its SCL pin, IO4_SDA (GPIO4) on SDA, the peripheral rail 3.3V_P on 3V3 and ground; R5 and R6 (2.2k) hold the two lines at 3.3V_P through the I2C jumper JP3, and the sheet's note says to cut that jumper to disconnect them."
+
+[[connectors.qwiic.buses]]
+signal = "i2c"
+role = "i2c0"
+
+# --- the clock plan: Y1 is a 12 MHz crystal, as the core sheet states. ---
+
+[[plans]]
+name = "pll-150-48"         # the operating point: clk_sys 150 MHz off
+default = true              # PLL_SYS, clk_usb/clk_adc 48 MHz off PLL_USB, clk_peri left
+source = "xosc"             # crystal-exact (state-and-verify: generation checks
+xosc_hz = 12000000          # hz == xosc * fbdiv / (postdiv1 * postdiv2) per PLL).
+clk_peri_hz = 12000000
+clk_sys_hz = 150000000
+clk_usb_hz = 48000000
+clk_adc_hz = 48000000
+pll_sys_fbdiv = 125
+pll_sys_postdiv1 = 5
+pll_sys_postdiv2 = 2
+pll_usb_fbdiv = 100
+pll_usb_postdiv1 = 5
+pll_usb_postdiv2 = 5
+
+[debug]
+signals = ["swd"]
+exposure = "header"
+fitted = "yes"
+onboard = "none"
+recovery = "mask-rom"
+source = "The hardware overview: 'a dedicated 1mm 3-pin connector tied to the RP2350's debug pins (SWDIO, SWCK & Ground)', and WRL-27708 lists a 3-pin 1mm Vertical Debug Connector; the printed schematic labels the RP2350B's SWCLK (pin 33) and SWDIO (pin 34) SW.CLK and SW.DIO. There is no on-board debug probe. RP2350 datasheet section 4.1: the mask ROM is a physically immutable memory resource, so the recovery path is in silicon and no image written to flash can remove it."
+
+[csharp_interpreter]
+optimization = "speed"

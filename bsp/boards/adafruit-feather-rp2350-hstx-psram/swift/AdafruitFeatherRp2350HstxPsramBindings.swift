@@ -64,6 +64,10 @@ public enum AdafruitFeatherRp2350HstxPsramBindings {
     public static let I2C1_FUNCSEL: UInt32 = 3
     public static let I2C1_IC_CLK_HZ: UInt32 = 150000000
 
+    // -- the PWM chips: how many the part has, the slices its pins carry, PWM chip n being
+    // slice n --
+    public static let PWM_CHIP_COUNT: UInt32 = 8
+
     // -- PWM0: an rp2350 pwm binding descriptor: one slice of the pwm block, counting on
     // clk_sys, and each output the board routes -- its index in the slice (0 = A, 1 = B)
     // and its pad --

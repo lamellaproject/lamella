@@ -526,7 +526,9 @@ fn shl1(mag: &mut [u32; LIMBS]) {
 /// constructor raises.
 #[cfg(feature = "float")]
 pub fn from_double(value: f64) -> Result<[u32; 4], Fault> {
-    if !value.is_finite() {
+    // Decimal.MaxValue is 2^96 - 1. Reject the source magnitude before rounding
+    // significant digits can bring an out-of-range value back into range.
+    if !value.is_finite() || value.abs() >= (1u128 << 96) as f64 {
         return Err(Fault::Overflow);
     }
     if value == 0.0 {
@@ -647,4 +649,22 @@ pub fn to_double(a: Dec) -> f64 {
 pub fn subtract(a: Dec, mut b: Dec) -> Result<[u32; 4], Fault> {
     b.negate();
     add(a, b)
+}
+
+#[cfg(all(test, feature = "float"))]
+mod tests {
+    use super::{Fault, from_double};
+
+    #[test]
+    fn from_double_checks_range_before_rounding_significant_digits() {
+        let boundary = (1u128 << 96) as f64;
+        for value in [boundary, f64::from_bits(boundary.to_bits() + 1)] {
+            for signed in [value, -value] {
+                assert_eq!(from_double(signed), Err(Fault::Overflow), "{signed:e}");
+            }
+        }
+        let below = f64::from_bits(boundary.to_bits() - 1);
+        assert!(from_double(below).is_ok());
+        assert!(from_double(-below).is_ok());
+    }
 }

@@ -30,6 +30,9 @@ public enum Rp2350Instances {
     public static let SPI0_BASE: UInt32 = 0x40080000
     public static let SPI0_RESET_BIT: UInt32 = 18
     public static let SPI0_RESET_MASK: UInt32 = 0x40000
+    public static let SPI1_BASE: UInt32 = 0x40088000
+    public static let SPI1_RESET_BIT: UInt32 = 19
+    public static let SPI1_RESET_MASK: UInt32 = 0x80000
     public static let I2C0_BASE: UInt32 = 0x40090000
     public static let I2C0_RESET_BIT: UInt32 = 4
     public static let I2C0_RESET_MASK: UInt32 = 0x10

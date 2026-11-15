@@ -25,9 +25,10 @@ namespace Lamella.Boards.Adafruit
             AdafruitFeatherM0AdaloggerBindings.SD_CARD_DETECT_PORT_BASE,
             AdafruitFeatherM0AdaloggerBindings.SD_CARD_DETECT_PIN);
 
-        /// <summary>The logical bus id of the microSD socket's SPI (MOSI PB10, SCK PB11 and MISO
-        /// PA12, on SERCOM4), as <c>SpiConnectionSettings</c> names it.</summary>
-        public const int SdSpiBusId = 0;
+        /// <summary>The bus id of the microSD socket's SPI (MOSI PB10, SCK PB11 and MISO PA12), as
+        /// <c>SpiConnectionSettings</c> names it: 4, the number of SERCOM4, the block that serves
+        /// it.</summary>
+        public const int SdSpiBusId = 4;
 
         /// <summary>The microSD socket's chip select (Arduino D4, PA08), as a pin number -- the pin
         /// <c>Storage.MountSdOverSpi</c> takes. It is the first of the SD bus's chip selects, so

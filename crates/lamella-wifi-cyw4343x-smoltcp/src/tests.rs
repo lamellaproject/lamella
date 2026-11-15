@@ -67,6 +67,9 @@ struct Script {
     driver_like: bool,
     /// Each join's network name, credential kind and secret, as the driver was handed them.
     joins: Vec<(Vec<u8>, &'static str, Vec<u8>)>,
+    scan_names: Vec<Vec<u8>>,
+    backoff: Option<Micros>,
+    seeds: Vec<u32>,
 }
 
 impl Script {
@@ -85,6 +88,9 @@ impl Script {
             accept: true,
             driver_like: false,
             joins: Vec::new(),
+            scan_names: Vec::new(),
+            backoff: None,
+            seeds: Vec::new(),
         }
     }
 
@@ -160,9 +166,18 @@ impl Radio for Script {
     fn link(&self) -> LinkState {
         self.link
     }
+
+    fn backoff(&self) -> Option<Micros> {
+        self.backoff
+    }
 }
 
 impl<'b> Control<'b> for Script {
+    fn seed(&mut self, seed: u32) {
+        self.seeds.push(seed);
+        self.requests.push("seed");
+    }
+
     fn attach(&mut self) -> bool {
         self.request("attach")
     }
@@ -211,6 +226,11 @@ impl<'b> Control<'b> for Script {
         self.request("scan")
     }
 
+    fn scan_for(&mut self, ssid: &'b [u8]) -> bool {
+        self.scan_names.push(ssid.to_vec());
+        self.request("scan")
+    }
+
     fn capabilities(&mut self) -> bool {
         self.request("capabilities")
     }
@@ -218,6 +238,32 @@ impl<'b> Control<'b> for Script {
 
 fn station(script: Script) -> Station<Script, TestClock> {
     Station::new(script, TestClock { now: 0 })
+}
+
+#[test]
+fn a_named_scan_hands_the_name_to_the_radio() {
+    let mut s = station(Script::new(Vec::new()));
+    assert!(s.start_scan(b"concealed-lab"));
+    assert_eq!(s.radio().scan_names, [b"concealed-lab".to_vec()]);
+}
+
+#[test]
+fn a_named_scan_rejects_empty_and_overlong_names_without_a_radio_request() {
+    for name in [&b""[..], &b"123456789012345678901234567890123"[..]] {
+        let mut s = station(Script::new(Vec::new()));
+        assert!(!s.start_scan(name));
+        assert!(s.radio().requests.is_empty());
+    }
+}
+
+#[test]
+fn a_second_named_scan_cannot_replace_the_first_scans_target() {
+    let mut s = station(Script::new(Vec::new()));
+    assert!(s.start_scan(b"concealed-lab"));
+    s.radio.accept = false;
+    assert!(!s.start_scan(b"another-lab"));
+    assert_eq!(&s.target[..s.target_len], b"concealed-lab");
+    assert_eq!(s.radio.scan_names, [b"concealed-lab".to_vec()]);
 }
 
 const OURS: [u8; 6] = [0x02, 0x00, 0x00, 0x00, 0x00, 0x01];
@@ -366,6 +412,152 @@ fn a_bring_up_stops_at_a_refusal_a_rejected_request_and_its_deadline() {
 
     let mut s = station(Script::new(vec![step(Wake::At(u64::MAX))]));
     assert_eq!(s.bring_up(IMAGES, 5_000, &mut |_, _| {}), Err(Stop::TimedOut));
+}
+
+std::thread_local! {
+    /// What the narration was shown, on this test's thread.
+    static NARRATED: core::cell::RefCell<Vec<Result<Outcome, Stop>>> = const { core::cell::RefCell::new(Vec::new()) };
+    static SEED_SOURCE: core::cell::Cell<(u32, Option<u32>)> = const { core::cell::Cell::new((0, None)) };
+}
+
+fn draw_seed() -> Option<u32> {
+    SEED_SOURCE.with(|source| {
+        let (calls, value) = source.get();
+        source.set((calls + 1, value));
+        value
+    })
+}
+
+#[test]
+fn the_seed_is_drawn_once_at_radio_start_even_across_repeated_program_starts() {
+    for seed in [Some(0x1234_5678), Some(0), None] {
+        SEED_SOURCE.with(|source| source.set((0, seed)));
+        let mut s = station(Script::new(vec![
+            step(Wake::Done(Outcome::Attached { chip_id: 0x1515_a9af })),
+            step(Wake::Done(Outcome::Uploaded { save_restore: true })),
+            step(Wake::Done(Outcome::Ready { version: lamella_wifi_cyw4343x::Version::EMPTY })),
+            step(Wake::Done(Outcome::Up { address: OURS })),
+        ]));
+        s.seed_with(draw_seed);
+        assert_eq!(SEED_SOURCE.with(|source| source.get().0), 0, "a dormant radio draws nothing");
+        assert!(s.start_bring_up(IMAGES, 1_000_000));
+        assert_eq!(SEED_SOURCE.with(|source| source.get().0), 1);
+        assert_eq!(s.radio().seeds, seed.into_iter().collect::<Vec<_>>());
+        assert_eq!(s.radio().requests, if seed.is_some() { vec!["attach", "seed"] } else { vec!["attach"] });
+        assert!(s.start_bring_up(IMAGES, 1_000_000));
+        passes(&mut s, 12);
+        assert_eq!(s.bring_up_state(), BringUp::Up);
+        for _ in 0..4 {
+            s.seed_with(draw_seed);
+            assert!(s.start_bring_up(IMAGES, 1_000_000));
+            passes(&mut s, 2);
+        }
+        assert_eq!(SEED_SOURCE.with(|source| source.get().0), 1, "including when entropy was unavailable");
+        assert_eq!(s.radio().seeds.len(), usize::from(seed.is_some()));
+    }
+}
+
+#[test]
+fn a_seed_is_not_requested_for_a_rejected_start_and_not_repeated_after_a_radio_refusal() {
+    SEED_SOURCE.with(|source| source.set((0, Some(7))));
+    let mut script = Script::new(Vec::new());
+    script.accept = false;
+    let mut s = station(script);
+    s.seed_with(draw_seed);
+    assert!(!s.start_bring_up(IMAGES, 1_000_000));
+    assert!(!s.start_bring_up(IMAGES, 1_000_000));
+    assert_eq!(SEED_SOURCE.with(|source| source.get().0), 0);
+    assert!(s.radio().seeds.is_empty());
+
+    let mut s = station(Script::new(vec![step(Wake::Done(Outcome::Refused(Refusal::new("chip identity", 1))))]));
+    s.seed_with(draw_seed);
+    assert!(s.start_bring_up(IMAGES, 1_000_000));
+    passes(&mut s, 3);
+    assert!(!s.start_bring_up(IMAGES, 1_000_000));
+    assert_eq!(SEED_SOURCE.with(|source| source.get().0), 1);
+    assert_eq!(s.radio().seeds, [7]);
+}
+
+fn narrated(shown: Result<Outcome, Stop>, _us: Micros) {
+    NARRATED.with(|seen| seen.borrow_mut().push(shown));
+}
+
+fn taken_narration() -> Vec<Result<Outcome, Stop>> {
+    NARRATED.with(|seen| core::mem::take(&mut *seen.borrow_mut()))
+}
+
+/// Pumps `s` and moves its bring-up on, `passes` times, as a controller's pass does.
+fn passes(s: &mut Station<Script, TestClock>, passes: usize) {
+    for _ in 0..passes {
+        s.service();
+        s.advance_bring_up(IMAGES);
+    }
+}
+
+/// **A BRING-UP STARTED IN THE BACKGROUND** waits for nothing: the start makes the first rung's
+/// request and returns, and each pass after it carries an outcome in and makes the request of the
+/// rung that follows, until the radio is up with the chip's address. Every outcome on the way is
+/// narrated.
+#[test]
+fn a_bring_up_started_in_the_background_is_moved_on_by_each_pass_and_narrated() {
+    let mut s = station(Script::new(vec![
+        step(Wake::Again),
+        step(Wake::Done(Outcome::Attached { chip_id: 0x1515_a9af })),
+        step(Wake::At(500)),
+        step(Wake::Done(Outcome::Uploaded { save_restore: true })),
+        link_step(Wake::Done(Outcome::Ready { version: lamella_wifi_cyw4343x::Version::EMPTY }), LinkState::Detached),
+        step(Wake::Done(Outcome::Up { address: OURS })),
+    ]));
+    s.narrate_with(narrated);
+    taken_narration();
+    assert_eq!(s.bring_up_state(), BringUp::Off, "nothing runs the chip before the start");
+    assert!(s.start_bring_up(IMAGES, 1_000_000));
+    assert_eq!(s.radio().requests, ["attach"], "the start makes the first request and returns");
+    assert_eq!(s.bring_up_state(), BringUp::Starting { rung: Rung::Attach, asked: true });
+    assert_eq!(s.radio().polls.len(), 0, "and polls nothing itself");
+    for _ in 0..200 {
+        passes(&mut s, 1);
+        if s.bring_up_state() == BringUp::Up {
+            break;
+        }
+    }
+    assert_eq!(s.bring_up_state(), BringUp::Up);
+    assert_eq!(s.address(), Some(OURS));
+    assert_eq!(s.radio().requests, ["attach", "upload", "open", "up"]);
+    let shown = taken_narration();
+    assert_eq!(shown.len(), 4, "every outcome narrated: {shown:?}");
+    assert_eq!(shown.last(), Some(&Ok(Outcome::Up { address: OURS })));
+    assert!(s.start_bring_up(IMAGES, 1_000_000), "a radio that is up is up");
+    assert_eq!(s.radio().requests.len(), 4, "and is not brought up again");
+}
+
+/// A bring-up in the background stops where the waiting one does -- at a refusal, at a request the
+/// driver does not take, at its deadline -- and narrates the stop; a stopped bring-up stays stopped.
+#[test]
+fn a_bring_up_in_the_background_stops_at_a_refusal_a_rejected_request_and_its_deadline_and_says_so() {
+    let refusal = Refusal::new("chip identity", 0x4373);
+    let mut s = station(Script::new(vec![step(Wake::Done(Outcome::Refused(refusal)))]));
+    s.narrate_with(narrated);
+    taken_narration();
+    assert!(s.start_bring_up(IMAGES, 1_000_000));
+    passes(&mut s, 3);
+    assert_eq!(s.bring_up_state(), BringUp::Stopped(Stop::Refused(refusal)));
+    assert_eq!(taken_narration(), [Ok(Outcome::Refused(refusal)), Err(Stop::Refused(refusal))]);
+    assert!(!s.start_bring_up(IMAGES, 1_000_000), "a stopped bring-up stays stopped");
+    assert_eq!(s.radio().requests, ["attach"]);
+
+    let mut script = Script::new(Vec::new());
+    script.accept = false;
+    let mut s = station(script);
+    s.narrate_with(narrated);
+    assert!(!s.start_bring_up(IMAGES, 1_000_000), "the driver did not take the first request");
+    assert_eq!(s.bring_up_state(), BringUp::Stopped(Stop::Rejected("attach")));
+    assert_eq!(taken_narration(), [Err(Stop::Rejected("attach"))]);
+
+    let mut s = station(Script::new(vec![step(Wake::At(u64::MAX))]));
+    assert!(s.start_bring_up(IMAGES, 5_000));
+    passes(&mut s, 1_000);
+    assert_eq!(s.bring_up_state(), BringUp::Stopped(Stop::TimedOut));
 }
 
 #[test]

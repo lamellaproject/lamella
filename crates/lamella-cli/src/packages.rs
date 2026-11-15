@@ -450,7 +450,7 @@ pub struct Provided {
 /// this release's version.
 #[must_use]
 pub fn provided(id: &str) -> Option<Provided> {
-    const NAMED: &[(&str, &str)] = &[("System.Device.Gpio", "4.2.0"), ("Lamella.Hardware", "1.0.0-alpha.2")];
+    const NAMED: &[(&str, &str)] = &[("System.Device.Gpio", "4.2.0"), ("Lamella.Hardware", "1.0.0-alpha.3")];
     if let Some((canonical, version)) = NAMED.iter().find(|(named, _)| named.eq_ignore_ascii_case(id)) {
         return Some(Provided { id: (*canonical).to_owned(), version: Version::parse(version)? });
     }
@@ -611,7 +611,7 @@ fn not_provided(id: &str) -> String {
     let assembly = ["System.IO.Ports", "System.Device.Model", "System.Device.Analog"].into_iter().find(|name| known(name));
     if let Some(assembly) = assembly {
         return format!(
-            "Lamella provides no package {assembly} yet. Its assembly is in the class library: name it with\n    <Reference Include=\"{assembly}\"><HintPath>path\\to\\{assembly}.dll</HintPath></Reference>"
+            "Lamella provides no package {assembly}. Its assembly is in the class library: name it with\n    <Reference Include=\"{assembly}\"><HintPath>path\\to\\{assembly}.dll</HintPath></Reference>"
         );
     }
     format!("Lamella provides no package {id}. A program built for Lamella names the packages Lamella builds: {LISTED}.")
@@ -830,7 +830,7 @@ mod tests {
         }
         for over in ["1.*-*", "1.0.*-*", "1.0-*", "1-*", "*-*", "1.*-alpha.*", "1.0.0-alpha.*"] {
             let served = select(&reference("Lamella.Hardware", Some(over))).expect("served");
-            assert_eq!((served.version.to_string(), served.warning), ("1.0.0-alpha.2".to_owned(), None), "{over}");
+            assert_eq!((served.version.to_string(), served.warning), ("1.0.0-alpha.3".to_owned(), None), "{over}");
         }
     }
 
@@ -920,39 +920,46 @@ mod tests {
 
     #[test]
     fn the_shared_hardware_library_is_served_up_to_the_version_built() {
-        let built = select(&reference("Lamella.Hardware", Some("1.0.0-alpha.2"))).expect("selected");
-        assert_eq!((built.version.to_string(), built.warning), ("1.0.0-alpha.2".to_owned(), None));
-        let older = select(&reference("Lamella.Hardware", Some("1.0.0-alpha.1"))).expect("selected");
-        assert_eq!(older.version.to_string(), "1.0.0-alpha.2");
-        assert_eq!(
-            older.warning.expect("NU1603").render("App.csproj"),
-            "App.csproj(9): warning NU1603: the project depends on Lamella.Hardware (>= 1.0.0-alpha.1) but \
-             Lamella.Hardware 1.0.0-alpha.1 was not found. Lamella.Hardware 1.0.0-alpha.2 was resolved instead."
-        );
+        for built in ["1.0.0-alpha.3", "[1.0.0-alpha.3]"] {
+            let hardware = select(&reference("Lamella.Hardware", Some(built))).expect("selected");
+            assert_eq!((hardware.version.to_string(), hardware.warning), ("1.0.0-alpha.3".to_owned(), None), "{built}");
+        }
+        for asked in ["1.0.0-alpha.1", "1.0.0-alpha.2"] {
+            let older = select(&reference("Lamella.Hardware", Some(asked))).expect("selected");
+            assert_eq!(older.version.to_string(), "1.0.0-alpha.3", "{asked}");
+            assert_eq!(
+                older.warning.expect("NU1603").render("App.csproj"),
+                format!(
+                    "App.csproj(9): warning NU1603: the project depends on Lamella.Hardware (>= {asked}) but \
+                     Lamella.Hardware {asked} was not found. Lamella.Hardware 1.0.0-alpha.3 was resolved instead."
+                )
+            );
+        }
         for floated in ["1.0.0-*", "1.0.0-alpha.*"] {
             let hardware = select(&reference("Lamella.Hardware", Some(floated))).expect("selected");
-            assert_eq!((hardware.version.to_string(), hardware.warning), ("1.0.0-alpha.2".to_owned(), None), "{floated}");
+            assert_eq!((hardware.version.to_string(), hardware.warning), ("1.0.0-alpha.3".to_owned(), None), "{floated}");
         }
-        let pinned = select(&reference("Lamella.Hardware", Some("[1.0.0-alpha.1]"))).expect_err("NU1102");
-        assert_eq!(pinned.text, "the project asks for Lamella.Hardware 1.0.0-alpha.1 exactly, and Lamella builds only 1.0.0-alpha.2.");
+        let pinned = select(&reference("Lamella.Hardware", Some("[1.0.0-alpha.2]"))).expect_err("NU1102");
+        assert_eq!(pinned.text, "the project asks for Lamella.Hardware 1.0.0-alpha.2 exactly, and Lamella builds only 1.0.0-alpha.3.");
         let unnamed = select(&reference("Lamella.Hardware", None)).expect_err("NU1015");
         assert_eq!(
             unnamed.text,
-            "the reference to Lamella.Hardware gives no version. Lamella builds 1.0.0-alpha.2: name one, as \
-             Version=\"1.0.0-alpha.2\"."
+            "the reference to Lamella.Hardware gives no version. Lamella builds 1.0.0-alpha.3: name one, as \
+             Version=\"1.0.0-alpha.3\"."
         );
         for (above, asked, or_lower) in [
             ("1.0.0", "1.0.0", " or lower"),
+            ("1.0.0-alpha.4", "1.0.0-alpha.4", " or lower"),
             ("1.*", "(>= 1.0.0)", " or lower"),
             ("1.0.0-beta.*", "(>= 1.0.0-beta)", " or lower"),
-            ("[1.0.0-alpha.3]", "1.0.0-alpha.3", ""),
+            ("[1.0.0-alpha.4]", "1.0.0-alpha.4", ""),
         ] {
             let refused = select(&reference("Lamella.Hardware", Some(above))).expect_err("above the provided version");
             assert_eq!(
                 refused.render("App.csproj"),
                 format!(
                     "App.csproj(9): error NU1102: the current lamella does not provide Lamella.Hardware {asked}. \
-                     Either reference Lamella.Hardware 1.0.0-alpha.2{or_lower}, or use a version of lamella that \
+                     Either reference Lamella.Hardware 1.0.0-alpha.3{or_lower}, or use a version of lamella that \
                      provides Lamella.Hardware {asked}."
                 ),
                 "{above}"

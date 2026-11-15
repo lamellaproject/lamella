@@ -45,7 +45,14 @@ pub use lamella_runtime_support_debug as debug_support;
     feature = "board-raspberrypi-pico-2",
     feature = "board-raspberrypi-pico-2-w",
     feature = "board-pimoroni-pico-plus-2",
-    feature = "board-pimoroni-pico-plus-2-w"
+    feature = "board-pimoroni-pico-plus-2-w",
+    feature = "board-adafruit-feather-rp2350-hstx",
+    feature = "board-adafruit-feather-rp2350-hstx-psram",
+    feature = "board-adafruit-metro-rp2350",
+    feature = "board-adafruit-metro-rp2350-psram",
+    feature = "board-pimoroni-pico-lipo-2",
+    feature = "board-pimoroni-pico-lipo-2-xl-w",
+    feature = "board-sparkfun-iot-redboard-rp2350"
 ))]
 pub use lamella_board_support as board_support;
 
@@ -748,6 +755,63 @@ extern "C" fn lamella_char_to_string_impl(c: u32) -> *mut u32 {
 extern "C" fn lamella_double_to_string_impl(value: f64) -> *mut u32 {
     let mut buf = [0u8; F64_STR_CAP];
     let len = format_f64(value, &mut buf);
+    let obj = alloc_string(len as u32);
+    if obj.is_null() {
+        return obj;
+    }
+    unsafe {
+        let units = (obj as *mut u8).add(4) as *mut u16;
+        for (i, &b) in buf[..len].iter().enumerate() {
+            core::ptr::write(units.add(i), b as u16);
+        }
+    }
+    obj
+}
+
+/// Formats `value` into `buf` EXACTLY as the interpreter's `format_single` does: the rule of
+/// [`format_f64`] with a float's own shortest digits, and scientific iff the base-10 exponent is
+/// `<= -5` or `>= 9`, so `1000000000f` is `1E+09`. A float widened to a double and printed by
+/// `format_f64` keeps the double's digits and the double's switch point, and both differ. Returns
+/// the length.
+fn format_f32(value: f32, buf: &mut [u8; F64_STR_CAP]) -> usize {
+    use core::fmt::Write;
+    if value.is_infinite() {
+        let s: &[u8] = if value < 0.0 { b"-Infinity" } else { b"Infinity" };
+        buf[..s.len()].copy_from_slice(s);
+        return s.len();
+    }
+    let mut sci = [0u8; F64_STR_CAP];
+    let sci_len = {
+        let mut sink = ByteSink {
+            buf: &mut sci,
+            len: 0,
+        };
+        let _ = write!(sink, "{value:e}");
+        sink.len
+    };
+    if let Some(epos) = sci[..sci_len].iter().position(|&b| b == b'e') {
+        if let Some(exp) = parse_ascii_i32(&sci[epos + 1..sci_len]) {
+            if exp <= -5 || exp >= 9 {
+                buf[..epos].copy_from_slice(&sci[..epos]);
+                let sign = if exp < 0 { '-' } else { '+' };
+                let mut sink = ByteSink { buf, len: epos };
+                let _ = write!(sink, "E{sign}{:02}", exp.abs());
+                return sink.len;
+            }
+        }
+    }
+    let mut sink = ByteSink { buf, len: 0 };
+    let _ = write!(sink, "{value}");
+    sink.len
+}
+
+/// `System.Single.ToString()` on device. The argument arrives WIDENED, as the other `Single` seams'
+/// do: every `f32` is exact in an `f64`, so narrowing it here recovers the value, and a NaN is still
+/// a NaN.
+#[no_mangle]
+extern "C" fn lamella_single_to_string_impl(value: f64) -> *mut u32 {
+    let mut buf = [0u8; F64_STR_CAP];
+    let len = format_f32(value as f32, &mut buf);
     let obj = alloc_string(len as u32);
     if obj.is_null() {
         return obj;
@@ -1751,6 +1815,7 @@ anchor_seam_shim!("lamella_monitor_wait");
 anchor_seam_shim!("lamella_string_substring");
 anchor_seam_shim!("lamella_char_to_string");
 anchor_seam_shim!("lamella_double_to_string");
+anchor_seam_shim!("lamella_single_to_string");
 anchor_seam_shim!("lamella_double_to_fixed");
 anchor_seam_shim!("lamella_double_to_exponential");
 anchor_seam_shim!("lamella_gc_walk_roots");

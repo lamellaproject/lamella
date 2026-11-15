@@ -5,10 +5,11 @@
 //! the RSN and RSN extension elements of three more, the walk's bounds,
 //! and the ends.
 
+use crate::control::Payload;
 use crate::link::Security;
 use crate::scan::{
     Advertised, PARAMS_LEN, RECORD_FIXED_LEN, RECORD_HEAD_LEN, RESULT_HEAD_LEN, ScanEnd,
-    ScanRecord, Walked, akm, capability, element, head, params, records, walk,
+    ScanRecord, Walked, akm, capability, element, head, params, params_for, records, walk,
 };
 use std::vec::Vec;
 
@@ -441,6 +442,52 @@ fn the_parameters_match_the_hand_derived_bytes() {
     );
     assert_eq!(&params(0xABCD)[6..8], &[0xCD, 0xAB]);
     assert_eq!(PARAMS_LEN, 74);
+}
+
+#[test]
+fn the_named_parameters_are_the_plain_ones_with_the_name_at_its_place() {
+    // The synthetic network's name, thirteen bytes, spelled by hand.
+    let name = [
+        0x73, 0x79, 0x6E, 0x74, 0x68, 0x65, 0x74, 0x69, 0x63, 0x2D, 0x6E, 0x65, 0x74,
+    ];
+    assert_eq!(&name[..], SSID_A);
+    let p = params_for(1, SSID_A);
+    assert_eq!(p.len(), PARAMS_LEN);
+    assert_eq!(&p[..8], &[0x01, 0x00, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00]);
+    assert_eq!(&p[8..12], &[13, 0, 0, 0], "the name's length, one word");
+    assert_eq!(&p[12..25], &name[..], "the name's bytes behind it");
+    assert!(
+        p[25..44].iter().all(|&b| b == 0),
+        "zeros to the field's end"
+    );
+    assert_eq!(
+        &p[44..52],
+        &[0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x02, 0x00]
+    );
+    assert_eq!(&p[52..68], &[0xFF; 16], "the four default words");
+    assert_eq!(&p[68..74], &[0, 0, 0, 0, 0, 0]);
+    // The plain form in every byte outside the name's field, for another
+    // sync id and for the longest name.
+    let long = [0x5A; 32];
+    let q = params_for(0xABCD, &long);
+    assert_eq!(&q[..8], &params(0xABCD)[..8]);
+    assert_eq!(&q[8..12], &[32, 0, 0, 0]);
+    assert_eq!(&q[12..44], &long[..]);
+    assert_eq!(&q[44..], &params(0xABCD)[44..]);
+    assert_eq!(params_for(0xABCD, &[0x5A; 40]), q, "cut at the field");
+    let one = params_for(2, b"x");
+    assert_eq!(&one[8..13], &[1, 0, 0, 0, b'x']);
+    assert!(one[13..44].iter().all(|&b| b == 0));
+    // The payload of the request writes these bytes and no other.
+    let payload = Payload::ScanFor {
+        sync: 1,
+        name: SSID_A,
+    };
+    assert_eq!(payload.len(), 74);
+    let mut into = [0xEE; 80];
+    payload.write(&mut into);
+    assert_eq!(&into[..74], &p[..]);
+    assert_eq!(&into[74..], &[0xEE; 6]);
 }
 
 #[test]

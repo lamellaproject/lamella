@@ -5,7 +5,7 @@ use crate::bound::{
     BoundInitializerTarget, BoundMemberInitializerValue,
 };
 use crate::diagnostic::{Diagnostic, DiagnosticKind};
-use crate::statement::{BoundStmt, BoundStmtKind, BoundSwitchLabel, BoundSwitchSection};
+use crate::statement::{BoundLabel, BoundStmt, BoundStmtKind, BoundSwitchLabel, BoundSwitchSection};
 use crate::special::SpecialType;
 use crate::symbols::{Model, TypeKind};
 use crate::types::TypeSymbol;
@@ -40,10 +40,10 @@ pub fn method_body_always_exits(body: &BoundStmt) -> bool {
 /// What the endpoint test knows about the `goto`s inside the statement it was asked about.
 struct Jumps {
     /// The labels a `goto` names that no statement declares (`CS0159`): such a `goto` cannot jump.
-    undefined: BTreeSet<Box<str>>,
+    undefined: BTreeSet<BoundLabel>,
     /// The labels a REACHABLE `goto` targets. A statement carrying one is reached through the jump
     /// even when the statement before it never completes.
-    reached: BTreeSet<Box<str>>,
+    reached: BTreeSet<BoundLabel>,
 }
 
 impl Jumps {
@@ -53,7 +53,7 @@ impl Jumps {
     ///
     /// Which labels are reached depends on which `goto`s are, and that depends on which labels
     /// are: the set grows from empty, one walk at a time, until a walk adds nothing.
-    fn reaching(stmt: &BoundStmt, undefined: BTreeSet<Box<str>>) -> Jumps {
+    fn reaching(stmt: &BoundStmt, undefined: BTreeSet<BoundLabel>) -> Jumps {
         let mut jumps = Jumps {
             undefined,
             reached: BTreeSet::new(),
@@ -72,7 +72,7 @@ impl Jumps {
     /// Records in `found` the label of every `goto` that control reaches inside `stmt`, its start
     /// taken as reached. A statement list is reached in order ([`Jumps::sequence_gotos`]); every
     /// other statement's children are taken as reached when it is.
-    fn reachable_gotos(&self, stmt: &BoundStmt, found: &mut BTreeSet<Box<str>>) {
+    fn reachable_gotos(&self, stmt: &BoundStmt, found: &mut BTreeSet<BoundLabel>) {
         match &stmt.kind {
             BoundStmtKind::Goto(label) => {
                 found.insert(label.clone());
@@ -93,7 +93,7 @@ impl Jumps {
 
     /// [`Jumps::reachable_gotos`] over a statement list run in order: a statement is reached when
     /// the one before it completes, or when a reached label marks it.
-    fn sequence_gotos(&self, statements: &[BoundStmt], found: &mut BTreeSet<Box<str>>) {
+    fn sequence_gotos(&self, statements: &[BoundStmt], found: &mut BTreeSet<BoundLabel>) {
         let mut reachable = true;
         for statement in statements {
             reachable |= self.marks(statement);
@@ -133,17 +133,16 @@ impl Jumps {
 }
 
 /// The `goto` targets in `body` that name no declared label -- exactly the labels [`check_labels`]
-/// reports `CS0159` for. Computed the same way (collect every declared label method-wide, then keep
-/// the goto targets not among them), so the exit analysis and CS0159 agree on which `goto`s cannot
-/// jump.
-fn undefined_goto_labels(body: &BoundStmt) -> BTreeSet<Box<str>> {
-    let mut declared: BTreeSet<Box<str>> = BTreeSet::new();
+/// reports `CS0159` for. Comparing the identities resolved during binding, rather than spellings,
+/// keeps the exit analysis and CS0159 in agreement even when disjoint scopes reuse a name.
+fn undefined_goto_labels(body: &BoundStmt) -> BTreeSet<BoundLabel> {
+    let mut declared: BTreeSet<BoundLabel> = BTreeSet::new();
     visit_statements(body, &mut |stmt| {
         if let BoundStmtKind::Labeled { label, .. } = &stmt.kind {
             declared.insert(label.clone());
         }
     });
-    let mut undefined: BTreeSet<Box<str>> = BTreeSet::new();
+    let mut undefined: BTreeSet<BoundLabel> = BTreeSet::new();
     visit_statements(body, &mut |stmt| {
         if let BoundStmtKind::Goto(label) = &stmt.kind {
             if !declared.contains(label) {
@@ -1190,7 +1189,7 @@ pub(crate) fn collect_field_uses(expr: &BoundExpr, reads: &mut FieldSet, writes:
 /// rather than risk flagging reachable code.
 #[must_use]
 pub fn check_unreachable(body: &BoundStmt) -> Vec<Diagnostic> {
-    let mut goto_targets: BTreeSet<Box<str>> = BTreeSet::new();
+    let mut goto_targets: BTreeSet<BoundLabel> = BTreeSet::new();
     visit_statements(body, &mut |stmt| {
         if let BoundStmtKind::Goto(label) = &stmt.kind {
             goto_targets.insert(label.clone());
@@ -1208,7 +1207,7 @@ struct Unreachable {
     diagnostics: Vec<Diagnostic>,
     /// The labels that some `goto` targets; a labeled statement among them is a jump landing
     /// point, so it is reachable even after a statement whose control does not fall through.
-    goto_targets: BTreeSet<Box<str>>,
+    goto_targets: BTreeSet<BoundLabel>,
 }
 
 impl Unreachable {
@@ -1222,7 +1221,7 @@ impl Unreachable {
             }
             if !reachable {
                 if let BoundStmtKind::LocalFunction(function) = &statement.kind {
-                    self.statement(&function.body);
+                    self.diagnostics.extend(check_unreachable(&function.body));
                     continue;
                 }
             }
@@ -1311,7 +1310,7 @@ impl Unreachable {
                 self.statement(inner)
             }
             Kind::LocalFunction(function) => {
-                self.statement(&function.body);
+                self.diagnostics.extend(check_unreachable(&function.body));
                 true
             }
         }
@@ -1473,13 +1472,14 @@ fn section_transfers(stmt: &BoundStmt) -> bool {
     }
 }
 
-/// Reports `CS0140` (a label declared twice) and `CS0159` (a `goto` to a label that does
-/// not exist) within one method body -- labels share a single method-wide scope (8.7.1).
+/// Reports `CS0140` for overlapping label declarations and `CS0159` for unresolved jumps.
+/// Binding gives disjoint declarations distinct identities and resolves jumps only within the
+/// label's block or a nested block of the same function (ECMA-334 15.4).
 #[must_use]
 pub fn check_labels(body: &BoundStmt) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    let mut labels: BTreeSet<Box<str>> = BTreeSet::new();
-    let mut label_decls: Vec<(Box<str>, lamella_syntax::span::Span)> = Vec::new();
+    let mut labels: BTreeSet<BoundLabel> = BTreeSet::new();
+    let mut label_decls: Vec<(BoundLabel, Span)> = Vec::new();
     visit_statements(body, &mut |stmt| {
         if let BoundStmtKind::Labeled { label, .. } = &stmt.kind {
             if labels.insert(label.clone()) {
@@ -1487,30 +1487,30 @@ pub fn check_labels(body: &BoundStmt) -> Vec<Diagnostic> {
             } else {
                 diagnostics.push(Diagnostic::new(
                     DiagnosticKind::DuplicateLabel {
-                        label: label.clone(),
+                        label: label.name().into(),
                     },
                     stmt.span,
                 ));
             }
         }
     });
-    let mut goto_targets: BTreeSet<Box<str>> = BTreeSet::new();
+    let mut goto_targets: BTreeSet<BoundLabel> = BTreeSet::new();
     visit_statements(body, &mut |stmt| {
         if let BoundStmtKind::Goto(label) = &stmt.kind {
             goto_targets.insert(label.clone());
             if !labels.contains(label) {
                 diagnostics.push(Diagnostic::new(
                     DiagnosticKind::UndefinedLabel {
-                        label: label.clone(),
+                        label: label.name().into(),
                     },
                     stmt.span,
                 ));
             }
         }
     });
-    goto_targets.extend(local_function_gotos(body));
+    let nested_targets = local_function_gotos(body);
     for (label, span) in label_decls {
-        if !goto_targets.contains(&label) {
+        if !goto_targets.contains(&label) && !nested_targets.contains(label.name()) {
             diagnostics.push(Diagnostic::new(DiagnosticKind::UnreferencedLabel, span));
         }
     }
@@ -1530,7 +1530,7 @@ fn local_function_gotos(body: &BoundStmt) -> BTreeSet<Box<str>> {
     while let Some(function_body) = pending.pop() {
         visit_statements(function_body, &mut |stmt| match &stmt.kind {
             BoundStmtKind::Goto(label) => {
-                found.insert(label.clone());
+                found.insert(label.name().into());
             }
             BoundStmtKind::LocalFunction(function) => pending.push(&function.body),
             _ => {}
@@ -1551,7 +1551,7 @@ fn local_function_gotos(body: &BoundStmt) -> BTreeSet<Box<str>> {
 fn switch_jump_targets(sections: &[BoundSwitchSection]) -> BTreeSet<usize> {
     let mut case_section: BTreeMap<i64, usize> = BTreeMap::new();
     let mut default_section: Option<usize> = None;
-    let mut label_section: BTreeMap<Box<str>, usize> = BTreeMap::new();
+    let mut label_section: BTreeMap<BoundLabel, usize> = BTreeMap::new();
     for (index, section) in sections.iter().enumerate() {
         for label in &section.labels {
             match label {
@@ -2602,10 +2602,20 @@ impl<'a> Analyzer<'a> {
                 self.expression(right, &mut if_null, span);
             }
             BoundExprKind::Sequence { spilled, value } => {
+                let mut outputs = Vec::new();
                 for operand in spilled {
+                    // Taking an out argument's address does not assign it. Its invocation
+                    // must finish before subsequent expressions may read the variable.
+                    if let BoundExprKind::Ref { out: true, operand } = &operand.kind
+                        && let BoundExprKind::Local(name) = &operand.kind
+                    {
+                        outputs.push(name.clone());
+                        continue;
+                    }
                     self.expression(operand, assigned, span);
                 }
                 self.expression(value, assigned, span);
+                assigned.extend(outputs);
             }
             BoundExprKind::Throw(operand) => self.expression(operand, assigned, span),
             BoundExprKind::Assignment {

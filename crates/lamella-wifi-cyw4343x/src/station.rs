@@ -13,15 +13,26 @@
 //! leave the network held and the link down: after a rest the station
 //! scans, and when the network was seen re-enters the join at its
 //! disassociation step with the secret re-supplied, without a ceiling,
-//! until the caller disconnects. The two failures it does not retry are
-//! the supplicant's handshake timeout, the usual sign of a wrong
-//! passphrase, and a recovery scan that sees the network advertising no
-//! suite the credential can use; each detaches the network. After the
-//! radio up, a request the firmware answers with "not up" is retried a
-//! bounded number of times, since the radio's settle outlives the event
-//! that announces it. On request the station reads the firmware's
-//! capability string and keeps its word on whether it runs the SAE
-//! exchange itself.
+//! until the caller disconnects. A scan the firmware reports complete
+//! with the network in none of its records is followed by a second one
+//! whose probe requests carry the network's name, so that a network which
+//! does not broadcast its name is found; a scan that ended any other way
+//! is followed by none, and the next cycle scans afresh. The one failure
+//! it does not retry is a recovery scan that sees the network advertising
+//! no suite the credential can use, which detaches the network. A failed
+//! attempt that is the sign of a refused secret -- on a WPA2 join the
+//! supplicant's handshake timeout, on a WPA3 join an association failure
+//! behind a failed authentication -- is retried as every other, behind a
+//! rest of its own: five seconds, doubled at each such failure in a row up
+//! to five minutes, longer by under a fifth once the caller gave a seed,
+//! and put back to five seconds by a join that completes. After the radio
+//! up, a request the firmware answers with "not up" is retried a bounded
+//! number of times, since the radio's settle outlives the event that
+//! announces it. On request the station reads the
+//! firmware's capability string and keeps its word on whether it runs the
+//! SAE exchange itself.
+
+use core::fmt;
 
 use crate::backplane::Window;
 use crate::clock::Micros;
@@ -55,6 +66,11 @@ pub const JOIN_WAIT_US: Micros = 15_000_000;
 pub const LOSS_SETTLE_US: Micros = 1_000_000;
 /// The rest after a failed or empty recovery cycle before the next.
 pub const CYCLE_REST_US: Micros = 5_000_000;
+/// The rest behind the first failed attempt that is the sign of a refused
+/// secret.
+pub const REFUSED_REST_US: Micros = 5_000_000;
+/// The longest rest behind such an attempt.
+pub const REFUSED_REST_MAX_US: Micros = 300_000_000;
 /// The hold after the supplicant's word on a secured join (WPA2-PSK or
 /// WPA3-SAE) before the join completes, measured on the CYW43439's
 /// firmware 7.95.49: on a WPA3 join a frame written within about a
@@ -132,13 +148,35 @@ const SCAN_MODE: Request<'static> = Request {
     payload: Payload::Word(scan::request::ACTIVE as u32),
 };
 
-const fn scan_start(sync: u16) -> Request<'static> {
+/// A network's name that a scan asks for, shown by its length alone in a
+/// debug print, as the held network's is.
+#[derive(Clone, Copy)]
+struct Name<'b> {
+    bytes: &'b [u8],
+}
+
+impl fmt::Debug for Name<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Name")
+            .field("len", &self.bytes.len())
+            .finish()
+    }
+}
+
+/// The scan start: the plain scan's, or the scan's that asks for `named`.
+const fn scan_start<'b>(sync: u16, named: Option<Name<'b>>) -> Request<'b> {
     Request {
         stage: STAGE_SCAN_START,
         set: true,
         cmd: cmd::SET_VAR,
         name: var::SCAN,
-        payload: Payload::Scan { sync },
+        payload: match named {
+            Some(name) => Payload::ScanFor {
+                sync,
+                name: name.bytes,
+            },
+            None => Payload::Scan { sync },
+        },
     }
 }
 
@@ -202,8 +240,21 @@ pub struct Station<'b> {
     seen: bool,
     seen_compatible: bool,
     mismatch: Option<Advertised>,
+    /// The name a `scan_for` request asked for; the name the scan in
+    /// flight carries, when it is a second scan; and whether a record of
+    /// the request's scans carried the name asked for.
+    wanted: Option<Name<'b>>,
+    named: Option<Name<'b>>,
+    heard: bool,
     recovering: bool,
     rest_until: Micros,
+    /// The failed attempts in a row that were the sign of a refused
+    /// secret; the state of the spread's generator, zero until a seed is
+    /// given; and the rest that the last failed attempt began where it was
+    /// such a sign, zero otherwise.
+    refused: u32,
+    spread: u32,
+    backoff: Micros,
     assoc_status: u32,
     auth_status: u32,
     associated: bool,
@@ -236,8 +287,14 @@ impl<'b> Station<'b> {
             seen: false,
             seen_compatible: false,
             mismatch: None,
+            wanted: None,
+            named: None,
+            heard: false,
             recovering: false,
             rest_until: 0,
+            refused: 0,
+            spread: 0,
+            backoff: 0,
             assoc_status: 0,
             auth_status: 0,
             associated: false,
@@ -260,6 +317,25 @@ impl<'b> Station<'b> {
     /// The chip's address, once read.
     pub const fn address(&self) -> Option<[u8; ADDRESS_LEN]> {
         self.address
+    }
+
+    /// The rest that the last failed attempt began, where its failure was
+    /// the sign of a refused secret for the join's kind: the caller's word
+    /// on when the next try comes. `None` behind every other failure,
+    /// behind a join that completed and behind a join request.
+    pub const fn backoff(&self) -> Option<Micros> {
+        if self.backoff == 0 {
+            None
+        } else {
+            Some(self.backoff)
+        }
+    }
+
+    /// The seed of the spread on the rests behind refused secrets. Until a
+    /// seed is given those rests carry no spread. A seed of zero is taken
+    /// as one, since the generator's zero state never leaves zero.
+    pub fn seed(&mut self, seed: u32) {
+        self.spread = if seed == 0 { 1 } else { seed };
     }
 
     /// Whether nothing is in flight.
@@ -323,6 +399,20 @@ impl<'b> Station<'b> {
         true
     }
 
+    /// Record a scan request that looks for the network named `name` (1 to
+    /// 32 bytes); accepted as `scan` is. It is the scan of `scan`, and when
+    /// the firmware reports that scan complete with the name in none of its
+    /// records, a second scan whose probe requests carry the name, which a
+    /// network that does not broadcast its name answers. The records of
+    /// both are handed back and one outcome ends the request.
+    pub fn scan_for(&mut self, name: &'b [u8]) -> bool {
+        if name.is_empty() || name.len() > scan::SSID_MAX || !self.scan() {
+            return false;
+        }
+        self.wanted = Some(Name { bytes: name });
+        true
+    }
+
     /// Record a join request; accepted after the radio up, with nothing in
     /// flight and no network held, for an SSID of 1 to 32 bytes and a
     /// passphrase of 8 to 64 or none.
@@ -354,6 +444,7 @@ impl<'b> Station<'b> {
         }
         self.network = Some(network);
         self.link = LinkState::Joining;
+        self.backoff = 0;
         self.assoc_status = 0;
         self.auth_status = 0;
         self.associated = false;
@@ -367,30 +458,42 @@ impl<'b> Station<'b> {
 
     /// Record a disconnect; accepted whenever a network is held. The
     /// network is dropped at once; the disassociation is sent as soon as
-    /// no exchange is outstanding.
+    /// no exchange is outstanding. The count of refused secrets is put
+    /// back by every call, accepted or not: the caller ended the trying.
     pub fn disconnect(&mut self) -> bool {
+        self.refused = 0;
         if self.link == LinkState::Detached {
             return false;
         }
         self.network = None;
         self.link = LinkState::Detached;
         self.recovering = false;
+        self.backoff = 0;
         self.disconnect = true;
         true
     }
 
     fn begin_scan(&mut self) {
+        self.next_sync();
+        self.records = 0;
+        self.seen = false;
+        self.seen_compatible = false;
+        self.mismatch = None;
+        self.wanted = None;
+        self.named = None;
+        self.heard = false;
+        self.yield_at = None;
+        self.exchange = None;
+    }
+
+    /// A sync number of its own for the next scan request: the count of
+    /// this station's scans, never zero.
+    fn next_sync(&mut self) {
         self.scans = self.scans.wrapping_add(1);
         if self.scans == 0 {
             self.scans = 1;
         }
         self.sync = self.scans;
-        self.records = 0;
-        self.seen = false;
-        self.seen_compatible = false;
-        self.mismatch = None;
-        self.yield_at = None;
-        self.exchange = None;
     }
 
     /// One bounded step.
@@ -494,7 +597,7 @@ impl<'b> Station<'b> {
                 Ok(Wake::Again)
             }
             Stage::ScanStart { tries } => {
-                let request = scan_start(self.sync);
+                let request = scan_start(self.sync, self.named);
                 let reply = match self.exchange_step(request, bus, window, buf, layer, ids, now)? {
                     Progress::Wake(wake) => return Ok(wake),
                     Progress::Event(event) => return self.funnel(event, buf, layer, now),
@@ -532,6 +635,7 @@ impl<'b> Station<'b> {
             },
             Stage::NotFound => {
                 self.stage = Stage::Idle;
+                self.backoff = 0;
                 self.rest_until = now + CYCLE_REST_US;
                 Ok(Wake::Done(Outcome::JoinFailed(JoinFailure::NotFound)))
             }
@@ -816,6 +920,11 @@ impl<'b> Station<'b> {
                 self.mismatch = Some(walked.record.security);
             }
         }
+        if let Some(name) = self.wanted
+            && name.bytes == walked.record.ssid()
+        {
+            self.heard = true;
+        }
         self.record = Some((payload_at + at, payload_at + walked.end));
         self.yield_at = walked.next;
         self.stage = Stage::ScanYield;
@@ -833,10 +942,48 @@ impl<'b> Station<'b> {
         self.scan_end(ScanEnd::of_status(self.scan_status))
     }
 
-    /// The scan ended: the outcome, and the recovery cycle's verdict when
-    /// the scan was its own.
+    /// The name a second scan is to carry, when one follows the scan that
+    /// ended with `end`: after a plain scan the firmware reported complete,
+    /// the held network's name when the recovery cycle saw it in no
+    /// record, or the name a `scan_for` request asked for and heard in
+    /// none. A plain scan that ended any other way is followed by no second
+    /// scan: the firmware may still be scanning, and a scan start it
+    /// answers busy would park the driver.
+    fn unseen(&self, end: ScanEnd) -> Option<Name<'b>> {
+        if end != ScanEnd::Complete || self.named.is_some() {
+            return None;
+        }
+        if self.recovering {
+            return match self.network {
+                Some(network) if !self.seen => Some(Name {
+                    bytes: network.ssid(),
+                }),
+                _ => None,
+            };
+        }
+        if self.heard { None } else { self.wanted }
+    }
+
+    /// The scan ended: a second scan that asks for the network by name
+    /// when the first did not see it, with no outcome between the two;
+    /// else the outcome, and the recovery cycle's verdict when the scan
+    /// was its own.
     fn scan_end(&mut self, end: ScanEnd) -> Result<Wake, Refusal> {
+        if let Some(name) = self.unseen(end) {
+            // The scan mode stands from the plain scan's own request, and
+            // the records' count and what they showed run on over both
+            // scans; the second scan has a sync number and a bound of its
+            // own.
+            self.next_sync();
+            self.named = Some(name);
+            self.yield_at = None;
+            self.exchange = None;
+            self.stage = Stage::ScanStart { tries: 0 };
+            return Ok(Wake::Again);
+        }
         let records = self.records;
+        self.wanted = None;
+        self.named = None;
         self.yield_at = None;
         self.exchange = None;
         if self.recovering {
@@ -933,12 +1080,20 @@ impl<'b> Station<'b> {
     /// completion -- with the association event's in its place if no word
     /// came; the supplicant's event carries another address.
     fn joined(&mut self, event: Event) -> Result<Wake, Refusal> {
+        self.link_up();
+        let bssid = self.bssid.unwrap_or(event.address);
+        Ok(Wake::Done(Outcome::Joined { bssid }))
+    }
+
+    /// The link up behind a join that completed, on either path: nothing in
+    /// flight, and the count of refused secrets put back.
+    fn link_up(&mut self) {
         self.link = LinkState::Up;
         self.stage = Stage::Idle;
         self.exchange = None;
         self.recovering = false;
-        let bssid = self.bssid.unwrap_or(event.address);
-        Ok(Wake::Done(Outcome::Joined { bssid }))
+        self.refused = 0;
+        self.backoff = 0;
     }
 
     /// The hold's expiry on a secured join whose two words are both in.
@@ -960,36 +1115,48 @@ impl<'b> Station<'b> {
     /// The join completes at the hold's expiry, with the address the
     /// association word named.
     fn joined_held(&mut self) -> Result<Wake, Refusal> {
-        self.link = LinkState::Up;
-        self.stage = Stage::Idle;
-        self.exchange = None;
-        self.recovering = false;
+        self.link_up();
         let bssid = self.bssid.unwrap_or([0; ADDRESS_LEN]);
         Ok(Wake::Done(Outcome::Joined { bssid }))
     }
 
     /// The attempt failed: the network stays held and the link down for the
-    /// next cycle, except on the supplicant's timeout and on a mismatch,
-    /// which detach it.
+    /// next cycle, except on a mismatch, which detaches it. Behind the sign
+    /// of a refused secret the rest before that cycle is the refusals' own.
     fn join_failed(&mut self, failure: JoinFailure, now: Micros) -> Result<Wake, Refusal> {
         self.stage = Stage::Idle;
         self.exchange = None;
         self.recovering = false;
-        match failure {
-            JoinFailure::Supplicant { reason } if reason == reason::supplicant::WPA_PSK_TIMEOUT => {
-                self.network = None;
-                self.link = LinkState::Detached;
-            }
-            JoinFailure::Mismatch { .. } => {
-                self.network = None;
-                self.link = LinkState::Detached;
-            }
-            _ => {
-                self.link = LinkState::Down;
-                self.rest_until = now + CYCLE_REST_US;
-            }
+        self.backoff = 0;
+        if let JoinFailure::Mismatch { .. } = failure {
+            self.network = None;
+            self.link = LinkState::Detached;
+        } else {
+            self.link = LinkState::Down;
+            let refused = self
+                .network
+                .is_some_and(|network| failure.refused_secret(network.kind()));
+            let rest = if refused {
+                self.refused_once_more()
+            } else {
+                CYCLE_REST_US
+            };
+            self.rest_until = now + rest;
         }
         Ok(Wake::Done(Outcome::JoinFailed(failure)))
+    }
+
+    /// One refused secret more in the row: the rest before the next try,
+    /// with its spread, kept for the caller. The count stops where the
+    /// rest has reached its cap, so no count ends the trying.
+    fn refused_once_more(&mut self) -> Micros {
+        if refused_rest(self.refused) < REFUSED_REST_MAX_US {
+            self.refused += 1;
+        }
+        self.spread = spread_step(self.spread);
+        let rest = refused_rest(self.refused);
+        self.backoff = rest + spread_of(rest, self.spread);
+        self.backoff
     }
 }
 
@@ -997,6 +1164,40 @@ impl Default for Station<'_> {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// The rest before the next try behind the `count`-th failed attempt in a
+/// row that was the sign of a refused secret, without its spread:
+/// `REFUSED_REST_US`, doubled at each one after the first, and
+/// `REFUSED_REST_MAX_US` once a doubling reaches it, whatever the count.
+pub const fn refused_rest(count: u32) -> Micros {
+    let mut rest = REFUSED_REST_US;
+    let mut doubled = 1;
+    while doubled < count && rest < REFUSED_REST_MAX_US {
+        rest *= 2;
+        doubled += 1;
+    }
+    if rest > REFUSED_REST_MAX_US {
+        REFUSED_REST_MAX_US
+    } else {
+        rest
+    }
+}
+
+/// One step of the spread's generator: a xorshift of 32 bits, whose zero
+/// state never leaves zero.
+pub(crate) const fn spread_step(state: u32) -> u32 {
+    let mut word = state;
+    word ^= word << 13;
+    word ^= word >> 17;
+    word ^= word << 5;
+    word
+}
+
+/// The spread on `rest` for the generator's `word`: the word over 2^32 of
+/// a fifth of the rest, so from nothing to under a fifth.
+pub(crate) const fn spread_of(rest: Micros, word: u32) -> Micros {
+    ((rest / 5) * word as Micros) >> 32
 }
 
 /// A reply that refuses -- a non-zero status, or the error flag -- refuses

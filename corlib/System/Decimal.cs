@@ -1,5 +1,7 @@
 // Lamella managed corlib (from scratch). -- System.Decimal
 #if LAMELLA_SURFACE_DECIMAL
+using System.Globalization;
+
 namespace System
 {
     public struct Decimal : IComparable, IFormattable
@@ -341,92 +343,79 @@ namespace System
 
         public string ToString(string format)
         {
-            if ((object)format == null || format.Length == 0) return ToString();
-            if (format.Length == 1 && (format[0] == 'G' || format[0] == 'g')) return ToString();
-            throw new FormatException("Format specifier was invalid.");
+            return NumberFormatter.FormatDecimal(ToString(), format);
+        }
+
+        public string ToString(IFormatProvider provider)
+        {
+            NumberParser.AskProvider(provider);
+            return ToString();
         }
 
         public string ToString(string format, IFormatProvider provider)
         {
+            NumberParser.AskProvider(provider);
             return ToString(format);
         }
 
         public static Decimal Parse(string s)
         {
-            Decimal result;
-            int outcome = TryParseCore(s, out result);
-            if (outcome == 1) return result;
-            if (outcome == -2) throw new OverflowException("Value was either too large or too small for a Decimal.");
             if ((object)s == null) throw new ArgumentNullException("s");
-            throw new FormatException("Input string was not in a correct format.");
+            Decimal result;
+            int outcome = NumberParser.ScanDecimal(s, (int)NumberStyles.Number, out result);
+            if (outcome != NumberParser.Done) NumberParser.Refuse(outcome, s, "Value was either too large or too small for a Decimal.");
+            return result;
+        }
+
+        public static Decimal Parse(string s, NumberStyles style)
+        {
+            if ((object)s == null) throw new ArgumentNullException("s");
+            NumberParser.CheckFractionalStyle(style);
+            Decimal result;
+            int outcome = NumberParser.ScanDecimal(s, (int)style, out result);
+            if (outcome != NumberParser.Done) NumberParser.Refuse(outcome, s, "Value was either too large or too small for a Decimal.");
+            return result;
+        }
+
+        public static Decimal Parse(string s, IFormatProvider provider)
+        {
+            return Parse(s, NumberStyles.Number, provider);
+        }
+
+        public static Decimal Parse(string s, NumberStyles style, IFormatProvider provider)
+        {
+            if ((object)s == null) throw new ArgumentNullException("s");
+            NumberParser.CheckFractionalStyle(style);
+            NumberParser.AskProvider(provider);
+            Decimal result;
+            int outcome = NumberParser.ScanDecimal(s, (int)style, out result);
+            if (outcome != NumberParser.Done) NumberParser.Refuse(outcome, s, "Value was either too large or too small for a Decimal.");
+            return result;
         }
 
 #if LAMELLA_SURFACE_NETFX_2_0
         public static bool TryParse(string s, out Decimal result)
         {
-            return TryParseCore(s, out result) == 1;
+            result = Zero;
+            if ((object)s == null) return false;
+            Decimal scanned;
+            if (NumberParser.ScanDecimal(s, (int)NumberStyles.Number, out scanned) != NumberParser.Done) return false;
+            result = scanned;
+            return true;
+        }
+
+        public static bool TryParse(string s, NumberStyles style, IFormatProvider provider, out Decimal result)
+        {
+            NumberParser.CheckFractionalStyle(style);
+            result = Zero;
+            if ((object)s == null) return false;
+            NumberParser.AskProvider(provider);
+            Decimal scanned;
+            if (NumberParser.ScanDecimal(s, (int)style, out scanned) != NumberParser.Done) return false;
+            result = scanned;
+            return true;
         }
 #endif
-
-        private static int TryParseCore(string s, out Decimal result)
-        {
-            result = Zero;
-            if ((object)s == null) return 0;
-            int end = s.Length;
-            while (end > 0 && NumberText.IsPad(s[end - 1])) end = end - 1;
-            int i = 0;
-            while (i < end && NumberText.IsPad(s[i])) i = i + 1;
-            if (i >= end) return 0;
-
-            bool negative = false;
-            if (s[i] == '-') { negative = true; i = i + 1; }
-            else if (s[i] == '+') { i = i + 1; }
-
-            uint mlo = 0, mmid = 0, mhi = 0;
-            int scale = 0;
-            bool sawDigit = false;
-            bool sawDot = false;
-            while (i < end)
-            {
-                char c = s[i];
-                if (c == '.')
-                {
-                    if (sawDot) return 0;
-                    sawDot = true;
-                    i = i + 1;
-                    continue;
-                }
-                if (c == ',') { if (sawDot || !sawDigit) return 0; i = i + 1; continue; }
-                if (c < '0' || c > '9') return 0;
-                sawDigit = true;
-                int digit = c - '0';
-                if (!MulAdd(ref mlo, ref mmid, ref mhi, (uint)digit)) return -2;
-                if (sawDot)
-                {
-                    scale++;
-                    if (scale > 28) return -2;
-                }
-                i = i + 1;
-            }
-            if (!sawDigit) return 0;
-
-            result = new Decimal((int)mlo, (int)mmid, (int)mhi, negative, (byte)scale);
-            return 1;
-        }
-
-        private static bool MulAdd(ref uint clo, ref uint cmid, ref uint chi, uint digit)
-        {
-            ulong cur = (ulong)clo * 10UL + digit;
-            clo = (uint)cur;
-            ulong carry = cur >> 32;
-            cur = (ulong)cmid * 10UL + carry;
-            cmid = (uint)cur;
-            carry = cur >> 32;
-            cur = (ulong)chi * 10UL + carry;
-            chi = (uint)cur;
-            carry = cur >> 32;
-            return carry == 0;
-        }
     }
 }
 #endif

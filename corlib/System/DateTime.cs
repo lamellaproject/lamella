@@ -1,7 +1,7 @@
 // Lamella managed corlib (from scratch). -- System.DateTime
 namespace System
 {
-    public struct DateTime : IComparable
+    public struct DateTime : IComparable, IFormattable
     {
         private const long TicksPerMillisecond = 10000;
         private const long TicksPerSecond = 10000000;
@@ -549,11 +549,19 @@ namespace System
             return ToString(format, System.Globalization.DateTimeFormatInfo.InvariantInfo);
         }
 
+        /// <summary>Formats this value in the general format, under <paramref name="provider"/>.</summary>
+        /// <param name="provider">What supplies the format's culture-specific parts, or null.</param>
+        /// <returns>The text.</returns>
+        public string ToString(IFormatProvider provider)
+        {
+            return ToString(null, provider);
+        }
+
         public string ToString(string format, IFormatProvider provider)
         {
             System.Globalization.DateTimeFormatInfo dtfi = GetFormatInfo(provider);
             if (format == null || format.Length == 0) format = "G";
-            string pattern = (format.Length == 1) ? ExpandStandard(format[0], dtfi) : format;
+            string pattern = (format.Length == 1) ? ExpandStandard(format[0], dtfi, InternalKindBits) : format;
             return Format(this, pattern, dtfi);
         }
 
@@ -561,13 +569,13 @@ namespace System
         {
             if (provider != null)
             {
-                object formatInfo = provider.GetFormat(typeof(System.Globalization.DateTimeFormatInfo));
-                if (formatInfo != null) return (System.Globalization.DateTimeFormatInfo)formatInfo;
+                System.Globalization.DateTimeFormatInfo formatInfo = provider.GetFormat(typeof(System.Globalization.DateTimeFormatInfo)) as System.Globalization.DateTimeFormatInfo;
+                if (formatInfo != null) return formatInfo;
             }
             return System.Globalization.DateTimeFormatInfo.InvariantInfo;
         }
 
-        private static string ExpandStandard(char format, System.Globalization.DateTimeFormatInfo dtfi)
+        private static string ExpandStandard(char format, System.Globalization.DateTimeFormatInfo dtfi, long kindBits)
         {
             switch (format)
             {
@@ -582,7 +590,11 @@ namespace System
                 case 's': return "yyyy-MM-ddTHH:mm:ss";
                 case 'u': return "yyyy-MM-dd HH:mm:ssZ";
                 case 'o':
-                case 'O': return "yyyy-MM-ddTHH:mm:ss.fffffff";
+                case 'O':
+                    if (kindBits == KindBitsUtc) return "yyyy-MM-ddTHH:mm:ss.fffffff'Z'";
+                    // Local times use the same zero offset as ToUniversalTime.
+                    if (kindBits == KindBitsLocal) return "yyyy-MM-ddTHH:mm:ss.fffffff'+00:00'";
+                    return "yyyy-MM-ddTHH:mm:ss.fffffff";
                 case 'r':
                 case 'R': return "ddd, dd MMM yyyy HH:mm:ss 'GMT'";
                 case 'm':

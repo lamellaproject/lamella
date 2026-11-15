@@ -137,4 +137,58 @@ public sealed class LamellaCheckBoard : Task
     <Error Condition="'$(_LamellaBoardProblem)' != ''" File="$(MSBuildProjectFullPath)" Code="$(_LamellaBoardProblemCode)" Text="$(_LamellaBoardProblem)" />
   </Target>
 
+  <!-- A package whose targets create LamellaFlashRegion items appends those targets' names to
+       LamellaFlashRegionsDependsOn. They run in two places only, each time before the regions are read: in a publish
+       with LamellaTargetBoard set, and in a run on a debug probe once the device, the board and the published image
+       are checked. For a net11.0 program, the LamellaResolvedRhuPack items stand before they run. The list is empty
+       by default, and no target in it may rely on the build having run in the same call. -->
+  <Target Name="_LamellaPrepareFlashRegions"
+          DependsOnTargets="_LamellaFlashRegionPacks;$(LamellaFlashRegionsDependsOn)"
+          Condition="'$(_LamellaServesRun)' == 'true' and '$(LamellaTargetBoard)' != '' and '$(LamellaFlashRegionsDependsOn)' != ''" />
+
+  <Target Name="_LamellaFlashRegionPacks"
+          DependsOnTargets="_LamellaRhuResolvedPacks"
+          Condition="'$(_LamellaRhuDispatch)' == 'true'" />
+
+  <!-- Each flash region the board's package declares as a LamellaFlashRegion item goes into the publish folder
+       with the files a write of it needs beside it: its record, and each notice its record names. The lamella
+       tool checks each region for the board as a write of it would, and lists those files; a region it refuses
+       stops the publish, with the tool's reason. This runs after the published files are listed, and after a
+       lamella1.0 program's image has replaced them, so the regions are published beside the image. -->
+  <Target Name="_LamellaPublishRegions"
+          AfterTargets="ComputeResolvedFilesToPublishList"
+          DependsOnTargets="_LamellaPrepareFlashRegions;_LamellaPublishRegionFiles"
+          Condition="'$(_LamellaServesRun)' == 'true'" />
+
+  <Target Name="_LamellaPublishRegionFiles"
+          DependsOnTargets="_LamellaCheckTool"
+          Condition="'@(LamellaFlashRegion)' != ''">
+    <PropertyGroup>
+      <_LamellaRegionFilesFile>$(_LamellaIntermediateDir)lamella.regions.proj</_LamellaRegionFilesFile>
+      <_LamellaRegionOptions>@(LamellaFlashRegion->'--region &quot;%(FullPath)&quot;', ' ')</_LamellaRegionOptions>
+      <_LamellaRegionOptions Condition="'$(LamellaTargetBoard)' != ''">--board &quot;$(LamellaTargetBoard)&quot; $(_LamellaRegionOptions)</_LamellaRegionOptions>
+      <_LamellaRegionsExit>-1</_LamellaRegionsExit>
+    </PropertyGroup>
+    <MakeDir Directories="$(_LamellaIntermediateDir)" />
+    <Delete Files="$(_LamellaRegionFilesFile)" />
+    <Exec Command="&quot;$(_LamellaTool)&quot; flash --msbuild-regions &quot;$(_LamellaRegionFilesFile)&quot; $(_LamellaRegionOptions)"
+          IgnoreExitCode="true" IgnoreStandardErrorWarningFormat="true" ConsoleToMSBuild="true"
+          EchoOff="true" StandardOutputImportance="low" StandardErrorImportance="low">
+      <Output TaskParameter="ExitCode" PropertyName="_LamellaRegionsExit" />
+      <Output TaskParameter="ConsoleOutput" ItemName="_LamellaRegionsOutput" />
+    </Exec>
+    <PropertyGroup Condition="'$(_LamellaRegionsExit)' != '0'">
+      <_LamellaRegionsFailure>@(_LamellaRegionsOutput, '%0A')</_LamellaRegionsFailure>
+      <_LamellaRegionsFailure Condition="'$(_LamellaRegionsFailure)' == ''">The board's flash regions could not be checked (exit code $(_LamellaRegionsExit)).</_LamellaRegionsFailure>
+    </PropertyGroup>
+    <Error Condition="'$(_LamellaRegionsExit)' != '0'" Code="LAMSDK0032" Text="$(_LamellaRegionsFailure)" />
+    <MSBuild Projects="$(_LamellaRegionFilesFile)" Targets="LamellaRegionFiles"
+             Properties="LamellaRegionsStamp=$([System.DateTime]::UtcNow.Ticks)">
+      <Output TaskParameter="TargetOutputs" ItemName="_LamellaRegionFile" />
+    </MSBuild>
+    <ItemGroup>
+      <ResolvedFileToPublish Include="@(_LamellaRegionFile)" RelativePath="%(Filename)%(Extension)" CopyToPublishDirectory="PreserveNewest" />
+    </ItemGroup>
+  </Target>
+
 </Project>

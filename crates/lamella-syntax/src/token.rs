@@ -406,6 +406,9 @@ pub struct Token {
     /// parser can see this flag where the text alone reads as the keyword (ECMA-334 5th ed,
     /// 12.8.8.1).
     pub verbatim: bool,
+    /// Whether an integer token uses decimal digits rather than a hexadecimal or binary prefix.
+    /// False for other tokens and for tokens synthesized without source spelling.
+    pub decimal_integer: bool,
 }
 
 impl Token {
@@ -416,6 +419,7 @@ impl Token {
             kind,
             span,
             verbatim: false,
+            decimal_integer: false,
         }
     }
 
@@ -427,6 +431,7 @@ impl Token {
             kind,
             span,
             verbatim,
+            decimal_integer: false,
         }
     }
 

@@ -158,7 +158,7 @@ pub struct LoadedAttribute {
 /// the full identity, because `unbox.any` and array-element compatibility (I.8.7.1) both
 /// distinguish them: unboxing an `int` box as `uint` throws InvalidCastException, and a
 /// `bool[]` is not castable to `byte[]` even though both pack 1-byte elements.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CastPrim {
     /// `bool`.
     Bool = 1,
@@ -253,12 +253,19 @@ const CAST_LEAF_VECTOR_INTERFACE: u32 = 7;
 /// decodes it as plain `Named`; an older runtime, which knows no kind 8, reads the record as none
 /// and matches it leniently.
 const CAST_LEAF_NAMED_ARRAY_BASE: u32 = 8;
+/// An arena-backed shape: `token` is the offset of a wrapper count, a compact leaf record, then
+/// `(kind, rank)` word pairs from outermost to innermost. Kinds 0, 1 and 2 denote a vector,
+/// rectangular array and vector interface respectively; kind 3 denotes a pointer.
+/// Older readers treat kind 9 as unknown.
+const CAST_SHAPE_SEQUENCE: u32 = 9;
+/// The `void` leaf of an unmanaged pointer signature.
+const CAST_LEAF_VOID: u32 = 10;
 
 impl CastElem {
     /// This shape as a frozen-image record `(shape, token)`: the shape word packs the array depth
     /// (bits 0-7), the leaf's kind (bits 8-15) and the leaf's payload (bits 16-23: a primitive's
-    /// code, or a named type's assembly), and `token` is a named type's token. `None` for a shape
-    /// nested in more than 255 arrays, which then stays in the live map.
+    /// code, or a named type's assembly), and `token` is a named type's token. Shapes that do not
+    /// fit this compact record use [`Self::write_frozen_record`]'s arena-backed representation.
     #[must_use]
     fn frozen_record(&self) -> Option<(u32, u32)> {
         if let CastElem::VectorInterface(element) = self {
@@ -283,10 +290,12 @@ impl CastElem {
             CastElem::Prim(prim) => (CAST_LEAF_PRIM, u32::from(prim.code()), 0),
             CastElem::String => (CAST_LEAF_STRING, 0, 0),
             CastElem::Object => (CAST_LEAF_OBJECT, 0, 0),
+            CastElem::Void => (CAST_LEAF_VOID, 0, 0),
             CastElem::Named(handle) => (CAST_LEAF_NAMED, (*handle >> 32) as u32 & 0xFF, *handle as u32),
             CastElem::Lenient => (CAST_LEAF_LENIENT, 0, 0),
             CastElem::GenericValueType => (CAST_LEAF_GENERIC_VALUE_TYPE, 0, 0),
-            CastElem::Array(_) | CastElem::VectorInterface(_) => return None,
+            CastElem::Array(_) | CastElem::MdArray { .. } | CastElem::VectorInterface(_)
+            | CastElem::Pointer(_) => return None,
         };
         Some((depth | (kind << 8) | (payload << 16), token))
     }
@@ -307,6 +316,7 @@ impl CastElem {
             CAST_LEAF_PRIM => CastElem::Prim(CastPrim::from_code(payload as u8)?),
             CAST_LEAF_STRING => CastElem::String,
             CAST_LEAF_OBJECT => CastElem::Object,
+            CAST_LEAF_VOID => CastElem::Void,
             CAST_LEAF_NAMED | CAST_LEAF_NAMED_ARRAY_BASE => {
                 CastElem::Named((u64::from(payload) << 32) | u64::from(token))
             }
@@ -319,15 +329,84 @@ impl CastElem {
         }
         Some(elem)
     }
+
+    fn write_frozen_record(&self, arena: &mut TableArena) -> Option<(u32, u32)> {
+        if let Some(record) = self.frozen_record() {
+            return Some(record);
+        }
+        let mut wrappers = Vec::new();
+        let mut leaf = self;
+        loop {
+            match leaf {
+                CastElem::Array(element) => {
+                    wrappers.push((0, 0));
+                    leaf = element;
+                }
+                CastElem::MdArray { element, rank } => {
+                    wrappers.push((1, *rank));
+                    leaf = element;
+                }
+                CastElem::VectorInterface(element) => {
+                    wrappers.push((2, 0));
+                    leaf = element;
+                }
+                CastElem::Pointer(element) => {
+                    wrappers.push((3, 0));
+                    leaf = element;
+                }
+                _ => break,
+            }
+        }
+        let (shape, token) = leaf.frozen_record()?;
+        let count = u32::try_from(wrappers.len()).ok()?;
+        let offset = u32::try_from(arena.bytes.len()).ok()?;
+        arena.push_u32(count);
+        arena.push_u32(shape);
+        arena.push_u32(token);
+        for (kind, rank) in wrappers {
+            arena.push_u32(kind);
+            arena.push_u32(rank);
+        }
+        Some((CAST_SHAPE_SEQUENCE << 8, offset))
+    }
+
+    fn read_frozen_record(arena: &TableArena, shape: u32, token: u32) -> Option<CastElem> {
+        if shape != CAST_SHAPE_SEQUENCE << 8 {
+            return Self::from_frozen_record(shape, token);
+        }
+        let offset = token as usize;
+        let count = arena.read_u32(offset)? as usize;
+        let end = offset.checked_add(12)?.checked_add(count.checked_mul(8)?)?;
+        arena.bytes.get(offset..end)?;
+        let leaf_shape = arena.read_u32(offset + 4)?;
+        if leaf_shape & 0xFF != 0 || (leaf_shape >> 8) & 0xFF == CAST_LEAF_VECTOR_INTERFACE {
+            return None;
+        }
+        let mut elem = Self::from_frozen_record(leaf_shape, arena.read_u32(offset + 8)?)?;
+        for index in (0..count).rev() {
+            let at = offset + 12 + index * 8;
+            let kind = arena.read_u32(at)?;
+            let rank = arena.read_u32(at + 4)?;
+            elem = match (kind, rank) {
+                (0, 0) => CastElem::Array(Box::new(elem)),
+                (1, rank) => CastElem::MdArray { element: Box::new(elem), rank },
+                (2, 0) => CastElem::VectorInterface(Box::new(elem)),
+                (3, 0) => CastElem::Pointer(Box::new(elem)),
+                _ => return None,
+            };
+        }
+        Some(elem)
+    }
 }
 
-/// What a cast-test token (`castclass` / `isinst` / `unbox.any` operand, or a `newarr`
-/// element) names, in the shape the runtime cast checks compare: the loader classifies each
-/// token once (decoding an array `TypeSpec`'s signature blob where needed), and `castclass`
+/// What a cast-test token (`castclass` / `isinst` / `unbox.any` operand, a `newarr`
+/// element or a rectangular-array constructor) names, in the shape the runtime cast checks compare:
+/// the loader classifies each token once (decoding an array `TypeSpec`'s signature blob where
+/// needed), and `castclass`
 /// on an array or `unbox.any` on a box matches the operand's recorded shape against the
 /// target's. A token with no recorded shape is matched leniently (unverified), as is every token
 /// of an image baked before the shapes were carried.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CastElem {
     /// An exact CTS primitive.
     Prim(CastPrim),
@@ -335,11 +414,22 @@ pub enum CastElem {
     String,
     /// `System.Object`.
     Object,
+    /// The `void` type, including the element of `void*`.
+    Void,
     /// A named class / value type / interface / enum: its asm-folded token handle.
     Named(u64),
     /// A single-dimensional zero-based array of the element shape.
     Array(Box<CastElem>),
-    /// A shape the checks do not model (multi-dimensional array, pointer, byref, a generic
+    /// An unmanaged pointer to the exact element type.
+    Pointer(Box<CastElem>),
+    /// A rectangular array of the element shape and rank, distinct from a vector even at rank 1.
+    MdArray {
+        /// The array's element type, which can itself be an array.
+        element: Box<CastElem>,
+        /// The number of dimensions.
+        rank: u32,
+    },
+    /// A shape the checks do not model (byref, a generic
     /// instantiation of a class or an interface): matched leniently.
     Lenient,
     /// An instantiation of a generic VALUE type -- `KeyValuePair<int, string>`, `int?` -- which a
@@ -497,6 +587,40 @@ impl FieldOffsets<'_> {
             }
         }
         found.or_else(|| (offset == self.end()).then_some(self.slot_count()))
+    }
+}
+
+/// The declared storage of an instance field, independent of its evaluation-stack value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldStorage {
+    /// A fixed-width primitive, including the signedness of narrow integers.
+    Primitive(PrimKind),
+    /// A native integer or unmanaged pointer, at the executing target's pointer width.
+    Native,
+    /// An inline value type whose own field layout describes its bytes.
+    ValueType(TypeId),
+    /// A managed reference, which cannot be stored in an untracked raw stack buffer.
+    Reference,
+}
+
+impl FieldStorage {
+    fn words(self) -> [u32; 2] {
+        match self {
+            Self::Primitive(kind) => [1, u32::from(kind.code())],
+            Self::Native => [2, 0],
+            Self::ValueType(id) => [3, id],
+            Self::Reference => [4, 0],
+        }
+    }
+
+    fn from_words(tag: u32, value: u32) -> Option<Self> {
+        Some(match (tag, value) {
+            (1, value) => Self::Primitive(PrimKind::from_code(u8::try_from(value).ok()?)?),
+            (2, 0) => Self::Native,
+            (3, id) => Self::ValueType(id),
+            (4, 0) => Self::Reference,
+            _ => return None,
+        })
     }
 }
 
@@ -1043,6 +1167,8 @@ pub struct Module {
     /// layout it can compute, and frozen into a trailing table. A type without one cannot have
     /// its fields walked by a pointer.
     field_offsets: BTreeMap<TypeId, Box<[u32]>>,
+    /// Two storage-descriptor words per field slot, separate from the offset-run format.
+    field_storage: BTreeMap<TypeId, Box<[u32]>>,
     /// A `TypeDef` token mapped to its [`TypeId`] (for `castclass` / `isinst`).
     type_tokens: BTreeMap<u64, TypeId>,
     /// The reverse of `type_tokens`: a [`TypeId`] mapped to its declaring type's asm-folded
@@ -1257,6 +1383,7 @@ pub struct Module {
     board_buses: Option<Box<[u32]>>,
     type_methods_by_name: BTreeMap<(u64, String), u64>,
     type_properties_by_name: BTreeMap<(u64, String), u64>,
+    type_events_by_name: BTreeMap<(u64, String), u64>,
     /// Reflection introspection metadata per type (the `System.Type` `Namespace`/`FullName`/`Is*`
     /// surface), keyed by the type's asm-folded handle. Empty on a Kernel-only build (the loader
     /// records it only under the `NETMFv4_4` reflection tier).
@@ -1696,7 +1823,7 @@ struct FrozenTables {
     /// the same reason: an image baked before it existed reads every enum as signed, as it always
     /// did.
     enum_unsigned: SortedTokenSet,
-    /// The frozen `cast_elems` (cast-test token -> its [`CastElem::frozen_record`]). Trailing, for
+    /// The frozen `cast_elems` (cast-test token -> its [`CastElem::write_frozen_record`]). Trailing, for
     /// the same reason: an image baked before it existed matches every cast test leniently, as it
     /// always did.
     cast_elems: SortedWideTable,
@@ -1745,6 +1872,11 @@ struct FrozenTables {
     methods_by_name: SortedWideTable,
     /// The frozen `Type.GetProperty` index, same key shape.
     properties_by_name: SortedWideTable,
+    /// The frozen `Event` index, keyed like the property index but in a separate table.
+    /// Its directory entry is trailing so older images have an empty event index.
+    events_by_name: SortedWideTable,
+    /// Per-type runs of field storage descriptors, in instance-slot order.
+    field_storage_runs: SortedWideTable,
     /// The frozen `name_to_handle` (full-name id -> type handle, split u32s).
     name_to_handle: SortedWideTable,
     /// The frozen `type_ctors` (type handle -> public parameterless ctor).
@@ -2349,6 +2481,14 @@ const HEADER_WORDS: usize = HEADER_RESERVED_BASE + HEADER_RESERVED_WORDS;
 ///
 const RUNTIME_SLOT_EXCEPTION_MESSAGE: u64 = 1;
 
+/// The well-known id of `System.Threading.Thread`'s id field -- the scheduler's id for a started
+/// thread -- in [`Module::runtime_field_slots`]. Never reused, as [`RUNTIME_SLOT_EXCEPTION_MESSAGE`].
+const RUNTIME_SLOT_THREAD_ID: u64 = 2;
+
+/// The well-known id of `System.Threading.Thread`'s name field (`Thread.Name`) in
+/// [`Module::runtime_field_slots`]. Never reused, as [`RUNTIME_SLOT_EXCEPTION_MESSAGE`].
+const RUNTIME_SLOT_THREAD_NAME: u64 = 3;
+
 /// `Lamella.Runtime.Clock::SetTicks(long)` in [`Module::runtime_methods`] -- and the first of the
 /// four well-known ids of the methods the RUNTIME calls, whose shared reasoning is here.
 ///
@@ -2569,6 +2709,8 @@ impl FrozenTables {
         pair(out, self.static_slot_types.offset, self.static_slot_types.entries);
         pair(out, self.field_offset_runs.offset, self.field_offset_runs.entries);
         pair(out, self.board_buses.offset, self.board_buses.entries);
+        pair(out, self.events_by_name.offset, self.events_by_name.entries);
+        pair(out, self.field_storage_runs.offset, self.field_storage_runs.entries);
     }
 
     /// Reads a [`FrozenTables::write_directory`] image back; returns the views and the word
@@ -2683,6 +2825,8 @@ impl FrozenTables {
         trailing!(static_slot_types, DenseIdColumn);
         trailing!(field_offset_runs, SortedWideTable);
         trailing!(board_buses, WordRun);
+        trailing!(events_by_name, SortedWideTable);
+        trailing!(field_storage_runs, SortedWideTable);
         Some((frozen, cursor))
     }
 }
@@ -2959,6 +3103,7 @@ impl Module {
         self.freeze_sig_tables();
         self.freeze_type_shape();
         self.freeze_field_offsets();
+        self.freeze_field_storage();
         self.freeze_strings();
         self.freeze_names();
         self.freeze_reflect_records();
@@ -2977,7 +3122,7 @@ impl Module {
     }
 
     /// Drains every name-keyed reflection builder through one sorted UTF-8 pool. Name ids are
-    /// pool ranks, so the pool and all six name tables rebuild TOGETHER whenever any builder has
+    /// pool ranks, so the pool and its name tables rebuild together whenever any builder has
     /// new entries (old frozen entries thaw back to strings through the old pool first).
     fn freeze_names(&mut self) {
         if self.type_names.is_empty()
@@ -2985,6 +3130,7 @@ impl Module {
             && self.type_fields_by_name.is_empty()
             && self.type_methods_by_name.is_empty()
             && self.type_properties_by_name.is_empty()
+            && self.type_events_by_name.is_empty()
             && self.name_to_handle.is_empty()
             && self.reflect_types.is_empty()
             && self.method_params.is_empty()
@@ -3035,6 +3181,8 @@ impl Module {
         methods.extend(core::mem::take(&mut self.type_methods_by_name));
         let mut properties = thaw_by_name(&self.arena, self.frozen.properties_by_name);
         properties.extend(core::mem::take(&mut self.type_properties_by_name));
+        let mut events = thaw_by_name(&self.arena, self.frozen.events_by_name);
+        events.extend(core::mem::take(&mut self.type_events_by_name));
 
         let mut reflect_rows: Vec<(u64, ReflectType)> = self
             .frozen
@@ -3134,6 +3282,7 @@ impl Module {
             .chain(fields.iter().map(|((_, name), _)| name))
             .chain(methods.iter().map(|((_, name), _)| name))
             .chain(properties.iter().map(|((_, name), _)| name))
+            .chain(events.iter().map(|((_, name), _)| name))
             .chain(handles_by_name.iter().map(|(name, _)| name))
             .chain(
                 reflect_rows
@@ -3206,6 +3355,9 @@ impl Module {
         let (table, kept) = write_by_name(properties);
         self.frozen.properties_by_name = table;
         self.type_properties_by_name.extend(kept);
+        let (table, kept) = write_by_name(events);
+        self.frozen.events_by_name = table;
+        self.type_events_by_name.extend(kept);
         self.frozen.name_to_handle = SortedWideTable::write(
             &mut self.arena,
             handles_by_name
@@ -3680,7 +3832,7 @@ impl Module {
         if !self.cast_elems.is_empty() {
             let mut records = frozen.cast_elems.entries_of(arena);
             for (handle, elem) in core::mem::take(&mut self.cast_elems) {
-                match elem.frozen_record() {
+                match elem.write_frozen_record(arena) {
                     Some((shape, token)) => {
                         let shape = if matches!(elem, CastElem::Named(_))
                             && self.array_base_names.remove(&handle)
@@ -3835,15 +3987,17 @@ impl Module {
 
     /// Drops, before a bake, the byte layout of every type whose fields no pointer can walk.
     ///
-    /// A walk starts at a field's address, and only `ldflda` makes one, so a type keeps its
-    /// layout when a body the image carries takes the address of a field it declares or inherits.
-    /// A trimmed image's dropped bodies are empty, so they keep nothing.
+    /// Field addresses keep the declaring layout and its derived layouts. Direct field accesses
+    /// also keep value-type layouts when the image can allocate raw stack storage. Nested value
+    /// fields keep their layouts recursively. A trimmed image's dropped bodies are empty.
     #[cfg(feature = "code-in-place")]
     fn drop_unaddressed_field_offsets(&mut self) {
         if self.field_offsets.is_empty() {
             return;
         }
         let mut addressed: BTreeSet<TypeId> = BTreeSet::new();
+        let mut raw_fields: BTreeSet<TypeId> = BTreeSet::new();
+        let mut has_stack_allocation = false;
         for (id, method) in self.methods.iter().enumerate() {
             let Method::Managed { body, .. } = method else {
                 continue;
@@ -3853,14 +4007,23 @@ impl Module {
             };
             let asm = self.method_asm(id as MethodId);
             for instruction in &code {
-                if let (lamella_cil::Opcode::Ldflda, lamella_cil::Operand::Token(token)) =
+                has_stack_allocation |= instruction.opcode == lamella_cil::Opcode::Localloc;
+                if let (lamella_cil::Opcode::Ldflda | lamella_cil::Opcode::Ldfld | lamella_cil::Opcode::Stfld,
+                    lamella_cil::Operand::Token(token)) =
                     (instruction.opcode, &instruction.operand)
                 {
                     if let Some(owner) = self.field_type(asm, *token) {
-                        addressed.insert(owner);
+                        if instruction.opcode == lamella_cil::Opcode::Ldflda {
+                            addressed.insert(owner);
+                        } else if self.type_is_value_type(owner) {
+                            raw_fields.insert(owner);
+                        }
                     }
                 }
             }
+        }
+        if has_stack_allocation {
+            addressed.extend(raw_fields);
         }
         let walkable = |type_id: TypeId| {
             let mut current = Some(type_id);
@@ -3873,13 +4036,25 @@ impl Module {
             }
             false
         };
-        let kept: BTreeSet<TypeId> = self
+        let mut kept: BTreeSet<TypeId> = self
             .field_offsets
             .keys()
             .copied()
             .filter(|&type_id| walkable(type_id))
             .collect();
+        let mut pending: Vec<TypeId> = kept.iter().copied().collect();
+        while let Some(owner) = pending.pop() {
+            let slots = self.type_field_offsets(owner).map_or(0, |layout| layout.slot_count());
+            for slot in 0..slots {
+                if let Some(FieldStorage::ValueType(nested)) = self.type_field_storage(owner, slot) {
+                    if kept.insert(nested) {
+                        pending.push(nested);
+                    }
+                }
+            }
+        }
         self.field_offsets.retain(|type_id, _| kept.contains(type_id));
+        self.field_storage.retain(|type_id, _| kept.contains(type_id));
     }
 
     /// Drains `field_offsets` into one run of words per type, addressed by a sparse table keyed by
@@ -3909,6 +4084,24 @@ impl Module {
                 .map(|(key, (offset, words))| (key, offset, words))
                 .collect(),
         );
+    }
+
+    fn freeze_field_storage(&mut self) {
+        if self.field_storage.is_empty() {
+            return;
+        }
+        let mut records: BTreeMap<u64, (u32, u32)> = self.frozen.field_storage_runs
+            .entries_of(&self.arena).into_iter()
+            .map(|(key, offset, words)| (key, (offset, words))).collect();
+        for (type_id, run) in core::mem::take(&mut self.field_storage) {
+            let offset = self.arena.bytes.len() as u32;
+            for word in run.iter() {
+                self.arena.push_u32(*word);
+            }
+            records.insert(u64::from(type_id), (offset, run.len() as u32));
+        }
+        self.frozen.field_storage_runs = SortedWideTable::write(&mut self.arena,
+            records.into_iter().map(|(key, (offset, words))| (key, offset, words)).collect());
     }
 
     /// Drains `static_slot_types` into a dense column indexed by static slot, carrying an earlier
@@ -4699,6 +4892,12 @@ impl Module {
                 }
                 if let Some(info) = self.types.get(index) {
                     if first_visit {
+                        let slots = self.type_field_offsets(type_id).map_or(0, |layout| layout.slot_count());
+                        for slot in 0..slots {
+                            if let Some(FieldStorage::ValueType(nested)) = self.type_field_storage(type_id, slot) {
+                                type_queue.push((nested, false));
+                            }
+                        }
                         for &target in info.vtable.iter() {
                             push(target, &mut keep_method, &mut queue);
                         }
@@ -4789,6 +4988,15 @@ impl Module {
                                 type_queue.push((type_id, false));
                             }
                         }
+                        // A rectangular-array constructor carries the allocated element's type.
+                        // Keep it even when the array is empty and no element is constructed.
+                        if instruction.opcode == Opcode::Newobj {
+                            if let Some(type_id) = self.cast_elem(asm_key(asm, token.0))
+                                .and_then(|shape| self.array_shape_element(&shape))
+                            {
+                                type_queue.push((type_id, false));
+                            }
+                        }
                         if matches!(instruction.opcode, Opcode::Callvirt | Opcode::Ldvirtftn)
                             && reached_sites.insert(asm_key(asm, token.0))
                         {
@@ -4814,6 +5022,11 @@ impl Module {
                     Opcode::Ldtoken => {
                         if let Some(type_id) = self.type_id_of(asm, token) {
                             type_queue.push((type_id, true));
+                        }
+                        if let Some(type_id) = self.cast_elem(asm_key(asm, token.0))
+                            .and_then(|shape| self.array_shape_element(&shape))
+                        {
+                            type_queue.push((type_id, false));
                         }
                     }
                     Opcode::Ldfld
@@ -4873,11 +5086,12 @@ impl Module {
         }
     }
 
-    /// The type an array or vector-interface cast shape compares elements against, if it names one.
+    /// The named element type reached through an array, pointer or vector-interface shape.
     #[cfg(feature = "code-in-place")]
     fn array_shape_element(&self, shape: &CastElem) -> Option<TypeId> {
         match shape {
-            CastElem::Array(element) | CastElem::VectorInterface(element) => match element.as_ref() {
+            CastElem::Array(element) | CastElem::MdArray { element, .. }
+            | CastElem::VectorInterface(element) | CastElem::Pointer(element) => match element.as_ref() {
                 CastElem::Named(handle) => self.type_id_by_handle(*handle),
                 deeper => self.array_shape_element(deeper),
             },
@@ -5066,6 +5280,7 @@ impl Module {
         self.type_tokens.retain(|_, id| type_kept(id));
         self.type_full_names.retain(|id, _| type_kept(id));
         self.field_offsets.retain(|id, _| type_kept(id));
+        self.field_storage.retain(|id, _| type_kept(id));
         self.vtable_slot_keys.retain(|id, _| type_kept(id));
         self.finalizers.retain(|id, _| type_kept(id));
         let by_token = core::mem::take(&mut self.by_token);
@@ -5094,6 +5309,9 @@ impl Module {
         });
         self.type_properties_by_name
             .retain(|(handle, _), _| handle_of_kept_type.contains(handle));
+        self.type_events_by_name
+            .retain(|(handle, _), _| handle_of_kept_type.contains(handle));
+        let kept_events: BTreeSet<u64> = self.type_events_by_name.values().copied().collect();
         self.reflect_types
             .retain(|handle, _| handle_of_kept_type.contains(handle));
         self.method_params
@@ -5102,6 +5320,7 @@ impl Module {
             .retain(|handle, _| kept_method(&by_token, *handle));
         self.custom_attributes.retain(|handle, _| {
             handle_of_kept_type.contains(handle) || kept_method(&by_token, *handle)
+                || kept_events.contains(handle)
         });
         self.by_token = by_token;
         self.strings.retain(|key, _| strings.contains(key));
@@ -5173,6 +5392,7 @@ impl Module {
             .keys()
             .chain(self.type_fields_by_name.keys())
             .chain(self.type_properties_by_name.keys())
+            .chain(self.type_events_by_name.keys())
             .map(|(_, name)| str_entry(name))
             .sum();
         let call_targets = self.call_targets.len() * (16 + 24);
@@ -5291,6 +5511,8 @@ impl Module {
             ("static slot owner column entries (frozen)", self.frozen.static_slot_types.entries),
             ("field_offsets", self.field_offsets.len()),
             ("field offset runs (frozen)", self.frozen.field_offset_runs.entries),
+            ("field_storage", self.field_storage.len()),
+            ("field storage runs (frozen)", self.frozen.field_storage_runs.entries),
             ("board bus table words", self.board_buses.as_ref().map_or(0, |table| table.len())),
             ("board bus table words (frozen)", self.frozen.board_buses.entries),
             ("enum_widths", self.enum_widths.len()),
@@ -5321,6 +5543,8 @@ impl Module {
             ("type_fields_by_name", self.type_fields_by_name.len()),
             ("type_methods_by_name", self.type_methods_by_name.len()),
             ("type_properties_by_name", self.type_properties_by_name.len()),
+            ("type_events_by_name", self.type_events_by_name.len()),
+            ("event names (frozen)", self.frozen.events_by_name.entries),
             ("method_debug", self.method_debug.len()),
             ("sig pool (unique sigs interned)", self.sig_pool.len()),
             (
@@ -5548,6 +5772,29 @@ impl Module {
         })
     }
 
+    /// Records the storage type of each instance slot, in the same order as the byte offsets.
+    pub fn set_type_field_storage(&mut self, type_id: TypeId, fields: &[FieldStorage]) {
+        let words = fields.iter().flat_map(|field| field.words()).collect::<Vec<_>>();
+        self.field_storage.insert(type_id, words.into_boxed_slice());
+    }
+
+    /// The exact storage of an instance slot, if its signature was resolved by the loader.
+    #[must_use]
+    pub fn type_field_storage(&self, type_id: TypeId, slot: usize) -> Option<FieldStorage> {
+        let at = slot.checked_mul(2)?;
+        let (tag, value) = if let Some(run) = self.field_storage.get(&type_id) {
+            (*run.get(at)?, *run.get(at.checked_add(1)?)?)
+        } else {
+            let (offset, len) = self.frozen.field_storage_runs.get(&self.arena, u64::from(type_id))?;
+            if at.checked_add(1)? >= len as usize {
+                return None;
+            }
+            let offset = (offset as usize).checked_add(at.checked_mul(4)?)?;
+            (self.arena.read_u32(offset)?, self.arena.read_u32(offset.checked_add(4)?)?)
+        };
+        FieldStorage::from_words(tag, value)
+    }
+
     /// Replaces `type_id`'s full instance-field layout (base fields first, then own),
     /// computed once every base type is known.
     pub fn set_type_field_defaults(&mut self, type_id: TypeId, field_defaults: Vec<Value>) {
@@ -5597,7 +5844,8 @@ impl Module {
     }
 
     /// Records the [`CastElem`] shape of a cast-test token in assembly `asm` (a `castclass` /
-    /// `isinst` / `unbox.any` operand or a `newarr` element type), decoded by the loader --
+    /// `isinst` / `unbox.any` operand, a `newarr` element type or a rectangular-array constructor),
+    /// decoded by the loader --
     /// including an array `TypeSpec`'s signature blob, which is what lets `castclass` compare
     /// an array operand's element type against an array-typed target.
     pub fn bind_cast_elem(&mut self, asm: u8, token: Token, elem: CastElem) {
@@ -5633,7 +5881,7 @@ impl Module {
         self.frozen
             .cast_elems
             .get(&self.arena, handle)
-            .and_then(|(shape, token)| CastElem::from_frozen_record(shape, token))
+            .and_then(|(shape, token)| CastElem::read_frozen_record(&self.arena, shape, token))
             .or_else(|| self.cast_elems.get(&handle).cloned())
     }
 
@@ -6000,6 +6248,9 @@ impl Module {
 
     /// The underlying value of the constant named `name` in the enum type identified by an
     /// already-asm-folded `handle` -- the by-handle form for an intrinsic holding a folded tag.
+    /// Resolves across assemblies, as [`Self::enum_value_name_resolved`] does: a program's
+    /// `typeof(DayOfWeek)` carries the corlib enum's `TypeRef` in the program's token space, and
+    /// the members are recorded under the corlib's `TypeDef`.
     #[must_use]
     pub fn enum_value_by_name_handle(
         &self,
@@ -6007,7 +6258,7 @@ impl Module {
         name: &str,
         ignore_case: bool,
     ) -> Option<i64> {
-        for (value, constant) in self.enum_members_resolved_direct(handle)? {
+        for (value, constant) in self.enum_members_resolved(handle)? {
             let matched = if ignore_case {
                 constant.eq_ignore_ascii_case(name)
             } else {
@@ -6197,10 +6448,15 @@ impl Module {
     }
 
     /// Whether the enum type identified by an already-asm-folded `handle` has a 64-bit underlying
-    /// type (long / ulong) -- the by-handle form for an intrinsic holding a folded tag.
+    /// type (long / ulong) -- the by-handle form for an intrinsic holding a folded tag. Resolves
+    /// across assemblies, as [`Self::enum_is_flags_by_handle`] does.
     #[must_use]
     pub fn enum_is_wide_by_handle(&self, handle: u64) -> bool {
-        self.enum_wide_contains(handle)
+        if self.enum_wide_contains(handle) {
+            return true;
+        }
+        self.canonical_type_handle(handle)
+            .is_some_and(|canonical| self.enum_wide_contains(canonical))
     }
 
     /// Records the [`BoxedPrimitive`] display kind of a `box` operand type token in assembly `asm`
@@ -6521,12 +6777,14 @@ impl Module {
     /// somewhere else -- `None` when `handle` is already canonical, names no declared type, or
     /// the type has no recorded defining handle.
     ///
-    /// `ldtoken` folds the EXECUTING assembly's id onto its token operand, so `typeof(T)` for a
-    /// `T` another assembly declares yields a handle in the naming assembly's `TypeRef` space,
+    /// `ldtoken` folds the EXECUTING assembly's id onto its token operand, so the runtime type
+    /// handle for a type `T` another assembly declares is in the naming assembly's `TypeRef` space,
     /// while every load-time record for `T` is keyed by the DEFINING assembly's `TypeDef` handle.
     /// Mapping `handle -> TypeId -> defining handle` crosses that gap; a lookup keyed by a type
     /// handle wants it as a FALLBACK after its direct hit, never instead of one, so a
     /// same-assembly answer is reached without the indirection and cannot be displaced by it.
+    /// This lookup rule is separate from interning the `System.Type` reference returned to
+    /// managed code: the original metadata tokens remain valid keys for their own records.
     ///
     /// The `Some` case is exactly "these are two names for one type", which is why the callers
     /// can retry against it without a second identity test.
@@ -7224,14 +7482,38 @@ impl Module {
     /// message absent rather than reading whatever sits at some other slot.
     #[must_use]
     pub fn exception_message_slot(&self) -> Option<u32> {
+        self.runtime_field_slot(RUNTIME_SLOT_EXCEPTION_MESSAGE)
+    }
+
+    /// Records the instance slots of a `System.Threading.Thread`'s id and name, which a debugger
+    /// reads to show a thread by the name its program gave it. Recorded at load, where the layout
+    /// that decides them is known, for the reason [`Module::bind_exception_message_slot`] gives.
+    pub fn bind_thread_id_slot(&mut self, slot: u32) {
+        self.runtime_field_slots.insert(RUNTIME_SLOT_THREAD_ID, slot);
+    }
+
+    /// See [`Module::bind_thread_id_slot`].
+    pub fn bind_thread_name_slot(&mut self, slot: u32) {
+        self.runtime_field_slots.insert(RUNTIME_SLOT_THREAD_NAME, slot);
+    }
+
+    /// The instance slots of a `System.Threading.Thread`'s id and name, or `None` where no corlib
+    /// defining them was loaded, or where the image was baked before they were recorded.
+    #[must_use]
+    pub fn thread_slots(&self) -> Option<(u32, u32)> {
+        Some((
+            self.runtime_field_slot(RUNTIME_SLOT_THREAD_ID)?,
+            self.runtime_field_slot(RUNTIME_SLOT_THREAD_NAME)?,
+        ))
+    }
+
+    /// The instance slot recorded under well-known id `id` in [`Module::runtime_field_slots`]: from
+    /// the baked image where the module booted from one, else as the loader recorded it.
+    fn runtime_field_slot(&self, id: u64) -> Option<u32> {
         self.frozen
             .runtime_field_slots
-            .get(&self.arena, RUNTIME_SLOT_EXCEPTION_MESSAGE)
-            .or_else(|| {
-                self.runtime_field_slots
-                    .get(&RUNTIME_SLOT_EXCEPTION_MESSAGE)
-                    .copied()
-            })
+            .get(&self.arena, id)
+            .or_else(|| self.runtime_field_slots.get(&id).copied())
     }
 
     /// Gives this module the bus table of the board a build names, so a later
@@ -7320,6 +7602,23 @@ impl Module {
     pub fn bind_type_property_name(&mut self, type_handle: u64, name: &str, property_handle: u64) {
         self.type_properties_by_name
             .insert((type_handle, name.to_string()), property_handle);
+    }
+
+    /// Records an event's asm-folded `Event` token under its declaring type and name.
+    pub fn bind_type_event_name(&mut self, type_handle: u64, name: &str, event_handle: u64) {
+        self.type_events_by_name.insert((type_handle, name.to_string()), event_handle);
+    }
+
+    /// The named event's asm-folded token, resolving type aliases across assemblies.
+    /// Event and property names occupy distinct indexes.
+    #[must_use]
+    pub fn type_event_handle(&self, type_handle: u64, name: &str) -> Option<u64> {
+        let find = |handle| {
+            self.frozen_name_lookup(self.frozen.events_by_name, handle, name).or_else(|| {
+                self.type_events_by_name.get(&(handle, name.to_string())).copied()
+            })
+        };
+        find(type_handle).or_else(|| find(self.canonical_type_handle(type_handle)?))
     }
 
     /// The asm-folded `Field` token of the field named `name` on the type whose handle is
@@ -7803,6 +8102,100 @@ impl Module {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "reflection")]
+    #[test]
+    fn event_attributes_keep_member_and_assembly_identity_across_freezes() {
+        let mut module = Module::new();
+        let first_type = module.add_type(Vec::new());
+        let second_type = module.add_type(Vec::new());
+        let attr_type = module.add_type(alloc::vec![Value::Int32(0)]);
+        let ctor = module.add_method(0, one_ret_raw(), 1);
+        module.bind_type_token(0, Token(0x0200_0001), first_type);
+        module.bind_type_token(1, Token(0x0100_0001), first_type);
+        module.bind_type_token(1, Token(0x0200_0001), second_type);
+        let first = asm_key(0, 0x0200_0001);
+        let alias = asm_key(1, 0x0100_0001);
+        let second = asm_key(1, 0x0200_0001);
+        let property = asm_key(0, 0x1700_0001);
+        let event = asm_key(0, 0x1400_0001);
+        let other_event = asm_key(1, 0x1400_0001);
+        module.bind_type_property_name(first, "Signal", property);
+        module.bind_type_event_name(first, "Signal", event);
+        module.bind_type_event_name(second, "Signal", other_event);
+        for (target, code) in [(property, 11), (event, 17), (other_event, 23)] {
+            module.add_custom_attribute(target, LoadedAttribute {
+                ctor, type_id: attr_type, positional: Vec::new(),
+                named_fields: alloc::vec![(0, AttrValue::Int { value: code, wide: false })],
+                named_properties: Vec::new(),
+            });
+        }
+        let check = |module: &Module, phase| {
+            assert_eq!(module.type_property_handle(alias, "Signal"), Some(property), "{phase}");
+            assert_eq!(module.type_event_handle(alias, "Signal"), Some(event), "{phase}");
+            assert_eq!(module.type_event_handle(second, "Signal"), Some(other_event), "{phase}");
+            assert_eq!(module.type_event_handle(first, "Missing"), None, "{phase}");
+            for (handle, code) in [(first, 17), (alias, 17), (second, 23)] {
+                for inherit in [0, 1] {
+                    let mut vm = crate::Vm::new();
+                    let name = vm.heap_mut().alloc_string(&"Signal".encode_utf16().collect::<Vec<_>>()).unwrap();
+                    let result = crate::intrinsics::type_event_custom_attributes(&mut vm, module, &[
+                        Value::NativeInt(handle as i64), Value::Object(name), Value::Int32(inherit),
+                    ]).expect("event attributes");
+                    let Some(Value::Object(array)) = result else { panic!("attribute array") };
+                    assert_eq!(vm.heap().array_len(array), Some(1), "{phase}");
+                    let Some(Value::Object(attribute)) = vm.heap().array_get(array, 0) else { panic!("attribute instance") };
+                    assert_eq!(vm.heap().instance_field(attribute, 0), Some(Value::Int32(code)), "{phase}");
+                }
+            }
+        };
+        check(&module, "live");
+        module.freeze();
+        assert!(module.type_events_by_name.is_empty());
+        check(&module, "frozen");
+        // A name sorting before existing names shifts the shared pool's ranks.
+        module.bind_type_event_name(first, "Earlier", asm_key(0, 0x1400_0002));
+        module.freeze();
+        check(&module, "refrozen");
+        assert_eq!(module.type_event_handle(first, "Earlier"), Some(asm_key(0, 0x1400_0002)));
+    }
+
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn event_attributes_keep_their_event_index_through_trimming_and_baking() {
+        let mut module = Module::new();
+        let kept = module.add_type(Vec::new());
+        let dropped = module.add_type(Vec::new());
+        module.bind_type_token(0, Token(0x0200_0001), kept);
+        module.bind_type_token(0, Token(0x0200_0002), dropped);
+        let keep_handle = asm_key(0, 0x0200_0001);
+        let drop_handle = asm_key(0, 0x0200_0002);
+        let keep_event = asm_key(0, 0x1400_0001);
+        let drop_event = asm_key(0, 0x1400_0002);
+        module.bind_type_event_name(keep_handle, "Signal", keep_event);
+        module.bind_type_event_name(drop_handle, "Signal", drop_event);
+        module.bind_type_property_name(keep_handle, "Signal", asm_key(0, 0x1700_0001));
+        let ctor = module.add_method(0, one_ret_raw(), 1);
+        for target in [keep_event, drop_event] {
+            module.add_custom_attribute(target, LoadedAttribute {
+                ctor, type_id: kept, positional: Vec::new(),
+                named_fields: Vec::new(), named_properties: Vec::new(),
+            });
+        }
+        module.retain_reachable(&[true], &[true, false], &BTreeSet::new());
+        assert_eq!(module.custom_attributes_of(keep_event).len(), 1);
+        assert!(module.custom_attributes_of(drop_event).is_empty());
+        assert_eq!(module.type_event_handle(drop_handle, "Signal"), None);
+        let image = module.write_baked(None).expect("bake event index");
+        let older = image_without_trailing_tables(&image, 2);
+        let (baked, _) = Module::from_baked(Box::leak(image.into_boxed_slice())).expect("read event index");
+        assert_eq!(baked.type_event_handle(keep_handle, "Signal"), Some(keep_event));
+        assert_eq!(baked.type_event_handle(drop_handle, "Signal"), None);
+        assert_eq!(baked.type_property_handle(keep_handle, "Signal"), Some(asm_key(0, 0x1700_0001)));
+        let (old, _) = Module::from_baked(Box::leak(older.into_boxed_slice())).expect("read older directory");
+        assert_eq!(old.type_event_handle(keep_handle, "Signal"), None);
+        assert_eq!(old.type_property_handle(keep_handle, "Signal"), Some(asm_key(0, 0x1700_0001)));
+    }
+
     /// The entry assembly is FIRST-WINS, and the case that needs it is the REPL: an incremental
     /// delta loads AFTER the program and carries an entry token of its own, so a last-wins rule
     /// would rename the domain to whichever fragment the user typed most recently. Nothing else
@@ -7905,6 +8298,58 @@ mod tests {
         assert_eq!(module.array_prim_kind(0, long_elem), Some(PrimKind::I8));
         assert_eq!(module.array_prim_kind(0, Token(0x0100_0001)), None);
         assert_eq!(module.array_prim_kind(1, byte_elem), None, "unknown assembly");
+    }
+
+    #[test]
+    fn stack_struct_storage_descriptors_preserve_kinds_and_reject_bad_records() {
+        let mut module = Module::new();
+        let owner = module.add_type(Vec::new());
+        let mut kinds: Vec<_> = (1..=8).map(|code| FieldStorage::Primitive(PrimKind::from_code(code).unwrap())).collect();
+        kinds.extend([FieldStorage::Native, FieldStorage::Reference, FieldStorage::ValueType(73)]);
+        module.set_type_field_storage(owner, &kinds);
+        let check = |module: &Module| {
+            for (slot, kind) in kinds.iter().enumerate() {
+                assert_eq!(module.type_field_storage(owner, slot), Some(*kind));
+            }
+            assert_eq!(module.type_field_storage(owner, kinds.len()), None);
+            assert_eq!(module.type_field_storage(owner, usize::MAX), None);
+            assert_eq!(module.type_field_storage(owner + 1, 0), None);
+        };
+        check(&module);
+        module.freeze();
+        check(&module);
+        assert!(module.field_storage.is_empty());
+        module.set_type_field_storage(owner, &[FieldStorage::Native]);
+        assert_eq!(module.type_field_storage(owner, 0), Some(FieldStorage::Native));
+        module.freeze();
+        assert_eq!(module.type_field_storage(owner, 0), Some(FieldStorage::Native));
+        assert_eq!(module.type_field_storage(owner, 1), None);
+        let (offset, _) = module.frozen.field_storage_runs.get(&module.arena, owner as u64).unwrap();
+        module.arena.write_u32(offset as usize, 99);
+        assert_eq!(module.type_field_storage(owner, 0), None);
+        module.arena.write_u32(offset as usize, 1);
+        module.arena.write_u32(offset as usize + 4, 257);
+        assert_eq!(module.type_field_storage(owner, 0), None);
+        module.arena.bytes.to_mut().truncate(offset as usize + 4);
+        assert_eq!(module.type_field_storage(owner, 0), None);
+    }
+
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn stack_struct_storage_table_is_optional_in_older_baked_images() {
+        let mut module = Module::new();
+        let owner = module.add_type(alloc::vec![Value::Int32(0)]);
+        module.set_type_field_offsets(owner, 4, 4, &[0]);
+        module.set_type_field_storage(owner, &[FieldStorage::Primitive(PrimKind::I4)]);
+        module.freeze();
+        let image = module.write_baked(None).unwrap();
+        let older = image_without_trailing_tables(&image, 1);
+        let (baked, _) = Module::from_baked(Box::leak(image.into_boxed_slice())).unwrap();
+        assert_eq!(baked.type_field_storage(owner, 0), Some(FieldStorage::Primitive(PrimKind::I4)));
+        assert_eq!(baked.type_field_offsets(owner).unwrap().end(), 4);
+        let (old, _) = Module::from_baked(Box::leak(older.into_boxed_slice())).unwrap();
+        assert_eq!(old.type_field_storage(owner, 0), None);
+        assert_eq!(old.type_field_offsets(owner).unwrap().end(), 4);
     }
 
     #[test]
@@ -8371,6 +8816,11 @@ mod tests {
         shapes.extend([
             CastElem::String,
             CastElem::Object,
+            CastElem::Void,
+            CastElem::Pointer(Box::new(CastElem::Void)),
+            CastElem::Pointer(Box::new(CastElem::Prim(CastPrim::I4))),
+            CastElem::Pointer(Box::new(CastElem::Pointer(Box::new(CastElem::Named(named))))),
+            CastElem::Array(Box::new(CastElem::Pointer(Box::new(CastElem::Named(named))))),
             CastElem::Named(named),
             CastElem::Lenient,
             CastElem::GenericValueType,
@@ -8384,6 +8834,19 @@ mod tests {
             CastElem::Array(Box::new(CastElem::Array(Box::new(CastElem::Named(named))))),
             CastElem::Array(Box::new(CastElem::Lenient)),
             CastElem::Array(Box::new(CastElem::Object)),
+            CastElem::MdArray { element: Box::new(CastElem::Prim(CastPrim::I4)), rank: 1 },
+            CastElem::MdArray { element: Box::new(CastElem::Prim(CastPrim::I4)), rank: 2 },
+            CastElem::Array(Box::new(CastElem::MdArray {
+                element: Box::new(CastElem::Named(named)), rank: 3,
+            })),
+            CastElem::MdArray {
+                element: Box::new(CastElem::Array(Box::new(CastElem::MdArray {
+                    element: Box::new(CastElem::String), rank: 2,
+                }))), rank: 3,
+            },
+            CastElem::VectorInterface(Box::new(CastElem::MdArray {
+                element: Box::new(CastElem::Object), rank: 2,
+            })),
         ]);
 
         let mut module = Module::new();
@@ -8414,6 +8877,27 @@ mod tests {
             CastElem::from_frozen_record(vector, token),
             Some(CastElem::VectorInterface(Box::new(CastElem::Prim(CastPrim::I4))))
         );
+    }
+
+    #[test]
+    fn extended_cast_shapes_validate_their_arena_records() {
+        let shape = CastElem::Array(Box::new(CastElem::MdArray {
+            element: Box::new(CastElem::Prim(CastPrim::I4)), rank: 2,
+        }));
+        let mut arena = TableArena::default();
+        let (code, offset) = shape.write_frozen_record(&mut arena).unwrap();
+        assert_eq!(CastElem::read_frozen_record(&arena, code, offset), Some(shape));
+        assert_eq!(CastElem::from_frozen_record(code, offset), None, "compact readers reject extended shapes");
+        assert_eq!(CastElem::read_frozen_record(&arena, code, u32::MAX), None);
+        let original = arena.clone();
+        arena.bytes.to_mut().pop();
+        assert_eq!(CastElem::read_frozen_record(&arena, code, offset), None, "truncated record");
+        arena = original.clone();
+        arena.write_u32(offset as usize, u32::MAX);
+        assert_eq!(CastElem::read_frozen_record(&arena, code, offset), None, "oversized count");
+        arena = original;
+        arena.write_u32(offset as usize + 12, 99);
+        assert_eq!(CastElem::read_frozen_record(&arena, code, offset), None, "unknown wrapper kind");
     }
 
     /// Which named cast targets an array is an instance of survives a bake, and every other
@@ -8616,7 +9100,7 @@ mod tests {
         let mut module = Module::new();
         module.set_board_buses(&two_bus_table()).expect("a well-formed table");
         let image = module.write_baked(None).expect("bake");
-        let older = image_without_trailing_tables(&image, 1);
+        let older = image_without_trailing_tables(&image, 3);
         let leaked: &'static [u8] = Box::leak(older.into_boxed_slice());
         let (baked, _) = Module::from_baked(leaked).expect("an older image still boots");
         assert_eq!(baked.board_bus_length(2, 0), -1);
@@ -8637,7 +9121,8 @@ mod tests {
             baked_directory_start(word_at(&image, HEADER_WORD_COUNT_INDEX)).expect("a whole header");
         let directory_len = word_at(&image, HEADER_DIRECTORY_LEN_INDEX) as usize;
         let arena_start = directory_start + directory_len;
-        let pair_at = arena_start - 16;
+        // The bus table precedes the event index and field storage table.
+        let pair_at = arena_start - 48;
         let table_offset = u64::from_le_bytes(image[pair_at..pair_at + 8].try_into().expect("8 bytes"));
         let resealed = |edit: &dyn Fn(&mut Vec<u8>)| {
             let mut image = image.clone();

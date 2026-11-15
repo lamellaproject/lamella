@@ -42,6 +42,7 @@ namespace Lamella.Boards.RaspberryPi
             Buses.BindGpio(new GpioDriverFactory(MakeGpio));
             AdcControllers.Bind(new AdcDriverFactory(MakeAdc));
 #if LAMELLA_SURFACE_FLOAT
+            Buses.SetPwmChipCount(RaspberrypiPico2WBindings.PWM_CHIP_COUNT);
             Buses.BindPwm(1, new PwmChannelFactory(OpenPwm1));
             Buses.BindPwm(2, new PwmChannelFactory(OpenPwm2));
             Buses.BindPwm(3, new PwmChannelFactory(OpenPwm3));

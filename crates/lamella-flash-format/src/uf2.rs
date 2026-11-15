@@ -118,6 +118,46 @@ pub fn to_uf2(image: &[u8], base: u32, family: u32) -> Result<Vec<u8>, EmitError
     Ok(out)
 }
 
+/// Pack several spans into one UF2 file for the part `family` identifies: each `(base, bytes)` at its
+/// own address, its blocks in the order the spans are given, every block numbered as one file.
+///
+/// A bootloader counts a file whole once it has seen every block of that one numbering, so the spans
+/// arrive as one download or not at all; the order the blocks are written in is the host's, and only
+/// their order in the file is chosen here. Each span is padded up to whole 256-byte pages with erased
+/// flash (`0xFF`), so a page the span ends inside reads as if the span had left it alone.
+///
+/// # Errors
+/// [`EmitError::EmptyImage`] for no spans or an empty one, and [`EmitError::AddressOverflow`] for a
+/// span that runs past the 32-bit address space.
+pub fn to_uf2_spans(spans: &[(u32, &[u8])], family: u32) -> Result<Vec<u8>, EmitError> {
+    if spans.is_empty() || spans.iter().any(|(_, bytes)| bytes.is_empty()) {
+        return Err(EmitError::EmptyImage);
+    }
+    let mut pages: Vec<(u32, [u8; PAYLOAD])> = Vec::new();
+    for &(base, bytes) in spans {
+        if u64::from(base) + (bytes.len().div_ceil(PAYLOAD) * PAYLOAD) as u64 > u64::from(u32::MAX) + 1 {
+            return Err(EmitError::AddressOverflow { base, len: bytes.len() });
+        }
+        for (index, chunk) in bytes.chunks(PAYLOAD).enumerate() {
+            let mut page = [ERASED; PAYLOAD];
+            page[..chunk.len()].copy_from_slice(chunk);
+            pages.push((base + (index * PAYLOAD) as u32, page));
+        }
+    }
+    let num_blocks = u32::try_from(pages.len()).map_err(|_| EmitError::AddressOverflow { base: spans[0].0, len: usize::MAX })?;
+    let mut out = Vec::with_capacity(pages.len() * BLOCK);
+    for (block_no, (address, page)) in pages.iter().enumerate() {
+        let header = [MAGIC_START0, MAGIC_START1, FLAG_FAMILY_ID, *address, PAYLOAD as u32, block_no as u32, num_blocks, family];
+        for word in header {
+            out.extend_from_slice(&word.to_le_bytes());
+        }
+        out.extend_from_slice(page);
+        out.resize((block_no + 1) * BLOCK - 4, 0);
+        out.extend_from_slice(&MAGIC_END.to_le_bytes());
+    }
+    Ok(out)
+}
+
 /// The image a UF2 file holds for one chip family, checked and not yet laid out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FamilyImage<'a> {
@@ -543,6 +583,39 @@ mod tests {
             assert_eq!(word(block, 7), FAMILY_RP2350_ARM_S);
             assert_eq!(word(block, 127), MAGIC_END, "trailing magic at offset 508");
         }
+    }
+
+    /// **SEVERAL SPANS ARE ONE FILE:** every block carries the one count and its own number, in the
+    /// order the spans are given; each span is padded to whole pages with erased flash; and the file
+    /// reads back as its spans at their addresses, with erased flash between them.
+    #[test]
+    fn several_spans_are_numbered_as_one_file_in_the_order_given() {
+        let image = vec![0x11; PAYLOAD + 10];
+        let body = vec![0x22; PAYLOAD];
+        let directory = [0x33; 16];
+        let (at_image, at_body, at_directory) = (XIP_BASE, XIP_BASE + 0x3_C1000, XIP_BASE + 0x3_C0000);
+        let spans: [(u32, &[u8]); 3] = [(at_image, &image), (at_body, &body), (at_directory, &directory)];
+        let uf2 = to_uf2_spans(&spans, FAMILY_RP2350_ARM_S).unwrap();
+        let blocks: Vec<&[u8]> = uf2.chunks(BLOCK).collect();
+        assert_eq!(blocks.len(), 4);
+        let addresses: Vec<u32> = blocks.iter().map(|block| word(block, 3)).collect();
+        assert_eq!(addresses, [at_image, at_image + PAYLOAD as u32, at_body, at_directory], "the order given: the directory last");
+        for (number, block) in blocks.iter().enumerate() {
+            assert_eq!((word(block, 5), word(block, 6), word(block, 7)), (number as u32, 4, FAMILY_RP2350_ARM_S));
+            assert_eq!((word(block, 0), word(block, 127)), (MAGIC_START0, MAGIC_END));
+        }
+        assert!(blocks[1][32 + 10..32 + PAYLOAD].iter().all(|&byte| byte == ERASED), "a span's last page is padded erased");
+        assert!(blocks[3][32 + 16..32 + PAYLOAD].iter().all(|&byte| byte == ERASED));
+        let read = image_for_family(&uf2, FAMILY_RP2350_ARM_S).expect("one whole file");
+        let flat = read.to_bytes();
+        assert_eq!(&flat[..image.len()], &image[..]);
+        assert_eq!(&flat[0x3_C1000..0x3_C1000 + PAYLOAD], &body[..]);
+        assert_eq!(&flat[0x3_C0000..0x3_C0010], &directory);
+        assert!(flat[2 * PAYLOAD..0x3_C0000].iter().all(|&byte| byte == ERASED), "erased between the spans");
+        let (nothing, long): (&[u8], &[u8]) = (&[], &[0; 257]);
+        assert_eq!(to_uf2_spans(&[], FAMILY_RP2350_ARM_S), Err(EmitError::EmptyImage));
+        assert_eq!(to_uf2_spans(&[(XIP_BASE, nothing)], FAMILY_RP2350_ARM_S), Err(EmitError::EmptyImage));
+        assert!(matches!(to_uf2_spans(&[(0xFFFF_FF00, long)], FAMILY_RP2350_ARM_S), Err(EmitError::AddressOverflow { .. })));
     }
 
     #[test]

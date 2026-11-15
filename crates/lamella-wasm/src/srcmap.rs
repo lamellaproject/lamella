@@ -10,7 +10,7 @@
 
 use crate::abi::result_buffer;
 use lamella_load::{load_with_corlib_and_libraries_unfrozen, load_with_corlib_unfrozen};
-use lamella_metadata::{Assembly, PortablePdb};
+use lamella_metadata::{Assembly, PortablePdb, SigType};
 use lamella_token::Token;
 
 /// The `MethodDef` metadata table tag (matches lamella-dap's InterpreterBackend).
@@ -96,6 +96,7 @@ fn srcmap_inner(
     };
 
     let mut method_names: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    let mut local_types: std::collections::HashMap<u32, Vec<SigType>> = std::collections::HashMap::new();
     for type_def in app_asm.type_defs() {
         let type_name = type_def.name();
         for method in type_def.methods() {
@@ -106,6 +107,7 @@ fn srcmap_inner(
                 None => leaf.to_string(),
             };
             method_names.insert(method.rid(), qualified);
+            local_types.insert(method.rid(), method.local_variables());
         }
     }
 
@@ -125,10 +127,14 @@ fn srcmap_inner(
         }
         let document = pdb.method_document(rid).unwrap_or_default();
         let name = method_names.get(&rid).cloned().unwrap_or_default();
+        let types = local_types.get(&rid).map_or(&[][..], Vec::as_slice);
         let locals: Vec<serde_json::Value> = pdb
             .local_variables(rid)
             .into_iter()
-            .map(|lv| serde_json::json!({ "index": lv.index, "name": lv.name }))
+            .map(|lv| match types.get(usize::from(lv.index)).and_then(SigType::stack_class) {
+                Some(class) => serde_json::json!({ "index": lv.index, "name": lv.name, "kind": class.keyword() }),
+                None => serde_json::json!({ "index": lv.index, "name": lv.name }),
+            })
             .collect();
         methods.insert(method_id.to_string(), serde_json::json!({ "document": document, "name": name, "points": points, "locals": locals }));
     }
@@ -212,3 +218,4 @@ pub unsafe extern "C" fn lamella_srcmap_libs(
         trim != 0,
     ))
 }
+

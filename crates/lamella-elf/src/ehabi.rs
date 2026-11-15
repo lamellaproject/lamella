@@ -668,11 +668,15 @@ fn pass_over(vsp: u32, stack_pointer: u32, bytes: u32) -> Result<u32, Error> {
 /// The unwinding tables of a linked ELF.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Tables<'a> {
-    /// Every index table: each section of type [`SHT_ARM_EXIDX`].
+    /// Every index table: each section of type [`SHT_ARM_EXIDX`], and each `SHT_PROGBITS` section
+    /// that is one by everything else EHABI32 requires of one (see [`tables`]).
     pub indexes: Vec<Region<'a>>,
     /// Every section the image loads, which is where an index entry's table entry is looked for.
     pub loaded: Vec<Region<'a>>,
 }
+
+/// `SHF_LINK_ORDER`: the section's order follows the section its `sh_link` names (ELF gABI).
+const SHF_LINK_ORDER: u64 = 0x80;
 
 /// Finds the unwinding tables of a linked little-endian 32-bit Arm ELF.
 ///
@@ -680,6 +684,15 @@ pub struct Tables<'a> {
 /// requires the type and lets the name carry a suffix. A section loads when it has `SHF_ALLOC` and
 /// occupies bytes in the file; a `SHT_NOBITS` section's offset addresses whatever the file put
 /// there instead.
+///
+/// **A TABLE TYPED `SHT_PROGBITS` IS TAKEN BY EVERYTHING ELSE THE SAME SECTION OF EHABI32 REQUIRES**:
+/// `SHF_ALLOC` and `SHF_LINK_ORDER`, an `sh_link` naming the code section it indexes, which is
+/// allocated and executable, and entries that form a searchable table naming functions inside that
+/// section and nowhere else. A linker that places part of a program in a board's external flash can
+/// write the index for that part as such a section, and the program's frames there are described by
+/// it and by nothing else. Another kind of section kept in its code's order -- a table of absolute
+/// addresses or of stack sizes -- read as index entries names functions far from its code, and is
+/// left out.
 ///
 /// Any other file yields no tables, because [`SHT_ARM_EXIDX`] is a processor-specific number that
 /// means an index table only when the machine is Arm.
@@ -694,21 +707,54 @@ pub fn tables(elf: &[u8]) -> Tables<'_> {
     if !arm {
         return found;
     }
-    for section in crate::section_headers(elf) {
+    let sections = crate::section_headers(elf);
+    for section in &sections {
         if section.kind == crate::SHT_NOBITS {
             continue;
         }
         let (Some(bytes), Ok(address)) = (section.data, u32::try_from(section.address)) else {
             continue;
         };
-        if section.kind == SHT_ARM_EXIDX {
-            found.indexes.push(Region { address, bytes });
+        let region = Region { address, bytes };
+        if section.kind == SHT_ARM_EXIDX || indexes_its_linked_code(section, &sections, region) {
+            found.indexes.push(region);
         }
         if section.flags & u64::from(crate::SHF_ALLOC) != 0 {
-            found.loaded.push(Region { address, bytes });
+            found.loaded.push(region);
         }
     }
     found
+}
+
+/// Whether `section`, holding `region`, is an index table typed `SHT_PROGBITS`: see [`tables`].
+/// `sections` are the file's headers, in its order, which `sh_link` counts in.
+fn indexes_its_linked_code(
+    section: &crate::SectionHeader<'_>,
+    sections: &[crate::SectionHeader<'_>],
+    region: Region<'_>,
+) -> bool {
+    let alloc = u64::from(crate::SHF_ALLOC);
+    let code_flags = alloc | u64::from(crate::SHF_EXECINSTR);
+    if section.kind != crate::SHT_PROGBITS
+        || section.flags & alloc == 0
+        || section.flags & SHF_LINK_ORDER == 0
+    {
+        return false;
+    }
+    let Some(code) = usize::try_from(section.link).ok().and_then(|index| sections.get(index)) else {
+        return false;
+    };
+    if code.flags & code_flags != code_flags {
+        return false;
+    }
+    let Ok(table) = IndexTable::new(region) else {
+        return false;
+    };
+    let inside = |function: u32| {
+        u64::from(function) >= code.address && u64::from(function) < code.address.saturating_add(code.size)
+    };
+    !table.is_empty()
+        && (0..table.len()).all(|position| table.entry(position).is_some_and(|entry| inside(entry.function)))
 }
 
 #[cfg(test)]

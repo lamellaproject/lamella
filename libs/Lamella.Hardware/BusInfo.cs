@@ -1,4 +1,4 @@
-// Lamella.Hardware.I2cBusInfo and SpiBusInfo -- the buses the board serves.
+// Lamella.Hardware.BoardI2cBus and BoardSpiBus -- the buses the board serves.
 using System.Collections.Generic;
 
 namespace Lamella.Hardware
@@ -8,11 +8,11 @@ namespace Lamella.Hardware
     /// <param name="Sda">The bus's data pin.</param>
     /// <param name="Scl">The bus's clock pin.</param>
     /// <param name="Frequencies">The clock frequencies in hertz the bus serves.</param>
-    public sealed record I2cBusInfo(int Number, BoardPin Sda, BoardPin Scl, IReadOnlyList<int> Frequencies)
+    public sealed record BoardI2cBus(int Number, BoardPin Sda, BoardPin Scl, IReadOnlyList<int> Frequencies)
     {
         /// <summary>Whether <paramref name="other"/> is a record of the same bus: every member equal.</summary>
         /// <param name="other">The record to compare, or null, which is not equal.</param>
-        public bool Equals(I2cBusInfo other)
+        public bool Equals(BoardI2cBus other)
         {
             return (object)other != null
                 && Number == other.Number
@@ -39,12 +39,12 @@ namespace Lamella.Hardware
     /// <c>SpiConnectionSettings.ChipSelectLine</c> names.</param>
     /// <param name="MinFrequency">The slowest clock frequency in hertz the bus makes.</param>
     /// <param name="MaxFrequency">The fastest clock frequency in hertz the bus makes.</param>
-    public sealed record SpiBusInfo(int Number, BoardPin Sck, BoardPin Mosi, BoardPin Miso,
+    public sealed record BoardSpiBus(int Number, BoardPin Sck, BoardPin Mosi, BoardPin Miso,
         IReadOnlyList<BoardPin> ChipSelects, int MinFrequency, int MaxFrequency)
     {
         /// <summary>Whether <paramref name="other"/> is a record of the same bus: every member equal.</summary>
         /// <param name="other">The record to compare, or null, which is not equal.</param>
-        public bool Equals(SpiBusInfo other)
+        public bool Equals(BoardSpiBus other)
         {
             return (object)other != null
                 && Number == other.Number

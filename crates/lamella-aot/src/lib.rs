@@ -8,6 +8,8 @@ extern crate alloc;
 pub mod cil;
 pub mod debugmap;
 pub mod dwarf;
+mod kind;
+pub use kind::BuildKind;
 /// The closed generic instantiation set and the canonical spelling that names each instantiation.
 ///
 /// **EXTRACTED TO ITS OWN LEAF CRATE, BECAUSE BOTH TIERS MONOMORPHIZE.** The interpreter's baker

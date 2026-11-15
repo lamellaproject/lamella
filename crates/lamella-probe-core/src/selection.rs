@@ -35,6 +35,25 @@ pub fn serial_named(name: &str) -> &str {
     }
 }
 
+/// The board a probe's id names after its serial number, `probe:<serial>/<board>`, or `None` for a
+/// name that names no board: a bare serial number, or `probe:<serial>` alone.
+///
+/// The board is what follows the id's last slash, which is where [`serial_named`] ends the serial
+/// number, so the two never disagree about where one stops and the other starts. It names the board
+/// a device list says the probe reaches; [`serial_named`] says why the probe is the same probe
+/// whichever board is behind it, and what the board means is the caller's to decide.
+#[must_use]
+pub fn board_named(name: &str) -> Option<&str> {
+    let name = name.trim();
+    let head = name.get(..PROBE_ID_PREFIX.len())?;
+    if !head.eq_ignore_ascii_case(PROBE_ID_PREFIX) {
+        return None;
+    }
+    let (_, board) = name[PROBE_ID_PREFIX.len()..].rsplit_once('/')?;
+    let board = board.trim();
+    (!board.is_empty()).then_some(board)
+}
+
 /// What the ladder needs to know about one discovered device, and nothing more.
 ///
 /// Deliberately three fields. A probe family's own discovery type carries far more -- transport,
@@ -377,6 +396,23 @@ mod tests {
         assert_eq!(serial_named("probe:/raspberrypi-pico-2"), "", "no serial before the board");
         assert_eq!(serial_named("probe:AB/CD/raspberrypi-pico-2"), "AB/CD", "the board is after the last slash");
         assert_eq!(serial_named("AB/CD"), "AB/CD", "a bare serial is the serial, whole");
+    }
+
+    /// The other half of the same split: the board a row names is what [`serial_named`] leaves
+    /// after the serial number, so the two read one id the same way.
+    #[test]
+    fn the_board_a_probe_id_names_is_what_follows_its_serial() {
+        for (named, board) in [
+            ("probe:BBBB2222/raspberrypi-pico-2", "raspberrypi-pico-2"),
+            ("PROBE:BBBB2222/pimoroni-pico-plus-2", "pimoroni-pico-plus-2"),
+            (" probe: BBBB2222 / raspberrypi-pico-2 ", "raspberrypi-pico-2"),
+            ("probe:AB/CD/raspberrypi-pico-2", "raspberrypi-pico-2"),
+        ] {
+            assert_eq!(board_named(named), Some(board), "{named:?}");
+        }
+        for none in ["probe:BBBB2222", "BBBB2222", "AB/CD", "probe:BBBB2222/", "probe:", "XYprobe:1/board"] {
+            assert_eq!(board_named(none), None, "{none:?} names no board");
+        }
     }
 
     /// The ladder must SURVIVE a family narrowing, because that is how it is actually called: a

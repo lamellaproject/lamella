@@ -94,8 +94,10 @@ SECTIONS
      initial SP, and the C# firmware's heap is everything between the statics and the stack's floor:
      sized here, at link time, rather than fixed in the firmware. That firmware also hands the floor
      to the core's stack-limit register, so a stack that outgrows its share faults rather than
-     writing into the heap. build.rs sizes the stack from the build's features. */
-  _sheap = ALIGN(_enoinit, 8);
+     writing into the heap. build.rs sizes the stack from the build's features. The heap's first byte
+     is aligned to 16, the heap's smallest block, which it requires of the base it is handed: where
+     the statics end moves with every build. */
+  _sheap = ALIGN(_enoinit, 16);
   _stack_floor = ORIGIN(RAM) + LENGTH(RAM) - @LAMELLA_STACK_BYTES@;
   ASSERT(_stack_floor > _sheap, "the statics reach into the stack's share of RAM")
 

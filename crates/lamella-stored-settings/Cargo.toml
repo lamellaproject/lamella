@@ -1,0 +1,16 @@
+[package]
+name = "lamella-stored-settings"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "The settings a board keeps in its flash, such as the network it joins: the record's format and its two-slot writer, shared by the board's firmware and by the tools that write a board's settings."
+publish = false
+
+[dependencies]
+# The plain values the record stores: the security kinds, the reconnection kind and the boot setting.
+lamella-net-core = { path = "../lamella-net-core" }
+
+[lints]
+workspace = true

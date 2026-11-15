@@ -45,7 +45,6 @@ lamella-dap = { path = "../lamella-dap", default-features = false, optional = tr
 lamella-debug-backend = { path = "../lamella-debug-backend", optional = true }
 lamella-assemble = { path = "../lamella-assemble", optional = true }
 lamella-metadata = { path = "../lamella-metadata", optional = true }
-lamella-token = { path = "../lamella-token", optional = true }
 
 [dev-dependencies]
 # The reference-assembly search as a TEST build makes it: it also looks at this source tree's test
@@ -66,7 +65,6 @@ bake = [
     "dep:lamella-debug-backend",
     "dep:lamella-assemble",
     "dep:lamella-metadata",
-    "dep:lamella-token",
 ]
 
 [[package.metadata.lamella.test-configuration]]

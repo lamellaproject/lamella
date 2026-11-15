@@ -243,7 +243,7 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                 Inst::Truncate { value } => {
                     mark(&mut lo, &mut hi, &mut defined, *value, ip);
                 }
-                Inst::InitStruct => {}
+                Inst::InitStruct | Inst::Nop => {}
                 Inst::FieldLoad { base, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *base, ip);
                 }
@@ -261,7 +261,7 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                 Inst::FieldAddr { base, .. } => {
                     mark(&mut lo, &mut hi, &mut defined, *base, ip);
                 }
-                Inst::LoadTypeDesc { object } => {
+                Inst::LoadTypeDesc { object } | Inst::NullCheck { object } => {
                     mark(&mut lo, &mut hi, &mut defined, *object, ip);
                 }
                 Inst::InterfaceHasTag { descriptor, .. }
@@ -672,7 +672,7 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         Inst::Convert { value, .. } => f(*value),
         Inst::Widen { value, .. } => f(*value),
         Inst::Truncate { value } => f(*value),
-        Inst::InitStruct => {}
+        Inst::InitStruct | Inst::Nop => {}
         Inst::FieldLoad { base, .. } => f(*base),
         Inst::FieldStore { base, value, .. } => {
             f(*base);
@@ -684,7 +684,7 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
             f(*value);
         }
         Inst::FieldAddr { base, .. } => f(*base),
-        Inst::LoadTypeDesc { object } => f(*object),
+        Inst::LoadTypeDesc { object } | Inst::NullCheck { object } => f(*object),
         Inst::InterfaceHasTag { descriptor, .. }
         | Inst::DescriptorWord { descriptor, .. }
         | Inst::TypeName { descriptor } => f(*descriptor),

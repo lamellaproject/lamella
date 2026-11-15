@@ -72,6 +72,17 @@ pub trait DebugBackend {
         Ok(())
     }
 
+    /// Whether the program this backend debugs runs inside this process, on this computer, as a
+    /// program on the in-process interpreter does.
+    ///
+    /// An adapter answers a Debug Console line that names no frame with an evaluation session of its
+    /// own, and that session runs here. So it answers there only for a target where this is `true`:
+    /// for any other, an answer computed on this computer would be shown as the target's. The default
+    /// is `false`, which is right for every target reached over a wire or a probe.
+    fn runs_in_this_process(&self) -> bool {
+        false
+    }
+
     /// Whether [`DebugBackend::terminate`] can succeed on this backend, so a client offers to end the
     /// program only where it can be ended. The default is `false`, matching `terminate`'s own default
     /// of refusing.
@@ -112,6 +123,13 @@ pub trait DebugBackend {
     /// The default (0) suits a backend that does not track an exit code (e.g. a device that only halts).
     fn exit_code(&self) -> i32 {
         0
+    }
+
+    /// The code the target gave for a program that ended in a [`Stop::Fault`] -- an abort or a trap
+    /// the target itself reported, such as a board's 134 for an exception nothing caught -- or `None`
+    /// when it gave none. The adapter reports it in the `exited` event, and -1 when there is none.
+    fn fault_exit_code(&self) -> Option<i32> {
+        None
     }
 
     /// Runs a callee the current step descended into to its return, instead of the adapter
@@ -257,6 +275,20 @@ pub trait DebugBackend {
         None
     }
 
+    /// The source location of frame `index` of [`DebugBackend::stack`], counted as it lists them,
+    /// where `address` is that frame's address. The adapter puts it on the frame of a `stackTrace`.
+    ///
+    /// The default is [`DebugBackend::source_location`] of the address, which is right for a backend
+    /// whose frames' addresses are the statements they are at. **A FRAME THAT STANDS AT A CALL IS NOT
+    /// AT ITS ADDRESS** on a backend whose frame address is the return address: that address is the
+    /// instruction after the call, which for a call that ends a statement is the next statement's
+    /// first instruction, so its location is a line the frame has not reached. Such a backend
+    /// overrides this to locate the call itself.
+    fn frame_source_location(&self, index: usize, address: u64) -> Option<SourceLocation> {
+        let _ = index;
+        self.source_location(address)
+    }
+
     /// Whether the backend has source-level debug info loaded (the interpreter's Portable
     /// PDB, or a device's AOT debug-info). When true, the adapter steps at *source*
     /// granularity -- `next` / `stepIn` / `stepOut` advance to the next sequence point (a
@@ -382,6 +414,46 @@ pub trait DebugBackend {
     fn take_debug_output(&mut self) -> Option<String> {
         None
     }
+
+    /// The program's threads that have not finished, the main thread first while it runs, each with
+    /// the id a client names it by and the name it shows.
+    ///
+    /// The default is the one thread a backend that does not schedule threads debugs: id 1, named as
+    /// .NET's debugger names a main thread.
+    fn threads(&self) -> Vec<ThreadInfo> {
+        alloc::vec![ThreadInfo { id: MAIN_THREAD, name: String::from("Main Thread") }]
+    }
+
+    /// The thread the calls that read or move one thread act on: [`DebugBackend::stack`],
+    /// [`DebugBackend::variables`] and the other variable reads, [`DebugBackend::set_variable`],
+    /// [`DebugBackend::depth`], [`DebugBackend::at_source_boundary`] and [`DebugBackend::step`].
+    ///
+    /// At every stop it is the thread the stop happened on -- the one that reached a breakpoint, the
+    /// one a step moved -- which is the thread the adapter's `stopped` event names. The default is
+    /// the one thread, 1.
+    fn selected_thread(&self) -> u32 {
+        MAIN_THREAD
+    }
+
+    /// Selects thread `id` for the calls [`DebugBackend::selected_thread`] lists, or answers `false`
+    /// when the program has no such thread, leaving the selection as it was. The default knows only
+    /// thread 1.
+    fn select_thread(&mut self, id: u32) -> bool {
+        id == MAIN_THREAD
+    }
+}
+
+/// The id of the main thread, the thread every program starts on and the only one a backend that does
+/// not schedule threads has.
+pub const MAIN_THREAD: u32 = 1;
+
+/// One thread of the program, as a client's list of threads shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ThreadInfo {
+    /// The id a client names the thread by, in a `stackTrace` or a `continue`.
+    pub id: u32,
+    /// The name the client shows for it.
+    pub name: String,
 }
 
 /// Why execution stopped after a `resume` or `step`.

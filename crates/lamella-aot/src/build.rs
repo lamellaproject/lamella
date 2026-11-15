@@ -22,6 +22,7 @@ use lamella_token::Token;
 #[cfg(feature = "arm32")]
 use crate::arm32;
 use crate::cil;
+pub use crate::BuildKind;
 use crate::resolver::{ELEMENT_KIND_REFERENCE, MetadataResolver};
 #[cfg(feature = "riscv32")]
 use crate::riscv32;
@@ -71,6 +72,13 @@ pub enum BuildError {
     /// around. (`build_object_riscv` requires one; a library object has no entry -- that path differs.)
     #[cfg(feature = "riscv32")]
     NoEntryPoint,
+    /// The entry point reads its `string[] args`, and the build has no `string[]` to give it: it
+    /// references no assembly, and the program names `System.String` nowhere, so there is no type to
+    /// describe the empty array .NET passes a program run with no arguments.
+    ///
+    /// Refused rather than given null, because a program that reads `args` can tell the two apart:
+    /// `args == null` would answer true where .NET's answers false.
+    EntryArgumentUnavailable,
     /// The program names an assembly the build was never given, so every type and member it declares
     /// resolves to nothing.
     ///
@@ -342,6 +350,12 @@ impl core::fmt::Display for BuildError {
                 "the assembly declares no static `Main`, so there is no entry point to build a \
                  runnable image around",
             ),
+            BuildError::EntryArgumentUnavailable => write!(
+                f,
+                "`Main` reads its `string[] args`, and this build links no class library, so it \
+                 has no `string[]` to give it: the empty array a program run with no arguments is \
+                 given cannot be made",
+            ),
             BuildError::UnresolvedAssemblyReference { missing, supplied } => write!(
                 f,
                 "the program references {} that the build was not given, and was given {}",
@@ -559,16 +573,20 @@ fn read_assembly(bytes: &[u8]) -> Result<Assembly<'_>, BuildError> {
 /// Cortex-M0+, "rp2350" for the Pico 2 / Pico 2 W Cortex-M33) emits a flashable bare-metal image --
 /// the flat, linker-free fast path. `"qemu-riscv32"` emits the RV32IM twin of that image for QEMU's
 /// `virt` machine, and `"ch32v003"` the RV32EC twin for the CH32V003's 16 KB flash at `0x0000_0000`.
-pub fn build(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
+///
+/// `kind` is the program's [`BuildKind`]. These images carry no debug information, so what it
+/// changes is what an unread `Main(string[] args)` is given (see [`BuildKind`]); a `.wasm` widget,
+/// which has no entry point to give anything, is the same either way.
+pub fn build(cil: &[u8], target: &str, kind: BuildKind) -> Result<Vec<u8>, BuildError> {
     match target {
         #[cfg(feature = "wasm")]
         "wasm" => build_wasm(cil),
         #[cfg(feature = "arm32")]
-        t if CORTEX_M_TARGETS.contains(&t) => build_cortex_m(cil, t),
+        t if CORTEX_M_TARGETS.contains(&t) => build_cortex_m(cil, t, kind),
         #[cfg(feature = "riscv32")]
-        "qemu-riscv32" => build_riscv32(cil, target),
+        "qemu-riscv32" => build_riscv32(cil, target, kind),
         #[cfg(feature = "riscv32")]
-        "ch32v003" => build_ch32v003(cil),
+        "ch32v003" => build_ch32v003(cil, kind),
         _ => Err(BuildError::UnsupportedTarget),
     }
 }
@@ -604,13 +622,13 @@ const RISCV_VIRT_FINISHER: u32 = 0x0010_0000;
 /// bootloader; a CH32V003 wants the RV32EC profile and flash at 0). Wiring those is a per-part boot
 /// image beside this one, not a change to the lowering.
 #[cfg(feature = "riscv32")]
-pub fn build_riscv32(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
+pub fn build_riscv32(cil: &[u8], target: &str, kind: BuildKind) -> Result<Vec<u8>, BuildError> {
     if target != "qemu-riscv32" {
         return Err(BuildError::UnsupportedTarget);
     }
     let assembly = read_assembly(cil)?;
     let entry = find_main(&assembly);
-    let (funcs, plan) = lower_assembly(&assembly, entry, &[])?;
+    let (funcs, plan) = lower_assembly(&assembly, entry, &[], kind)?;
     let code = riscv32::lower_module(&funcs).map_err(BuildError::LowerRiscv)?;
     let statics_words = crate::resolver::static_region_words(&assembly, &plan, &[]);
     Ok(riscv_virt_boot_image(&code, statics_words))
@@ -696,10 +714,10 @@ pub const CH32V003_SRAM_TOP: u32 = 0x2000_0800;
 /// routines is [`build_object_riscv_profile`] plus `lamella-linker`, which is the path
 /// `examples/ch32v003-blink` drives and the one that has been on silicon.
 #[cfg(feature = "riscv32")]
-pub fn build_ch32v003(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
+pub fn build_ch32v003(cil: &[u8], kind: BuildKind) -> Result<Vec<u8>, BuildError> {
     let assembly = read_assembly(cil)?;
     let entry = find_main(&assembly);
-    let (funcs, _plan) = lower_assembly(&assembly, entry, &[])?;
+    let (funcs, _plan) = lower_assembly(&assembly, entry, &[], kind)?;
     let code = riscv32::lower_module_profile(&funcs, riscv32::RiscvProfile::Rv32ec)
         .map_err(BuildError::LowerRiscv)?;
     Ok(ch32v003_boot_image(&code))
@@ -738,7 +756,7 @@ pub fn ch32v003_boot_image(code: &[u8]) -> Vec<u8> {
 pub fn build_wasm(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
     let assembly = read_assembly(cil)?;
     let entry = find_main(&assembly);
-    let (funcs, plan) = lower_assembly(&assembly, entry, &[])?;
+    let (funcs, plan) = lower_assembly(&assembly, entry, &[], BuildKind::Release)?;
     let exports = method_exports(&assembly, entry.is_some());
     let export_refs: Vec<(&str, u32)> = exports.iter().map(|(n, i)| (n.as_str(), *i)).collect();
     let static_region = crate::resolver::static_region_words(&assembly, &plan, &[]) * 4;
@@ -778,13 +796,13 @@ pub fn build_wasm(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
 /// before managed code runs, and an image without it links cleanly and then fails at its first
 /// allocation -- so a boot image builder is part of the linked path rather than a wrapper over it.
 #[cfg(feature = "arm32")]
-pub fn build_cortex_m(cil: &[u8], target: &str) -> Result<Vec<u8>, BuildError> {
+pub fn build_cortex_m(cil: &[u8], target: &str, kind: BuildKind) -> Result<Vec<u8>, BuildError> {
     if !CORTEX_M_TARGETS.contains(&target) {
         return Err(BuildError::UnsupportedTarget);
     }
     let assembly = read_assembly(cil)?;
     let entry = find_main(&assembly);
-    let (funcs, plan) = lower_assembly(&assembly, entry, &[])?;
+    let (funcs, plan) = lower_assembly(&assembly, entry, &[], kind)?;
     let code = arm32::lower_module(&funcs).map_err(BuildError::LowerArm)?;
     let statics_words = crate::resolver::static_region_words(&assembly, &plan, &[]);
     cortex_m_boot_image(target, &code, statics_words)
@@ -1076,8 +1094,9 @@ pub fn build_linked_cortex_m(
     corlib: &[u8],
     archive: &[u8],
     target: &str,
+    kind: BuildKind,
 ) -> Result<Vec<u8>, BuildError> {
-    build_linked_cortex_m_with_libraries(cil, corlib, &[], archive, target)
+    build_linked_cortex_m_with_libraries(cil, corlib, &[], archive, target, kind)
 }
 
 /// [`build_linked_cortex_m`], with USER CLASS LIBRARIES beside the corlib -- the tier a board
@@ -1115,8 +1134,9 @@ pub fn build_linked_cortex_m_with_libraries(
     libraries: &[&[u8]],
     archive: &[u8],
     target: &str,
+    kind: BuildKind,
 ) -> Result<Vec<u8>, BuildError> {
-    build_linked_cortex_m_with_board(cil, corlib, libraries, archive, target, None)
+    build_linked_cortex_m_with_board(cil, corlib, libraries, archive, target, None, kind)
 }
 
 /// [`build_linked_cortex_m_with_libraries`] for a build that names a board, with that board's bus
@@ -1126,6 +1146,10 @@ pub fn build_linked_cortex_m_with_libraries(
 ///
 /// The table is checked as the bake checks the one it writes into an image, and a table that fails
 /// is [`BuildError::BoardBusTable`].
+///
+/// `kind` is the program's [`BuildKind`], and the image is that kind's. An image a board is written
+/// with for a debugging session is the one [`build_linked_cortex_m_debug_with_board`] describes only
+/// when both are given the same kind.
 #[cfg(feature = "linked")]
 pub fn build_linked_cortex_m_with_board(
     cil: &[u8],
@@ -1134,8 +1158,9 @@ pub fn build_linked_cortex_m_with_board(
     archive: &[u8],
     target: &str,
     board_buses: Option<&[u32]>,
+    kind: BuildKind,
 ) -> Result<Vec<u8>, BuildError> {
-    build_linked_part(linked_part(target)?, cil, corlib, libraries, archive, board_buses)
+    build_linked_part(linked_part(target)?, cil, corlib, libraries, archive, board_buses, kind)
 }
 
 /// [`build_linked_cortex_m_with_libraries`] for an STM32 row whose image is MOVED: its vector table and
@@ -1151,6 +1176,7 @@ pub fn build_linked_cortex_m_with_board(
 /// A target with no STM32 row is [`BuildError::UnsupportedTarget`], and so is a `ram_top` that leaves
 /// the plan no room above the archive's bands.
 #[cfg(feature = "linked")]
+#[allow(clippy::too_many_arguments)]
 pub fn build_linked_cortex_m_moved(
     cil: &[u8],
     corlib: &[u8],
@@ -1159,6 +1185,7 @@ pub fn build_linked_cortex_m_moved(
     target: &str,
     code_base: u32,
     ram_top: u32,
+    kind: BuildKind,
 ) -> Result<Vec<u8>, BuildError> {
     if !matches!(linked_part(target)?, LinkedPart::Stm32(_)) {
         return Err(BuildError::UnsupportedTarget);
@@ -1167,7 +1194,7 @@ pub fn build_linked_cortex_m_moved(
     if moved.statics_capacity().is_none() {
         return Err(BuildError::UnsupportedTarget);
     }
-    build_linked_part(LinkedPart::Stm32(moved), cil, corlib, libraries, archive, None)
+    build_linked_part(LinkedPart::Stm32(moved), cil, corlib, libraries, archive, None, kind)
 }
 
 /// The linked image of `cil` for `part`, as [`build_linked_cortex_m_with_board`] builds it.
@@ -1179,10 +1206,11 @@ fn build_linked_part(
     libraries: &[&[u8]],
     archive: &[u8],
     board_buses: Option<&[u32]>,
+    kind: BuildKind,
 ) -> Result<Vec<u8>, BuildError> {
     let libraries = referenced_libraries(cil, libraries)?;
     let (program_object, deferred) =
-        build_linked_program_object(cil, corlib, &libraries, None, part.wide())?;
+        build_linked_program_object(cil, corlib, &libraries, None, part.wide(), kind)?;
     link_linked_image(
         part,
         &program_object,
@@ -1967,14 +1995,21 @@ pub fn build_linked_cortex_m_debug(
     libraries: &[&[u8]],
     archive: &[u8],
     target: &str,
+    kind: BuildKind,
 ) -> Result<Vec<u8>, BuildError> {
-    build_linked_cortex_m_debug_with_board(cil, pdb, corlib, libraries, archive, target, None)
+    build_linked_cortex_m_debug_with_board(cil, pdb, corlib, libraries, archive, target, None, kind)
 }
 
 /// [`build_linked_cortex_m_debug`] for a build that names a board, with that board's bus table, laid
 /// as [`build_linked_cortex_m_with_board`] lays it -- so the ELF a debugger reads is cut from the
-/// same link as the image the board is written with.
+/// same link as the image the board is written with, when both are given the same `kind`.
+///
+/// A [`BuildKind::Debug`] ELF describes every parameter and named local of the program's methods at
+/// every place a debugger can stop in them, and gives every sequence point an address; a
+/// [`BuildKind::Release`] ELF describes the optimized image, where a value kept in a register has
+/// no location.
 #[cfg(feature = "linked")]
+#[allow(clippy::too_many_arguments)]
 pub fn build_linked_cortex_m_debug_with_board(
     cil: &[u8],
     pdb: &lamella_metadata::PortablePdb,
@@ -1983,11 +2018,12 @@ pub fn build_linked_cortex_m_debug_with_board(
     archive: &[u8],
     target: &str,
     board_buses: Option<&[u32]>,
+    kind: BuildKind,
 ) -> Result<Vec<u8>, BuildError> {
     let part = linked_part(target)?;
     let libraries = referenced_libraries(cil, libraries)?;
     let (program_object, deferred) =
-        build_linked_program_object(cil, corlib, &libraries, Some(pdb), part.wide())?;
+        build_linked_program_object(cil, corlib, &libraries, Some(pdb), part.wide(), kind)?;
     let (image, linked) = link_linked_image(
         part,
         &program_object,
@@ -2493,18 +2529,22 @@ pub type MethodDebug = alloc::vec::Vec<(u32, u32, arm32::LineTable)>;
 /// stub gaps), so the SAME bytes are produced and the line tables match the layout BY CONSTRUCTION.
 /// Offsets are IMAGE-relative -- **the module sits at image offset `0x100`** ([`NORDIC_TEXT_BASE`]),
 /// after the sixteen-entry vector table and the stub region holding the startup and fault handler --
-/// and cross-method calls resolve (the rid-indexed layout). `device-dap-server` uses this instead of
+/// and cross-method calls resolve (the rid-indexed layout). `lamella-debug` uses this instead of
 /// single-method debug.
 ///
 #[cfg(feature = "arm32")]
-pub fn build_debug(cil: &[u8], target: &str) -> Result<(Vec<u8>, MethodDebug), BuildError> {
+pub fn build_debug(
+    cil: &[u8],
+    target: &str,
+    kind: BuildKind,
+) -> Result<(Vec<u8>, MethodDebug), BuildError> {
     let initial_sp: u32 = match target {
         "microbit" => 0x2000_4000,
         _ => return Err(BuildError::UnsupportedTarget),
     };
     let assembly = read_assembly(cil)?;
     let entry = find_main(&assembly);
-    let (funcs, maps, fails, duplicates, plan) = lower_assembly_debug(&assembly, entry, &[])?;
+    let (funcs, maps, fails, duplicates, plan) = lower_assembly_debug(&assembly, entry, &[], kind)?;
     refuse_duplicate_bodies(&duplicates)?;
     if let Some((rid, error)) = fails.into_iter().next() {
         return Err(lower_cil_error(&assembly, rid, error));
@@ -3238,6 +3278,9 @@ pub fn rp2040_boot_image(entry_offset: u32, code: &[u8]) -> Vec<u8> {
 /// whereas this object path carries the call graph + the relocation-dependent features (float,
 /// function pointers, native calls) the linker resolves. Emitting the object stays linker-free (the
 /// driver/examples own the link step); the `hosted-csharp-arm` example links + runs the result.
+///
+/// The object is a Release build's ([`BuildKind`]): the optimized code, and an unread
+/// `Main(string[] args)` is given null. [`build_object_with_corlib_debug`] builds either kind.
 #[cfg(feature = "arm32")]
 pub fn build_object(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
     build_object_inner(cil, None, &[])
@@ -3249,6 +3292,9 @@ pub fn build_object(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
 /// extern vtable entry the linker resolves against [`build_library_object`]'s export of it, and a
 /// `callvirt` naming a referenced method (a `MemberRef`, e.g. `object.GetHashCode()` on a base-typed
 /// receiver) dispatches through that shared slot instead of static-devirtualizing.
+///
+/// The object is a Release build's ([`BuildKind`]): the optimized code, and an unread
+/// `Main(string[] args)` is given null. [`build_object_with_corlib_debug`] builds either kind.
 #[cfg(feature = "arm32")]
 pub fn build_object_with_corlib(cil: &[u8], corlib: &[u8]) -> Result<Vec<u8>, BuildError> {
     build_object_inner(cil, Some(corlib), &[])
@@ -3272,8 +3318,9 @@ pub fn build_object_with_corlib_debug(
     cil: &[u8],
     corlib: &[u8],
     pdb: &lamella_metadata::PortablePdb,
+    kind: BuildKind,
 ) -> Result<Vec<u8>, BuildError> {
-    build_object_core(cil, Some(corlib), &[], false, false, Some(pdb)).map(|(bytes, _)| bytes)
+    build_object_core(cil, Some(corlib), &[], false, false, Some(pdb), kind).map(|(bytes, _)| bytes)
 }
 
 /// The PDB-derived text a compilation unit names, OWNED -- [`crate::debugmap::MethodSource`] borrows
@@ -3364,6 +3411,19 @@ impl MethodSources {
 #[cfg(feature = "arm32")]
 const PRODUCER: &str = "Lamella AOT";
 
+/// One past the highest method row `assembly` defines: the end of the rid-indexed functions a
+/// program's lowering lays out, which start at 1 (index 0 is the startup).
+#[cfg(feature = "arm32")]
+fn program_method_end(assembly: &Assembly) -> usize {
+    let mut end = 1;
+    for type_def in assembly.type_defs() {
+        for method in type_def.methods() {
+            end = end.max(method.rid() as usize + 1);
+        }
+    }
+    end
+}
+
 /// As [`build_object_with_corlib`], but with FURTHER referenced library assemblies -- the
 /// multi-assembly deploy shape (program + corlib + e.g. a BSP or `System.Net.NetworkInformation`).
 /// The whole ordered list `[corlib, libraries...]` flows: the startup chains every reference's
@@ -3373,6 +3433,9 @@ const PRODUCER: &str = "Lamella AOT";
 /// Remaining N-reference gap: a program type EXTENDING a reference's type sees the base's
 /// visible-portion-only field layout (the cross-assembly base-chain slice), so keep such
 /// hierarchies single-assembly for now.
+///
+/// The object is a Release build's ([`BuildKind`]): the optimized code, and an unread
+/// `Main(string[] args)` is given null. [`build_object_with_corlib_debug`] builds either kind.
 #[cfg(feature = "arm32")]
 pub fn build_object_with_libraries(
     cil: &[u8],
@@ -3392,6 +3455,9 @@ pub fn build_object_with_libraries(
 /// part -- a far branch/`adr` relaxes to `B.W`/`ADR.W`; on a v6-M target (`false`) it splices a
 /// literal-pool veneer instead. Either way a far reference ENCODES rather than deferring; the two
 /// paths are byte-identical for a method with no out-of-reach reference.
+///
+/// The object is a Release build's ([`BuildKind`]): the optimized code, and an unread
+/// `Main(string[] args)` is given null. [`build_object_with_corlib_debug`] builds either kind.
 #[cfg(feature = "arm32")]
 pub fn build_object_with_libraries_report(
     cil: &[u8],
@@ -3399,7 +3465,7 @@ pub fn build_object_with_libraries_report(
     libraries: &[&[u8]],
     wide: bool,
 ) -> Result<(Vec<u8>, LibraryBuildReport), BuildError> {
-    build_object_core(cil, Some(corlib), libraries, true, wide, None)
+    build_object_core(cil, Some(corlib), libraries, true, wide, None, BuildKind::Release)
 }
 
 #[cfg(feature = "arm32")]
@@ -3408,7 +3474,7 @@ fn build_object_inner(
     corlib: Option<&[u8]>,
     libraries: &[&[u8]],
 ) -> Result<Vec<u8>, BuildError> {
-    build_object_core(cil, corlib, libraries, false, false, None).map(|(bytes, _)| bytes)
+    build_object_core(cil, corlib, libraries, false, false, None, BuildKind::Release).map(|(bytes, _)| bytes)
 }
 
 /// The `TypeRef` a `MemberRef`'s parent names, following a `TypeSpec` through to the generic
@@ -3576,8 +3642,9 @@ fn build_object_core(
     defer: bool,
     wide: bool,
     pdb: Option<&lamella_metadata::PortablePdb>,
+    kind: BuildKind,
 ) -> Result<(Vec<u8>, LibraryBuildReport), BuildError> {
-    build_program_object(cil, corlib, libraries, defer, wide, pdb, false)
+    build_program_object(cil, corlib, libraries, defer, wide, pdb, false, kind)
         .map(|(bytes, report, _)| (bytes, report))
 }
 
@@ -3598,14 +3665,16 @@ fn build_linked_program_object(
     libraries: &[&[u8]],
     pdb: Option<&lamella_metadata::PortablePdb>,
     wide: bool,
+    kind: BuildKind,
 ) -> Result<(Vec<u8>, Vec<DeferredBody>), BuildError> {
-    build_program_object(cil, Some(corlib), libraries, false, wide, pdb, true)
+    build_program_object(cil, Some(corlib), libraries, false, wide, pdb, true, kind)
         .map(|(bytes, _, deferred)| (bytes, deferred))
 }
 
 /// [`build_object_core`], and with `defer_monomorphized` the build
 /// [`build_linked_program_object`] describes, which also returns what it deferred.
 #[cfg(feature = "arm32")]
+#[allow(clippy::too_many_arguments)]
 fn build_program_object(
     cil: &[u8],
     corlib: Option<&[u8]>,
@@ -3614,6 +3683,7 @@ fn build_program_object(
     wide: bool,
     pdb: Option<&lamella_metadata::PortablePdb>,
     defer_monomorphized: bool,
+    kind: BuildKind,
 ) -> Result<(Vec<u8>, LibraryBuildReport, Vec<DeferredBody>), BuildError> {
     let assembly = read_assembly(cil)?;
     let reference = match corlib {
@@ -3645,8 +3715,8 @@ fn build_program_object(
     } else {
         MonomorphizedFailure::Refuse
     };
-    let (mut funcs, maps, cil_fails, seams, duplicates, _thunks, plan) =
-        lower_assembly_seams(&assembly, entry, &references, monomorphized_failure)?;
+    let (mut funcs, mut maps, cil_fails, seams, duplicates, _thunks, plan) =
+        lower_assembly_seams(&assembly, entry, &references, monomorphized_failure, kind, kind.is_debug())?;
     refuse_duplicate_bodies(&duplicates)?;
     let cil_fail_rows: Vec<(u32, cil::CilError)> = if defer {
         for (rid, _) in &cil_fails {
@@ -3682,11 +3752,21 @@ fn build_program_object(
         for (lib_bytes, lib_assembly) in libraries.iter().zip(&library_assemblies) {
             chain(lib_bytes, lib_assembly);
         }
+        let argument = entry_argument(&assembly, &references, entry_rid, kind)?;
+        if entry_args_withheld(&argument) {
+            if let Some(arg) = maps
+                .get_mut(entry_rid as usize)
+                .and_then(|map| map.arg_values.get_mut(0))
+            {
+                *arg = None;
+            }
+        }
         funcs[0] = startup_with_references(
             find_native_export(&assembly, "lamella_time_init"),
             &reference_cctors,
             &startup_cctors(&assembly, &references),
             entry_rid,
+            argument,
         );
     }
     let resolver = MetadataResolver::new(&assembly)
@@ -3722,31 +3802,30 @@ fn build_program_object(
     if !defer {
         let sources = pdb.map(|pdb| MethodSources::resolve(pdb, &assembly, funcs.len()));
         let rows = sources.as_ref().map(MethodSources::rows);
-        let bytes = match (&sources, &rows) {
-            (Some(sources), Some(rows)) => arm32::lower_object_vtables_statics_debug(
-                &funcs,
-                &name_refs,
-                &[],
-                &descriptors,
-                &statics,
-                &qualifiers,
-                &crate::debugmap::ObjectDebug {
-                    source_maps: &maps,
-                    methods: rows,
-                    unit_name: sources.unit_name(),
-                    producer: PRODUCER,
-                },
-            )
-            .map(|(bytes, _)| bytes),
-            _ => arm32::lower_object_vtables_statics(
-                &funcs,
-                &name_refs,
-                &[],
-                &descriptors,
-                &statics,
-                &qualifiers,
-            ),
-        }
+        let debug = match (&sources, &rows) {
+            (Some(sources), Some(rows)) => Some(crate::debugmap::ObjectDebug {
+                source_maps: &maps,
+                methods: rows,
+                unit_name: sources.unit_name(),
+                producer: PRODUCER,
+            }),
+            _ => None,
+        };
+        let debug_bodies = match kind {
+            BuildKind::Debug => 1..program_method_end(&assembly),
+            BuildKind::Release => 0..0,
+        };
+        let bytes = arm32::lower_program_object(
+            &funcs,
+            &name_refs,
+            &[],
+            &descriptors,
+            &statics,
+            &qualifiers,
+            debug.as_ref(),
+            debug_bodies,
+        )
+        .map(|(bytes, _)| bytes)
         .map_err(BuildError::LowerArm)?;
         let report = LibraryBuildReport::default();
         let deferred = deferred_bodies(&report, monomorphized, &names, &[])?;
@@ -4599,6 +4678,9 @@ fn assembly_statics<'x>(
 /// converges to the lower-all shape of [`build_object`] (the implicit `.ctor` becomes an extern the
 /// linker drops when unreached). A reachable method that fails to lower is reported, never silently
 /// stubbed. Emitting the object stays linker-free (the driver/examples own the link + boot).
+///
+/// The object is a Release build's ([`BuildKind`]): the optimized code, and an unread
+/// `Main(string[] args)` is given null.
 #[cfg(feature = "riscv32")]
 pub fn build_object_riscv(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
     build_object_riscv_inner(cil, &[], riscv32::RiscvProfile::Rv32im)
@@ -4667,7 +4749,8 @@ fn build_object_riscv_inner(
                 .map(|rid| alloc::format!("{prefix}f{rid}")),
         );
     }
-    let (mut funcs, plan) = lower_reachable(&assembly, entry, &references, &reference_cctors)?;
+    let (mut funcs, plan) =
+        lower_reachable(&assembly, entry, &references, &reference_cctors, BuildKind::Release)?;
     let resolver = resolver.with_monomorphized(plan);
     descriptors = resolver.type_descriptors();
     descriptors.extend(resolver.instantiation_descriptors());
@@ -5306,6 +5389,7 @@ fn lower_reachable<'a>(
     entry: u32,
     references: &[&'a Assembly<'a>],
     reference_cctors: &[alloc::string::String],
+    kind: BuildKind,
 ) -> Result<(Vec<Function>, crate::generics::MonoPlan), BuildError> {
     let mut max_rid = entry;
     for type_def in assembly.type_defs() {
@@ -5405,7 +5489,13 @@ fn lower_reachable<'a>(
         }
         funcs[rid as usize] = func;
     }
-    funcs[0] = startup_with_references(init, reference_cctors, &cctors, entry);
+    funcs[0] = startup_with_references(
+        init,
+        reference_cctors,
+        &cctors,
+        entry,
+        entry_argument(assembly, references, entry, kind)?,
+    );
     Ok((funcs, plan))
 }
 
@@ -5540,7 +5630,7 @@ fn build_library_object_riscv_inner(
         .collect::<Result<_, _>>()?;
     let references: Vec<&Assembly> = reference_assemblies.iter().collect();
     let (mut funcs, _maps, fails, seams, duplicates, thunks, plan) =
-        lower_assembly_seams(&assembly, None, &references, MonomorphizedFailure::Refuse)?;
+        lower_assembly_seams(&assembly, None, &references, MonomorphizedFailure::Refuse, BuildKind::Release, false)?;
     refuse_duplicate_bodies(&duplicates)?;
     let prefix = library_prefix(cil);
     let resolver = MetadataResolver::new(&assembly)
@@ -5648,6 +5738,9 @@ pub fn build_library_object_riscv_report_with_references(
 /// ([`BuildError::PlaceholderLibraryMethod`]), and so does one that cannot be emitted
 /// ([`BuildError::StubbedLibraryMethod`]), unless the assembly is a core library, which reports both.
 /// No entry/startup ([`arm32::lower_object_library`]).
+///
+/// Built as a Release build ([`BuildKind`]) whatever the program's kind, as a .NET program's
+/// references are optimized whichever way the program itself is built.
 #[cfg(feature = "arm32")]
 pub fn build_library_object(cil: &[u8]) -> Result<Vec<u8>, BuildError> {
     build_library_object_inner(cil, &[], false).map(|(bytes, _)| bytes)
@@ -5894,7 +5987,7 @@ fn build_library_object_core(
         MonomorphizedFailure::Refuse
     };
     let (mut funcs, _maps, fails, seams, duplicates, thunks, plan) =
-        lower_assembly_seams(&assembly, None, &reference_list, monomorphized_failure)?;
+        lower_assembly_seams(&assembly, None, &reference_list, monomorphized_failure, BuildKind::Release, false)?;
     refuse_duplicate_bodies(&duplicates)?;
     if defer {
         for (rid, _) in &fails {
@@ -7132,8 +7225,82 @@ fn type_init_thunk_body(flag_offset: u32, cctor: u32) -> Function {
 /// so a chain carrying every one of them is correct and costs nothing observable. It is not free:
 /// a `.cctor` named here is a direct call from `f0`, and `f0` is the root of the reachability walk,
 /// so whatever the chain names, the image keeps. Keep the chain to what nothing can trigger.
-fn startup(init: Option<u32>, cctors: &[u32], entry_rid: u32) -> Function {
-    startup_with_references(init, &[], cctors, entry_rid)
+fn startup(
+    init: Option<u32>,
+    cctors: &[u32],
+    entry_rid: u32,
+    argument: EntryArgument,
+) -> Function {
+    startup_with_references(init, &[], cctors, entry_rid, argument)
+}
+
+/// What the startup passes the program's entry point. An entry point declares no parameter or one
+/// `string[]` (ECMA-335 II.15.4.1.2), and a program started with no arguments is given a new
+/// zero-length array in it.
+enum EntryArgument {
+    /// The entry point declares no parameter, so it is called with none.
+    None,
+    /// The entry point declares `string[] args` and its body never names it, so nothing can tell the
+    /// difference: a null reference, which the collector reads as it reads any reference. A Release
+    /// build gives it this, and so does a build that neither defines nor references
+    /// `System.String`, which has no `string[]` to describe.
+    Null,
+    /// The entry point declares `string[] args`, and is given a new zero-length array described by
+    /// this element, `System.String`'s.
+    EmptyArray(cil::ArrayElement),
+}
+
+/// The argument the startup passes the entry point `entry_rid` ([`EntryArgument`]): nothing for a
+/// parameterless entry point, and for one that declares `string[] args`, what a run with no
+/// arguments gives it -- a new zero-length `string[]`.
+///
+/// A Debug build gives the array whether or not the body names `args`. A body that never names it
+/// cannot observe the value, but a debugger can, and .NET's shows `args` as an empty `string[]` in
+/// a Debug session. A Release build gives such a body null, which saves the only array a small
+/// program allocates, and its debug information gives `args` no location, so a debugger reports the
+/// value as unavailable, as .NET's reports an argument optimized away.
+///
+/// The array is allocated as the program's own `new string[0]` would be, so a build that cannot
+/// allocate refuses a program it gives one, exactly as it refuses one that writes that expression.
+///
+/// A build with no references, of a program that names `System.String` nowhere, has no `string[]`
+/// to describe. It gives null to an entry point whose body never names `args`, which cannot tell,
+/// and refuses one whose body does ([`BuildError::EntryArgumentUnavailable`]), which could.
+fn entry_argument<'x>(
+    assembly: &'x Assembly<'x>,
+    references: &[&'x Assembly<'x>],
+    entry_rid: u32,
+    kind: BuildKind,
+) -> Result<EntryArgument, BuildError> {
+    let Some(method) = assembly.method(entry_rid) else {
+        return Ok(EntryArgument::None);
+    };
+    if method
+        .signature()
+        .is_none_or(|signature| signature.parameters.is_empty())
+    {
+        return Ok(EntryArgument::None);
+    }
+    let names_args = method
+        .body()
+        .is_none_or(|body| cil::names_argument(&body.code, 0));
+    if !names_args && kind == BuildKind::Release {
+        return Ok(EntryArgument::Null);
+    }
+    match MetadataResolver::new(assembly)
+        .with_references(references)
+        .string_array_element()
+    {
+        Some(element) => Ok(EntryArgument::EmptyArray(element)),
+        None if names_args => Err(BuildError::EntryArgumentUnavailable),
+        None => Ok(EntryArgument::Null),
+    }
+}
+
+/// Whether `argument` leaves the entry point's `args` holding a null the program never asked for,
+/// which its debug information must not describe as `args`' value.
+fn entry_args_withheld(argument: &EntryArgument) -> bool {
+    matches!(argument, EntryArgument::Null)
 }
 
 /// As [`startup`], but also chaining REFERENCE-assembly `.cctor`s (as extern `PInvoke` calls to
@@ -7143,52 +7310,101 @@ fn startup(init: Option<u32>, cctors: &[u32], entry_rid: u32) -> Function {
 /// referenced statics (`new AutoResetEvent(false)` reaches `WaitHandle.coordinator`), while a
 /// reference `.cctor` cannot name program state at all -- corlib does not know the program. Each
 /// call before the entry is void (its result is a dead placeholder).
+///
+/// The entry is given `argument`, made after the last initializer has run and immediately before
+/// the call, so no initializer's allocation finds it live.
 fn startup_with_references(
     init: Option<u32>,
     reference_cctors: &[alloc::string::String],
     cctors: &[u32],
     entry_rid: u32,
+    argument: EntryArgument,
 ) -> Function {
     let mut insts: Vec<(ValueId, Inst)> = Vec::new();
+    let mut value_types: Vec<MirType> = Vec::new();
+    let mut push = |ty: MirType, inst: Inst| {
+        let value = ValueId(insts.len() as u32);
+        insts.push((value, inst));
+        value_types.push(ty);
+        value
+    };
     for callee in init.into_iter() {
-        insts.push((
-            ValueId(insts.len() as u32),
+        push(
+            MirType::I32,
             Inst::Call {
                 callee,
                 args: Vec::new(),
             },
-        ));
+        );
     }
     for import in reference_cctors {
-        insts.push((
-            ValueId(insts.len() as u32),
+        push(
+            MirType::I32,
             Inst::PInvoke {
                 import: import.as_str().into(),
                 args: Vec::new(),
             },
-        ));
+        );
     }
     for &callee in cctors {
-        insts.push((
-            ValueId(insts.len() as u32),
+        push(
+            MirType::I32,
             Inst::Call {
                 callee,
                 args: Vec::new(),
             },
-        ));
+        );
     }
-    insts.push((
-        ValueId(insts.len() as u32),
+    let args = match argument {
+        EntryArgument::None => Vec::new(),
+        EntryArgument::Null => {
+            let zero = push(
+                MirType::I32,
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: 0,
+                },
+            );
+            vec![push(
+                MirType::ObjectRef,
+                Inst::Convert {
+                    value: zero,
+                    kind: ConvKind::IntToRef,
+                },
+            )]
+        }
+        EntryArgument::EmptyArray(element) => {
+            let length = push(
+                MirType::I32,
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: 0,
+                },
+            );
+            vec![push(
+                MirType::ObjectRef,
+                Inst::AllocArray {
+                    handle: element.handle,
+                    element: element.element,
+                    length,
+                    element_size: element.element_size,
+                    element_kind: element.element_kind,
+                    element_cast_class: element.element_cast_class,
+                },
+            )]
+        }
+    };
+    let result = push(
+        MirType::I32,
         Inst::Call {
             callee: entry_rid,
-            args: Vec::new(),
+            args,
         },
-    ));
-    let result = ValueId((insts.len() - 1) as u32);
+    );
     Function {
         params: Vec::new(),
         ret: Some(MirType::I32),
-        value_types: vec![MirType::I32; insts.len()],
+        value_types,
         entry: BlockId(0),
         blocks: vec![BasicBlock {
             params: Vec::new(),
@@ -8332,6 +8548,51 @@ fn decimal_seam_body(import: &str, param_types: Vec<MirType>, ret: MirType) -> O
     })
 }
 
+/// A synthesized MIR body for `System.Single.ToString()`: `this` is a managed pointer to the `f32`.
+/// It widens, as [`single_to_fixed_body`] does, because that is the path both backends already carry
+/// a float through; the runtime narrows it again and formats at the float's own precision.
+fn single_to_string_body() -> Function {
+    Function {
+        params: vec![MirType::ManagedPtr],
+        ret: Some(MirType::ObjectRef),
+        value_types: vec![
+            MirType::ManagedPtr,
+            MirType::F32,
+            MirType::F64,
+            MirType::ObjectRef,
+        ],
+        entry: BlockId(0),
+        blocks: vec![BasicBlock {
+            params: vec![ValueId(0)],
+            insts: vec![
+                (
+                    ValueId(1),
+                    Inst::Load {
+                        address: ValueId(0),
+                        width: 4,
+                        signed: false,
+                    },
+                ),
+                (
+                    ValueId(2),
+                    Inst::Convert {
+                        value: ValueId(1),
+                        kind: ConvKind::Float32ToFloat64,
+                    },
+                ),
+                (
+                    ValueId(3),
+                    Inst::PInvoke {
+                        import: "lamella_single_to_string".into(),
+                        args: vec![ValueId(2)],
+                    },
+                ),
+            ],
+            terminator: Some(Terminator::Return(Some(ValueId(3)))),
+        }],
+    }
+}
+
 fn double_to_string_body() -> Function {
     Function {
         params: vec![MirType::ManagedPtr],
@@ -8441,7 +8702,8 @@ fn double_to_exponential_body() -> Function {
 /// the SOURCE type's precision -- 7 significant digits for a float against 17 for a double -- so
 /// `3000000000f` renders as `"3E+09"` where the double holding the same value renders as
 /// `"3000000000"`. Widening cannot express that difference, because the two renderings differ in
-/// how many digits are asked for and not in the value. That one needs an `f32` formatter of its own.
+/// how many digits are asked for and not in the value. It has an `f32` formatter of its own, in
+/// [`single_to_string_body`].
 fn single_to_fixed_body() -> Function {
     Function {
         params: vec![MirType::F32, MirType::I32],
@@ -8873,6 +9135,7 @@ fn synthesized_seam_body<'a>(
     }
     if (type_name.namespace, type_name.name) == ("System", "Single") {
         let core = match (method.name(), params) {
+            (Some("ToString"), 0) => Some(single_to_string_body()),
             (Some("ToFixed"), 2) => Some(single_to_fixed_body()),
             (Some("ToExponential"), 3) => Some(single_to_exponential_body()),
             (Some("ParseValid"), 1) => Some(single_parse_body()),
@@ -9076,9 +9339,10 @@ fn lower_assembly<'a>(
     assembly: &'a Assembly<'a>,
     entry: Option<u32>,
     references: &[&'a Assembly<'a>],
+    kind: BuildKind,
 ) -> Result<(Vec<Function>, crate::generics::MonoPlan), BuildError> {
     let (funcs, _maps, fails, duplicates, plan) =
-        lower_assembly_debug(assembly, entry, references)?;
+        lower_assembly_debug(assembly, entry, references, kind)?;
     refuse_duplicate_bodies(&duplicates)?;
     if let Some((rid, error)) = fails.into_iter().next() {
         return Err(lower_cil_error(assembly, rid, error));
@@ -9093,9 +9357,10 @@ fn lower_assembly_debug<'a>(
     assembly: &'a Assembly<'a>,
     entry: Option<u32>,
     references: &[&'a Assembly<'a>],
+    kind: BuildKind,
 ) -> Result<LoweredAssemblyDebug, BuildError> {
     let (funcs, maps, fails, _seams, duplicates, _thunks, plan) =
-        lower_assembly_seams(assembly, entry, references, MonomorphizedFailure::Refuse)?;
+        lower_assembly_seams(assembly, entry, references, MonomorphizedFailure::Refuse, kind, false)?;
     Ok((funcs, maps, fails, duplicates, plan))
 }
 
@@ -9245,6 +9510,8 @@ fn lower_assembly_seams<'a>(
     entry: Option<u32>,
     references: &[&'a Assembly<'a>],
     mut monomorphized: MonomorphizedFailure<'_>,
+    kind: BuildKind,
+    debug_lowering: bool,
 ) -> Result<LoweredAssembly, BuildError> {
     let mut methods = Vec::new();
     let mut max_rid = entry.unwrap_or(0);
@@ -9282,6 +9549,7 @@ fn lower_assembly_seams<'a>(
             find_native_export(assembly, "lamella_time_init"),
             &startup_cctors(assembly, references),
             entry_rid,
+            entry_argument(assembly, references, entry_rid, kind)?,
         );
     }
     let thunk_indices: Vec<(u32, u32)> = type_inits
@@ -9360,7 +9628,7 @@ fn lower_assembly_seams<'a>(
         })?;
         let (arg_narrow, local_narrow) =
             crate::resolver::narrowing_of(assembly, method, resolver.references());
-        match cil::lower_method_typed(
+        match cil::lower_method_typed_as(
             &body,
             &resolver,
             &arg_types,
@@ -9371,6 +9639,7 @@ fn lower_assembly_seams<'a>(
                 locals: &local_narrow,
                 pointees: &[],
             },
+            if debug_lowering { BuildKind::Debug } else { BuildKind::Release },
         ) {
             Ok((func, map)) => {
                 bodies.write(*rid, func);
@@ -13632,6 +13901,28 @@ mod tests {
 
     #[cfg(feature = "arm32")]
     #[test]
+    fn synthesized_single_to_string_verifies_and_lowers() {
+        let f = single_to_string_body();
+        lamella_ir::verify(&f).expect("Single.ToString body verifies");
+        let obj =
+            lamella_elf::read_object(&crate::arm32::lower_object(&[f], &["sts"], &[]).unwrap())
+                .unwrap();
+        assert!(
+            obj.symbols
+                .iter()
+                .any(|s| s.name == "lamella_single_to_string" && !s.defined),
+            "the formatter is an undefined extern the link resolves against runtime-support"
+        );
+        assert!(
+            !obj.symbols
+                .iter()
+                .any(|s| s.name == "lamella_double_to_string"),
+            "a float must not reach the double's formatter"
+        );
+    }
+
+    #[cfg(feature = "arm32")]
+    #[test]
     fn synthesized_double_to_string_verifies_and_lowers() {
         let f = double_to_string_body();
         lamella_ir::verify(&f).expect("Double.ToString body verifies");
@@ -13649,7 +13940,7 @@ mod tests {
     #[test]
     fn rejects_an_unknown_target() {
         assert!(matches!(
-            build(b"any bytes", "no-such-chip"),
+            build(b"any bytes", "no-such-chip", BuildKind::Release),
             Err(BuildError::UnsupportedTarget)
         ));
     }
@@ -13657,7 +13948,7 @@ mod tests {
     #[test]
     fn reports_malformed_cil_for_a_chip_target() {
         assert!(matches!(
-            build(b"not a managed assembly", "microbit"),
+            build(b"not a managed assembly", "microbit", BuildKind::Release),
             Err(BuildError::Parse)
         ));
     }
@@ -14307,7 +14598,7 @@ mod tests {
             0x2002_0000 - 0x4000,
             "and the heap's end, at the moved stack's floor"
         );
-        let refused = |target, top| build_linked_cortex_m_moved(&[], &[], &[], &[], target, 0, top);
+        let refused = |target, top| build_linked_cortex_m_moved(&[], &[], &[], &[], target, 0, top, BuildKind::Release);
         assert!(matches!(refused("stm32f769", 0x2000_4000), Err(BuildError::UnsupportedTarget)), "no room above the bands");
         assert!(matches!(refused("microbit", 0x2002_0000), Err(BuildError::UnsupportedTarget)), "not an STM32 row");
     }
@@ -14473,7 +14764,7 @@ mod tests {
     #[cfg(feature = "riscv32")]
     fn build_routes_ch32v003_to_the_rv32ec_backend() {
         assert!(matches!(
-            build(b"not a managed assembly", "ch32v003"),
+            build(b"not a managed assembly", "ch32v003", BuildKind::Release),
             Err(BuildError::Parse)
         ));
     }
@@ -14511,7 +14802,7 @@ mod tests {
 
     #[test]
     fn startup_runs_cctors_before_main() {
-        let f = startup(None, &[5, 7], 3);
+        let f = startup(None, &[5, 7], 3, EntryArgument::None);
         let callees = |g: &Function| -> Vec<u32> {
             g.blocks[0]
                 .insts
@@ -14527,9 +14818,14 @@ mod tests {
             f.blocks[0].terminator,
             Some(Terminator::Return(Some(_)))
         ));
-        assert_eq!(startup(None, &[], 3).blocks[0].insts.len(), 1);
         assert_eq!(
-            callees(&startup(Some(9), &[5, 7], 3)),
+            startup(None, &[], 3, EntryArgument::None).blocks[0]
+                .insts
+                .len(),
+            1
+        );
+        assert_eq!(
+            callees(&startup(Some(9), &[5, 7], 3, EntryArgument::None)),
             vec![9, 5, 7, 3],
             "init hook, then .cctors, then Main"
         );
@@ -14542,7 +14838,7 @@ mod tests {
             alloc::string::String::from("Ldeadbeef.f12"),
             alloc::string::String::from("Ldeadbeef.f31"),
         ];
-        let f = startup_with_references(Some(9), &refs, &[5, 7], 3);
+        let f = startup_with_references(Some(9), &refs, &[5, 7], 3, EntryArgument::None);
         let order: Vec<alloc::string::String> = f.blocks[0]
             .insts
             .iter()
@@ -14562,6 +14858,80 @@ mod tests {
             Some(Terminator::Return(Some(v))) if v.0 as usize == f.blocks[0].insts.len() - 1
         ));
         assert!(lamella_ir::verify(&f).is_ok());
+    }
+
+    #[test]
+    fn startup_gives_the_entry_the_argument_it_declares() {
+        let entry_call = |f: &Function| -> Vec<ValueId> {
+            match f.blocks[0].insts.last() {
+                Some((_, Inst::Call { callee: 3, args })) => args.clone(),
+                other => panic!("the startup does not end by calling the entry: {other:?}"),
+            }
+        };
+
+        let none = startup(None, &[5], 3, EntryArgument::None);
+        assert!(entry_call(&none).is_empty());
+        assert_eq!(none.blocks[0].insts.len(), 2);
+
+        let null = startup(None, &[5], 3, EntryArgument::Null);
+        assert_eq!(entry_call(&null), vec![ValueId(2)]);
+        assert!(matches!(
+            null.blocks[0].insts[1].1,
+            Inst::ConstInt {
+                ty: MirType::I32,
+                value: 0
+            }
+        ));
+        assert!(matches!(
+            null.blocks[0].insts[2].1,
+            Inst::Convert {
+                value: ValueId(1),
+                kind: ConvKind::IntToRef
+            }
+        ));
+        assert_eq!(null.value_types[2], MirType::ObjectRef);
+
+        let string = TypeHandle(0x0300_0001);
+        let element = cil::ArrayElement {
+            handle: lamella_ir::array_handle(string),
+            element: Some(string),
+            element_size: 4,
+            element_kind: ELEMENT_KIND_REFERENCE,
+            element_cast_class: crate::resolver::ARRAY_CAST_CLASS_NONE,
+        };
+        let array = startup(None, &[5], 3, EntryArgument::EmptyArray(element));
+        assert_eq!(entry_call(&array), vec![ValueId(2)]);
+        assert!(matches!(
+            array.blocks[0].insts[1].1,
+            Inst::ConstInt {
+                ty: MirType::I32,
+                value: 0
+            }
+        ));
+        match &array.blocks[0].insts[2].1 {
+            Inst::AllocArray {
+                handle,
+                element,
+                length,
+                element_size,
+                element_kind,
+                element_cast_class,
+            } => {
+                assert_eq!(*handle, lamella_ir::array_handle(string));
+                assert_eq!(*element, Some(string));
+                assert_eq!(*length, ValueId(1));
+                assert_eq!(*element_size, 4);
+                assert_eq!(*element_kind, ELEMENT_KIND_REFERENCE);
+                assert_eq!(*element_cast_class, crate::resolver::ARRAY_CAST_CLASS_NONE);
+            }
+            other => panic!("the argument is not a new array: {other:?}"),
+        }
+        assert_eq!(array.value_types[2], MirType::ObjectRef);
+
+        for f in [&none, &null, &array] {
+            assert_eq!(f.value_types.len(), f.blocks[0].insts.len());
+            assert!(lamella_ir::verify(f).is_ok());
+        }
     }
 
     /// THE DEFECT, STATED: a second body for one MethodDef row REPLACES the first rather than
@@ -14917,7 +15287,7 @@ mod tests {
             ),
             alloc::format!(
                 "{}",
-                LowerError::BigStructResultUnsupported { call: "callvirt" }
+                LowerError::BigStructResultUnsupported { call: "calli" }
             ),
             alloc::format!(
                 "{}",
@@ -14953,6 +15323,10 @@ mod tests {
             alloc::format!(
                 "{}",
                 LowerError::UnencodableStringUnit { unit: 0xD800, index: 2 }
+            ),
+            alloc::format!(
+                "{}",
+                LowerError::ImmediateOutOfRange { at: 12, imm: 2048 }
             ),
         ];
         assert_renders_as_one_sentence(&messages);

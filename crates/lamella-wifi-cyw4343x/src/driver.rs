@@ -363,6 +363,20 @@ impl<'b> Driver<'b> {
         self.state == State::Ready && self.station.scan()
     }
 
+    /// Record a scan request that looks for the network named `name` (1 to
+    /// 32 bytes): the scan of `scan`, and when the firmware reports that
+    /// scan complete with the name in none of its records, a second scan
+    /// whose probe requests carry the name, which a network that does not
+    /// broadcast its name answers. Every record of both is handed back and
+    /// one outcome ends the request, carrying the end of the last scan it
+    /// ran and the records of both. A first scan that ended any other way
+    /// is followed by no second one. The name is held by reference until
+    /// that outcome. Accepted as `scan` is; returns `false` otherwise, and
+    /// for a name outside its bounds.
+    pub fn scan_for(&mut self, name: &'b [u8]) -> bool {
+        self.state == State::Ready && self.station.scan_for(name)
+    }
+
     /// Record a join request: associate with the network named by `ssid`
     /// (1 to 32 bytes), with `passphrase` (8 to 64 bytes) on a WPA2-PSK
     /// network or `None` on an open one, and keep the link joined. The
@@ -511,6 +525,27 @@ impl<'b> Driver<'b> {
     /// The link's state.
     pub fn link(&self) -> LinkState {
         self.station.link()
+    }
+
+    /// The rest that the last failed join attempt began, where its failure
+    /// was the sign of a refused secret for the join's kind
+    /// (`JoinFailure::refused_secret`): when the next try comes. `None`
+    /// behind every other failure, behind a join that completed and behind
+    /// a join request. Such rests grow from five seconds to five minutes
+    /// with the failures in a row; a join that completes and a disconnect
+    /// put them back, and a join request behind a mismatch continues them.
+    pub fn backoff(&self) -> Option<Micros> {
+        self.station.backoff()
+    }
+
+    /// Give the seed of the spread on the rests behind refused secrets:
+    /// from then on each such rest is longer by up to a fifth, so that
+    /// stations that were refused together do not try again together. The
+    /// driver holds no random source; a caller that has one hands a word
+    /// of it here, behind the attach request, which makes the station's
+    /// state anew. Before any seed the rests carry no spread.
+    pub fn seed(&mut self, seed: u32) {
+        self.station.seed(seed);
     }
 
     /// The chip's own address, once the radio-up request read it back.

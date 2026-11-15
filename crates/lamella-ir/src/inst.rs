@@ -494,6 +494,16 @@ pub enum Inst {
         /// [`Inst::CallVirtual`].
         returns_value: bool,
     },
+    /// Raises NullReferenceException when the object reference `object` is null -- the test a
+    /// `callvirt` makes of its receiver before the method runs (ECMA-335 III.4.2). The raise is the
+    /// function's inline-check stub, the one a field access through null takes: the exception's tag
+    /// stored, then a return, as a throw with no handler of this function's own leaves. So it is laid
+    /// only where no catch or finally of the function can be reached; inside a protected try the front
+    /// end hoists a check that routes there instead. A side effect; the result is a placeholder.
+    NullCheck {
+        /// The object reference tested.
+        object: ValueId,
+    },
     /// A `castclass` base-pointer chain scan: walks `args[0]` (the object's TypeDesc address) up the
     /// base_ptr@12 chain looking for `args[1]` (the target type's TypeDesc address). The result is 1 if
     /// the target is found (the cast holds) or 0 if the chain ends first; the front end feeds it into the
@@ -636,6 +646,15 @@ pub enum Inst {
     /// Zero-initializes the value-type instance this defines -- the CLI's `initobj`. The
     /// result is the zeroed value type; its size comes from the result's [`MirType`].
     InitStruct,
+    /// Does nothing, so that a place in the source has an instruction to stand at.
+    ///
+    /// A Debug build gives every statement of a method an instruction of its own, as .NET's JIT does
+    /// in a Debug build, so every sequence point the compiler wrote has an address. A statement
+    /// whose IL makes no code gets this: the `nop` a C# compiler writes at an opening brace, a
+    /// `return` whose value is already in place, a method's closing brace at its `ret`. A Release
+    /// build never emits it. A back end lowers it to its target's no-operation instruction. The
+    /// instruction's result is a placeholder nothing reads.
+    Nop,
     /// Loads the scalar field at byte `offset` of the value-type `base` -- the CLI's
     /// `ldfld` on a local struct. The result is the field's value.
     FieldLoad {

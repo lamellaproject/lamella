@@ -78,7 +78,8 @@ pub enum LowerError {
     /// **REFUSED RATHER THAN EMITTED, AND THE REASON IS THAT THE WRONG ANSWER IS SILENT**: without
     /// the convention the caller stores a0:a1 into a slot several words wide and leaves the rest of
     /// it whatever it was. The arm32 twin
-    /// (`crate::arm32::LowerError::BigStructResultUnsupported`) refuses on the same terms.
+    /// (`crate::arm32::LowerError::BigStructResultUnsupported`) refuses only `calli` and a delegate
+    /// invoke: it finds a virtual or interface call's target before it passes the pointer.
     ///
     /// Carries the call kind, so the message names what cannot be lowered rather than a condition.
     BigStructResultUnsupported {
@@ -93,6 +94,19 @@ pub enum LowerError {
         unit: u16,
         /// Its index in the literal, in UTF-16 code units.
         index: u32,
+    },
+    /// An instruction asked for an immediate its 12-bit field cannot hold: a load or store offset,
+    /// or an `addi`-family operand, outside -2048..=2047. The field keeps only the low 12 bits, so
+    /// the instruction would reach a different byte than the one meant and nothing would trap.
+    ///
+    /// **REFUSED BECAUSE THE WRONG ANSWER IS SILENT**, and per function, so a library build stubs
+    /// the one method rather than the whole library. Carries the instruction's byte offset and the
+    /// immediate asked for.
+    ImmediateOutOfRange {
+        /// The byte offset of the instruction.
+        at: u32,
+        /// The immediate it asked for.
+        imm: i32,
     },
 }
 
@@ -149,6 +163,12 @@ impl core::fmt::Display for LowerError {
                 "a string literal holds the UTF-16 code unit 0x{unit:04X} at index {index}, \
                  which this build's string storage cannot represent -- a lone surrogate has no \
                  form under `string-utf8`",
+            ),
+            LowerError::ImmediateOutOfRange { at, imm } => write!(
+                f,
+                "the instruction at byte {at} needs the immediate {imm}, outside the \
+                 -2048..2047 a RISC-V load, store or `addi` holds -- encoded, it would reach a \
+                 different address than the one meant",
             ),
         }
     }
@@ -230,7 +250,8 @@ fn scratch() -> Reg {
     Reg::new(31).unwrap_or(Reg::ZERO)
 }
 
-/// `t5` (x30), reserved SOLELY for reaching a frame slot past the 12-bit `lw`/`sw` immediate. Nothing
+/// `t5` (x30), reserved SOLELY for reaching an address past the 12-bit `lw`/`sw` immediate: a frame
+/// slot, or a word of a value type wider than 2 KB through the pointer it travels by. Nothing
 /// else in this backend touches x30, which is the point: a far STORE cannot borrow its source
 /// register, and picking a "probably dead" temporary at each of ~200 access sites would be a
 /// per-site judgement call with a silent miscompile as the failure mode. One reserved register makes
@@ -273,6 +294,61 @@ fn slot_store(enc: &mut Encoder, rs: Reg, off: i32) {
     let far = far_scratch();
     enc.li(far, off);
     enc.add(far, far, Reg::SP);
+    enc.sw(rs, far, 0);
+}
+
+/// `lbu rd, off(sp)`, extended past [`FRAME_IMM_MAX`] the way [`slot_load`] is: the address is
+/// assembled in the destination register, so a far load needs no scratch. Byte-identical to a bare
+/// `lbu` in range.
+fn slot_load_byte(enc: &mut Encoder, rd: Reg, off: i32) {
+    if (-2048..=FRAME_IMM_MAX).contains(&off) {
+        enc.lbu(rd, Reg::SP, off);
+        return;
+    }
+    enc.li(rd, off);
+    enc.add(rd, rd, Reg::SP);
+    enc.lbu(rd, rd, 0);
+}
+
+/// `sb rs, off(sp)`, extended past [`FRAME_IMM_MAX`] through the reserved [`far_scratch`], as
+/// [`slot_store`] is. Byte-identical to a bare `sb` in range.
+fn slot_store_byte(enc: &mut Encoder, rs: Reg, off: i32) {
+    if (-2048..=FRAME_IMM_MAX).contains(&off) {
+        enc.sb(rs, Reg::SP, off);
+        return;
+    }
+    let far = far_scratch();
+    enc.li(far, off);
+    enc.add(far, far, Reg::SP);
+    enc.sb(rs, far, 0);
+}
+
+/// `lw rd, off(base)` for an offset from a POINTER rather than from sp, extended past
+/// [`FRAME_IMM_MAX`]: a value type wider than 2 KB is copied word by word from the address it
+/// travels by. The far address is assembled in `rd`, or in [`far_scratch`] when `rd` is the base
+/// itself. Byte-identical to a bare `lw` in range.
+fn load_word_at(enc: &mut Encoder, rd: Reg, base: Reg, off: i32) {
+    if (-2048..=FRAME_IMM_MAX).contains(&off) {
+        enc.lw(rd, base, off);
+        return;
+    }
+    let at = if rd == base { far_scratch() } else { rd };
+    enc.li(at, off);
+    enc.add(at, at, base);
+    enc.lw(rd, at, 0);
+}
+
+/// `sw rs, off(base)` for an offset from a pointer, extended past [`FRAME_IMM_MAX`] through
+/// [`far_scratch`]: the twin of [`load_word_at`] for a result written through the caller's buffer.
+/// Byte-identical to a bare `sw` in range.
+fn store_word_at(enc: &mut Encoder, rs: Reg, base: Reg, off: i32) {
+    if (-2048..=FRAME_IMM_MAX).contains(&off) {
+        enc.sw(rs, base, off);
+        return;
+    }
+    let far = far_scratch();
+    enc.li(far, off);
+    enc.add(far, far, base);
     enc.sw(rs, far, 0);
 }
 
@@ -1184,6 +1260,9 @@ fn lower_module_to_image(
                 offset: 0,
                 limit: 0,
             },
+            lamella_asm_riscv32::AssembleError::ImmediateOutOfRange { at, imm } => {
+                LowerError::ImmediateOutOfRange { at, imm }
+            }
         })?;
     let shifts = &assembled.shifts;
     let bytes = assembled.bytes;
@@ -1921,13 +2000,63 @@ fn lower_object_relocatable(
     Ok((object, stub_report, line_tables))
 }
 
+/// Lowers one function into `enc` ([`lower_function_body`]), then refuses it if any instruction it
+/// emitted asked for an immediate the encoding cannot hold ([`LowerError::ImmediateOutOfRange`]).
+///
+/// Checked here, per function, rather than only when the image is finished: a library build lowers
+/// each method into a scratch encoder it never finishes, and stubs a method that fails, so a check
+/// left to the end would either never run or sink the whole library.
+#[allow(clippy::too_many_arguments)]
+fn lower_function(
+    enc: &mut Encoder,
+    func: &Function,
+    func_labels: &[Label],
+    alloc: AllocSite,
+    descriptors: &[TypeMeta],
+    type_descs: &mut TypeDescs,
+    type_desc_labels: &mut Vec<(TypeHandle, Label)>,
+    externs: &mut Vec<alloc::string::String>,
+    profile: RiscvProfile,
+    relocs: &mut Vec<(u32, u32)>,
+    desc_relocs: &mut Vec<DescReloc>,
+    abs_desc_relocs: &mut Vec<DescReloc>,
+    string_header: Option<u32>,
+    relocate: bool,
+    source_map: &[Vec<u32>],
+    line_table: &mut Vec<(u32, u32)>,
+) -> Result<Option<MethodRecordInfo>, LowerError> {
+    let start = enc.position();
+    let record = lower_function_body(
+        enc,
+        func,
+        func_labels,
+        alloc,
+        descriptors,
+        type_descs,
+        type_desc_labels,
+        externs,
+        profile,
+        relocs,
+        desc_relocs,
+        abs_desc_relocs,
+        string_header,
+        relocate,
+        source_map,
+        line_table,
+    )?;
+    match enc.unencodable_immediate() {
+        Some((at, imm)) if at >= start => Err(LowerError::ImmediateOutOfRange { at, imm }),
+        _ => Ok(record),
+    }
+}
+
 /// Lowers one function into `enc`: a prologue that allocates a frame and saves the callee-saved
 /// registers it uses (plus `ra` if it calls), the incoming arguments moved from a0-a7 into the
 /// entry block's parameters, the block bodies, and -- at each return -- a value moved to a0 then
 /// the saved registers restored and `ret`. Returns the function's `.lamella_stackmaps`
 /// METHOD_SLOTS record material (`None` for a leaf -- it can never appear mid-walk).
 #[allow(clippy::too_many_arguments)]
-fn lower_function(
+fn lower_function_body(
     enc: &mut Encoder,
     func: &Function,
     func_labels: &[Label],
@@ -2256,6 +2385,9 @@ fn lower_inst(
             }
             emit_null_test(enc, value_types, *base, reg(*base), stubs);
             enc.lw(reg(result), reg(*base), field_offset(*offset)?);
+        }
+        Inst::NullCheck { object } => {
+            emit_null_test(enc, value_types, *object, reg(*object), stubs)
         }
         Inst::FieldStore {
             base,
@@ -2690,7 +2822,7 @@ fn lower_function_spilled(
                 Reg::T1
             };
             for w in 0..slot_words(&func.value_types, param) as i32 {
-                enc.lw(Reg::T0, ptr, w * 4);
+                load_word_at(enc, Reg::T0, ptr, w * 4);
                 slot_store(enc, Reg::T0, slot(param) + w * 4);
             }
             continue;
@@ -2766,7 +2898,7 @@ fn lower_function_spilled(
                         slot_load(enc, Reg::T0, sret_off);
                         for w in 0..slot_words(&func.value_types, *v) as i32 {
                             slot_load(enc, Reg::T1, slot(*v) + w * 4);
-                            enc.sw(Reg::T1, Reg::T0, w * 4);
+                            store_word_at(enc, Reg::T1, Reg::T0, w * 4);
                         }
                         enc.mv(Reg::A0, Reg::T0);
                     } else {
@@ -3053,6 +3185,7 @@ fn lower_inst_spilled(
     let (t0, t1, t2) = (Reg::T0, Reg::T1, Reg::T2);
     let scratch = spilled_scratch(profile);
     match inst {
+        Inst::Nop => enc.addi(Reg::ZERO, Reg::ZERO, 0),
         Inst::ConstInt { ty, value } => {
             enc.li(t0, *value as i32);
             slot_store(enc, t0, slot(result));
@@ -3637,6 +3770,10 @@ fn lower_inst_spilled(
                 enc.sw(t1, t0, 4);
             }
         }
+        Inst::NullCheck { object } => {
+            slot_load(enc, t0, slot(*object));
+            emit_null_test(enc, value_types, *object, t0, stubs);
+        }
         Inst::FieldLoad { base, offset } => {
             let ptr = is_pointer(value_types, *base);
             if let Some((full_words, rem)) = value_type_copy_extent(value_types, result) {
@@ -3658,9 +3795,9 @@ fn lower_inst_spilled(
                     if ptr {
                         enc.lbu(t1, t0, field_offset(*offset + at)?);
                     } else {
-                        enc.lbu(t1, Reg::SP, slot(*base) + (*offset + at) as i32);
+                        slot_load_byte(enc, t1, slot(*base) + (*offset + at) as i32);
                     }
-                    enc.sb(t1, Reg::SP, slot(result) + at as i32);
+                    slot_store_byte(enc, t1, slot(result) + at as i32);
                 }
             } else if ptr {
                 slot_load(enc, t0, slot(*base));
@@ -3694,11 +3831,11 @@ fn lower_inst_spilled(
                 }
                 for k in 0..rem {
                     let at = full_words * 4 + k;
-                    enc.lbu(t1, Reg::SP, slot(*value) + at as i32);
+                    slot_load_byte(enc, t1, slot(*value) + at as i32);
                     if ptr {
                         enc.sb(t1, t0, field_offset(*offset + at)?);
                     } else {
-                        enc.sb(t1, Reg::SP, slot(*base) + (*offset + at) as i32);
+                        slot_store_byte(enc, t1, slot(*base) + (*offset + at) as i32);
                     }
                 }
             } else if ptr {
@@ -6715,6 +6852,159 @@ mod tests {
         );
     }
 
+    /// Every load and store in `code` as `(word index, base register, signed immediate)`, decoded
+    /// from the instruction bits the way the hardware reads them.
+    fn memory_accesses(code: &[u8]) -> Vec<(usize, u32, i32)> {
+        code.chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .enumerate()
+            .filter_map(|(i, w)| {
+                let rs1 = (w >> 15) & 0x1f;
+                match w & 0x7f {
+                    0x03 => Some((i, rs1, (w as i32) >> 20)),
+                    0x23 => Some((i, rs1, (((w as i32) >> 25) << 5) | ((w >> 7) & 0x1f) as i32)),
+                    _ => None,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_sub_word_tail_past_the_frame_immediate_stays_inside_the_frame() {
+        let pair = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(0),
+            size: 2,
+            refs: lamella_ir::RefWords::NONE,
+        };
+        let cell = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(1),
+            size: 3,
+            refs: lamella_ir::RefWords::NONE,
+        };
+        let fillers = 600u32;
+        let mut value_types = vec![MirType::ObjectRef];
+        let mut insts: Vec<(ValueId, Inst)> = (1..=fillers)
+            .map(|i| {
+                value_types.push(MirType::I32);
+                (
+                    ValueId(i),
+                    Inst::ConstInt {
+                        ty: MirType::I32,
+                        value: i64::from(i),
+                    },
+                )
+            })
+            .collect();
+        let v = |k: u32| ValueId(fillers + k);
+        let body = [
+            (
+                v(1),
+                pair,
+                Inst::FieldLoad {
+                    base: ValueId(0),
+                    offset: 0,
+                },
+            ),
+            (
+                v(2),
+                MirType::I32,
+                Inst::FieldStore {
+                    base: ValueId(0),
+                    offset: 0,
+                    value: v(1),
+                },
+            ),
+            (
+                v(3),
+                cell,
+                Inst::FieldLoad {
+                    base: ValueId(0),
+                    offset: 0,
+                },
+            ),
+            (
+                v(4),
+                pair,
+                Inst::FieldLoad {
+                    base: v(3),
+                    offset: 0,
+                },
+            ),
+            (
+                v(5),
+                MirType::I32,
+                Inst::FieldStore {
+                    base: v(3),
+                    offset: 0,
+                    value: v(4),
+                },
+            ),
+            (
+                v(6),
+                MirType::I32,
+                Inst::ConstInt {
+                    ty: MirType::I32,
+                    value: 0,
+                },
+            ),
+        ];
+        for (id, ty, inst) in body {
+            value_types.push(ty);
+            insts.push((id, inst));
+        }
+        let func = Function {
+            params: vec![MirType::ObjectRef],
+            ret: Some(MirType::I32),
+            value_types,
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts,
+                terminator: Some(Terminator::Return(Some(v(6)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        let code = lower(&func).expect("a far sub-word copy lowers");
+        let below_sp: Vec<_> = memory_accesses(&code)
+            .into_iter()
+            .filter(|&(_, base, imm)| base == 2 && imm < 0)
+            .collect();
+        assert!(
+            below_sp.is_empty(),
+            "sp-relative accesses below the frame, as (word, base, offset): {below_sp:?}"
+        );
+    }
+
+    #[test]
+    fn a_value_type_past_two_kilobytes_copies_through_its_pointer_at_every_offset() {
+        let big = MirType::ValueType {
+            handle: lamella_ir::TypeHandle(0),
+            size: 2052,
+            refs: lamella_ir::RefWords::NONE,
+        };
+        let func = Function {
+            params: vec![big],
+            ret: Some(big),
+            value_types: vec![big],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: Vec::new(),
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        assert!(lamella_ir::verify(&func).is_ok());
+        let code = lower(&func).expect("a struct past 2 KB passes and returns by reference");
+        let negative: Vec<_> = memory_accesses(&code)
+            .into_iter()
+            .filter(|&(_, _, imm)| imm < 0)
+            .collect();
+        assert!(
+            negative.is_empty(),
+            "accesses before their base, as (word, base, offset): {negative:?}"
+        );
+    }
+
     #[test]
     fn classifies_pointer_bases() {
         let types = [
@@ -8745,8 +9035,8 @@ mod tests {
         let funcs = [body(1), body(2)];
         let names = ["first", "second"];
         let maps = [
-            crate::cil::CilSourceMap { rows: vec![vec![7]], local_changes: vec![Vec::new()], arg_values: Vec::new() },
-            crate::cil::CilSourceMap { rows: vec![vec![7]], local_changes: vec![Vec::new()], arg_values: Vec::new() },
+            crate::cil::CilSourceMap { rows: vec![vec![7]], local_changes: vec![Vec::new()], arg_values: Vec::new(), zero_until_stored: Vec::new() },
+            crate::cil::CilSourceMap { rows: vec![vec![7]], local_changes: vec![Vec::new()], arg_values: Vec::new(), zero_until_stored: Vec::new() },
         ];
         let points = [(7u32, 11u32, 5u32)];
         let sources = [

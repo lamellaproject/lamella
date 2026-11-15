@@ -154,10 +154,10 @@ namespace Lamella.Boards.Microchip
         }
 #endif
 
-        /// <summary>The logical bus id of the TWI all three extension headers share (SDA PA08 and
-        /// SCL PA09, on pins 11 and 12 of each), as <c>I2cConnectionSettings</c> names it. The kit's
-        /// debugger reaches the same two pads.</summary>
-        public const int ExtTwiBusId = 0;
+        /// <summary>The bus id of the TWI all three extension headers share (SDA PA08 and SCL PA09,
+        /// on pins 11 and 12 of each), as <c>I2cConnectionSettings</c> names it: 2, the number of
+        /// SERCOM2, the block that serves it. The kit's debugger reaches the same two pads.</summary>
+        public const int ExtTwiBusId = 2;
 
         private static I2cDriver MakeExtTwi() { return new Samd21I2cDriver(ExtTwiBinding()); }
 
@@ -272,8 +272,9 @@ namespace Lamella.Boards.Microchip
             return AdcControllers.CreateAnalogController();
         }
 
-        /// <summary>The logical bus id of the EXT1 header's SPI (MOSI PA06, MISO PA04 and SCK PA07,
-        /// on header pins 16, 17 and 18), as <c>SpiConnectionSettings</c> names it.</summary>
+        /// <summary>The bus id of the EXT1 header's SPI (MOSI PA06, MISO PA04 and SCK PA07, on
+        /// header pins 16, 17 and 18), as <c>SpiConnectionSettings</c> names it: 0, the number of
+        /// SERCOM0, the block that serves it.</summary>
         public const int Ext1SpiBusId = 0;
 
         /// <summary>The EXT1 header's chip select line, SPI_SS_A on pin 15 (PA05), as

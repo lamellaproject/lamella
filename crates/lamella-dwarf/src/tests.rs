@@ -6,6 +6,7 @@ use alloc::vec::Vec;
 use crate::cursor::{Cursor, Format};
 use crate::line::{self, Row};
 use crate::{DebugInfo, DeviceRow, DwarfError, Options, Sections};
+use crate::{ScalarType, scalar_type};
 
 /// Builds a DWARF 5 line-program unit around a caller-supplied program body.
 ///
@@ -1314,6 +1315,7 @@ const ABBREV: &[u8] = &[
     8, 0x34, 0, 0x03, 0x08, 0x02, 0x17, 0, 0,
     9, 0x2e, 1, 0x47, 0x13, 0x11, 0x01, 0x12, 0x06, 0, 0,
     10, 0x2e, 1, 0x31, 0x13, 0x11, 0x01, 0x12, 0x06, 0, 0,
+    11, 0x05, 0, 0x03, 0x08, 0x02, 0x17, 0, 0,
     0,
 ];
 
@@ -1397,6 +1399,15 @@ impl UnitBuilder {
         self
     }
 
+    /// A parameter whose location is an offset into `.debug_loc` rather than an expression.
+    fn parameter_at_list(&mut self, name: &str, offset: u32) -> &mut Self {
+        self.entries.push(11);
+        self.entries.extend_from_slice(name.as_bytes());
+        self.entries.push(0);
+        self.entries.extend_from_slice(&offset.to_le_bytes());
+        self
+    }
+
     /// A parameter that carries no name and points at the entry at `origin` for one.
     fn inherited_parameter(&mut self, origin: u32, location: &[u8]) -> &mut Self {
         self.entries.push(6);
@@ -1466,6 +1477,35 @@ fn an_expression_is_classified_only_when_the_whole_of_it_is_one_place() {
     assert_eq!(locals::classify(stack_value), Place::Expression(stack_value));
     assert_eq!(locals::classify(piece), Place::Expression(piece));
     assert_eq!(locals::classify(deref), Place::Expression(deref));
+}
+
+/// `DW_OP_litN; DW_OP_stack_value` is the value N itself, stored nowhere (DWARF 5 sections 2.5.1.1
+/// and 2.6.1.1.4), for each N the literal operations encode, 0 to 31.
+///
+/// # ONLY THOSE TWO BYTES, WHOLE
+///
+/// `DW_OP_lit0` alone is a location: the memory at address 0. A `DW_OP_piece` after the
+/// `DW_OP_stack_value` makes the number four bytes of a larger value, and `DW_OP_stack_value` alone
+/// has no number to give. The operations either side of the literals in table 7.9, `DW_OP_skip`
+/// and `DW_OP_reg0`, are not literals. Each of these is carried whole.
+#[test]
+fn a_literal_made_the_value_is_that_constant_and_nothing_near_it_is() {
+    for literal in 0u8..32 {
+        assert_eq!(
+            locals::classify(&[0x30 + literal, 0x9f]),
+            Place::Constant(u64::from(literal)),
+            "DW_OP_lit{literal}"
+        );
+    }
+    let address_zero: &[u8] = &[0x30];
+    let a_piece: &[u8] = &[0x31, 0x9f, 0x93, 0x04];
+    let no_literal: &[u8] = &[0x9f];
+    let twice: &[u8] = &[0x30, 0x9f, 0x9f];
+    let below: &[u8] = &[0x2f, 0x9f];
+    let above: &[u8] = &[0x50, 0x9f];
+    for carried in [address_zero, a_piece, no_literal, twice, below, above] {
+        assert_eq!(locals::classify(carried), Place::Expression(carried), "{carried:02x?}");
+    }
 }
 
 /// `DW_AT_frame_base` decides what a frame offset means, and only two shapes are answerable.
@@ -1628,11 +1668,11 @@ fn a_discarded_subprogram_overlapping_a_live_one_is_dropped_by_the_code_ranges()
     );
 
     let code = [(0x50u64, 0x250u64)];
-    let filtered = Locals::parse_within(&sections, &code).expect("parses");
+    let filtered = Locals::parse_within(&sections, &code, &Options::default()).expect("parses");
     assert_eq!(filtered.at(0x54).and_then(|p| p.name), Some(&b"live"[..]));
     assert_eq!(filtered.at(0x54).map(|p| p.locals.len()), Some(1));
 
-    let unanswerable = Locals::parse_within(&sections, &[]).expect("parses");
+    let unanswerable = Locals::parse_within(&sections, &[], &Options::default()).expect("parses");
     assert_eq!(unanswerable.subprograms().len(), 2);
 }
 
@@ -1683,6 +1723,125 @@ fn a_debug_loc_list_applies_only_over_its_own_ranges() {
     assert_eq!(local.place_at(0x300), Place::Nowhere);
 }
 
+/// **A SUBPROGRAM WHOSE PRODUCER SET THE THUMB BIT IN ITS `DW_AT_low_pc`** covers its first
+/// instruction once the target says its code addresses carry the bit, and keeps its length. Left
+/// set, the range begins one byte past the function, so at its first instruction no subprogram is
+/// found and a stop on the function's first line shows no locals.
+#[test]
+fn a_thumb_bit_in_a_subprograms_low_pc_is_cleared_where_the_target_says_its_addresses_carry_it() {
+    let mut builder = UnitBuilder::new();
+    builder.subprogram("<Main>$", 0x1007_846d, 0x12, &[0x57]);
+    builder.parameter("args", &[0x50]);
+    builder.close();
+    let info = builder.finish();
+    let sections = locals_of(&info);
+    let code = [(0x1000_0000u64, 0x1020_0000u64)];
+
+    let as_stored = Locals::parse_within(&sections, &code, &Options::default()).expect("parses");
+    assert!(as_stored.at(0x1007_846c).is_none(), "as stored, the range starts past the function");
+
+    let thumb = Options { arm_thumb_addresses: true };
+    let locals = Locals::parse_within(&sections, &code, &thumb).expect("parses");
+    let program = locals.at(0x1007_846c).expect("the function's first instruction is covered");
+    assert_eq!(program.name, Some(&b"<Main>$"[..]));
+    assert_eq!((program.low_pc, program.high_pc), (0x1007_846c, 0x1007_847e), "its length is kept");
+    assert_eq!(program.frame_base, FrameBase::Register(7));
+    assert_eq!(program.locals[0].name, Some(&b"args"[..]));
+    assert_eq!(program.locals[0].place_at(0x1007_846c), Place::Register(0));
+    assert!(locals.at(0x1007_847e).is_none(), "one past its end is outside it");
+}
+
+/// **AND FROM A LOCATION LIST'S RANGES WITH IT**: each range moves by what its start was, so the
+/// instruction at a boundary belongs to the range it begins rather than to the one before it, and
+/// the instruction after the last range is in none.
+#[test]
+fn a_thumb_bit_in_a_location_lists_ranges_is_cleared_with_it() {
+    let mut section = Vec::new();
+    for (start, end, register) in [(0x1007_8481u32, 0x1007_848fu32, 0x52u8), (0x1007_848f, 0x1007_853d, 0x54)] {
+        section.extend_from_slice(&start.to_le_bytes());
+        section.extend_from_slice(&end.to_le_bytes());
+        section.extend_from_slice(&1u16.to_le_bytes());
+        section.push(register);
+    }
+    section.extend_from_slice(&0u32.to_le_bytes());
+    section.extend_from_slice(&0u32.to_le_bytes());
+
+    let mut builder = UnitBuilder::new();
+    builder.subprogram("f", 0x1007_8481, 0xbc, &[0x5d]);
+    builder.variable_at_list("moves", 0);
+    builder.close();
+    let info = builder.finish();
+    let sections = Sections {
+        debug_info: &info,
+        debug_abbrev: ABBREV,
+        debug_loc: &section,
+        ..Sections::default()
+    };
+
+    let as_stored = Locals::parse_with(&sections, &Options::default()).expect("parses");
+    let local = &as_stored.at(0x1007_8482).expect("covered").locals[0];
+    assert_eq!(
+        local.place_at(0x1007_848e),
+        Place::Register(2),
+        "as stored, the instruction at the boundary is the earlier range's"
+    );
+
+    let locals = Locals::parse_with(&sections, &Options { arm_thumb_addresses: true }).expect("parses");
+    let local = &locals.at(0x1007_8480).expect("the first instruction is covered").locals[0];
+    assert_eq!(local.place_at(0x1007_8480), Place::Register(2));
+    assert_eq!(local.place_at(0x1007_848c), Place::Register(2));
+    assert_eq!(local.place_at(0x1007_848e), Place::Register(4), "the boundary begins the second range");
+    assert_eq!(local.place_at(0x1007_853a), Place::Register(4));
+    assert_eq!(local.place_at(0x1007_853c), Place::Nowhere, "past the last range");
+}
+
+/// Where a function's parameters reach their homes: the start of each parameter's first range past
+/// the entry, the latest of them. A parameter described by one expression never moves, so a function
+/// whose parameters are all described so has no such address, and neither has one with none.
+#[test]
+fn the_parameters_reach_their_homes_where_their_location_lists_move_them() {
+    let mut section = Vec::new();
+    let mut list = |ranges: &[(u32, u32, &[u8])]| {
+        let offset = section.len() as u32;
+        for (start, end, expression) in ranges {
+            section.extend_from_slice(&start.to_le_bytes());
+            section.extend_from_slice(&end.to_le_bytes());
+            section.extend_from_slice(&(expression.len() as u16).to_le_bytes());
+            section.extend_from_slice(expression);
+        }
+        section.extend_from_slice(&[0; 8]);
+        offset
+    };
+    let args = list(&[(0x9000_0000, 0x9000_0014, &[0x50]), (0x9000_0014, 0x9000_004c, &[0x7b, 0x74])]);
+    let later = list(&[(0x9000_0000, 0x9000_0010, &[0x51]), (0x9000_0010, 0x9000_004c, &[0x7b, 0x78])]);
+
+    let mut builder = UnitBuilder::new();
+    builder.subprogram("<Main>$", 0x9000_0000, 0x4c, &[0x57]);
+    builder.parameter_at_list("args", args);
+    builder.parameter_at_list("count", later);
+    builder.variable("a", &[0x7b, 0x70]);
+    builder.close();
+    builder.subprogram("Add", 0x9000_0050, 0x20, &[0x57]);
+    builder.parameter("x", &[0x50]);
+    builder.close();
+    builder.subprogram("Tick", 0x9000_0070, 0x10, &[0x57]);
+    builder.variable("t", &[0x7b, 0x70]);
+    builder.close();
+    let info = builder.finish();
+    let sections = Sections {
+        debug_info: &info,
+        debug_abbrev: ABBREV,
+        debug_loc: &section,
+        ..Sections::default()
+    };
+    let locals = Locals::parse(&sections).expect("parses");
+
+    let main = locals.at(0x9000_0000).expect("covered");
+    assert_eq!(main.parameters_at_home(), Some(0x9000_0014), "the latest parameter's move, not the first");
+    assert_eq!(locals.at(0x9000_0050).expect("covered").parameters_at_home(), None, "one expression never moves");
+    assert_eq!(locals.at(0x9000_0070).expect("covered").parameters_at_home(), None, "no parameter, no address");
+}
+
 /// A DWARF 5 location list, which is the same idea in an encoding that shares no bytes with it.
 #[test]
 fn a_debug_loclists_list_reads_the_kinds_it_can_and_stops_at_one_it_cannot() {
@@ -1719,6 +1878,95 @@ fn a_debug_loclists_list_reads_the_kinds_it_can_and_stops_at_one_it_cannot() {
     ));
 }
 
+/// **A LOCAL DESCRIBED AS ZERO UNTIL ITS FIRST STORE** reads as the constant 0 over that range of
+/// its DWARF 5 location list and as its frame slot from the store on, whether or not its type is
+/// described; before the list's first range, and past its last, it is nowhere.
+#[test]
+fn a_local_zero_until_its_first_store_reads_as_the_constant_then_as_its_slot() {
+    const LOW: u32 = 0x100;
+    let at = |offset: u32| u64::from(LOW + offset);
+    let mut loclists = vec![0u8; 4];
+    loclists.extend_from_slice(&5u16.to_le_bytes());
+    loclists.extend_from_slice(&[4, 0]);
+    loclists.extend_from_slice(&0u32.to_le_bytes());
+    let mut list = |slot: u8| {
+        let offset = loclists.len() as u32;
+        loclists.push(0x08);
+        loclists.extend_from_slice(&(LOW + 4).to_le_bytes());
+        loclists.push(0x0c);
+        loclists.extend_from_slice(&[2, 0x30, 0x9f]);
+        loclists.push(0x08);
+        loclists.extend_from_slice(&(LOW + 0x10).to_le_bytes());
+        loclists.push(0x30);
+        loclists.extend_from_slice(&[2, 0x7d, slot]);
+        loclists.push(0x00);
+        offset
+    };
+    let n_list = list(8);
+    let label_list = list(12);
+    let length = (loclists.len() - 4) as u32;
+    loclists[..4].copy_from_slice(&length.to_le_bytes());
+
+    let abbrev = [
+        1, 0x11, 1, 0x03, 0x08, 0, 0,
+        2, 0x2e, 1, 0x03, 0x08, 0x11, 0x01, 0x12, 0x06, 0x40, 0x18, 0, 0,
+        3, 0x24, 0, 0x03, 0x08, 0x3e, 0x0b, 0x0b, 0x0b, 0, 0,
+        4, 0x34, 0, 0x03, 0x08, 0x02, 0x17, 0x49, 0x13, 0, 0,
+        5, 0x34, 0, 0x03, 0x08, 0x02, 0x17, 0, 0,
+        0,
+    ];
+    let mut entries = vec![1];
+    entries.extend_from_slice(b"p.cs\0");
+    let int = 12 + entries.len() as u32;
+    entries.push(3);
+    entries.extend_from_slice(b"int\0");
+    entries.extend_from_slice(&[0x05, 4]);
+    entries.push(2);
+    entries.extend_from_slice(b"f\0");
+    entries.extend_from_slice(&LOW.to_le_bytes());
+    entries.extend_from_slice(&0x40u32.to_le_bytes());
+    entries.extend_from_slice(&[1, 0x5d]);
+    entries.push(4);
+    entries.extend_from_slice(b"n\0");
+    entries.extend_from_slice(&n_list.to_le_bytes());
+    entries.extend_from_slice(&int.to_le_bytes());
+    entries.push(5);
+    entries.extend_from_slice(b"label\0");
+    entries.extend_from_slice(&label_list.to_le_bytes());
+    entries.extend_from_slice(&[0, 0]);
+    let mut info = ((2 + 1 + 1 + 4 + entries.len()) as u32).to_le_bytes().to_vec();
+    info.extend_from_slice(&5u16.to_le_bytes());
+    info.extend_from_slice(&[0x01, 4]);
+    info.extend_from_slice(&0u32.to_le_bytes());
+    info.extend_from_slice(&entries);
+
+    let sections = Sections {
+        debug_info: &info,
+        debug_abbrev: &abbrev,
+        debug_loclists: &loclists,
+        ..Sections::default()
+    };
+    let locals = Locals::parse(&sections).expect("parses");
+    let program = locals.at(at(4)).expect("covered");
+    let [n, label] = &program.locals[..] else {
+        panic!("two locals: {:?}", program.locals);
+    };
+    assert_eq!(n.name, Some(&b"n"[..]));
+    assert_eq!(n.place_at(at(0)), Place::Nowhere, "before the list's first range");
+    assert_eq!(n.place_at(at(4)), Place::Constant(0), "from the stop on the entry");
+    assert_eq!(n.place_at(at(0xf)), Place::Constant(0), "to the first store");
+    assert_eq!(n.place_at(at(0x10)), Place::RegisterOffset { register: 13, offset: 8 }, "its slot from the store");
+    assert_eq!(n.place_at(at(0x3f)), Place::RegisterOffset { register: 13, offset: 8 });
+    assert_eq!(n.place_at(at(0x40)), Place::Nowhere, "past the list's last range");
+    let int = crate::types::scalar_type(&sections, n.type_offset.expect("typed")).expect("a scalar");
+    assert_eq!((int.encoding, int.byte_size), (0x05, 4));
+
+    assert_eq!(label.name, Some(&b"label"[..]));
+    assert_eq!(label.type_offset, None);
+    assert_eq!(label.place_at(at(4)), Place::Constant(0));
+    assert_eq!(label.place_at(at(0x10)), Place::RegisterOffset { register: 13, offset: 12 });
+}
+
 /// A file can point an entry's origin at itself, and a reader that trusts the chain does not return.
 #[test]
 fn an_origin_that_points_at_itself_terminates() {
@@ -1733,4 +1981,86 @@ fn an_origin_that_points_at_itself_terminates() {
     let program = locals.at(0x100).expect("covered");
     assert_eq!(program.locals[0].name, None, "a cycle names nothing");
     assert_eq!(program.locals[0].place_at(0x100), Place::Register(4));
+}
+
+/// A DWARF 4 unit around `body`, its abbreviations at offset 0 and its addresses four bytes wide.
+fn unit_of(body: &[u8]) -> Vec<u8> {
+    let mut unit = ((2 + 4 + 1 + body.len()) as u32).to_le_bytes().to_vec();
+    unit.extend_from_slice(&4u16.to_le_bytes());
+    unit.extend_from_slice(&0u32.to_le_bytes());
+    unit.push(4);
+    unit.extend_from_slice(body);
+    unit
+}
+
+/// A variable's type is read through the names and qualifiers around it to the scalar it is, an
+/// enumeration as its underlying type, and a pointer as no scalar; and the reference a variable
+/// makes, counted from its own unit, is kept as an offset within the whole section.
+#[test]
+fn a_variables_type_is_read_through_names_and_qualifiers_to_the_scalar_it_is() {
+    const TYPES_ABBREV: &[u8] = &[
+        1, 0x11, 1, 0, 0,
+        2, 0x2e, 1, 0x03, 0x08, 0x11, 0x01, 0x12, 0x06, 0, 0,
+        3, 0x34, 0, 0x03, 0x08, 0x02, 0x18, 0x49, 0x13, 0, 0,
+        4, 0x24, 0, 0x03, 0x08, 0x3e, 0x0b, 0x0b, 0x0b, 0, 0,
+        5, 0x16, 0, 0x03, 0x08, 0x49, 0x13, 0, 0,
+        6, 0x26, 0, 0x49, 0x13, 0, 0,
+        7, 0x04, 0, 0x03, 0x08, 0x0b, 0x0b, 0x49, 0x13, 0, 0,
+        8, 0x0f, 0, 0x0b, 0x0b, 0x49, 0x13, 0, 0,
+        0,
+    ];
+    let first = unit_of(&[1, 4, b'b', b'y', b't', b'e', 0, 0x08, 1, 0]);
+    let mut body = vec![1u8];
+    let here = |body: &Vec<u8>| (11 + body.len()) as u32;
+    let int = here(&body);
+    body.extend_from_slice(&[4, b'i', b'n', b't', 0, 0x05, 4]);
+    let number = here(&body);
+    body.push(5);
+    body.extend_from_slice(b"Number\0");
+    body.extend_from_slice(&int.to_le_bytes());
+    let constant = here(&body);
+    body.push(6);
+    body.extend_from_slice(&number.to_le_bytes());
+    let day = here(&body);
+    body.push(7);
+    body.extend_from_slice(b"Day\0");
+    body.push(4);
+    body.extend_from_slice(&int.to_le_bytes());
+    let pointer = here(&body);
+    body.extend_from_slice(&[8, 4]);
+    body.extend_from_slice(&int.to_le_bytes());
+    body.push(2);
+    body.extend_from_slice(b"f\0");
+    body.extend_from_slice(&0x1000u32.to_le_bytes());
+    body.extend_from_slice(&0x10u32.to_le_bytes());
+    for (name, location, kind) in [(b"n\0", &[0x91u8, 0x70][..], constant), (b"d\0", &[0x50][..], day), (b"p\0", &[0x51][..], pointer)] {
+        body.push(3);
+        body.extend_from_slice(name);
+        body.push(location.len() as u8);
+        body.extend_from_slice(location);
+        body.extend_from_slice(&kind.to_le_bytes());
+    }
+    body.extend_from_slice(&[0, 0]);
+    let mut info = first.clone();
+    let second = info.len() as u64;
+    info.extend_from_slice(&unit_of(&body));
+    let sections = Sections { debug_info: &info, debug_abbrev: TYPES_ABBREV, ..Sections::default() };
+    let absolute = |relative: u32| second + u64::from(relative);
+
+    let locals = Locals::parse(&sections).expect("parses");
+    let f = locals.at(0x1000).expect("covered");
+    assert_eq!(f.locals[0].type_offset, Some(absolute(constant)), "counted from the section, not the unit");
+    let int_type = ScalarType { name: Some(&b"int"[..]), encoding: 0x05, byte_size: 4, enumeration: false };
+    assert_eq!(scalar_type(&sections, absolute(constant)), Some(int_type), "through const and typedef to int");
+    assert_eq!(
+        scalar_type(&sections, absolute(day)),
+        Some(ScalarType { name: Some(&b"Day"[..]), encoding: 0x05, byte_size: 4, enumeration: true }),
+        "an enumeration as its underlying type, under its own name"
+    );
+    assert_eq!(scalar_type(&sections, absolute(pointer)), None, "a pointer is no scalar");
+    assert_eq!(
+        scalar_type(&sections, 12),
+        Some(ScalarType { name: Some(&b"byte"[..]), encoding: 0x08, byte_size: 1, enumeration: false }),
+        "a type in the first unit"
+    );
 }

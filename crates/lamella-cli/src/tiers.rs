@@ -9,13 +9,14 @@ struct LinkedTarget {
     aot_target: &'static str,
     /// The triple the archive beside it was compiled for.
     triple: &'static str,
-    /// Whether the archive carries the board's own half -- the startup its clock plan names, its
-    /// console and its millisecond clock -- so that each board needs an archive of its own.
+    /// Whether the archive carries the board's own half -- its console, and on an RP2350 the
+    /// startup its clock plan names and its millisecond clock -- so that each board needs an
+    /// archive of its own.
     ///
     /// **A BOARD BUILD IS FOUND BY THE BOARD, NEVER BY THE TRIPLE ALONE.** An archive built for
-    /// the triple without a board starts no clock and writes its console through a debugger, so on
-    /// a board with nothing attached the image runs at the clock it was reset into and faults at
-    /// its first `Console.Write` -- an image that links, writes and says nothing about why.
+    /// the triple without a board writes its console through a debugger, and on an RP2350 starts
+    /// no clock, so on a board with nothing attached the image faults at its first
+    /// `Console.Write` -- an image that links, writes and says nothing about why.
     per_board: bool,
 }
 
@@ -28,12 +29,12 @@ const LINKED_TARGETS: &[LinkedTarget] = &[
     LinkedTarget {
         aot_target: "microbit",
         triple: "thumbv6m-none-eabi",
-        per_board: false,
+        per_board: true,
     },
     LinkedTarget {
         aot_target: "nrf52833",
         triple: "thumbv6m-none-eabi",
-        per_board: false,
+        per_board: true,
     },
     LinkedTarget {
         aot_target: "rp2350",
@@ -245,8 +246,8 @@ fn no_archive_refusal(
     let refused = format!(
         "no runtime support archive for {board} ({aot_target}, {triple}).\n\n\
          The class-library tier links your program against this archive, so it cannot be built \
-         without one.\nOn this target the archive also carries the board's own startup, console \
-         and clock, so each\nboard has an archive of its own. Looked in:\n{places}\n\n"
+         without one.\nOn this target the archive also carries parts of the board's own, such as \
+         its console, so\neach board has an archive of its own. Looked in:\n{places}\n\n"
     );
     let Some(root) = checkout() else {
         return format!(
@@ -690,8 +691,8 @@ mod tests {
             .collect();
         assert_eq!(
             boards.len(),
-            4,
-            "the four RP2350 boards take a board build: {boards:?}"
+            13,
+            "the eleven RP2350 boards and the two micro:bits take a board build: {boards:?}"
         );
         for board in boards {
             let feature = board_feature(board);
@@ -737,8 +738,22 @@ mod tests {
         checked.sort_unstable();
         assert_eq!(
             checked,
-            ["pimoroni-pico-plus-2", "pimoroni-pico-plus-2-w", "raspberrypi-pico-2", "raspberrypi-pico-2-w"],
-            "the four RP2350 boards take a board build, and each one's console is the ring"
+            [
+                "adafruit-feather-rp2350-hstx",
+                "adafruit-feather-rp2350-hstx-psram",
+                "adafruit-metro-rp2350",
+                "adafruit-metro-rp2350-psram",
+                "bbc-micro-bit-v1",
+                "bbc-micro-bit-v2",
+                "pimoroni-pico-lipo-2",
+                "pimoroni-pico-lipo-2-xl-w",
+                "pimoroni-pico-plus-2",
+                "pimoroni-pico-plus-2-w",
+                "raspberrypi-pico-2",
+                "raspberrypi-pico-2-w",
+                "sparkfun-iot-redboard-rp2350",
+            ],
+            "the eleven RP2350 boards and the two micro:bits take a board build, and each one's console is the ring"
         );
     }
 
@@ -828,7 +843,7 @@ mod tests {
         for target in targets() {
             assert!(
                 !matches!(
-                    build_linked_cortex_m(&[], &[], &[], target),
+                    build_linked_cortex_m(&[], &[], &[], target, lamella_aot::BuildKind::Debug),
                     Err(BuildError::UnsupportedTarget)
                 ),
                 "{target} is listed here, so the linked build must have a plan for it"
@@ -836,7 +851,7 @@ mod tests {
         }
         assert!(
             matches!(
-                build_linked_cortex_m(&[], &[], &[], "ch32v003"),
+                build_linked_cortex_m(&[], &[], &[], "ch32v003", lamella_aot::BuildKind::Debug),
                 Err(BuildError::UnsupportedTarget)
             ),
             "and a target the table does not list is refused as unsupported"

@@ -5,12 +5,12 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "device-dap-server: debugs a program running on a Cortex-M board from a Debug Adapter Protocol client such as VS Code, through the board's debug probe."
+description = "lamella-debug: the Lamella debugger. It speaks the Debug Adapter Protocol to an editor such as VS Code, and debugs a program on this computer's interpreter, on a board's interpreter over Lamella Link, or as native code on a board through its debug probe."
 publish = false
 
 [[bin]]
-name = "device-dap-server"
-path = "src/main.rs"
+name = "lamella-debug"
+path = "src/bin/lamella-debug/main.rs"
 
 [lints]
 workspace = true
@@ -18,10 +18,23 @@ workspace = true
 [dependencies]
 lamella-debug-device = { path = "../lamella-debug-device" }
 lamella-probe-core = { path = "../lamella-probe-core" }
-# The server links the adapter + wire protocol WITHOUT the interpreter, and lowers the deployed
-# program (lamella-aot) + reads its Portable PDB (lamella-metadata) to compose the native ->
-# source-line mapping at launch.
-lamella-dap = { path = "../lamella-dap", default-features = false }
+# The adapter WITH the interpreter, which debugs a program on this computer. The native tier lowers
+# the deployed program (lamella-aot) and reads its Portable PDB (lamella-metadata) to compose the
+# native -> source-line mapping at launch.
+lamella-dap = { path = "../lamella-dap" }
+# This computer's tier loads the program, with the class library a run gives it.
+lamella-load = { path = "../lamella-load" }
+# A board's interpreter, over Lamella Link: its serial and native-USB carriers, the debug backend over
+# the wire, and the board a HELLO answers as. NOT `baked`: that knob turns on lamella-load's
+# non-additive `code-in-place`, which cfg's out the interpreter backend above.
+lamella-wire-host = { path = "../lamella-wire-host", default-features = false, features = [
+    "serial",
+    "usb",
+    "debug-backend",
+    "boards",
+] }
+# The launch's fields and the debug manifest the build writes.
+serde_json = "1"
 lamella-aot = { path = "../lamella-aot" }
 lamella-metadata = { path = "../lamella-metadata" }
 # PROBE ENUMERATION AND SELECTION, not one vendor id. `usbbulk` is NOT optional: without it this
@@ -33,18 +46,26 @@ lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf" }
 # `--board`: a board id resolves here exactly as it does for every `lamella` verb, to the family
 # whose part this server writes and the debug-port IDCODE that part answers.
 lamella-catalog = { path = "../lamella-catalog" }
-lamella-stlink = { path = "../lamella-stlink", optional = true }
+# In every build: a build without `st` still knows an attached ST-LINK by its USB ids, so a launch that
+# names one is refused naming the feature that drives it. Its only dependencies are the probe seam and
+# the USB bulk transport, which every build already has.
+lamella-stlink = { path = "../lamella-stlink" }
 lamella-cmsis-dap-stm32 = { path = "../lamella-cmsis-dap-stm32", optional = true }
-# An STM32F7 or H7 deploy writes through the route `lamella flash` takes: the part identified, the write
-# bounded by the flash the part reports, and every byte read back.
-lamella-flash-routes = { path = "../lamella-flash-routes", optional = true }
-lamella-flash-backend = { path = "../lamella-flash-backend", optional = true }
+# An RP2350 deploy, a micro:bit v2's, and an STM32F7, H7 or U5 one, writes through the route `lamella
+# flash` takes: the part identified, the write bounded by the flash the part reports, and every byte
+# read back. In every build, because every RP2350 board and the micro:bit v2 are written this way.
+lamella-flash-routes = { path = "../lamella-flash-routes" }
+lamella-flash-backend = { path = "../lamella-flash-backend" }
+# An RP2350 is held after its write by the part's own reset, which catches the core at the boot ROM's
+# reset vector, before the program it then runs to.
+lamella-cmsis-dap-rp2350 = { path = "../lamella-cmsis-dap-rp2350" }
 lamella-cmsis-dap-sam = { path = "../lamella-cmsis-dap-sam", optional = true }
 
 # The refusal tests compile the programs they are refused with, so no assembly is committed to go
 # stale against the compiler.
 [dev-dependencies]
 lamella-assemble = { path = "../lamella-assemble" }
+lamella-clock-host = { path = "../lamella-clock-host" }
 
 # EVERY PROBE AND PART THE SERVER KNOWS IS ON BY DEFAULT. A server is installed to debug the board in
 # front of someone, and one built without that board's probe is not the server they asked for. The
@@ -52,17 +73,22 @@ lamella-assemble = { path = "../lamella-assemble" }
 # needs it, and names the command that installs a server with every feature on.
 [features]
 default = ["st", "sam"]
-## Lets `device-dap-server` drive an ST-Link and program STM32 flash, so an ST board with an
+## Lets `lamella-debug` drive an ST-Link and program STM32 flash, so an ST board with an
 ## on-board debugger can be deployed to and natively debugged over its one USB cable.
-st = [
-    "dep:lamella-stlink",
-    "dep:lamella-cmsis-dap-stm32",
-    "dep:lamella-flash-routes",
-    "dep:lamella-flash-backend",
-]
-## Lets `device-dap-server` stop a SAM D21 with the sequence that part needs. The generic
+st = ["dep:lamella-cmsis-dap-stm32"]
+## Lets `lamella-debug` stop a SAM D21 with the sequence that part needs. The generic
 ## reset-and-halt arms the vector catch under nRESET, which requires the debug port to stay
 ## reachable while the part is held; a SAM D21 does not offer that, so `Samd21Debug::samd21_park`
 ## drives the DSU's cold-plugging reset extension instead. It is written against `TargetAccess`
 ## rather than against a CMSIS-DAP probe, so an ST-Link reaches it too.
 sam = ["dep:lamella-cmsis-dap-sam"]
+
+[[package.metadata.lamella.test-configuration]]
+name = "every-probe"
+args = []
+why = "the debugger as it is installed: every probe and part this tree drives"
+
+[[package.metadata.lamella.test-configuration]]
+name = "no-st-no-sam"
+args = ["--no-default-features"]
+why = "a build without the ST-LINK and SAM support, whose refusals name the feature that builds one"

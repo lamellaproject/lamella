@@ -228,6 +228,20 @@ mod python {
         unsafe { core::ptr::write_volatile(address as *mut u32, value) };
     }
 
+    /// Starts the Cortex-M SysTick counter, free-running on the processor clock with the full 24-bit
+    /// reload. It is the counter the shared monotonic clock folds: [`install_clock`] measures a
+    /// counter that is already counting and starts none, so this runs first. Without it the clock
+    /// never moves, so `time.monotonic()` stays at 0, `time.sleep` returns at once, and the radio is
+    /// not brought up, since every deadline in its driver is on this clock.
+    fn systick_start() {
+        const SYST_CSR: usize = 0xe000_e010;
+        const SYST_RVR: usize = 0xe000_e014;
+        const SYST_CVR: usize = 0xe000_e018;
+        write_register(SYST_RVR, 0x00ff_ffff);
+        write_register(SYST_CVR, 0);
+        write_register(SYST_CSR, 0b101); // ENABLE | CLKSOURCE = processor
+    }
+
     /// The part's own registers, for the TRNG driver.
     #[cfg(feature = "python-net")]
     struct Part;
@@ -272,24 +286,15 @@ mod python {
         }
     }
 
-    /// Brings the wireless up and hands the interpreter a backend, then states what it got.
-    ///
-    /// The lines it prints are the whole diagnosis when a socket program does nothing: a board that
-    /// never joined, a board that joined and got no lease, and a board with a dead peer look
-    /// identical from the program's side, and only one of them is the program's fault.
+    /// Starts the radio's controller and hands the interpreter a network backend without writing
+    /// setup diagnostics to the program's console.
     #[cfg(feature = "python-net")]
     fn install_net(model: &mut ObjectModel, ticks_per_ms: u32) {
         use crate::pico_wifi;
-        use lamella_net_core::NetBackend;
 
-        let before = arena_live();
         let settings = alloc::boxed::Box::new(lamella_wifi_cyw4343x_smoltcp::record::NoStore);
-        pico_wifi::ensure_wifi(ticks_per_ms.saturating_mul(1000), settings, &mut |line: &str| {
-            uart::str(line);
-            uart::str("\r\n");
-        });
-        if !pico_wifi::wifi_up() {
-            uart::str("[net] wifi is NOT up; the program runs with no backend\r\n");
+        pico_wifi::start_wifi(ticks_per_ms.saturating_mul(1000), settings);
+        if !pico_wifi::fitted() {
             return;
         }
         let device = pico_wifi::device();
@@ -312,41 +317,16 @@ mod python {
         let seed = if from_trng {
             u64::from_le_bytes(seed_bytes)
         } else {
-            uart::str("[net] the TRNG gave no entropy, so the network seed is the MAC and the uptime\r\n");
-            let mac = pico_wifi::mac();
+            let mac = pico_wifi::chip_address().unwrap_or([0; 6]);
             u64::from(u32::from_le_bytes([mac[2], mac[3], mac[4], mac[5]])) ^ crate::systick_clock::now_ms()
         };
-        let mut net = lamella_net_smoltcp::SmoltcpNet::new(
+        let net = lamella_net_smoltcp::SmoltcpNet::new(
             device,
             config,
             crate::systick_clock::now_ms,
             seed,
-        );
-        let deadline = crate::systick_clock::now_ms().saturating_add(8_000);
-        while net.ipv4_addr().is_none() && crate::systick_clock::now_ms() < deadline {
-            let _ = net.poll(Some(100));
-        }
-        match net.ipv4_addr() {
-            None => uart::str("[net] joined, no address YET (dhcp still trying)\r\n"),
-            Some(ip) => {
-                uart::str("[net] joined, ip ");
-                uart::decimal(ip[0] as usize);
-                uart::str(".");
-                uart::decimal(ip[1] as usize);
-                uart::str(".");
-                uart::decimal(ip[2] as usize);
-                uart::str(".");
-                uart::decimal(ip[3] as usize);
-                uart::str("\r\n");
-            }
-        }
-        uart::str("[net] stack at bring-up ");
-        uart::decimal(arena_live().saturating_sub(before));
-        uart::str(" bytes, before any socket | arena ");
-        uart::decimal(arena_live());
-        uart::str(" live of ");
-        uart::decimal(ARENA_BYTES);
-        uart::str("\r\n");
+        )
+        .with_wifi(pico_wifi::view);
         model.set_net_backend(alloc::boxed::Box::new(net));
     }
 
@@ -444,6 +424,7 @@ mod python {
         }
         uart::init();
         uart::str("[py] boot\r\n");
+        systick_start();
         let ticks_per_ms = install_clock();
 
         let image: &'static [u8] = core::hint::black_box(BUNDLE);
@@ -460,12 +441,8 @@ mod python {
                 #[cfg(feature = "python-gc-engine")]
                 model.set_collect_when_full(true);
                 #[cfg(feature = "python-net")]
-                match ticks_per_ms {
-                    Some(ticks) => install_net(&mut model, ticks),
-                    None => uart::str(
-                        "[net] no derivable clock, so the radio is not brought up: its bus rate and \
-                         its deadlines are both set from clk_sys\r\n",
-                    ),
+                if let Some(ticks) = ticks_per_ms {
+                    install_net(&mut model, ticks);
                 }
                 let outcome = run_bundle(bundle, &mut model);
                 uart::str(&model.take_stdout());

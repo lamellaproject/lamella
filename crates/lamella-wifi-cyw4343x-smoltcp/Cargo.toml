@@ -15,6 +15,8 @@ publish = false
 lamella-wifi-cyw4343x = { path = "../lamella-wifi-cyw4343x" }
 # The Wi-Fi seam the controller answers, and its plain values.
 lamella-net-core = { path = "../lamella-net-core" }
+# The stored network's record and its two-slot writer, which the board's other writers share.
+lamella-stored-settings = { path = "../lamella-stored-settings" }
 # The device trait and its tokens. `socket-raw` is here because the Ethernet medium turns on the
 # socket layer, which does not build without at least one socket kind; a consumer's own kinds
 # (a TCP/IP backend's) union with it.

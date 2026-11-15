@@ -2,13 +2,18 @@
 
 pub mod artifact;
 pub mod backends;
+pub mod behind_probe;
 pub mod bootsel;
+mod bootsel_regions;
 pub mod contracts;
 pub mod dfu;
 pub mod external;
 pub mod identity;
 pub mod manifest;
+pub mod picoboot;
 pub mod placement;
+pub mod region;
+pub mod settings;
 pub mod user_row;
 
 use lamella_catalog as catalog;
@@ -453,6 +458,12 @@ impl Programmer {
         }
     }
 
+    /// Whether this mechanism writes a board's flash regions beside an image ([`write_regions`]): an
+    /// RP2350's probe route, and its drive route, whose boot ROM also answers PICOBOOT.
+    pub fn writes_regions(self) -> bool {
+        matches!(self, Programmer::Rp2350Probe { .. } | Programmer::Uf2Volume { family: RP2350_UF2_FAMILY, .. })
+    }
+
     /// The attach under reset a write over this route runs before it touches flash, or `None` for a
     /// write that attaches without holding the core in reset.
     ///
@@ -645,7 +656,7 @@ pub const PROGRAMMING: &[Programming] = &[
     },
     Programming {
         board: "pimoroni-pico-lipo-2",
-        aot_target: None,
+        aot_target: Some("rp2350"),
         programmer: Programmer::Uf2Volume {
             family: RP2350_UF2_FAMILY,
             base: RP2_XIP_BASE,
@@ -654,7 +665,7 @@ pub const PROGRAMMING: &[Programming] = &[
     },
     Programming {
         board: "pimoroni-pico-lipo-2-xl-w",
-        aot_target: None,
+        aot_target: Some("rp2350"),
         programmer: Programmer::Uf2Volume {
             family: RP2350_UF2_FAMILY,
             base: RP2_XIP_BASE,
@@ -663,7 +674,7 @@ pub const PROGRAMMING: &[Programming] = &[
     },
     Programming {
         board: "adafruit-feather-rp2350-hstx",
-        aot_target: None,
+        aot_target: Some("rp2350"),
         programmer: Programmer::Uf2Volume {
             family: RP2350_UF2_FAMILY,
             base: RP2_XIP_BASE,
@@ -672,12 +683,39 @@ pub const PROGRAMMING: &[Programming] = &[
     },
     Programming {
         board: "adafruit-feather-rp2350-hstx-psram",
-        aot_target: None,
+        aot_target: Some("rp2350"),
         programmer: Programmer::Uf2Volume {
             family: RP2350_UF2_FAMILY,
             base: RP2_XIP_BASE,
         },
         alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: false }),
+    },
+    Programming {
+        board: "adafruit-metro-rp2350",
+        aot_target: Some("rp2350"),
+        programmer: Programmer::Uf2Volume {
+            family: RP2350_UF2_FAMILY,
+            base: RP2_XIP_BASE,
+        },
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: false }),
+    },
+    Programming {
+        board: "adafruit-metro-rp2350-psram",
+        aot_target: Some("rp2350"),
+        programmer: Programmer::Uf2Volume {
+            family: RP2350_UF2_FAMILY,
+            base: RP2_XIP_BASE,
+        },
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: false }),
+    },
+    Programming {
+        board: "sparkfun-iot-redboard-rp2350",
+        aot_target: Some("rp2350"),
+        programmer: Programmer::Uf2Volume {
+            family: RP2350_UF2_FAMILY,
+            base: RP2_XIP_BASE,
+        },
+        alternate: Some(Programmer::Rp2350Probe { base: RP2_XIP_BASE, block_erase: true }),
     },
     Programming {
         board: "raspberrypi-pico",
@@ -1325,6 +1363,8 @@ pub struct Prepared {
     /// The image's second half, for the board's external flash, when it has one. The two are
     /// written together by [`write_set`], never one without the other.
     pub window: Option<WindowHalf>,
+    /// The flash regions written beside the image, each its own span, by [`write_regions`].
+    pub regions: Vec<region::RegionSpan>,
 }
 
 /// The half of a two-region image that belongs in a board's external flash.
@@ -1364,7 +1404,7 @@ pub fn prepare_image(
             let bytes =
                 std::fs::read(path).map_err(|error| format!("read {}: {error}", path.display()))?;
             let read = format!("{} B of {}", bytes.len(), required.description());
-            return Ok(Prepared { bytes, read, wrapped: None, window: None });
+            return Ok(Prepared { bytes, read, wrapped: None, window: None, regions: Vec::new() });
         }
     }
     let external = external_flash_for(row, route);
@@ -1403,9 +1443,83 @@ pub fn prepare_image(
         None => format!("{} B of {}", artifact.bytes.len(), artifact.format),
     };
     Ok(match wrap_for_route(route, &artifact.bytes) {
-        Some((bytes, line)) => Prepared { bytes, read, wrapped: Some(line), window },
-        None => Prepared { bytes: artifact.bytes, read, wrapped: None, window },
+        Some((bytes, line)) => Prepared { bytes, read, wrapped: Some(line), window, regions: Vec::new() },
+        None => Prepared { bytes: artifact.bytes, read, wrapped: None, window, regions: Vec::new() },
     })
+}
+
+/// The region files `files`, read for a write through `route` to `row`'s board beside `image`, the
+/// image [`prepare_image`] read for the same write when there is one: each checked against its record
+/// and placed where the board's facts keep a flash region, in order of address. Nothing is opened.
+///
+/// # Errors
+/// A route that writes no region; every refusal of [`region::read_region`]; two regions that overlap;
+/// and a region the image's own span reaches. Each names what it found.
+pub fn prepare_regions(
+    files: &[std::path::PathBuf],
+    row: &Programming,
+    route: Programmer,
+    placement: &placement::Placement,
+    image: Option<&Prepared>,
+) -> Result<Vec<region::RegionFile>, String> {
+    if files.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !route.writes_regions() {
+        return Err(format!(
+            "a flash region is written only through an RP2350's probe or its BOOTSEL drive, and this write to {} \
+             goes through {}, so nothing was written.",
+            row.board,
+            route.description()
+        ));
+    }
+    let mut read = files
+        .iter()
+        .map(|file| region::read_region(file, row.board, route.flash_base()))
+        .collect::<Result<Vec<_>, _>>()?;
+    read.sort_by_key(|file| file.span.base);
+    let end_of = |span: &region::RegionSpan| u64::from(span.base) + span.bytes.len() as u64;
+    if let Some(pair) = read.windows(2).find(|pair| end_of(&pair[0].span) > u64::from(pair[1].span.base)) {
+        let (low, high) = (&pair[0].span, &pair[1].span);
+        return Err(format!(
+            "{} lies from {:#010x} to {:#010x} and {} from {:#010x}, so the two overlap and nothing was written.",
+            low.name,
+            low.base,
+            end_of(low),
+            high.name,
+            high.base
+        ));
+    }
+    if let Some(prepared) = image {
+        let (base, length) = image_span(prepared, route, placement)?;
+        let end = u64::from(base) + length;
+        if let Some(file) = read.iter().find(|file| u64::from(file.span.base) < end && u64::from(base) < end_of(&file.span)) {
+            return Err(format!(
+                "the image runs from {base:#010x} to {end:#010x}, over {} from {:#010x} to {:#010x}, so nothing was \
+                 written.",
+                file.span.name,
+                file.span.base,
+                end_of(&file.span)
+            ));
+        }
+    }
+    Ok(read)
+}
+
+/// Where an image `prepared` for `route` starts, and how many bytes it spans: the blocks of a UF2 for
+/// the route's chip family, or the flat bytes from where `placement` writes them.
+///
+/// # Errors
+/// A UF2 that holds no whole image for the family, which nothing else checks on a drive route.
+fn image_span(prepared: &Prepared, route: Programmer, placement: &placement::Placement) -> Result<(u32, u64), String> {
+    match route.required_format() {
+        Some(crate::artifact::Format::Uf2 { family }) => {
+            let held = lamella_flash_format::uf2::image_for_family(&prepared.bytes, family)
+                .map_err(|why| format!("the image's UF2 holds no image a region can be placed beside: {why}"))?;
+            Ok((held.base(), held.span()))
+        }
+        _ => Ok((placement.base(), prepared.bytes.len() as u64)),
+    }
 }
 
 /// The image the UF2 file at `path` holds for `row`'s board, for a route that takes flat bytes:
@@ -1672,7 +1786,6 @@ fn write_with(
             .map_err(|why| why.to_string());
         }
         Programmer::Rp2350Probe { base, block_erase } => {
-            use crate::backends::Rp2350Failure;
             use lamella_cmsis_dap_rp2350::Erase;
 
             let erase = if block_erase { Erase::Blocks } else { Erase::Sectors };
@@ -1683,18 +1796,7 @@ fn write_with(
             };
             return crate::backends::write_rp2350(
                 |clock_hz, d8h, say| {
-                    let session = lamella_probe::open(&selector).map_err(|why| {
-                        Rp2350Failure::Unopened(describe_probe_choice(&why, &selector, probe, programmer))
-                    })?;
-                    let mut dap = lamella_probe_core::ArmDap::new(session.into_dap());
-                    let idcode = lamella_cmsis_dap_rp2350::connect(&mut dap).map_err(|why| {
-                        Rp2350Failure::Other(format!("connecting to the RP2350: {}", lamella_flash_backend::FlashError::Probe(why)))
-                    })?;
-                    if clock_hz != lamella_cmsis_dap_rp2350::FALLBACK_SWD_CLOCK_HZ {
-                        lamella_cmsis_dap_rp2350::set_swd_clock(&mut dap, clock_hz).map_err(|why| {
-                            Rp2350Failure::AtSpeed(format!("the probe did not take the clock: {why}"))
-                        })?;
-                    }
+                    let (dap, idcode) = open_rp2350(&selector, probe, programmer, clock_hz)?;
                     let mut backend = crate::backends::Rp2350Probe::new(dap, idcode, RP2350_SETTLES)
                         .erasing(erase)
                         .remembering(*d8h)
@@ -1938,6 +2040,262 @@ pub fn write_set(
         allow,
     )
     .map_err(|why| why.to_string())
+}
+
+/// Write `image`, when there is one, and each of `regions` through `programmer`, every one its own
+/// span: the image at the address `placement` gives, each region where its record places it, and
+/// nothing between them. Each span the flash already holds is left as it is. A region's directory,
+/// its first [`region::RegionSpan::header`] bytes, is erased before the rest of the region and
+/// programmed after it. `allow` and `say` are [`write_set`]'s.
+///
+/// An RP2350's probe route writes the regions and then the image in one session. Its drive route
+/// writes the regions through the boot ROM's PICOBOOT interface and then copies the image's UF2, which
+/// `image` is on that route; when PICOBOOT cannot be opened, the regions ride that UF2 instead.
+///
+/// # Errors
+/// A route that writes no region, or anything that stops the write, already worded for a reader.
+#[allow(clippy::too_many_arguments)]
+pub fn write_regions(
+    programmer: Programmer,
+    board: &str,
+    placement: &placement::Placement,
+    image: Option<&[u8]>,
+    regions: &[region::RegionSpan],
+    probe: Option<&str>,
+    allow: &lamella_flash_backend::Allow,
+    say: &mut dyn FnMut(&str),
+) -> Result<region::RegionsReport, String> {
+    if let (Programmer::Rp2350Probe { base, block_erase }, [_, ..]) = (programmer, regions) {
+        let route = Rp2350Route { programmer, base, block_erase };
+        return write_rp2350_regions(route, board, image, regions, probe, allow, say);
+    }
+    match (image, regions) {
+        (Some(image), []) => {
+            let report = write_scoped(programmer, placement, image, probe, allow, say)?;
+            Ok(region::RegionsReport { image: Some(report), image_held: false, part: None, regions: Vec::new() })
+        }
+        (None, []) => Err(String::from("there is nothing to write: no image and no region.")),
+        (_, [_, ..]) if matches!(programmer, Programmer::Uf2Volume { family: RP2350_UF2_FAMILY, .. }) => {
+            let mut attached = bootsel_regions::Attached { programmer, placement, volume: probe, allow };
+            bootsel_regions::write(&mut attached, image, regions, RP2350_UF2_FAMILY, say)
+        }
+        (_, [first, ..]) => Err(format!(
+            "this build writes no flash region to {board} through {}, so {} was not written. Nothing was \
+             written.",
+            programmer.description(),
+            first.name
+        )),
+    }
+}
+
+/// The RP2350 probe route a write of regions goes through: the route itself, where it writes an
+/// image from, and whether the board's flash takes the 64 KiB block erase.
+#[derive(Clone, Copy, Debug)]
+struct Rp2350Route {
+    programmer: Programmer,
+    base: u32,
+    block_erase: bool,
+}
+
+/// Which piece of a write a span carries.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Piece {
+    /// The region at this index of the write's regions.
+    Region(usize),
+    /// The image.
+    Image,
+}
+
+/// The order an RP2350 probe write takes its pieces in: every region by its base, then the image.
+/// A write cut short while it writes the regions leaves the image as it was.
+fn rp2350_order(image: Option<&[u8]>, regions: &[region::RegionSpan]) -> Vec<Piece> {
+    let mut order: Vec<Piece> = (0..regions.len()).map(Piece::Region).collect();
+    order.sort_by_key(|piece| match *piece {
+        Piece::Region(index) => regions[index].base,
+        Piece::Image => u32::MAX,
+    });
+    if image.is_some() {
+        order.push(Piece::Image);
+    }
+    order
+}
+
+/// `order`'s pieces as the spans the part routine writes, at offsets from the start of the flash:
+/// the image from `base`, and each region from its own base.
+///
+/// # Errors
+/// A piece placed below the start of the flash's window, worded for a reader.
+fn rp2350_spans<'a>(
+    base: u32,
+    image: Option<&'a [u8]>,
+    regions: &'a [region::RegionSpan],
+    order: &[Piece],
+) -> Result<Vec<lamella_cmsis_dap_rp2350::Span<'a>>, String> {
+    use lamella_cmsis_dap_rp2350::{Span, XIP_BASE};
+
+    order
+        .iter()
+        .map(|piece| {
+            let (name, address, bytes, header) = match *piece {
+                Piece::Region(index) => {
+                    let region = &regions[index];
+                    (region.name.as_str(), region.base, region.bytes.as_slice(), region.header)
+                }
+                Piece::Image => ("the image", base, image.unwrap_or(&[]), 0),
+            };
+            let offset = address.checked_sub(XIP_BASE).ok_or_else(|| {
+                format!(
+                    "{name} belongs at {address:#010x}, below {XIP_BASE:#010x}, where the RP2350's flash \
+                     window begins. Nothing was written."
+                )
+            })?;
+            Ok(Span { offset, bytes, header })
+        })
+        .collect()
+}
+
+/// The flash no span of an RP2350 probe write on `board` may reach, in bytes from the start of the
+/// flash: the two sectors its stored network is kept in, when its facts state them.
+///
+/// # Errors
+/// A board this build does not know, and a stored-settings place its probe route cannot reach.
+fn rp2350_kept(board: &str) -> Result<Vec<core::ops::Range<u32>>, String> {
+    let table = catalog::load_board(board)
+        .ok_or_else(|| format!("{board} is not a board this build knows. Nothing was written."))?;
+    let Some(settings) = table.stored_settings else {
+        return Ok(Vec::new());
+    };
+    let place = settings::place(board, &settings)?;
+    let slots = u32::try_from(lamella_stored_settings::SLOTS).unwrap_or(u32::MAX);
+    let stored_network = place.offset..place.offset.saturating_add(slots.saturating_mul(place.erase_unit));
+    Ok(vec![stored_network])
+}
+
+/// Opens the probe `selector` chooses for an RP2350 route, wakes the part's debug port, and sets the
+/// SWD clock to `clock_hz`: the first steps of each attempt of a write through
+/// [`Programmer::Rp2350Probe`]. Answers with the part and the `DPIDR` it answered.
+fn open_rp2350(
+    selector: &lamella_probe::Selector,
+    probe: Option<&str>,
+    programmer: Programmer,
+    clock_hz: u32,
+) -> Result<(impl lamella_probe_core::TargetAccess, u32), crate::backends::Rp2350Failure> {
+    use crate::backends::Rp2350Failure;
+
+    let session = lamella_probe::open(selector)
+        .map_err(|why| Rp2350Failure::Unopened(describe_probe_choice(&why, selector, probe, programmer)))?;
+    let mut dap = lamella_probe_core::ArmDap::new(session.into_dap());
+    let idcode = lamella_cmsis_dap_rp2350::connect(&mut dap).map_err(|why| {
+        Rp2350Failure::Other(format!(
+            "connecting to the RP2350: {}",
+            lamella_flash_backend::FlashError::Probe(why)
+        ))
+    })?;
+    if clock_hz != lamella_cmsis_dap_rp2350::FALLBACK_SWD_CLOCK_HZ {
+        lamella_cmsis_dap_rp2350::set_swd_clock(&mut dap, clock_hz)
+            .map_err(|why| Rp2350Failure::AtSpeed(format!("the probe did not take the clock: {why}")))?;
+    }
+    Ok((dap, idcode))
+}
+
+/// Writes `image` and `regions` through the RP2350 probe `route` names, on `board`: each its own
+/// span, in [`rp2350_order`]'s order, in one session of the part routine, with the board's stored
+/// network out of every span. Then each region's read-back is checked against its record's SHA-256.
+/// A transfer fault at the faster SWD clock makes the whole write again at the fallback clock, as a
+/// write of an image alone does.
+fn write_rp2350_regions(
+    route: Rp2350Route,
+    board: &str,
+    image: Option<&[u8]>,
+    regions: &[region::RegionSpan],
+    probe: Option<&str>,
+    allow: &lamella_flash_backend::Allow,
+    say: &mut dyn FnMut(&str),
+) -> Result<region::RegionsReport, String> {
+    use lamella_cmsis_dap_rp2350::Erase;
+
+    let order = rp2350_order(image, regions);
+    let spans = rp2350_spans(route.base, image, regions, &order)?;
+    let keep = rp2350_kept(board)?;
+    let erase = if route.block_erase { Erase::Blocks } else { Erase::Sectors };
+    let selector = lamella_probe::Selector::named_or_environment(probe);
+    let (identity, mechanism, written) = crate::backends::write_rp2350_for(
+        |clock_hz, d8h, say| {
+            let (dap, idcode) = open_rp2350(&selector, probe, route.programmer, clock_hz)?;
+            let mut backend = crate::backends::Rp2350Probe::new(dap, idcode, RP2350_SETTLES)
+                .erasing(erase)
+                .remembering(*d8h)
+                .saying(&mut *say);
+            let written = backend.write_spans(&spans, &keep, allow);
+            *d8h = backend.remembered();
+            let mechanism = lamella_flash_backend::FlashBackend::mechanism(&backend);
+            written
+                .map(|(identity, written)| (identity, mechanism, written))
+                .map_err(|why| crate::backends::rp2350_failure(why, clock_hz))
+        },
+        say,
+    )?;
+    rp2350_report(identity, mechanism, route.base, image, regions, &order, &written)
+}
+
+/// What an RP2350 probe write of `order`'s pieces did, piece by piece, once each region's read-back
+/// is checked against its record's SHA-256.
+///
+/// # Errors
+/// A region whose read-back's SHA-256 is not its record's, naming both.
+fn rp2350_report(
+    identity: lamella_flash_backend::PartIdentity,
+    mechanism: &'static str,
+    base: u32,
+    image: Option<&[u8]>,
+    regions: &[region::RegionSpan],
+    order: &[Piece],
+    written: &[lamella_cmsis_dap_rp2350::SpanWrite],
+) -> Result<region::RegionsReport, String> {
+    let mut report =
+        region::RegionsReport { image: None, image_held: false, part: Some(identity.clone()), regions: Vec::new() };
+    for (piece, write) in order.iter().zip(written) {
+        match *piece {
+            Piece::Image => {
+                report.image = Some(lamella_flash_backend::Report {
+                    mechanism,
+                    identity: identity.clone(),
+                    base,
+                    bytes: image.map_or(0, <[u8]>::len),
+                    verification: lamella_flash_backend::Verification::ReadBack,
+                });
+                report.image_held = write.sectors_erased == 0 && write.bytes_programmed == 0;
+            }
+            Piece::Region(index) => {
+                let region = &regions[index];
+                let read: Vec<u8> =
+                    write.read.iter().flat_map(|word| word.to_le_bytes()).take(region.bytes.len()).collect();
+                let found = lamella_pe::sha256::sha256(&read);
+                if found != region.sha256 {
+                    return Err(format!(
+                        "{} read back from {:#010x} with the SHA-256 {}, and its record states {}: the \
+                         region did not take.",
+                        region.name,
+                        region.base,
+                        hex_of(&found),
+                        hex_of(&region.sha256)
+                    ));
+                }
+                let outcome = if write.sectors_erased == 0 && write.bytes_programmed == 0 {
+                    region::RegionOutcome::Held
+                } else {
+                    region::RegionOutcome::Written { sectors: write.sectors_erased, bytes: write.bytes_programmed }
+                };
+                report.regions.push((region.name.clone(), outcome));
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// `bytes` as lowercase hexadecimal, two digits a byte.
+fn hex_of(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
 /// Writes `image` through the ST-LINK `open` opens, on `family`'s plan: the family's attach, memory access,
@@ -2399,9 +2757,9 @@ pub fn cannot_write(board: &str) -> String {
         ));
     }
     text.push_str(
-        "\nthat list is short because how a board is PROGRAMMED is not yet stated in any board \
-         file --\nthe board files declare how a running board is TALKED TO, which is a different \
-         fact. Every\nmechanism here has to be added by hand until it is.\n\n\
+        "\nthat list is short because no board file states how a board is PROGRAMMED --\nthe \
+         board files declare how a running board is TALKED TO, which is a different fact, so \
+         every\nmechanism here is added by hand.\n\n\
          `lamella build <file> --board ",
     );
     text.push_str(board);
@@ -3008,6 +3366,83 @@ mod tests {
         assert_eq!(prepared.wrapped, None);
     }
 
+    /// A region of `sectors` sectors for the Pico 2 W, placed `at` bytes into its flash, written as
+    /// `name` in `test`'s scratch folder with its record and its notice beside it.
+    fn region_file(test: &str, name: &str, at: u32, sectors: usize) -> std::path::PathBuf {
+        let mut bytes = vec![0xFF; sectors * 0x1000];
+        bytes[..4].copy_from_slice(b"LWFD");
+        let digest = |bytes: &[u8]| crate::manifest::hex(lamella_pe::sha256::sha256(bytes));
+        let path = image_file(test, name, &bytes);
+        let record = format!(
+            "{{\"schema\":1,\"kind\":\"flash-region\",\"board\":\"raspberrypi-pico-2-w\",\"device\":\"flash\",\
+             \"base\":\"{at:#x}\",\"bytes\":{},\"sha256\":\"{}\",\"images\":[{{\"name\":\"directory\",\"offset\":0,\
+             \"bytes\":4,\"sha256\":\"{}\"}}],\"notices\":[\"LICENSE.RP\"]}}",
+            bytes.len(),
+            digest(&bytes),
+            digest(b"LWFD")
+        );
+        std::fs::write(crate::manifest::path_for(&path), record).expect("the record");
+        std::fs::write(path.with_file_name("LICENSE.RP"), "license").expect("the notice");
+        path
+    }
+
+    /// The Pico 2 W's row.
+    fn pico2_w() -> &'static Programming {
+        programmer_for("raspberrypi-pico-2-w").expect("raspberrypi-pico-2-w is routed")
+    }
+
+    /// **REGIONS ARE READ IN ORDER OF ADDRESS, BESIDE AN IMAGE OR ALONE, ON BOTH RP2350 ROUTES**: each
+    /// its own span at the address its record and the board's facts give, nothing opened.
+    #[test]
+    fn regions_are_read_in_order_of_address_beside_an_image_or_alone_on_both_rp2350_routes() {
+        let image = image_file("regions-order", "image.bin", &stamped(700));
+        let files = [region_file("regions-order", "b.region.bin", 0x3C_1000, 1), region_file("regions-order", "a.region.bin", 0x3C_0000, 1)];
+        let row = pico2_w();
+        for via in [None, Some("probe")] {
+            let route = route_for(row, via).expect("a route");
+            assert!(route.writes_regions(), "{via:?}");
+            let placement = placed(row, route);
+            let prepared = prepare_image(&image, row, route, &placement).expect("the image");
+            for beside in [Some(&prepared), None] {
+                let read = prepare_regions(&files, row, route, &placement, beside).unwrap_or_else(|why| panic!("{via:?}: {why}"));
+                let got: Vec<(&str, u32)> = read.iter().map(|file| (file.span.name.as_str(), file.span.base)).collect();
+                assert_eq!(got, [("a.region.bin", 0x103C_0000), ("b.region.bin", 0x103C_1000)], "{via:?}");
+            }
+        }
+        assert!(prepare_regions(&[], row, route_for(row, None).unwrap(), &placed(row, route_for(row, None).unwrap()), None).unwrap().is_empty());
+    }
+
+    /// **A REGION ON A ROUTE THAT WRITES NONE IS REFUSED** before any file is read: an RP2040's drive
+    /// route, whose boot ROM this build writes no region through.
+    #[test]
+    fn a_region_on_a_route_that_writes_none_is_refused() {
+        let row = programmer_for("raspberrypi-pico").expect("raspberrypi-pico is routed");
+        let route = route_for(row, None).expect("its drive route");
+        assert!(!route.writes_regions());
+        let files = [std::path::PathBuf::from("no-such.region.bin")];
+        let refusal = prepare_regions(&files, row, route, &placed(row, route), None).expect_err("refused");
+        assert!(refusal.contains("only through an RP2350's probe or its BOOTSEL drive") && refusal.contains("raspberrypi-pico "), "{refusal}");
+    }
+
+    /// **TWO REGIONS THAT OVERLAP, OR A REGION THE IMAGE REACHES, ARE REFUSED**, naming both.
+    #[test]
+    fn regions_that_overlap_each_other_or_the_image_are_refused_naming_both() {
+        let row = pico2_w();
+        let files = [region_file("regions-overlap", "a.region.bin", 0x3C_0000, 2), region_file("regions-overlap", "b.region.bin", 0x3C_1000, 1)];
+        let route = route_for(row, Some("probe")).expect("the probe route");
+        let refusal = prepare_regions(&files, row, route, &placed(row, route), None).expect_err("they overlap");
+        assert!(refusal.contains("a.region.bin lies from 0x103c0000 to 0x103c2000 and b.region.bin from 0x103c1000"), "{refusal}");
+        let long = image_file("regions-overlap", "long.bin", &stamped(0x3C_0100));
+        let region = [files[0].clone()];
+        for via in [None, Some("probe")] {
+            let route = route_for(row, via).expect("a route");
+            let placement = placed(row, route);
+            let prepared = prepare_image(&long, row, route, &placement).expect("the image fits the flash");
+            let refusal = prepare_regions(&region, row, route, &placement, Some(&prepared)).expect_err("the image reaches it");
+            assert!(refusal.contains("over a.region.bin from 0x103c0000"), "{via:?}: {refusal}");
+        }
+    }
+
     /// The block `numbered` as `number` of `count`, its other fields as they were.
     fn numbered(mut block: Vec<u8>, number: u32, count: u32) -> Vec<u8> {
         block[20..24].copy_from_slice(&number.to_le_bytes());
@@ -3557,22 +3992,26 @@ mod tests {
         }
     }
 
-    /// The Pimoroni Pico LiPo 2 and Pico LiPo 2 XL W and the two Adafruit Feather RP2350s, with
-    /// and without PSRAM.
-    const LIPO_2_AND_FEATHER_RP2350_BOARDS: [&str; 4] = [
+    /// The Pimoroni Pico LiPo 2 and Pico LiPo 2 XL W, the two Adafruit Feather RP2350s and the two
+    /// Adafruit Metro RP2350s, each with and without PSRAM, and the SparkFun IoT RedBoard - RP2350.
+    const LIPO_2_AND_FEATHER_RP2350_BOARDS: [&str; 7] = [
         "pimoroni-pico-lipo-2",
         "pimoroni-pico-lipo-2-xl-w",
         "adafruit-feather-rp2350-hstx",
         "adafruit-feather-rp2350-hstx-psram",
+        "adafruit-metro-rp2350",
+        "adafruit-metro-rp2350-psram",
+        "sparkfun-iot-redboard-rp2350",
     ];
 
-    /// The two Pimoroni Pico LiPo 2s and the two Adafruit Feather RP2350s take the Pico 2's two
-    /// routes: the bootloader drive by default, which checks the RP2350 family, and by `--via probe`
-    /// the route that reads every byte back.
+    /// The two Pimoroni Pico LiPo 2s, the two Adafruit Feather RP2350s, the two Adafruit Metro
+    /// RP2350s and the SparkFun IoT RedBoard - RP2350 take the Pico 2's two routes: the bootloader
+    /// drive by default, which checks the RP2350 family, and by `--via probe` the route that reads
+    /// every byte back.
     ///
-    /// Each carries the Pico 2's die, the two Pimoroni boards in its QFN-80 package and the two
-    /// Feathers in its QFN-60, so the bootrom, the memory map and the boot block are the Pico 2's,
-    /// and so is every fact a route states.
+    /// Each carries the Pico 2's die, the Pimoroni, Metro and SparkFun boards in its QFN-80 package
+    /// and the two Feathers in its QFN-60, so the bootrom, the memory map and the boot block are the
+    /// Pico 2's, and so is every fact a route states.
     #[test]
     fn the_pico_lipo_2s_and_the_feather_rp2350s_take_the_pico_2s_two_routes() {
         for board in LIPO_2_AND_FEATHER_RP2350_BOARDS {
@@ -3593,11 +4032,7 @@ mod tests {
                 "{board}: the probe route, which reads every byte back"
             );
             assert_eq!(uf2_family_for_board(board), Some(RP2350_UF2_FAMILY), "{board}");
-            assert_eq!(
-                aot_target_for(board),
-                Err(NoAotTarget::WritableButNotBuildable),
-                "{board}: written, and not built for until it has an archive of its own"
-            );
+            assert_eq!(aot_target_for(board), Ok("rp2350"), "{board}: built for, with an archive of its own");
         }
     }
 
@@ -3613,13 +4048,14 @@ mod tests {
     #[test]
     fn an_rp2350_rows_block_erase_follows_the_flash_part_its_board_names() {
         const TAKES_THE_BLOCK_ERASE: [&str; 2] = ["W25Q32RV", "W25Q128JV"];
-        const NAMED_BY_A_DOCUMENT: [(&str, &str, &str); 6] = [
+        const NAMED_BY_A_DOCUMENT: [(&str, &str, &str); 7] = [
             ("raspberrypi-pico-2", "W25Q32RV", "the Pico 2 datasheet: flash (Winbond W25Q32RV)"),
             ("raspberrypi-pico-2-w", "W25Q32RV", "its schematic, RPI-PICO2W rev 2 sheet 1: U3 W25Q32RVXHJQ"),
             ("pimoroni-pico-plus-2", "W25Q128JV", "its schematic, sheet 2: U2 W25Q128JVPIQ"),
             ("pimoroni-pico-plus-2-w", "W25Q128JV", "its schematic, sheet 2: U2 W25Q128JVPIQ"),
             ("pimoroni-pico-lipo-2", "W25Q128JV", "its schematic, sheet 2: U2 W25Q128JVPIQ"),
             ("pimoroni-pico-lipo-2-xl-w", "W25Q128JV", "its schematic, sheet 2: U2 W25Q128JVPIQ"),
+            ("sparkfun-iot-redboard-rp2350", "W25Q128JV", "its schematic, core sheet: U3 W25Q128JVPIM"),
         ];
         let takes_the_block_erase =
             |part: &str| TAKES_THE_BLOCK_ERASE.iter().any(|takes| part.starts_with(takes));
@@ -3657,7 +4093,7 @@ mod tests {
             );
             checked += 1;
         }
-        assert_eq!(checked, 8, "every RP2350 row, and only those, has a probe route to check");
+        assert_eq!(checked, 11, "every RP2350 row, and only those, has a probe route to check");
     }
 
     /// An image that carries no PICOBIN block is refused for each of these boards on both routes,

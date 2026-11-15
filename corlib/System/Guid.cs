@@ -1,7 +1,11 @@
 // Lamella managed corlib (from scratch). -- System.Guid
 namespace System
 {
+#if LAMELLA_SURFACE_NETFX_2_0
+    public struct Guid : IComparable, IFormattable
+#else
     public struct Guid : IComparable
+#endif
     {
         private int _a;
         private short _b;
@@ -49,11 +53,12 @@ namespace System
             _k = b[15];
         }
 
+        // Construct from D, N, B, P or X text. An overflowing 32-bit X field throws OverflowException.
         public Guid(string g)
         {
             if ((object)g == null) throw new ArgumentNullException("g");
             Guid parsed;
-            if (!TryParseCore(g, out parsed))
+            if (!TryParseCore(g, true, out parsed))
                 throw new FormatException("Guid should contain 32 digits with 4 dashes (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).");
             _a = parsed._a;
             _b = parsed._b;
@@ -138,12 +143,26 @@ namespace System
             return result.ToString();
         }
 
+#if LAMELLA_SURFACE_NETFX_2_0
+        /// <summary>Formats this value with <paramref name="format"/>. The provider is not used: nothing in
+        /// a Guid's text depends on a culture.</summary>
+        /// <param name="format">"D", "N", "B", "P" or "X", or null or empty for "D".</param>
+        /// <param name="provider">Not used.</param>
+        /// <returns>The text.</returns>
+        public string ToString(string format, IFormatProvider provider)
+        {
+            return ToString(format);
+        }
+#endif
+
+        private const string FormatRefusal = "Format string can be only \"D\", \"d\", \"N\", \"n\", \"P\", \"p\", \"B\", \"b\", \"X\" or \"x\".";
+
         public string ToString(string format)
         {
             char specifier = 'D';
             if ((object)format != null && format.Length != 0)
             {
-                if (format.Length != 1) throw new FormatException("Format string can be only \"D\", \"d\", \"N\", \"n\", \"P\", \"p\", \"B\", or \"b\".");
+                if (format.Length != 1) throw new FormatException(FormatRefusal);
                 specifier = format[0];
             }
             System.Text.StringBuilder result = new System.Text.StringBuilder();
@@ -181,7 +200,34 @@ namespace System
                 AppendBody(result);
                 return result.ToString();
             }
-            throw new FormatException("Format string can be only \"D\", \"d\", \"N\", \"n\", \"P\", \"p\", \"B\", or \"b\".");
+            if (specifier == 'X' || specifier == 'x')
+            {
+                result.Append("{0x");
+                AppendHex(result, _a, 8);
+                result.Append(",0x");
+                AppendHex(result, _b & 0xFFFF, 4);
+                result.Append(",0x");
+                AppendHex(result, _c & 0xFFFF, 4);
+                result.Append(",{0x");
+                AppendByte(result, _d);
+                result.Append(",0x");
+                AppendByte(result, _e);
+                result.Append(",0x");
+                AppendByte(result, _f);
+                result.Append(",0x");
+                AppendByte(result, _g);
+                result.Append(",0x");
+                AppendByte(result, _h);
+                result.Append(",0x");
+                AppendByte(result, _i);
+                result.Append(",0x");
+                AppendByte(result, _j);
+                result.Append(",0x");
+                AppendByte(result, _k);
+                result.Append("}}");
+                return result.ToString();
+            }
+            throw new FormatException(FormatRefusal);
         }
 
         private static int HexValue(char c)
@@ -215,7 +261,100 @@ namespace System
             return true;
         }
 
-        private static bool TryParseCore(string s, out Guid result)
+        private static void SkipXWhiteSpace(string s, ref int index, int end)
+        {
+            while (index < end && Char.IsWhiteSpace(s[index])) index++;
+        }
+
+        private static bool ReadXChar(string s, ref int index, int end, char expected)
+        {
+            SkipXWhiteSpace(s, ref index, end);
+            if (index == end || s[index] != expected) return false;
+            index++;
+            return true;
+        }
+
+        private static bool ReadXPrefix(string s, ref int index, int end)
+        {
+            if (!ReadXChar(s, ref index, end, '0')) return false;
+            SkipXWhiteSpace(s, ref index, end);
+            if (index == end || (s[index] != 'x' && s[index] != 'X')) return false;
+            index++;
+            return true;
+        }
+
+        // X fields require 0x, then accept a leading plus and a second hex prefix. Whitespace is
+        // insignificant even within a number. Find the delimiter before decoding to preserve the
+        // distinction between a missing delimiter and an overflowing number in the constructor.
+        private static bool ReadXNumber(string s, ref int index, int end, char delimiter,
+            bool throwOnOverflow, out int value)
+        {
+            value = 0;
+            if (!ReadXPrefix(s, ref index, end)) return false;
+            int limit = index;
+            while (limit < end && s[limit] != delimiter) limit++;
+            if (limit == end) return false;
+            SkipXWhiteSpace(s, ref index, limit);
+            if (index == limit) return false;
+            if (s[index] == '+') index++;
+            int prefix = index;
+            if (ReadXPrefix(s, ref prefix, limit)) index = prefix;
+            uint number = 0;
+            while (index < limit)
+            {
+                char ch = s[index];
+                index++;
+                if (Char.IsWhiteSpace(ch)) continue;
+                int digit = HexValue(ch);
+                if (digit < 0) return false;
+                if (number > 0x0fffffff)
+                {
+                    if (throwOnOverflow) throw new OverflowException("Value was too large for a UInt32.");
+                    return false;
+                }
+                number = (number << 4) | (uint)digit;
+            }
+            value = unchecked((int)number);
+            index = limit + 1;
+            return true;
+        }
+
+        private static bool ReadXByte(string s, ref int index, int end, char delimiter,
+            bool throwOnOverflow, out int value)
+        {
+            if (!ReadXNumber(s, ref index, end, delimiter, throwOnOverflow, out value)) return false;
+            return (uint)value <= 255;
+        }
+
+        private static bool TryParseX(string s, int index, int end, bool throwOnOverflow, out Guid result)
+        {
+            result = new Guid();
+            int a, b, c, d, e, f, g, h, i, j, k;
+            if (!ReadXChar(s, ref index, end, '{')) return false;
+            if (!ReadXNumber(s, ref index, end, ',', throwOnOverflow, out a)) return false;
+            if (!ReadXNumber(s, ref index, end, ',', throwOnOverflow, out b)) return false;
+            if (!ReadXNumber(s, ref index, end, ',', throwOnOverflow, out c)) return false;
+            if (!ReadXChar(s, ref index, end, '{')) return false;
+            if (!ReadXByte(s, ref index, end, ',', throwOnOverflow, out d)) return false;
+            if (!ReadXByte(s, ref index, end, ',', throwOnOverflow, out e)) return false;
+            if (!ReadXByte(s, ref index, end, ',', throwOnOverflow, out f)) return false;
+            if (!ReadXByte(s, ref index, end, ',', throwOnOverflow, out g)) return false;
+            if (!ReadXByte(s, ref index, end, ',', throwOnOverflow, out h)) return false;
+            if (!ReadXByte(s, ref index, end, ',', throwOnOverflow, out i)) return false;
+            if (!ReadXByte(s, ref index, end, ',', throwOnOverflow, out j)) return false;
+            if (!ReadXByte(s, ref index, end, '}', throwOnOverflow, out k)) return false;
+            if (!ReadXChar(s, ref index, end, '}')) return false;
+            SkipXWhiteSpace(s, ref index, end);
+            if (index != end) return false;
+            // The second and third X fields retain the low 16 bits of the parsed unsigned value.
+            result = new Guid(a, unchecked((short)b), unchecked((short)c),
+                (byte)d, (byte)e, (byte)f, (byte)g, (byte)h, (byte)i, (byte)j, (byte)k);
+            return true;
+        }
+
+        // Parse, TryParse and the string constructor share the five formats and case-insensitive hex.
+        // Only the constructor reports an overflowing 32-bit X field as OverflowException.
+        private static bool TryParseCore(string s, bool throwOnOverflow, out Guid result)
         {
             result = new Guid();
             if ((object)s == null) return false;
@@ -227,6 +366,12 @@ namespace System
             if (length == 0) return false;
 
             char open = s[start];
+            if (open == '{')
+            {
+                int prefix = start + 1;
+                if (ReadXPrefix(s, ref prefix, end))
+                    return TryParseX(s, start, end, throwOnOverflow, out result);
+            }
             char close = (char)0;
             bool braced = false;
             if (open == '{') { close = '}'; braced = true; start = start + 1; end = end - 1; }
@@ -285,14 +430,14 @@ namespace System
         {
             if ((object)input == null) throw new ArgumentNullException("input");
             Guid result;
-            if (!TryParseCore(input, out result))
+            if (!TryParseCore(input, false, out result))
                 throw new FormatException("Guid should contain 32 digits with 4 dashes (xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx).");
             return result;
         }
 
         public static bool TryParse(string input, out Guid result)
         {
-            return TryParseCore(input, out result);
+            return TryParseCore(input, false, out result);
         }
 #endif
 

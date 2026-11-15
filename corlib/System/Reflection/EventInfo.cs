@@ -7,15 +7,18 @@ namespace System.Reflection
         private string _name;
         private MethodInfo _add;
         private MethodInfo _remove;
+        private Type _declaringType;
 
-        internal EventInfo(string name, MethodInfo add, MethodInfo remove)
+        internal EventInfo(string name, MethodInfo add, MethodInfo remove, Type declaringType)
         {
             _name = name;
             _add = add;
             _remove = remove;
+            _declaringType = declaringType;
         }
 
         public override string Name { get { return _name; } }
+        public override Type DeclaringType { get { return _declaringType; } }
 
         public Type EventHandlerType
         {
@@ -42,7 +45,10 @@ namespace System.Reflection
             _remove.Invoke(target, new object[] { handler });
         }
 
-        public override object[] GetCustomAttributes(bool inherit) { return new object[0]; }
+        public override object[] GetCustomAttributes(bool inherit)
+        {
+            return _declaringType.GetEventCustomAttributes(_name, inherit);
+        }
     }
 }
 #endif

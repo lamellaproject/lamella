@@ -91,6 +91,18 @@ board-raspberrypi-pico-2 = ["console-memory", "clock-board", "dep:lamella-board-
 board-raspberrypi-pico-2-w = ["console-memory", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-raspberrypi-pico-2-w"]
 board-pimoroni-pico-plus-2 = ["console-memory", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-pimoroni-pico-plus-2", "psram-heap"]
 board-pimoroni-pico-plus-2-w = ["console-memory", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-pimoroni-pico-plus-2-w", "psram-heap"]
+# A micro:bit's board build keeps the console ring and nothing else of a board's own: its console
+# goes to the ring in RAM that its DAPLink reads, so a program that prints runs with no debugger
+# attached. Both micro:bits link the Thumb-1 archive, and each has a build of its own.
+board-bbc-micro-bit-v1 = ["console-memory"]
+board-bbc-micro-bit-v2 = ["console-memory"]
+board-adafruit-feather-rp2350-hstx = ["console-memory", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-adafruit-feather-rp2350-hstx"]
+board-adafruit-feather-rp2350-hstx-psram = ["console-memory", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-adafruit-feather-rp2350-hstx-psram"]
+board-adafruit-metro-rp2350 = ["console-memory", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-adafruit-metro-rp2350"]
+board-adafruit-metro-rp2350-psram = ["console-memory", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-adafruit-metro-rp2350-psram"]
+board-pimoroni-pico-lipo-2 = ["console-memory", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-pimoroni-pico-lipo-2", "psram-heap"]
+board-pimoroni-pico-lipo-2-xl-w = ["console-memory", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-pimoroni-pico-lipo-2-xl-w", "psram-heap"]
+board-sparkfun-iot-redboard-rp2350 = ["console-memory", "clock-board", "dep:lamella-board-support", "lamella-board-support/board-sparkfun-iot-redboard-rp2350", "psram-heap"]
 # The managed heap takes the PSRAM the board's startup brought up as its SECOND SEGMENT: objects go
 # to the SRAM band first and spill into the PSRAM once it is full, and one collection covers both.
 # Selected by the board features of a board that fits a PSRAM, never on its own: the window comes

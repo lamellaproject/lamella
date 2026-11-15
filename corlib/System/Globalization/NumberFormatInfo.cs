@@ -48,7 +48,7 @@ namespace System.Globalization
 
         public object GetFormat(System.Type formatType)
         {
-            return this;
+            return formatType == typeof(NumberFormatInfo) ? this : null;
         }
     }
 }

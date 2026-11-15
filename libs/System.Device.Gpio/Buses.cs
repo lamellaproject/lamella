@@ -33,10 +33,11 @@ namespace Lamella.Hardware
     /// assembly carries.</summary>
     internal sealed class Buses
     {
-        /// <summary>The number of logical buses of each kind, and of PWM chips, so valid ids are 0
-        /// to <c>BusCount - 1</c>. A bus id or a chip is a LOGICAL index the board maps onto a
-        /// peripheral instance, not a peripheral instance number, which is what keeps this a
-        /// framework constant rather than a per-chip fact.</summary>
+        /// <summary>How many SPI buses and how many I2C buses the table holds: valid ids are 0 to
+        /// <c>BusCount - 1</c>. A bus id is the number of the chip block that serves the bus, as
+        /// SERCOM3 is I2C bus 3 and SPI1 is SPI bus 1, so a board on a chip whose bus blocks number
+        /// past 7 needs this raised. The PWM chips are counted by the board's part instead, as
+        /// <see cref="PwmChipCount"/>.</summary>
         public const int BusCount = 8;
 
         private Buses() { }
@@ -54,7 +55,7 @@ namespace Lamella.Hardware
         private static GpioDriverFactory _gpioFactory;
         private static GpioDriver _gpioDriver;
 #if LAMELLA_SURFACE_FLOAT
-        private static readonly PwmChannelFactory[] _pwmFactories = new PwmChannelFactory[BusCount];
+        private static PwmChannelFactory[] _pwmFactories = new PwmChannelFactory[BusCount];
 #endif
 
         /// <summary>Binds the factory that creates SPI bus <paramref name="busId"/>'s driver.
@@ -104,6 +105,31 @@ namespace Lamella.Hardware
         }
 
 #if LAMELLA_SURFACE_FLOAT
+        /// <summary>How many PWM chips the board's part has, so a chip runs from 0 to
+        /// <c>PwmChipCount - 1</c>. A chip is the chip's own number for the block it names, as PWM
+        /// chip n is an RP2350's slice n, so how many there are is a fact of the part: an RP2350A's
+        /// pins carry slices 0 to 7 and an RP2350B's 0 to 11. <see cref="BusCount"/> until a board's
+        /// class states its part's with <see cref="SetPwmChipCount"/>.</summary>
+        public static int PwmChipCount
+        {
+            get { return _pwmFactories.Length; }
+        }
+
+        /// <summary>States how many PWM chips the board's part has, the count the board's facts give.
+        /// A board's class states it in its type initializer, before it binds a chip; stating the
+        /// count already stated does nothing.</summary>
+        /// <exception cref="System.InvalidOperationException">A chip is already bound under another
+        /// count.</exception>
+        public static void SetPwmChipCount(int count)
+        {
+            if (count == _pwmFactories.Length) return;
+            if (AnyPwmBound())
+            {
+                throw new System.InvalidOperationException("a board's PWM chips are counted before any is bound");
+            }
+            _pwmFactories = new PwmChannelFactory[count];
+        }
+
         /// <summary>Binds the factory that creates PWM chip <paramref name="chip"/>'s channels.
         /// Call it once per chip during board startup; the factory runs each time
         /// <see cref="System.Device.Pwm.PwmChannel.Create(int, int, int, double)"/> names the
@@ -346,10 +372,20 @@ namespace Lamella.Hardware
 
         private static void CheckChip(int chip)
         {
-            if (chip < 0 || chip >= BusCount)
+            if (chip < 0 || chip >= _pwmFactories.Length)
             {
                 throw new System.ArgumentOutOfRangeException("chip");
             }
+        }
+
+        /// <summary>Whether a factory is bound for any PWM chip.</summary>
+        private static bool AnyPwmBound()
+        {
+            for (int chip = 0; chip < _pwmFactories.Length; chip++)
+            {
+                if ((object)_pwmFactories[chip] != null) return true;
+            }
+            return false;
         }
 #endif
 
@@ -416,10 +452,10 @@ namespace Lamella.Hardware
             for (int index = 0; index < BusCount; index++)
             {
                 if ((object)_spiFactories[index] != null || (object)_i2cFactories[index] != null) return true;
-#if LAMELLA_SURFACE_FLOAT
-                if ((object)_pwmFactories[index] != null) return true;
-#endif
             }
+#if LAMELLA_SURFACE_FLOAT
+            if (AnyPwmBound()) return true;
+#endif
             return false;
         }
 

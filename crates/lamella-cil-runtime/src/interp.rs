@@ -226,6 +226,13 @@ pub struct Vm {
     /// the compactor remaps these keys at every collection ([`run_collection`]) just as it does the
     /// exception-message table.
     locks: BTreeMap<u32, LockState>,
+    /// Reflection references live as metadata handles rather than heap objects. Each handle
+    /// used as a monitor gets one private heap object, shared by all monitor operations.
+    /// These objects remain rooted for the VM's lifetime, including while their locks are idle.
+    reflection_monitors: BTreeMap<CastElem, ObjectRef>,
+    /// One representative metadata handle per resolved Type identity. Returning the same
+    /// handle makes raw object-reference comparisons agree with reflection equality.
+    reflection_type_handles: BTreeMap<CastElem, i64>,
     /// Threads whose most recent timed `Monitor.Wait` ended by its DEADLINE rather than by a pulse.
     ///
     /// The outcome cannot be the parking intrinsic's return value: that call returns BEFORE the
@@ -405,6 +412,24 @@ impl Vm {
         self.heap.set_object_budget(budget);
     }
 
+    /// Sets a fixed collection interval, in allocations, in place of the adaptive threshold
+    /// (`None`, the default, restores it). `Some(1)` collects at the instruction boundary after
+    /// every allocation, the stress setting for testing the collector's roots. See
+    /// [`Heap::set_collection_interval`].
+    #[cfg(feature = "gc")]
+    pub fn set_collection_interval(&mut self, interval: Option<core::num::NonZeroUsize>) {
+        self.heap.set_collection_interval(interval);
+    }
+
+    /// Makes every collection move every object that survives it (`false`, the default, compacts
+    /// in place), so a reference the collector cannot see is wrong after any collection rather
+    /// than only after one that reclaimed something below its object. The other stress setting,
+    /// beside [`Vm::set_collection_interval`]. See [`Heap::set_move_every_survivor`].
+    #[cfg(feature = "gc")]
+    pub fn set_move_every_survivor(&mut self, move_every_survivor: bool) {
+        self.heap.set_move_every_survivor(move_every_survivor);
+    }
+
     /// Reserves the next green-thread id (`Thread.Start`). Ids start at 1; thread 0 is main.
     pub fn alloc_thread_id(&mut self) -> u32 {
         if self.next_thread_id == 0 {
@@ -466,6 +491,22 @@ impl Vm {
 
     fn live_thread_count(&self) -> u32 {
         self.live_thread_count
+    }
+
+    /// Interns a resolved Type reference while retaining a real handle for metadata lookup.
+    pub(crate) fn reflection_type_handle(&mut self, identity: CastElem, handle: i64) -> i64 {
+        *self.reflection_type_handles.entry(identity).or_insert(handle)
+    }
+
+    /// The private monitor object for a canonical reflection identity. The caller resolves
+    /// cross-assembly aliases before looking it up; collection relocates the cached reference.
+    pub(crate) fn reflection_monitor(&mut self, handle: CastElem) -> ObjectRef {
+        if let Some(&object) = self.reflection_monitors.get(&handle) {
+            return object;
+        }
+        let object = self.heap.alloc_array(Vec::new());
+        self.reflection_monitors.insert(handle, object);
+        object
     }
 
     /// Acquires the `Monitor` lock on object `obj` (its heap index) for `thread`. Returns `true` if
@@ -1779,6 +1820,9 @@ struct Frame {
     /// What every step of `method` reads from the module, resolved once when the frame is set up.
     context: MethodContext,
     ip: usize,
+    /// The instruction whose execution can propagate an exception into this frame.
+    /// Kept separately because a lazy initializer rewinds `ip` to replay its trigger.
+    fault_ip: usize,
     stack: Vec<Value>,
     locals: Vec<Value>,
     args: Vec<Value>,
@@ -1811,6 +1855,8 @@ struct Frame {
     /// A `constrained.` prefix awaiting the next `callvirt`: the type to resolve the call
     /// against (the receiver stays a managed pointer to the value type).
     pending_constraint: Option<Token>,
+    /// A `readonly.` prefix applies to the next non-prefix instruction.
+    pending_readonly: bool,
     /// The frame's `localloc` (`stackalloc`) buffers: flat zeroed byte blocks a managed
     /// pointer (`Location::Stack`) indexes into. They live as long as the frame and are
     /// dropped with it on return, giving `stackalloc`'s lifetime. Empty for the common
@@ -1898,6 +1944,7 @@ impl FramePool {
                 frame.method = method;
                 frame.context = context;
                 frame.ip = 0;
+                frame.fault_ip = 0;
                 self.give_values(core::mem::replace(&mut frame.args, args));
                 frame
             }
@@ -1922,6 +1969,7 @@ impl FramePool {
         frame.pending_filter = None;
         frame.multicast = None;
         frame.pending_constraint = None;
+        frame.pending_readonly = false;
         frame.varargs = None;
         self.shells.push(frame);
     }
@@ -2201,7 +2249,7 @@ pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Val
     loop {
         let instruction = body.code.get(frame.ip).ok_or(Trap::FellThroughEnd)?;
         frame.ip += 1;
-        match step(&mut frame, 0, body.code.len(), None, &mut vm, instruction)? {
+        match step(&mut frame, 0, &[], body.code.len(), None, &mut vm, instruction)? {
             Flow::Next => {}
             Flow::Return(result) => return Ok(result),
             Flow::Call { .. } | Flow::CallVararg { .. } => {
@@ -2406,6 +2454,9 @@ fn is_lock_blocked(state: &ThreadState) -> bool {
     matches!(state, ThreadState::Blocked | ThreadState::BlockedUntil(_))
 }
 
+/// The park a bounded idle wait adds for its bound ([`idle_wait`]): an id no thread has.
+const BOUNDED_WAIT: u32 = u32::MAX;
+
 /// The next runnable thread at or after `start` (round-robin, wrapping); `None` once every thread is
 /// finished or blocked.
 fn next_ready_thread(threads: &[ThreadSlot], start: usize) -> Option<usize> {
@@ -2439,7 +2490,11 @@ impl crate::reactor::ReactorEnv for Vm {
 /// the SAME impl; here it is fed the interpreter's parked threads and applies the wake back to their
 /// slots. Returns `false` when nothing is waitable -- the remaining threads are lock/join-deadlocked
 /// and the scheduler stops. The single OS block point / tickless-idle foundation.
-fn idle_wait(threads: &mut [ThreadSlot], vm: &mut Vm) -> bool {
+///
+/// `until` bounds the wait at that machine-clock time, for a debug run that must come back to its
+/// debugger ([`Threads::debug_run`]): the wait then ends there whether or not a thread woke. A bound
+/// never makes something waitable, so a program with nothing to wait for still answers `false`.
+fn idle_wait(threads: &mut [ThreadSlot], vm: &mut Vm, until: Option<u64>) -> bool {
     use crate::reactor::WaitReason;
     let mut parks: alloc::vec::Vec<(u32, WaitReason)> = alloc::vec::Vec::new();
     for slot in threads.iter() {
@@ -2457,6 +2512,9 @@ fn idle_wait(threads: &mut [ThreadSlot], vm: &mut Vm) -> bool {
             }
             _ => {}
         }
+    }
+    if let Some(until) = until.filter(|_| !parks.is_empty()) {
+        parks.push((BOUNDED_WAIT, crate::reactor::WaitReason::Sleep(until)));
     }
     match crate::reactor::block_point(&parks, vm) {
         None => false,
@@ -2491,8 +2549,87 @@ enum ThreadStatus {
     Done(Option<Value>),
     Yielded,
     /// The service callback asked the scheduler to stop -- the embedder is taking the machine back
-    /// (a host `HELLO` reclaiming a board from the app it deployed).
+    /// (a host `HELLO` reclaiming a board from the app it deployed). In a debug run, also the run
+    /// stopping the thread part-way through its turn, for the reason it leaves in
+    /// [`Watching::suspension`]; the turn goes on from there at the next call.
     Interrupted,
+}
+
+/// Why a debug run stopped a thread part-way through its turn ([`Watching::suspension`]).
+#[derive(Clone, Copy)]
+enum Suspension {
+    /// The thread is about to run an instruction with an enabled breakpoint, which it has not run.
+    Breakpoint,
+    /// The thread the run watches has run its one instruction.
+    Stepped,
+    /// The run has spent its instructions or reached its time.
+    Spent,
+}
+
+/// Why the scheduler ended a debug run's slice short of the program's end ([`Watching::end`]): every
+/// [`Slice`] except [`Slice::Finished`].
+#[derive(Clone, Copy)]
+enum Ended {
+    /// See [`Slice::Running`].
+    Running,
+    /// See [`Slice::Breakpoint`].
+    Breakpoint(u32),
+    /// See [`Slice::Stepped`].
+    Stepped(u32),
+    /// See [`Slice::Waiting`].
+    Waiting,
+}
+
+/// What a debug run watches for, as the thread taking a turn sees it ([`Session::run_until_yield`]).
+#[derive(Default)]
+struct Watching {
+    /// The thread a step watches: it stops once it has run one instruction.
+    step: Option<u32>,
+    /// Whether the thread taking this turn is the one [`Watching::step`] names. Its next instruction
+    /// runs although a breakpoint is set on it, as a step moves off whatever instruction it is on.
+    watched: bool,
+    /// Whether the thread taking this turn runs its next instruction although a breakpoint is set on
+    /// it: the thread a debugger reported stopped there, going on.
+    stepping_off: bool,
+    /// Whether the watched thread has run its instruction.
+    stepped: bool,
+    /// The instructions the run may still take, across every thread.
+    budget: u32,
+    /// The machine-clock time (monotonic milliseconds) the run ends at, where the machine has a clock.
+    until: Option<u64>,
+    /// Why the run stopped the thread taking its turn part-way through it, once it has.
+    suspension: Option<Suspension>,
+    /// Why the scheduler ended the run's slice, once it has ([`Watching::end`]).
+    ended: Option<Ended>,
+}
+
+impl Watching {
+    /// Whether the run has reached its time.
+    fn past(&self, vm: &Vm) -> bool {
+        match (self.until, vm.now_millis()) {
+            (Some(until), Some(now)) => now >= until,
+            _ => false,
+        }
+    }
+
+    /// Whether the run's time can be told: it names one, and the machine has a clock.
+    fn timed(&self, vm: &Vm) -> bool {
+        self.until.is_some() && vm.now_millis().is_some()
+    }
+
+    /// Ends the slice for `why`. The scheduler returns that as its run's interruption, and
+    /// [`Threads::debug_run`] answers the reason left here.
+    fn end(&mut self, why: Ended) -> Ran {
+        self.ended = Some(why);
+        Ran::Interrupted
+    }
+
+    /// Stops the thread taking its turn part-way through it, for `why`: what the thread returns as
+    /// its turn's interruption, the reason left here for the scheduler.
+    fn suspend(&mut self, why: Suspension) -> ThreadStatus {
+        self.suspension = Some(why);
+        ThreadStatus::Interrupted
+    }
 }
 
 /// Runs `module`'s `entry` (with `args`) to completion, returning its result.
@@ -2806,126 +2943,412 @@ pub fn run_interruptible(
     {
         return Err(Trap::StaticCtorsNotRun);
     }
-    let mut threads = alloc::vec![ThreadSlot {
-        id: 0,
-        session: Session::new(module, entry, args)?,
-        state: ThreadState::Ready,
-        result: None,
-        background: false,
-    }];
-    let mut cursor = 0usize;
-    let mut live = 1u32;
-    loop {
-        if threads
-            .iter()
-            .all(|slot| slot.background || slot.state == ThreadState::Done)
-        {
-            break;
+    let mut threads = Threads::with_main(Session::new(module, entry, args)?);
+    threads.schedule::<false>(module, vm, service, &mut Watching::default())
+}
+
+/// The program's threads under the cooperative scheduler, kept between calls: what
+/// [`run_interruptible`] runs to the end in one call, held so a debugger can run the program a slice
+/// at a time ([`Threads::debug_run`]) and look at each thread between slices.
+///
+/// The entry is thread 0, the main thread, and a `Thread.Start` adds a thread as a fresh [`Session`]
+/// (a thread IS a reified session). The scheduler gives the threads turns: a thread runs until it
+/// finishes, reaches a yield point (`Thread.Yield` / `Sleep` / `Join`, a contended lock, a blocking
+/// socket, signalled through the [`Vm`]'s thread-op channel) or spends its quantum, then the next
+/// runnable thread runs. With a single thread -- the common case, and every program that spawns none
+/// -- that reduces to running thread 0 to completion.
+///
+/// A debug run stops a thread part-way through its turn and, when called again, goes on with that
+/// same turn, so a program's threads interleave under the debugger exactly as they do without it.
+pub struct Threads {
+    slots: Vec<ThreadSlot>,
+    /// Where the scheduler looks for the next runnable thread: the one taking a turn, while it does.
+    cursor: usize,
+    /// The number of live (not-finished) threads, mirrored to the Vm so a GC safepoint knows whether
+    /// to collect inline (one thread) or defer to the all-threads collection (many).
+    live: u32,
+    /// The quantum the thread at `cursor` has left, while a debug run has stopped it part-way through
+    /// its turn.
+    suspended: Option<u32>,
+    /// The thread that runs its next instruction although a breakpoint is set on it
+    /// ([`Threads::step_off`]).
+    stepping_off: Option<u32>,
+}
+
+/// What a debug run of the threads stops for, besides the program's end ([`Threads::debug_run`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Watch {
+    /// Stop once this thread has run one instruction: a debugger's single step. That instruction runs
+    /// although a breakpoint is set on it, as a step moves off whatever instruction it is on. Every
+    /// other thread runs meanwhile, as on .NET, and stops at a breakpoint. `None` runs the threads
+    /// until one reaches a breakpoint.
+    pub step: Option<u32>,
+    /// The most instructions the threads together run before the slice ends.
+    pub budget: u32,
+    /// The machine-clock time (monotonic milliseconds) the slice ends at, an idle wait included, on a
+    /// machine with a clock. Without one, a slice ends at its budget or after an idle wait.
+    pub until: Option<u64>,
+}
+
+/// Why a debug run's slice ended ([`Threads::debug_run`]).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Slice {
+    /// The slice spent its budget or reached its time with no thread stopped: the program runs on
+    /// when the run is called again.
+    Running,
+    /// Thread `id` has reached an instruction with an enabled breakpoint, which it has not run.
+    Breakpoint(u32),
+    /// The thread the slice watched ([`Watch::step`]) has run its one instruction.
+    Stepped(u32),
+    /// No thread can run and nothing will wake one: every thread left is asleep for good or blocked
+    /// on another. The program has not ended, as on .NET; only its debugger can end it now.
+    Waiting,
+    /// Every foreground thread has finished: the main thread's return.
+    Finished(Option<Value>),
+}
+
+impl Threads {
+    /// The threads of a program started at `entry` with `args`: the main thread alone, about to run
+    /// `entry`'s first instruction.
+    ///
+    /// # Errors
+    /// Returns [`Trap::NoSuchMethod`] if `entry` is not a managed method.
+    pub fn new(module: &Module, entry: MethodId, args: Vec<Value>) -> Result<Threads, Trap> {
+        Ok(Threads::with_main(Session::new(module, entry, args)?))
+    }
+
+    /// The threads of a program whose main thread is `session`, the only one, about to run.
+    fn with_main(session: Session) -> Threads {
+        Threads {
+            slots: alloc::vec![ThreadSlot {
+                id: 0,
+                session,
+                state: ThreadState::Ready,
+                result: None,
+                background: false,
+            }],
+            cursor: 0,
+            live: 1,
+            suspended: None,
+            stepping_off: None,
         }
-        drain_pin_events(module, vm, &mut threads)?;
-        let Some(index) = next_ready_thread(&threads, cursor) else {
-            if !service(vm) {
-                return Ok(Ran::Interrupted);
+    }
+
+    /// The thread `id` names, while it has not finished.
+    fn live_slot(&self, id: u32) -> Option<&ThreadSlot> {
+        self.slots
+            .iter()
+            .find(|slot| slot.id == id && slot.state != ThreadState::Done)
+    }
+
+    /// The threads that have not finished, by id, in the order they started: the main thread, 0,
+    /// first while it runs.
+    #[must_use]
+    pub fn ids(&self) -> Vec<u32> {
+        self.slots
+            .iter()
+            .filter(|slot| slot.state != ThreadState::Done)
+            .map(|slot| slot.id)
+            .collect()
+    }
+
+    /// Thread `id`'s session -- its call stack -- while it has not finished.
+    #[must_use]
+    pub fn session(&self, id: u32) -> Option<&Session> {
+        self.live_slot(id).map(|slot| &slot.session)
+    }
+
+    /// [`Threads::session`], to change: a debugger writing a variable.
+    pub fn session_mut(&mut self, id: u32) -> Option<&mut Session> {
+        self.slots
+            .iter_mut()
+            .find(|slot| slot.id == id && slot.state != ThreadState::Done)
+            .map(|slot| &mut slot.session)
+    }
+
+    /// The name thread `id`'s program gave it (`Thread.Name`), while it runs and has one.
+    ///
+    /// Read from the `System.Threading.Thread` whose id is this thread's, found on the heap at the
+    /// slots the loader recorded ([`Module::thread_slots`]). Nothing is kept alive to name a thread
+    /// by, so a debugged program's collections are a run's: a `Thread` the program no longer holds
+    /// has no name once a collection has reclaimed it. `None` for the main thread, an unnamed thread,
+    /// or a module whose corlib records no slots.
+    #[must_use]
+    pub fn thread_name(&self, module: &Module, vm: &Vm, id: u32) -> Option<String> {
+        if id == 0 {
+            return None;
+        }
+        self.live_slot(id)?;
+        let (id_slot, name_slot) = module.thread_slots()?;
+        let wanted = Value::Int32(i32::try_from(id).ok()?);
+        let heap = vm.heap();
+        let thread = (0..)
+            .map(ObjectRef)
+            .map_while(|reference| Some((reference, heap.get(reference)?)))
+            .find(|(_, object)| {
+                matches!(object, crate::object::Object::Instance { type_id, fields }
+                    if fields.get(id_slot as usize) == Some(&wanted)
+                        && module.type_full_name(*type_id) == Some("System.Threading.Thread"))
+            })?
+            .0;
+        let Some(Value::Object(name)) = heap.instance_field(thread, name_slot) else {
+            return None;
+        };
+        Some(String::from_utf16_lossy(&heap.as_string(name)?))
+    }
+
+    /// Whether thread `id` is waiting inside a call -- asleep, joining another thread, blocked on a
+    /// lock or a socket -- rather than about to run its next instruction. Its innermost frame is then
+    /// past the call it waits in.
+    #[must_use]
+    pub fn is_waiting(&self, id: u32) -> bool {
+        self.live_slot(id)
+            .is_some_and(|slot| slot.state != ThreadState::Ready)
+    }
+
+    /// The thread the scheduler gave the last turn to, while it has not finished; otherwise the
+    /// first that has not. `None` once every thread has finished.
+    #[must_use]
+    pub fn current(&self) -> Option<u32> {
+        self.slots
+            .get(self.cursor)
+            .filter(|slot| slot.state != ThreadState::Done)
+            .or_else(|| self.slots.iter().find(|slot| slot.state != ThreadState::Done))
+            .map(|slot| slot.id)
+    }
+
+    /// Lets thread `id` run its next instruction although a breakpoint is set on it: the thread a
+    /// debugger reported stopped at that breakpoint, going on. Without this a continue would stop on
+    /// the same breakpoint again at once.
+    pub fn step_off(&mut self, id: u32) {
+        self.stepping_off = Some(id);
+    }
+
+    /// Sets the breakpoints every thread stops at, replacing any set before: each a method and the
+    /// instruction a thread stops before, in the session's ip domain. A thread started later holds
+    /// them too: it takes the set of the thread that started it.
+    pub fn set_breakpoints(&mut self, breakpoints: &[(MethodId, u32)]) {
+        for slot in &mut self.slots {
+            slot.session.clear_breakpoints();
+            for &(method, instruction) in breakpoints {
+                slot.session.add_breakpoint(method, instruction);
             }
-            if idle_wait(&mut threads, vm) {
-                if !service(vm) {
+        }
+    }
+
+    /// Runs the threads for one slice of a debug session: until `watch` is met, a thread reaches a
+    /// breakpoint, the slice ends or the program does. See [`Slice`].
+    ///
+    /// The threads run as [`run_interruptible`] runs them, turn by turn, with no service callback;
+    /// a thread stopped part-way through its turn finishes that turn first when the run is called
+    /// again.
+    ///
+    /// # Errors
+    /// Propagates a [`Trap`] from any thread's execution, which ends the program.
+    pub fn debug_run(&mut self, module: &Module, vm: &mut Vm, watch: &Watch) -> Result<Slice, Trap> {
+        let mut watching = Watching {
+            step: watch.step,
+            budget: watch.budget,
+            until: watch.until,
+            ..Watching::default()
+        };
+        Ok(match self.schedule::<true>(module, vm, &mut |_| true, &mut watching)? {
+            Ran::Finished(result) => Slice::Finished(result),
+            Ran::Interrupted => match watching.ended {
+                Some(Ended::Running) | None => Slice::Running,
+                Some(Ended::Breakpoint(id)) => Slice::Breakpoint(id),
+                Some(Ended::Stepped(id)) => Slice::Stepped(id),
+                Some(Ended::Waiting) => Slice::Waiting,
+            },
+        })
+    }
+
+    /// The scheduler: gives the threads turns until every foreground thread has finished or
+    /// `service` stops the run, as [`run_interruptible`] runs them -- or, in a debug run, until the
+    /// slice ends ([`Threads::debug_run`]).
+    ///
+    /// `DEBUG` is a debug run's: it may stop a thread part-way through its turn and takes that turn up
+    /// first when called again, bounds its idle waits, watches for breakpoints and its step, and ends
+    /// its slice for the reason it leaves in `watching`. A run is the same code without those: none of
+    /// them is compiled into it, so a device's firmware carries none.
+    fn schedule<const DEBUG: bool>(
+        &mut self,
+        module: &Module,
+        vm: &mut Vm,
+        service: &mut dyn FnMut(&mut Vm) -> bool,
+        watching: &mut Watching,
+    ) -> Result<Ran, Trap> {
+        loop {
+            let resumed = if DEBUG { self.suspended.take() } else { None };
+            let (index, mut quantum) = if let Some(quantum) = resumed {
+                (self.cursor, quantum)
+            } else {
+                if self
+                    .slots
+                    .iter()
+                    .all(|slot| slot.background || slot.state == ThreadState::Done)
+                {
+                    break;
+                }
+                drain_pin_events(module, vm, &mut self.slots)?;
+                let Some(index) = next_ready_thread(&self.slots, self.cursor) else {
+                    if !service(vm) {
+                        return Ok(Ran::Interrupted);
+                    }
+                    if idle_wait(&mut self.slots, vm, if DEBUG { watching.until } else { None }) {
+                        if !service(vm) {
+                            return Ok(Ran::Interrupted);
+                        }
+                        if DEBUG && (!watching.timed(vm) || watching.past(vm)) {
+                            return Ok(watching.end(Ended::Running));
+                        }
+                        continue;
+                    }
+                    if self
+                        .slots
+                        .iter()
+                        .any(|slot| slot.state == ThreadState::SleepingForever)
+                    {
+                        if DEBUG {
+                            return Ok(watching.end(Ended::Waiting));
+                        }
+                        vm.sleep_millis(FOREVER_IDLE_SLICE_MS);
+                        continue;
+                    }
+                    if DEBUG {
+                        return Ok(watching.end(Ended::Waiting));
+                    }
+                    break;
+                };
+                self.cursor = index;
+                (index, TIME_SLICE_QUANTUM)
+            };
+            let id = self.slots[index].id;
+            vm.set_current_thread(id);
+            vm.set_live_thread_count(self.live);
+            if DEBUG {
+                watching.watched = watching.step == Some(id) && !watching.stepped;
+                watching.stepping_off = self.stepping_off == Some(id);
+            }
+            let status = self.slots[index]
+                .session
+                .run_until_yield::<DEBUG>(module, vm, service, &mut quantum, watching)?;
+            if DEBUG && self.stepping_off == Some(id) && !watching.stepping_off {
+                self.stepping_off = None;
+            }
+            match status {
+                ThreadStatus::Interrupted => {
+                    if DEBUG && let Some(why) = watching.suspension.take() {
+                        self.suspended = Some(quantum);
+                        return Ok(watching.end(match why {
+                            Suspension::Breakpoint => Ended::Breakpoint(id),
+                            Suspension::Stepped => Ended::Stepped(id),
+                            Suspension::Spent => Ended::Running,
+                        }));
+                    }
                     return Ok(Ran::Interrupted);
                 }
-                continue;
-            }
-            if threads.iter().any(|slot| slot.state == ThreadState::SleepingForever) {
-                vm.sleep_millis(FOREVER_IDLE_SLICE_MS);
-                continue;
-            }
-            break;
-        };
-        cursor = index;
-        vm.set_current_thread(threads[index].id);
-        vm.set_live_thread_count(live);
-        match threads[index].session.run_until_yield(module, vm, service)? {
-            ThreadStatus::Interrupted => return Ok(Ran::Interrupted),
-            ThreadStatus::Done(value) => {
-                let finished = threads[index].id;
-                threads[index].result = Some(value);
-                threads[index].state = ThreadState::Done;
-                vm.mark_thread_finished(finished);
-                live -= 1;
-                for slot in &mut threads {
-                    if matches!(slot.state, ThreadState::Joining(target, _) if target == finished) {
-                        slot.state = ThreadState::Ready;
+                ThreadStatus::Done(value) => {
+                    let finished = self.slots[index].id;
+                    self.slots[index].result = Some(value);
+                    self.slots[index].state = ThreadState::Done;
+                    vm.mark_thread_finished(finished);
+                    self.live -= 1;
+                    for slot in &mut self.slots {
+                        if matches!(slot.state, ThreadState::Joining(target, _) if target == finished) {
+                            slot.state = ThreadState::Ready;
+                        }
                     }
+                    self.cursor = index + 1;
                 }
-                cursor = index + 1;
-            }
-            ThreadStatus::Yielded => match vm.take_thread_op() {
-                Some(ThreadOp::Spawn { id, method, target, background }) => {
-                    let session = Session::new(module, method, delegate_call_args(&target, &[]))?;
-                    threads.push(ThreadSlot {
-                        id,
-                        session,
-                        state: ThreadState::Ready,
-                        result: None,
-                        background,
-                    });
-                    live += 1;
-                }
-                Some(ThreadOp::Yield) => cursor = index + 1,
-                Some(ThreadOp::Join { target, deadline }) => {
-                    let pending = threads
-                        .iter()
-                        .any(|slot| slot.id == target && slot.state != ThreadState::Done);
-                    if pending {
-                        threads[index].state = ThreadState::Joining(target, deadline);
+                ThreadStatus::Yielded => match vm.take_thread_op() {
+                    Some(ThreadOp::Spawn { id, method, target, background }) => {
+                        let mut session =
+                            Session::new(module, method, delegate_call_args(&target, &[]))?;
+                        if DEBUG {
+                            session.breakpoints = self.slots[index].session.breakpoints.clone();
+                        }
+                        self.slots.push(ThreadSlot {
+                            id,
+                            session,
+                            state: ThreadState::Ready,
+                            result: None,
+                            background,
+                        });
+                        self.live += 1;
                     }
-                    cursor = index + 1;
-                }
-                Some(ThreadOp::BlockOnLock { wake, deadline }) => {
-                    threads[index].state = match deadline {
-                        Some(deadline) => ThreadState::BlockedUntil(deadline),
-                        None => ThreadState::Blocked,
-                    };
-                    if let Some(id) = wake {
-                        for slot in &mut threads {
+                    Some(ThreadOp::Yield) => self.cursor = index + 1,
+                    Some(ThreadOp::Join { target, deadline }) => {
+                        let pending = self
+                            .slots
+                            .iter()
+                            .any(|slot| slot.id == target && slot.state != ThreadState::Done);
+                        if pending {
+                            self.slots[index].state = ThreadState::Joining(target, deadline);
+                        }
+                        self.cursor = index + 1;
+                    }
+                    Some(ThreadOp::BlockOnLock { wake, deadline }) => {
+                        self.slots[index].state = match deadline {
+                            Some(deadline) => ThreadState::BlockedUntil(deadline),
+                            None => ThreadState::Blocked,
+                        };
+                        if let Some(id) = wake {
+                            for slot in &mut self.slots {
+                                if slot.id == id && is_lock_blocked(&slot.state) {
+                                    slot.state = ThreadState::Ready;
+                                }
+                            }
+                        }
+                        self.cursor = index + 1;
+                    }
+                    Some(ThreadOp::WakeThread { id }) => {
+                        for slot in &mut self.slots {
                             if slot.id == id && is_lock_blocked(&slot.state) {
                                 slot.state = ThreadState::Ready;
                             }
                         }
+                        self.cursor = index + 1;
                     }
-                    cursor = index + 1;
-                }
-                Some(ThreadOp::WakeThread { id }) => {
-                    for slot in &mut threads {
-                        if slot.id == id && is_lock_blocked(&slot.state) {
-                            slot.state = ThreadState::Ready;
+                    Some(ThreadOp::SleepFor(millis)) => {
+                        let deadline = vm.now_millis().map_or(0, |now| now.saturating_add(millis));
+                        self.slots[index].state = ThreadState::Sleeping(deadline);
+                        self.cursor = index + 1;
+                    }
+                    Some(ThreadOp::SleepForever) => {
+                        self.slots[index].state = ThreadState::SleepingForever;
+                        self.cursor = index + 1;
+                    }
+                    Some(ThreadOp::BlockOnIo { socket, interest, deadline }) => {
+                        if let Some(backend) = vm.net_backend() {
+                            backend.register(socket, interest);
                         }
+                        self.slots[index].state = ThreadState::IoWait(socket, deadline);
+                        self.cursor = index + 1;
                     }
-                    cursor = index + 1;
+                    None => self.cursor = index + 1,
+                },
+            }
+            #[cfg(feature = "gc")]
+            if vm.take_force_collect() {
+                collect_all_threads(&mut self.slots, module, vm);
+            }
+            if DEBUG {
+                if let (true, Some(id)) = (watching.stepped, watching.step) {
+                    return Ok(watching.end(Ended::Stepped(id)));
                 }
-                Some(ThreadOp::SleepFor(millis)) => {
-                    let deadline = vm.now_millis().map_or(0, |now| now.saturating_add(millis));
-                    threads[index].state = ThreadState::Sleeping(deadline);
-                    cursor = index + 1;
+                if watching.past(vm) {
+                    return Ok(watching.end(Ended::Running));
                 }
-                Some(ThreadOp::SleepForever) => {
-                    threads[index].state = ThreadState::SleepingForever;
-                    cursor = index + 1;
-                }
-                Some(ThreadOp::BlockOnIo { socket, interest, deadline }) => {
-                    if let Some(backend) = vm.net_backend() {
-                        backend.register(socket, interest);
-                    }
-                    threads[index].state = ThreadState::IoWait(socket, deadline);
-                    cursor = index + 1;
-                }
-                None => cursor = index + 1,
-            },
+            }
         }
-        #[cfg(feature = "gc")]
-        if vm.take_force_collect() {
-            collect_all_threads(&mut threads, module, vm);
-        }
+        Ok(Ran::Finished(
+            self.slots
+                .first_mut()
+                .and_then(|slot| slot.result.take())
+                .flatten(),
+        ))
     }
-    Ok(Ran::Finished(threads.into_iter().next().and_then(|slot| slot.result).flatten()))
 }
 
 /// A steppable, inspectable execution: the foundation the debugger drives.
@@ -3197,28 +3620,53 @@ impl Session {
 
     /// Runs to completion OR until a threading intrinsic raises a scheduler request (the cooperative
     /// yield points: `Thread.Start` / `Join` / `Yield` / `Sleep`), whichever comes first. The
-    /// scheduler ([`run`]) then acts on the request and resumes a (possibly different) thread. With
-    /// no threading this never yields and is exactly [`Session::run`].
+    /// scheduler ([`Threads`]) then acts on the request and resumes a (possibly different) thread.
+    /// With no threading this never yields and is exactly [`Session::run`].
+    ///
+    /// `quantum` is the turn's time slice, counted down here. `DEBUG` is a debug run's
+    /// ([`Threads::debug_run`]): the thread then also stops part-way through its turn -- before an
+    /// instruction with a breakpoint, once the watched thread has run its one instruction, or when the
+    /// run's budget or time is spent -- leaving `quantum` where it got to. A run pays nothing for it.
     ///
     /// # Errors
     /// Returns a [`Trap`] if an instruction faults.
-    fn run_until_yield(
+    fn run_until_yield<const DEBUG: bool>(
         &mut self,
         module: &Module,
         vm: &mut Vm,
         service: &mut dyn FnMut(&mut Vm) -> bool,
+        quantum: &mut u32,
+        watching: &mut Watching,
     ) -> Result<ThreadStatus, Trap> {
-        let mut quantum = TIME_SLICE_QUANTUM;
         loop {
             if let Some(result) = &self.result {
                 return Ok(ThreadStatus::Done(result.clone()));
             }
+            if DEBUG {
+                if watching.budget == 0 {
+                    return Ok(watching.suspend(Suspension::Spent));
+                }
+                if !watching.watched && !watching.stepping_off && self.at_breakpoint() {
+                    return Ok(watching.suspend(Suspension::Breakpoint));
+                }
+                watching.budget -= 1;
+            }
             self.advance(module, vm)?;
+            if DEBUG {
+                watching.stepping_off = false;
+                if watching.watched {
+                    watching.watched = false;
+                    watching.stepped = true;
+                }
+                if let Some(result) = &self.result {
+                    return Ok(ThreadStatus::Done(result.clone()));
+                }
+            }
             if vm.has_thread_op() {
                 return Ok(ThreadStatus::Yielded);
             }
-            quantum -= 1;
-            if quantum == 0 {
+            *quantum -= 1;
+            if *quantum == 0 {
                 if !service(vm) {
                     return Ok(ThreadStatus::Interrupted);
                 }
@@ -3226,7 +3674,13 @@ impl Session {
                 if vm.live_thread_count() > 1 {
                     return Ok(ThreadStatus::Yielded);
                 }
-                quantum = TIME_SLICE_QUANTUM;
+                *quantum = TIME_SLICE_QUANTUM;
+                if DEBUG && watching.past(vm) {
+                    return Ok(watching.suspend(Suspension::Spent));
+                }
+            }
+            if DEBUG && watching.stepped {
+                return Ok(watching.suspend(Suspension::Stepped));
             }
         }
     }
@@ -3555,7 +4009,8 @@ impl Session {
             0 => return Ok(Status::Done(None)),
             len => len - 1,
         };
-        let top = &mut frames[current];
+        let (callers, current_frame) = frames.split_at_mut(current);
+        let top = &mut current_frame[0];
         let asm = top.context.asm;
         #[cfg(feature = "code-in-place")]
         let code = match top.context.code {
@@ -3565,6 +4020,7 @@ impl Session {
         #[cfg(not(feature = "code-in-place"))]
         let code = method_code(module, top.method)?;
         let instruction_ip = top.ip;
+        top.fault_ip = instruction_ip;
         #[cfg(not(feature = "code-in-place"))]
         let instruction = {
             let fetched = code.get(top.ip).ok_or(Trap::FellThroughEnd)?;
@@ -3581,7 +4037,7 @@ impl Session {
             top.ip = next_ip;
             &fetched_in_place
         };
-        let flow = match step(top, current, code.len(), Some(module), vm, instruction) {
+        let flow = match step(top, current, callers, code.len(), Some(module), vm, instruction) {
             Ok(flow) => flow,
             #[cfg(feature = "exceptions")]
             Err(trap) => match catchable_fault(&trap, module, vm, Some(top.method)) {
@@ -3618,7 +4074,8 @@ impl Session {
                     vm.frame_pool.retire(finished);
                 }
                 let returned_struct = returned_value_location
-                    .map(|location| read_byref(frames, vm, location));
+                    .map(|location| read_byref(frames, vm, location, Opcode::Newobj))
+                    .transpose()?;
                 match frames.last_mut() {
                     Some(caller) => {
                         if let Some(object) = returned_object {
@@ -3656,17 +4113,10 @@ impl Session {
                     Ok(Status::Running)
                 }
                 Some(MethodKind::Intrinsic(func)) => {
-                    #[cfg(feature = "gc")]
-                    vm.park_frames(core::mem::take(frames));
-                    let cctor = run_pending_cctor_nested(module, vm, method);
-                    #[cfg(feature = "gc")]
-                    {
-                        *frames = vm.unpark_frames();
-                    }
-                    cctor?;
                     let mut args = args;
+                    run_pending_cctor_nested(module, vm, method, frames, &mut args)?;
                     if !is_compare_exchange(module, method) {
-                        deref_byref_args_in_place(frames, vm, &mut args);
+                        deref_byref_args_in_place(frames, vm, &mut args)?;
                     }
                     #[cfg(feature = "gc")]
                     vm.park_frames(core::mem::take(frames));
@@ -3786,7 +4236,7 @@ impl Session {
                 }
                 Some(MethodKind::Intrinsic(_)) => {
                     vm.frame_pool.give_values(args);
-                    let value = read_byref(frames, vm, location);
+                    let value = read_byref(frames, vm, location, Opcode::Newobj)?;
                     frames
                         .last_mut()
                         .ok_or(Trap::CallStackOverflow)?
@@ -3907,7 +4357,13 @@ impl Session {
                 let slot = module
                     .field_slot(asm, field)
                     .ok_or_else(|| unresolved_field(module, asm, field))?;
-                let value = read_field_at(frames, vm, location, slot);
+                let value = if matches!(location, Location::Stack { .. }) {
+                    let (address, storage) = stack_field_address(module, asm, field, slot, location, Opcode::Ldfld)?;
+                    let bytes = stack_field_bytes(frames, module, &address, storage, Opcode::Ldfld)?;
+                    decode_stack_field(module, storage, bytes, 0)?
+                } else {
+                    read_field_at(frames, vm, location, slot)
+                };
                 frames
                     .get_mut(current)
                     .ok_or(Trap::StackUnderflow)?
@@ -3923,6 +4379,20 @@ impl Session {
                 let slot = module
                     .field_slot(asm, field)
                     .ok_or_else(|| unresolved_field(module, asm, field))?;
+                if matches!(location, Location::Stack { .. }) {
+                    let (address, storage) = stack_field_address(module, asm, field, slot, location, Opcode::Stfld)?;
+                    let mut bytes = stack_field_bytes(frames, module, &address, storage, Opcode::Stfld)?.to_vec();
+                    encode_stack_field(module, storage, &mut bytes, &value, 0)?;
+                    let Location::Stack { frame, buffer, offset } = address else {
+                        return Err(Trap::TypeMismatch(Opcode::Stfld));
+                    };
+                    let destination = frames.get_mut(frame)
+                        .and_then(|frame| frame.buffers.get_mut(buffer))
+                        .and_then(|buffer| buffer.get_mut(offset as usize..(offset as usize).checked_add(bytes.len())?))
+                        .ok_or(Trap::NullReference)?;
+                    destination.copy_from_slice(&bytes);
+                    return Ok(Status::Running);
+                }
                 let type_id = module
                     .field_type(asm, field)
                     .ok_or_else(|| unresolved_field(module, asm, field))?;
@@ -3938,7 +4408,7 @@ impl Session {
                 Ok(Status::Running)
             }
             Flow::LoadObj { location, opcode } => {
-                let value = narrow_loaded_int(read_byref(frames, vm, location), opcode);
+                let value = narrow_loaded_int(read_byref(frames, vm, location, opcode)?, opcode);
                 frames
                     .get_mut(current)
                     .ok_or(Trap::StackUnderflow)?
@@ -3951,7 +4421,7 @@ impl Session {
                 Ok(Status::Running)
             }
             Flow::CopyObj { dest, src } => {
-                let value = read_byref(frames, vm, src);
+                let value = read_byref(frames, vm, src, Opcode::Cpobj)?;
                 write_location_value(frames, vm, dest, value)?;
                 Ok(Status::Running)
             }
@@ -4169,15 +4639,155 @@ fn read_field_at(frames: &[Frame], vm: &Vm, location: Location, slot: u32) -> Va
     }
 }
 
+fn stack_field_address(
+    module: &Module,
+    asm: u8,
+    field: Token,
+    slot: u32,
+    base: Location,
+    opcode: Opcode,
+) -> Result<(Location, crate::module::FieldStorage), Trap> {
+    let owner = module.field_type(asm, field).ok_or_else(|| unresolved_field(module, asm, field))?;
+    let layout = module.type_field_offsets(owner).ok_or(Trap::Unsupported(opcode))?;
+    if slot as usize >= layout.slot_count() {
+        return Err(Trap::FieldSlotMissing { field, slot });
+    }
+    let displacement = layout.offset_of(slot as usize).ok_or(Trap::Unsupported(opcode))?;
+    let storage = module.type_field_storage(owner, slot as usize).ok_or(Trap::Unsupported(opcode))?;
+    let width = stack_field_width(module, storage, opcode)?;
+    if displacement.checked_add(width).is_none_or(|end| end > layout.end()) {
+        return Err(Trap::Unsupported(opcode));
+    }
+    let Location::Stack { frame, buffer, offset } = base else {
+        return Err(Trap::TypeMismatch(opcode));
+    };
+    Ok((Location::Stack {
+        frame, buffer, offset: offset.checked_add(displacement).ok_or(Trap::NullReference)?,
+    }, storage))
+}
+
+fn stack_field_width(module: &Module, storage: crate::module::FieldStorage, opcode: Opcode) -> Result<u32, Trap> {
+    use crate::module::FieldStorage;
+    match storage {
+        FieldStorage::Primitive(kind) if kind.packable() => Ok(kind.byte_width() as u32),
+        FieldStorage::Native => Ok(crate::native_pointer_size()),
+        FieldStorage::ValueType(id) => module.type_field_offsets(id).map(|layout| layout.end()).ok_or(Trap::Unsupported(opcode)),
+        _ => Err(Trap::Unsupported(opcode)),
+    }
+}
+
+fn stack_field_bytes<'a>(
+    frames: &'a [Frame], module: &Module, address: &Location,
+    storage: crate::module::FieldStorage, opcode: Opcode,
+) -> Result<&'a [u8], Trap> {
+    let Location::Stack { frame, buffer, offset } = address else {
+        return Err(Trap::TypeMismatch(opcode));
+    };
+    let width = stack_field_width(module, storage, opcode)? as usize;
+    let start = *offset as usize;
+    frames.get(*frame).and_then(|frame| frame.buffers.get(*buffer))
+        .and_then(|buffer| buffer.get(start..start.checked_add(width)?))
+        .ok_or(Trap::NullReference)
+}
+
+fn stack_field_opcodes(storage: crate::module::FieldStorage) -> Option<(Opcode, Opcode)> {
+    use crate::{module::FieldStorage, PrimKind};
+    Some(match storage {
+        FieldStorage::Primitive(kind) => match kind {
+            PrimKind::I1 => (Opcode::LdindI1, Opcode::StindI1),
+            PrimKind::U1 => (Opcode::LdindU1, Opcode::StindI1),
+            PrimKind::I2 => (Opcode::LdindI2, Opcode::StindI2),
+            PrimKind::U2 => (Opcode::LdindU2, Opcode::StindI2),
+            PrimKind::I4 => (Opcode::LdindI4, Opcode::StindI4),
+            PrimKind::I8 => (Opcode::LdindI8, Opcode::StindI8),
+            PrimKind::F4 => (Opcode::LdindR4, Opcode::StindR4),
+            PrimKind::F8 => (Opcode::LdindR8, Opcode::StindR8),
+        },
+        FieldStorage::Native => (Opcode::LdindI, Opcode::StindI),
+        _ => return None,
+    })
+}
+
+// Recursive metadata cannot expand the Rust call stack without bound.
+const MAX_STACK_FIELD_DEPTH: usize = 64;
+
+fn decode_stack_field(
+    module: &Module, storage: crate::module::FieldStorage, bytes: &[u8], depth: usize,
+) -> Result<Value, Trap> {
+    use crate::module::FieldStorage;
+    if depth >= MAX_STACK_FIELD_DEPTH {
+        return Err(Trap::Unsupported(Opcode::Ldfld));
+    }
+    if let Some((load, _)) = stack_field_opcodes(storage) {
+        let mut raw = [0; 8];
+        let destination = raw.get_mut(..bytes.len()).ok_or(Trap::Unsupported(Opcode::Ldfld))?;
+        destination.copy_from_slice(bytes);
+        if storage == FieldStorage::Native && crate::native_pointer_size() == 4 {
+            return Ok(Value::NativeInt(i32::from_le_bytes(raw[..4].try_into().unwrap()) as i64));
+        }
+        return stack_loaded_value(load, raw);
+    }
+    let FieldStorage::ValueType(id) = storage else { return Err(Trap::Unsupported(Opcode::Ldfld)) };
+    let layout = module.type_field_offsets(id).ok_or(Trap::Unsupported(Opcode::Ldfld))?;
+    let mut fields = Vec::new();
+    for slot in 0..layout.slot_count() {
+        let field = module.type_field_storage(id, slot).ok_or(Trap::Unsupported(Opcode::Ldfld))?;
+        let at = layout.offset_of(slot).ok_or(Trap::Unsupported(Opcode::Ldfld))? as usize;
+        let width = stack_field_width(module, field, Opcode::Ldfld)? as usize;
+        let end = at.checked_add(width).ok_or(Trap::Unsupported(Opcode::Ldfld))?;
+        let bytes = bytes.get(at..end).ok_or(Trap::Unsupported(Opcode::Ldfld))?;
+        fields.push(decode_stack_field(module, field, bytes, depth + 1)?);
+    }
+    if module.type_handle_of(id).is_some_and(|handle| module.is_enum_by_handle(handle)) {
+        if fields.len() != 1 { return Err(Trap::Unsupported(Opcode::Ldfld)) }
+        return Ok(fields.remove(0));
+    }
+    Ok(Value::Struct(fields.into_boxed_slice()))
+}
+
+fn encode_stack_field(
+    module: &Module, storage: crate::module::FieldStorage, bytes: &mut [u8], value: &Value, depth: usize,
+) -> Result<(), Trap> {
+    use crate::module::FieldStorage;
+    if depth >= MAX_STACK_FIELD_DEPTH {
+        return Err(Trap::Unsupported(Opcode::Stfld));
+    }
+    if let Some((_, store)) = stack_field_opcodes(storage) {
+        let raw = stack_stored_bytes(store, value.clone())?;
+        bytes.copy_from_slice(raw.get(..bytes.len()).ok_or(Trap::Unsupported(Opcode::Stfld))?);
+        return Ok(());
+    }
+    let FieldStorage::ValueType(id) = storage else { return Err(Trap::Unsupported(Opcode::Stfld)) };
+    let layout = module.type_field_offsets(id).ok_or(Trap::Unsupported(Opcode::Stfld))?;
+    let fields: &[Value] = if module.type_handle_of(id).is_some_and(|handle| module.is_enum_by_handle(handle)) {
+        core::slice::from_ref(value)
+    } else if let Value::Struct(fields) = value {
+        fields
+    } else {
+        return Err(Trap::TypeMismatch(Opcode::Stfld));
+    };
+    if fields.len() != layout.slot_count() { return Err(Trap::TypeMismatch(Opcode::Stfld)) }
+    for (slot, value) in fields.iter().enumerate() {
+        let field = module.type_field_storage(id, slot).ok_or(Trap::Unsupported(Opcode::Stfld))?;
+        let at = layout.offset_of(slot).ok_or(Trap::Unsupported(Opcode::Stfld))? as usize;
+        let width = stack_field_width(module, field, Opcode::Stfld)? as usize;
+        let end = at.checked_add(width).ok_or(Trap::Unsupported(Opcode::Stfld))?;
+        let bytes = bytes.get_mut(at..end).ok_or(Trap::Unsupported(Opcode::Stfld))?;
+        encode_stack_field(module, field, bytes, value, depth + 1)?;
+    }
+    Ok(())
+}
+
 /// Dereferences any managed-pointer argument to the value it points at, so an intrinsic
 /// (which works on values -- e.g. `Int32.ToString` on `&int`) sees the value, not the
 /// pointer.
-fn deref_byref_args_in_place(frames: &[Frame], vm: &Vm, args: &mut [Value]) {
+fn deref_byref_args_in_place(frames: &[Frame], vm: &Vm, args: &mut [Value]) -> Result<(), Trap> {
     for arg in args.iter_mut() {
         if let Value::ByRef(location) = arg {
-            *arg = read_byref(frames, vm, location.clone());
+            *arg = read_byref(frames, vm, location.clone(), Opcode::Call)?;
         }
     }
+    Ok(())
 }
 
 /// Materializes the string a `newobj String(char*[, int, int])` builds: decode the pointer
@@ -4333,17 +4943,23 @@ fn narrow_loaded_int(value: Value, opcode: Opcode) -> Value {
     }
 }
 
-/// The value a managed pointer refers to (for `ldobj` and intrinsic-argument deref);
-/// `Null` if the location holds nothing.
-fn read_byref(frames: &[Frame], vm: &Vm, location: Location) -> Value {
-    read_location_value(frames, vm, location).unwrap_or(Value::Null)
+/// Reads the whole value a managed pointer names. Raw stack bytes and other locations
+/// without a readable whole value are refused; they do not represent a null reference.
+fn read_byref(frames: &[Frame], vm: &Vm, location: Location, opcode: Opcode) -> Result<Value, Trap> {
+    read_location_value(frames, vm, location).ok_or(Trap::Unsupported(opcode))
 }
 
 /// The underlying integer of an enum value at a managed pointer this frame can reach (a
-/// local/argument of this frame, or a heap field/element/static) -- for Enum.ToString.
+/// local/argument of any live frame, or a heap field/element/static) -- for Enum.ToString.
 #[cfg(feature = "bcl")]
-fn read_enum_value(frame: &Frame, frame_index: usize, vm: &Vm, location: Location) -> Option<i64> {
-    match read_constrained_receiver(frame, frame_index, vm, &location)? {
+fn read_enum_value(
+    frame: &Frame,
+    frame_index: usize,
+    callers: &[Frame],
+    vm: &Vm,
+    location: Location,
+) -> Option<i64> {
+    match read_constrained_receiver(frame, frame_index, callers, vm, &location)? {
         Value::Int32(n) => Some(i64::from(n)),
         Value::Int64(n) => Some(n),
         _ => None,
@@ -4351,22 +4967,24 @@ fn read_enum_value(frame: &Frame, frame_index: usize, vm: &Vm, location: Locatio
 }
 
 /// The whole value a `constrained.` receiver's managed pointer names, for the III.2.1 box below --
-/// the same location set [`read_enum_value`] reads (this frame's locals and arguments, a heap
+/// the same location set [`read_enum_value`] reads (live frames' locals and arguments, a heap
 /// field, an array element, a static, a box interior), widened from an enum's integer to any value.
 ///
-/// Restricted to the CURRENT frame because a `constrained.` receiver is formed by `ldloca` /
-/// `ldarga` in the method making the call, or is a heap location that needs no frame at all; a
-/// pointer into an OUTER frame cannot arise at this site and reads as absent rather than as a
-/// wrong slot in this one.
+/// A by-reference parameter or a struct's `this` can name a caller's storage. The
+/// current frame is borrowed separately from its callers while an instruction runs.
 fn read_constrained_receiver(
     frame: &Frame,
     frame_index: usize,
+    callers: &[Frame],
     vm: &Vm,
     location: &Location,
 ) -> Option<Value> {
+    let containing_frame = |index| {
+        if index == frame_index { Some(frame) } else { callers.get(index) }
+    };
     match location {
-        Location::Local { frame: f, slot } if *f == frame_index => frame.locals.get(*slot).cloned(),
-        Location::Arg { frame: f, slot } if *f == frame_index => frame.args.get(*slot).cloned(),
+        Location::Local { frame: f, slot } => containing_frame(*f)?.locals.get(*slot).cloned(),
+        Location::Arg { frame: f, slot } => containing_frame(*f)?.args.get(*slot).cloned(),
         Location::Field { object, slot } => vm.heap().instance_field(*object, *slot),
         Location::Element {
             array,
@@ -4378,7 +4996,7 @@ fn read_constrained_receiver(
         Location::Static { slot } => vm.static_field(*slot),
         Location::Boxed { object } => vm.heap().boxed_value(*object),
         Location::Nested { base, slot } => {
-            match read_constrained_receiver(frame, frame_index, vm, base) {
+            match read_constrained_receiver(frame, frame_index, callers, vm, base) {
                 Some(Value::Struct(fields)) => fields.get(*slot as usize).cloned(),
                 _ => None,
             }
@@ -4716,7 +5334,18 @@ fn push_pending_cctor(
 /// Runs the not-yet-run `.cctor` of `method`'s declaring type as a NESTED session -- for
 /// the inline-intrinsic dispatch, which pushes no frame of its own (the same pattern the
 /// reflective intrinsics use to run attribute constructors).
-fn run_pending_cctor_nested(module: &Module, vm: &mut Vm, method: MethodId) -> Result<(), Trap> {
+///
+/// The caller's `frames` are parked for the run, and the call's `args`, which the call has
+/// already taken off the caller's stack, go back onto it until the run ends: a collection inside
+/// the constructor marks and relocates both, and `args` come back holding the new positions.
+/// Nothing is parked when no constructor runs.
+fn run_pending_cctor_nested(
+    module: &Module,
+    vm: &mut Vm,
+    method: MethodId,
+    frames: &mut Vec<Frame>,
+    args: &mut Vec<Value>,
+) -> Result<(), Trap> {
     let Some(type_id) = module.method_type(method) else {
         return Ok(());
     };
@@ -4724,8 +5353,27 @@ fn run_pending_cctor_nested(module: &Module, vm: &mut Vm, method: MethodId) -> R
                     .map_err(Trap::TypeInitializationFailed)? else {
         return Ok(());
     };
-    Session::new(module, cctor, Vec::new())?.run(module, vm)?;
-    Ok(())
+    #[cfg(feature = "gc")]
+    let count = args.len();
+    #[cfg(feature = "gc")]
+    {
+        if let Some(caller) = frames.last_mut() {
+            caller.stack.append(args);
+        }
+        vm.park_frames(core::mem::take(frames));
+    }
+    #[cfg(not(feature = "gc"))]
+    let _ = (frames, args);
+    let ran = Session::new(module, cctor, Vec::new()).and_then(|mut session| session.run(module, vm));
+    #[cfg(feature = "gc")]
+    {
+        *frames = vm.unpark_frames();
+        if let Some(caller) = frames.last_mut() {
+            let at = caller.stack.len().saturating_sub(count);
+            args.extend(caller.stack.drain(at..));
+        }
+    }
+    ran.map(|_| ())
 }
 
 fn new_frame(vm: &mut Vm, module: &Module, id: MethodId, args: Vec<Value>) -> Result<Frame, Trap> {
@@ -5102,7 +5750,9 @@ fn raise(
     let Some(frame) = frames.last() else {
         return Err(Trap::UnhandledException(vm.unhandled_detail(module)));
     };
-    let fault_ip = frame.ip.saturating_sub(1);
+    // A failed initializer propagates at its triggering instruction even though the
+    // resume position was rewound so a successful initializer could replay it.
+    let fault_ip = frame.fault_ip;
     raise_from(frames, module, vm, exception, 0, fault_ip)
 }
 
@@ -5320,7 +5970,10 @@ fn finally_handlers(
             runs && keep(clause)
         })
         .collect();
-    clauses.sort_by_key(|clause| clause.try_range.start);
+    // When nested try regions start together, the longer one is outermost.
+    clauses.sort_by_key(|clause| {
+        (clause.try_range.start, core::cmp::Reverse(clause.try_range.end))
+    });
     clauses
         .into_iter()
         .map(|clause| clause.handler_range)
@@ -5423,7 +6076,19 @@ pub(crate) fn alloc_array_of_element(
                     .map_or(Value::Null, |fields| Value::Struct(fields.into_boxed_slice())),
                 None => Value::Int32(0),
             };
-            vm.heap_mut().alloc_typed_array(alloc::vec![default; length], element_type)
+            // Preserve the declared storage size independently of the reduced value slots.
+            // A reference to a type in another assembly uses that type's defining handle.
+            let element_width = module.type_size(asm, token).or_else(|| {
+                let canonical = module.canonical_type_handle(element_type)?;
+                module.type_size((canonical >> 32) as u8, Token(canonical as u32))
+            }).or_else(|| {
+                let type_id = module.type_id_of(asm, token)?;
+                module.type_is_value_type(type_id).then_some(type_id)
+                    .and_then(|id| module.type_field_offsets(id)).map(|layout| layout.end())
+            }).map(|size| size as usize);
+            vm.heap_mut().alloc_array_with_element_width(
+                alloc::vec![default; length], element_type, element_width,
+            )
         }
     }
 }
@@ -5431,12 +6096,20 @@ pub(crate) fn alloc_array_of_element(
 fn step(
     frame: &mut Frame,
     frame_index: usize,
+    callers: &[Frame],
     code_len: usize,
     module: Option<&Module>,
     vm: &mut Vm,
     instruction: &Instruction,
 ) -> Result<Flow, Trap> {
     let opcode = instruction.opcode;
+    let readonly = if matches!(opcode,
+        Opcode::Readonly | Opcode::Constrained | Opcode::Volatile | Opcode::Unaligned | Opcode::Tail
+    ) {
+        false
+    } else {
+        core::mem::take(&mut frame.pending_readonly)
+    };
     let asm = frame.context.asm;
     match opcode {
         Opcode::Nop => {}
@@ -5511,7 +6184,7 @@ fn step(
         | Opcode::MulOvf
         | Opcode::MulOvfUn => {
             let (a, b) = frame.pop2()?;
-            let result = match stack_pointer_arithmetic(opcode, &a, &b)? {
+            let result = match stack_pointer_arithmetic(vm.heap(), opcode, &a, &b)? {
                 Some(pointer) => pointer,
                 None if matches!(a, Value::ByRef(_)) || matches!(b, Value::ByRef(_)) => {
                     match field_pointer_arithmetic(module, vm, opcode, &a, &b)? {
@@ -5565,6 +6238,15 @@ fn step(
         | Opcode::ConvRUn => {
             let value = frame.pop()?;
             let converted = match value {
+                // A pinned string's logical native address names its first UTF-16 unit.
+                // RuntimeHelpers.OffsetToStringData uses the same headerless address space.
+                Value::Object(string)
+                    if matches!(opcode, Opcode::ConvI | Opcode::ConvU)
+                        && vm.heap().is_string(string) =>
+                {
+                    Value::ByRef(Location::StringChar { string, byte_offset: 0 })
+                }
+                Value::Null if matches!(opcode, Opcode::ConvI | Opcode::ConvU) => Value::NativeInt(0),
                 Value::ByRef(_)
                     if matches!(
                         opcode,
@@ -5603,7 +6285,7 @@ fn step(
 
         Opcode::Ceq | Opcode::Cgt | Opcode::CgtUn | Opcode::Clt | Opcode::CltUn => {
             let (a, b) = frame.pop2()?;
-            let result = compare(opcode, a, b)?;
+            let result = compare(vm.heap(), opcode, a, b)?;
             frame.stack.push(Value::Int32(i32::from(result)));
         }
 
@@ -5641,7 +6323,7 @@ fn step(
         | Opcode::BltUn
         | Opcode::BltUnS => {
             let (a, b) = frame.pop2()?;
-            if compare(opcode, a, b)? {
+            if compare(vm.heap(), opcode, a, b)? {
                 frame.ip = branch_target(instruction, code_len)?;
             }
         }
@@ -5739,6 +6421,21 @@ fn step(
             let mut args = take_args_pooled(frame, vm, arg_count)?;
             let sig_key = target_info.map(|(key, _)| key);
             let constraint = frame.pending_constraint.take();
+            // ECMA-335 III.2.1: a reference-type constraint dereferences `this` before
+            // callvirt, including its null check and dispatch on the object's runtime type.
+            // Only value-type constraints keep the managed pointer and constraint dispatch.
+            let constraint = match constraint {
+                Some(token) if is_value_type_operand(module, asm, token) == Some(false) => {
+                    let receiver = args.first_mut().ok_or(Trap::StackUnderflow)?;
+                    let Value::ByRef(location) = receiver else {
+                        return Err(Trap::TypeMismatch(Opcode::Callvirt));
+                    };
+                    *receiver = read_constrained_receiver(frame, frame_index, callers, vm, location)
+                        .ok_or(Trap::Unsupported(Opcode::Callvirt))?;
+                    None
+                }
+                other => other,
+            };
             let runtime_type = match constraint {
                 Some(constraint) => module.type_id_of(asm, constraint),
                 None => match args.first().ok_or(Trap::StackUnderflow)? {
@@ -5758,7 +6455,7 @@ fn step(
                     let handle = asm_key(asm, constraint.0);
                     let enum_value = match args.first() {
                         Some(Value::ByRef(location)) => {
-                            read_enum_value(frame, frame_index, vm, location.clone())
+                            read_enum_value(frame, frame_index, callers, vm, location.clone())
                         }
                         _ => None,
                     };
@@ -5784,7 +6481,7 @@ fn step(
             if let Some(constraint) = constraint {
                 if !module.method_declares_value_type(method) {
                     if let Some(Value::ByRef(location)) = args.first().cloned() {
-                        match read_constrained_receiver(frame, frame_index, vm, &location) {
+                        match read_constrained_receiver(frame, frame_index, callers, vm, &location) {
                             None => {}
                             Some(value @ (Value::Object(_) | Value::Null)) => args[0] = value,
                             Some(value)
@@ -5895,7 +6592,7 @@ fn step(
                     })
                     .collect();
                 vm.frame_pool.give_values(lengths);
-                let array = vm.heap_mut().alloc_md_array(dims);
+                let array = vm.heap_mut().alloc_md_array_typed(dims, asm_key(asm, token.0));
                 frame.stack.push(Value::Object(array));
                 return Ok(Flow::Next);
             }
@@ -6068,6 +6765,10 @@ fn step(
                         .push(Value::ByRef(Location::Field { object, slot }));
                 }
                 Value::Null => return Err(Trap::NullReference),
+                Value::ByRef(base @ Location::Stack { .. }) => {
+                    let (address, _) = stack_field_address(module, asm, token, slot, base, Opcode::Ldflda)?;
+                    frame.stack.push(Value::ByRef(address));
+                }
                 Value::ByRef(base) => {
                     frame.stack.push(Value::ByRef(Location::Nested {
                         base: alloc::boxed::Box::new(base),
@@ -6102,6 +6803,18 @@ fn step(
                 .array_len(array)
                 .ok_or(Trap::TypeMismatch(Opcode::Ldelema))?;
             let index = bounded_index(index, len)?;
+            if !readonly {
+                if let (Some(module), Some(element)) = (module, vm.heap().array_element_type(array)) {
+                    let token = token_operand(instruction)?;
+                    if element != 0 && !array_element_is(module, element, asm, token) {
+                        let held = classify_elem_handle(module, element);
+                        let wanted = classify_elem_handle(module, asm_key(asm, token.0));
+                        if !elem_compatible(module, &held, &wanted, ElemRule::Address) {
+                            return Err(Trap::ArrayTypeMismatch);
+                        }
+                    }
+                }
+            }
             frame.stack.push(Value::ByRef(Location::Element {
                 array,
                 index,
@@ -6150,7 +6863,9 @@ fn step(
         Opcode::Constrained => {
             frame.pending_constraint = Some(token_operand(instruction)?);
         }
-        Opcode::Readonly => {}
+        // A readonly element address can safely read through a covariant array reference.
+        // Writable addresses require an exact reference element type before exposing storage.
+        Opcode::Readonly => frame.pending_readonly = true,
         Opcode::Volatile | Opcode::Unaligned | Opcode::Tail => {}
         Opcode::LdindI1
         | Opcode::LdindU1
@@ -6732,6 +7447,7 @@ impl Frame {
             method,
             context,
             ip: 0,
+            fault_ip: 0,
             stack: Vec::new(),
             locals: Vec::new(),
             args,
@@ -6742,6 +7458,7 @@ impl Frame {
             pending_filter: None,
             multicast: None,
             pending_constraint: None,
+            pending_readonly: false,
             buffers: Vec::new(),
             varargs: None,
         }
@@ -7146,7 +7863,12 @@ fn pointer_offset(value: &Value) -> Option<i64> {
 /// not), and STRICTER by the base for `pointer - offset` (we throw walking below the allocation
 /// base, where a device would not). All three residues lie outside a single allocation, which is
 /// exactly the region III.1.5 leaves unspecified; in-bounds arithmetic agrees exactly.
-fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Option<Value>, Trap> {
+fn stack_pointer_arithmetic(
+    heap: &Heap,
+    opcode: Opcode,
+    a: &Value,
+    b: &Value,
+) -> Result<Option<Value>, Trap> {
     let add = matches!(opcode, Opcode::Add | Opcode::AddOvfUn);
     let sub = matches!(opcode, Opcode::Sub | Opcode::SubOvfUn);
     let checked = matches!(opcode, Opcode::AddOvfUn | Opcode::SubOvfUn);
@@ -7156,7 +7878,7 @@ fn stack_pointer_arithmetic(opcode: Opcode, a: &Value, b: &Value) -> Result<Opti
     if sub {
         if let (Value::ByRef(la), Value::ByRef(lb)) = (a, b) {
             if is_raw_pointer(la) && is_raw_pointer(lb) {
-                let difference = raw_pointer_byte_difference(la, lb);
+                let difference = raw_pointer_byte_difference(heap, la, lb);
                 if checked && difference.is_some_and(i64::is_negative) {
                     return Err(Trap::Overflow);
                 }
@@ -7427,12 +8149,17 @@ fn is_raw_pointer(location: &Location) -> bool {
 }
 
 /// The signed BYTE difference `a - b` of two raw pointers into the SAME buffer/array/slot,
-/// for `pointer - pointer` (III.1.5). `None` for pointers into different allocations (or
-/// different element bases) -- subtracting those is undefined, and returning `None` lets
+/// for `pointer - pointer` (III.1.5). `None` for pointers into different allocations
+/// -- subtracting those is undefined, and returning `None` lets
 /// the op trap, as in .NET.
-fn raw_pointer_byte_difference(a: &Location, b: &Location) -> Option<i64> {
+fn raw_pointer_byte_difference(heap: &Heap, a: &Location, b: &Location) -> Option<i64> {
     if let (Some((base_a, off_a)), Some((base_b, off_b))) = (slot_pointer(a), slot_pointer(b)) {
         return (base_a == base_b).then(|| i64::from(off_a) - i64::from(off_b));
+    }
+    if let (Some((base_a, off_a)), Some((base_b, off_b))) =
+        (array_pointer(heap, a), array_pointer(heap, b))
+    {
+        return (base_a == base_b).then(|| (off_a as i64).wrapping_sub(off_b as i64));
     }
     match (a, b) {
         (
@@ -7479,9 +8206,12 @@ fn raw_pointer_byte_difference(a: &Location, b: &Location) -> Option<i64> {
 /// hold); the raw buffer/element kinds compare within their base; pointers into
 /// different bases get an arbitrary but stable order (the CLI leaves cross-allocation
 /// comparison unspecified -- unsafe code may still form it, so it must not trap).
-fn pointer_compare(a: &Location, b: &Location) -> core::cmp::Ordering {
+fn pointer_compare(heap: &Heap, a: &Location, b: &Location) -> core::cmp::Ordering {
     if let (Some((base_a, off_a)), Some((base_b, off_b))) = (slot_pointer(a), slot_pointer(b)) {
         return base_a.cmp(&base_b).then(off_a.cmp(&off_b));
+    }
+    if let (Some(a), Some(b)) = (array_pointer(heap, a), array_pointer(heap, b)) {
+        return a.cmp(&b);
     }
     fn rank(location: &Location) -> u8 {
         match location {
@@ -7552,9 +8282,24 @@ fn pointer_compare(a: &Location, b: &Location) -> core::cmp::Ordering {
                 base: bb,
                 slot: sb,
             },
-        ) => pointer_compare(ba, bb).then(sa.cmp(sb)),
+        ) => pointer_compare(heap, ba, bb).then(sa.cmp(sb)),
         _ => rank(a).cmp(&rank(b)),
     }
+}
+
+/// An array pointer's byte displacement from the start of its array. The element
+/// index and an arithmetic offset can name the same address in different ways.
+fn array_pointer(heap: &Heap, location: &Location) -> Option<(ObjectRef, u64)> {
+    let Location::Element {
+        array,
+        index,
+        byte_offset,
+    } = location else {
+        return None;
+    };
+    let width = heap.array_element_width(*array)? as u64;
+    let offset = (*index as u64).wrapping_mul(width).wrapping_add(u64::from(*byte_offset));
+    Some((*array, offset))
 }
 
 /// Normalizes a frame-slot pointer to its `(base, byte displacement)` form: a plain
@@ -7886,7 +8631,7 @@ fn relation_of(opcode: Opcode) -> Option<(Relation, bool)> {
 /// Evaluates a comparison or conditional branch (III.1.5, Table 13). Integers
 /// compare signed unless the unsigned variant is used; floats compare ordered,
 /// with the unordered (NaN) result chosen by the `.un` variant.
-fn compare(opcode: Opcode, a: Value, b: Value) -> Result<bool, Trap> {
+fn compare(heap: &Heap, opcode: Opcode, a: Value, b: Value) -> Result<bool, Trap> {
     let (relation, unordered_or_unsigned) = relation_of(opcode).ok_or(Trap::Unsupported(opcode))?;
     #[cfg(feature = "float")]
     if let (Some(x), Some(y)) = (as_double(&a), as_double(&b)) {
@@ -7896,7 +8641,7 @@ fn compare(opcode: Opcode, a: Value, b: Value) -> Result<bool, Trap> {
         return Ok(apply_relation(relation, x.partial_cmp(&y)));
     }
     if let (Value::ByRef(la), Value::ByRef(lb)) = (&a, &b) {
-        let ordering = pointer_compare(la, lb);
+        let ordering = pointer_compare(heap, la, lb);
         return Ok(apply_relation(relation, Some(ordering)));
     }
     if let (Value::ByRef(_), other) | (other, Value::ByRef(_)) = (&a, &b) {
@@ -8135,6 +8880,9 @@ pub(crate) fn value_type_receiver(module: &Module, vm: &Vm, method: MethodId, ar
 /// and what the box of a value type holds when no constructor has run. A primitive answers its zero
 /// at its width, an enum its underlying zero, a struct its zeroed fields, and a reference type null.
 pub(crate) fn zero_of_type(module: &Module, type_id: Option<TypeId>, handle: u64) -> Value {
+    if names_a_reference_type(module, type_id, handle) {
+        return Value::Null;
+    }
     let defaults = type_id.and_then(|type_id| module.type_field_defaults(type_id));
     if defaults.as_ref().is_none_or(|fields| fields.is_empty()) && !module.is_enum_by_handle(handle)
     {
@@ -8151,6 +8899,34 @@ pub(crate) fn zero_of_type(module: &Module, type_id: Option<TypeId>, handle: u64
         }
         Some(defaults) => Value::Struct(defaults.into_boxed_slice()),
         None => Value::Int32(0),
+    }
+}
+
+/// Whether the type `type_id` names is a reference type, whose zero is null; where the module has
+/// no type id for it, whether the type operand `handle` (asm-folded) names one by its shape.
+///
+/// With a type id: a type the module records as neither a value type nor an enum, and no primitive,
+/// with or without fields. With none: `string`, `object`, an array (no array type has a type id), a
+/// vector interface, or a shape the module does not model. Of those shapes, a pointer and a managed
+/// pointer are no type argument, so a `default(T)` reaches only the others: a class or interface
+/// instantiation, or a multi-dimensional array.
+fn names_a_reference_type(module: &Module, type_id: Option<TypeId>, handle: u64) -> bool {
+    match type_id {
+        Some(type_id) => {
+            !module.type_is_value_type(type_id)
+                && !module.is_enum_by_handle(handle)
+                && module.primitive_zero_of_type(type_id).is_none()
+        }
+        None => matches!(
+            module.cast_elem(handle),
+            Some(
+                CastElem::String
+                    | CastElem::Object
+                    | CastElem::Array(_)
+                    | CastElem::VectorInterface(_)
+                    | CastElem::Lenient
+            )
+        ),
     }
 }
 
@@ -8274,7 +9050,8 @@ pub(crate) fn cast_matches(module: &Module, asm: u8, vm: &Vm, value: &Value, tok
             }
             None if module.is_object_type_token(asm, token) => true,
             None if module.is_string_type_token(asm, token) => false,
-            None if matches!(module.cast_elem(asm_key(asm, token.0)), Some(CastElem::Array(_))) => {
+            None if matches!(module.cast_elem(asm_key(asm, token.0)),
+                Some(CastElem::Array(_) | CastElem::MdArray { .. })) => {
                 false
             }
             None => true,
@@ -8308,7 +9085,15 @@ pub(crate) fn cast_matches(module: &Module, asm: u8, vm: &Vm, value: &Value, tok
         return false;
     }
     if let Some(op_elem) = vm.heap().array_element_type(reference) {
-        return array_cast_matches(module, asm, op_elem, token);
+        let element = (op_elem != 0).then(|| classify_elem_handle(module, op_elem));
+        return array_cast_matches(module, asm, element.as_ref(), None, token);
+    }
+    if let Some((rank, array_type)) = vm.heap().md_array_type(reference) {
+        let element = match module.cast_elem(array_type) {
+            Some(CastElem::MdArray { element, .. }) => Some(*element),
+            _ => None,
+        };
+        return array_cast_matches(module, asm, element.as_ref(), Some(rank), token);
     }
     if matches!(module.cast_elem(asm_key(asm, token.0)), Some(CastElem::VectorInterface(_))) {
         return false;
@@ -8316,17 +9101,52 @@ pub(crate) fn cast_matches(module: &Module, asm: u8, vm: &Vm, value: &Value, tok
     true
 }
 
+/// Whether an object reference can be stored in an array element described by `target`.
+/// Declared elements use the ordinary cast relation; array elements retain their rank and
+/// covariance rules. Shapes without a resolved element identity remain unverified.
+pub(crate) fn reference_matches_element(
+    module: &Module, vm: &Vm, reference: ObjectRef, target: &CastElem,
+) -> bool {
+    match target {
+        CastElem::Object => true,
+        CastElem::String => vm.heap().is_string(reference),
+        CastElem::Named(handle) => {
+            let asm = (handle >> 32) as u8;
+            let token = Token(*handle as u32);
+            module.is_object_type_token(asm, token)
+                || cast_matches(module, asm, vm, &Value::Object(reference), token)
+        }
+        CastElem::Array(target_element) => vm.heap().array_element_type(reference)
+            .is_some_and(|element| element == 0 || elem_compatible(
+                module, &classify_elem_handle(module, element), target_element, ElemRule::Array,
+            )),
+        CastElem::MdArray { element: target_element, rank: target_rank } => {
+            vm.heap().md_array_type(reference).is_some_and(|(rank, array_type)| {
+                rank == *target_rank && match module.cast_elem(array_type) {
+                    Some(CastElem::MdArray { element, .. }) => {
+                        elem_compatible(module, &element, target_element, ElemRule::Array)
+                    }
+                    _ => true,
+                }
+            })
+        }
+        CastElem::Prim(_) | CastElem::GenericValueType => false,
+        CastElem::Lenient | CastElem::Pointer(_) | CastElem::Void | CastElem::VectorInterface(_) => true,
+    }
+}
+
 /// Whether the type operand `token` in assembly `asm` names a VALUE type: `Some(true)` for a
 /// primitive or a type the module records as a struct or an enum, `Some(false)` for a reference
 /// type -- a class, an interface, `string`, `object` or an array -- and `None` for a type the module
-/// cannot resolve or a shape the checks do not model.
+/// cannot resolve or a shape the checks do not model. A class or interface instantiation such as
+/// `List<int>` has a lenient cast shape and is answered by the type it resolves to.
 fn is_value_type_operand(module: &Module, asm: u8, token: Token) -> Option<bool> {
     match module.cast_elem(asm_key(asm, token.0)) {
         Some(CastElem::Prim(_) | CastElem::GenericValueType) => Some(true),
         Some(
-            CastElem::String | CastElem::Object | CastElem::Array(_) | CastElem::VectorInterface(_),
+            CastElem::String | CastElem::Object | CastElem::Array(_) | CastElem::MdArray { .. }
+            | CastElem::VectorInterface(_),
         ) => Some(false),
-        Some(CastElem::Lenient) => None,
         _ => module.type_id_of(asm, token).map(|type_id| module.type_is_value_type(type_id)),
     }
 }
@@ -8349,17 +9169,17 @@ fn array_element_is(module: &Module, element: u64, asm: u8, token: Token) -> boo
     }
 }
 
-/// Whether an ARRAY whose `newarr` element handle is `op_elem` (asm-folded; `0` = an
-/// untracked intrinsic mint, always lenient) casts to the type `token` names. Element
+/// Whether an array casts to the type `token` names. `op_rank` is `None` for a vector and
+/// `Some(rank)` for a rectangular array; an untracked allocation has no `op_elem`. Element
 /// compatibility follows I.8.7.1 as .NET implements it: same element type, same-width
 /// signed/unsigned INTEGER interchange (`int[]` casts to `uint[]`, but `bool`/`char`/floats
 /// match only themselves), enum/underlying interchange, and reference-element covariance.
-/// An interface target is tested against the interfaces `System.Array` DECLARES, so
-/// `(IEnumerable)array` succeeds and `(IComparable)array` throws, as on .NET. With no corlib
-/// loaded there is no `System.Array` to ask, and a named target is decided by the name the loader
-/// read: an array is an instance of `System.Array` and the interfaces it implements, and of no
-/// other named type.
-fn array_cast_matches(module: &Module, asm: u8, op_elem: u64, token: Token) -> bool {
+/// The loader's array-base identities apply at every metadata tier: partial managed declarations
+/// cannot remove the interfaces built into every array. Other interface targets are tested against
+/// `System.Array`'s declarations, so an unrelated interface such as `IComparable` is rejected.
+fn array_cast_matches(
+    module: &Module, asm: u8, op_elem: Option<&CastElem>, op_rank: Option<u32>, token: Token,
+) -> bool {
     if module.is_object_type_token(asm, token) {
         return true;
     }
@@ -8367,34 +9187,43 @@ fn array_cast_matches(module: &Module, asm: u8, op_elem: u64, token: Token) -> b
         return false;
     }
     match module.cast_elem(asm_key(asm, token.0)) {
-        Some(CastElem::VectorInterface(target_elem)) => {
-            if op_elem == 0 {
-                return true;
-            }
-            let op = classify_elem_handle(module, op_elem);
-            elem_compatible(module, &op, &target_elem, ElemRule::Array)
+        Some(CastElem::VectorInterface(target_elem) | CastElem::Array(target_elem)) => {
+            op_rank.is_none()
+                && op_elem.is_none_or(|op| elem_compatible(module, op, &target_elem, ElemRule::Array))
         }
-        Some(CastElem::Array(target_elem)) => {
-            if op_elem == 0 {
-                return true;
-            }
-            let op = classify_elem_handle(module, op_elem);
-            elem_compatible(module, &op, &target_elem, ElemRule::Array)
+        Some(CastElem::MdArray { element, rank }) => {
+            op_rank == Some(rank)
+                && op_elem.is_none_or(|op| elem_compatible(module, op, &element, ElemRule::Array))
         }
         Some(CastElem::Object) => true,
         Some(CastElem::Prim(_) | CastElem::String | CastElem::GenericValueType) => false,
-        target @ (Some(CastElem::Named(_)) | Some(CastElem::Lenient) | None) => {
+        // A named target holds an array if it is a built-in array base or an interface declared by
+        // System.Array. Optional reflection metadata can add declarations, not remove those bases.
+        target @ (Some(CastElem::Named(_) | CastElem::Lenient | CastElem::Pointer(_) | CastElem::Void) | None) => {
+            let handle = match target {
+                Some(CastElem::Named(handle)) => handle,
+                _ => asm_key(asm, token.0),
+            };
             let target_id = module.type_id_of(asm, token);
-            let reflect = target_id
-                .and_then(|id| module.type_handle_of(id))
-                .and_then(|handle| module.reflect_type(handle));
+            let defining_handle = target_id.and_then(|id| module.type_handle_of(id));
+            // Generic operands can carry an unmarked TypeRef or omit the cast record. Their
+            // resolved type keeps the array-base identity on its defining handle.
+            if module.cast_names_array_base(handle)
+                || defining_handle.is_some_and(|handle| module.cast_names_array_base(handle))
+            {
+                return true;
+            }
+            let reflect = defining_handle.and_then(|handle| module.reflect_type(handle));
             match (reflect, array_type_id(module), target_id) {
                 (Some(reflect), Some(array_id), Some(target)) if reflect.is_interface => {
                     module.implements_interface(array_id, target)
                 }
-                (Some(reflect), _, _) if !reflect.is_interface => reflect.full_name == "System.Array",
+                (Some(reflect), _, _) if !reflect.is_interface => false,
+                // Resolved types can omit their redundant Named cast record. Their defining
+                // handles still obey the named-type rule; only unresolved shapes stay unverified.
                 _ => match target {
                     Some(CastElem::Named(handle)) => module.cast_names_array_base(handle),
+                    None if target_id.is_some() => module.cast_names_array_base(asm_key(asm, token.0)),
                     _ => true,
                 },
             }
@@ -8405,22 +9234,27 @@ fn array_cast_matches(module: &Module, asm: u8, op_elem: u64, token: Token) -> b
 /// The [`TypeId`] of `System.Array`, the base of every array, or `None` when the loaded module
 /// records no such type.
 ///
-/// Resolved by NAME through the same reflection-recorded table
-/// [`array_cast_matches`] already uses to recognize `System.Array` as a cast target, so it needs no
-/// tier the caller does not need already, and it survives baking with the rest of that table.
+/// The reflection name must identify the loader-marked core type. An application's same-named
+/// declaration cannot supply the interfaces of arrays.
 fn array_type_id(module: &Module) -> Option<TypeId> {
     module
         .type_handle_by_name("System.Array")
+        .filter(|handle| module.cast_names_array_base(*handle))
         .and_then(|handle| module.type_id_by_handle(handle))
 }
 
-/// The element-compatibility rule in force: array casts and `unbox.any` share the matcher
-/// but differ on integer leniency.
+/// Element compatibility for array casts, element addresses, and unboxing.
 #[derive(Clone, Copy, PartialEq)]
 enum ElemRule {
     /// Array-element compatibility (I.8.7.1): same-width signed/unsigned integers
     /// interchange, and reference elements are covariant.
     Array,
+    /// `ldelema` storage compatibility: integer storage types interchange, but reference
+    /// elements must be identical because the returned address permits writes.
+    Address,
+    /// A reference element's exact type: an array reference retains the identities of its
+    /// nested elements, including signedness and enum types.
+    Identity,
     /// `unbox.any` compatibility (III.4.33): the exact type, with an enum standing for its
     /// exact underlying primitive -- an `int` box does NOT unbox as `uint`.
     Unbox,
@@ -8473,21 +9307,26 @@ pub(crate) fn prim_of_full_name(full_name: &str) -> Option<CastPrim> {
 }
 
 /// Whether an operand element shape is compatible with a target element shape under `rule`.
-/// Both sides normalize an enum to its exact underlying primitive first -- .NET lets an
-/// `int`-backed enum interchange with `int` and with any enum sharing that exact underlying
-/// type (never `uint` or another width). A [`CastElem::Lenient`] side always matches
-/// (unverified), as does a named type the module cannot resolve.
+/// Enums normalize to their underlying primitive for array casts, storage and unboxing.
+/// Exact reference-type identity retains enum types and signedness inside nested arrays.
+/// A named type the module cannot resolve remains unverified.
 fn elem_compatible(module: &Module, op: &CastElem, target: &CastElem, rule: ElemRule) -> bool {
     let normalize = |elem: &CastElem| -> CastElem {
+        if matches!(elem, CastElem::Pointer(_) | CastElem::Void) {
+            return CastElem::Lenient;
+        }
         if let CastElem::Named(handle) = elem {
-            if let Some(prim) = module.enum_underlying_prim_by_handle(*handle) {
-                return CastElem::Prim(prim);
+            if rule != ElemRule::Identity {
+                if let Some(prim) = module.enum_underlying_prim_by_handle(*handle) {
+                    return CastElem::Prim(prim);
+                }
             }
         }
         elem.clone()
     };
     let op = normalize(op);
     let target = normalize(target);
+    let nested_rule = if rule == ElemRule::Address { ElemRule::Identity } else { rule };
     match (&op, &target) {
         (CastElem::Prim(_), CastElem::Lenient) | (CastElem::Lenient, CastElem::Prim(_)) => false,
         (CastElem::GenericValueType, CastElem::GenericValueType | CastElem::Named(_) | CastElem::Lenient)
@@ -8496,7 +9335,7 @@ fn elem_compatible(module: &Module, op: &CastElem, target: &CastElem, rule: Elem
         (CastElem::Lenient, _) | (_, CastElem::Lenient) => true,
         (CastElem::Prim(a), CastElem::Prim(b)) => {
             a == b
-                || (rule == ElemRule::Array
+                || (matches!(rule, ElemRule::Array | ElemRule::Address)
                     && matches!(
                         (a.integer_width(), b.integer_width()),
                         (Some(x), Some(y)) if x == y
@@ -8517,17 +9356,23 @@ fn elem_compatible(module: &Module, op: &CastElem, target: &CastElem, rule: Elem
                     _ => true,
                 }
         }
-        (CastElem::Array(_), CastElem::Object) => rule == ElemRule::Array,
+        // An array element is itself a reference. Its covariance uses the same base and
+        // interface rules as a directly tested array, including vector element restrictions.
+        (CastElem::Array(_) | CastElem::MdArray { .. }, CastElem::Object) => rule == ElemRule::Array,
         (CastElem::Array(op_elem), CastElem::Array(target_elem)) => {
-            elem_compatible(module, op_elem, target_elem, rule)
+            elem_compatible(module, op_elem, target_elem, nested_rule)
         }
-        (CastElem::Array(_), CastElem::Named(handle)) => {
+        (CastElem::MdArray { element: op_elem, rank: op_rank },
+         CastElem::MdArray { element: target_elem, rank: target_rank }) => {
+            op_rank == target_rank && elem_compatible(module, op_elem, target_elem, nested_rule)
+        }
+        (CastElem::Array(element), CastElem::Named(handle)) => {
             rule == ElemRule::Array
-                && module
-                    .reflect_type(*handle)
-                    .is_none_or(|reflect| {
-                        reflect.is_interface || reflect.full_name == "System.Array"
-                    })
+                && array_cast_matches(module, (*handle >> 32) as u8, Some(element), None, Token(*handle as u32))
+        }
+        (CastElem::MdArray { element, rank }, CastElem::Named(handle)) => {
+            rule == ElemRule::Array
+                && array_cast_matches(module, (*handle >> 32) as u8, Some(element), Some(*rank), Token(*handle as u32))
         }
         (CastElem::Named(op_handle), CastElem::Object) => {
             rule == ElemRule::Array
@@ -8552,19 +9397,24 @@ fn elem_compatible(module: &Module, op: &CastElem, target: &CastElem, rule: Elem
             }
         }
         (CastElem::Named(handle), CastElem::Prim(p))
-        | (CastElem::Prim(p), CastElem::Named(handle)) => match module.reflect_type(*handle) {
-            Some(reflect) => match prim_of_full_name(&reflect.full_name) {
-                Some(named_prim) => {
-                    named_prim == *p
-                        || (rule == ElemRule::Array
-                            && matches!(
-                                (named_prim.integer_width(), p.integer_width()),
-                                (Some(x), Some(y)) if x == y
-                            ))
-                }
-                None => false,
-            },
-            None => true,
+        | (CastElem::Prim(p), CastElem::Named(handle)) => {
+            if rule == ElemRule::Identity && module.is_enum_by_handle(*handle) {
+                return false;
+            }
+            match module.reflect_type(*handle) {
+                Some(reflect) => match prim_of_full_name(&reflect.full_name) {
+                    Some(named_prim) => {
+                        named_prim == *p
+                            || (matches!(rule, ElemRule::Array | ElemRule::Address)
+                                && matches!(
+                                    (named_prim.integer_width(), p.integer_width()),
+                                    (Some(x), Some(y)) if x == y
+                                ))
+                    }
+                    None => false,
+                },
+                None => true,
+            }
         },
         _ => false,
     }
@@ -8756,7 +9606,7 @@ fn run_collection(vm: &mut Vm, module: &Module, roots: &mut dyn FnMut(&mut dyn F
         lock_states.push(state);
     }
 
-    let Vm { heap, statics, parked, .. } = vm;
+    let Vm { heap, statics, parked, reflection_monitors, .. } = vm;
     let finalizable = heap.collect(|visit| {
         roots(&mut *visit);
         for frames in parked.activations.iter_mut() {
@@ -8781,6 +9631,9 @@ fn run_collection(vm: &mut Vm, module: &Module, roots: &mut dyn FnMut(&mut dyn F
         }
         for value in lock_keys.iter_mut() {
             visit(value);
+        }
+        for object in reflection_monitors.values_mut() {
+            visit_ref(object, visit);
         }
     });
 
@@ -8906,6 +9759,183 @@ mod tests {
     use super::*;
     use lamella_cil::{EhClause, Instruction, Operand};
 
+    fn monitor_type_handles() -> (Module, [Value; 3]) {
+        let mut module = Module::new();
+        let first = module.add_type(Vec::new());
+        let second = module.add_type(Vec::new());
+        module.bind_type_token(0, Token(0x0200_0001), first);
+        module.bind_type_token(1, Token(0x0100_0001), first);
+        module.bind_type_token(1, Token(0x0200_0001), second);
+        (module, [
+            Value::NativeInt(asm_key(0, 0x0200_0001) as i64),
+            Value::NativeInt(asm_key(1, 0x0100_0001) as i64),
+            Value::NativeInt(asm_key(1, 0x0200_0001) as i64),
+        ])
+    }
+
+    #[test]
+    fn monitor_type_handles_share_aliases_but_not_other_objects() {
+        use crate::intrinsics::{monitor_enter, monitor_exit, monitor_try_enter};
+        for frozen in [false, true] {
+            let (mut module, [first, alias, second]) = monitor_type_handles();
+            if frozen { module.freeze(); }
+            let mut vm = Vm::new();
+            let boxed = Value::Object(vm.heap_mut().alloc_boxed(0, first.clone()));
+            assert_eq!(monitor_enter(&mut vm, &module, &[first.clone()]), Ok(None));
+            assert_eq!(monitor_try_enter(&mut vm, &module, &[alias.clone()]), Ok(Some(Value::Int32(1))));
+            vm.set_current_thread(1);
+            assert_eq!(monitor_try_enter(&mut vm, &module, &[alias.clone()]), Ok(Some(Value::Int32(0))));
+            for other in [second, boxed] {
+                assert_eq!(monitor_try_enter(&mut vm, &module, &[other.clone()]), Ok(Some(Value::Int32(1))));
+                assert_eq!(monitor_exit(&mut vm, &module, &[other]), Ok(None));
+            }
+            assert_eq!(monitor_exit(&mut vm, &module, &[alias.clone()]), Err(Trap::SynchronizationLock));
+            vm.set_current_thread(0);
+            assert_eq!(monitor_exit(&mut vm, &module, &[alias.clone()]), Ok(None));
+            vm.set_current_thread(1);
+            assert_eq!(monitor_try_enter(&mut vm, &module, &[first.clone()]), Ok(Some(Value::Int32(0))));
+            vm.set_current_thread(0);
+            assert_eq!(monitor_exit(&mut vm, &module, &[first]), Ok(None));
+            vm.set_current_thread(1);
+            assert_eq!(monitor_try_enter(&mut vm, &module, &[alias.clone()]), Ok(Some(Value::Int32(1))));
+            assert_eq!(monitor_exit(&mut vm, &module, &[alias]), Ok(None));
+            for invalid in [Value::Null, Value::Int32(1)] {
+                assert_eq!(monitor_enter(&mut vm, &module, &[invalid]), Err(Trap::TypeMismatch(Opcode::Call)));
+            }
+        }
+    }
+
+    #[test]
+    fn monitor_constructed_types_share_structural_identity() {
+        use crate::intrinsics::{monitor_enter, monitor_exit, monitor_pulse, monitor_try_enter};
+        use crate::module::{CastElem, CastPrim};
+        for frozen in [false, true] {
+            let (mut module, [known, _, _]) = monitor_type_handles();
+            let type_id = module.type_id_by_handle(asm_key(0, 0x0200_0001)).unwrap();
+            let resolved_spec = Token(0x1b00_0003);
+            module.bind_type_token(2, resolved_spec, type_id);
+            for asm in [0, 1] {
+                module.bind_cast_elem(asm, Token(0x1b00_0001),
+                    CastElem::Array(Box::new(CastElem::Prim(CastPrim::I4))));
+                module.bind_cast_elem(asm, Token(0x1b00_0002),
+                    CastElem::MdArray { element: Box::new(CastElem::Prim(CastPrim::I4)), rank: 2 });
+            }
+            if frozen { module.freeze(); }
+            let mut vm = Vm::new();
+            vm.heap_mut().alloc_array(Vec::new());
+            for token in [0x1b00_0001, 0x1b00_0002] {
+                let first = Value::NativeInt(asm_key(0, token) as i64);
+                let alias = Value::NativeInt(asm_key(1, token) as i64);
+                assert_eq!(monitor_enter(&mut vm, &module, &[first.clone()]), Ok(None));
+                assert_eq!(monitor_pulse(&mut vm, &module, &[alias.clone()]), Ok(None));
+                #[cfg(feature = "gc")]
+                run_collection(&mut vm, &module, &mut |_| {});
+                vm.set_current_thread(1);
+                assert_eq!(monitor_try_enter(&mut vm, &module, &[alias.clone()]),
+                    Ok(Some(Value::Int32(0))));
+                for other in [known.clone(), Value::NativeInt(asm_key(1, token ^ 3) as i64)] {
+                    assert_eq!(monitor_try_enter(&mut vm, &module, &[other.clone()]),
+                        Ok(Some(Value::Int32(1))));
+                    assert_eq!(monitor_exit(&mut vm, &module, &[other]), Ok(None));
+                }
+                vm.set_current_thread(0);
+                assert_eq!(monitor_exit(&mut vm, &module, &[alias]), Ok(None));
+            }
+            let resolved = Value::NativeInt(asm_key(2, resolved_spec.0) as i64);
+            assert_eq!(monitor_enter(&mut vm, &module, &[known.clone()]), Ok(None));
+            assert_eq!(monitor_pulse(&mut vm, &module, &[resolved.clone()]), Ok(None));
+            vm.set_current_thread(1);
+            assert_eq!(monitor_try_enter(&mut vm, &module, &[resolved]), Ok(Some(Value::Int32(0))));
+            vm.set_current_thread(0);
+            assert_eq!(monitor_exit(&mut vm, &module, &[known]), Ok(None));
+        }
+    }
+
+    #[test]
+    fn monitor_unknown_constructed_types_do_not_share_a_lenient_identity() {
+        use crate::intrinsics::monitor_enter;
+        for frozen in [false, true] {
+            let mut module = Module::new();
+            let shapes = [
+                CastElem::Lenient,
+                CastElem::GenericValueType,
+                CastElem::Array(Box::new(CastElem::Lenient)),
+                CastElem::Array(Box::new(CastElem::Named(asm_key(1, 0x0100_ffff)))),
+            ];
+            for (row, shape) in shapes.into_iter().enumerate() {
+                module.bind_cast_elem(0, Token(0x1b00_0001 + row as u32), shape);
+            }
+            if frozen { module.freeze(); }
+            let mut vm = Vm::new();
+            for row in 1..=5 {
+                let handle = Value::NativeInt(0x1b00_0000 + row);
+                assert_eq!(monitor_enter(&mut vm, &module, &[handle]),
+                    Err(Trap::TypeMismatch(Opcode::Call)));
+            }
+        }
+    }
+
+    #[test]
+    fn monitor_type_handles_wait_pulse_and_timed_acquisition() {
+        use crate::intrinsics::{monitor_enter, monitor_exit, monitor_pulse, monitor_pulse_all,
+            monitor_try_enter, monitor_try_enter_timeout, monitor_wait, monitor_wait_timeout};
+        for timed in [false, true] {
+            let (module, [first, alias, _]) = monitor_type_handles();
+            let mut vm = Vm::new();
+            assert_eq!(monitor_enter(&mut vm, &module, &[first.clone()]), Ok(None));
+            assert_eq!(monitor_enter(&mut vm, &module, &[alias.clone()]), Ok(None));
+            vm.set_current_thread(1);
+            assert_eq!(monitor_try_enter_timeout(&mut vm, &module, &[alias.clone(), Value::Int32(5)]), Ok(None));
+            assert!(matches!(vm.thread_op.take(), Some(ThreadOp::BlockOnLock { deadline: Some(_), .. })));
+            assert!(vm.resolve_lock_deadline(1));
+            assert_eq!(monitor_exit(&mut vm, &module, &[alias.clone()]), Err(Trap::SynchronizationLock));
+            vm.set_current_thread(0);
+            let wait = if timed {
+                monitor_wait_timeout(&mut vm, &module, &[first.clone(), Value::Int32(5)])
+            } else {
+                monitor_wait(&mut vm, &module, &[first.clone()])
+            };
+            assert_eq!(wait, Ok(None));
+            assert!(matches!(vm.thread_op.take(), Some(ThreadOp::BlockOnLock { .. })));
+            vm.set_current_thread(1);
+            assert_eq!(monitor_try_enter(&mut vm, &module, &[alias.clone()]), Ok(Some(Value::Int32(1))));
+            let pulse = if timed { monitor_pulse_all } else { monitor_pulse };
+            assert_eq!(pulse(&mut vm, &module, &[alias.clone()]), Ok(None));
+            assert_eq!(monitor_exit(&mut vm, &module, &[alias.clone()]), Ok(None));
+            assert!(matches!(vm.thread_op.take(), Some(ThreadOp::WakeThread { id: 0 })));
+            vm.set_current_thread(0);
+            assert_eq!(monitor_exit(&mut vm, &module, &[first.clone()]), Ok(None));
+            assert_eq!(monitor_exit(&mut vm, &module, &[alias.clone()]), Ok(None));
+            assert_eq!(monitor_exit(&mut vm, &module, &[alias.clone()]), Err(Trap::SynchronizationLock));
+            assert_eq!(monitor_wait(&mut vm, &module, &[alias.clone()]), Err(Trap::SynchronizationLock));
+            assert_eq!(monitor_pulse(&mut vm, &module, &[alias]), Err(Trap::SynchronizationLock));
+        }
+    }
+
+    #[cfg(feature = "gc")]
+    #[test]
+    fn monitor_type_handles_keep_identity_after_compaction_and_release() {
+        use crate::intrinsics::{monitor_enter, monitor_exit, monitor_try_enter};
+        let (module, [first, alias, second]) = monitor_type_handles();
+        let mut vm = Vm::new();
+        vm.heap_mut().alloc_array(Vec::new());
+        assert_eq!(monitor_enter(&mut vm, &module, &[first.clone()]), Ok(None));
+        run_collection(&mut vm, &module, &mut |_| {});
+        vm.set_current_thread(1);
+        assert_eq!(monitor_try_enter(&mut vm, &module, &[alias.clone()]), Ok(Some(Value::Int32(0))));
+        assert_eq!(monitor_enter(&mut vm, &module, &[second.clone()]), Ok(None));
+        vm.set_current_thread(0);
+        assert_eq!(monitor_exit(&mut vm, &module, &[alias.clone()]), Ok(None));
+        run_collection(&mut vm, &module, &mut |_| {});
+        assert_eq!(monitor_enter(&mut vm, &module, &[first.clone()]), Ok(None));
+        assert_eq!(monitor_try_enter(&mut vm, &module, &[second.clone()]), Ok(Some(Value::Int32(0))));
+        vm.set_current_thread(1);
+        assert_eq!(monitor_try_enter(&mut vm, &module, &[alias.clone()]), Ok(Some(Value::Int32(0))));
+        assert_eq!(monitor_exit(&mut vm, &module, &[second]), Ok(None));
+        vm.set_current_thread(0);
+        assert_eq!(monitor_exit(&mut vm, &module, &[first]), Ok(None));
+    }
+
     fn method(code: Vec<Instruction>) -> MethodBodyImage {
         MethodBodyImage {
             max_stack: 8,
@@ -8918,6 +9948,70 @@ mod tests {
 
     fn run(code: Vec<Instruction>) -> Result<Option<Value>, Trap> {
         run_method(&method(code), Vec::new())
+    }
+
+    #[cfg(feature = "exceptions")]
+    fn nested_finally_trace(throw_in_try: bool) -> Option<Value> {
+        let mut body = method(vec![
+            Instruction::simple(Opcode::LdcI40),
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::simple(if throw_in_try { Opcode::Ldnull } else { Opcode::Nop }),
+            Instruction::simple(if throw_in_try { Opcode::Throw } else { Opcode::Nop }),
+            Instruction::new(Opcode::Leave, Operand::Target(21)),
+            Instruction::simple(Opcode::Ldloc0),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(10)),
+            Instruction::simple(Opcode::Mul),
+            Instruction::simple(Opcode::LdcI41),
+            Instruction::simple(Opcode::Add),
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::simple(Opcode::Endfinally),
+            Instruction::simple(Opcode::Ldloc0),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(10)),
+            Instruction::simple(Opcode::Mul),
+            Instruction::simple(Opcode::LdcI42),
+            Instruction::simple(Opcode::Add),
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::simple(Opcode::Endfinally),
+            Instruction::simple(Opcode::Pop),
+            Instruction::new(Opcode::Leave, Operand::Target(21)),
+            Instruction::simple(Opcode::Ldloc0),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        body.handlers = vec![
+            EhClause {
+                try_range: InstructionRange { start: 2, end: 5 },
+                handler_range: InstructionRange { start: 5, end: 12 },
+                kind: EhKind::Finally,
+            },
+            EhClause {
+                try_range: InstructionRange { start: 2, end: 12 },
+                handler_range: InstructionRange { start: 12, end: 19 },
+                kind: EhKind::Finally,
+            },
+            EhClause {
+                try_range: InstructionRange { start: 2, end: 19 },
+                handler_range: InstructionRange { start: 19, end: 21 },
+                kind: EhKind::Catch(Token(0x0100_00a1)),
+            },
+        ]
+        .into_boxed_slice();
+        let mut module = Module::new();
+        let main = module.add_method_image(0, body, 0);
+        let mut vm = Vm::new();
+        let mut session = Session::new(&module, main, Vec::new()).unwrap();
+        session.continue_(&module, &mut vm).unwrap().returned
+    }
+
+    #[cfg(feature = "exceptions")]
+    #[test]
+    fn leave_runs_nested_finallys_with_the_same_try_start_innermost_first() {
+        assert_eq!(nested_finally_trace(false), Some(Value::Int32(12)));
+    }
+
+    #[cfg(feature = "exceptions")]
+    #[test]
+    fn catch_runs_nested_finallys_with_the_same_try_start_innermost_first() {
+        assert_eq!(nested_finally_trace(true), Some(Value::Int32(12)));
     }
 
     /// Discarding delivered output keeps what was not delivered, in order, keeps the buffer's
@@ -9279,6 +10373,331 @@ mod tests {
         assert_eq!(result, Ok(Some(Value::Int32(0x1234_5678))));
     }
 
+    fn stack_struct_field_program(code: Vec<Instruction>) -> (Module, MethodId) {
+        let mut module = Module::new();
+        let record = module.add_type(vec![Value::Int32(0), Value::Int32(0)]);
+        module.set_type_is_value_type(record, true);
+        module.bind_type_token(0, Token(0x0200_0001), record);
+        module.set_type_field_offsets(record, 8, 4, &[0, 4]);
+        module.set_type_field_storage(record,
+            &[crate::module::FieldStorage::Primitive(crate::PrimKind::I4); 2]);
+        let field = Token(0x0400_0001);
+        module.bind_field(0, field, 1);
+        module.bind_field_type(0, field, record);
+        let entry = module.add_method_image(0, method(code), 0);
+        (module, entry)
+    }
+
+    #[test]
+    fn stack_struct_field_store_uses_byte_offset() {
+        let (module, entry) = stack_struct_field_program(vec![
+            Instruction::new(Opcode::LdcI4, Operand::Int32(16)),
+            Instruction::simple(Opcode::Localloc),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(8)),
+            Instruction::simple(Opcode::Add),
+            Instruction::simple(Opcode::Dup),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(47)),
+            Instruction::new(Opcode::Stfld, Operand::Token(Token(0x0400_0001))),
+            Instruction::simple(Opcode::LdcI44),
+            Instruction::simple(Opcode::Add),
+            Instruction::simple(Opcode::LdindI4),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        assert_eq!(super::run(&module, &mut Vm::new(), entry, Vec::new()),
+            Ok(Some(Value::Int32(47))));
+    }
+
+    #[test]
+    fn stack_intrinsic_arguments_trap_instead_of_becoming_null() {
+        fn observe(_vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+            Ok(args.first().cloned())
+        }
+        for cross_frame in [false, true] {
+            for frozen in [false, true] {
+                let mut module = Module::new();
+                let intrinsic_token = Token(0x0a00_0001);
+                let relay_token = Token(0x0600_0001);
+                let intrinsic = module.add_intrinsic(0, observe, 0, 1);
+                module.bind_token(0, intrinsic_token, intrinsic);
+                let relay = module.add_method_image(0, method(vec![
+                    Instruction::simple(Opcode::Ldarg0),
+                    Instruction::new(Opcode::Call, Operand::Token(intrinsic_token)),
+                    Instruction::simple(Opcode::Ret),
+                ]), 1);
+                module.bind_token(0, relay_token, relay);
+                let target = if cross_frame { relay_token } else { intrinsic_token };
+                let entry = module.add_method_image(0, method(vec![
+                    Instruction::simple(Opcode::LdcI44),
+                    Instruction::simple(Opcode::Localloc),
+                    Instruction::simple(Opcode::Dup),
+                    Instruction::new(Opcode::LdcI4, Operand::Int32(42)),
+                    Instruction::simple(Opcode::StindI4),
+                    Instruction::new(Opcode::Call, Operand::Token(target)),
+                    Instruction::simple(Opcode::Ret),
+                ]), 0);
+                if frozen { module.freeze(); }
+                assert_eq!(super::run(&module, &mut Vm::new(), entry, Vec::new()),
+                    Err(Trap::Unsupported(Opcode::Call)), "cross_frame={cross_frame} frozen={frozen}");
+            }
+        }
+    }
+
+    #[test]
+    fn readable_intrinsic_arguments_preserve_values_including_null() {
+        fn observe(_vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+            Ok(args.first().cloned())
+        }
+        for (value, expected) in [
+            (Instruction::new(Opcode::LdcI4, Operand::Int32(42)), Value::Int32(42)),
+            (Instruction::simple(Opcode::Ldnull), Value::Null),
+        ] {
+            let mut module = Module::new();
+            let token = Token(0x0a00_0001);
+            let intrinsic = module.add_intrinsic(0, observe, 0, 1);
+            module.bind_token(0, token, intrinsic);
+            let entry = module.add_method_image(0, method(vec![
+                value,
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::new(Opcode::Call, Operand::Token(token)),
+                Instruction::simple(Opcode::Ret),
+            ]), 0);
+            for frozen in [false, true] {
+                if frozen { module.freeze(); }
+                assert_eq!(super::run(&module, &mut Vm::new(), entry, Vec::new()),
+                    Ok(Some(expected.clone())), "frozen={frozen}");
+            }
+        }
+    }
+
+    #[test]
+    fn stack_struct_whole_object_loads_do_not_return_null() {
+        for cross_frame in [false, true] {
+            let kind = Token(0x0200_0001);
+            let callee_token = Token(0x0600_0001);
+            let mut code = vec![
+                Instruction::simple(Opcode::LdcI48),
+                Instruction::simple(Opcode::Localloc),
+                Instruction::simple(Opcode::Dup),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(20)),
+                Instruction::new(Opcode::Stfld, Operand::Token(Token(0x0400_0001))),
+            ];
+            code.push(if cross_frame {
+                Instruction::new(Opcode::Call, Operand::Token(callee_token))
+            } else {
+                Instruction::new(Opcode::Ldobj, Operand::Token(kind))
+            });
+            code.push(Instruction::simple(Opcode::Ret));
+            let (mut module, entry) = stack_struct_field_program(code);
+            let callee = module.add_method_image(0, method(vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::new(Opcode::Ldobj, Operand::Token(kind)),
+                Instruction::simple(Opcode::Ret),
+            ]), 1);
+            module.bind_token(0, callee_token, callee);
+            assert_eq!(super::run(&module, &mut Vm::new(), entry, Vec::new()),
+                Err(Trap::Unsupported(Opcode::Ldobj)), "cross_frame={cross_frame}");
+        }
+    }
+
+    #[test]
+    fn stack_struct_whole_object_copies_do_not_write_null() {
+        let (module, entry) = stack_struct_field_program(vec![
+            Instruction::simple(Opcode::LdcI48),
+            Instruction::simple(Opcode::Localloc),
+            Instruction::simple(Opcode::Dup),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(20)),
+            Instruction::new(Opcode::Stfld, Operand::Token(Token(0x0400_0001))),
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(1)),
+            Instruction::simple(Opcode::Ldloc0),
+            Instruction::new(Opcode::Cpobj, Operand::Token(Token(0x0200_0001))),
+            Instruction::simple(Opcode::Ldloc1),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        assert_eq!(super::run(&module, &mut Vm::new(), entry, Vec::new()),
+            Err(Trap::Unsupported(Opcode::Cpobj)));
+    }
+
+    #[test]
+    fn stack_struct_field_load_reads_raw_bytes() {
+        let (module, entry) = stack_struct_field_program(vec![
+            Instruction::new(Opcode::LdcI4, Operand::Int32(8)),
+            Instruction::simple(Opcode::Localloc),
+            Instruction::simple(Opcode::Dup),
+            Instruction::simple(Opcode::LdcI44),
+            Instruction::simple(Opcode::Add),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(47)),
+            Instruction::simple(Opcode::StindI4),
+            Instruction::new(Opcode::Ldfld, Operand::Token(Token(0x0400_0001))),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        assert_eq!(super::run(&module, &mut Vm::new(), entry, Vec::new()),
+            Ok(Some(Value::Int32(47))));
+    }
+
+    #[test]
+    fn stack_struct_field_address_reaches_raw_bytes() {
+        let (module, entry) = stack_struct_field_program(vec![
+            Instruction::new(Opcode::LdcI4, Operand::Int32(8)),
+            Instruction::simple(Opcode::Localloc),
+            Instruction::simple(Opcode::Dup),
+            Instruction::new(Opcode::Ldflda, Operand::Token(Token(0x0400_0001))),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(47)),
+            Instruction::simple(Opcode::StindI4),
+            Instruction::simple(Opcode::LdcI44),
+            Instruction::simple(Opcode::Add),
+            Instruction::simple(Opcode::LdindI4),
+            Instruction::simple(Opcode::Ret),
+        ]);
+        assert_eq!(super::run(&module, &mut Vm::new(), entry, Vec::new()),
+            Ok(Some(Value::Int32(47))));
+    }
+
+    fn stack_struct_cross_frame_program(mut module: Module, storage: crate::module::FieldStorage) -> (Module, MethodId) {
+        let record = module.add_type(vec![Value::Null]);
+        module.set_type_is_value_type(record, true);
+        module.set_type_field_offsets(record, 24, 8, &[8]);
+        module.set_type_field_storage(record, &[storage]);
+        let field = Token(0x0400_0001);
+        module.bind_field(1, field, 0);
+        module.bind_field_type(1, field, record);
+        let callee_token = Token(0x0600_0001);
+        let callee = module.add_method_image(1, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(Opcode::Ldarg1),
+            Instruction::new(Opcode::Stfld, Operand::Token(field)),
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::new(Opcode::Ldfld, Operand::Token(field)),
+            Instruction::simple(Opcode::Ret),
+        ]), 2);
+        module.bind_token(0, callee_token, callee);
+        let main = module.add_method_image(0, method(vec![
+            Instruction::new(Opcode::LdcI4, Operand::Int32(24)),
+            Instruction::simple(Opcode::Localloc),
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::new(Opcode::Call, Operand::Token(callee_token)),
+            Instruction::simple(Opcode::Ret),
+        ]), 1);
+        (module, main)
+    }
+
+    fn check_stack_struct_storage_modes(mut module: Module, entry: MethodId, value: Value, expected: Value) {
+        let check = |module: &Module| assert_eq!(
+            super::run(module, &mut Vm::new(), entry, vec![value.clone()]), Ok(Some(expected.clone())));
+        check(&module);
+        #[cfg(feature = "code-in-place")]
+        {
+            let mut trimmed = module.clone();
+            let (methods, types, strings) = trimmed.reachable_set(Some(entry));
+            trimmed.retain_reachable(&methods, &types, &strings);
+            check(&trimmed);
+            let image = trimmed.write_baked(Some(entry)).expect("bake trimmed raw fields");
+            let (baked, _) = Module::from_baked(Box::leak(image.into_boxed_slice())).unwrap();
+            check(&baked);
+        }
+        module.freeze();
+        check(&module);
+        #[cfg(feature = "code-in-place")]
+        {
+            let image = module.write_baked(Some(entry)).expect("bake raw fields");
+            let (baked, _) = Module::from_baked(Box::leak(image.into_boxed_slice())).unwrap();
+            check(&baked);
+        }
+    }
+
+    #[test]
+    fn stack_struct_fields_use_declared_integer_widths_across_frames() {
+        use crate::{module::FieldStorage, PrimKind};
+        for (kind, value, expected) in [
+            (PrimKind::I1, Value::Int32(0x1ff), Value::Int32(-1)),
+            (PrimKind::U1, Value::Int32(0x1ff), Value::Int32(255)),
+            (PrimKind::I2, Value::Int32(0x18001), Value::Int32(-32767)),
+            (PrimKind::U2, Value::Int32(0x18001), Value::Int32(32769)),
+            (PrimKind::I4, Value::Int32(i32::MIN), Value::Int32(i32::MIN)),
+            (PrimKind::I8, Value::Int64(i64::MIN), Value::Int64(i64::MIN)),
+        ] {
+            let (module, entry) = stack_struct_cross_frame_program(Module::new(), FieldStorage::Primitive(kind));
+            check_stack_struct_storage_modes(module, entry, value, expected);
+        }
+        let (module, entry) = stack_struct_cross_frame_program(Module::new(), FieldStorage::Native);
+        check_stack_struct_storage_modes(module, entry, Value::NativeInt(-1), Value::NativeInt(-1));
+    }
+
+    #[cfg(feature = "float")]
+    #[test]
+    fn stack_struct_fields_preserve_floating_storage_across_frames() {
+        use crate::{module::FieldStorage, PrimKind};
+        for (kind, value, expected) in [
+            (PrimKind::F4, Value::Float(1.0 / 3.0), Value::Single(1.0 / 3.0)),
+            (PrimKind::F8, Value::Float(-1.25), Value::Float(-1.25)),
+        ] {
+            let (module, entry) = stack_struct_cross_frame_program(Module::new(), FieldStorage::Primitive(kind));
+            check_stack_struct_storage_modes(module, entry, value, expected);
+        }
+    }
+
+    #[test]
+    fn stack_struct_nested_field_copies_keep_layout_dependencies() {
+        use crate::{module::FieldStorage, PrimKind};
+        let mut module = Module::new();
+        let nested = module.add_type(vec![Value::Int32(0), Value::Int32(0)]);
+        module.set_type_field_offsets(nested, 8, 4, &[0, 4]);
+        module.set_type_field_storage(nested, &[
+            FieldStorage::Primitive(PrimKind::I1), FieldStorage::Primitive(PrimKind::I4)]);
+        let (module, entry) = stack_struct_cross_frame_program(module, FieldStorage::ValueType(nested));
+        let value = Value::Struct(vec![Value::Int32(255), Value::Int32(47)].into_boxed_slice());
+        let expected = Value::Struct(vec![Value::Int32(-1), Value::Int32(47)].into_boxed_slice());
+        check_stack_struct_storage_modes(module, entry, value, expected);
+    }
+
+    #[test]
+    fn stack_struct_narrow_writes_preserve_neighbors_and_padding() {
+        use crate::{module::FieldStorage, PrimKind};
+        let mut module = Module::new();
+        let record = module.add_type(vec![Value::Int32(0)]);
+        module.set_type_field_offsets(record, 4, 4, &[1]);
+        module.set_type_field_storage(record, &[FieldStorage::Primitive(PrimKind::U1)]);
+        let field = Token(0x0400_0001);
+        module.bind_field(0, field, 0);
+        module.bind_field_type(0, field, record);
+        let entry = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::LdcI44),
+            Instruction::simple(Opcode::Localloc),
+            Instruction::simple(Opcode::Dup),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(0x12345678)),
+            Instruction::simple(Opcode::StindI4),
+            Instruction::simple(Opcode::Dup),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(0x1ab)),
+            Instruction::new(Opcode::Stfld, Operand::Token(field)),
+            Instruction::simple(Opcode::LdindI4),
+            Instruction::simple(Opcode::Ret),
+        ]), 0);
+        assert_eq!(super::run(&module, &mut Vm::new(), entry, Vec::new()),
+            Ok(Some(Value::Int32(0x1234ab78))));
+    }
+
+    #[test]
+    fn stack_struct_invalid_layouts_and_out_of_bounds_accesses_trap() {
+        use crate::{module::FieldStorage, PrimKind};
+        let (mut module, entry) = stack_struct_cross_frame_program(Module::new(), FieldStorage::Primitive(PrimKind::I4));
+        module.set_type_field_offsets(0, 28, 4, &[24]);
+        assert_eq!(super::run(&module, &mut Vm::new(), entry, vec![Value::Int32(47)]), Err(Trap::NullReference));
+        module.set_type_field_offsets(0, 8, 4, &[8]);
+        assert_eq!(super::run(&module, &mut Vm::new(), entry, vec![Value::Int32(47)]), Err(Trap::Unsupported(Opcode::Stfld)));
+        module.set_type_field_offsets(0, 24, 4, &[8]);
+        module.set_type_field_storage(0, &[]);
+        assert_eq!(super::run(&module, &mut Vm::new(), entry, vec![Value::Int32(47)]), Err(Trap::Unsupported(Opcode::Stfld)));
+        module.set_type_field_storage(0, &[FieldStorage::Reference]);
+        assert_eq!(super::run(&module, &mut Vm::new(), entry, vec![Value::Null]), Err(Trap::Unsupported(Opcode::Stfld)));
+        module.set_type_field_storage(0, &[FieldStorage::Native]);
+        let pointer = Value::ByRef(Location::Local { frame: 0, slot: 0 });
+        assert_eq!(super::run(&module, &mut Vm::new(), entry, vec![pointer]), Err(Trap::TypeMismatch(Opcode::StindI)));
+        module.set_type_field_offsets(0, 4, 4, &[0]);
+        module.set_type_field_storage(0, &[FieldStorage::ValueType(0)]);
+        assert_eq!(decode_stack_field(&module, FieldStorage::ValueType(0), &[0; 4], 0), Err(Trap::Unsupported(Opcode::Ldfld)));
+    }
+
     #[test]
     fn localloc_unwritten_bytes_read_as_zero() {
         let result = run(vec![
@@ -9313,6 +10732,75 @@ mod tests {
         assert_eq!(result, Ok(Some(Value::Int32(0xABCD))));
     }
 
+    fn convert_value(vm: &mut Vm, opcode: Opcode, value: Value) -> Result<Option<Value>, Trap> {
+        let mut module = Module::new();
+        let main = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(opcode),
+            Instruction::simple(Opcode::Ret),
+        ]), 1);
+        super::run(&module, vm, main, vec![value])
+    }
+
+    #[test]
+    fn fixed_string_native_conversion_preserves_character_addresses() {
+        for opcode in [Opcode::ConvI, Opcode::ConvU] {
+            for text in ["s\0t!", "", "\u{e9}\u{1f642}"] {
+                let mut vm = Vm::new();
+                vm.heap_mut().alloc_text("discarded before collection");
+                let string = vm.heap_mut().alloc_text(text);
+                let pointer = convert_value(&mut vm, opcode, Value::Object(string))
+                    .expect("convert pinned string").expect("native pointer");
+                assert_eq!(pointer, Value::ByRef(Location::StringChar { string, byte_offset: 0 }));
+                let mut units: Vec<u16> = text.encode_utf16().collect();
+                units.push(0);
+                for (index, expected) in units.iter().enumerate() {
+                    let displaced = stack_pointer_arithmetic(vm.heap(), Opcode::Add,
+                        &pointer, &Value::Int32((index * 2) as i32)).unwrap().unwrap();
+                    let Value::ByRef(location) = displaced else { panic!("string address") };
+                    assert_eq!(read_location_value(&[], &vm, location), Some(Value::Int32(i32::from(*expected))));
+                }
+                assert_eq!(convert_value(&mut vm, opcode, pointer.clone()), Ok(Some(pointer.clone())));
+                #[cfg(feature = "gc")]
+                {
+                    let mut root = pointer;
+                    vm.heap_mut().collect(|visit| visit(&mut root));
+                    let Value::ByRef(location @ Location::StringChar { string: moved, .. }) = root else {
+                        panic!("string address lost during collection");
+                    };
+                    assert_ne!(moved, string, "the retained string must move");
+                    assert_eq!(read_location_value(&[], &vm, location), Some(Value::Int32(i32::from(units[0]))));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_string_null_conversion_and_invalid_reference_controls() {
+        let mut vm = Vm::new();
+        let string = Value::Object(vm.heap_mut().alloc_text("test"));
+        let object = Value::Object(vm.heap_mut().alloc_instance(0, vec![]));
+        for opcode in [Opcode::ConvI, Opcode::ConvU] {
+            assert_eq!(convert_value(&mut vm, opcode, Value::Null), Ok(Some(Value::NativeInt(0))));
+            assert_eq!(convert_value(&mut vm, opcode, object.clone()), Err(Trap::TypeMismatch(opcode)));
+            assert_eq!(convert_value(&mut vm, opcode, Value::Int32(42)), Ok(Some(Value::NativeInt(42))));
+        }
+        for opcode in [Opcode::ConvI1, Opcode::ConvU2, Opcode::ConvI4, Opcode::ConvI8, Opcode::ConvR8] {
+            for value in [Value::Null, string.clone(), object.clone()] {
+                assert_eq!(convert_value(&mut vm, opcode, value), Err(Trap::TypeMismatch(opcode)));
+            }
+        }
+    }
+
+    #[test]
+    fn fixed_string_offset_intrinsic_matches_the_symbolic_data_address() {
+        use crate::intrinsic_registry::{intrinsic_by_id, intrinsic_id};
+        let getter = intrinsic_by_id(intrinsic_id("runtime_helpers_offset_to_string_data"))
+            .expect("registered string data offset getter");
+        let mut vm = Vm::new();
+        assert_eq!(getter(&mut vm, &Module::new(), &[]), Ok(Some(Value::Int32(0))));
+    }
+
     #[test]
     fn string_pinnable_pointer_reads_units_terminator_and_walks() {
         let mut vm = Vm::new();
@@ -9335,7 +10823,8 @@ mod tests {
             string: s,
             byte_offset: 0,
         });
-        let walked = stack_pointer_arithmetic(Opcode::Add, &pinned, &Value::Int32(2)).unwrap();
+        let walked =
+            stack_pointer_arithmetic(vm.heap(), Opcode::Add, &pinned, &Value::Int32(2)).unwrap();
         assert_eq!(
             walked,
             Some(Value::ByRef(Location::StringChar {
@@ -9355,6 +10844,168 @@ mod tests {
             ),
             Some(Value::Int32(0))
         );
+    }
+
+    fn array_pointer_binary(
+        vm: &mut Vm,
+        opcode: Opcode,
+        a: Value,
+        b: Value,
+    ) -> Result<Option<Value>, Trap> {
+        let mut module = Module::new();
+        let main = module.add_method_image(
+            0,
+            method(vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::Ldarg1),
+                Instruction::simple(opcode),
+                Instruction::simple(Opcode::Ret),
+            ]),
+            2,
+        );
+        super::run(&module, vm, main, vec![a, b])
+    }
+
+    #[test]
+    fn array_pointer_comparisons_use_byte_addresses() {
+        use crate::object::PrimKind;
+        for kind in [PrimKind::U1, PrimKind::I2, PrimKind::I4, PrimKind::I8] {
+            let mut vm = Vm::new();
+            let array = vm.heap_mut().alloc_packed_array(kind, 4, 0);
+            let other = vm.heap_mut().alloc_packed_array(kind, 4, 0);
+            let width = kind.byte_width() as u32;
+            let at = |array, index, byte_offset| {
+                Value::ByRef(Location::Element { array, index, byte_offset })
+            };
+            let indexed = at(array, 2, 0);
+            let displaced = at(array, 1, width);
+            for (a, b, opcode, expected) in [
+                (indexed.clone(), displaced.clone(), Opcode::Ceq, 1),
+                (displaced.clone(), indexed.clone(), Opcode::Ceq, 1),
+                (at(array, 0, width + 1), at(array, 1, 0), Opcode::CgtUn, 1),
+                (at(array, 1, 0), at(array, 0, width + 1), Opcode::CltUn, 1),
+                (indexed.clone(), at(other, 2, 0), Opcode::Ceq, 0),
+                (indexed, at(array, 2, 1), Opcode::Ceq, 0),
+            ] {
+                assert_eq!(
+                    array_pointer_binary(&mut vm, opcode, a, b),
+                    Ok(Some(Value::Int32(expected))),
+                    "{kind:?} {opcode:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn array_pointer_difference_uses_byte_addresses() {
+        use crate::object::PrimKind;
+        for kind in [PrimKind::U1, PrimKind::I2, PrimKind::I4, PrimKind::I8] {
+            let mut vm = Vm::new();
+            let array = vm.heap_mut().alloc_packed_array(kind, 4, 0);
+            let width = kind.byte_width() as u32;
+            let at = |index, byte_offset| {
+                Value::ByRef(Location::Element { array, index, byte_offset })
+            };
+            for (a, b, expected) in [
+                (at(2, 0), at(0, 0), i64::from(2 * width)),
+                (at(0, 0), at(2, 0), -i64::from(2 * width)),
+                (at(1, width), at(2, 0), 0),
+            ] {
+                assert_eq!(
+                    array_pointer_binary(&mut vm, Opcode::Sub, a, b),
+                    Ok(Some(Value::NativeInt(expected))),
+                    "{kind:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn struct_array_pointers_use_padded_element_layout() {
+        let definition = Token::new(0x02, 1);
+        let reference = Token::new(0x01, 1);
+        for preparation in ["live", "frozen", "baked"] {
+            let mut module = Module::new();
+            let item = module.add_type(vec![Value::Int32(0); 3]);
+            module.set_type_is_value_type(item, true);
+            module.bind_type_token(0, definition, item);
+            module.bind_type_token(1, reference, item);
+            module.set_type_size(0, definition, 12);
+            module.set_type_field_offsets(item, 12, 4, &[0, 4, 8]);
+            if preparation == "frozen" {
+                module.freeze();
+            }
+            if preparation == "baked" {
+                #[cfg(not(feature = "code-in-place"))]
+                continue;
+                #[cfg(feature = "code-in-place")]
+                {
+                    let image = module.write_baked(None).expect("bake array element layout");
+                    module = Module::from_baked(Box::leak(image.into_boxed_slice()))
+                        .expect("read array element layout").0;
+                }
+            }
+            for (asm, token) in [(0, definition), (1, reference)] {
+                let mut vm = Vm::new();
+                let array = alloc_array_of_element(&mut vm, &module, asm, token, 4);
+                assert_eq!(vm.heap().array_element_width(array), Some(12));
+                let empty = alloc_array_of_element(&mut vm, &module, asm, token, 0);
+                assert_eq!(vm.heap().array_element_width(empty), Some(12));
+                let value = |n| Value::Struct(vec![Value::Int32(n); 3].into_boxed_slice());
+                for index in 0..4 {
+                    assert!(vm.heap_mut().array_set(array, index, value(index as i32 + 10)));
+                }
+                let at = |index, byte_offset| Location::Element { array, index, byte_offset };
+                for (a, b, opcode, expected) in [
+                    (at(2, 0), at(0, 0), Opcode::Sub, Value::NativeInt(24)),
+                    (at(0, 0), at(2, 0), Opcode::Sub, Value::NativeInt(-24)),
+                    (at(0, 24), at(2, 0), Opcode::Ceq, Value::Int32(1)),
+                    (at(0, 25), at(2, 0), Opcode::CgtUn, Value::Int32(1)),
+                ] {
+                    assert_eq!(array_pointer_binary(&mut vm, opcode, Value::ByRef(a), Value::ByRef(b)),
+                        Ok(Some(expected)), "{preparation}, asm={asm}, {opcode:?}");
+                }
+                assert_eq!(read_location_value(&[], &vm, at(0, 24)), Some(value(12)));
+                write_location_value(&mut [], &mut vm, at(0, 36), value(99)).expect("write third stride");
+                assert_eq!(vm.heap().array_get(array, 2), Some(value(12)));
+                assert_eq!(vm.heap().array_get(array, 3), Some(value(99)));
+                let copy = vm.heap_mut().clone_array(array).expect("clone struct array");
+                assert_eq!(vm.heap().array_element_width(copy), Some(12));
+                assert_eq!(read_location_value(&[], &vm, Location::Element {
+                    array: copy, index: 0, byte_offset: 36,
+                }), Some(value(99)));
+                #[cfg(feature = "gc")]
+                {
+                    let mut root = Value::ByRef(Location::Element {
+                        array: copy, index: 0, byte_offset: 36,
+                    });
+                    vm.heap_mut().collect(|visit| visit(&mut root));
+                    let Value::ByRef(location @ Location::Element { array: moved, .. }) = root else {
+                        panic!("element address lost during collection");
+                    };
+                    assert_ne!(moved, copy, "the retained array must move");
+                    assert_eq!(vm.heap().array_element_width(moved), Some(12));
+                    assert_eq!(read_location_value(&[], &vm, location), Some(value(99)));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn struct_array_stride_uses_layout_without_guessing_from_slots() {
+        let token = Token::new(0x02, 1);
+        let mut module = Module::new();
+        let item = module.add_type(vec![Value::Int32(0); 3]);
+        module.set_type_is_value_type(item, true);
+        module.bind_type_token(0, token, item);
+        let mut vm = Vm::new();
+        let unknown = alloc_array_of_element(&mut vm, &module, 0, token, 2);
+        assert_eq!(vm.heap().array_element_width(unknown), None);
+        // The same reduced slots can describe a byte, short and int with padding.
+        module.set_type_field_offsets(item, 8, 4, &[0, 2, 4]);
+        module.freeze();
+        let recorded = alloc_array_of_element(&mut vm, &module, 0, token, 2);
+        assert_eq!(vm.heap().array_element_width(recorded), Some(8));
     }
 
     /// A module holding `Pair`, a class whose two `int` fields the loader recorded at bytes 0 and 4,
@@ -9486,8 +11137,11 @@ mod tests {
 
     #[test]
     fn checked_pointer_arithmetic_refuses_the_wrap_the_unchecked_form_allows() {
-        let ovf = |opcode, a: &Value, b: &Value| stack_pointer_arithmetic(opcode, a, b).unwrap_err();
-        let walk = |opcode, a: &Value, b: &Value| stack_pointer_arithmetic(opcode, a, b).unwrap();
+        let heap = Heap::new();
+        let ovf =
+            |opcode, a: &Value, b: &Value| stack_pointer_arithmetic(&heap, opcode, a, b).unwrap_err();
+        let walk =
+            |opcode, a: &Value, b: &Value| stack_pointer_arithmetic(&heap, opcode, a, b).unwrap();
 
         let all_ones = Value::NativeInt(i64::from(u32::MAX));
         assert_eq!(
@@ -10222,6 +11876,49 @@ mod tests {
     }
 
     #[test]
+    fn resolved_array_targets_without_cast_records_enforce_named_store_checks() {
+        for frozen in [false, true] {
+            let mut module = Module::new();
+            let unrelated = Token(0x0200_0001);
+            let array_base = Token(0x0200_0002);
+            for token in [unrelated, array_base] {
+                let type_id = module.add_type(Vec::new());
+                module.bind_type_token(0, token, type_id);
+            }
+            module.mark_array_base_name(0, array_base);
+            if frozen { module.freeze(); }
+            for (token, allowed) in [(unrelated, false), (array_base, true)] {
+                let handle = asm_key(0, token.0);
+                assert_eq!(module.cast_elem(handle), None);
+                for rectangular in [false, true] {
+                    let mut vm = Vm::new();
+                    let array = crate::intrinsics::array_create_instance(
+                        &mut vm, &module, &[Value::NativeInt(handle as i64), Value::Int32(1)],
+                    ).unwrap().unwrap();
+                    let Value::Object(destination) = array else { panic!("array") };
+                    let source = if rectangular {
+                        vm.heap_mut().alloc_md_array(vec![1, 1])
+                    } else {
+                        vm.heap_mut().alloc_array(vec![Value::Int32(0)])
+                    };
+                    let mut frame = Frame::new(0, MethodContext::NONE, Vec::new());
+                    frame.stack.extend([array, Value::Int32(0), Value::Object(source)]);
+                    let result = step(&mut frame, 0, &[], 1, Some(&module), &mut vm,
+                        &Instruction::simple(Opcode::StelemRef));
+                    if allowed {
+                        assert!(result.is_ok(), "{:?}", result.err());
+                        assert_eq!(vm.heap().array_get(destination, 0), Some(Value::Object(source)));
+                    } else {
+                        assert!(matches!(result, Err(Trap::ArrayTypeMismatch)),
+                            "a resolved target without a cast record must reject unrelated arrays: {:?}", result.err());
+                        assert_eq!(vm.heap().array_get(destination, 0), Some(Value::Null));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn packed_byte_array_matches_boxed_element_semantics() {
         let elem = Token(0x0100_0005);
         let mut module = Module::new();
@@ -10258,6 +11955,239 @@ mod tests {
             super::run(&module, &mut Vm::new(), main, Vec::new()),
             Ok(Some(Value::Int32(455)))
         );
+    }
+
+    fn array_address_module() -> (Module, Token, Token) {
+        let root_token = Token(0x0200_0001);
+        let leaf_token = Token(0x0200_0002);
+        let mut module = Module::new();
+        let root = module.add_type(Vec::new());
+        let leaf = module.add_type(Vec::new());
+        module.set_type_base(leaf, Some(root));
+        module.bind_type_token(0, root_token, root);
+        module.bind_type_token(0, leaf_token, leaf);
+        module.bind_type_token(1, Token(0x0100_0001), root);
+        (module, root_token, leaf_token)
+    }
+
+    #[test]
+    #[cfg(feature = "exceptions")]
+    fn ldelema_rejects_covariant_arguments_before_entering_the_callee() {
+        let (mut module, root, leaf) = array_address_module();
+        let field = Token(0x0400_0001);
+        let callee_token = Token(0x0600_0001);
+        module.bind_static_field(0, field, Value::Int32(0));
+        let callee = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::LdcI41),
+            Instruction::new(Opcode::Stsfld, Operand::Token(field)),
+            ret(),
+        ]), 1);
+        module.bind_token(0, callee_token, callee);
+        let main = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(Opcode::LdcI40),
+            Instruction::new(Opcode::Ldelema, Operand::Token(root)),
+            Instruction::new(Opcode::Call, Operand::Token(callee_token)),
+            ret(),
+        ]), 1);
+        for (element, should_call) in [(root, true), (leaf, false)] {
+            let mut vm = Vm::new();
+            vm.init_statics(&module.decode_static_defaults());
+            let array = vm.heap_mut().alloc_typed_array(vec![Value::Null], asm_key(0, element.0));
+            let result = super::run(&module, &mut vm, main, vec![Value::Object(array)]);
+            if should_call {
+                assert_eq!(result, Ok(None));
+            } else {
+                assert!(matches!(result, Err(Trap::UnhandledException(_))), "{result:?}");
+            }
+            assert_eq!(vm.static_field(0), Some(Value::Int32(i32::from(should_call))));
+        }
+    }
+
+    #[test]
+    fn ldelema_checks_reference_identity_and_preserves_primitive_storage_types() {
+        let (mut module, root, leaf) = array_address_module();
+        let string = Token(0x0100_0002);
+        let object = Token(0x0100_0003);
+        let int = Token(0x0100_0004);
+        let uint = Token(0x0100_0005);
+        let long = Token(0x0100_0006);
+        module.bind_cast_elem(0, string, CastElem::String);
+        module.bind_cast_elem(0, object, CastElem::Object);
+        module.bind_cast_elem(0, int, CastElem::Prim(CastPrim::I4));
+        module.bind_cast_elem(0, uint, CastElem::Prim(CastPrim::U4));
+        module.bind_cast_elem(0, long, CastElem::Prim(CastPrim::I8));
+        for (element, requested, allowed) in [
+            (asm_key(0, root.0), root, true),
+            (asm_key(1, 0x0100_0001), root, true),
+            (asm_key(0, leaf.0), root, false),
+            (asm_key(0, string.0), string, true),
+            (asm_key(0, string.0), object, false),
+            (asm_key(0, uint.0), int, true),
+            (asm_key(0, long.0), int, false),
+        ] {
+            let mut vm = Vm::new();
+            let array = vm.heap_mut().alloc_typed_array(vec![Value::Null], element);
+            let mut frame = Frame::new(0, MethodContext::NONE, Vec::new());
+            frame.stack.extend([Value::Object(array), Value::Int32(0)]);
+            let result = step(&mut frame, 0, &[], 1, Some(&module), &mut vm,
+                &Instruction::new(Opcode::Ldelema, Operand::Token(requested)));
+            if allowed {
+                assert!(result.is_ok(), "{element:#x} -> {requested:?}: {:?}", result.err());
+                assert_eq!(frame.pop().unwrap(), Value::ByRef(Location::Element {
+                    array, index: 0, byte_offset: 0,
+                }));
+            } else {
+                assert!(matches!(result, Err(Trap::ArrayTypeMismatch)),
+                    "{element:#x} -> {requested:?}: {:?}", result.err());
+            }
+        }
+    }
+
+    #[test]
+    fn ldelema_requires_exact_nested_array_types() {
+        let mut failures = Vec::new();
+        for reflected in [false, true] {
+            for mode in 0..=2 {
+                if mode == 2 && !cfg!(feature = "code-in-place") { continue; }
+                let mut module = Module::new();
+                let enum_a = Token(0x0200_0001);
+                let enum_b = Token(0x0200_0002);
+                let enum_ref = Token(0x0100_0001);
+                for (token, name) in [(enum_a, "Sample.A"), (enum_b, "Sample.B")] {
+                    let id = module.add_type(Vec::new());
+                    module.bind_type_token(0, token, id);
+                    if token == enum_a { module.bind_type_token(1, enum_ref, id); }
+                    module.set_enum_constant(0, token.0, 0, String::from("Zero"));
+                    module.set_enum_width(0, token.0, 4);
+                    if reflected {
+                        module.bind_reflect_type(asm_key(0, token.0), crate::module::ReflectType {
+                            full_name: String::from(name), is_value_type: true,
+                            ..crate::module::ReflectType::default()
+                        });
+                    }
+                }
+                let int = CastElem::Prim(CastPrim::I4);
+                let uint = CastElem::Prim(CastPrim::U4);
+                let a = CastElem::Named(asm_key(0, enum_a.0));
+                let b = CastElem::Named(asm_key(0, enum_b.0));
+                let a_ref = CastElem::Named(asm_key(1, enum_ref.0));
+                let vector = |elem| CastElem::Array(Box::new(elem));
+                let rect = |elem, rank| CastElem::MdArray { element: Box::new(elem), rank };
+                let cases = [
+                    (int.clone(), uint.clone(), true),
+                    (a.clone(), int.clone(), true),
+                    (a.clone(), b.clone(), true),
+                    (vector(int.clone()), vector(int.clone()), true),
+                    (vector(int.clone()), vector(uint.clone()), false),
+                    (vector(uint.clone()), vector(int.clone()), false),
+                    (vector(a.clone()), vector(int.clone()), false),
+                    (vector(int.clone()), vector(a.clone()), false),
+                    (vector(a.clone()), vector(b.clone()), false),
+                    (vector(a.clone()), vector(a_ref.clone()), true),
+                    (vector(CastElem::String), vector(CastElem::Object), false),
+                    (vector(vector(int.clone())), vector(vector(uint.clone())), false),
+                    (vector(vector(a.clone())), vector(vector(a_ref)), true),
+                    (rect(int.clone(), 1), rect(uint.clone(), 1), false),
+                    (rect(int.clone(), 1), rect(int.clone(), 2), false),
+                    (rect(int.clone(), 1), vector(int.clone()), false),
+                    (rect(int.clone(), 2), rect(int.clone(), 2), true),
+                    (rect(int.clone(), 2), rect(uint.clone(), 2), false),
+                    (rect(a, 2), rect(b, 2), false),
+                    (vector(rect(int, 2)), vector(rect(uint, 2)), false),
+                ];
+                for (i, (held, wanted, _)) in cases.iter().enumerate() {
+                    let token = Token(0x1b00_0001 + i as u32);
+                    module.bind_cast_elem(0, token, held.clone());
+                    module.bind_cast_elem(1, token, wanted.clone());
+                }
+                if mode == 1 { module.freeze(); }
+                #[cfg(feature = "code-in-place")]
+                if mode == 2 {
+                    let bytes = module.write_baked(None).unwrap();
+                    module = Module::from_baked(Box::leak(bytes.into_boxed_slice())).unwrap().0;
+                }
+                for (i, (held, wanted, allowed)) in cases.iter().enumerate() {
+                    let token = Token(0x1b00_0001 + i as u32);
+                    let mut vm = Vm::new();
+                    let array = vm.heap_mut().alloc_typed_array(vec![Value::Null], asm_key(0, token.0));
+                    let mut frame = Frame::new(0, MethodContext { asm: 1, ..MethodContext::NONE }, Vec::new());
+                    frame.stack.extend([Value::Object(array), Value::Int32(0)]);
+                    let result = step(&mut frame, 0, &[], 1, Some(&module), &mut vm,
+                        &Instruction::new(Opcode::Ldelema, Operand::Token(token)));
+                    let matched = if *allowed {
+                        result.is_ok() && frame.pop() == Ok(Value::ByRef(Location::Element {
+                            array, index: 0, byte_offset: 0,
+                        }))
+                    } else {
+                        matches!(result, Err(Trap::ArrayTypeMismatch))
+                    };
+                    if !matched {
+                        failures.push(format!("{held:?} -> {wanted:?}, allowed={allowed}, \
+                            reflected={reflected}, storage={mode}: {:?}", result.err()));
+                    }
+                }
+            }
+        }
+        assert!(failures.is_empty(), "{}", failures.join("\n"));
+    }
+
+    #[test]
+    fn ldelema_readonly_skips_the_type_check_for_one_address_only() {
+        let (module, root, leaf) = array_address_module();
+        let mut vm = Vm::new();
+        let array = vm.heap_mut().alloc_typed_array(vec![Value::Null], asm_key(0, leaf.0));
+        let mut frame = Frame::new(0, MethodContext::NONE, Vec::new());
+        step(&mut frame, 0, &[], 1, Some(&module), &mut vm,
+            &Instruction::simple(Opcode::Readonly)).unwrap();
+        frame.stack.extend([Value::Object(array), Value::Int32(0)]);
+        let address = Instruction::new(Opcode::Ldelema, Operand::Token(root));
+        step(&mut frame, 0, &[], 1, Some(&module), &mut vm, &address).unwrap();
+        assert_eq!(frame.pop().unwrap(), Value::ByRef(Location::Element {
+            array, index: 0, byte_offset: 0,
+        }));
+        frame.stack.extend([Value::Object(array), Value::Int32(0)]);
+        assert!(matches!(step(&mut frame, 0, &[], 1, Some(&module), &mut vm, &address),
+            Err(Trap::ArrayTypeMismatch)));
+    }
+
+    #[test]
+    #[cfg(feature = "exceptions")]
+    fn readonly_array_address_call_does_not_change_a_later_writable_address() {
+        let (mut module, root, leaf) = array_address_module();
+        let address_token = Token(0x0A00_0001);
+        let address = module.add_intrinsic(
+            0,
+            crate::intrinsics::md_array_address,
+            crate::intrinsic_registry::intrinsic_id("md_array_address"),
+            3,
+        );
+        module.bind_token(0, address_token, address);
+        let main = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(Opcode::LdcI40),
+            Instruction::simple(Opcode::LdcI40),
+            Instruction::simple(Opcode::Readonly),
+            Instruction::new(Opcode::Call, Operand::Token(address_token)),
+            Instruction::simple(Opcode::Pop),
+            Instruction::simple(Opcode::Ldarg1),
+            Instruction::simple(Opcode::LdcI40),
+            Instruction::new(Opcode::Ldelema, Operand::Token(root)),
+            Instruction::simple(Opcode::Pop),
+            ret(),
+        ]), 2);
+        for (element, allowed) in [(root, true), (leaf, false)] {
+            let mut vm = Vm::new();
+            let grid = vm.heap_mut().alloc_md_array(vec![1, 1]);
+            let vector = vm.heap_mut().alloc_typed_array(vec![Value::Null], asm_key(0, element.0));
+            let result = super::run(&module, &mut vm, main,
+                vec![Value::Object(grid), Value::Object(vector)]);
+            if allowed {
+                assert_eq!(result, Ok(None));
+            } else {
+                assert!(matches!(result, Err(Trap::UnhandledException(_))), "{result:?}");
+            }
+        }
     }
 
     #[test]
@@ -10365,6 +12295,192 @@ mod tests {
         );
     }
 
+    fn constrained_reference_program(boxed: bool) -> (Module, MethodId, TypeId) {
+        let constraint = Token(0x0200_0001);
+        let derived_token = Token(0x0200_0002);
+        let speak = Token(0x0600_0001);
+        let ran = Token(0x0400_0001);
+        let mut module = Module::new();
+        let base = module.add_type(vec![]);
+        let derived = module.add_type(vec![]);
+        module.bind_type_token(0, constraint, base);
+        module.bind_type_token(0, derived_token, derived);
+        module.set_type_base(derived, Some(base));
+        module.set_type_is_value_type(derived, boxed);
+        module.bind_static_field(0, ran, Value::Int32(0));
+        let base_speak = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::LdcI41),
+            Instruction::new(Opcode::Stsfld, Operand::Token(ran)),
+            Instruction::simple(Opcode::LdcI41),
+            ret(),
+        ]), 1);
+        let derived_speak = module.add_method_image(0, method(if boxed {
+            vec![Instruction::simple(Opcode::Ldarg0), Instruction::simple(Opcode::LdindI4), ret()]
+        } else {
+            vec![Instruction::simple(Opcode::LdcI42), ret()]
+        }), 1);
+        module.set_method_type(base_speak, base);
+        module.set_method_type(derived_speak, derived);
+        module.set_vtable(base, vec![base_speak]);
+        module.set_vtable(derived, vec![derived_speak]);
+        module.bind_method_slot(base_speak, 0);
+        module.bind_method_slot(derived_speak, 0);
+        module.bind_token(0, speak, base_speak);
+        let main = module.add_method_image(0, method(vec![
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            Instruction::new(Opcode::Constrained, Operand::Token(constraint)),
+            Instruction::new(Opcode::Callvirt, Operand::Token(speak)),
+            ret(),
+        ]), 1);
+        (module, main, derived)
+    }
+
+    #[test]
+    #[cfg(feature = "exceptions")]
+    fn constrained_reference_null_throws_before_the_method_runs() {
+        let (module, main, _) = constrained_reference_program(false);
+        let mut vm = Vm::new();
+        vm.init_statics(&[Value::Int32(0)]);
+        let result = super::run(&module, &mut vm, main, vec![Value::Null]);
+        let Err(Trap::UnhandledException(detail)) = result else {
+            panic!("expected NullReferenceException, got {result:?}");
+        };
+        assert_eq!(detail.tag, crate::exception::exception_tag("System.NullReferenceException"));
+        assert_eq!(vm.static_field(0), Some(Value::Int32(0)));
+    }
+
+    #[test]
+    fn constrained_reference_dispatches_on_the_referenced_object() {
+        let (module, main, derived) = constrained_reference_program(false);
+        let mut vm = Vm::new();
+        let receiver = vm.heap_mut().alloc_instance(derived, vec![]);
+        assert_eq!(super::run(&module, &mut vm, main, vec![Value::Object(receiver)]),
+            Ok(Some(Value::Int32(2))));
+    }
+
+    #[test]
+    fn constrained_reference_dispatches_and_unboxes_a_boxed_value() {
+        let (module, main, _) = constrained_reference_program(true);
+        let mut vm = Vm::new();
+        let receiver = vm.heap_mut().alloc_boxed(asm_key(0, 0x0200_0002), Value::Int32(42));
+        assert_eq!(super::run(&module, &mut vm, main, vec![Value::Object(receiver)]),
+            Ok(Some(Value::Int32(42))));
+    }
+
+    fn constrained_reference_outer_program(nested: bool, local: bool) -> (Module, MethodId, TypeId) {
+        let (mut module, _, derived) = constrained_reference_program(false);
+        let field = Token(0x0400_0002);
+        module.bind_field(0, field, 0);
+        let mut body = vec![Instruction::simple(Opcode::Ldarg0)];
+        if nested {
+            body.push(Instruction::new(Opcode::Ldflda, Operand::Token(field)));
+        }
+        body.extend([
+            Instruction::new(Opcode::Constrained, Operand::Token(Token(0x0200_0001))),
+            Instruction::new(Opcode::Callvirt, Operand::Token(Token(0x0600_0001))),
+            ret(),
+        ]);
+        let show = module.add_method_image(0, method(body), 1);
+        let show_token = Token(0x0600_0003);
+        module.bind_token(0, show_token, show);
+        let mut caller = if local {
+            vec![
+                Instruction::simple(Opcode::Ldarg0),
+                Instruction::simple(Opcode::Stloc0),
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            ]
+        } else {
+            vec![Instruction::new(Opcode::LdargaS, Operand::Variable(0))]
+        };
+        caller.extend([Instruction::new(Opcode::Call, Operand::Token(show_token)), ret()]);
+        let main = module.add_method_image(0, method(caller), 1);
+        (module, main, derived)
+    }
+
+    #[test]
+    fn constrained_reference_ref_parameter_reads_the_callers_local() {
+        let (module, main, derived) = constrained_reference_outer_program(false, true);
+        let mut vm = Vm::new();
+        let receiver = vm.heap_mut().alloc_instance(derived, vec![]);
+        assert_eq!(super::run(&module, &mut vm, main, vec![Value::Object(receiver)]),
+            Ok(Some(Value::Int32(2))));
+    }
+
+    #[test]
+    fn constrained_reference_in_parameter_reads_the_callers_argument() {
+        let (module, main, derived) = constrained_reference_outer_program(false, false);
+        let mut vm = Vm::new();
+        let receiver = vm.heap_mut().alloc_instance(derived, vec![]);
+        assert_eq!(super::run(&module, &mut vm, main, vec![Value::Object(receiver)]),
+            Ok(Some(Value::Int32(2))));
+    }
+
+    #[test]
+    fn constrained_reference_struct_this_field_reads_the_callers_local() {
+        let (module, main, derived) = constrained_reference_outer_program(true, true);
+        let mut vm = Vm::new();
+        let receiver = vm.heap_mut().alloc_instance(derived, vec![]);
+        let cell = Value::Struct(vec![Value::Object(receiver)].into_boxed_slice());
+        assert_eq!(super::run(&module, &mut vm, main, vec![cell]), Ok(Some(Value::Int32(2))));
+    }
+
+    #[test]
+    #[cfg(feature = "exceptions")]
+    fn constrained_reference_outer_null_throws_before_the_method_runs() {
+        let (module, main, _) = constrained_reference_outer_program(false, true);
+        let mut vm = Vm::new();
+        vm.init_statics(&[Value::Int32(0)]);
+        let result = super::run(&module, &mut vm, main, vec![Value::Null]);
+        let Err(Trap::UnhandledException(detail)) = result else {
+            panic!("expected NullReferenceException, got {result:?}");
+        };
+        assert_eq!(detail.tag, crate::exception::exception_tag("System.NullReferenceException"));
+        assert_eq!(vm.static_field(0), Some(Value::Int32(0)));
+    }
+
+    /// [`constrained_reference_program`]'s call made through a constraint token whose cast shape
+    /// is lenient, as a class or interface instantiation such as `Box<int>` is, and which resolves
+    /// to the same base class.
+    fn constrained_instantiation_program() -> (Module, MethodId, TypeId) {
+        let (mut module, _, derived) = constrained_reference_program(false);
+        let instantiation = Token(0x1B00_0001);
+        let base = module.type_id_of(0, Token(0x0200_0001)).unwrap();
+        module.bind_type_token(0, instantiation, base);
+        module.bind_cast_elem(0, instantiation, CastElem::Lenient);
+        let main = module.add_method_image(0, method(vec![
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            Instruction::new(Opcode::Constrained, Operand::Token(instantiation)),
+            Instruction::new(Opcode::Callvirt, Operand::Token(Token(0x0600_0001))),
+            ret(),
+        ]), 1);
+        (module, main, derived)
+    }
+
+    #[test]
+    fn constrained_instantiation_dispatches_on_the_referenced_object() {
+        let (module, main, derived) = constrained_instantiation_program();
+        let mut vm = Vm::new();
+        vm.init_statics(&[Value::Int32(0)]);
+        let receiver = vm.heap_mut().alloc_instance(derived, vec![]);
+        assert_eq!(super::run(&module, &mut vm, main, vec![Value::Object(receiver)]),
+            Ok(Some(Value::Int32(2))));
+        assert_eq!(vm.static_field(0), Some(Value::Int32(0)));
+    }
+
+    #[test]
+    #[cfg(feature = "exceptions")]
+    fn constrained_instantiation_null_throws_before_the_method_runs() {
+        let (module, main, _) = constrained_instantiation_program();
+        let mut vm = Vm::new();
+        vm.init_statics(&[Value::Int32(0)]);
+        let result = super::run(&module, &mut vm, main, vec![Value::Null]);
+        let Err(Trap::UnhandledException(detail)) = result else {
+            panic!("expected NullReferenceException, got {result:?}");
+        };
+        assert_eq!(detail.tag, crate::exception::exception_tag("System.NullReferenceException"));
+        assert_eq!(vm.static_field(0), Some(Value::Int32(0)));
+    }
+
     #[test]
     fn static_fields_persist_across_calls() {
         let field = Token(0x0400_0009);
@@ -10399,6 +12515,101 @@ mod tests {
             super::run(&module, &mut Vm::new(), main, Vec::new()),
             Ok(Some(Value::Int32(2)))
         );
+    }
+
+    #[cfg(feature = "exceptions")]
+    fn cctor_fault_program(access: Opcode, with_finally: bool) -> (Module, MethodId, TypeId) {
+        let mut module = Module::new();
+        let holder = module.add_type(Vec::new());
+        let field = Token(0x0400_0001);
+        let trace = Token(0x0400_0002);
+        let wrapper = Token(0x0100_0001);
+        module.bind_type_full_name(holder, String::from("Broken"));
+        module.bind_static_field(0, field, Value::Int32(0));
+        module.bind_static_field(0, trace, Value::Int32(0));
+        module.bind_static_slot_range(0, 1, holder);
+        module.bind_catch_type_tag(0, wrapper,
+            crate::exception::exception_tag("System.TypeInitializationException"));
+        let cctor = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldnull),
+            Instruction::simple(Opcode::Throw),
+        ]), 0);
+        module.set_method_type(cctor, holder);
+        module.add_static_ctor(cctor);
+
+        let mut code = vec![
+            Instruction::simple(Opcode::Ldnull),
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::simple(if access == Opcode::Stsfld { Opcode::LdcI47 } else { Opcode::Nop }),
+            Instruction::new(access, Operand::Token(field)),
+            Instruction::simple(if access == Opcode::Stsfld { Opcode::Nop } else { Opcode::Pop }),
+            Instruction::new(Opcode::Leave, Operand::Target(0)),
+        ];
+        let mut handlers = Vec::new();
+        if with_finally {
+            let start = code.len() as u32;
+            code.extend([
+                Instruction::simple(Opcode::LdcI41),
+                Instruction::new(Opcode::Stsfld, Operand::Token(trace)),
+                Instruction::simple(Opcode::Endfinally),
+            ]);
+            handlers.push(EhClause {
+                try_range: InstructionRange { start: 3, end: start },
+                handler_range: InstructionRange { start, end: code.len() as u32 },
+                kind: EhKind::Finally,
+            });
+        }
+        let handler = code.len() as u32;
+        code.extend([
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::new(Opcode::Leave, Operand::Target(handler + 2)),
+            Instruction::simple(Opcode::Ldloc0),
+            ret(),
+        ]);
+        code[5].operand = Operand::Target(handler + 2);
+        handlers.push(EhClause {
+            try_range: InstructionRange { start: if with_finally { 2 } else { 3 }, end: handler },
+            handler_range: InstructionRange { start: handler, end: handler + 2 },
+            kind: EhKind::Catch(wrapper),
+        });
+        let mut body = method(code);
+        body.handlers = handlers.into_boxed_slice();
+        let main = module.add_method_image(0, body, 0);
+        (module, main, holder)
+    }
+
+    #[cfg(feature = "exceptions")]
+    #[test]
+    fn cctor_failure_at_first_try_instruction_is_caught_and_cached() {
+        for access in [Opcode::Ldsfld, Opcode::Ldsflda, Opcode::Stsfld] {
+            for frozen in [false, true] {
+                let (mut module, main, holder) = cctor_fault_program(access, false);
+                if frozen { module.freeze(); }
+                let mut vm = Vm::new();
+                let first = super::run(&module, &mut vm, main, Vec::new());
+                let Ok(Some(Value::Object(wrapper))) = first else {
+                    panic!("{access:?}, frozen={frozen}: expected a caught wrapper, got {first:?}");
+                };
+                assert_eq!(vm.cctor_failure(holder), Some(wrapper));
+                let inner = vm.exception_inner(wrapper).expect("the original exception is retained");
+                assert_ne!(wrapper, inner);
+                assert_eq!(super::run(&module, &mut vm, main, Vec::new()), first);
+                assert_eq!(vm.exception_inner(wrapper), Some(inner));
+                assert_eq!(vm.cctors_failed.len(), 1);
+            }
+        }
+    }
+
+    #[cfg(feature = "exceptions")]
+    #[test]
+    fn cctor_failure_at_first_try_instruction_runs_its_finally() {
+        for access in [Opcode::Ldsfld, Opcode::Ldsflda, Opcode::Stsfld] {
+            let (module, main, _) = cctor_fault_program(access, true);
+            let mut vm = Vm::new();
+            assert!(matches!(super::run(&module, &mut vm, main, Vec::new()),
+                Ok(Some(Value::Object(_)))));
+            assert_eq!(vm.static_field(1), Some(Value::Int32(1)), "{access:?}");
+        }
     }
 
     /// `static readonly int Answer = 7;` in the shape the interpreter runs it: a `.cctor` that
@@ -10536,7 +12747,7 @@ mod tests {
     fn an_image_baked_before_the_trigger_tables_is_refused_until_booted() {
         let (mut module, main) = static_readonly_program();
         let image = module.write_baked(Some(main)).expect("bake");
-        let older = crate::module::image_without_trailing_tables(&image, 4);
+        let older = crate::module::image_without_trailing_tables(&image, 6);
         let image: &'static [u8] = Box::leak(older.into_boxed_slice());
         let (baked, entry) = Module::from_baked(image).expect("an older image still reads");
         let entry = entry.expect("the image records its entry point");
@@ -10758,6 +12969,57 @@ mod tests {
     }
 
     #[test]
+    fn rectangular_arrays_do_not_satisfy_vector_casts() {
+        let vector = Token::new(0x1b, 1);
+        let mut module = Module::new();
+        module.bind_cast_elem(0, vector, CastElem::Array(Box::new(CastElem::Prim(CastPrim::I4))));
+        let main = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::new(Opcode::Isinst, Operand::Token(vector)),
+            Instruction::simple(Opcode::Ret),
+        ]), 1);
+        let mut vm = Vm::new();
+        let plain = vm.heap_mut().alloc_array(vec![Value::Int32(0)]);
+        assert_eq!(super::run(&module, &mut vm, main, vec![Value::Object(plain)]),
+            Ok(Some(Value::Object(plain))), "a vector still satisfies its array type");
+        assert_eq!(super::run(&module, &mut vm, main, vec![Value::Null]), Ok(Some(Value::Null)));
+        for dimensions in [vec![2, 3], vec![4]] {
+            let rectangular = vm.heap_mut().alloc_md_array(dimensions);
+            assert_eq!(super::run(&module, &mut vm, main, vec![Value::Object(rectangular)]),
+                Ok(Some(Value::Null)), "a rectangular array is not a vector");
+        }
+    }
+
+    #[test]
+    fn rectangular_array_clones_keep_their_element_type() {
+        let matrix = Token::new(0x1b, 1);
+        let other_rank = Token::new(0x1b, 2);
+        let other_element = Token::new(0x1b, 3);
+        let vector_interface = Token::new(0x1b, 4);
+        let mut module = Module::new();
+        for (token, rank, element) in [
+            (matrix, 2, CastPrim::I4), (other_rank, 3, CastPrim::I4), (other_element, 2, CastPrim::I8),
+        ] {
+            module.bind_cast_elem(0, token, CastElem::MdArray {
+                element: Box::new(CastElem::Prim(element)), rank,
+            });
+        }
+        module.bind_cast_elem(0, vector_interface, CastElem::VectorInterface(Box::new(CastElem::Prim(CastPrim::I4))));
+        module.freeze();
+        let mut vm = Vm::new();
+        let original = vm.heap_mut().alloc_md_array_typed(vec![0, 4], asm_key(0, matrix.0));
+        let copy = vm.heap_mut().clone_array(original).expect("clone of rectangular array");
+        assert_ne!(original, copy);
+        for array in [original, copy] {
+            let value = Value::Object(array);
+            assert!(super::cast_matches(&module, 0, &vm, &value, matrix));
+            for target in [other_rank, other_element, vector_interface] {
+                assert!(!super::cast_matches(&module, 0, &vm, &value, target));
+            }
+        }
+    }
+
+    #[test]
     fn each_frame_runs_its_own_method_and_resolves_tokens_in_its_own_assembly() {
         let shared = Token::new(0x06, 1);
         let into_other = Token::new(0x06, 2);
@@ -10877,6 +13139,127 @@ mod tests {
         }
         assert!(most >= 32, "the loop allocated ({most} objects at most)");
         assert!(most <= 100, "the heap stayed at its threshold, not {most} objects");
+    }
+
+    #[cfg(feature = "gc")]
+    #[test]
+    fn a_collection_interval_collects_after_that_many_allocations() {
+        let mut module = Module::new();
+        let garbage = module.add_intrinsic(
+            0,
+            make_garbage,
+            crate::intrinsic_registry::intrinsic_id("test_make_garbage"),
+            0,
+        );
+        module.bind_token(0, Token::new(0x0A, 1), garbage);
+        let churn = module.add_method_image(
+            0,
+            method(vec![
+                Instruction::new(Opcode::Call, Operand::Token(Token::new(0x0A, 1))),
+                Instruction::new(Opcode::Br, Operand::Target(0)),
+            ]),
+            0,
+        );
+        for interval in [1, 10] {
+            let mut vm = Vm::new();
+            vm.set_collection_interval(core::num::NonZeroUsize::new(interval));
+            let mut session = Session::new(&module, churn, Vec::new()).expect("session");
+            let mut most = 0;
+            let mut collections = 0;
+            for _ in 0..2000 {
+                let before = vm.heap().object_count();
+                session.step(&module, &mut vm).expect("step");
+                let after = vm.heap().object_count();
+                if after < before {
+                    collections += 1;
+                }
+                most = most.max(after);
+            }
+            assert_eq!(most, interval, "the heap's peak under an interval of {interval}");
+            assert_eq!(collections, 1000 / interval, "the collections under an interval of {interval}");
+        }
+    }
+
+    /// Allocates a string of as many `a`s as its argument says, and hands it back.
+    #[cfg(feature = "gc")]
+    fn make_text(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+        let Some(&Value::Int32(length)) = args.first() else {
+            return Err(Trap::TypeMismatch(Opcode::Call));
+        };
+        let units = alloc::vec![0x61u16; usize::try_from(length).unwrap_or(0)];
+        let text = vm.heap_mut().alloc_string(&units).map_err(|_| Trap::OutOfMemory)?;
+        Ok(Some(Value::Object(text)))
+    }
+
+    /// Asks for a collection at the next instruction.
+    #[cfg(feature = "gc")]
+    fn ask_for_collection(vm: &mut Vm, _module: &Module, _args: &[Value]) -> Result<Option<Value>, Trap> {
+        vm.request_collect();
+        Ok(None)
+    }
+
+    /// The length of the string its argument names.
+    #[cfg(feature = "gc")]
+    fn text_length(vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+        let Some(&Value::Object(text)) = args.first() else {
+            return Err(Trap::TypeMismatch(Opcode::Call));
+        };
+        let units = vm.heap().as_string(text).ok_or(Trap::TypeMismatch(Opcode::Call))?;
+        Ok(Some(Value::Int32(i32::try_from(units.len()).unwrap_or(i32::MAX))))
+    }
+
+    /// **AN INTRINSIC's ARGUMENTS ARE ROOTS WHILE ITS TYPE's STATIC CONSTRUCTOR RUNS.** A first
+    /// call to an intrinsic runs its declaring type's pending `.cctor` before the intrinsic, as a
+    /// nested run, after the call has taken its arguments off the caller's stack. A collection in
+    /// that constructor must mark and relocate them with everything else.
+    ///
+    /// The argument here is live -- a local holds it too -- so it survives and MOVES: the garbage
+    /// below it is reclaimed. An argument left at its old index then names the object that moved
+    /// into that index, and the intrinsic answers about the wrong object, in range and without a
+    /// trap: 4, the length of the string after it, for the 3 of its own.
+    #[cfg(feature = "gc")]
+    #[test]
+    fn a_collection_in_an_intrinsics_static_constructor_relocates_the_intrinsics_arguments() {
+        let mut module = Module::new();
+        let owner = module.add_type(Vec::new());
+        let intrinsic = |module: &mut Module, func: crate::module::IntrinsicFn, name: &str, arg_count: u16, row: u32| {
+            let id = module.add_intrinsic(0, func, crate::intrinsic_registry::intrinsic_id(name), arg_count);
+            module.bind_token(0, Token::new(0x0A, row), id);
+            id
+        };
+        intrinsic(&mut module, make_garbage, "test_make_garbage", 0, 1);
+        intrinsic(&mut module, make_text, "test_make_text", 1, 2);
+        intrinsic(&mut module, ask_for_collection, "test_ask_for_collection", 0, 3);
+        let length = intrinsic(&mut module, text_length, "test_text_length", 1, 4);
+        module.set_method_type(length, owner);
+        let cctor = module.add_method_image(
+            0,
+            method(vec![Instruction::new(Opcode::Call, Operand::Token(Token::new(0x0A, 3))), ret()]),
+            0,
+        );
+        module.set_method_type(cctor, owner);
+        module.add_static_ctor(cctor);
+        let call = |row: u32| Instruction::new(Opcode::Call, Operand::Token(Token::new(0x0A, row)));
+        let main = module.add_method_image(
+            0,
+            method(vec![
+                call(1),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(3)),
+                call(2),
+                Instruction::new(Opcode::Stloc, Operand::Variable(0)),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(4)),
+                call(2),
+                Instruction::new(Opcode::Stloc, Operand::Variable(1)),
+                Instruction::new(Opcode::Ldloc, Operand::Variable(0)),
+                call(4),
+                ret(),
+            ]),
+            0,
+        );
+
+        let mut vm = Vm::new();
+        assert_eq!(super::run(&module, &mut vm, main, Vec::new()), Ok(Some(Value::Int32(3))));
+        assert_eq!(vm.heap().object_count(), 2, "the constructor's collection ran, and took the garbage");
     }
 
     /// Set by the thread [`a_loop_that_allocates_and_calls_nothing_is_preempted_for_another_thread`]
@@ -11082,6 +13465,40 @@ mod tests {
         );
     }
 
+
+    #[cfg(feature = "exceptions")]
+    #[test]
+    fn type_identity_runtime_exception_agrees_with_typeof_for_an_alias_record() {
+        for mode in 0..3 {
+            if mode == 2 && !cfg!(feature = "code-in-place") { continue; }
+            for asm in [0, 1] {
+                let mut module = Module::new();
+                let type_id = module.add_type(vec![]);
+                let defining = Token(0x0200_0001);
+                let alias = Token(0x0100_0007);
+                module.bind_type_token(0, defining, type_id);
+                module.bind_type_token(asm, alias, type_id);
+                module.bind_reflect_type(asm_key(asm, alias.0), crate::module::ReflectType {
+                    full_name: String::from("System.DivideByZeroException"),
+                    ..crate::module::ReflectType::default()
+                });
+                if mode == 1 { module.freeze(); }
+                #[cfg(feature = "code-in-place")]
+                if mode == 2 {
+                    let image = module.write_baked(None).expect("bake exception type records");
+                    module = Module::from_baked(Box::leak(image.into_boxed_slice()))
+                        .expect("read exception type records").0;
+                }
+                let mut vm = Vm::new();
+                let exception = catchable_fault(&Trap::DivideByZero, &module, &mut vm, None)
+                    .expect("runtime exception");
+                assert_eq!(vm.exception_type_handle(exception), Some(asm_key(asm, alias.0)));
+                let runtime = crate::intrinsics::object_get_type(&mut vm, &module, &[Value::Object(exception)]);
+                let named = crate::intrinsics::type_from_handle(&mut vm, &module, &[Value::NativeInt(i64::from(defining.0))]);
+                assert_eq!(runtime, named, "mode={mode}, asm={asm}");
+            }
+        }
+    }
 
     #[cfg(feature = "typed-references")]
     mod typed_references {

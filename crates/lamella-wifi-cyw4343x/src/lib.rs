@@ -13,12 +13,14 @@
 //! driver services the packet channel on every poll and hands each event
 //! the firmware delivers to the caller as an outcome; the caller then
 //! brings the radio up (`up`), lists the networks in range (`scan`, each
-//! record carrying what the network advertises about its security) and
-//! joins one (`join` with a WPA2 passphrase or none; `join_with` for a
-//! WPA3 password too, the firmware running the SAE exchange), and the
-//! driver keeps the link joined, returning to a scan and re-entering the
-//! join on every loss until `disconnect`; the firmware's own capability
-//! string can be read once ready (`capabilities`). While
+//! record carrying what the network advertises about its security;
+//! `scan_for` looks for one network by its name and so finds one that
+//! does not broadcast it) and joins one (`join` with a WPA2 passphrase or
+//! none; `join_with` for a WPA3 password too, the firmware running the
+//! SAE exchange), and the driver keeps the link joined, returning to a
+//! scan and re-entering the join on every loss until `disconnect`; the
+//! firmware's own capability string can be read once ready
+//! (`capabilities`). While
 //! the link is up the driver hands every data frame's Ethernet frame to
 //! the caller in place and writes the one Ethernet frame the caller stages
 //! (`stage`, `flush`, `send`) under the chip's credit window; the device

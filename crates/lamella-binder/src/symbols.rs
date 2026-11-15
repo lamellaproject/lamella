@@ -6,6 +6,7 @@ use crate::types::TypeSymbol;
 use alloc::borrow::Cow;
 use alloc::boxed::Box;
 use lamella_syntax::ast::Literal;
+use lamella_syntax::version::{Feature, LanguageVersion};
 use alloc::collections::{BTreeMap, BTreeSet};
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -260,6 +261,9 @@ impl ParameterInfo {
 /// A method of a type (17.5), reduced to what overload resolution needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MethodSymbol {
+    /// Whether this method implements a property, indexer or event accessor. Accessors remain
+    /// available to their language constructs but do not introduce names for member lookup.
+    pub is_accessor: bool,
     /// The method's name.
     pub name: Box<str>,
     /// The return type (`void` is `SpecialType::Void`).
@@ -348,7 +352,14 @@ pub struct MethodSymbol {
     /// are separate overloads distinguished only by this count -- so ECMA-334 14.5.5.1 selects
     /// candidates by comparing it against the call site's type-argument count.
     pub type_parameters: Vec<Box<str>>,
-    /// The interface an EXPLICIT implementation qualifies itself with, AS WRITTEN and unresolved --
+    /// Parameter types before this method's own type parameters were substituted by
+    /// [`MethodSymbol::instantiate`]. `None` for a method that has not been instantiated.
+    ///
+    /// The original signature preserves generic specificity and distinguishes definitions that
+    /// close to identical parameter types. Applicability can therefore be checked before ranking
+    /// candidates, without losing the identity needed to emit the selected method.
+    pub uninstantiated_parameters: Option<Vec<TypeSymbol>>,
+    /// The interface an explicit implementation qualifies itself with --
     /// `IEnumerable<T>` for `IEnumerator<T> IEnumerable<T>.GetEnumerator()`. `None` for every
     /// ordinary member, which is nearly all of them.
     ///
@@ -360,10 +371,10 @@ pub struct MethodSymbol {
     /// `class C : IBox<int>, IBox<string>` apart. Recovering them from the string would mean
     /// re-parsing generated text, nested arguments and all.
     ///
-    /// Unresolved on purpose: collection runs before the model is complete, so this is
-    /// [`crate::bind_type`]'s syntactic reading. [`Binder::explicitly_implements`] resolves it
-    /// against the use site's scope, which is what makes `IEnumerable<T>` and
-    /// `System.Collections.Generic.IEnumerable<T>` one member rather than two.
+    /// Collection initially stores [`crate::bind_type`]'s syntactic reading.
+    /// [`crate::program::qualify_declared_signatures`] qualifies it in its declaring scope
+    /// before interface mapping. Constructed members substitute its type arguments without
+    /// resolving the resulting qualifier again in a derived type's scope.
     pub explicit_interface: Option<TypeSymbol>,
     /// The constraints on each of this method's OWN type parameters (25.7), in the same order.
     ///
@@ -386,6 +397,12 @@ impl MethodSymbol {
             return None;
         }
         self.type_parameter_constraints.get(index)
+    }
+
+    /// Whether this method was declared generic, open or already closed over type arguments.
+    #[must_use]
+    pub fn is_generic(&self) -> bool {
+        self.uninstantiated_parameters.is_some() || !self.type_parameters.is_empty()
     }
 
     /// The declared name of parameter `index`, or `None` when this method carries no parameter
@@ -426,6 +443,31 @@ impl MethodSymbol {
             .iter()
             .position(|info| info.default.is_some())
             .unwrap_or(self.parameters.len())
+    }
+
+    /// This method with every parameter required: its defaults dropped, everything else kept.
+    ///
+    /// What a call compiled at a language version without optional parameters (below C# 4) sees
+    /// of a referenced method that declares them, since the editions behind those versions apply a
+    /// function member only when every parameter takes an argument.
+    #[must_use]
+    pub fn without_defaults(&self) -> MethodSymbol {
+        let mut method = self.clone();
+        for info in &mut method.parameter_info {
+            info.default = None;
+        }
+        method
+    }
+
+    /// [`MethodSymbol::accepts_argument_count`] for a call compiled at `version`: below C# 4 every
+    /// parameter needs an argument, for the reason [`MethodSymbol::without_defaults`] gives.
+    #[must_use]
+    pub fn accepts_argument_count_at(&self, argc: usize, version: LanguageVersion) -> bool {
+        if version.supports(Feature::DefaultParameterValues) {
+            self.accepts_argument_count(argc)
+        } else {
+            self.without_defaults().accepts_argument_count(argc)
+        }
     }
 
     /// Whether a call supplying `argc` POSITIONAL arguments has the right count for this method.
@@ -511,12 +553,24 @@ impl MethodSymbol {
             .collect();
         let mut closed = self.clone();
         closed.type_parameters = Vec::new();
+        closed.uninstantiated_parameters = Some(self.parameters.clone());
         closed.return_type = substitute(&self.return_type, &bindings);
         for parameter in &mut closed.parameters {
             *parameter = substitute(parameter, &bindings);
         }
         Some(closed)
     }
+}
+
+/// The conversion direction permitted for a generic interface or delegate parameter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variance {
+    /// The argument must be identical.
+    Invariant,
+    /// The source argument identity- or reference-converts to the target argument.
+    Covariant,
+    /// The target argument identity- or reference-converts to the source argument.
+    Contravariant,
 }
 
 /// A named type with its members.
@@ -592,6 +646,9 @@ pub struct TypeInfo {
     /// `Box<T>`. Empty for every non-generic type, which is every C# 1.0 type.
     ///
     pub type_parameters: Vec<Box<str>>,
+    /// Variance of the definition's type parameters, in declaration order. A missing
+    /// entry is invariant; source declarations without variance use an empty vector.
+    pub type_parameter_variance: Vec<Variance>,
     /// Whether any declaration of this type carried the `partial` modifier (ECMA-334 4th ed
     /// 17.1.4), so a second declaration of the same name MERGES into this one instead of replacing
     /// it.
@@ -896,7 +953,7 @@ pub fn same_type_definition(a: &TypeSymbol, b: &TypeSymbol) -> bool {
 ///
 /// **A name NOT in `bindings` is left alone**, which is what keeps an ordinary type whose name
 /// happens to be short from being rewritten.
-fn substitute(ty: &TypeSymbol, bindings: &BTreeMap<&str, &TypeSymbol>) -> TypeSymbol {
+pub(crate) fn substitute(ty: &TypeSymbol, bindings: &BTreeMap<&str, &TypeSymbol>) -> TypeSymbol {
     match ty {
         TypeSymbol::Named(parts) => match parts.split_first() {
             Some((name, [])) => match bindings.get(&**name) {
@@ -949,6 +1006,7 @@ impl TypeInfo {
             is_sealed: false,
             is_abstract: false,
             type_parameters: Vec::new(),
+            type_parameter_variance: Vec::new(),
             type_parameter_constraints: Vec::new(),
             is_partial: false,
             synthesized_constructor: false,
@@ -1090,6 +1148,8 @@ impl TypeInfo {
         }
         for property in &mut closed.properties {
             property.ty = substitute(&property.ty, &bindings);
+            property.explicit_interface = property.explicit_interface.as_ref()
+                .map(|interface| substitute(interface, &bindings));
         }
         for event in &mut closed.events {
             event.ty = substitute(&event.ty, &bindings);
@@ -1100,6 +1160,8 @@ impl TypeInfo {
             .chain(closed.constructors.iter_mut())
         {
             method.return_type = substitute(&method.return_type, &bindings);
+            method.explicit_interface = method.explicit_interface.as_ref()
+                .map(|interface| substitute(interface, &bindings));
             for parameter in &mut method.parameters {
                 *parameter = substitute(parameter, &bindings);
             }
@@ -1134,12 +1196,13 @@ impl TypeInfo {
         self.events.iter().find(|event| &*event.name == name)
     }
 
-    /// The property with the given name declared directly on this type.
+    /// The ordinary property with the given name declared directly on this type.
+    /// Explicit interface implementations are reached through their interface, not this name.
     #[must_use]
     pub fn find_property(&self, name: &str) -> Option<&PropertySymbol> {
         self.properties
             .iter()
-            .find(|property| &*property.name == name)
+            .find(|property| &*property.name == name && property.explicit_interface.is_none())
     }
 
     /// The methods with the given name -- the method group overload resolution
@@ -1229,6 +1292,8 @@ impl TypeInfo {
 #[derive(Debug, Default, Clone)]
 pub struct Model {
     types: BTreeMap<(String, String), TypeInfo>,
+    /// The dialect used by conversion queries, including those outside a binder.
+    pub(crate) language_version: LanguageVersion,
     /// The compilation's `global using` directives, every unit's; see [`Model::global_usings`].
     global_usings: Vec<lamella_syntax::ast::UsingKind>,
     /// Every namespace the compilation's source declares, by its full name, whether or not a type
@@ -1243,6 +1308,7 @@ pub struct Model {
 /// collector is upstream of it.
 fn implicit_constructor() -> MethodSymbol {
     MethodSymbol {
+        is_accessor: false,
         return_tuple_names: Vec::new(),
         return_required_modifiers: Vec::new(),
         explicit_interface: None,
@@ -1260,6 +1326,7 @@ fn implicit_constructor() -> MethodSymbol {
         accessibility: Accessibility::Public,
         conditional: Vec::new(),
         sets_required_members: false,
+        uninstantiated_parameters: None,
         type_parameters: Vec::new(),
         type_parameter_constraints: Vec::new(),
     }
@@ -2212,6 +2279,7 @@ mod tests {
             is_required: false,
         });
         info.methods.push(MethodSymbol {
+            is_accessor: false,
             return_tuple_names: Vec::new(),
             return_required_modifiers: Vec::new(),
             explicit_interface: None,
@@ -2229,10 +2297,12 @@ mod tests {
             accessibility: Accessibility::Public,
             conditional: Vec::new(),
             sets_required_members: false,
+            uninstantiated_parameters: None,
             type_parameters: Vec::new(),
             type_parameter_constraints: Vec::new(),
         });
         info.methods.push(MethodSymbol {
+            is_accessor: false,
             return_tuple_names: Vec::new(),
             return_required_modifiers: Vec::new(),
             explicit_interface: None,
@@ -2250,10 +2320,12 @@ mod tests {
             accessibility: Accessibility::Public,
             conditional: Vec::new(),
             sets_required_members: false,
+            uninstantiated_parameters: None,
             type_parameters: Vec::new(),
             type_parameter_constraints: Vec::new(),
         });
         info.methods.push(MethodSymbol {
+            is_accessor: false,
             return_tuple_names: Vec::new(),
             return_required_modifiers: Vec::new(),
             explicit_interface: None,
@@ -2271,6 +2343,7 @@ mod tests {
             accessibility: Accessibility::Public,
             conditional: Vec::new(),
             sets_required_members: false,
+            uninstantiated_parameters: None,
             type_parameters: Vec::new(),
             type_parameter_constraints: Vec::new(),
         });

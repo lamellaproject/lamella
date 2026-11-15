@@ -711,6 +711,13 @@ pub enum DiagnosticKind {
         /// The target type.
         to: Box<str>,
     },
+    /// `CS0457`: a user-defined conversion has no unique most specific operator.
+    AmbiguousUserConversion {
+        /// The source type.
+        from: Box<str>,
+        /// The target type.
+        to: Box<str>,
+    },
     /// `CS0037`: the `null` literal is assigned to a non-nullable value type.
     CannotConvertNullToValueType {
         /// The non-nullable value type.
@@ -1303,6 +1310,10 @@ pub enum DiagnosticKind {
         /// The length the list was required to have.
         length: u64,
     },
+    /// CS0846: an initializer for a higher-rank array omitted a nested list.
+    NestedArrayInitializerExpected,
+    /// CS0623: a brace initializer appeared where an element expression was required.
+    UnexpectedArrayInitializer,
     /// `CS0153`: a `goto case` outside any `switch`. The target is a case of the enclosing
     /// switch (15.10), so outside one it names nothing.
     GotoCaseOutsideSwitch,
@@ -2126,6 +2137,11 @@ pub enum DiagnosticKind {
         /// The delegate type being created.
         delegate: Box<str>,
     },
+    /// `CS0407`: the selected method's return type is incompatible with the delegate.
+    WrongDelegateReturnType {
+        /// The selected method, including its return type and parameter types.
+        method: Box<str>,
+    },
     /// `CS0127`: a `return` in a `void` method has an expression.
     ReturnValueInVoidMethod {
         /// The enclosing method's name.
@@ -2531,6 +2547,7 @@ impl DiagnosticKind {
             DiagnosticKind::DeriveFromSealed { .. } => 509,
             DiagnosticKind::NamespaceElementBadAccessibility => 1527,
             DiagnosticKind::NoImplicitConversion { .. } => 29,
+            DiagnosticKind::AmbiguousUserConversion { .. } => 457,
             DiagnosticKind::CannotConvertNullToValueType { .. } => 37,
             DiagnosticKind::TypeUsedAsValue { .. } => 119,
             DiagnosticKind::OperatorNotApplicable { .. } => 19,
@@ -2632,6 +2649,8 @@ impl DiagnosticKind {
             DiagnosticKind::ForEachInvalidEnumerator { .. } => 202,
             DiagnosticKind::VoidParameter => 1536,
             DiagnosticKind::ArrayInitializerLength { .. } => 847,
+            DiagnosticKind::NestedArrayInitializerExpected => 846,
+            DiagnosticKind::UnexpectedArrayInitializer => 623,
             DiagnosticKind::GotoCaseOutsideSwitch => 153,
             DiagnosticKind::RethrowOutsideCatch => 156,
             DiagnosticKind::ControlLeavesFinally => 157,
@@ -2776,6 +2795,7 @@ impl DiagnosticKind {
             DiagnosticKind::TypeArgumentsOnNonGenericName { .. } => 307,
             DiagnosticKind::NamespaceUsedLikeVariable { .. } => 118,
             DiagnosticKind::NoOverloadMatchesDelegate { .. } => 123,
+            DiagnosticKind::WrongDelegateReturnType { .. } => 407,
             DiagnosticKind::ReturnValueInVoidMethod { .. } => 127,
             DiagnosticKind::ReturnValueRequired { .. } => 126,
             DiagnosticKind::ByRefReturnInValueMethod => 8149,
@@ -3169,6 +3189,10 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::NamespaceElementBadAccessibility => write!(
                 f,
                 "Elements defined in a namespace cannot be explicitly declared as private, protected, protected internal, or private protected"
+            ),
+            DiagnosticKind::AmbiguousUserConversion { from, to } => write!(
+                f,
+                "Ambiguous user-defined conversions when converting from '{from}' to '{to}'"
             ),
             DiagnosticKind::NoImplicitConversion { from, to } => {
                 write!(f, "Cannot implicitly convert type '{from}' to '{to}'")
@@ -3600,6 +3624,12 @@ impl fmt::Display for DiagnosticKind {
             DiagnosticKind::VoidParameter => write!(f, "Invalid parameter type 'void'"),
             DiagnosticKind::ArrayInitializerLength { length } => {
                 write!(f, "An array initializer of length '{length}' is expected")
+            }
+            DiagnosticKind::NestedArrayInitializerExpected => {
+                f.write_str("A nested array initializer is expected")
+            }
+            DiagnosticKind::UnexpectedArrayInitializer => {
+                f.write_str("Array initializers can only be used in a variable or field initializer. Try using a new expression instead.")
             }
             DiagnosticKind::GotoCaseOutsideSwitch => {
                 write!(f, "A goto case is only valid inside a switch statement")
@@ -4172,6 +4202,9 @@ impl fmt::Display for DiagnosticKind {
             }
             DiagnosticKind::NoOverloadMatchesDelegate { method, delegate } => {
                 write!(f, "No overload for '{method}' matches delegate '{delegate}'")
+            }
+            DiagnosticKind::WrongDelegateReturnType { method } => {
+                write!(f, "'{method}' has the wrong return type")
             }
             DiagnosticKind::ReturnValueInVoidMethod { method } => write!(
                 f,

@@ -20,6 +20,13 @@ lamella-probe-core = { path = "../lamella-probe-core" }
 # ELF describes, so the bytes flashed and the addresses debugged come from one file.
 lamella-dwarf = { path = "../lamella-dwarf" }
 lamella-elf = { path = "../lamella-elf" }
+# A program's console ring in RAM, followed while it runs by the one reader `lamella run` follows it
+# with. `no_std` over `lamella-elf` alone, so the WebAssembly build of this crate keeps building.
+lamella-probe-console = { path = "../lamella-probe-console" }
+# What the code a board gives for a program it stopped means, from the one table of end codes the
+# runtimes and `lamella run` read. A `no_std` leaf with no dependencies, so the WebAssembly build of
+# this crate keeps building and never builds the interpreter for it.
+lamella-exit-codes = { path = "../lamella-exit-codes" }
 
 # NO PROBE SELECTION AND NO PART, AND THAT IS THE POINT. `DeviceBackend` must not know which probes
 # or which parts exist -- that is the property the widening to `TargetAccess` bought. The server that

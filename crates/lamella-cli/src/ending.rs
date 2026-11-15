@@ -1,10 +1,16 @@
 //! How `lamella run` ends, whatever it ran and wherever it ran it.
 //!
 //! A program that returned, or exited, with a code gives that code back unchanged, in every
-//! language and every mode, as `dotnet run`, `python` and `node` each do. Every other ending is 1,
-//! with one sentence on standard error: this tool's own failure, an exception nothing caught, and a
-//! run stopped by a time limit its caller set. As with those three runners, a caller tells this
-//! tool's 1 from a program's own 1 by that sentence.
+//! language and every mode, as `dotnet run`, `python` and `node` each do. A C# program that did not
+//! return gives the code its runtime or its board gives for how it ended: 134 for an exception
+//! nothing caught, as .NET gives on Linux and macOS and a Lamella RHU board gives, 1 for a stop of
+//! the runtime's own, 2 for a processor fault, and 4 when a Lamella RHU board's kernel refused to
+//! start the program. On a board, one sentence on standard error says which
+//! ([`stopped_sentence`]); on this machine the runtime's own report of the exception is that
+//! sentence, as `dotnet run` adds none of its own. A Python or JavaScript exception nothing caught
+//! is 1, as `python` and `node` end one. Every other ending is 1, with one sentence on standard
+//! error: this tool's own failure, and a run stopped by a time limit its caller set. As with those
+//! three runners, a caller tells this tool's 1 from a program's own 1 by that sentence.
 //!
 //! Ctrl+C is the one exception. A run it stops ends the way the operating system ends any program
 //! stopped by Ctrl+C, so a shell, or a script running one program after another, sees what it sees
@@ -21,8 +27,11 @@ use std::sync::atomic::{AtomicBool, Ordering};
 pub enum Ended {
     /// The program returned, or exited, with this code.
     Program(i32),
-    /// The program ended without returning a code of its own: an exception nothing caught stopped
-    /// it, or, on a board, it was aborted.
+    /// The program did not return: its runtime or its board stopped it, and gives this code for how
+    /// it ended. The code is the run's own, as a returned code is.
+    Stopped(i32),
+    /// A Python or JavaScript program ended on an exception nothing caught, which ends the run with
+    /// 1, as `python` and `node` end one.
     Uncaught,
     /// The time limit the caller set ran out before the program ended.
     TimedOut,
@@ -30,6 +39,17 @@ pub enum Ended {
     Failed,
     /// Ctrl+C stopped the run.
     Interrupted,
+}
+
+/// What the code a board gives for a program it stopped means, as one sentence: the meaning the
+/// end-code table gives it, in the words the debugger says it in. A code with no meaning there is
+/// named as the board gives it.
+#[must_use]
+pub fn stopped_sentence(code: i32) -> String {
+    match lamella_cil_runtime::exit_code::meaning(code) {
+        Some(meaning) => format!("The program ended with code {code}: {meaning}."),
+        None => format!("The program was aborted, and the board gives code {code} for it."),
+    }
 }
 
 /// The exit code Windows gives a program Ctrl+C stopped, `STATUS_CONTROL_C_EXIT`.
@@ -43,14 +63,14 @@ const INTERRUPTED: i32 = 128 + 2;
 impl Ended {
     /// The exit code a caller reads.
     ///
-    /// The program's own code, unchanged; 1 for every other ending but Ctrl+C; and for Ctrl+C,
-    /// what this operating system reports for any program it stopped. On Linux and macOS that is
-    /// how a shell reports a death by signal, since [`Ended::finish`] ends the process by the
-    /// signal rather than by an exit code.
+    /// The program's own code, unchanged, and the code its board gives for a program it stopped; 1
+    /// for every other ending but Ctrl+C; and for Ctrl+C, what this operating system reports for any
+    /// program it stopped. On Linux and macOS that is how a shell reports a death by signal, since
+    /// [`Ended::finish`] ends the process by the signal rather than by an exit code.
     #[must_use]
     pub fn code(self) -> i32 {
         match self {
-            Ended::Program(code) => code,
+            Ended::Program(code) | Ended::Stopped(code) => code,
             Ended::Uncaught | Ended::TimedOut | Ended::Failed => 1,
             Ended::Interrupted => INTERRUPTED,
         }
@@ -233,16 +253,41 @@ mod platform {
 mod tests {
     use super::*;
 
-    /// **THE PROGRAM'S OWN CODE COMES BACK UNCHANGED, AND EVERYTHING ELSE IS 1** -- a 3, a 70 (which
-    /// a C# program may return itself), a negative code and one past 255 included.
+    /// **THE PROGRAM'S OWN CODE, AND THE CODE ITS BOARD GIVES FOR STOPPING IT, COME BACK UNCHANGED,
+    /// AND EVERYTHING ELSE IS 1** -- a 3, a 70 (which a C# program may return itself), a negative
+    /// code and one past 255 included, and a board's 134, 2, 1 and 4.
     #[test]
     fn a_programs_code_comes_back_unchanged_and_every_other_ending_is_one() {
         for code in [0, 1, 3, 70, 255, 256, -1, i32::MIN] {
             assert_eq!(Ended::Program(code).code(), code);
         }
+        for code in [134, 2, 1, 4, 70_000] {
+            assert_eq!(Ended::Stopped(code).code(), code);
+        }
         for other in [Ended::Uncaught, Ended::TimedOut, Ended::Failed] {
             assert_eq!(other.code(), 1, "{other:?}");
         }
+    }
+
+    /// **EACH END CODE A BOARD GIVES IS SAID IN WORDS**: the end-code table's meaning, in the sentence the
+    /// debugger says it in, so a run and a debugging session say one program's end alike. A code with no
+    /// meaning there is named as the board gave it.
+    #[test]
+    fn each_end_code_a_board_gives_is_said_in_words() {
+        use lamella_cil_runtime::exit_code::{FATAL_STOP, KERNEL_REFUSED_ENTRY, PROCESSOR_FAULT, UNHANDLED_EXCEPTION, meaning};
+        assert_eq!((UNHANDLED_EXCEPTION, FATAL_STOP, PROCESSOR_FAULT, KERNEL_REFUSED_ENTRY), (134, 1, 2, 4));
+        for (code, said) in [
+            (134, "The program ended with code 134: an exception nothing caught, a fail-fast or an abort ended it."),
+            (2, "The program ended with code 2: the processor faulted."),
+            (1, "The program ended with code 1: the runtime stopped it on a fatal error of its own."),
+            (4, "The program ended with code 4: a Lamella RHU board's kernel refused to start it."),
+        ] {
+            assert_eq!(stopped_sentence(code), said, "code {code}");
+            let meant = meaning(code).expect("the table gives it a meaning");
+            assert_eq!(stopped_sentence(code), format!("The program ended with code {code}: {meant}."), "code {code}");
+        }
+        assert_eq!(meaning(70), None);
+        assert_eq!(stopped_sentence(70), "The program was aborted, and the board gives code 70 for it.");
     }
 
     /// **CTRL+C GIVES THE CODE THIS SYSTEM GIVES EVERY PROGRAM IT STOPPED**: the code Windows
@@ -262,6 +307,7 @@ mod tests {
         assert_eq!(shown(Ended::Program(0)), format!("{:?}", ExitCode::SUCCESS));
         assert_eq!(shown(Ended::Program(3)), format!("{:?}", ExitCode::from(3)));
         assert_eq!(shown(Ended::Program(70)), format!("{:?}", ExitCode::from(70)));
+        assert_eq!(shown(Ended::Stopped(134)), format!("{:?}", ExitCode::from(134)));
         for other in [Ended::Uncaught, Ended::TimedOut, Ended::Failed] {
             assert_eq!(shown(other), format!("{:?}", ExitCode::FAILURE), "{other:?}");
         }

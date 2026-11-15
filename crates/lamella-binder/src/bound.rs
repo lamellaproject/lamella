@@ -33,6 +33,34 @@ use lamella_syntax::token::{IntegerSuffix, RealSuffix};
 
 mod delegate_signature;
 mod foreach;
+mod interface_mapping;
+use interface_mapping::InterfaceTypeParameters;
+#[cfg(test)]
+mod explicit_property_tests;
+mod method_group;
+
+#[cfg(test)]
+mod receiver_capture_tests;
+
+/// An array element can keep contextual arms until another element supplies its type.
+enum ImplicitArrayElement {
+    Bound(BoundExpr),
+    Contextual,
+    Conditional {
+        condition: BoundExpr,
+        when_true: Box<ImplicitArrayElement>,
+        when_false: Box<ImplicitArrayElement>,
+    },
+}
+
+impl ImplicitArrayElement {
+    fn bound(&self) -> Option<&BoundExpr> {
+        match self {
+            Self::Bound(value) => Some(value),
+            _ => None,
+        }
+    }
+}
 
 /// Why a class does or does not implement one interface method. Three of the four outcomes are
 /// failures, and csc gives each its own code because each names a different repair: declare the
@@ -355,8 +383,8 @@ struct ClosedFrom {
 ///
 /// `candidates` and `origins` are PARALLEL, index for index; `origins[i]` is `None` exactly when
 /// `candidates[i]` is an ordinary non-generic method. Keeping them parallel rather than pairing
-/// them into one list is what lets `candidates` be handed to the existing overload resolution
-/// unchanged -- it knows nothing about generics and should not have to.
+/// them into one list lets overload resolution judge applicability and betterness while the
+/// selected candidate still identifies the definition and type arguments required for emission.
 #[derive(Debug, Default)]
 struct CandidateSet {
     /// Every candidate, CLOSED. Overload resolution sees real types throughout.
@@ -368,69 +396,6 @@ struct CandidateSet {
     /// the call, which is the boundary csc draws (measured: a same-arity non-generic candidate's
     /// `CS1503` is reported INSTEAD).
     uninferable: Vec<MethodSymbol>,
-}
-
-impl CandidateSet {
-    /// Applies the half of ECMA-334 4th ed **14.4.2.2** that only the OPEN signatures can settle:
-    /// *"In case the expanded parameter types ... are identical, the following tie-breaking rules
-    /// are applied ... by comparing the given uninstantiated and unexpanded parameter types."*
-    ///
-    /// **WITHOUT THIS, ADDING INFERENCE BREAKS PROGRAMS THAT COMPILED BEFORE IT.** `M(1)` against
-    /// `void M(int)` beside `void M<T>(T)` bound to the non-generic only because the generic one
-    /// was dropped for want of inference. Inferred, the two close to the SAME signature `(int)`,
-    /// neither converts better than the other, and the call becomes CS0121 -- a working program
-    /// turned ambiguous by a feature that was supposed to accept more. Rule 1 settles it: *"If one
-    /// of MP and MQ is non-generic, but the other is generic, then the non-generic is better."*
-    ///
-    /// Dropping here rather than ranking inside `is_better` is deliberate, and it is safe for one
-    /// reason worth stating: applicability depends only on the parameter list and the `params` /
-    /// vararg shape, so two candidates identical in all three are applicable in exactly the same
-    /// situations. Dropping one can therefore never lose a call that would otherwise resolve, and
-    /// it keeps `candidates` free of EQUAL entries -- which `instantiation_of` needs, because two
-    /// equal candidates are indistinguishable to it once a winner has been cloned out.
-    fn apply_identical_signature_tie_break(&mut self) {
-        let mut beaten: Vec<bool> = alloc::vec![false; self.candidates.len()];
-        for left in 0..self.candidates.len() {
-            for right in 0..self.candidates.len() {
-                if left == right || beaten[left] || beaten[right] {
-                    continue;
-                }
-                if !Self::same_call_shape(&self.candidates[left], &self.candidates[right]) {
-                    continue;
-                }
-                if Self::beats(
-                    self.origins[left].as_ref(),
-                    self.origins[right].as_ref(),
-                ) {
-                    beaten[right] = true;
-                }
-            }
-        }
-        let mut keep = beaten.iter().map(|beaten| !beaten);
-        self.candidates.retain(|_| keep.next() == Some(true));
-        let mut keep = beaten.iter().map(|beaten| !beaten);
-        self.origins.retain(|_| keep.next() == Some(true));
-    }
-
-    /// Whether two candidates are applicable in exactly the same situations: the same parameter
-    /// types AND the same trailing-argument shape. `params` and vararg are part of it because
-    /// `M(int[])` and `M(params int[])` accept different call sites despite one parameter list.
-    fn same_call_shape(left: &MethodSymbol, right: &MethodSymbol) -> bool {
-        left.parameters == right.parameters
-            && left.is_params == right.is_params
-            && left.is_vararg == right.is_vararg
-    }
-
-    /// Whether `left` wins 14.4.2.2's tie-break over `right`. `None` is a non-generic candidate.
-    fn beats(left: Option<&ClosedFrom>, right: Option<&ClosedFrom>) -> bool {
-        match (left, right) {
-            (None, Some(_)) => true,
-            (Some(_), None) | (None, None) => false,
-            (Some(left), Some(right)) => {
-                more_specific(&left.definition.parameters, &right.definition.parameters)
-            }
-        }
-    }
 }
 
 /// Whether parameter list `left` is MORE SPECIFIC than `right` (14.4.2.2): *"each given parameter
@@ -484,8 +449,8 @@ fn type_more_specific(left: &TypeSymbol, right: &TypeSymbol) -> bool {
     }
 }
 
-/// A user-defined `++`/`--` whose operand or result type differs from the variable's (14.14.2): the
-/// operator method to call and any implicit conversion of its result back to the variable's type.
+/// A resolved user-defined `++`/`--`: the operator method to call and any implicit conversion
+/// of its result back to the variable's type. An exact nullable signature needs no conversion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConvertingStep {
     /// The `op_Increment`/`op_Decrement` to call.
@@ -808,9 +773,9 @@ pub enum BoundExprKind {
         operator: PostfixOperator,
         /// The operand.
         operand: Box<BoundExpr>,
-        /// A user-defined `op_Increment`/`op_Decrement` whose parameter/result type differs from the
-        /// operand's (14.14.2): the operator to call and any conversion of its result back to the
-        /// operand type. `None` for a numeric/enum/pointer step or an exact same-type user operator.
+        /// A resolved `op_Increment`/`op_Decrement`, either an explicitly declared nullable
+        /// signature or an operator whose parameter/result type differs from the operand's.
+        /// `None` for a built-in, lifted, or exact nonnullable step.
         step: Option<Box<ConvertingStep>>,
         /// Whether the step is in a `checked` context, so an integral, enum or pointer step checks
         /// for overflow (ECMA-334 12.8.19).
@@ -1080,7 +1045,7 @@ pub(crate) struct LocalFunctionOuter {
     switch_depth: u32,
 }
 
-/// The handler and `lock` nesting of the function being bound, set aside while a nested
+/// The handler, `lock` and label scopes of the function being bound, set aside while a nested
 /// function's body binds -- see [`Binder::enter_function_body`].
 struct HandlerNesting {
     catch_depth: u32,
@@ -1088,6 +1053,7 @@ struct HandlerNesting {
     finally_depth: u32,
     lock_depth: u32,
     finally_floor: Vec<u32>,
+    label_floor: usize,
 }
 
 /// One lambda being bound: where its own scopes start, and what it has captured so far.
@@ -1129,6 +1095,7 @@ pub struct Binder {
     /// place rather than at each construct.
     language_version: LanguageVersion,
     scopes: Vec<BTreeMap<String, TypeSymbol>>,
+    pub(crate) label_scopes: crate::statement::LabelScopes,
     /// The identity of each open scope, parallel to `scopes` -- `scope_ids[d]` is the id of the
     /// scope at depth `d`. Kept alongside rather than inside the map because every existing
     /// lookup wants the names and nothing else.
@@ -1274,10 +1241,9 @@ pub struct Binder {
     /// second global alias of one name is `CS1537` in the unit that wrote the second.
     global_aliases_declared: alloc::collections::BTreeSet<Box<str>>,
     imported_namespaces: Vec<Box<str>>,
-    /// `using X = N.T;` aliases in scope, each the alias name and its target type, so an
-    /// unqualified `X` resolves to the target (16.4.1). Scoped per namespace block alongside
-    /// `imported_namespaces`.
-    aliases: Vec<(Box<str>, TypeSymbol)>,
+    /// Aliases with their declaration scopes, so a nearer member can hide an outer alias
+    /// (16.3.1). Scoped per namespace block alongside `imported_namespaces`.
+    aliases: Vec<UsingAlias>,
     /// `using static N.T;` imports in scope, each the imported TYPE, so an unqualified name
     /// resolves to one of its directly declared static members or nested types (ECMA-334 6th ed,
     /// 13.5.4). Scoped per namespace block alongside `imported_namespaces`.
@@ -1558,12 +1524,19 @@ pub struct ImportScope {
     static_types: usize,
 }
 
+#[derive(Debug, Clone)]
+struct UsingAlias {
+    name: Box<str>,
+    target: TypeSymbol,
+    namespace: Box<str>,
+}
+
 /// The imports a file context adds above the base every file sits on, held by value, so a caller can
 /// set one file's context aside, bind under another's, and put the first back exactly.
 #[derive(Debug, Clone, Default)]
 pub struct FileImports {
     namespaces: Vec<Box<str>>,
-    aliases: Vec<(Box<str>, TypeSymbol)>,
+    aliases: Vec<UsingAlias>,
     static_types: Vec<TypeSymbol>,
 }
 
@@ -1599,6 +1572,7 @@ impl Binder {
     /// dialect. (The same reasoning as `unsafe_option_missing`.)
     pub fn set_language_version(&mut self, version: LanguageVersion) {
         self.language_version = version;
+        self.model.language_version = version;
     }
 
     /// Refuses `feature` unless this compilation can admit it, and says WHICH of the two reasons.
@@ -2027,6 +2001,7 @@ impl Binder {
     pub fn with_model(model: Model) -> Binder {
         let mut binder = Binder {
             world: model.type_table(),
+            language_version: model.language_version,
             model,
             ..Binder::default()
         };
@@ -2396,7 +2371,7 @@ impl Binder {
         if let TypeSymbol::Named(parts) = ty {
             if parts.len() == 1 {
                 let name: &str = &parts[0];
-                if let Some(target) = self.alias_target(name) {
+                if let Some(target) = self.visible_alias_target(name) {
                     return target.fold_builtin();
                 }
                 let hits = self.type_namespaces_containing(name);
@@ -2965,13 +2940,47 @@ impl Binder {
                 arguments: arguments.clone(),
             },
         };
-        Some(
+        let resolved =
             match resolve_type(&self.world, &qualified, &mut self.diagnostics, span).fold_builtin()
             {
                 TypeSymbol::Special(special) => self.resolve_special_type(special, span),
                 resolved => resolved,
+            };
+        self.refuse_type_named_like_type_parameter(&resolved, span);
+        Some(resolved)
+    }
+
+    /// Refuses, as LAM0001, a type reached through `global::` or a `using` alias whose name is a
+    /// single identifier that a type parameter in scope also has: `Base<global::Foo>` in
+    /// `class Mid<Foo>`. Model symbols spell a type parameter by its simple name, so constructing
+    /// the declaration would substitute its argument for that type as well, and the program would
+    /// be checked and emitted against the wrong type.
+    ///
+    /// Only the report is added; the resolution is returned unchanged. A caller that resolves
+    /// without reporting (an attribute's name, for one) answers as it did before, while every
+    /// reporting caller fails the compilation, so nothing is emitted against the collision.
+    fn refuse_type_named_like_type_parameter(&mut self, resolved: &TypeSymbol, span: Span) {
+        let TypeSymbol::Named(parts) = resolved else {
+            return;
+        };
+        let [name] = &parts[..] else {
+            return;
+        };
+        if self.type_parameter_in_scope(name).is_none() {
+            return;
+        }
+        self.report(Diagnostic::new(
+            DiagnosticKind::FeatureNotInThisBuild {
+                feature: alloc::format!(
+                    "naming the type `{name}` through `global::` or an alias inside the scope of a \
+                     type parameter also named `{name}`"
+                )
+                .into(),
+                permitted_by: self.language_version,
+                instead: Some("Rename the type parameter."),
             },
-        )
+            span,
+        ));
     }
 
     /// The namespace a `using` alias's target names, when it names one rather than a type:
@@ -3002,8 +3011,7 @@ impl Binder {
 
     /// `ty` with a leading `using` alias of a NAMESPACE replaced by that namespace (16.3.1):
     /// `T.StringBuilder` for `using T = System.Text;` is `System.Text.StringBuilder`. `None` when
-    /// the first part is no such alias, or is a type or namespace in scope, which an alias does not
-    /// hide.
+    /// the first part is no such alias or a nearer declaration hides it.
     fn expand_namespace_alias(&self, ty: &TypeSymbol) -> Option<TypeSymbol> {
         let (parts, arguments) = match ty {
             TypeSymbol::Named(parts) => (parts, None),
@@ -3019,10 +3027,7 @@ impl Binder {
         if rest.is_empty() || lamella_syntax::ast::alias_qualifier(first).is_some() {
             return None;
         }
-        let namespace = self.aliased_namespace(&self.alias_target(first)?)?;
-        if self.named_type_in_scope(first).is_some() || self.model.is_namespace(first) {
-            return None;
-        }
+        let namespace = self.aliased_namespace(&self.visible_alias_target(first)?)?;
         let mut expanded: Vec<Box<str>> = namespace.split('.').map(Box::from).collect();
         expanded.extend(rest.iter().cloned());
         Some(match arguments {
@@ -3131,7 +3136,12 @@ impl Binder {
             return qualified;
         }
         if let Some(expanded) = self.expand_namespace_alias(ty) {
-            return self.resolve_named_type_unchecked(&expanded, span);
+            // The alias fixes an absolute namespace; the use site cannot qualify it again.
+            self.gate_generic_use(&expanded, span);
+            return match resolve_type(&self.world, &expanded, &mut self.diagnostics, span).fold_builtin() {
+                TypeSymbol::Special(special) => self.resolve_special_type(special, span),
+                resolved => resolved,
+            };
         }
         self.gate_generic_use(ty, span);
         if let TypeSymbol::Special(special) = ty {
@@ -3140,8 +3150,10 @@ impl Binder {
         if let TypeSymbol::Named(parts) = ty {
             if parts.len() == 1 {
                 let name: &str = &parts[0];
-                if let Some(target) = self.alias_target(name) {
-                    return target.fold_builtin();
+                if let Some(target) = self.visible_alias_target(name) {
+                    let target = target.fold_builtin();
+                    self.refuse_type_named_like_type_parameter(&target, span);
+                    return target;
                 }
                 if let Some(symbol) = self.named_type_in_scope(name) {
                     return symbol;
@@ -3649,7 +3661,7 @@ impl Binder {
                 {
                     return ty.clone();
                 }
-                if let Some(target) = self.alias_target(name) {
+                if let Some(target) = self.visible_alias_target(name) {
                     return target.fold_builtin();
                 }
                 self.named_type_in_scope(name).unwrap_or_else(|| ty.clone())
@@ -3777,31 +3789,94 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// that walk the model's inheritance graph (13.1).
     pub(crate) fn converts(&self, from: &TypeSymbol, to: &TypeSymbol) -> bool {
         converts(&self.model, from, to)
-            || self.user_conversion(from, to, "op_Implicit").is_some()
+            || !matches!(
+                self.find_user_conversion(from, to, "op_Implicit", false, None),
+                Ok(None)
+            )
     }
 
-    /// Whether `value` is the integer literal `0` and `target` is an enum type -- the implicit
-    /// enumeration conversion (13.1.3), which lets `E e = 0;`. ONLY the literal `0` (the spec's
-    /// "decimal-integer-literal 0") converts: NOT a floating or decimal zero (`E e = 0.0;`), and NOT
-    /// a named or folded constant that happens to be zero (`const int Z = 0; E e = Z;`). Those are
-    /// later reference-compiler relaxations, rejected under strict C# 1.0.
+    /// The expression facts overload applicability needs in addition to its type.
+    pub(crate) fn argument_constant(&self, value: &BoundExpr) -> ArgumentConstant {
+        ArgumentConstant::new(
+            value,
+            self.language_version,
+            self.constant_value(value).as_ref(),
+        )
+    }
+
+    /// Whether `expr` is a constant of type `int`/`long` whose value fits the integral
+    /// `target` -- the implicit constant expression conversion (13.1.7), which lets
+    /// `byte b = 10` and `b[0] = 10` compile without a cast.
+    fn implicit_constant_conversion(&self, expr: &BoundExpr, target: &TypeSymbol) -> bool {
+        if let Some(underlying) = crate::conversion::nullable_underlying(target) {
+            return self.implicit_constant_conversion(expr, underlying);
+        }
+        let (TypeSymbol::Special(source), TypeSymbol::Special(target)) = (&expr.ty, target) else {
+            return false;
+        };
+        if !matches!(source, SpecialType::Int32 | SpecialType::Int64) {
+            return false;
+        }
+        self.constant_int_value(expr).is_some_and(|value| constant_converts(*source, value, *target))
+    }
+
+    /// The rendered value of an int/long CONSTANT that is out of range of the integral type it is
+    /// narrowing to under the constant-expression conversion (13.1.7) -- so an out-of-range one is
+    /// CS0031, not the generic narrowing CS0266. An `int` constant converts to
+    /// sbyte/byte/short/ushort/uint/ulong; a `long` constant only to ulong; every other target (char,
+    /// a floating type, an identity or widening target, or a `uint`/other non-int/long source) is
+    /// outside this rule, so those keep the CS0266/CS0029 path. `None` when the rule does not apply or
+    /// the value is in range.
+    fn constant_out_of_range(&self, value: &BoundExpr, target: &TypeSymbol) -> Option<Box<str>> {
+        use SpecialType as S;
+        let (TypeSymbol::Special(source), TypeSymbol::Special(target)) = (&value.ty, target) else {
+            return None;
+        };
+        let eligible = match source {
+            S::Int32 => matches!(
+                target,
+                S::SByte | S::Byte | S::Int16 | S::UInt16 | S::UInt32 | S::UInt64
+            ),
+            S::Int64 => *target == S::UInt64,
+            _ => false,
+        };
+        if !eligible {
+            return None;
+        }
+        let folded = self.constant_int_value(value)?;
+        if constant_fits(folded, *target) {
+            None
+        } else {
+            Some(alloc::string::ToString::to_string(&folded).into())
+        }
+    }
+
+    /// Whether `expr` is an `int` constant whose value fits the unsigned integral `target`
+    /// (13.1.7 constant expression conversion, as applied by a binary operator's overload resolution).
+    fn int_constant_fits(&self, expr: &BoundExpr, target: SpecialType) -> bool {
+        matches!(expr.ty, TypeSymbol::Special(SpecialType::Int32))
+            && self.constant_int_value(expr).is_some_and(|value| constant_fits(value, target))
+    }
+
+    /// Whether the expression has an implicit enumeration conversion to this enum or nullable enum.
+    /// Assignment, argument applicability, optional defaults and lowering share the same facts.
     fn enum_from_zero(&self, value: &BoundExpr, target: &TypeSymbol) -> bool {
-        self.type_info_of(target).map(|info| info.kind) == Some(TypeKind::Enum)
-            && matches!(
-                value.kind,
-                BoundExprKind::Literal(Literal::Integer { value: 0, .. })
-            )
+        let target = crate::conversion::nullable_underlying(target).unwrap_or(target);
+        self.argument_constant(value).enum_zero && self.is_enum_type(target)
     }
 
     /// Whether `value` is assignable to `target`: it implicitly converts by type, it is a
     /// constant whose value fits a narrower integral `target` (13.1.7), or it is the constant
-    /// `0` assigned to an enum (13.1.3). Use this at an assignment context that has the value
-    /// expression, not just its type.
+    /// `0` assigned to an enum (13.1.3) or a nullable enum. Use this at an assignment context that
+    /// has the value expression, not just its type.
     ///
     /// An expression with no type of its own converts by its own rule: a throw expression or a
     /// `default` literal to every type that holds a value, and a conditional or switch expression
     /// whose arms have no type in common to every type each of its arms converts to.
     pub(crate) fn assignable(&self, value: &BoundExpr, target: &TypeSymbol) -> bool {
+        if matches!(value.kind, BoundExprKind::MethodGroup { .. }) {
+            return self.method_group_matches_delegate(value, target);
+        }
         if is_throw_marker(&value.ty) || is_default_literal_marker(&value.ty) {
             return !target.is_void();
         }
@@ -3811,7 +3886,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 .all(|arm| self.assignable(arm, target));
         }
         self.converts(&value.ty, target)
-            || implicit_constant_conversion(value, target)
+            || self.implicit_constant_conversion(value, target)
             || self.enum_from_zero(value, target)
     }
 
@@ -3826,7 +3901,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             let to_delegate = self
                 .type_info_of(target)
                 .is_some_and(|info| info.kind == TypeKind::Delegate);
-            if !to_delegate {
+            if to_delegate {
+                if let Err(kind) = self.method_group_target(value, target) {
+                    self.report(Diagnostic::new(kind, span));
+                }
+            } else {
                 self.report(Diagnostic::new(
                     DiagnosticKind::MethodGroupToNonDelegate {
                         method: name.clone(),
@@ -3849,8 +3928,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         if value.ty.is_error() {
             return;
         }
+        if let Some(kind) = self.ambiguous_implicit_conversion(value, target) {
+            self.report(Diagnostic::new(kind, span));
+            return;
+        }
         if !self.assignable(value, target) {
-            if let Some(value_text) = constant_out_of_range(value, target) {
+            if let Some(value_text) = self.constant_out_of_range(value, target) {
                 self.report(Diagnostic::new(
                     DiagnosticKind::ConstantOutOfRange {
                         value: value_text,
@@ -3873,42 +3956,70 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
     }
 
-    /// A user-defined conversion method (`op_Implicit`/`op_Explicit`) taking `from` and
-    /// returning `to`, declared on either the source or target type (17.9.3). The static
-    /// call a `from -> to` conversion lowers to.
-    ///
-    /// A pair for which 17.9.3 forbids declaring an operator is refused before the search runs,
-    /// because the return-type test below is vacuous there: it accepts an operator whose return
-    /// type merely CONVERTS to the target, and every type converts to `object`. Against the real
-    /// BCL that selected `System.String.op_Implicit(String) -> ReadOnlySpan<char>` as the
-    /// conversion from `string` to `object`, and emission -- which looks an operator up keyed by
-    /// its return type -- then missed and refused with *"call to a method outside this module"*.
-    /// `(object)aString` was nine of the C# differential's nine failures.
-    ///
-    /// The guard is in this function rather than at the fourteen call sites that reach it. Only the
-    /// cast expression could actually select the wrong operator -- [`Self::convert`] is safe
-    /// because it tests `converts` first -- but a rule delivered to one caller of fourteen is a
-    /// rule the other thirteen do not have, and which of them can reach the case is not a property
-    /// anyone re-derives when adding the fifteenth.
+    /// The unique user-defined operator with standard implicit conversions on
+    /// either side. Applicability queries retain ambiguous candidate sets; only
+    /// a selected conversion needs a unique operator (13.4.2-13.4.3).
     pub(crate) fn user_conversion(
         &self,
         from: &TypeSymbol,
         to: &TypeSymbol,
         name: &str,
     ) -> Option<MethodReference> {
-        self.find_user_conversion(from, to, name, false)
+        self.find_user_conversion(from, to, name, false, None)
             .ok()
             .flatten()
     }
 
-    /// Cast searches distinguish an empty candidate set from an ambiguous one so
-    /// the latter cannot fall through to another conversion path (13.4.4).
+    /// The `System.Decimal` operator that carries the predefined implicit numeric conversion from
+    /// the integral type `source`, `char` included, to `decimal` (13.1.2): the corlib's operator for
+    /// `source` itself, else the one the user-defined selection finds unique, else, for a type
+    /// narrower than `int`, the `int` operator. `None` for any other source, or when the corlib
+    /// declares none of these.
+    ///
+    /// The conversion is predefined, so it exists whatever operators the corlib declares; CIL has
+    /// no `decimal` primitive, so which operator carries it is this compiler's choice. A `char` or a
+    /// `ushort` widens to `int`, `uint`, `long` and `ulong` alike, so against a corlib without an
+    /// operator for it the selection is ambiguous: the right answer for a user-defined conversion,
+    /// and never a reason to refuse a predefined one. Every value of a type narrower than `int` is an
+    /// `int` (unary numeric promotion, 14.2.6.1), so the `int` operator is exact for each of them.
+    pub(crate) fn predefined_decimal_operator(
+        &self,
+        source: &TypeSymbol,
+    ) -> Option<MethodReference> {
+        let TypeSymbol::Special(special) = source else {
+            return None;
+        };
+        if !special.is_integral() {
+            return None;
+        }
+        let decimal = TypeSymbol::Special(SpecialType::Decimal);
+        if let Some(operator) = self.user_conversion(source, &decimal, "op_Implicit") {
+            return Some(operator);
+        }
+        let narrower_than_int = matches!(
+            special,
+            SpecialType::SByte
+                | SpecialType::Byte
+                | SpecialType::Int16
+                | SpecialType::UInt16
+                | SpecialType::Char
+        );
+        if !narrower_than_int {
+            return None;
+        }
+        let int = TypeSymbol::Special(SpecialType::Int32);
+        self.user_conversion(&int, &decimal, "op_Implicit")
+    }
+
+    /// Searches distinguish an empty candidate set from an ambiguous one so
+    /// assignments and casts cannot choose an arbitrary operator (13.4.3-13.4.4).
     fn find_user_conversion(
         &self,
         from: &TypeSymbol,
         to: &TypeSymbol,
         name: &str,
         explicit: bool,
+        expression: Option<&BoundExpr>,
     ) -> Result<Option<MethodReference>, ()> {
         if no_conversion_operator_can_exist(&self.model, from, to) {
             return Ok(None);
@@ -3932,11 +4043,16 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                         self.standard_implicit_conversion(source, target)
                             || (explicit && self.standard_implicit_conversion(target, source))
                     };
-                    if !standard(from, &method.parameters[0]) || !standard(&method.return_type, to)
+                    // Constant-expression prefixes participate in the same candidate
+                    // set as type-based prefixes (13.3.1, 10.5.5).
+                    let prefix = standard(from, &method.parameters[0])
+                        || expression.is_some_and(|value| {
+                            self.implicit_constant_conversion(value, &method.parameters[0])
+                        });
+                    if !prefix || !standard(&method.return_type, to)
                     {
                         continue;
                     }
-                    let exact = &method.parameters[0] == from && &method.return_type == to;
                     let declaring_type =
                         self.declaring_type_in_chain(owner, name, &method.parameters);
                     let declaring_instantiation =
@@ -3951,21 +4067,17 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                         instantiation: None,
                         declaring_instantiation,
                     };
-                    if exact && !explicit {
-                        return Ok(Some(reference));
-                    }
                     if !candidates.contains(&reference) {
                         candidates.push(reference);
                     }
                 }
             }
         }
-        if !explicit || candidates.is_empty() {
-            return Ok(candidates.into_iter().next());
+        if candidates.is_empty() {
+            return Ok(None);
         }
-        // Fourth-edition 13.4.4 and seventh-edition 10.5.5 select source and target
-        // types independently over both operator kinds. An ambiguous set must not
-        // fall through to another cast path that picks an arbitrary operator.
+        // Source and target types are selected independently (13.4.3-13.4.4).
+        // Even exact endpoints can have multiple operators on different owners.
         let source = self
             .most_specific_conversion_type(
                 candidates
@@ -3974,6 +4086,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     .collect(),
                 from,
                 true,
+                expression,
             )
             .ok_or(())?;
         let target = self
@@ -3984,6 +4097,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     .collect(),
                 to,
                 false,
+                None,
             )
             .ok_or(())?;
         let mut selected = candidates
@@ -3996,14 +4110,15 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         Ok(Some(result.clone()))
     }
 
-    /// The most specific endpoint of a cast's candidate set (13.4.4). Source
-    /// selection prefers implicit prefixes and target selection prefers implicit
-    /// suffixes; only when that subset is empty is the encompassing direction reversed.
+    /// The most specific endpoint of an assignment or cast candidate set.
+    /// Source selection prefers implicit prefixes and target selection prefers
+    /// implicit suffixes; casts reverse the direction when that subset is empty.
     fn most_specific_conversion_type<'a>(
         &self,
         types: Vec<&'a TypeSymbol>,
         endpoint: &TypeSymbol,
         source: bool,
+        expression: Option<&BoundExpr>,
     ) -> Option<&'a TypeSymbol> {
         if let Some(exact) = types.iter().copied().find(|ty| *ty == endpoint) {
             return Some(exact);
@@ -4014,6 +4129,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             .filter(|ty| {
                 if source {
                     self.standard_implicit_conversion(endpoint, ty)
+                        || expression.is_some_and(|value| self.implicit_constant_conversion(value, ty))
                 } else {
                     self.standard_implicit_conversion(ty, endpoint)
                 }
@@ -4025,12 +4141,24 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         } else {
             preferred
         };
+        // Encompassing compares types, without applying a value conversion.
+        // Nullable parameter types therefore use the lifted underlying relation
+        // even when a value conversion between them requires separate lowering.
+        let encompasses = |from: &TypeSymbol, to: &TypeSymbol| {
+            match (
+                crate::conversion::nullable_underlying(from),
+                crate::conversion::nullable_underlying(to),
+            ) {
+                (Some(from), Some(to)) => self.standard_implicit_conversion(from, to),
+                _ => self.standard_implicit_conversion(from, to),
+            }
+        };
         types.iter().copied().find(|candidate| {
             types.iter().all(|other| {
                 if most_encompassed {
-                    self.standard_implicit_conversion(candidate, other)
+                    encompasses(candidate, other)
                 } else {
-                    self.standard_implicit_conversion(other, candidate)
+                    encompasses(other, candidate)
                 }
             })
         })
@@ -4071,10 +4199,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 && self.standard_implicit_conversion(source, target)
                 && converts(&self.model, from, to);
         }
-        if self.satisfies_reference_type_constraint(to) {
+        if is_reference_base_class(to) || self.satisfies_reference_type_constraint(to) {
             // Reference, boxing and constrained type-parameter conversions preserve
             // their ordinary hierarchy checks (13.1.4, 13.1.5 and 13.1.6).
-            return (self.satisfies_reference_type_constraint(from)
+            return (is_reference_base_class(from)
+                || self.satisfies_reference_type_constraint(from)
                 || self.is_value_type(from)
                 || self.constraints_of_type_parameter(from).is_some())
                 && self.satisfies_named_constraint(from, to);
@@ -4084,6 +4213,26 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
         matches!((from, to), (TypeSymbol::Special(_), TypeSymbol::Special(_)))
             && crate::conversion::has_implicit_conversion(from, to)
+    }
+
+    /// An ambiguous operator set is an error only when its conversion is selected.
+    fn ambiguous_implicit_conversion(
+        &self,
+        value: &BoundExpr,
+        target: &TypeSymbol,
+    ) -> Option<DiagnosticKind> {
+        if converts(&self.model, &value.ty, target)
+            || self.implicit_constant_conversion(value, target)
+            || self.enum_from_zero(value, target)
+        {
+            return None;
+        }
+        self.find_user_conversion(&value.ty, target, "op_Implicit", false, None)
+            .is_err()
+            .then(|| DiagnosticKind::AmbiguousUserConversion {
+                from: value.ty.to_string().into(),
+                to: target.to_string().into(),
+            })
     }
 
     /// Reports a failed implicit conversion at `span`: `CS0266` when an explicit
@@ -4118,6 +4267,17 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// boxes, or upcasts as needed (13.1). Returns `expr` unchanged when the types
     /// match or no implicit conversion applies (the site reports any error).
     pub(crate) fn convert(&self, expr: BoundExpr, target: &TypeSymbol) -> BoundExpr {
+        self.convert_implicit(expr, target, true)
+    }
+
+    /// Standard prefixes and suffixes use the same lowering as an ordinary
+    /// implicit conversion, with further user-defined operators disabled.
+    fn convert_implicit(
+        &self,
+        expr: BoundExpr,
+        target: &TypeSymbol,
+        allow_user_defined: bool,
+    ) -> BoundExpr {
         if is_default_literal_marker(&expr.ty) && !target.is_error() {
             return BoundExpr {
                 kind: BoundExprKind::DefaultValue(target.clone()),
@@ -4163,9 +4323,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             if crate::conversion::nullable_underlying(&expr.ty).is_none()
                 && (expr.ty == *underlying
                     || crate::conversion::converts(&self.model, &expr.ty, underlying)
-                    || implicit_constant_conversion(&expr, underlying))
+                    || self.implicit_constant_conversion(&expr, underlying)
+                    || self.enum_from_zero(&expr, underlying))
             {
-                let value = self.convert(expr, underlying);
+                let value = self.convert_implicit(expr, underlying, allow_user_defined);
                 return BoundExpr {
                     ty: target.clone(),
                     kind: BoundExprKind::ObjectCreation {
@@ -4200,13 +4361,16 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 ty: target.clone(),
             };
         }
+        // The predefined numeric conversion to decimal uses Decimal.op_Implicit
+        // because CIL has no decimal conversion opcode. Restrict this path to
+        // numeric operands; other sources need their user-defined step first.
         if matches!(target, TypeSymbol::Special(SpecialType::Decimal))
-            && !matches!(expr.ty, TypeSymbol::Special(SpecialType::Decimal))
+            && matches!(expr.ty, TypeSymbol::Special(source) if source.is_numeric())
         {
-            if let Some(method) = self.user_conversion(&expr.ty, target, "op_Implicit") {
-                let argument = self.convert(expr, &method.parameters[0]);
+            if let Some(method) = self.predefined_decimal_operator(&expr.ty) {
+                let argument = self.convert_implicit(expr, &method.parameters[0], false);
                 return BoundExpr {
-                    ty: target.clone(),
+                    ty: method.return_type.clone(),
                     kind: BoundExprKind::Call {
                         callee: Box::new(error_expr()),
                         arguments: alloc::vec![argument],
@@ -4225,7 +4389,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 ty: target.clone(),
             };
         }
-        if implicit_constant_conversion(&expr, target) {
+        if self.implicit_constant_conversion(&expr, target) {
             return BoundExpr {
                 kind: BoundExprKind::Conversion {
                     operand: Box::new(expr),
@@ -4234,44 +4398,23 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 ty: target.clone(),
             };
         }
-        if let Some(method) = self.user_conversion(&expr.ty, target, "op_Implicit") {
-            let produced = method.return_type.clone();
-            let argument = self.convert(expr, &method.parameters[0]);
+        // A user-defined conversion executes a standard prefix, one operator,
+        // and a standard suffix (fourth edition 13.4.3).
+        if allow_user_defined
+            && let Some(method) = self.user_conversion(&expr.ty, target, "op_Implicit")
+        {
+            let argument = self.convert_implicit(expr, &method.parameters[0], false);
             let call = BoundExpr {
-                ty: produced.clone(),
+                ty: method.return_type.clone(),
                 kind: BoundExprKind::Call {
                     callee: Box::new(error_expr()),
                     arguments: alloc::vec![argument],
                     method: Some(method),
                 },
             };
-            if produced == *target {
-                return call;
-            }
-            return self.convert_numeric_or_relabel(call, target);
+            return self.convert_implicit(call, target, false);
         }
         expr
-    }
-
-    /// Applies the standard conversion that follows a user-defined one. Kept separate from
-    /// [`Self::convert`] so it cannot re-enter the user-conversion search and recurse: the second
-    /// step of 6.4.4 is a STANDARD conversion by definition.
-    fn convert_numeric_or_relabel(&self, expr: BoundExpr, target: &TypeSymbol) -> BoundExpr {
-        if let (TypeSymbol::Special(from), TypeSymbol::Special(to)) = (&expr.ty, target) {
-            if from.is_numeric() && to.is_numeric() {
-                return BoundExpr {
-                    ty: target.clone(),
-                    kind: BoundExprKind::Conversion {
-                        operand: Box::new(expr),
-                        conversion: ConversionKind::ImplicitNumeric,
-                    },
-                };
-            }
-        }
-        BoundExpr {
-            ty: target.clone(),
-            ..expr
-        }
     }
 
     /// Binds an expression whose meaning depends on the type it is being converted TO, returning
@@ -4444,7 +4587,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         target: &TypeSymbol,
         span: Span,
     ) -> BoundExpr {
-        let count = match constant_int_value(&count) {
+        let count = match self.constant_int_value(&count) {
             Some(value) => BoundExpr {
                 ty: TypeSymbol::Special(SpecialType::Int32),
                 kind: BoundExprKind::Literal(integer_literal(value)),
@@ -4528,7 +4671,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let (element_ty, element_span) = match element {
             Some(written) => (self.resolve_type_ref(written), written.span),
             None => {
-                let inferred = self.best_common_type(bound_elements.as_deref().unwrap_or(&[]));
+                let inferred = self.best_common_type(bound_elements.as_deref().unwrap_or(&[]).iter());
                 if inferred.is_none() {
                     self.report(Diagnostic::new(
                         DiagnosticKind::NoBestTypeForImplicitArray,
@@ -4555,11 +4698,15 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         Some((element_ty, count, elements))
     }
 
-    /// The best common type of `elements` (csc's rule for an implicitly typed array): the one
-    /// element type every element converts to, when exactly one does.
-    fn best_common_type(&self, elements: &[BoundExpr]) -> Option<TypeSymbol> {
+    /// The best common type of typed elements (ECMA-334 fifth edition 12.6.3.15):
+    /// the unique candidate type to which every element type implicitly converts.
+    /// Constant-expression conversions do not add bounds, nor does an assignment target.
+    fn best_common_type<'e>(
+        &self,
+        elements: impl Iterator<Item = &'e BoundExpr> + Clone,
+    ) -> Option<TypeSymbol> {
         let mut candidates: Vec<&TypeSymbol> = Vec::new();
-        for element in elements {
+        for element in elements.clone() {
             let ty = &element.ty;
             if !ty.is_error()
                 && !matches!(ty, TypeSymbol::Special(SpecialType::Null))
@@ -4572,7 +4719,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             .into_iter()
             .filter(|candidate| {
                 elements
-                    .iter()
+                    .clone()
                     .all(|element| element.ty.is_error() || self.converts(&element.ty, candidate))
             })
             .collect();
@@ -4723,7 +4870,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         };
         let count_bound = self.bind_expression(count);
         self.check_assignable(&count_bound, &int, count.span);
-        let constant = constant_int_value(&count_bound);
+        let constant = self.constant_int_value(&count_bound);
         if constant.is_some_and(|value| value < 0) {
             self.report(Diagnostic::new(
                 DiagnosticKind::StackAllocNegativeSize,
@@ -4983,7 +5130,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     }
                 };
                 if invoke.return_type.is_void() {
-                    if !crate::statement::is_statement_expression(&value.kind) {
+                    if !crate::statement::is_statement_expression_as_written(expression, &value.kind) {
                         self.report(Diagnostic::new(
                             DiagnosticKind::IllegalStatementExpression,
                             expression.span,
@@ -5005,6 +5152,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 self.merge_next_scope_into_current();
                 let bound = self.bind_statement(block);
                 self.current_method = saved;
+                self.diagnostics.extend(crate::flow::check_labels(&bound));
                 BoundLambdaBody::Block(bound)
             }
         };
@@ -5104,6 +5252,199 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             .collect()
     }
 
+    /// An implicit array supplies its own element type (ECMA-334 fifth edition 12.7.11.5).
+    /// Bind each leaf once. Expressions with a natural type supply bounds; contextual forms
+    /// receive the inferred element type afterward, independently of the assignment target.
+    fn bind_implicit_array(&mut self, init: Option<&Expr>, rank: u32, span: Span) -> BoundExpr {
+        self.gate_feature(Feature::ImplicitlyTypedArray, Span::empty_at(span.start));
+        let Some(init) = init else {
+            return error_expr(); // The parser already diagnosed the missing initializer.
+        };
+        let mut dimensions = alloc::vec![None; rank as usize];
+        let mut leaves = Vec::new();
+        let shape_valid = self.implicit_array_leaves(init, 0, &mut dimensions, &mut leaves);
+        let elements: Vec<_> = leaves.iter()
+            .map(|leaf| self.bind_implicit_array_element(leaf, false))
+            .collect();
+        // A method group has no type but has not failed: another element may supply
+        // a delegate type for its ordinary assignment conversion below.
+        if !shape_valid || elements.iter().filter_map(ImplicitArrayElement::bound).any(|element| {
+            element.ty.is_error() && !matches!(element.kind, BoundExprKind::MethodGroup { .. })
+        }) {
+            return error_expr();
+        }
+        let inferred = if elements
+            .iter()
+            .filter_map(ImplicitArrayElement::bound)
+            .any(|element| element.ty == TypeSymbol::Special(SpecialType::Void))
+        {
+            None
+        } else {
+            self.best_common_type(elements.iter().filter_map(ImplicitArrayElement::bound).filter(|element| {
+                supplies_natural_type(&element.ty)
+            }))
+        };
+        let Some(element_ty) = inferred else {
+            self.report(Diagnostic::new(
+                DiagnosticKind::NoBestTypeForImplicitArray,
+                span,
+            ));
+            return error_expr();
+        };
+        let elements = elements
+            .into_iter()
+            .zip(leaves)
+            .map(|(element, syntax)| self.finish_implicit_array_element(element, syntax, &element_ty))
+            .collect();
+        let lengths = dimensions
+            .into_iter()
+            .map(|length| BoundExpr {
+                kind: BoundExprKind::Literal(Literal::Integer {
+                    value: length.unwrap_or(0) as u64,
+                    decimal: false,
+                    suffix: IntegerSuffix::None,
+                }),
+                ty: TypeSymbol::Special(SpecialType::Int32),
+            })
+            .collect();
+        BoundExpr {
+            ty: element_ty.into_array(rank),
+            kind: BoundExprKind::ArrayCreation { lengths, elements },
+        }
+    }
+
+    /// Preserve contextual `new()` arms without binding them prematurely. A typed arm can
+    /// supply the conditional's own type; two contextual arms wait for the array's type.
+    fn bind_implicit_array_element(&mut self, syntax: &Expr, in_arm: bool) -> ImplicitArrayElement {
+        let expr = without_parentheses(syntax);
+        if matches!(expr.kind, ExprKind::DefaultValue(None) | ExprKind::ObjectCreation { target: None, .. }) {
+            return ImplicitArrayElement::Contextual;
+        }
+        if let ExprKind::Conditional { condition, when_true, when_false } = &expr.kind
+            && implicit_array_new_arm(expr)
+        {
+            let condition = self.bind_condition(condition);
+            let true_arm = self.bind_implicit_array_element(when_true, true);
+            let false_arm = self.bind_implicit_array_element(when_false, true);
+            // A method group's Error placeholder is not a binding failure or a type
+            // for the other arm. Keep it for conversion once a delegate type is known.
+            let true_bound = true_arm.bound()
+                .filter(|arm| !matches!(arm.kind, BoundExprKind::MethodGroup { .. }));
+            let false_bound = false_arm.bound()
+                .filter(|arm| !matches!(arm.kind, BoundExprKind::MethodGroup { .. }));
+            let natural = match (true_bound, false_bound) {
+                (Some(left), Some(right)) => self.conditional_natural_type(left, right),
+                (Some(typed), None) | (None, Some(typed)) if supplies_natural_type(&typed.ty) => {
+                    Some(typed.ty.clone())
+                }
+                _ => None,
+            };
+            if condition.ty.is_error() || natural.as_ref().is_some_and(TypeSymbol::is_error) {
+                return ImplicitArrayElement::Bound(error_expr());
+            }
+            let element = ImplicitArrayElement::Conditional {
+                condition,
+                when_true: Box::new(true_arm),
+                when_false: Box::new(false_arm),
+            };
+            return match natural {
+                Some(ty) => ImplicitArrayElement::Bound(self.finish_implicit_array_element(element, expr, &ty)),
+                None => element,
+            };
+        }
+        let element = if in_arm { self.bind_arm(syntax) } else { self.bind_convertible(syntax) };
+        let invalid = match &element.kind {
+            BoundExprKind::TypeReference(ty) => Some(match &expr.kind {
+                ExprKind::PredefinedType(keyword) => DiagnosticKind::InvalidExpressionTerm {
+                    term: keyword.keyword().into(),
+                },
+                _ => DiagnosticKind::TypeUsedAsValue { type_name: ty.to_string().into() },
+            }),
+            BoundExprKind::NamespaceReference(namespace) => Some(DiagnosticKind::NamespaceUsedLikeVariable {
+                namespace: namespace.clone(),
+            }),
+            _ => None,
+        };
+        if let Some(kind) = invalid {
+            self.report(Diagnostic::new(kind, expr.span));
+            return ImplicitArrayElement::Bound(error_expr());
+        }
+        ImplicitArrayElement::Bound(element)
+    }
+
+    /// Apply the inferred type to an element and its deferred arms without rebinding its
+    /// condition or any typed operand. Each condition and constructor remains evaluated once.
+    fn finish_implicit_array_element(
+        &mut self,
+        element: ImplicitArrayElement,
+        syntax: &Expr,
+        target: &TypeSymbol,
+    ) -> BoundExpr {
+        match element {
+            ImplicitArrayElement::Bound(value) => self.convert_at(value, syntax, target),
+            ImplicitArrayElement::Contextual => self.bind_target_typed(without_parentheses(syntax), target)
+                .expect("a default literal or implicit object creation takes its target"),
+            ImplicitArrayElement::Conditional { condition, when_true, when_false } => {
+                let ExprKind::Conditional { when_true: true_syntax, when_false: false_syntax, .. } = &without_parentheses(syntax).kind else {
+                    unreachable!("a deferred conditional retains its syntax");
+                };
+                BoundExpr {
+                    ty: target.clone(),
+                    kind: BoundExprKind::Conditional {
+                        condition: Box::new(condition),
+                        when_true: Box::new(self.finish_implicit_array_element(*when_true, true_syntax, target)),
+                        when_false: Box::new(self.finish_implicit_array_element(*when_false, false_syntax, target)),
+                    },
+                }
+            }
+        }
+    }
+
+    /// Collect the leaves in source order and check the rectangular shape. `None` distinguishes
+    /// an unseen dimension from a dimension of length zero, which subsequent lists must match.
+    fn implicit_array_leaves<'s>(
+        &mut self,
+        init: &'s Expr,
+        depth: usize,
+        dimensions: &mut [Option<usize>],
+        leaves: &mut Vec<&'s Expr>,
+    ) -> bool {
+        let ExprKind::ArrayInitializer(items) = &init.kind else {
+            self.report(Diagnostic::new(
+                DiagnosticKind::NestedArrayInitializerExpected,
+                init.span,
+            ));
+            leaves.push(init);
+            return false;
+        };
+        let mut valid = true;
+        if let Some(length) = dimensions[depth] {
+            if length != items.len() {
+                self.report(Diagnostic::new(
+                    DiagnosticKind::ArrayInitializerLength { length: length as u64 },
+                    init.span,
+                ));
+                valid = false;
+            }
+        } else {
+            dimensions[depth] = Some(items.len());
+        }
+        for item in items {
+            if depth + 1 < dimensions.len() {
+                valid &= self.implicit_array_leaves(item, depth + 1, dimensions, leaves);
+            } else if matches!(item.kind, ExprKind::ArrayInitializer(_)) {
+                self.report(Diagnostic::new(
+                    DiagnosticKind::UnexpectedArrayInitializer,
+                    item.span,
+                ));
+                valid = false;
+            } else {
+                leaves.push(item);
+            }
+        }
+        valid
+    }
+
     /// Binds a rectangular array initializer `{{ .. }, { .. }}` (19.6): the leaf elements
     /// flattened in row-major order and converted to the element type, paired with each
     /// dimension's length, inferred from the initializer's shape (the sub-list count at each
@@ -5137,6 +5478,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             .map(|length| BoundExpr {
                 kind: BoundExprKind::Literal(Literal::Integer {
                     value: length as u64,
+                    decimal: false,
                     suffix: IntegerSuffix::None,
                 }),
                 ty: TypeSymbol::Special(SpecialType::Int32),
@@ -5395,10 +5737,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.imported_namespaces.push(namespace.into());
     }
 
-    /// Brings a `using X = N.T;` alias into scope: an unqualified `X` resolves to `target`
-    /// (16.4.1).
+    /// Brings a `using X = N.T;` alias into the global namespace's scope (16.3.1).
     pub fn import_alias(&mut self, name: &str, target: TypeSymbol) {
-        self.aliases.push((name.into(), target));
+        self.aliases.push(UsingAlias { name: name.into(), target, namespace: "".into() });
     }
 
     /// Brings a `using static N.T;` import into scope: `T`'s directly declared static members and
@@ -5430,16 +5771,67 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// resolves each target so an unusable one is named where it is written); it calls this for the
     /// scope effect and keeps its own diagnostics.
     pub fn import_using(&mut self, kind: &UsingKind) {
+        self.import_using_in_namespace(kind, "");
+    }
+
+    /// Qualifies a using target's first name in the namespace where the directive occurs.
+    /// A nearer namespace or type fixes the prefix even if a later part is missing; lookup
+    /// must not fall back to a different first name in an outer namespace.
+    pub(crate) fn qualify_using_alias_target(&self, target: &TypeSymbol, enclosing: &str) -> TypeSymbol {
+        let TypeSymbol::Named(parts) = target else {
+            return target.clone();
+        };
+        let Some(first) = parts.first() else {
+            return target.clone();
+        };
+        if lamella_syntax::ast::alias_qualifier(first).is_some() {
+            return target.clone();
+        }
+        let mut scope = enclosing;
+        loop {
+            if self.type_named_in(scope, first)
+                || self.model.is_namespace(&namespace_member(scope, first))
+            {
+                let mut qualified: Vec<Box<str>> = scope
+                    .split('.')
+                    .filter(|part| !part.is_empty())
+                    .map(Box::from)
+                    .collect();
+                qualified.extend(parts.iter().cloned());
+                return TypeSymbol::Named(qualified.into());
+            }
+            if scope.is_empty() {
+                return target.clone();
+            }
+            scope = scope.rsplit_once('.').map_or("", |(parent, _)| parent);
+        }
+    }
+
+    /// Applies a directive in `namespace`'s body, retaining where its alias was declared.
+    pub fn import_using_in_namespace(&mut self, kind: &UsingKind, namespace: &str) {
         match kind {
-            UsingKind::Namespace(name) => self.import_namespace(&crate::program::dotted(name)),
+            UsingKind::Namespace(name) => {
+                let target = self.qualify_using_alias_target(
+                    &TypeSymbol::Named(name.parts.clone().into()), namespace);
+                let target = self.without_alias_qualifier(&target).unwrap_or(target);
+                self.import_namespace(&target.to_string());
+            }
             UsingKind::Static(name) => {
-                self.import_static_type(TypeSymbol::Named(crate::program::qualified_parts(name)));
+                let target = self.qualify_using_alias_target(
+                    &TypeSymbol::Named(name.parts.clone().into()), namespace);
+                let target = self.without_alias_qualifier(&target).unwrap_or(target);
+                self.import_static_type(target);
             }
             UsingKind::Alias { name, target, .. } => {
-                self.import_alias(
-                    name,
-                    TypeSymbol::Named(crate::program::qualified_parts(target)),
-                );
+                let target = self.qualify_using_alias_target(
+                    &TypeSymbol::Named(target.parts.clone().into()), namespace);
+                // Resolve an explicit qualifier only after it has prevented relative lookup.
+                let target = self.without_alias_qualifier(&target).unwrap_or(target);
+                self.aliases.push(UsingAlias {
+                    name: name.clone(),
+                    target,
+                    namespace: namespace.into(),
+                });
             }
         }
     }
@@ -5449,8 +5841,26 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.aliases
             .iter()
             .rev()
-            .find(|(alias, _)| &**alias == name)
-            .map(|(_, target)| target.clone())
+            .find(|alias| &*alias.name == name)
+            .map(|alias| alias.target.clone())
+    }
+
+    /// Checks whether a member declaration in a nearer scope hides an alias.
+    /// Explicit `alias::` lookup uses `alias_target` instead and is unaffected by
+    /// such members.
+    fn visible_alias_target(&self, name: &str) -> Option<TypeSymbol> {
+        let alias = self.aliases.iter().rev().find(|alias| &*alias.name == name)?;
+        for (scope, imported) in self.type_lookup_scopes(name) {
+            if imported || scope == alias.namespace {
+                break;
+            }
+            if self.model.get(&scope, name).is_some()
+                || self.model.is_namespace(&full_type_name(&scope, name))
+            {
+                return None;
+            }
+        }
+        Some(alias.target.clone())
     }
 
     /// A marker for the current set of imported namespaces, aliases and static types, to scope the
@@ -5591,22 +6001,83 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// answer its fully-qualified spelling does.
     fn enclosing_type_scope(&self, leading: &[Box<str>], name: &str) -> Option<Box<str>> {
         let (outer, rest) = leading.split_first()?;
-        for (namespace, _) in self.type_namespaces_containing(outer) {
-            let mut full = String::new();
-            if !namespace.is_empty() {
-                full.push_str(&namespace);
-                full.push('.');
-            }
-            full.push_str(outer);
-            for part in rest {
-                full.push('.');
-                full.push_str(part);
-            }
-            if self.model.get(&full, name).is_some() {
-                return Some(full.into());
+        if let Some(target) = self.visible_alias_target(outer) {
+            let target = self.without_alias_qualifier(&target).unwrap_or(target);
+            if let TypeSymbol::Named(parts) = target {
+                return self.nested_type_path_scope(parts.join("."), rest, name);
             }
         }
+        let hits = self.type_namespaces_containing(outer);
+        for (namespace, imported) in self.type_lookup_scopes(outer) {
+            let full = namespace_member(&namespace, outer);
+            if self.model.get(&namespace, outer).is_none()
+                && (imported || !self.model.is_namespace(&full))
+            {
+                continue;
+            }
+            if imported {
+                if !hits.iter().any(|(candidate, _)| *candidate == namespace) {
+                    continue;
+                }
+                if self.visible_alias_target(outer).is_none()
+                    && hits.iter().filter(|(_, is_import)| *is_import).count() > 1
+                {
+                    return None;
+                }
+            }
+            return self.nested_type_path_scope(full, rest, name);
+        }
         None
+    }
+
+    /// Resolves a nested type path from its already-selected outer type or namespace.
+    fn nested_type_path_scope(
+        &self,
+        mut full: String,
+        rest: &[Box<str>],
+        name: &str,
+    ) -> Option<Box<str>> {
+        for part in rest {
+            if let Some(declaring) = self.nested_type_scope(&full, part) {
+                full = namespace_member(&declaring, part);
+            } else {
+                let nested_namespace = namespace_member(&full, part);
+                if !self.model.is_namespace(&nested_namespace) {
+                    return None;
+                }
+                full = nested_namespace;
+            }
+        }
+        self.nested_type_scope(&full, name)
+    }
+
+    /// The declaring scope of a nested type reached through `enclosing`.
+    fn nested_type_scope(&self, enclosing: &str, name: &str) -> Option<Box<str>> {
+        if self.model.get(enclosing, name).is_some() {
+            return Some(enclosing.into());
+        }
+        let qualifier = self.model.get_by_symbol(&named_symbol_from_dotted(enclosing))?;
+        // This metadata-name path can retain an inherited type's identity without an
+        // argument projection when neither the qualifier nor the declaring type is generic.
+        if !qualifier.type_parameters.is_empty() {
+            return None;
+        }
+        let mut inaccessible = None;
+        for scope in self.inherited_type_scopes(enclosing) {
+            if self.model.get(&scope, name).is_some() {
+                let declaring = self.model.get_by_symbol(&named_symbol_from_dotted(&scope))?;
+                if !declaring.type_parameters.is_empty() {
+                    return None;
+                }
+                if self.type_is_accessible_here(&type_symbol_in(&scope, name)) {
+                    return Some(scope);
+                }
+                // Preserve an inaccessible declaration for diagnostics when no base supplies
+                // an accessible type of this name.
+                inaccessible.get_or_insert(scope);
+            }
+        }
+        inaccessible
     }
 
     /// The scopes an unqualified name searches after the enclosing type's OWN: every type
@@ -5689,14 +6160,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
     }
 
-    /// The distinct in-scope namespaces (current, global, and imported) that hold
-    /// a type with this name.
-    /// The namespaces (in scope) that declare a type of this simple name, ordered
-    /// most-specific scope first. The flag marks a hit that comes from a `using`-imported
-    /// namespace: those alone share one precedence level, so two of them are a CS0104
-    /// ambiguity, whereas a more-specific scope (an enclosing type, the current namespace,
-    /// the global namespace) unambiguously SHADOWS every less-specific hit (3.8, 10.8).
-    fn type_namespaces_containing(&self, name: &str) -> Vec<(Box<str>, bool)> {
+    /// Declaration spaces for `name` in lookup order, followed by imports. The flag marks an import.
+    fn type_lookup_scopes(&self, name: &str) -> Vec<(Box<str>, bool)> {
         let mut search: Vec<(Box<str>, bool)> = Vec::new();
         if let Some(TypeSymbol::Named(parts)) = &self.current_type
             && !self.resolving_type_header
@@ -5716,7 +6181,20 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             search.insert(0, (enclosing.into(), false));
         }
         if let Some(current) = self.current_namespace() {
-            search.push((current, false));
+            let mut namespace = Some(current.as_ref());
+            while let Some(scope) = namespace {
+                search.push((scope.into(), false));
+                if self.model.get_by_symbol(&named_symbol_from_dotted(scope))
+                    .is_some_and(|info| info.type_parameters.is_empty())
+                {
+                    search.extend(self.inherited_type_scopes(scope).into_iter()
+                        .filter(|base| self.model.get_by_symbol(&named_symbol_from_dotted(base))
+                            .is_some_and(|info| info.type_parameters.is_empty()))
+                        .filter(|base| self.type_is_accessible_here(&type_symbol_in(base, name)))
+                        .map(|base| (base, false)));
+                }
+                namespace = scope.rsplit_once('.').map(|(parent, _)| parent);
+            }
         }
         search.push((Box::from(""), false));
         search.extend(self.imported_namespaces.iter().cloned().map(|ns| (ns, true)));
@@ -5726,13 +6204,30 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 .filter_map(Self::type_scope_key)
                 .map(|scope| (scope, true)),
         );
+        search
+    }
+
+    /// The enclosing and imported namespaces that declare a type of this simple name, ordered
+    /// most-specific scope first. The flag marks a hit that comes from a `using`-imported
+    /// namespace: those alone share one precedence level, so two of them are a CS0104
+    /// ambiguity, whereas a more-specific scope (an enclosing type, the current namespace,
+    /// the global namespace) unambiguously SHADOWS every less-specific hit (3.8, 10.8).
+    fn type_namespaces_containing(&self, name: &str) -> Vec<(Box<str>, bool)> {
         let mut hits: Vec<(Box<str>, bool)> = Vec::new();
-        for (namespace, imported) in search {
+        for (namespace, imported) in self.type_lookup_scopes(name) {
             if self.model.get(&namespace, name).is_some()
                 && !hits.iter().any(|(seen, _)| *seen == namespace)
             {
                 hits.push((namespace, imported));
             }
+        }
+        // Inaccessible imports cannot make an accessible imported type ambiguous.
+        // Keep them for diagnostics when no accessible import supplies the name.
+        if hits.iter().any(|(namespace, imported)|
+            *imported && self.type_is_accessible_here(&type_symbol_in(namespace, name)))
+        {
+            hits.retain(|(namespace, imported)|
+                !*imported || self.type_is_accessible_here(&type_symbol_in(namespace, name)));
         }
         hits
     }
@@ -5971,6 +6466,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
 
         let mut bound = Vec::new();
         let mut new_fields = Vec::new();
+        self.label_scopes.enter(statements.iter());
         for statement in statements {
             match &statement.kind {
                 StmtKind::LocalDeclaration {
@@ -6041,6 +6537,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
 
         self.exit_scope();
+        self.label_scopes.exit();
         self.session_receiver = None;
         self.session_fields = BTreeMap::new();
         self.current_type = None;
@@ -6093,27 +6590,47 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Binds a constructor initializer `: this(args)` / `: base(args)`: the arguments are
     /// bound in a scope with the constructor's parameters, then matched to a constructor
     /// of the sibling (`this`) or base type. Returns the target `.ctor` reference and the
-    /// bound arguments, or `None` if it does not resolve.
+    /// bound arguments in parameter order and their source-order spill, or `None` if it
+    /// does not resolve.
     pub fn bind_constructor_chain(
         &mut self,
         enclosing: &TypeSymbol,
         parameters: &[(Box<str>, TypeSymbol)],
         initializer: &lamella_syntax::ast::ConstructorInitializer,
-    ) -> Option<(MethodReference, Vec<BoundExpr>)> {
+    ) -> Option<(MethodReference, Vec<BoundExpr>, Vec<BoundExpr>)> {
         let diagnostics_before = self.diagnostics.len();
-        self.current_type = Some(enclosing.clone());
+        let outer_type = self.current_type.replace(enclosing.clone());
         self.enter_scope();
         for (name, ty) in parameters {
-            self.declare_local(name, self.resolve_type(ty));
+            // Resolve names within composite parameter types as well as bare names, so an
+            // argument referencing a parameter has the same type as the target signature.
+            self.declare_local(name, self.canonicalize(ty));
         }
+        let result = self.bind_constructor_chain_inner(enclosing, initializer);
+        self.exit_scope();
+        self.current_type = outer_type;
+        // Argument binding, overload resolution and conversion all belong to the constructor's
+        // body phase, including diagnostics on an early return from resolution.
+        self.mark_body_phase(diagnostics_before);
+        result
+    }
+
+    fn bind_constructor_chain_inner(
+        &mut self,
+        enclosing: &TypeSymbol,
+        initializer: &lamella_syntax::ast::ConstructorInitializer,
+    ) -> Option<(MethodReference, Vec<BoundExpr>, Vec<BoundExpr>)> {
         let arguments: Vec<BoundExpr> = initializer
             .arguments
             .iter()
             .map(|argument| self.bind_argument_expression(&argument.value))
             .collect();
-        self.exit_scope();
-        self.current_type = None;
-        self.mark_body_phase(diagnostics_before);
+        if arguments.iter().any(|argument| {
+            argument.ty.is_error()
+                && !matches!(argument.kind, BoundExprKind::MethodGroup { .. })
+        }) {
+            return None;
+        }
         let target = match initializer.kind {
             lamella_syntax::ast::ConstructorInitializerKind::This => enclosing.clone(),
             lamella_syntax::ast::ConstructorInitializerKind::Base => {
@@ -6123,49 +6640,90 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let constructors = self.type_info_of(&target)?.constructors.clone();
         let argument_types: Vec<TypeSymbol> =
             arguments.iter().map(argument_type).collect();
-        let arg_constants: Vec<Option<i64>> =
-            arguments.iter().map(constant_int_value).collect();
+        let arg_constants: Vec<ArgumentConstant> =
+            arguments.iter().map(|value| self.argument_constant(value)).collect();
         let names = argument_names(&initializer.arguments);
-        let chosen =
+        // Only a constructor the initializer can access is a candidate, judged from the
+        // constructor's own class: `base(...)` reaches a protected constructor, `this(...)`
+        // a private one (10.5). One that alone would resolve is CS0122, as for `new T(...)`.
+        let accessible: Vec<_> = constructors.iter()
+            .filter(|constructor| self.accessible_from(enclosing, &target, constructor.accessibility))
+            .cloned()
+            .collect();
+        let has_method_group = arguments.iter()
+            .any(|argument| matches!(argument.kind, BoundExprKind::MethodGroup { .. }));
+        let chosen = if has_method_group {
+            self.resolve_with_method_groups(
+                ".ctor", &target, &accessible, &arguments, &names, &[], initializer.span,
+            )?
+        } else {
             match resolve_overload(
                 &self.model,
-                &constructors,
+                &accessible,
                 &argument_types,
                 &arg_constants,
                 &names,
+                self.language_version,
             ) {
-            OverloadResult::Resolved(method) => method,
-            _ => return None,
+                OverloadResult::Resolved(method) => method,
+                failure => {
+                    if accessible.len() != constructors.len()
+                        && let OverloadResult::Resolved(inaccessible) = resolve_overload(
+                            &self.model,
+                            &constructors,
+                            &argument_types,
+                            &arg_constants,
+                            &names,
+                            self.language_version,
+                        )
+                    {
+                        self.diagnostics.push(Diagnostic::new(
+                            DiagnosticKind::Inaccessible {
+                                member: qualified_method_with_modes(
+                                    &target,
+                                    &simple_type_name(&target),
+                                    &inaccessible,
+                                ),
+                            },
+                            initializer.span,
+                        ));
+                        return None;
+                    }
+                    let span = match &failure {
+                        OverloadResult::BadArgument { index, .. } => initializer
+                            .arguments
+                            .get(*index)
+                            .map_or(initializer.span, |argument| argument.value.span),
+                        _ => initializer.span,
+                    };
+                    self.report_constructor_failure(
+                        &target, &accessible, &argument_types, span, failure,
+                    );
+                    return None;
+                }
+            }
         };
-        let mut arguments = arguments;
-        let filled = names
-            .iter()
-            .any(Option::is_some)
-            .then(|| map_arguments(&chosen, &names))
-            .flatten();
-        // An argument with no type of its own -- a `default` literal, or a conditional or switch
-        // expression whose arms have no type in common -- is converted here to the chosen
-        // constructor's parameter type, which is the only type it can have.
-        for (index, argument) in arguments.iter_mut().enumerate() {
-            if !is_default_literal_marker(&argument.ty) && typeless_kind(&argument.ty).is_none() {
-                continue;
-            }
-            let parameter = match &filled {
-                Some(filled) => filled.iter().position(|slot| *slot == Some(index)),
-                None => Some(index),
-            };
-            if let Some(parameter) =
-                parameter.and_then(|position| chosen.parameters.get(position))
-            {
-                let typeless = core::mem::replace(argument, error_expr());
-                *argument = self.convert(typeless, parameter);
-            }
+        if !has_method_group {
+            self.check_call_conversions(
+                &chosen, &argument_types, &arg_constants, &names, &arguments, initializer.span,
+            );
         }
+        self.report_target_typed_arguments(&initializer.arguments, &arguments);
+        let mut arguments = arguments;
+        // The constructor prologue carries the spill separately from its parameter-order
+        // arguments, so conversions and ref/out addresses evaluate in source order.
         let mut chain_named = false;
+        let mut spilled = Vec::new();
         if names.iter().any(Option::is_some)
             && let Some(fill) = named_slots(&chosen, &names)
         {
-            arguments = self.place_named_slots(&fill, core::mem::take(&mut arguments));
+            (arguments, spilled) = self.apply_named_slots(
+                &fill,
+                arguments,
+                &chosen.parameters,
+                chosen.is_params,
+                Vec::new(),
+            );
             chain_named = true;
         }
         let omitted: Vec<(TypeSymbol, Literal)> = if chain_named {
@@ -6202,7 +6760,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         } else {
             arguments
         };
-        Some((reference, arguments))
+        Some((reference, arguments, spilled))
     }
 
     /// Binds a field initializer in `enclosing`'s context and checks it converts
@@ -6449,7 +7007,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
         let from = &bound.ty;
         let standard = crate::conversion::converts(&self.model, from, parameter_type)
-            || implicit_constant_conversion(bound, parameter_type)
+            || self.implicit_constant_conversion(bound, parameter_type)
             || self.enum_from_zero(bound, parameter_type);
         if !standard {
             return Some(DiagnosticKind::DefaultValueWrongType {
@@ -6632,7 +7190,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             .cloned()
             .collect();
         let argument_types: Vec<TypeSymbol> = arguments.iter().map(argument_type).collect();
-        let arg_constants: Vec<Option<i64>> = arguments.iter().map(constant_int_value).collect();
+        let arg_constants: Vec<ArgumentConstant> = arguments.iter().map(|value| self.argument_constant(value)).collect();
         let constructor = self.check_constructor(
             &class,
             &accessible,
@@ -6640,6 +7198,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             &argument_types,
             &arg_constants,
             &[],
+            &arguments,
             attribute.span,
         )?;
         let reference = MethodReference {
@@ -6673,7 +7232,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 Some(field) => (true, field.ty.clone()),
                 None => (
                     false,
-                    info.properties.iter().find(|property| &*property.name == name)?.ty.clone(),
+                    info.find_property(name)?.ty.clone(),
                 ),
             };
             let ty = self.resolve_type(&ty);
@@ -7118,6 +7677,35 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             .is_some_and(|accessor| accessor == method.name)
     }
 
+    /// Whether the selected getter has its paired setter. An override can inherit the other
+    /// accessor; a new indexer cannot borrow a setter from a hidden base declaration.
+    fn indexer_has_setter(&self, getter: &MethodReference) -> bool {
+        let Some(name) = getter.name.strip_prefix("get_") else {
+            return true;
+        };
+        let setter = alloc::format!("set_{name}");
+        for (_, info) in self.model.base_class_chain(&getter.declaring_type).resolved() {
+            let Some(declaration) = info.methods.iter().find(|method| {
+                method.name == getter.name && method.parameters == getter.parameters
+            }) else {
+                continue;
+            };
+            if info.methods.iter().any(|method| {
+                &*method.name == setter
+                    && method.parameters.len() == getter.parameters.len() + 1
+                    && method.parameters[..getter.parameters.len()] == getter.parameters
+                    && method.parameters.last() == Some(&getter.return_type)
+            }) {
+                return true;
+            }
+            if !declaration.is_override {
+                return false;
+            }
+        }
+        // A getter outside the available model cannot establish a missing setter.
+        true
+    }
+
     /// Whether `target`, written at `position`, is a VARIABLE -- storage the write lands in -- and,
     /// when it is not, the first reason, reported at the target (parentheses removed, where csc
     /// points every code here but `CS1612`).
@@ -7388,6 +7976,34 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             return true;
         }
         let syntax = without_parentheses(syntax);
+        if let BoundExprKind::Call { method: Some(getter), .. } = &operand.kind
+            && self.is_indexer_read(getter)
+            && !self.indexer_has_setter(getter)
+        {
+            let indices = getter.parameters.iter().map(ToString::to_string)
+                .collect::<Vec<_>>().join(", ");
+            self.report(Diagnostic::new(
+                DiagnosticKind::PropertyCannotBeAssigned {
+                    property: alloc::format!("{}.this[{indices}]", getter.declaring_type).into(),
+                },
+                syntax.span,
+            ));
+            return false;
+        }
+        if let BoundExprKind::PropertyAccess { receiver, setter_declaring_type, name, .. } = &operand.kind
+            && !self.property_has_setter(setter_declaring_type, name)
+            && self.auto_property_backing_write(receiver, setter_declaring_type, name).is_none()
+        {
+            let declaring = self.property_declaring_type(setter_declaring_type, name)
+                .unwrap_or_else(|| setter_declaring_type.clone());
+            self.report(Diagnostic::new(
+                DiagnosticKind::PropertyCannotBeAssigned {
+                    property: alloc::format!("{declaring}.{name}").into(),
+                },
+                syntax.span,
+            ));
+            return false;
+        }
         let steppable = match &operand.kind {
             BoundExprKind::Call {
                 method: Some(method),
@@ -7653,7 +8269,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     }
 
     /// Enters the body of a function nested in the one being bound -- a lambda's -- which no
-    /// `catch`, filter, `finally` or `lock` of the outer one encloses. Returns what
+    /// `catch`, filter, `finally`, `lock` or label scope of the outer one encloses. Returns what
     /// [`Self::exit_function_body`] restores.
     fn enter_function_body(&mut self) -> HandlerNesting {
         HandlerNesting {
@@ -7662,6 +8278,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             finally_depth: core::mem::take(&mut self.finally_depth),
             lock_depth: core::mem::take(&mut self.lock_depth),
             finally_floor: core::mem::take(&mut self.finally_floor),
+            label_floor: self.label_scopes.enter_function(),
         }
     }
 
@@ -7671,6 +8288,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.finally_depth = outer.finally_depth;
         self.lock_depth = outer.lock_depth;
         self.finally_floor = outer.finally_floor;
+        self.label_scopes.exit_function(outer.label_floor);
     }
 
     pub(crate) fn enter_catch(&mut self) {
@@ -7915,7 +8533,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 .and_then(|info| {
                     info.properties
                         .iter()
-                        .find(|candidate| candidate.name == *name)
+                        .find(|candidate| candidate.name == *name && candidate.explicit_interface.is_none())
                         .map(|candidate| candidate.tuple_names.clone())
                 })
                 .unwrap_or_default(),
@@ -8346,6 +8964,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 extra_ranks,
                 initializer,
             } => {
+                let Some(element) = element else {
+                    return self.bind_implicit_array(initializer.as_deref(), *rank, expr.span);
+                };
                 let mut ty = self.resolve_type_ref(element);
                 if !ty.is_error() {
                     for &extra in extra_ranks.iter().rev() {
@@ -8431,7 +9052,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     return self.finish_typeless(operand, operand_syntax, &ty);
                 }
                 if !self.unchecked_context {
-                    if let Some(value_text) = constant_out_of_range(&operand, &ty) {
+                    if let Some(value_text) = self.constant_out_of_range(&operand, &ty) {
                         self.report(Diagnostic::new(
                             DiagnosticKind::CheckedConstantConversionOverflow {
                                 value: value_text,
@@ -8899,7 +9520,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
         if !left.ty.is_error() && !right.ty.is_error() {
             if self.user_operator_first(operator, &left.ty, &right.ty) {
-                if let Some(call) = self.bind_user_binary_operator(operator, &left, &right) {
+                if let Some(call) = self.bind_user_binary_operator(operator, &left, &right, span) {
                     return call;
                 }
             }
@@ -8947,7 +9568,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         } else if let Some(result) = binary_result_type(self, operator, &left.ty, &right.ty) {
             result
         } else {
-            if let Some(call) = self.bind_user_binary_operator(operator, &left, &right) {
+            if let Some(call) = self.bind_user_binary_operator(operator, &left, &right, span) {
                 return call;
             }
             self.diagnostics.push(Diagnostic::new(
@@ -9069,11 +9690,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             return (left, right);
         }
         let uint = TypeSymbol::Special(SpecialType::UInt32);
-        if is_uint(&left.ty) && int_constant_fits(&right, SpecialType::UInt32) {
+        if is_uint(&left.ty) && self.int_constant_fits(&right, SpecialType::UInt32) {
             let right = self.convert(right, &uint);
             return (left, right);
         }
-        if is_uint(&right.ty) && int_constant_fits(&left, SpecialType::UInt32) {
+        if is_uint(&right.ty) && self.int_constant_fits(&left, SpecialType::UInt32) {
             let left = self.convert(left, &uint);
             return (left, right);
         }
@@ -9137,7 +9758,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     ) -> Option<BoundExpr> {
         let mut spilled = Vec::new();
         let spilled_target = spill_target_operands(target.clone(), &mut spilled);
-        let call = self.bind_user_binary_operator(binary_op, &spilled_target, value)?;
+        let call = self.bind_user_binary_operator(binary_op, &spilled_target, value, span)?;
         if !self.assignable(&call, &spilled_target.ty) {
             self.report_no_implicit_conversion(&call.ty, &spilled_target.ty, span);
             return Some(error_expr());
@@ -9162,17 +9783,20 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         operator: BinaryOperator,
         left: &BoundExpr,
         right: &BoundExpr,
+        span: Span,
     ) -> Option<BoundExpr> {
         let name = operator.overload_method_name()?;
         let argument_types = [left.ty.clone(), right.ty.clone()];
         for owner in [&left.ty, &right.ty] {
             let candidates = self.methods_in_chain(owner, name);
             if let OverloadResult::Resolved(method) =
-                resolve_overload(&self.model, &candidates, &argument_types, &[], &[])
+                resolve_overload(&self.model, &candidates, &argument_types, &[], &[], self.language_version)
             {
                 let declaring_type = self.declaring_type_in_chain(owner, name, &method.parameters);
                 let declaring_instantiation =
                     self.declaring_instantiation_of(&declaring_type, name, &method.parameters);
+                self.check_assignable(left, &method.parameters[0], span);
+                self.check_assignable(right, &method.parameters[1], span);
                 let left_arg = self.convert(left.clone(), &method.parameters[0]);
                 let right_arg = self.convert(right.clone(), &method.parameters[1]);
                 return Some(BoundExpr {
@@ -9341,6 +9965,20 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         })
     }
 
+    fn field_reference_type(&self, field: &FieldReference) -> TypeSymbol {
+        // Enum members have their underlying type inside enum member initializers (21.3).
+        // The field itself retains its declared enum type for metadata and other contexts.
+        if self.in_field_initializer
+            && self.current_type.as_ref().is_some_and(|ty| self.is_enum_type(ty))
+            && field.is_static
+        {
+            if let Some(underlying) = self.enum_underlying_type(&field.declaring_type) {
+                return underlying;
+            }
+        }
+        field.ty.clone()
+    }
+
     /// The integral type a constant of type `ty` is held at: `ty` itself for an integral type or
     /// `char`, and an enum's underlying type for an enum. `None` for every other type.
     pub(crate) fn integral_constant_type(&self, ty: &TypeSymbol) -> Option<SpecialType> {
@@ -9357,6 +9995,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// every enum's operations computed at its underlying type.
     pub(crate) fn constant_value(&self, expr: &BoundExpr) -> Option<Literal> {
         constant_value_in(expr, &|ty| self.integral_constant_type(ty))
+    }
+
+    /// An integral constant's low 64 bits, with enum operations evaluated at their underlying type.
+    fn constant_int_value(&self, expr: &BoundExpr) -> Option<i64> {
+        self.constant_value(expr).as_ref().and_then(literal_int_value)
     }
 
     /// Whether `ty` is an enum type declared in the model.
@@ -9462,7 +10105,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         );
         if narrower_than_int
             && matches!(operand.kind, BoundExprKind::Literal(Literal::Integer { .. }))
-            && implicit_constant_conversion(&operand, parameter)
+            && self.implicit_constant_conversion(&operand, parameter)
         {
             return BoundExpr {
                 kind: operand.kind,
@@ -9485,6 +10128,37 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         ) && !self.check_step_operand(&operand, operand_expr)
         {
             return error_expr();
+        }
+        if matches!(operator, UnaryOperator::PreIncrement | UnaryOperator::PreDecrement) {
+            let name = if operator == UnaryOperator::PreIncrement { "op_Increment" } else { "op_Decrement" };
+            if let Some(bound) = self.bind_nullable_indexer_step(&operand, name, false, span) {
+                return bound;
+            }
+            if let Some(method) = self.explicit_nullable_step(&operand.ty, name) {
+                // Prefix returns the newly stored value. Capture the target before invoking the
+                // operator, including a property's struct receiver or a ref-returned variable.
+                let mut spilled = Vec::new();
+                let target = self.capture_compound_target(operand, &mut spilled);
+                let value = BoundExpr {
+                    ty: target.ty.clone(),
+                    kind: BoundExprKind::Call {
+                        callee: Box::new(error_expr()),
+                        arguments: alloc::vec![target.clone()],
+                        method: Some(method),
+                    },
+                };
+                let target = self.auto_property_step_store(&target).unwrap_or(target);
+                let assignment = BoundExpr {
+                    ty: target.ty.clone(),
+                    kind: BoundExprKind::Assignment {
+                        operator: AssignmentOperator::Assign,
+                        target: Box::new(target),
+                        value: Box::new(value),
+                        checked: self.checked_context,
+                    },
+                };
+                return Self::spilling(assignment, spilled);
+            }
         }
         if operator == UnaryOperator::Minus && matches!(&operand_expr.kind, ExprKind::Literal(_)) {
             if let BoundExprKind::Literal(literal) = &operand.kind {
@@ -9523,14 +10197,15 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         } else if matches!(
             operator,
             UnaryOperator::PreIncrement | UnaryOperator::PreDecrement
-        ) && self.has_step_operator(
-            &operand.ty,
-            if operator == UnaryOperator::PreIncrement {
+        ) && {
+            let step = if operator == UnaryOperator::PreIncrement {
                 "op_Increment"
             } else {
                 "op_Decrement"
-            },
-        ) {
+            };
+            self.has_step_operator(&operand.ty, step)
+                || self.has_lifted_step(&operand.ty, step)
+        } {
             operand.ty.clone()
         } else {
             if let Some(call) = self.bind_user_unary_operator(operator, &operand) {
@@ -9550,14 +10225,15 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             }
         }
         let operand = self.promoted_negation_operand(operator, operand, &ty);
-        BoundExpr {
+        let bound = BoundExpr {
             kind: BoundExprKind::Unary {
                 operator,
                 operand: Box::new(operand),
                 checked: self.checked_context,
             },
             ty,
-        }
+        };
+        self.finish_auto_property_step(bound)
     }
 
     /// A byte/ushort enum complement promotes to int before converting back to the enum.
@@ -9597,7 +10273,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let argument_types = [operand.ty.clone()];
         let candidates = self.methods_in_chain(&operand.ty, name);
         if let OverloadResult::Resolved(method) =
-            resolve_overload(&self.model, &candidates, &argument_types, &[], &[])
+            resolve_overload(&self.model, &candidates, &argument_types, &[], &[], self.language_version)
         {
             let declaring_type = self.declaring_type_in_chain(&operand.ty, name, &method.parameters);
             let declaring_instantiation =
@@ -9630,7 +10306,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let candidates = self.methods_in_chain(&operand.ty, "op_True");
         let argument_types = [operand.ty.clone()];
         if let OverloadResult::Resolved(method) =
-            resolve_overload(&self.model, &candidates, &argument_types, &[], &[])
+            resolve_overload(&self.model, &candidates, &argument_types, &[], &[], self.language_version)
         {
             let declaring_type =
                 self.declaring_type_in_chain(&operand.ty, "op_True", &method.parameters);
@@ -9675,19 +10351,25 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             PostfixOperator::Increment => "op_Increment",
             PostfixOperator::Decrement => "op_Decrement",
         };
-        let mut converting: Option<Box<ConvertingStep>> = None;
+        if let Some(bound) = self.bind_nullable_indexer_step(&operand, step_name, true, span) {
+            return bound;
+        }
+        let mut resolved_step = self.explicit_nullable_step(&operand.ty, step_name)
+            .map(|operator| Box::new(ConvertingStep { operator, result_conversion: None }));
         let ty = if operand.ty.is_error() {
             TypeSymbol::Error
         } else if as_special(&operand.ty).is_some_and(SpecialType::is_numeric)
             || self.is_enum_type(&operand.ty)
             || matches!(operand.ty, TypeSymbol::Pointer(_))
+            || resolved_step.is_some()
             || self.has_step_operator(&operand.ty, step_name)
+            || self.has_lifted_step(&operand.ty, step_name)
         {
             operand.ty.clone()
         } else if let Some((operator_method, result_conversion)) =
             self.find_converting_step(&operand.ty, step_name)
         {
-            converting = Some(Box::new(ConvertingStep {
+            resolved_step = Some(Box::new(ConvertingStep {
                 operator: operator_method,
                 result_conversion,
             }));
@@ -9700,15 +10382,195 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             self.report_unary(symbol, &operand.ty, span);
             TypeSymbol::Error
         };
-        BoundExpr {
+        let bound = BoundExpr {
             kind: BoundExprKind::Postfix {
                 operator,
                 operand: Box::new(operand),
-                step: converting,
+                step: resolved_step,
                 checked: self.checked_context,
             },
             ty,
+        };
+        self.finish_auto_property_step(bound)
+    }
+
+    /// The legal constructor store of a getter-only auto-property. Its read still uses
+    /// the getter, so a virtual property's override participates in a step.
+    fn auto_property_step_store(&self, operand: &BoundExpr) -> Option<BoundExpr> {
+        let BoundExprKind::PropertyAccess { receiver, setter_declaring_type, name, .. } = &operand.kind else {
+            return None;
+        };
+        if self.property_has_setter(setter_declaring_type, name) {
+            return None;
         }
+        let field = self.auto_property_backing_write(receiver, setter_declaring_type, name)?;
+        Some(BoundExpr {
+            ty: field.ty.clone(),
+            kind: BoundExprKind::FieldAccess {
+                receiver: receiver.clone(), name: field.name.clone(), field: Some(field),
+            },
+        })
+    }
+
+    /// Step a saved getter value through its managed address, then store the result in
+    /// the backing field. Postfix retains the old value across that store.
+    fn finish_auto_property_step(&self, mut step: BoundExpr) -> BoundExpr {
+        let (operand, postfix) = match &mut step.kind {
+            BoundExprKind::Unary {
+                operator: UnaryOperator::PreIncrement | UnaryOperator::PreDecrement, operand, ..
+            } => (operand, false),
+            BoundExprKind::Postfix { operand, .. } => (operand, true),
+            _ => return step,
+        };
+        let Some(target) = self.auto_property_step_store(operand) else {
+            return step;
+        };
+        let ty = operand.ty.clone();
+        let saved = BoundExpr { ty: ty.clone(), kind: BoundExprKind::Temp(0) };
+        let pointer = BoundExpr {
+            ty: TypeSymbol::ByRef(Box::new(ty.clone())), kind: BoundExprKind::Temp(0),
+        };
+        let place = BoundExpr {
+            ty: ty.clone(), kind: BoundExprKind::Dereference { operand: Box::new(pointer) },
+        };
+        let read = core::mem::replace(&mut **operand, place.clone());
+        let checked = self.checked_context;
+        let store = |value| BoundExpr {
+            ty: ty.clone(),
+            kind: BoundExprKind::Assignment {
+                operator: AssignmentOperator::Assign, target: Box::new(target),
+                value: Box::new(value), checked,
+            },
+        };
+        let result = if postfix {
+            Self::spilling(saved.clone(), alloc::vec![step, store(place)])
+        } else {
+            store(step)
+        };
+        // The address operand runs in the getter's scope. The nested step and store
+        // then share that address without re-evaluating the getter or changing the field early.
+        let address = BoundExpr {
+            ty, kind: BoundExprKind::Ref { out: false, operand: Box::new(saved) },
+        };
+        Self::spilling(Self::spilling(result, alloc::vec![address]), alloc::vec![read])
+    }
+
+    /// Applies a nullable step to an indexer, preserving its receiver, indices,
+    /// and old or new result around the getter/operator/setter calls.
+    fn bind_nullable_indexer_step(
+        &mut self,
+        operand: &BoundExpr,
+        step_name: &str,
+        postfix: bool,
+        span: Span,
+    ) -> Option<BoundExpr> {
+        let BoundExprKind::Call { callee, arguments, method: Some(getter) } = &operand.kind else {
+            return None;
+        };
+        if !self.is_indexer_read(getter) {
+            return None;
+        }
+        let BoundExprKind::MethodGroup { receiver, .. } = &callee.kind else {
+            return None;
+        };
+        let operator = self.explicit_nullable_step(&operand.ty, step_name);
+        if operator.is_none() && !self.has_lifted_step(&operand.ty, step_name) {
+            return None;
+        }
+        let setter = alloc::format!("set_{}", getter.name.strip_prefix("get_")?);
+        let mut captures = Vec::new();
+        let receiver = self.spill_named_receiver((**receiver).clone(), &mut captures);
+        let indices: Vec<_> = arguments.iter()
+            .map(|index| Self::spill_named_operand(index.clone(), &mut captures))
+            .collect();
+        let read = BoundExpr {
+            ty: operand.ty.clone(),
+            kind: BoundExprKind::Call {
+                callee: Box::new(BoundExpr {
+                    ty: TypeSymbol::Error,
+                    kind: BoundExprKind::MethodGroup {
+                        receiver: Box::new(receiver.clone()),
+                        name: getter.name.clone(),
+                    },
+                }),
+                arguments: indices.clone(),
+                method: Some(getter.clone()),
+            },
+        };
+        // A postfix step keeps its old value in an inner scope. Copy the captured operands
+        // to the same positions there so both accessor calls retain the original location.
+        let mut saved = Vec::new();
+        let current = if postfix {
+            saved.extend(captures.iter().enumerate().map(|(index, capture)| BoundExpr {
+                kind: BoundExprKind::Temp(index as u32),
+                ty: match &capture.kind {
+                    BoundExprKind::Ref { .. } => TypeSymbol::ByRef(Box::new(capture.ty.clone())),
+                    _ => capture.ty.clone(),
+                },
+            }));
+            Self::spill_named_operand(read, &mut saved)
+        } else {
+            read
+        };
+        let value = if let Some(operator) = operator {
+            BoundExpr {
+                ty: operand.ty.clone(),
+                kind: BoundExprKind::Call {
+                    callee: Box::new(error_expr()),
+                    arguments: alloc::vec![current.clone()],
+                    method: Some(operator),
+                },
+            }
+        } else {
+            // A lifted step updates a private copy of the getter value through its address.
+            // The ordinary step lowering owns null propagation and checked overflow; only
+            // its new result reaches the setter, and postfix keeps the original value above.
+            let ty = operand.ty.clone();
+            let address = BoundExpr {
+                ty: ty.clone(),
+                kind: BoundExprKind::Ref {
+                    out: false,
+                    operand: Box::new(BoundExpr { ty: ty.clone(), kind: BoundExprKind::Temp(0) }),
+                },
+            };
+            let place = BoundExpr {
+                ty: ty.clone(),
+                kind: BoundExprKind::Dereference {
+                    operand: Box::new(BoundExpr {
+                        ty: TypeSymbol::ByRef(Box::new(ty.clone())),
+                        kind: BoundExprKind::Temp(0),
+                    }),
+                },
+            };
+            let step = BoundExpr {
+                ty,
+                kind: BoundExprKind::Unary {
+                    operator: if step_name == "op_Increment" {
+                        UnaryOperator::PreIncrement
+                    } else {
+                        UnaryOperator::PreDecrement
+                    },
+                    operand: Box::new(place),
+                    checked: self.checked_context,
+                },
+            };
+            Self::spilling(Self::spilling(step, alloc::vec![address]), alloc::vec![current.clone()])
+        };
+        let names = alloc::vec![None; indices.len()];
+        let mut arguments = indices;
+        arguments.push(value);
+        let Some(store) = self.bind_indexer_store(receiver, &setter, arguments, &names, span) else {
+            return Some(error_expr());
+        };
+        let result = if postfix {
+            // Both operands run in the enclosing scope: keep the old value, then perform
+            // the write, before opening the scope that returns the old value alone.
+            let old = BoundExpr { ty: operand.ty.clone(), kind: BoundExprKind::Temp(0) };
+            Self::spilling(Self::spilling(old, alloc::vec![current, store]), saved)
+        } else {
+            store
+        };
+        Some(Self::spilling(result, captures))
     }
 
     /// Whether `ty` declares a user-defined `op_Increment`/`op_Decrement` (named by
@@ -9718,6 +10580,40 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             method.parameters.len() == 1
                 && &method.parameters[0] == ty
                 && &method.return_type == ty
+        })
+    }
+
+    /// Finds an explicitly declared `S? -> S?` step on `S`. It is an unlifted candidate and
+    /// wins over the lifted `S -> S` signature (ECMA-334 fourth edition 14.4.2.2).
+    fn explicit_nullable_step(&self, ty: &TypeSymbol, step: &str) -> Option<MethodReference> {
+        let underlying = crate::conversion::nullable_underlying(ty)?;
+        let method = self.methods_in_chain(underlying, step).into_iter().find(|method| {
+            method.is_static
+                && method.parameters.as_slice() == core::slice::from_ref(ty)
+                && &method.return_type == ty
+        })?;
+        let declaring_type = self.declaring_type_in_chain(underlying, step, &method.parameters);
+        let declaring_instantiation =
+            self.declaring_instantiation_of(&declaring_type, step, &method.parameters);
+        Some(MethodReference {
+            declaring_type,
+            name: step.into(),
+            parameters: method.parameters,
+            return_type: method.return_type,
+            is_static: true,
+            is_vararg: false,
+            instantiation: None,
+            declaring_instantiation,
+        })
+    }
+
+    /// A nullable numeric/enum or an exact value-type user step lifts (14.2.7).
+    /// The emitter preserves the lvalue and old/new result around the nullable operation.
+    fn has_lifted_step(&self, ty: &TypeSymbol, step: &str) -> bool {
+        crate::conversion::nullable_underlying(ty).is_some_and(|underlying| {
+            as_special(underlying).is_some_and(SpecialType::is_numeric)
+                || self.is_enum_type(underlying)
+                || (self.is_value_type(underlying) && self.has_step_operator(underlying, step))
         })
     }
 
@@ -9876,7 +10772,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 ty,
             ),
             None => {
-                let marker = typeless_marker(Typeless::Conditional, &[&true_arm, &false_arm]);
+                let marker = typeless_marker(
+                    Typeless::Conditional,
+                    &[&true_arm, &false_arm],
+                    |arm| self.argument_constant(arm),
+                );
                 (true_arm, false_arm, marker)
             }
         };
@@ -10370,7 +11270,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             values.push(self.bind_arm(&arm.value));
         }
         let natural = self.switch_natural_type(&values);
-        let marker = typeless_marker(Typeless::Switch, &values.iter().collect::<Vec<_>>());
+        let marker = typeless_marker(
+            Typeless::Switch,
+            &values.iter().collect::<Vec<_>>(),
+            |arm| self.argument_constant(arm),
+        );
 
         let fallback = if has_catch_all {
             None
@@ -10919,21 +11823,23 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// deliberately does not admit (13.7.2). Lifting on the underlying types is what makes that
     /// omission cost nothing here.
     ///
+    /// Predefined operator shapes, with the operands spilled to `x` and `y`, and `x.V` for
     ///
     /// | operators | result | value |
     /// |---|---|---|
     /// | `+ - * / % & \| ^ << >>` | `S?` | `(x.HasValue & y.HasValue) ? new S?(x.V op y.V) : null` |
     /// | `==` `!=` | `bool` | `(x.V == y.V) & (x.HasValue == y.HasValue)`, negated for `!=` |
-    /// | `< > <= >=` | `bool` | `(x.V op y.V) & x.HasValue & y.HasValue` |
+    /// | `< > <= >=` | `bool` | `(x.HasValue & y.HasValue) ? (x.V op y.V) : false` |
     ///
     /// **AN EQUALITY YIELDS `bool`, NOT `bool?`**, which is what makes `if (a == b)` legal on two
     /// `int?` -- and the branchless form above has no `HasValue` test to branch on at all. `!=` is
-    /// the NEGATION of the `==` form, not the mirror of it with `|` and `!=`. A RELATIONAL result is
-    /// `bool` too and is FALSE when either operand is null, which is why its presence terms are
-    /// `and`ed onto the comparison instead of compared to each other.
+    /// the negation of the predefined `==` form. User-defined equality and inequality instead
+    /// call their own operator when both values are present (14.2.7); those methods need not
+    /// return opposite results. A relational result is also `bool`, and is false when either
+    /// operand is null. Its presence tests guard the underlying operator, which can have effects.
     ///
-    /// `GetValueOrDefault()` rather than `Value`, because both operands are unwrapped
-    /// unconditionally in the two `bool` shapes: an unwrap that THREW on a null operand would turn
+    /// `GetValueOrDefault()` rather than `Value`, because predefined equality unwraps both operands
+    /// unconditionally: an unwrap that THREW on a null operand would turn
     /// `a == b` into an exception.
     ///
     ///
@@ -10979,12 +11885,14 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
         // Fourth-edition 14.10.4 defines only & and | on bool?. Without true/false
         // operators, 14.11.2 cannot provide && or ||. Neither has a lifted form (14.2.7).
-        if matches!(operator, Op::LogicalAnd | Op::LogicalOr)
-            || (matches!(operator, Op::BitwiseAnd | Op::BitwiseOr)
-                && matches!(left_under, TypeSymbol::Special(SpecialType::Boolean))
-                && matches!(right_under, TypeSymbol::Special(SpecialType::Boolean)))
-        {
+        if matches!(operator, Op::LogicalAnd | Op::LogicalOr) {
             return None;
+        }
+        if matches!(operator, Op::BitwiseAnd | Op::BitwiseOr)
+            && matches!(left_under, TypeSymbol::Special(SpecialType::Boolean))
+            && matches!(right_under, TypeSymbol::Special(SpecialType::Boolean))
+        {
+            return self.bind_nullable_boolean(operator, left, right, span);
         }
         let (left, right) = if self.is_enum_type(&left_under) || self.is_enum_type(&right_under) {
             let left_value = self.nullable_value(left.clone(), span)?;
@@ -11032,13 +11940,15 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let right_value = self.nullable_value(temp(1, &right_ty), span)?;
         let (left_value, right_value) =
             self.adjust_binary_constant(operator, left_value, right_value);
+        // The predefined != uses negated equality. User operators below resolve the written
+        // operator itself: op_Inequality is independent of op_Equality (14.2.7).
         let inner_operator = if operator == Op::NotEqual {
             Op::Equal
         } else {
             operator
         };
         let user_first = if user_operator_first {
-            self.bind_user_binary_operator(inner_operator, &left_value, &right_value)
+            self.bind_user_binary_operator(operator, &left_value, &right_value, span)
         } else {
             None
         };
@@ -11058,7 +11968,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     (node, false)
                 } else {
                     let call =
-                        self.bind_user_binary_operator(inner_operator, &left_value, &right_value)?;
+                        self.bind_user_binary_operator(operator, &left_value, &right_value, span)?;
                     (call, true)
                 }
             }
@@ -11079,6 +11989,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             presence.push(term);
         }
         let value = if comparison && user_defined {
+            let is_equal = operator == Op::Equal;
             let (same_presence, both_present) = match <[BoundExpr; 2]>::try_from(presence) {
                 Ok([left_has, right_has]) => (
                     self.binary_node(Op::Equal, left_has.clone(), right_has, boolean.clone()),
@@ -11094,34 +12005,22 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     condition: Box::new(both_present),
                     when_true: Box::new(inner),
                     when_false: Box::new(BoundExpr {
-                        kind: BoundExprKind::Literal(Literal::Boolean(true)),
+                        kind: BoundExprKind::Literal(Literal::Boolean(is_equal)),
                         ty: boolean.clone(),
                     }),
                 },
                 ty: boolean.clone(),
             };
-            let equal = BoundExpr {
+            BoundExpr {
                 kind: BoundExprKind::Conditional {
                     condition: Box::new(same_presence),
                     when_true: Box::new(when_present),
                     when_false: Box::new(BoundExpr {
-                        kind: BoundExprKind::Literal(Literal::Boolean(false)),
+                        kind: BoundExprKind::Literal(Literal::Boolean(!is_equal)),
                         ty: boolean.clone(),
                     }),
                 },
                 ty: boolean.clone(),
-            };
-            if operator == Op::NotEqual {
-                BoundExpr {
-                    kind: BoundExprKind::Unary {
-                        operator: UnaryOperator::Not,
-                        operand: Box::new(equal),
-                        checked: false,
-                    },
-                    ty: boolean.clone(),
-                }
-            } else {
-                equal
             }
         } else if comparison {
             let same_presence = match <[BoundExpr; 2]>::try_from(presence) {
@@ -11144,9 +12043,22 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 equal
             }
         } else if relational {
-            presence.into_iter().fold(inner, |combined, term| {
+            // Operands have already been captured above. Only their presence tests are eager
+            // here: a user operator must not run on a default value substituted for null.
+            let condition = presence.into_iter().reduce(|combined, term| {
                 self.binary_node(Op::BitwiseAnd, combined, term, boolean.clone())
-            })
+            })?;
+            BoundExpr {
+                kind: BoundExprKind::Conditional {
+                    condition: Box::new(condition),
+                    when_true: Box::new(inner),
+                    when_false: Box::new(BoundExpr {
+                        kind: BoundExprKind::Literal(Literal::Boolean(false)),
+                        ty: boolean.clone(),
+                    }),
+                },
+                ty: boolean.clone(),
+            }
         } else {
             let result_ty = self.nullable_of(&underlying_result);
             let condition = presence
@@ -11177,6 +12089,97 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 value: Box::new(value),
             },
             ty,
+        })
+    }
+
+    /// The nullable Boolean tables (ECMA-334 fourth edition 14.10.4). A present false decides
+    /// `&`, a true decides `|`; otherwise two present operands give the other Boolean value,
+    /// and any missing operand gives null. Both operands are evaluated before any decision.
+    fn bind_nullable_boolean(
+        &mut self,
+        operator: BinaryOperator,
+        left: BoundExpr,
+        right: BoundExpr,
+        span: Span,
+    ) -> Option<BoundExpr> {
+        use BinaryOperator as Op;
+        let boolean = TypeSymbol::Special(SpecialType::Boolean);
+        let result_ty = self.nullable_of(&boolean);
+        let literal = |value| BoundExpr {
+            kind: BoundExprKind::Literal(Literal::Boolean(value)),
+            ty: boolean.clone(),
+        };
+        let conditional = |condition, when_true, when_false| BoundExpr {
+            kind: BoundExprKind::Conditional {
+                condition: Box::new(condition),
+                when_true: Box::new(when_true),
+                when_false: Box::new(when_false),
+            },
+            ty: result_ty.clone(),
+        };
+        let left_temp = BoundExpr {
+            kind: BoundExprKind::Temp(0),
+            ty: left.ty.clone(),
+        };
+        let right_temp = BoundExpr {
+            kind: BoundExprKind::Temp(1),
+            ty: right.ty.clone(),
+        };
+        let left_value = self.nullable_value(left_temp.clone(), span)?;
+        let right_value = self.nullable_value(right_temp.clone(), span)?;
+        let mut presence = |operand: BoundExpr| {
+            if crate::conversion::nullable_underlying(&operand.ty).is_some() {
+                let term = self.member_access_of(operand, "HasValue", span);
+                if term.ty.is_error() {
+                    None
+                } else {
+                    Some(term)
+                }
+            } else {
+                Some(literal(true))
+            }
+        };
+        let left_has = presence(left_temp)?;
+        let right_has = presence(right_temp)?;
+        let both = self.binary_node(
+            Op::BitwiseAnd,
+            left_has.clone(),
+            right_has.clone(),
+            boolean.clone(),
+        );
+        let is_or = operator == Op::BitwiseOr;
+        let decisive = if is_or {
+            self.binary_node(Op::BitwiseOr, left_value, right_value, boolean.clone())
+        } else {
+            // GetValueOrDefault returns false for null too; only a PRESENT false decides `&`.
+            let left_false =
+                self.binary_node(Op::Equal, left_value, literal(false), boolean.clone());
+            let right_false =
+                self.binary_node(Op::Equal, right_value, literal(false), boolean.clone());
+            let left_decides =
+                self.binary_node(Op::BitwiseAnd, left_has, left_false, boolean.clone());
+            let right_decides =
+                self.binary_node(Op::BitwiseAnd, right_has, right_false, boolean.clone());
+            self.binary_node(Op::BitwiseOr, left_decides, right_decides, boolean.clone())
+        };
+        let value = conditional(
+            decisive,
+            self.convert(literal(is_or), &result_ty),
+            conditional(
+                both,
+                self.convert(literal(!is_or), &result_ty),
+                BoundExpr {
+                    kind: BoundExprKind::DefaultValue(result_ty.clone()),
+                    ty: result_ty.clone(),
+                },
+            ),
+        );
+        Some(BoundExpr {
+            kind: BoundExprKind::Sequence {
+                spilled: alloc::vec![left, right],
+                value: Box::new(value),
+            },
+            ty: result_ty,
         })
     }
 
@@ -11225,6 +12228,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let zero = BoundExpr {
             kind: BoundExprKind::Literal(Literal::Integer {
                 value: 0,
+                decimal: false,
                 suffix: if matches!(ty, TypeSymbol::Special(SpecialType::Int64)) {
                     IntegerSuffix::Long
                 } else {
@@ -11392,9 +12396,14 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         method: MethodReference,
         span: Span,
     ) -> BoundExpr {
+        let decimal_to_integral = is_decimal(&operand.ty)
+            && is_decimal(&method.declaring_type)
+            && matches!(&target, TypeSymbol::Special(special) if special.is_integral());
         let parameter = &method.parameters[0];
-        let argument = if converts(&self.model, &operand.ty, parameter) {
-            self.convert(operand, parameter)
+        let argument = if self.standard_implicit_conversion(&operand.ty, parameter)
+            || self.implicit_constant_conversion(&operand, parameter)
+        {
+            self.convert_implicit(operand, parameter, false)
         } else {
             self.bind_cast(operand, parameter.clone(), span)
         };
@@ -11406,8 +12415,17 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 method: Some(method),
             },
         };
-        if call.ty == target {
-            call
+        if self.standard_implicit_conversion(&call.ty, &target) {
+            self.convert_implicit(call, &target, false)
+        } else if decimal_to_integral {
+            // The predefined conversion from decimal to an integral type throws OverflowException
+            // for a value outside the target's range in every context (13.2.1), and the operator
+            // range-checks only its own return type, so the narrowing after it is checked whatever
+            // the context. Only this one cast: the operand was bound before, in its own context.
+            let context = core::mem::replace(&mut self.checked_context, true);
+            let narrowed = self.bind_cast(call, target, span);
+            self.checked_context = context;
+            narrowed
         } else {
             self.bind_cast(call, target, span)
         }
@@ -11418,6 +12436,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// bind its second step with the same rules as the first.
     pub(crate) fn bind_cast(&mut self, operand: BoundExpr, ty: TypeSymbol, span: Span) -> BoundExpr {
         if matches!(operand.kind, BoundExprKind::MethodGroup { .. }) && !ty.is_error() {
+            if self.is_delegate_type(&ty) {
+                self.check_assignable(&operand, &ty, span);
+                return self.bind_delegate_creation(&ty, &[operand], span);
+            }
             let candidates: Vec<(Box<str>, MethodSymbol)> = self
                 .type_info_of(&ty)
                 .map(|info| {
@@ -11469,6 +12491,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     };
                 }
             }
+            self.report(Diagnostic::new(DiagnosticKind::CannotCast {
+                from: "method group".into(), to: ty.to_string().into(),
+            }, span));
+            return error_expr();
         }
         if !operand.ty.is_error() && !ty.is_error() {
             // Predefined nullable casts precede operator lookup: Nullable<T>'s
@@ -11512,15 +12538,34 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             if matches!(ty, TypeSymbol::Special(SpecialType::Decimal))
                 != matches!(operand.ty, TypeSymbol::Special(SpecialType::Decimal))
             {
-                if let Some(method) = self
-                    .user_conversion(&operand.ty, &ty, "op_Implicit")
+                let predefined = if matches!(ty, TypeSymbol::Special(SpecialType::Decimal)) {
+                    self.predefined_decimal_operator(&operand.ty)
+                } else {
+                    None
+                };
+                if let Some(method) = predefined
+                    .or_else(|| self.user_conversion(&operand.ty, &ty, "op_Implicit"))
                     .or_else(|| self.user_conversion(&operand.ty, &ty, "op_Explicit"))
                 {
                     return self.bind_user_cast(operand, ty, method, span);
                 }
             }
+            // Predefined enum-to-native casts operate on the underlying integral
+            // value. Enumeration conversions remain excluded from user-defined
+            // operator prefixes.
+            if self.language_version() >= LanguageVersion::CSharp8
+                && matches!(&ty, TypeSymbol::Named(parts)
+                    if parts.len() == 2 && &*parts[0] == "System"
+                        && matches!(&*parts[1], "IntPtr" | "UIntPtr"))
+            {
+                if let Some(underlying) = self.enum_underlying_type(&operand.ty) {
+                    let mut as_underlying = operand;
+                    as_underlying.ty = underlying;
+                    return self.bind_cast(as_underlying, ty, span);
+                }
+            }
             // Casts consider implicit and explicit operators in one candidate set.
-            match self.find_user_conversion(&operand.ty, &ty, "op_Explicit", true) {
+            match self.find_user_conversion(&operand.ty, &ty, "op_Explicit", true, Some(&operand)) {
                 Ok(Some(method)) => return self.bind_user_cast(operand, ty, method, span),
                 Ok(None) => {}
                 Err(()) => {
@@ -11532,48 +12577,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                         span,
                     ));
                     return error_expr();
-                }
-            }
-            if let Some(value) = constant_int_value(&operand) {
-                let via = self.type_info_of(&ty).and_then(|info| {
-                    info.methods.iter().find_map(|m| {
-                        ((&*m.name == "op_Explicit" || &*m.name == "op_Implicit")
-                            && m.parameters.len() == 1
-                            && m.return_type == ty
-                            && matches!(
-                                m.parameters.first(),
-                                Some(TypeSymbol::Special(t)) if constant_fits(value, *t)
-                            ))
-                        .then(|| (m.name.clone(), m.clone()))
-                    })
-                });
-                if let Some((op_name, method)) = via {
-                    let param = method.parameters[0].clone();
-                    let argument = self.convert(operand, &param);
-                    let declaring_type =
-                        self.declaring_type_in_chain(&ty, &op_name, &method.parameters);
-                    let declaring_instantiation = self.declaring_instantiation_of(
-                        &declaring_type,
-                        &op_name,
-                        &method.parameters,
-                    );
-                    return BoundExpr {
-                        ty: ty.clone(),
-                        kind: BoundExprKind::Call {
-                            callee: Box::new(error_expr()),
-                            arguments: alloc::vec![argument],
-                            method: Some(MethodReference {
-                                declaring_type,
-                                name: op_name,
-                                parameters: method.parameters,
-                                return_type: method.return_type,
-                                is_static: true,
-                                is_vararg: false,
-                                instantiation: None,
-                                declaring_instantiation,
-                            }),
-                        },
-                    };
                 }
             }
             // 13.2.2's predefined decimal/enum conversion uses the enum's underlying
@@ -11989,7 +12992,13 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         {
             self.check_stack_escape(value, value_expr);
         }
-        let BoundExprKind::Assignment { target, .. } = &bound.kind else {
+        // Receiver captures wrap an assignment in a sequence; they do not change
+        // whether the property can be written.
+        let mut assignment = &bound;
+        while let BoundExprKind::Sequence { value, .. } = &assignment.kind {
+            assignment = value;
+        }
+        let BoundExprKind::Assignment { target, .. } = &assignment.kind else {
             return bound;
         };
         let BoundExprKind::PropertyAccess {
@@ -12038,24 +13047,19 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 field: Some(field),
             },
         };
-        let BoundExprKind::Assignment {
-            operator,
-            value,
-            checked,
-            ..
-        } = bound.kind
-        else {
-            unreachable!("matched as an assignment above")
-        };
-        BoundExpr {
-            ty: bound.ty,
-            kind: BoundExprKind::Assignment {
-                operator,
-                target: Box::new(store),
-                value,
-                checked,
-            },
+        let mut bound = bound;
+        let mut assignment = &mut bound;
+        loop {
+            match &mut assignment.kind {
+                BoundExprKind::Sequence { value, .. } => assignment = value,
+                BoundExprKind::Assignment { target, .. } => {
+                    **target = store;
+                    break;
+                }
+                _ => unreachable!("matched as an assignment above"),
+            }
         }
+        bound
     }
 
     /// The backing field a write to the SETTER-LESS auto-property `name` lowers to, or `None` when
@@ -12089,7 +13093,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             .type_info_of(declaring)?
             .find_property(name)
             .map(|property| property.is_static)?;
-        let in_constructor = matches!(&*context.name, ".ctor" | ".cctor");
+        // A nested function has its own write context even when declared in a constructor.
+        let in_constructor = matches!(&*context.name, ".ctor" | ".cctor")
+            && self.lambda_frames.is_empty();
         let permitted = if is_static {
             in_constructor && context.is_static
         } else {
@@ -12317,6 +13323,39 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
         if !target.ty.is_error() && !value.ty.is_error() {
             if let Some(binary_op) = compound_binary_operator(operator) {
+                // Nullable Boolean compounds use the three-valued &/| tables or lifted XOR.
+                // Capture the receiver/indices before reading the target and evaluating the RHS.
+                if nullable_boolean_compound(binary_op, &target.ty, &value) {
+                    // This lowering returns before the ordinary assignment checks below.
+                    // A computed value or readonly reference cannot be its destination.
+                    if !target_is_variable {
+                        return error_expr();
+                    }
+                    let this_in_struct = matches!(target.kind, BoundExprKind::This)
+                        && self.is_value_type(&target.ty);
+                    if (!is_lvalue(&target) || self.writes_through_readonly_ref(&target))
+                        && !this_in_struct
+                    {
+                        self.report(Diagnostic::new(DiagnosticKind::NotAssignable, target_span));
+                        return error_expr();
+                    }
+                    let mut spilled = Vec::new();
+                    let destination = self.capture_compound_target(target.clone(), &mut spilled);
+                    if let Some(binary) =
+                        self.bind_lifted_binary(binary_op, destination.clone(), value.clone(), span)
+                    {
+                        let assignment = BoundExpr {
+                            ty: destination.ty.clone(),
+                            kind: BoundExprKind::Assignment {
+                                operator: AssignmentOperator::Assign,
+                                target: Box::new(destination),
+                                value: Box::new(binary),
+                                checked: self.checked_context,
+                            },
+                        };
+                        return Self::spilling(assignment, spilled);
+                    }
+                }
                 if self.user_operator_first(binary_op, &target.ty, &value.ty) {
                     if let Some(assignment) =
                         self.bind_user_compound_assignment(binary_op, &target, &value, span)
@@ -12705,7 +13744,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// namespaces in scope (including a nested type of the current type) -- if any. Used for the
     /// color-color rule (7.6.4.1), where a name is both a value and a type of the same type.
     fn simple_name_as_type(&self, id: &str) -> Option<TypeSymbol> {
-        if let Some(target) = self.alias_target(id) {
+        if let Some(target) = self.visible_alias_target(id) {
             return Some(target);
         }
         self.type_namespaces_containing(id)
@@ -12815,7 +13854,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     span,
                 );
                 BoundExpr {
-                    ty: field.ty.clone(),
+                    ty: self.field_reference_type(&field),
                     kind: BoundExprKind::FieldAccess {
                         receiver: Box::new(receiver),
                         name: name.into(),
@@ -12869,8 +13908,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             },
             MemberResolution::NoSuchMember(type_name) => {
                 if let BoundExprKind::TypeReference(TypeSymbol::Named(parts)) = &receiver.kind {
-                    let enclosing = parts.join(".");
-                    if self.model.get(&enclosing, name).is_some() {
+                    if let Some(enclosing) = self.nested_type_scope(&parts.join("."), name) {
                         return self.named_type_reference(
                             type_symbol_in(&enclosing, name),
                             member_name_span(span, name),
@@ -13380,7 +14418,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         // whereas an explicit f.Invoke(args) follows the method-invocation order (14.4.3).
         // The guarded receiver evaluates once and throws NullReferenceException on null;
         // these bound nodes express control flow without admitting newer source syntax.
-        let callee = if self.is_delegate_value(&callee) {
+        let mut callee = if self.is_delegate_value(&callee) {
             let callee = if self.language_version.null_delegate_check_precedes_arguments() {
                 non_null_delegate(callee)
             } else {
@@ -13450,34 +14488,43 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let names: Vec<Option<(&str, Span)>> = argument_names(argument_exprs);
         let resolved = match group {
             Some((receiver_ty, name)) if !real_error => {
-                let gather_constants: Vec<Option<i64>> =
-                    arguments.iter().map(constant_int_value).collect();
-                let candidates = self.most_derived_candidates(
-                    &receiver_ty,
-                    &name,
-                    &argument_types,
-                    &gather_constants,
-                    &names,
-                );
-                let set = self.candidates_for_type_arguments(
-                    &candidates,
-                    &type_arguments,
-                    &argument_types,
-                    &receiver_ty,
-                    span,
-                );
+                let gather_constants: Vec<ArgumentConstant> =
+                    arguments.iter().map(|value| self.argument_constant(value)).collect();
+                let set = if has_method_group {
+                    self.candidates_for_method_group_call(
+                        &receiver_ty, &name, &type_arguments, &argument_types, &arguments,
+                        &names, &inferred_out, span,
+                    )
+                } else {
+                    let candidates = self.most_derived_candidates(
+                        &receiver_ty,
+                        &name,
+                        &argument_types,
+                        &gather_constants,
+                        &names,
+                    );
+                    self.candidates_for_type_arguments(
+                        &candidates,
+                        &type_arguments,
+                        &argument_types,
+                        &names,
+                        &receiver_ty,
+                        span,
+                    )
+                };
                 let chosen = if has_method_group {
                     self.resolve_with_method_groups(
                         &name,
                         &receiver_ty,
                         &set.candidates,
                         &arguments,
+                        &names,
                         &inferred_out,
                         span,
                     )
                 } else if !inferred_out.is_empty() {
-                    let arg_constants: Vec<Option<i64>> =
-                        arguments.iter().map(constant_int_value).collect();
+                    let arg_constants: Vec<ArgumentConstant> =
+                        arguments.iter().map(|value| self.argument_constant(value)).collect();
                     self.resolve_call_with_inferred_out(
                         &name,
                         &receiver_ty,
@@ -13490,8 +14537,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                         span,
                     )
                 } else {
-                    let arg_constants: Vec<Option<i64>> =
-                        arguments.iter().map(constant_int_value).collect();
+                    let arg_constants: Vec<ArgumentConstant> =
+                        arguments.iter().map(|value| self.argument_constant(value)).collect();
                     self.resolve_call_or_uninferable(
                         &name,
                         &receiver_ty,
@@ -13594,27 +14641,17 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             self.report_target_typed_arguments(argument_exprs, &arguments);
         }
         let mut arguments = arguments;
-        let mut spilled: Vec<BoundExpr> = Vec::new();
-        let mut inferred_out = inferred_out;
-        if let Some(fill) = named_fill.as_ref() {
-            omitted.clear();
-            inferred_out = fill
-                .iter()
-                .enumerate()
-                .filter_map(|(parameter, slot)| match slot {
-                    NamedSlot::Argument(index) if inferred_out.contains(index) => Some(parameter),
-                    _ => None,
-                })
-                .collect();
-            let (ordered, operands) =
-                self.apply_named_slots(fill, core::mem::take(&mut arguments));
-            arguments = ordered;
-            spilled = operands;
-        }
         if let Some(method) = resolved.as_ref() {
             for &index in &inferred_out {
+                // Type the original local before its address is stored in a temporary.
+                let parameter = match &named_fill {
+                    Some(fill) => fill.iter().position(|slot| {
+                        matches!(slot, NamedSlot::Argument(source) if *source == index)
+                    }),
+                    None => Some(index),
+                };
                 let (Some(parameter), Some(argument)) =
-                    (method.parameters.get(index), arguments.get_mut(index))
+                    (parameter.and_then(|slot| method.parameters.get(slot)), arguments.get_mut(index))
                 else {
                     continue;
                 };
@@ -13631,6 +14668,23 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 }
                 argument.ty = declared;
             }
+        }
+        let mut spilled = Vec::new();
+        if let (Some(fill), Some(method)) = (named_fill.as_ref(), resolved.as_ref()) {
+            omitted.clear();
+            if Self::slots_move(fill) && !method.is_static
+                && let BoundExprKind::MethodGroup { receiver, .. } = &mut callee.kind
+            {
+                let original = core::mem::replace(&mut **receiver, error_expr());
+                **receiver = self.spill_named_receiver(original, &mut spilled);
+            }
+            (arguments, spilled) = self.apply_named_slots(
+                fill,
+                arguments,
+                &method.parameters,
+                params_method,
+                spilled,
+            );
         }
         for (parameter_ty, literal) in core::mem::take(&mut omitted) {
             let filled = self.default_argument(&parameter_ty, &literal);
@@ -13902,64 +14956,130 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         self.tuple_element(rest, index - TUPLE_CHUNK, span)
     }
 
-    /// A named call's arguments in the order the method takes them, and the operands the caller
-    /// must spill to keep the order they are EVALUATED in.
-    ///
-    /// **TWO ORDERS ARE IN PLAY AND THEY ARE NOT THE SAME ONE.** C# evaluates arguments in the
-    /// order they are WRITTEN and passes them in the order the parameters are DECLARED (12.6.2.3),
-    /// so `M(b: F(), a: G())` calls `F` before `G` and still passes `G` first. When the mapping
-    /// MOVES anything, each argument is replaced by a [`BoundExprKind::Temp`] and the originals are
-    /// returned for the caller to wrap the node in a [`BoundExprKind::Sequence`] with -- which
-    /// evaluates them left to right, exactly once each, before the value.
-    ///
-    /// A mapping that moves nothing -- `M(a: 1, b: 2)`, or names that fill optionals in order --
-    /// returns no spill, and the node built from it is the one the call would have had unnamed.
+    /// Places named arguments in parameter order, preserving their evaluation order in a sequence.
+    /// Each expression converts to its corresponding parameter type before it is stored: the
+    /// conversion is part of that argument's evaluation (12.6.2.3), and constant expressions,
+    /// method groups and target-typed expressions need their original form to convert.
+    /// The caller supplies any receiver spill first. A mapping that moves nothing adds no spill.
     fn apply_named_slots(
         &mut self,
         fill: &[NamedSlot],
         mut source: Vec<BoundExpr>,
+        parameters: &[TypeSymbol],
+        is_params: bool,
+        mut spilled: Vec<BoundExpr>,
     ) -> (Vec<BoundExpr>, Vec<BoundExpr>) {
         if !Self::slots_move(fill) {
-            return (self.place_named_slots(fill, source), Vec::new());
+            return (self.place_named_slots(fill, source), spilled);
         }
-        let mut spilled: Vec<BoundExpr> = Vec::new();
-        let mut slots: Vec<Option<u32>> = Vec::with_capacity(source.len());
+        let fixed = parameters.len().saturating_sub(1);
+        let expanded_element = if is_params
+            && let Some(array @ TypeSymbol::Array { element, .. }) = parameters.last()
+            && !(fill.len() == parameters.len()
+                && matches!(fill.get(fixed), Some(NamedSlot::Argument(index))
+                    if self.assignable(&source[*index], array)))
+        {
+            Some(&**element)
+        } else {
+            None
+        };
+        for (parameter, slot) in fill.iter().enumerate() {
+            let NamedSlot::Argument(index) = slot else {
+                continue;
+            };
+            let target = if parameter >= fixed && expanded_element.is_some() {
+                expanded_element
+            } else {
+                parameters.get(parameter)
+            };
+            if let Some(target) = target {
+                let argument = core::mem::replace(&mut source[*index], error_expr());
+                source[*index] = self.convert(argument, target);
+            }
+        }
         for argument in &mut source {
-            if matches!(argument.kind, BoundExprKind::Ref { .. })
-                || is_default_literal_marker(&argument.ty)
+            // An unconverted null or default marker has no local type and remains at the
+            // call site if resolution did not supply one. Ref/out operands store addresses.
+            if is_default_literal_marker(&argument.ty)
+                || argument.ty == TypeSymbol::Special(SpecialType::Null)
             {
-                slots.push(None);
                 continue;
             }
-            slots.push(Some(spilled.len() as u32));
-            spilled.push(core::mem::replace(
-                argument,
-                BoundExpr {
-                    kind: BoundExprKind::Error,
-                    ty: TypeSymbol::Error,
-                },
-            ));
+            let value = core::mem::replace(argument, error_expr());
+            *argument = Self::spill_named_operand(value, &mut spilled);
         }
-        let mut ordered = Vec::with_capacity(fill.len());
-        for slot in fill {
-            ordered.push(match slot {
-                NamedSlot::Argument(index) => match slots[*index] {
-                    Some(temp) => BoundExpr {
-                        ty: spilled[temp as usize].ty.clone(),
-                        kind: BoundExprKind::Temp(temp),
-                    },
-                    None => core::mem::replace(
-                        &mut source[*index],
-                        BoundExpr {
-                            kind: BoundExprKind::Error,
-                            ty: TypeSymbol::Error,
-                        },
-                    ),
+        (self.place_named_slots(fill, source), spilled)
+    }
+
+    /// Stores a value or managed address once, keeping a by-reference argument's mode
+    /// and referent type on its use at the call site.
+    fn spill_named_operand(value: BoundExpr, spilled: &mut Vec<BoundExpr>) -> BoundExpr {
+        let ty = value.ty.clone();
+        let byref = match &value.kind {
+            BoundExprKind::Ref { out, .. } => Some(*out),
+            _ => None,
+        };
+        let temp = BoundExpr {
+            kind: BoundExprKind::Temp(spilled.len() as u32),
+            ty: if byref.is_some() { TypeSymbol::ByRef(Box::new(ty.clone())) } else { ty.clone() },
+        };
+        spilled.push(value);
+        match byref {
+            Some(out) => BoundExpr {
+                ty: ty.clone(),
+                kind: BoundExprKind::Ref {
+                    out,
+                    operand: Box::new(BoundExpr {
+                        ty,
+                        kind: BoundExprKind::Dereference { operand: Box::new(temp) },
+                    }),
                 },
-                NamedSlot::Default(ty, literal) => self.default_argument(ty, literal),
-            });
+            },
+            None => temp,
         }
-        (ordered, spilled)
+    }
+
+    /// Evaluates an instance before its arguments. Writable storage keeps its address when
+    /// the receiver is a value type or a type parameter that can denote one. Known reference
+    /// types, readonly fields and rvalues keep their values.
+    fn spill_named_receiver(&self, receiver: BoundExpr, spilled: &mut Vec<BoundExpr>) -> BoundExpr {
+        if matches!(receiver.kind, BoundExprKind::This | BoundExprKind::Base) {
+            return receiver;
+        }
+        let can_be_value_type = self.satisfies_value_type_constraint(&receiver.ty)
+            || (self.is_bare_type_parameter(&receiver.ty)
+                && !self.known_to_be_reference_type(&receiver.ty));
+        if can_be_value_type && self.names_writable_storage(&receiver) {
+            let ty = receiver.ty.clone();
+            let stored = Self::spill_named_operand(BoundExpr {
+                ty,
+                kind: BoundExprKind::Ref { out: false, operand: Box::new(receiver) },
+            }, spilled);
+            let BoundExprKind::Ref { operand, .. } = stored.kind else { unreachable!() };
+            *operand
+        } else {
+            Self::spill_named_operand(receiver, spilled)
+        }
+    }
+
+    /// Captures the location a lowered compound assignment reads and writes. A variable keeps
+    /// its address, including a field in a struct array element or ref-returned struct. A property
+    /// keeps its receiver: a struct variable by address, and a reference-type receiver by value.
+    fn capture_compound_target(&self, mut target: BoundExpr, spilled: &mut Vec<BoundExpr>) -> BoundExpr {
+        if let BoundExprKind::PropertyAccess { receiver, .. } = &mut target.kind {
+            if !matches!(receiver.kind, BoundExprKind::TypeReference(_)) {
+                let original = core::mem::replace(&mut **receiver, error_expr());
+                **receiver = self.spill_named_receiver(original, spilled);
+            }
+        } else if self.names_writable_storage(&target) {
+            let stored = Self::spill_named_operand(BoundExpr {
+                ty: target.ty.clone(),
+                kind: BoundExprKind::Ref { out: false, operand: Box::new(target) },
+            }, spilled);
+            let BoundExprKind::Ref { operand, .. } = stored.kind else { unreachable!() };
+            return *operand;
+        }
+        target
     }
 
     /// Whether the mapping actually moves anything. `M(a: 1, b: 2)` -- or names that fill optionals
@@ -13970,13 +15090,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         })
     }
 
-    /// The arguments in parameter order with NO temporaries: the expressions themselves move.
-    ///
-    /// **FOR THE ONE POSITION THAT HAS NOWHERE TO HANG A SEQUENCE.** A `: base(...)` / `: this(...)`
-    /// chain is not an expression -- it emits as arguments then a `call` -- so a chain whose names
-    /// permute the list evaluates them in PARAMETER order where 12.6.2.3 asks for source order.
-    /// Which value reaches which parameter is right either way; only the order two side-effecting
-    /// arguments run in can differ. Asserted as a gate row rather than left to be discovered.
+    /// Places already evaluated operands in parameter order and supplies omitted defaults.
     fn place_named_slots(&mut self, fill: &[NamedSlot], source: Vec<BoundExpr>) -> Vec<BoundExpr> {
         let mut source: Vec<Option<BoundExpr>> = source.into_iter().map(Some).collect();
         fill.iter()
@@ -14042,7 +15156,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let param_count = method.parameters.len();
         let fixed = param_count.saturating_sub(1);
         let array_ty = method.parameters[fixed].clone();
-        if arguments.len() == param_count && self.converts(&arguments[fixed].ty, &array_ty) {
+        // Normal form requires an implicit conversion from the expression to the array type,
+        // including a default literal or an expression whose arms have no common type.
+        if arguments.len() == param_count && self.assignable(&arguments[fixed], &array_ty) {
             return arguments
                 .into_iter()
                 .zip(method.parameters.iter())
@@ -14259,11 +15375,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         candidates: &[MethodSymbol],
         type_arguments: &[TypeSymbol],
         argument_types: &[TypeSymbol],
+        names: &[Option<(&str, Span)>],
         receiver_ty: &TypeSymbol,
         span: Span,
     ) -> CandidateSet {
         if type_arguments.is_empty() {
-            return self.candidates_by_inference(candidates, argument_types, receiver_ty, span);
+            return self.candidates_by_inference(candidates, argument_types, names, receiver_ty, span);
         }
         if type_arguments.iter().any(TypeSymbol::is_error) {
             return CandidateSet::default();
@@ -14329,6 +15446,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         &mut self,
         candidates: &[MethodSymbol],
         argument_types: &[TypeSymbol],
+        names: &[Option<(&str, Span)>],
         receiver_ty: &TypeSymbol,
         span: Span,
     ) -> CandidateSet {
@@ -14339,12 +15457,25 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 set.origins.push(None);
                 continue;
             }
-            let inferred =
+            let mapping = names
+                .iter()
+                .any(Option::is_some)
+                .then(|| map_arguments(candidate, names))
+                .flatten();
+            let inferred = if let Some(filled) = &mapping {
+                infer_named_type_arguments(&self.model, candidate, argument_types, filled)
+            } else {
+                // Invalid names still reach the ordinary argument diagnostics when positional
+                // inference can close the candidate. Applicability rejects their failed mapping.
                 infer_method_type_arguments(&self.model, candidate, argument_types).or_else(|| {
                     infer_expanded_type_arguments(&self.model, candidate, argument_types)
-                });
+                })
+            };
             let Some(arguments) = inferred else {
-                if candidate.parameters.len() == argument_types.len() {
+                // A valid named mapping can omit optional parameters without providing enough
+                // information to infer every type argument. Keep that failure for CS0411, just
+                // as for an uninferable positional call with the declared argument count.
+                if candidate.parameters.len() == argument_types.len() || mapping.is_some() {
                     set.uninferable.push(candidate.clone());
                 }
                 continue;
@@ -14364,7 +15495,6 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 arguments,
             }));
         }
-        set.apply_identical_signature_tie_break();
         set
     }
 
@@ -14376,12 +15506,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// arguments for exactly the calls inference exists to serve. Each candidate carries the
     /// arguments it was closed over, whichever way they arose.
     ///
-    /// **A tie yields `None` rather than a guess.** Two generic overloads that close to the SAME
-    /// signature (`void M<T>(T)` and `void M<T>(int)` at `M<int>(1)`) are already ambiguous to
-    /// overload resolution, and their DEFINITIONS differ -- `(!!0)` against `(int32)` -- so picking
-    /// either would name the wrong `MethodDef` in the row. Emission then refuses the call, which is
-    /// the outcome an unresolvable call should have anyway. Ties that 14.4.2.2 DOES settle never
-    /// reach here: [`CandidateSet::apply_identical_signature_tie_break`] removed the loser.
+    /// A closed candidate retains its uninstantiated parameter types, so two definitions can be
+    /// distinguished even when their substituted signatures match. If more than one origin
+    /// still matches the selected candidate, this returns `None` rather than guessing a token.
     fn instantiation_of(
         chosen: &MethodSymbol,
         set: &CandidateSet,
@@ -14421,14 +15548,21 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         declaring: &TypeSymbol,
         set: &CandidateSet,
         argument_types: &[TypeSymbol],
-        arg_constants: &[Option<i64>],
+        arg_constants: &[ArgumentConstant],
         names: &[Option<(&str, Span)>],
         arguments: &[BoundExpr],
         span: Span,
     ) -> Option<MethodSymbol> {
         if !set.uninferable.is_empty()
             && matches!(
-                resolve_overload(&self.model, &set.candidates, argument_types, arg_constants, names),
+                resolve_overload(
+                    &self.model,
+                    &set.candidates,
+                    argument_types,
+                    arg_constants,
+                    names,
+                    self.language_version,
+                ),
                 OverloadResult::WrongArgumentCount
             )
         {
@@ -14474,7 +15608,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         declaring: &TypeSymbol,
         candidates: &[MethodSymbol],
         argument_types: &[TypeSymbol],
-        arg_constants: &[Option<i64>],
+        arg_constants: &[ArgumentConstant],
         names: &[Option<(&str, Span)>],
         arguments: &[BoundExpr],
         inferred: &[usize],
@@ -14507,7 +15641,14 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let mut winners: Vec<MethodSymbol> = Vec::new();
         for fill in &fills {
             if let OverloadResult::Resolved(method) =
-                resolve_overload(&self.model, candidates, &filled_types(fill), arg_constants, names)
+                resolve_overload(
+                    &self.model,
+                    candidates,
+                    &filled_types(fill),
+                    arg_constants,
+                    names,
+                    self.language_version,
+                )
             {
                 if !winners
                     .iter()
@@ -14554,20 +15695,54 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
     }
 
+    /// Validates supplied conversions after selecting a call, in source argument order.
+    fn check_call_conversions(
+        &mut self,
+        method: &MethodSymbol,
+        argument_types: &[TypeSymbol],
+        arg_constants: &[ArgumentConstant],
+        names: &[Option<(&str, Span)>],
+        arguments: &[BoundExpr],
+        span: Span,
+    ) {
+        let judged = if names.iter().any(Option::is_some) {
+            let Some((types, constants)) = reorder_for(method, argument_types, arg_constants, names) else {
+                return;
+            };
+            Judged::named(&self.model, method, &types, &constants, names, self.language_version)
+        } else {
+            Judged::positional(&self.model, method, argument_types, arg_constants, self.language_version)
+        };
+        for (argument, target) in arguments.iter().zip(&judged.types) {
+            if !matches!(target, TypeSymbol::ByRef(_))
+                && !matches!(argument.kind, BoundExprKind::MethodGroup { .. })
+            {
+                self.check_assignable(argument, target, span);
+            }
+        }
+    }
+
     fn resolve_call(
         &mut self,
         name: &str,
         declaring: &TypeSymbol,
         candidates: &[MethodSymbol],
         argument_types: &[TypeSymbol],
-        arg_constants: &[Option<i64>],
+        arg_constants: &[ArgumentConstant],
         names: &[Option<(&str, Span)>],
         written: usize,
         arguments: &[BoundExpr],
         span: Span,
     ) -> Option<MethodSymbol> {
         let resolution =
-            resolve_overload(&self.model, candidates, argument_types, arg_constants, names);
+            resolve_overload(
+                &self.model,
+                candidates,
+                argument_types,
+                arg_constants,
+                names,
+                self.language_version,
+            );
         if names.iter().any(Option::is_some) {
             let judged = match &resolution {
                 OverloadResult::Resolved(method) => Some(method),
@@ -14600,6 +15775,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
         match resolution {
             OverloadResult::Resolved(method) => {
+                self.check_call_conversions(&method, argument_types, arg_constants, names, arguments, span);
                 let declaring_type = self.declaring_type_in_chain(declaring, name, &method.parameters);
                 self.check_accessible(&declaring_type, method.accessibility, name, span);
                 Some(method)
@@ -14671,89 +15847,57 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
     }
 
-    /// Resolves a call/constructor whose arguments include a method group (which has no
-    /// type on its own, so it is excluded from the type-based [`resolve_call`]). A candidate
-    /// applies when its parameter count matches, each ordinary argument is assignable to its
-    /// parameter, and each method-group argument's parameter is a DELEGATE type -- the group
-    /// converts to it (15.4), and `convert` builds the delegate at the call site. Returns the
-    /// unique applicable method (reporting CS0122 if inaccessible, CS0121 if two apply),
-    /// else `None`.
-    /// Whether a method-group argument is applicable to a parameter (15.4): the parameter must be a
-    /// delegate type and the group must contain a candidate whose signature exactly matches the
-    /// delegate's `Invoke` (parameters + return), the same test `bind_delegate_creation` applies.
-    /// Without it a `void()` group looks applicable to EVERY delegate parameter, so overloads like
-    /// `F(D0)`/`F(D1)` both match and the call is falsely reported ambiguous (CS0121).
-    fn method_group_matches_delegate(&self, argument: &BoundExpr, parameter: &TypeSymbol) -> bool {
-        let BoundExprKind::MethodGroup { receiver, name } = &argument.kind else {
-            return false;
-        };
-        let Some(invoke) = self.type_info_of(parameter).and_then(|info| {
-            if info.kind == TypeKind::Delegate {
-                info.methods.iter().find(|m| &*m.name == "Invoke").cloned()
-            } else {
-                None
-            }
-        }) else {
-            return false;
-        };
-        self.methods_in_chain(&receiver.ty, name)
-            .iter()
-            .any(|candidate| {
-                candidate.parameters == invoke.parameters
-                    && candidate.return_type == invoke.return_type
-            })
-    }
-
     /// `inferred` names the argument positions holding an IMPLICITLY TYPED out variable
     /// (`M(out var a)`), whose type is whatever the winning candidate's parameter says. Such a
     /// position constrains the candidate only in being by-reference, so it matches any `out`/`ref`
     /// parameter and nothing else -- which is the same relaxation a method-group argument already
     /// gets here, and the reason this path exists rather than the type-driven one.
+    /// [`MethodSymbol::accepts_argument_count`] as this compilation's version reads it: below C# 4 a
+    /// default is not filled (2nd edition 14.4.2.1), wherever the candidate came from.
+    fn accepts_argument_count_at_version(&self, method: &MethodSymbol, count: usize) -> bool {
+        if self.language_version.supports(Feature::DefaultParameterValues) {
+            method.accepts_argument_count(count)
+        } else {
+            method.without_defaults().accepts_argument_count(count)
+        }
+    }
+
     fn resolve_with_method_groups(
         &mut self,
         name: &str,
         declaring: &TypeSymbol,
         candidates: &[MethodSymbol],
         arguments: &[BoundExpr],
+        names: &[Option<(&str, Span)>],
         inferred: &[usize],
         span: Span,
     ) -> Option<MethodSymbol> {
-        let applicable: Vec<MethodSymbol> = candidates
-            .iter()
-            .filter(|candidate| {
-                candidate.accepts_argument_count(arguments.len())
-                    && arguments.iter().zip(&candidate.parameters).enumerate().all(
-                        |(index, (argument, parameter))| {
-                            if inferred.contains(&index) {
-                                matches!(parameter, TypeSymbol::ByRef(_))
-                            } else if matches!(argument.kind, BoundExprKind::Ref { .. })
-                                || matches!(parameter, TypeSymbol::ByRef(_))
-                            {
-                                argument_type(argument) == *parameter
-                            } else if matches!(argument.kind, BoundExprKind::MethodGroup { .. }) {
-                                self.method_group_matches_delegate(argument, parameter)
-                            } else {
-                                self.assignable(argument, parameter)
-                            }
-                        },
-                    )
-            })
-            .cloned()
+        let applicable: Vec<Judged<'_>> = candidates.iter()
+            .filter_map(|candidate| self.judge_method_group_call(candidate, arguments, names, inferred))
             .collect();
-        match applicable.as_slice() {
-            [method] => {
-                self.check_accessible(declaring, method.accessibility, name, span);
-                Some(method.clone())
+        let best = applicable.iter().find(|candidate| {
+            applicable.iter().all(|other| {
+                core::ptr::eq(*candidate, other)
+                    || self.better_method_group_call(candidate, other, arguments)
+            })
+        });
+        if let Some(judged) = best {
+            let method = judged.method.clone();
+            for (argument, target) in arguments.iter().zip(&judged.types) {
+                if !matches!(target, TypeSymbol::ByRef(_)) {
+                    self.check_assignable(argument, target, span);
+                }
             }
-            [] => None,
-            _ => {
-                self.diagnostics.push(Diagnostic::new(
-                    DiagnosticKind::AmbiguousCall { method: name.into() },
-                    span,
-                ));
-                None
-            }
+            let declaring_type = self.declaring_type_in_chain(declaring, name, &method.parameters);
+            self.check_accessible(&declaring_type, method.accessibility, name, span);
+            return Some(method);
         }
+        if applicable.is_empty() {
+            self.report_method_group_call_failure(name, declaring, candidates, arguments, names, inferred, span);
+        } else {
+            self.report(Diagnostic::new(DiagnosticKind::AmbiguousCall { method: name.into() }, span));
+        }
+        None
     }
 
     fn bind_element_access(
@@ -14840,12 +15984,14 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// for the resolution, and it is also the truer statement of the rule.
     fn resolve_indexer_accessor(
         &mut self,
-        receiver_ty: &TypeSymbol,
+        receiver: &mut BoundExpr,
         accessor: &str,
         arguments: Vec<BoundExpr>,
         names: &[Option<(&str, Span)>],
         span: Span,
     ) -> Option<(MethodReference, Vec<BoundExpr>, Vec<BoundExpr>)> {
+        let receiver_type = receiver.ty.clone();
+        let receiver_ty = &receiver_type;
         let written = names.len();
         if receiver_ty.is_error() || arguments.iter().any(|argument| argument.ty.is_error()) {
             return None;
@@ -14858,7 +16004,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             return None;
         }
         let argument_types: Vec<TypeSymbol> = arguments.iter().map(argument_type).collect();
-        let arg_constants: Vec<Option<i64>> = arguments.iter().map(constant_int_value).collect();
+        let arg_constants: Vec<ArgumentConstant> = arguments.iter().map(|value| self.argument_constant(value)).collect();
         let index_view = |tier: &Vec<MethodSymbol>| -> Vec<MethodSymbol> {
             if is_setter {
                 tier.iter().map(without_trailing_parameter).collect()
@@ -14871,7 +16017,13 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         } else {
             tiers.iter().position(|tier| {
                 index_view(tier).iter().any(|candidate| {
-                    is_applicable(&self.model, candidate, &argument_types, &arg_constants)
+                    is_applicable_at(
+                        &self.model,
+                        candidate,
+                        &argument_types,
+                        &arg_constants,
+                        self.language_version,
+                    )
                 })
             })
         };
@@ -14902,7 +16054,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         };
         let (arguments, spilled) = match named_slots(&method, names) {
             Some(fill) if names.iter().any(Option::is_some) => {
-                self.apply_named_slots(&fill, arguments)
+                let mut prefix = Vec::new();
+                if Self::slots_move(&fill) {
+                    let original = core::mem::replace(receiver, error_expr());
+                    *receiver = self.spill_named_receiver(original, &mut prefix);
+                }
+                self.apply_named_slots(&fill, arguments, &method.parameters, method.is_params, prefix)
             }
             _ => (arguments, Vec::new()),
         };
@@ -14954,14 +16111,14 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// Binds an indexer READ `obj[args]` as a call to its `get_` accessor (14.5.6.2).
     fn bind_indexer_call(
         &mut self,
-        receiver: BoundExpr,
+        mut receiver: BoundExpr,
         accessor: &str,
         arguments: Vec<BoundExpr>,
         names: &[Option<(&str, Span)>],
         span: Span,
     ) -> Option<BoundExpr> {
         let (method_ref, arguments, spilled) =
-            self.resolve_indexer_accessor(&receiver.ty, accessor, arguments, names, span)?;
+            self.resolve_indexer_accessor(&mut receiver, accessor, arguments, names, span)?;
         let declared = method_ref.return_type.clone();
         let callee = BoundExpr {
             ty: TypeSymbol::Error,
@@ -15045,8 +16202,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
 
         let operand = self.bind_expression(value_expr);
-        let result_ty = binary_result_type(self, binary_op, &current.ty, &operand.ty)?;
-        let combined = self.binary_node(binary_op, current, operand, result_ty);
+        let combined = if nullable_boolean_compound(binary_op, &current.ty, &operand) {
+            self.bind_lifted_binary(binary_op, current, operand, span)?
+        } else {
+            let result_ty = binary_result_type(self, binary_op, &current.ty, &operand.ty)?;
+            self.binary_node(binary_op, current, operand, result_ty)
+        };
 
         let mut store_args = store_indices;
         store_args.push(combined);
@@ -15093,14 +16254,14 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// -- the write is usable as a value (`int y = (a[i] = v)`). `None` when no setter matches.
     fn bind_indexer_store(
         &mut self,
-        receiver: BoundExpr,
+        mut receiver: BoundExpr,
         accessor: &str,
         arguments: Vec<BoundExpr>,
         names: &[Option<(&str, Span)>],
         span: Span,
     ) -> Option<BoundExpr> {
         let (setter, mut arguments, spilled) =
-            self.resolve_indexer_accessor(&receiver.ty, accessor, arguments, names, span)?;
+            self.resolve_indexer_accessor(&mut receiver, accessor, arguments, names, span)?;
         let value = arguments.pop()?;
         let element_ty = value.ty.clone();
         let target = BoundExpr {
@@ -15167,8 +16328,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                                 .iter()
                                 .map(|argument| self.bind_argument_expression(argument))
                                 .collect();
-                            let add =
+                            let resolved_add =
                                 self.resolve_collection_add(target_ty, &arguments, element.span);
+                            let (add, omitted, params_add) = match resolved_add {
+                                Some((add, omitted, params_add)) => (Some(add), omitted, params_add),
+                                None => (None, Vec::new(), false),
+                            };
                             if add.is_some() {
                                 for (written, value) in element.arguments.iter().zip(&arguments) {
                                     if typeless_kind(&value.ty).is_some() {
@@ -15177,18 +16342,26 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                                 }
                             }
                             if let Some(method) = &add {
-                                let parameters = method.parameters.clone();
-                                for (argument, parameter) in
-                                    arguments.iter_mut().zip(parameters.iter())
-                                {
-                                    let taken = core::mem::replace(
-                                        argument,
-                                        BoundExpr {
-                                            kind: BoundExprKind::Literal(Literal::Null),
-                                            ty: TypeSymbol::Special(SpecialType::Null),
-                                        },
-                                    );
-                                    *argument = self.convert(taken, parameter);
+                                for (parameter_ty, literal) in omitted {
+                                    let filled = self.default_argument(&parameter_ty, &literal);
+                                    arguments.push(filled);
+                                }
+                                if params_add {
+                                    arguments = self.bind_params_arguments(method, arguments);
+                                } else {
+                                    let parameters = method.parameters.clone();
+                                    for (argument, parameter) in
+                                        arguments.iter_mut().zip(parameters.iter())
+                                    {
+                                        let taken = core::mem::replace(
+                                            argument,
+                                            BoundExpr {
+                                                kind: BoundExprKind::Literal(Literal::Null),
+                                                ty: TypeSymbol::Special(SpecialType::Null),
+                                            },
+                                        );
+                                        *argument = self.convert(taken, parameter);
+                                    }
                                 }
                             }
                             BoundCollectionElement { arguments, add }
@@ -15221,13 +16394,13 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         target_ty: &TypeSymbol,
         arguments: &[BoundExpr],
         span: Span,
-    ) -> Option<MethodReference> {
-        let candidates = self.methods_in_chain(target_ty, "Add");
+    ) -> Option<(MethodReference, Vec<(TypeSymbol, Literal)>, bool)> {
+        let argument_types: Vec<TypeSymbol> = arguments.iter().map(|a| a.ty.clone()).collect();
+        let constants: Vec<ArgumentConstant> = arguments.iter().map(|value| self.argument_constant(value)).collect();
+        let candidates = self.most_derived_candidates(target_ty, "Add", &argument_types, &constants, &[]);
         if candidates.is_empty() {
             return None;
         }
-        let argument_types: Vec<TypeSymbol> = arguments.iter().map(|a| a.ty.clone()).collect();
-        let constants: Vec<Option<i64>> = arguments.iter().map(constant_int_value).collect();
         let method = self.resolve_call(
             "Add",
             target_ty,
@@ -15239,20 +16412,23 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             arguments,
             span,
         )?;
-        Some(MethodReference {
+        let omitted = method.omitted_defaults(arguments.len());
+        let declaring_type = self.declaring_type_in_chain(target_ty, "Add", &method.parameters);
+        let reference = MethodReference {
             declaring_instantiation: self.declaring_instantiation_of(
-                target_ty,
+                &declaring_type,
                 "Add",
                 &method.parameters,
             ),
-            declaring_type: target_ty.clone(),
+            declaring_type,
             name: method.name.clone(),
             parameters: method.parameters.clone(),
             return_type: method.return_type.clone(),
             is_static: false,
             is_vararg: false,
             instantiation: None,
-        })
+        };
+        Some((reference, omitted, method.is_params))
     }
 
     /// Binds one `name = value`, resolving `name` against `target_ty` and reporting the measured
@@ -15800,14 +16976,15 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                             &target_ty,
                             &candidates,
                             &arguments,
+                            &names,
                             &[],
                             span,
                         )
                     } else {
                         let argument_types: Vec<TypeSymbol> =
                             arguments.iter().map(argument_type).collect();
-                        let arg_constants: Vec<Option<i64>> =
-                            arguments.iter().map(constant_int_value).collect();
+                        let arg_constants: Vec<ArgumentConstant> =
+                            arguments.iter().map(|value| self.argument_constant(value)).collect();
                         self.check_constructor(
                             &target_ty,
                             &accessible,
@@ -15815,6 +16992,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                             &argument_types,
                             &arg_constants,
                             &names,
+                            &arguments,
                             span,
                         )
                     };
@@ -15824,8 +17002,13 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                         if names.iter().any(Option::is_some)
                             && let Some(fill) = named_slots(&chosen, &names)
                         {
-                            let (ordered, operands) =
-                                self.apply_named_slots(&fill, core::mem::take(&mut arguments));
+                            let (ordered, operands) = self.apply_named_slots(
+                                &fill,
+                                core::mem::take(&mut arguments),
+                                &chosen.parameters,
+                                chosen.is_params,
+                                Vec::new(),
+                            );
                             arguments = ordered;
                             ctor_spill = operands;
                         }
@@ -16064,10 +17247,10 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 count: 0,
             },
             [argument] => match &argument.kind {
-                BoundExprKind::MethodGroup { name, .. } => {
-                    DiagnosticKind::NoOverloadMatchesDelegate {
-                        method: name.clone(),
-                        delegate: delegate_ty.to_string().into(),
+                BoundExprKind::MethodGroup { .. } => {
+                    match self.method_group_target(argument, delegate_ty) {
+                        Err(kind) => kind,
+                        Ok(_) => return bound,
                     }
                 }
                 _ if argument.ty.is_error() => return bound,
@@ -16079,9 +17262,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         bound
     }
 
-    /// Binds `new D(methodGroup)`: the method group converts to delegate `D` when a
-    /// method named in it matches `D`'s `Invoke` signature (same parameters and return).
-    /// A static target carries no receiver; an instance target keeps its receiver.
+    /// Lowers a validated method-group conversion using the same target selection
+    /// as assignment and call applicability. A static target carries no receiver;
+    /// an instance target keeps its receiver.
     fn bind_delegate_creation(
         &self,
         delegate_ty: &TypeSymbol,
@@ -16096,26 +17279,14 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             },
             ty: delegate_ty.clone(),
         };
-        let Some(invoke) = self
-            .type_info_of(delegate_ty)
-            .and_then(|info| info.methods.iter().find(|m| &*m.name == "Invoke").cloned())
-        else {
-            return recover;
-        };
-        let [argument] = arguments else {
-            return recover;
-        };
+        let [argument] = arguments else { return recover; };
         let BoundExprKind::MethodGroup { receiver, name } = &argument.kind else {
             return recover;
         };
-        let receiver_ty = receiver.ty.clone();
-        let Some(target) = self
-            .methods_in_chain(&receiver_ty, name)
-            .into_iter()
-            .find(|m| m.parameters == invoke.parameters && m.return_type == invoke.return_type)
-        else {
+        let Ok(target) = self.method_group_target(argument, delegate_ty) else {
             return recover;
         };
+        let receiver_ty = receiver.ty.clone();
         let declaring = self.declaring_type_in_chain(&receiver_ty, name, &target.parameters);
         let bound_receiver = if target.is_static {
             None
@@ -16190,8 +17361,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         accessible: &[MethodSymbol],
         all: &[MethodSymbol],
         argument_types: &[TypeSymbol],
-        arg_constants: &[Option<i64>],
+        arg_constants: &[ArgumentConstant],
         names: &[Option<(&str, Span)>],
+        arguments: &[BoundExpr],
         span: Span,
     ) -> Option<MethodSymbol> {
         let constructors = accessible;
@@ -16201,14 +17373,31 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         {
             return None;
         }
-        let failure =
-            match resolve_overload(&self.model, constructors, argument_types, arg_constants, names) {
-                OverloadResult::Resolved(constructor) => return Some(constructor),
-                failure => failure,
-            };
+        let failure = match resolve_overload(
+            &self.model,
+            constructors,
+            argument_types,
+            arg_constants,
+            names,
+            self.language_version,
+        ) {
+            OverloadResult::Resolved(constructor) => {
+                self.check_call_conversions(
+                    &constructor, argument_types, arg_constants, names, arguments, span,
+                );
+                return Some(constructor);
+            }
+            failure => failure,
+        };
         if accessible.len() != all.len()
-            && let OverloadResult::Resolved(inaccessible) =
-                resolve_overload(&self.model, all, argument_types, arg_constants, names)
+            && let OverloadResult::Resolved(inaccessible) = resolve_overload(
+                &self.model,
+                all,
+                argument_types,
+                arg_constants,
+                names,
+                self.language_version,
+            )
         {
             self.diagnostics.push(Diagnostic::new(
                 DiagnosticKind::Inaccessible {
@@ -16440,10 +17629,14 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
 
     /// Whether `from` derives (directly or transitively) from `declaring`.
     fn derives_from(&self, from: &TypeSymbol, declaring: &TypeSymbol) -> bool {
+        // A class derived from any construction of a generic class derives from that class for
+        // protected access (10.5.3): `D<T> : B<T>` reaches `B`'s protected members, and so does
+        // `D : B<string>`. The chain links are constructed types, so both sides are definitions.
+        let declaring = definition_of(declaring);
         self.model
             .base_class_chain(from)
             .skip(1)
-            .any(|link| link.ty == *declaring)
+            .any(|link| definition_of(&link.ty) == declaring)
     }
 
     /// Reports `CS0122` when a member is not accessible from the current context.
@@ -16503,7 +17696,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         let Some(vantage) = self.protected_vantage(&current, declaring) else {
             return;
         };
-        if qualifier_ty == &vantage || self.derives_from(qualifier_ty, &vantage) {
+        // Any construction of the deriving class qualifies: csc accepts `other.F` for a
+        // `D<int> other` inside `D<T>`.
+        if definition_of(qualifier_ty) == definition_of(&vantage)
+            || self.derives_from(qualifier_ty, &vantage)
+        {
             return;
         }
         self.report(Diagnostic::new(
@@ -16542,7 +17739,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     NamedArgumentTarget::NotAValidTarget(ty.clone())
                 };
             }
-            if let Some(property) = info.properties.iter().find(|p| &*p.name == name) {
+            if let Some(property) = info.find_property(name) {
                 return if !self.is_accessible(&ty, property.accessibility) {
                     NamedArgumentTarget::Inaccessible(ty.clone())
                 } else if property.accessibility == Accessibility::Public
@@ -16798,9 +17995,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 self.is_accessible(&declaring, property.accessibility),
             ));
         }
-        if info.methods_named(name).next().is_some() {
+        // Reserved accessor signatures do not introduce declarations for member lookup (17.2.7).
+        if info.methods_named(name).any(|method| !method.is_accessor) {
             let any_accessible = info
                 .methods_named(name)
+                .filter(|method| !method.is_accessor)
                 .any(|method| self.is_accessible(&declaring, method.accessibility));
             return Some((MemberResolution::MethodGroup, any_accessible));
         }
@@ -17044,21 +18243,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             .unwrap_or(false)
     }
 
-    /// Reports the IMPLICIT `: base()` that no base constructor can accept -- `CS7036` naming the
-    /// first unsupplied parameter when the base declares exactly one constructor, `CS1729` when it
-    /// declares several. Both measured against csc.
-    ///
-    /// This is the quietest shape in the family, because nothing in the source mentions the call:
-    /// `class D : B { public D() { } }` where `B` only has `B(int)` names no base call, and neither
-    /// does a `D` declaring NO constructor at all, whose synthesized default carries the same
-    /// implicit one. The explicit `: base(...)` spelling was silent for a
-    /// DIFFERENT reason -- `bind_constructor_chain` resolves it from the emitter, where a
-    /// diagnostic reaches no one -- so its arity is checked here too, and the two spellings answer
-    /// with one rule instead of two.
-    ///
-    /// A constructor chaining to `: this(...)` does not call the base and is skipped. Only ARITY is
-    /// checked here: an inaccessible base constructor is `CS0122`, a separate rule, and reporting
-    /// this one in its place would be a wrong code on a real error.
+    /// Checks the implicit `base()` of each constructor without an initializer, including a
+    /// synthesized default constructor. These calls use the explicit initializer's overload
+    /// resolution and body diagnostics; an explicit `base(...)` or `this(...)` is checked separately.
     pub(crate) fn check_base_constructor_call(
         &mut self,
         class_ty: &TypeSymbol,
@@ -17081,11 +18268,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         if base_unresolved {
             return;
         }
-        let constructors = base_info.constructors.clone();
-        if constructors.is_empty() && !base_info.hidden_constructors {
+        if base_info.constructors.is_empty() && !base_info.hidden_constructors {
             return;
         }
-        let mut sites: Vec<(Span, usize)> = Vec::new();
+        // Each constructor without an initializer calls base(), including a synthesized default.
+        let mut sites: Vec<Span> = Vec::new();
         let mut declared_any = false;
         for member in &declaration.members {
             if let lamella_syntax::ast::Member::Constructor {
@@ -17102,44 +18289,26 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     continue;
                 }
                 declared_any = true;
+                // An external constructor has no implementation or implicit base call.
+                if modifiers.contains(&lamella_syntax::ast::Modifier::Extern) {
+                    continue;
+                }
                 match initializer {
-                    Some(init)
-                        if matches!(
-                            init.kind,
-                            lamella_syntax::ast::ConstructorInitializerKind::This
-                        ) => {}
-                    Some(init) => sites.push((*span, init.arguments.len())),
-                    None => sites.push((*span, 0)),
+                    Some(_) => {}
+                    None => sites.push(*span),
                 }
             }
         }
-        if !declared_any {
-            sites.push((declaration.span, 0));
+        if !declared_any && self.type_info_of(class_ty).is_some_and(|info| info.synthesized_constructor) {
+            sites.push(declaration.span);
         }
-        for (span, argc) in sites {
-            if constructors
-                .iter()
-                .any(|constructor| constructor.accepts_argument_count(argc))
-            {
-                continue;
-            }
-            let diagnostic = match constructors.as_slice() {
-                [only] if argc < only.parameters.len() => {
-                    DiagnosticKind::MissingArgumentForParameter {
-                        parameter: only.parameter_name(argc).unwrap_or("value").into(),
-                        method: qualified_method_with_modes(
-                            &base,
-                            &simple_type_name(&base),
-                            only,
-                        ),
-                    }
-                }
-                _ => DiagnosticKind::NoConstructor {
-                    type_name: base.to_string().into(),
-                    count: argc as u32,
-                },
+        for span in sites {
+            let initializer = lamella_syntax::ast::ConstructorInitializer {
+                kind: lamella_syntax::ast::ConstructorInitializerKind::Base,
+                arguments: Vec::new(),
+                span,
             };
-            self.diagnostics.push(Diagnostic::new(diagnostic, span));
+            self.bind_constructor_chain(class_ty, &[], &initializer);
         }
     }
 
@@ -17157,8 +18326,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         if !concrete {
             return;
         }
+        let original_class = class_ty;
+        let (parameters, mapping_type) = InterfaceTypeParameters::for_type(&self.model, class_ty);
+        let class_ty = &mapping_type;
         for interface in self.transitive_interfaces(class_ty) {
-            let (members, properties, events) = match self.model.get_by_symbol(&interface) {
+            let original_interface = parameters.original(&interface);
+            let (members, properties, events) = match self.model.get_by_symbol(&original_interface) {
                 Some(info) => (
                     info.methods.clone(),
                     info.properties.clone(),
@@ -17166,8 +18339,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 ),
                 None => continue,
             };
-            let interface_name = interface.to_string();
-            let wanted_interface = self.canonicalize(&interface);
+            let interface_name = original_interface.to_string();
+            // The model already qualified this interface in its declaring scope.
+            let wanted_interface = &interface;
             for property in &properties {
                 let declared_all: Vec<PropertySymbol> = self
                     .model
@@ -17175,36 +18349,20 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     .map(|info| {
                         info.properties
                             .iter()
-                            .filter(|candidate| candidate.name == property.name)
+                            .filter(|candidate| {
+                                candidate.name == property.name
+                                    && candidate.explicit_interface.as_ref().is_none_or(|written| {
+                                        written == wanted_interface
+                                    })
+                            })
                             .cloned()
                             .collect()
                     })
                     .unwrap_or_default();
-                let matches_type = |candidate: &PropertySymbol| {
-                    self.normalize_for_signature(&candidate.ty)
-                        == self.normalize_for_signature(&property.ty)
-                };
-                let declared_here = declared_all
-                    .iter()
-                    .find(|candidate| {
-                        candidate.explicit_interface.as_ref().is_some_and(|written| {
-                            self.canonicalize(&self.resolve_type(written)) == wanted_interface
-                        })
-                    })
-                    .or_else(|| declared_all.iter().find(|candidate| matches_type(candidate)))
-                    .cloned();
-                let provider = if declared_here.is_some() || !declared_all.is_empty() {
-                    (declared_here, true)
-                } else {
-                    let (found, resolved) = self.base_property_match(class_ty, &property.name);
-                    (
-                        found
-                            .map(|(inherited, _, _)| inherited)
-                            .filter(|inherited| matches_type(inherited)),
-                        resolved,
-                    )
-                };
-                let (provider, chain_resolved) = provider;
+                // Interface mapping considers explicit implementations in each base class.
+                // Ordinary property lookup excludes them and has different hiding rules.
+                let (provider, chain_resolved) =
+                    self.interface_property_match(class_ty, wanted_interface, property, &parameters);
                 if let Some(provider) = provider {
                     for (accessor, wanted_by_interface, supplied) in [
                         ("get", property.has_getter, provider.has_getter),
@@ -17250,7 +18408,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 if declared.accessibility != Accessibility::Public {
                     continue;
                 }
-                if self.normalize_for_signature(&declared.ty)
+                if self.normalize_for_signature(&parameters.original(&declared.ty))
                     != self.normalize_for_signature(&property.ty)
                 {
                     self.diagnostics.push(Diagnostic::new(
@@ -17268,12 +18426,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 }
             }
             for event in &events {
-                let declared_here = self.model.get_by_symbol(class_ty).is_some_and(|info| {
+                let declared_here = self.model.get_by_symbol(original_class).is_some_and(|info| {
                     info.events.iter().any(|declared| {
                         match declared.explicit_interface.as_ref() {
                             Some(written) => {
                                 declared.name.ends_with(&*event.name)
-                                    && self.canonicalize(&self.resolve_type(written)) == wanted_interface
+                                    && self.canonicalize(&self.resolve_type(written)) == self.canonicalize(&original_interface)
                             }
                             None => declared.name == event.name,
                         }
@@ -17282,7 +18440,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 if declared_here {
                     continue;
                 }
-                let (found, resolved) = self.base_event_match(class_ty, &event.name);
+                let (found, resolved) = self.base_event_match(original_class, &event.name);
                 if found.is_some() || !resolved {
                     continue;
                 }
@@ -17295,7 +18453,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                 ));
             }
             for member in &members {
-                let status = self.interface_member_status(class_ty, &interface, member);
+                let status = self.interface_member_status_in_mapping(
+                    class_ty, &interface, member, &parameters,
+                );
                 if status == InterfaceMemberStatus::Implemented {
                     continue;
                 }
@@ -17981,6 +19141,47 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         (None, true)
     }
 
+    /// Finds a property by name, type and interface through successive classes, explicit
+    /// implementations first within each class (ECMA-334 2nd ed, 20.4.2). Other interfaces'
+    /// explicit properties and non-public or static ordinary properties do not participate.
+    /// The caller diagnoses missing accessors. The boolean is false for an unresolved chain.
+    fn interface_property_match(
+        &self,
+        class_ty: &TypeSymbol,
+        interface: &TypeSymbol,
+        property: &PropertySymbol,
+        parameters: &InterfaceTypeParameters,
+    ) -> (Option<PropertySymbol>, bool) {
+        let wanted_type = self.normalize_for_signature(&property.ty);
+        let mut chain = self.model.base_class_chain(class_ty);
+        for link in chain.by_ref() {
+            let Some(info) = link.info else {
+                return (None, false);
+            };
+            for explicit in [true, false] {
+                for candidate in &info.properties {
+                    if candidate.name != property.name || candidate.is_static
+                        || self.normalize_for_signature(&parameters.original(&candidate.ty)) != wanted_type
+                    {
+                        continue;
+                    }
+                    let participates = match candidate.explicit_interface.as_ref() {
+                        Some(written) => explicit
+                            && written == interface,
+                        None => !explicit && candidate.accessibility == Accessibility::Public,
+                    };
+                    if !participates {
+                        continue;
+                    }
+                    return (Some(candidate.clone()), true);
+                }
+            }
+        }
+        let resolved = !chain.is_circular()
+            && self.model.get_by_symbol(&type_symbol_in("System", "Object")).is_some();
+        (None, resolved)
+    }
+
     /// The property named `name` declared by the nearest base type up `class_ty`'s class chain,
     /// with that type's simple name and whether its accessibility is known (false for a
     /// referenced type, whose properties are synthesized from their accessors and carry a
@@ -18325,7 +19526,9 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                         .zip(&canonical)
                         .all(|(a, b)| a == b)
             }) {
-                return !self.explicitly_implements(class_ty, interface, candidate);
+                return !self.explicitly_implements(
+                    class_ty, interface, candidate, &InterfaceTypeParameters::default(),
+                );
             }
             if let Some(name) = property
                 && info.properties.iter().any(|p| {
@@ -18504,8 +19707,8 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     /// `<interface>.<member>` name). The implicit search walks only the base-class chain, NOT the
     /// interfaces: the interface's own abstract declaration must not be mistaken for its
     /// implementation (that is the CS0535 the caller reports). An explicit implementation is
-    /// answered ONCE, by [`Self::explicitly_implements`], which names the interface and matches the
-    /// parameter list and runs before the implicit rules.
+    /// checked before implicit candidates in each class, using the interface identity and
+    /// parameter list.
     ///
     /// TEST-ONLY, and safely so: it collapses [`Self::interface_member_status`] to a boolean, so a
     /// test asking the yes/no question still exercises the four-state routine the diagnostics use.
@@ -18524,153 +19727,133 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         )
     }
 
-    /// Why a class does or does not implement one interface method. A member matching by name and
-    /// parameters is not automatically an implementation: it must ALSO be public and return the
-    /// interface's type, and csc gives each failure its own code (`CS0737`, `CS0738`) because each
-    /// names a different repair. Only a member matching by signature can reach those two -- a
-    /// class with nothing of that name is plainly `CS0535`.
-    ///
-    /// **An EXPLICIT implementation is matched before any of that (20.4.1)**, so a member that
-    /// fails those rules cannot stand in for one the class also declares explicitly.
+    /// Interface mapping searches each class before its base (ECMA-334 2nd ed, 20.4.2).
+    /// An explicit implementation takes precedence within that class. Otherwise, only a
+    /// public instance method with matching parameters and return type supplies the member.
+    /// A nonparticipating declaration does not hide a valid implementation farther up the chain.
+    /// The nearest failed match supplies a diagnostic only if no implementation is found.
+    #[cfg(test)]
     fn interface_member_status(
         &self,
         class_ty: &TypeSymbol,
         interface: &TypeSymbol,
         member: &MethodSymbol,
     ) -> InterfaceMemberStatus {
-        if self.explicitly_implements(class_ty, interface, member) {
-            return InterfaceMemberStatus::Implemented;
-        }
-        let candidate = self
-            .methods_in_class_chain(class_ty, &member.name)
-            .into_iter()
-            .find(|candidate| candidate.parameters == member.parameters);
-        if let Some(candidate) = candidate {
-            if candidate.accessibility != Accessibility::Public {
-                return InterfaceMemberStatus::NotPublic;
-            }
-            if self.normalize_for_signature(&candidate.return_type)
-                != self.normalize_for_signature(&member.return_type)
-            {
-                return InterfaceMemberStatus::WrongReturnType;
-            }
-            return InterfaceMemberStatus::Implemented;
-        }
-        if self.implemented_by_accessor_or_explicit(class_ty, member) {
-            return InterfaceMemberStatus::Implemented;
-        }
-        InterfaceMemberStatus::Missing
+        self.interface_member_status_in_mapping(
+            class_ty, interface, member, &InterfaceTypeParameters::default(),
+        )
     }
 
-    /// Whether the class declares an explicit implementation of `member` FOR THIS INTERFACE.
-    ///
-    /// **THE QUALIFIER IS RESOLVED, NOT COMPARED AS TEXT.** The collector stores an explicit
-    /// implementation under the qualifier the source wrote plus `.<member>`, and both
-    /// `IEnumerable.GetEnumerator` and `System.Collections.IEnumerable.GetEnumerator` are legal
-    /// spellings of one member -- so the stored name is split at its last `.` and the qualifier
-    /// put through the same scope search a written type name gets. Naming the interface and
-    /// matching the parameter list is what lets it run BEFORE the implicit rules without crediting
-    /// a member of some other interface.
+    fn interface_member_status_in_mapping(
+        &self,
+        class_ty: &TypeSymbol,
+        interface: &TypeSymbol,
+        member: &MethodSymbol,
+        parameters: &InterfaceTypeParameters,
+    ) -> InterfaceMemberStatus {
+        let mut failure = None;
+        let return_type = self.normalize_for_signature(&member.return_type);
+        let property = if !member.is_accessor || member.is_static || !member.type_parameters.is_empty() {
+            None
+        } else if let Some(name) = member.name.strip_prefix("get_")
+            .filter(|_| member.parameters.is_empty())
+        {
+            Some((name, true, &member.return_type))
+        } else {
+            member.name.strip_prefix("set_")
+                .filter(|_| member.parameters.len() == 1 && member.return_type.is_void())
+                .map(|name| (name, false, &member.parameters[0]))
+        };
+        for (owner, info) in self.model.base_class_chain(&self.lookup_type_of(class_ty)).resolved() {
+            if self.explicitly_implements(&owner, interface, member, parameters) {
+                return InterfaceMemberStatus::Implemented;
+            }
+            // Imported interfaces expose property accessors as methods. A matching source
+            // property supplies those slots despite unrelated ordinary methods in the chain.
+            if let Some((name, getter, ty)) = property
+                && info.properties.iter().any(|candidate| {
+                    &*candidate.name == name && !candidate.is_static
+                        && if getter { candidate.has_getter } else { candidate.has_setter }
+                        && self.normalize_for_signature(&parameters.original(&candidate.ty)) == self.normalize_for_signature(ty)
+                        && match candidate.explicit_interface.as_ref() {
+                            Some(written) => written == interface,
+                            None => candidate.accessibility == Accessibility::Public
+                                && (if getter { candidate.getter_accessibility } else { candidate.setter_accessibility })
+                                    == Some(Accessibility::Public),
+                        }
+                })
+            {
+                return InterfaceMemberStatus::Implemented;
+            }
+            for candidate in info.methods_named(&member.name) {
+                if !parameters.same_parameters(&candidate.parameters, &member.parameters)
+                    || candidate.type_parameters.len() != member.type_parameters.len()
+                    || candidate.is_static
+                {
+                    continue;
+                }
+                if candidate.accessibility != Accessibility::Public {
+                    failure.get_or_insert(InterfaceMemberStatus::NotPublic);
+                    continue;
+                }
+                if self.normalize_for_signature(&parameters.original(&candidate.return_type)) != return_type {
+                    failure.get_or_insert(InterfaceMemberStatus::WrongReturnType);
+                    continue;
+                }
+                return InterfaceMemberStatus::Implemented;
+            }
+        }
+        if failure.is_none() && self.accessor_provided_by_event(class_ty, member) {
+            return InterfaceMemberStatus::Implemented;
+        }
+        failure.unwrap_or(InterfaceMemberStatus::Missing)
+    }
+
+    /// Whether the class declares an explicit implementation of `member` for this interface.
+    /// Qualifiers are already canonical in their declaring scope and substituted by the base
+    /// walk. Resolving them in the derived scope would change their identity under shadowing.
     fn explicitly_implements(
         &self,
         class_ty: &TypeSymbol,
         interface: &TypeSymbol,
         member: &MethodSymbol,
+        parameters: &InterfaceTypeParameters,
     ) -> bool {
         let mut suffix = String::from(".");
         suffix.push_str(&member.name);
         let Some(info) = self.model.get_by_symbol(class_ty) else {
             return false;
         };
-        let wanted = self.canonicalize(interface);
         info.methods.iter().any(|declared| {
             let Some(written) = declared.explicit_interface.as_ref() else {
                 return false;
             };
-            if !declared.name.ends_with(&suffix) || declared.parameters != member.parameters {
+            if !declared.name.ends_with(&suffix)
+                || !parameters.same_parameters(&declared.parameters, &member.parameters)
+            {
                 return false;
             }
-            self.canonicalize(written) == wanted
+            written == interface
         })
     }
 
-    /// The one implementation form the signature walk cannot see: a `get_`/`set_`/`add_`/
-    /// `remove_` member supplied by declaring the property or field-like event itself. A source
-    /// type keeps those accessors in `properties`/`events` rather than as synthesized methods, so
-    /// the method walk above does not find them.
-    ///
-    /// **AN EXPLICIT IMPLEMENTATION IS NOT ANSWERED HERE.** It is answered once, and strictly, by
-    /// [`Self::explicitly_implements`], which names the interface and matches the parameter list
-    /// and runs before the implicit rules. An explicit PROPERTY is reached by the property walk
-    /// below rather than as a method: the collector stores one under its PLAIN name.
-    fn implemented_by_accessor_or_explicit(
+    /// Whether a field-like event supplies an accessor invisible to the method table.
+    /// Property accessors use the exact interface and signature mapping in
+    /// [`Self::interface_member_status`].
+    fn accessor_provided_by_event(
         &self,
         class_ty: &TypeSymbol,
         member: &MethodSymbol,
     ) -> bool {
-        self.accessor_provided_by_property_or_event(class_ty, member)
-    }
-
-    /// The methods named `name` in `ty`'s own type and its base CLASS chain (walking `info.base`,
-    /// which `link_bases` resolves to the base *class*, never an interface). Used to decide
-    /// implicit interface implementation: a candidate here is a concrete provider of the member,
-    /// whereas `methods_in_chain` would also surface the interface's own abstract method.
-    fn methods_in_class_chain(&self, ty: &TypeSymbol, name: &str) -> Vec<MethodSymbol> {
-        let mut methods: Vec<MethodSymbol> = Vec::new();
-        for (_, info) in self.model.base_class_chain(&self.lookup_type_of(ty)).resolved() {
-            for method in info.methods_named(name) {
-                methods.push(method.clone());
-            }
-        }
-        methods
-    }
-
-    /// Whether interface accessor method `member` is satisfied by a property or field-like event
-    /// of the same name in `class_ty`'s own type or a base CLASS. A source type keeps a property's
-    /// `get_`/`set_` (and an event's `add_`/`remove_`) accessors in `properties`/`events` rather
-    /// than as synthesized methods -- only indexers and metadata-loaded types carry the accessor
-    /// methods themselves -- so an interface accessor a source type implements via a property or
-    /// event is invisible to the method walk and would be a false CS0535. Lenient by design
-    /// (matched on accessor name and kind, not the full signature): a strict subset never risks a
-    /// false positive, so a subtler type mismatch is left for csc (CS0738) rather than reported.
-    fn accessor_provided_by_property_or_event(
-        &self,
-        class_ty: &TypeSymbol,
-        member: &MethodSymbol,
-    ) -> bool {
-        let property = member
-            .name
-            .strip_prefix("get_")
-            .filter(|_| member.parameters.is_empty())
-            .map(|name| (name, true))
-            .or_else(|| {
-                member
-                    .name
-                    .strip_prefix("set_")
-                    .filter(|_| member.parameters.len() == 1)
-                    .map(|name| (name, false))
-            });
         let event = member
             .name
             .strip_prefix("add_")
             .or_else(|| member.name.strip_prefix("remove_"))
             .filter(|_| member.parameters.len() == 1);
-        if property.is_none() && event.is_none() {
+        if event.is_none() {
             return false;
         }
         for (_, info) in self.model.base_class_chain(&self.lookup_type_of(class_ty)).resolved() {
-            if let Some((name, need_getter)) = property {
-                if info.properties.iter().any(|candidate| {
-                    &*candidate.name == name
-                        && if need_getter {
-                            candidate.has_getter
-                        } else {
-                            candidate.has_setter
-                        }
-                }) {
-                    return true;
-                }
-            }
             if let Some(name) = event {
                 if info.events.iter().any(|candidate| &*candidate.name == name) {
                     return true;
@@ -18792,7 +19975,14 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     && self.is_accessible(ty, method.accessibility)
             })
             .collect();
-        match resolve_overload(&self.model, &candidates, &[], &[], &[]) {
+        match resolve_overload(
+            &self.model,
+            &candidates,
+            &[],
+            &[],
+            &[],
+            self.language_version,
+        ) {
             OverloadResult::Resolved(method)
                 if method.return_type == TypeSymbol::Special(SpecialType::Void) =>
             {
@@ -18981,7 +20171,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     }
 
     /// The public instance method selected by an empty argument list in a foreach pattern.
-    /// Edition 2 requires a parameterless signature, not an expanded params-array invocation.
+    /// C# 1 and C# 8 onward require a parameterless signature.
     fn foreach_public_method(
         &mut self,
         ty: &TypeSymbol,
@@ -18993,10 +20183,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         }
         let method = self.resolve_instance_method(ty, name, span)?;
         if method.is_static
-            || (self
-                .language_version
-                .foreach_incomplete_pattern_uses_interface()
-                && !method.parameters.is_empty())
+            || !self.foreach_pattern_accepts_parameter_count(method.parameters.len())
         {
             return None;
         }
@@ -19258,7 +20445,11 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
     fn indexer_accessor(&self, ty: &TypeSymbol, prefix: &str, arity: usize) -> Option<Box<str>> {
         for (_, info) in self.member_lookup_walk(&self.lookup_type_of(ty), false) {
             for method in &info.methods {
-                if method.accepts_argument_count(arity) && method.name.starts_with(prefix) {
+                // Optional indices participate only at versions that allow default arguments;
+                // otherwise a differently named base indexer can still supply the accessor.
+                if self.accepts_argument_count_at_version(method, arity)
+                    && method.name.starts_with(prefix)
+                {
                     return Some(method.name.clone());
                 }
             }
@@ -19290,18 +20481,35 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
         receiver_ty: &TypeSymbol,
         name: &str,
         arguments: &[TypeSymbol],
-        arg_constants: &[Option<i64>],
+        arg_constants: &[ArgumentConstant],
         names: &[Option<(&str, Span)>],
     ) -> Vec<MethodSymbol> {
         let tiers = self.methods_in_chain_tiered(receiver_ty, name);
-        if names.iter().any(Option::is_some) {
-            return tiers.concat();
-        }
+        let named = names.iter().any(Option::is_some);
         for tier in &tiers {
-            if tier
-                .iter()
-                .any(|candidate| is_applicable(&self.model, candidate, arguments, arg_constants))
-            {
+            if tier.iter().any(|candidate| {
+                if named {
+                    reorder_for(candidate, arguments, arg_constants, names).is_some_and(
+                        |(types, constants)| {
+                            is_applicable_at(
+                                &self.model,
+                                candidate,
+                                &types,
+                                &constants,
+                                self.language_version,
+                            )
+                        },
+                    )
+                } else {
+                    is_applicable_at(
+                        &self.model,
+                        candidate,
+                        arguments,
+                        arg_constants,
+                        self.language_version,
+                    )
+                }
+            }) {
                 return tier.clone();
             }
         }
@@ -19595,8 +20803,12 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             };
         }
         if let Some((value, ty, _)) = self.const_locals.get(name) {
+            let mut value = value.clone();
+            if let Literal::Integer { decimal, .. } = &mut value {
+                *decimal = false;
+            }
             return BoundExpr {
-                kind: BoundExprKind::Literal(value.clone()),
+                kind: BoundExprKind::Literal(value),
                 ty: ty.clone(),
             };
         }
@@ -19658,7 +20870,7 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
                     }
                     let is_instance = !field.is_static;
                     return BoundExpr {
-                        ty: field.ty.clone(),
+                        ty: self.field_reference_type(&field),
                         kind: BoundExprKind::FieldAccess {
                             receiver: Box::new(self.implicit_receiver(is_instance, span)),
                             name: name.into(),
@@ -19730,13 +20942,14 @@ pub(crate) fn deref_ref_return(call: BoundExpr, declared: &TypeSymbol) -> BoundE
             ));
             return error_expr();
         }
-        if let Some(target) = self.alias_target(name) {
+        if let Some(target) = self.visible_alias_target(name) {
             if let Some(namespace) = self.aliased_namespace(&target) {
                 return BoundExpr {
                     kind: BoundExprKind::NamespaceReference(namespace.into()),
                     ty: TypeSymbol::Error,
                 };
             }
+            self.refuse_type_named_like_type_parameter(&target, span);
             return BoundExpr {
                 kind: BoundExprKind::TypeReference(target.clone()),
                 ty: target,
@@ -20663,67 +21876,10 @@ fn default_value_type_display(ty: &TypeSymbol) -> Box<str> {
     ty.to_string().into()
 }
 
-/// Whether `expr` is a constant of type `int`/`long` whose value fits the integral
-/// `target` -- the implicit constant expression conversion (13.1.7), which lets
-/// `byte b = 10` and `b[0] = 10` compile without a cast.
-fn implicit_constant_conversion(expr: &BoundExpr, target: &TypeSymbol) -> bool {
-    if let Some(underlying) = crate::conversion::nullable_underlying(target) {
-        return implicit_constant_conversion(expr, underlying);
-    }
-    let (TypeSymbol::Special(source), TypeSymbol::Special(target)) = (&expr.ty, target) else {
-        return false;
-    };
-    if !matches!(source, SpecialType::Int32 | SpecialType::Int64) {
-        return false;
-    }
-    match constant_int_value(expr) {
-        Some(value) => constant_fits(value, *target),
-        None => false,
-    }
-}
-
-/// The rendered value of an int/long CONSTANT that is out of range of the integral type it is
-/// narrowing to under the constant-expression conversion (13.1.7) -- so an out-of-range one is
-/// CS0031, not the generic narrowing CS0266. An `int` constant converts to
-/// sbyte/byte/short/ushort/uint/ulong; a `long` constant only to ulong; every other target (char,
-/// a floating type, an identity or widening target, or a `uint`/other non-int/long source) is
-/// outside this rule, so those keep the CS0266/CS0029 path. `None` when the rule does not apply or
-/// the value is in range.
-fn constant_out_of_range(value: &BoundExpr, target: &TypeSymbol) -> Option<Box<str>> {
-    use SpecialType as S;
-    let (TypeSymbol::Special(source), TypeSymbol::Special(target)) = (&value.ty, target) else {
-        return None;
-    };
-    let eligible = match source {
-        S::Int32 => matches!(
-            target,
-            S::SByte | S::Byte | S::Int16 | S::UInt16 | S::UInt32 | S::UInt64
-        ),
-        S::Int64 => *target == S::UInt64,
-        _ => false,
-    };
-    if !eligible {
-        return None;
-    }
-    let folded = constant_int_value(value)?;
-    if constant_fits(folded, *target) {
-        None
-    } else {
-        Some(alloc::string::ToString::to_string(&folded).into())
-    }
-}
-
 /// Whether `ty` is `uint` -- the only unsigned type whose binary numeric promotion with a
 /// signed operand widens to `long`, so a fitting `int` constant is instead retyped `uint` (13.1.7).
 fn is_uint(ty: &TypeSymbol) -> bool {
     matches!(ty, TypeSymbol::Special(SpecialType::UInt32))
-}
-
-/// Whether `expr` is an `int` constant whose value fits the unsigned integral `target`
-/// (13.1.7 constant expression conversion, as applied by a binary operator's overload resolution).
-fn int_constant_fits(expr: &BoundExpr, target: SpecialType) -> bool {
-    matches!(expr.ty, TypeSymbol::Special(SpecialType::Int32))
-        && constant_int_value(expr).is_some_and(|value| constant_fits(value, target))
 }
 
 /// The compile-time value of a constant integer expression (14.15): an integer or
@@ -20731,8 +21887,8 @@ fn int_constant_fits(expr: &BoundExpr, target: SpecialType) -> bool {
 /// enum member, a predefined `MaxValue`/`MinValue`), a `+`/`-` on one, or -- through the
 /// full constant evaluator -- an arithmetic/bitwise operation, a cast, or a conditional.
 /// `None` for a non-constant expression (or a `bool`/`string` constant, which is not an
-/// integer). Case labels, the constant-expression conversions, and overload resolution
-/// all fold through this.
+/// integer). This model-free form serves flow analysis; conversion checks use
+/// [`Binder::constant_int_value`] so enum operands retain their underlying widths.
 pub(crate) fn constant_int_value(expr: &BoundExpr) -> Option<i64> {
     match &expr.kind {
         BoundExprKind::Literal(Literal::Integer { value, .. }) => i64::try_from(*value).ok(),
@@ -20902,7 +22058,13 @@ fn constant_value_in(
         integral(ty).and_then(|ty| integral_constant::value(literal, ty))
     };
     match &expr.kind {
-        BoundExprKind::Literal(literal) => Some(literal.clone()),
+        BoundExprKind::Literal(literal) => {
+            let mut value = literal.clone();
+            if let Literal::Integer { decimal, .. } = &mut value {
+                *decimal = false;
+            }
+            Some(value)
+        },
         BoundExprKind::DefaultValue(ty) => default_constant(ty, integral),
         BoundExprKind::SizeOf(ty) => sizeof_constant(ty, integral),
         BoundExprKind::FieldAccess {
@@ -21040,6 +22202,7 @@ fn is_decimal(ty: &TypeSymbol) -> bool {
 pub(crate) fn integer_literal(value: i64) -> Literal {
     Literal::Integer {
         value: value as u64,
+        decimal: false,
         suffix: lamella_syntax::token::IntegerSuffix::None,
     }
 }
@@ -21053,6 +22216,19 @@ pub fn literal_int_value(literal: &Literal) -> Option<i64> {
         Literal::Character(unit) => Some(i64::from(*unit)),
         Literal::Boolean(b) => Some(i64::from(*b)),
         Literal::Real { .. } | Literal::Decimal { .. } | Literal::String(_) | Literal::Null => None,
+    }
+}
+
+/// The implicit constant expression conversion (13.1.7), by the type of the constant: "A
+/// constant-expression of type int can be converted to type sbyte, byte, short, ushort, uint, or
+/// ulong, provided the value of the constant-expression is within the range of the destination
+/// type", and "A constant-expression of type long can be converted to type ulong, provided the value
+/// of the constant-expression is not negative". Nothing else converts this way.
+fn constant_converts(source: SpecialType, value: i64, target: SpecialType) -> bool {
+    match source {
+        SpecialType::Int32 => constant_fits(value, target),
+        SpecialType::Int64 => target == SpecialType::UInt64 && constant_fits(value, target),
+        _ => false,
     }
 }
 
@@ -21101,17 +22277,52 @@ fn argument_type(argument: &BoundExpr) -> TypeSymbol {
     }
 }
 
-/// Whether an argument -- its type `arg_ty`, plus `arg_const` (its compile-time integer value
-/// when it is a constant) -- is applicable to parameter `param`: a standard implicit conversion,
-/// or the implicit constant-expression conversion (13.1.7) for an `int`/`long` constant whose
-/// value fits an integral parameter (so `Set(0x518, m)` binds when `Set` takes `uint`).
+/// Constant facts retained while arguments are reordered and candidates are ranked.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct ArgumentConstant {
+    integer: Option<i64>,
+    enum_zero: bool,
+}
+
+impl ArgumentConstant {
+    /// C# 1 through 5 require a decimal integer literal; C# 6 and 7 admit integer constants.
+    /// Later versions also admit real and decimal zero constants, including their nullable forms.
+    fn new(value: &BoundExpr, version: LanguageVersion, constant: Option<&Literal>) -> Self {
+        use SpecialType as S;
+        let enum_zero = if version < LanguageVersion::CSharp6 {
+            matches!(value.kind, BoundExprKind::Literal(Literal::Integer {
+                value: 0, decimal: true, ..
+            }))
+        } else {
+            let integer = matches!(value.ty, TypeSymbol::Special(
+                S::SByte | S::Byte | S::Int16 | S::UInt16 | S::Int32 | S::UInt32 | S::Int64 | S::UInt64
+            ));
+            let real = version >= LanguageVersion::CSharp8
+                && matches!(value.ty, TypeSymbol::Special(S::Single | S::Double | S::Decimal));
+            (integer || real) && match constant {
+                Some(Literal::Integer { value: 0, .. }) => true,
+                Some(Literal::Real { bits, .. }) => f64::from_bits(*bits) == 0.0,
+                Some(Literal::Decimal { lo: 0, mid: 0, hi: 0, .. }) => true,
+                _ => false,
+            }
+        };
+        Self { integer: constant.and_then(literal_int_value), enum_zero }
+    }
+}
+
+/// Whether an argument's type and constant facts make it applicable to `param`: a standard
+/// or user-defined implicit conversion, an implicit enumeration conversion, or the
+/// constant-expression conversion (13.1.7) for an `int`/`long` constant that fits.
+/// A nonempty user-defined candidate set is applicable even when selecting an
+/// operator from it would be ambiguous (13.4.2).
 /// A byref (`ref`/`out`) argument or parameter applies only with the identical passing
 /// mode and type on the other side (14.4.2.1) -- no conversion crosses a byref boundary.
 fn arg_applicable(
     model: &Model,
     arg_ty: &TypeSymbol,
-    arg_const: Option<i64>,
+    arg_const: ArgumentConstant,
     param: &TypeSymbol,
+    version: LanguageVersion,
 ) -> bool {
     if is_arglist_marker(arg_ty) {
         return false;
@@ -21125,57 +22336,36 @@ fn arg_applicable(
         return !matches!(param, TypeSymbol::ByRef(_))
             && arms
                 .iter()
-                .all(|(arm, constant)| arg_applicable(model, arm, *constant, param));
+                .all(|(arm, constant)| arg_applicable(model, arm, *constant, param, version));
     }
     if matches!(arg_ty, TypeSymbol::ByRef(_)) || matches!(param, TypeSymbol::ByRef(_)) {
         return arg_ty == param;
     }
-    if converts(model, arg_ty, param) || user_implicit_converts(model, arg_ty, param) {
+    if converts(model, arg_ty, param) || user_conversion_exists(model, arg_ty, param, version) {
         return true;
     }
     let target = crate::conversion::nullable_underlying(param).unwrap_or(param);
-    if arg_ty == &TypeSymbol::Special(SpecialType::Int32)
-        && arg_const == Some(0)
-        && model
-            .get_by_symbol(target)
-            .is_some_and(|info| info.kind == TypeKind::Enum)
+    if arg_const.enum_zero
+        && model.get_by_symbol(target).is_some_and(|info| info.kind == TypeKind::Enum)
     {
         return true;
     }
-    matches!(
-        arg_ty,
-        TypeSymbol::Special(SpecialType::Int32 | SpecialType::Int64)
-    ) && match target {
-        TypeSymbol::Special(target) => arg_const.is_some_and(|value| constant_fits(value, *target)),
+    match (arg_ty, target, arg_const.integer) {
+        (TypeSymbol::Special(source), TypeSymbol::Special(target), Some(value)) => {
+            constant_converts(*source, value, *target)
+        }
         _ => false,
     }
 }
 
-/// Whether a user-defined implicit conversion (`op_Implicit`) takes `from` to `to` (17.9.3): a
-/// one-parameter operator declared on either type. An argument with such a conversion to its
-/// parameter is applicable (14.4.2.1). Conversion operators are not inherited, so the direct
-/// members of each type suffice.
-fn user_implicit_converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
-    [from, to].into_iter().any(|owner| {
-        model.get_by_symbol(owner).is_some_and(|info| {
-            info.methods.iter().any(|method| {
-                &*method.name == "op_Implicit"
-                    && method.parameters.len() == 1
-                    && &method.parameters[0] == from
-                    && &method.return_type == to
-            })
-        })
-    })
-}
-
 /// Chooses the overload for a call (14.4.2): the unique best among the applicable candidates,
 /// or the diagnostic-bearing outcome otherwise. Conversions resolve against `model` so a
-/// derived argument matches a base parameter; `arg_constants` carries each argument's
-/// compile-time integer value (or `None`) to enable the constant conversion (13.1.7) in
-/// applicability. An empty `arg_constants` means "no constants" (e.g. the operator paths).
+/// derived argument matches a base parameter; `arg_constants` carries the expression facts
+/// that enable constant-expression and enumeration conversions in applicability. An empty `arg_constants` means "no constants" (e.g. the operator paths).
 /// Which SOURCE argument fills each of `method`'s parameters once the names are applied
 /// (12.6.2.2): `Some(i)` for the argument written at source position `i`, `None` for a parameter
-/// the call left out.
+/// the call left out. Positional arguments beyond a parameter array's position each have their
+/// own slot, so the expanded tail retains every source argument.
 ///
 /// `None` overall when this call cannot map onto this method AT ALL -- a name it has no parameter
 /// for, a name naming a parameter some other argument already filled, or a parameter left out that
@@ -21186,7 +22376,13 @@ fn user_implicit_converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> 
 /// empty means NOT KNOWN) can be mapped positionally and never by name, which is the honest
 /// answer -- a name cannot match what was never read.
 fn map_arguments(method: &MethodSymbol, names: &[Option<(&str, Span)>]) -> Option<Vec<Option<usize>>> {
-    let mut filled: Vec<Option<usize>> = alloc::vec![None; method.parameters.len()];
+    let declared = method.parameters.len();
+    let slots = if method.is_params && declared != 0 {
+        declared.max(names.len())
+    } else {
+        declared
+    };
+    let mut filled: Vec<Option<usize>> = alloc::vec![None; slots];
     for (index, name) in names.iter().enumerate() {
         let parameter = match name {
             None => index,
@@ -21194,6 +22390,15 @@ fn map_arguments(method: &MethodSymbol, names: &[Option<(&str, Span)>]) -> Optio
                 .find(|&i| method.parameter_name(i) == Some(*name))?,
         };
         if parameter >= filled.len() || filled[parameter].is_some() {
+            return None;
+        }
+        // A named parameter array supplies the array or its single expanded element. A later
+        // positional argument cannot add elements to that named argument (12.6.2.2).
+        if method.is_params
+            && parameter + 1 == declared
+            && name.is_some()
+            && names[index + 1..].iter().any(Option::is_none)
+        {
             return None;
         }
         filled[parameter] = Some(index);
@@ -21207,6 +22412,45 @@ fn map_arguments(method: &MethodSymbol, names: &[Option<(&str, Span)>]) -> Optio
         }
     }
     Some(filled)
+}
+
+/// Infer from supplied arguments and their corresponding parameters. The projection is used only
+/// for inference; applicability and emission retain the original signature, names, and defaults.
+fn infer_named_type_arguments(
+    model: &Model,
+    method: &MethodSymbol,
+    arguments: &[TypeSymbol],
+    filled: &[Option<usize>],
+) -> Option<Vec<TypeSymbol>> {
+    let mut supplied = method.clone();
+    let last = method.parameters.len().checked_sub(1)?;
+    let mut ordered: Vec<(usize, TypeSymbol)> = filled
+        .iter()
+        .enumerate()
+        .filter_map(|(parameter, argument)| {
+            argument.map(|index| (index, method.parameters[parameter.min(last)].clone()))
+        })
+        .collect();
+    ordered.sort_by_key(|(index, _)| *index);
+    supplied.parameters = ordered.into_iter().map(|(_, ty)| ty).collect();
+    supplied.parameter_info.clear();
+    supplied.is_params = false;
+    // Extra positional arguments force expansion even when each happens to be an array.
+    let normal = (arguments.len() <= method.parameters.len())
+        .then(|| infer_method_type_arguments(model, &supplied, arguments))
+        .flatten();
+    normal.or_else(|| {
+        if !method.is_params {
+            return None;
+        }
+        let TypeSymbol::Array { element, rank: 1 } = &method.parameters[last] else {
+            return None;
+        };
+        for argument in filled.iter().skip(last).flatten() {
+            supplied.parameters[*argument] = (**element).clone();
+        }
+        infer_method_type_arguments(model, &supplied, arguments)
+    })
 }
 
 /// The first parameter a named call leaves unfilled with nothing to fall back on.
@@ -21243,9 +22487,9 @@ fn unfilled_parameter(method: &MethodSymbol, names: &[Option<(&str, Span)>]) -> 
 fn reorder_for(
     method: &MethodSymbol,
     arguments: &[TypeSymbol],
-    arg_constants: &[Option<i64>],
+    arg_constants: &[ArgumentConstant],
     names: &[Option<(&str, Span)>],
-) -> Option<(Vec<TypeSymbol>, Vec<Option<i64>>)> {
+) -> Option<(Vec<TypeSymbol>, Vec<ArgumentConstant>)> {
     let filled = map_arguments(method, names)?;
     let mut types = Vec::with_capacity(filled.len());
     let mut constants = Vec::with_capacity(filled.len());
@@ -21253,11 +22497,11 @@ fn reorder_for(
         match slot {
             Some(index) => {
                 types.push(arguments.get(*index)?.clone());
-                constants.push(arg_constants.get(*index).copied().flatten());
+                constants.push(arg_constants.get(*index).copied().unwrap_or_default());
             }
             None => {
                 types.push(method.parameters[parameter].clone());
-                constants.push(None);
+                constants.push(ArgumentConstant::default());
             }
         }
     }
@@ -21271,37 +22515,48 @@ fn reorder_for(
 /// `M(int a, int b)` and does not map at all onto `M(int x, int y)`. A candidate whose mapping
 /// fails is not a candidate, which is where CS1739 and CS1744 come from.
 ///
+/// Betterness is then judged per SOURCE argument (the C# 4.0 specification 7.5.3.2, ECMA-334 5th
+/// edition 12.6.4.3): "Optional parameters with no corresponding arguments are removed from the
+/// parameter list" and "The parameters are reordered so that they occur at the same position as
+/// the corresponding argument", so `F(a: null, b: 1, c: 1L)` compares `(string, int, long)` with
+/// `(char[], int, long)` whichever order the two declare them in.
 fn resolve_overload_named(
     model: &Model,
     candidates: &[MethodSymbol],
     arguments: &[TypeSymbol],
-    arg_constants: &[Option<i64>],
+    arg_constants: &[ArgumentConstant],
     names: &[Option<(&str, Span)>],
+    version: LanguageVersion,
 ) -> OverloadResult {
-    let mapped: Vec<(&MethodSymbol, Vec<TypeSymbol>, Vec<Option<i64>>)> = candidates
+    let mapped: Vec<(&MethodSymbol, Vec<TypeSymbol>, Vec<ArgumentConstant>)> = candidates
         .iter()
         .filter_map(|candidate| {
             reorder_for(candidate, arguments, arg_constants, names)
                 .map(|(types, constants)| (candidate, types, constants))
         })
         .collect();
-    let applicable: Vec<&(&MethodSymbol, Vec<TypeSymbol>, Vec<Option<i64>>)> = mapped
+    let applicable: Vec<&(&MethodSymbol, Vec<TypeSymbol>, Vec<ArgumentConstant>)> = mapped
         .iter()
-        .filter(|(candidate, types, constants)| is_applicable(model, candidate, types, constants))
+        .filter(|(candidate, types, constants)| is_applicable(model, candidate, types, constants, version))
         .collect();
-    let best = applicable.iter().find(|(candidate, types, constants)| {
-        applicable.iter().all(|(other, ..)| {
-            core::ptr::eq(*candidate, *other) || is_better(model, candidate, other, types, constants)
+    let judged: Vec<Judged<'_>> = applicable
+        .iter()
+        .map(|(candidate, types, constants)| Judged::named(model, candidate, types, constants, names, version))
+        .collect();
+    let best = judged.iter().find(|candidate| {
+        judged.iter().all(|other| {
+            core::ptr::eq(candidate.method, other.method)
+                || candidate.is_better_than(model, other, arguments, version)
         })
     });
-    if let Some((best, ..)) = best {
-        return OverloadResult::Resolved((*best).clone());
+    if let Some(best) = best {
+        return OverloadResult::Resolved(best.method.clone());
     }
     if !applicable.is_empty() {
         return OverloadResult::Ambiguous;
     }
     for (candidate, types, constants) in &mapped {
-        if let Some(bad) = first_bad_normal(model, candidate, types, constants) {
+        if let Some(bad) = first_bad_normal(model, candidate, types, constants, version) {
             return bad;
         }
     }
@@ -21451,17 +22706,43 @@ fn resolve_overload(
     model: &Model,
     candidates: &[MethodSymbol],
     arguments: &[TypeSymbol],
-    arg_constants: &[Option<i64>],
+    arg_constants: &[ArgumentConstant],
     names: &[Option<(&str, Span)>],
+    version: LanguageVersion,
+) -> OverloadResult {
+    if version.supports(Feature::DefaultParameterValues) {
+        return resolve_among(model, candidates, arguments, arg_constants, names, version);
+    }
+    let required: Vec<MethodSymbol> = candidates
+        .iter()
+        .map(MethodSymbol::without_defaults)
+        .collect();
+    match resolve_among(model, &required, arguments, arg_constants, names, version) {
+        OverloadResult::Resolved(best) => {
+            let chosen = required.iter().position(|candidate| *candidate == best);
+            OverloadResult::Resolved(chosen.map_or(best, |index| candidates[index].clone()))
+        }
+        other => other,
+    }
+}
+
+/// [`resolve_overload`] among `candidates` as each one declares itself.
+fn resolve_among(
+    model: &Model,
+    candidates: &[MethodSymbol],
+    arguments: &[TypeSymbol],
+    arg_constants: &[ArgumentConstant],
+    names: &[Option<(&str, Span)>],
+    version: LanguageVersion,
 ) -> OverloadResult {
     if names.iter().any(Option::is_some) {
-        return resolve_overload_named(model, candidates, arguments, arg_constants, names);
+        return resolve_overload_named(model, candidates, arguments, arg_constants, names, version);
     }
     let applicable: Vec<&MethodSymbol> = candidates
         .iter()
-        .filter(|candidate| is_applicable(model, candidate, arguments, arg_constants))
+        .filter(|candidate| is_applicable(model, candidate, arguments, arg_constants, version))
         .collect();
-    if let Some(best) = best_candidate(model, &applicable, arguments, arg_constants) {
+    if let Some(best) = best_candidate(model, &applicable, arguments, arg_constants, version) {
         return OverloadResult::Resolved(best.clone());
     }
     if !applicable.is_empty() {
@@ -21478,17 +22759,18 @@ fn resolve_overload(
                 candidate,
                 &arguments[..arguments.len() - 1],
                 arg_constants,
+                version,
             ) {
                 return bad;
             }
         }
         if !candidate.is_vararg && candidate.accepts_argument_count(arguments.len()) {
-            if let Some(bad) = first_bad_normal(model, candidate, arguments, arg_constants) {
+            if let Some(bad) = first_bad_normal(model, candidate, arguments, arg_constants, version) {
                 return bad;
             }
         }
         if candidate.is_params && expanded.is_none() {
-            expanded = first_bad_expanded(model, candidate, arguments, arg_constants);
+            expanded = first_bad_expanded(model, candidate, arguments, arg_constants, version);
         }
     }
     expanded.unwrap_or(OverloadResult::WrongArgumentCount)
@@ -21501,7 +22783,8 @@ fn first_bad_normal(
     model: &Model,
     method: &MethodSymbol,
     arguments: &[TypeSymbol],
-    arg_constants: &[Option<i64>],
+    arg_constants: &[ArgumentConstant],
+    version: LanguageVersion,
 ) -> Option<OverloadResult> {
     arguments
         .iter()
@@ -21511,8 +22794,9 @@ fn first_bad_normal(
             (!arg_applicable(
                 model,
                 argument,
-                arg_constants.get(index).copied().flatten(),
+                arg_constants.get(index).copied().unwrap_or_default(),
                 parameter,
+                version,
             ))
             .then(|| OverloadResult::BadArgument {
                 index,
@@ -21531,7 +22815,8 @@ fn first_bad_expanded(
     model: &Model,
     method: &MethodSymbol,
     arguments: &[TypeSymbol],
-    arg_constants: &[Option<i64>],
+    arg_constants: &[ArgumentConstant],
+    version: LanguageVersion,
 ) -> Option<OverloadResult> {
     if !method.accepts_expanded_count(arguments.len()) {
         return None;
@@ -21549,8 +22834,9 @@ fn first_bad_expanded(
         (!arg_applicable(
             model,
             argument,
-            arg_constants.get(index).copied().flatten(),
+            arg_constants.get(index).copied().unwrap_or_default(),
             parameter,
+            version,
         ))
         .then(|| OverloadResult::BadArgument {
             index,
@@ -21567,10 +22853,28 @@ fn is_applicable(
     model: &Model,
     method: &MethodSymbol,
     arguments: &[TypeSymbol],
-    arg_constants: &[Option<i64>],
+    arg_constants: &[ArgumentConstant],
+    version: LanguageVersion,
 ) -> bool {
-    is_normal_applicable(model, method, arguments, arg_constants)
-        || (method.is_params && is_applicable_expanded(model, method, arguments, arg_constants))
+    is_normal_applicable(model, method, arguments, arg_constants, version)
+        || (method.is_params && is_applicable_expanded(model, method, arguments, arg_constants, version))
+}
+
+/// [`is_applicable`] for a call compiled at `version`: below C# 4 a default fills no parameter, so
+/// a candidate that needs one is not applicable, and what a reduction to the most derived tier
+/// asks before overload resolution must agree with what [`resolve_overload`] then answers.
+fn is_applicable_at(
+    model: &Model,
+    method: &MethodSymbol,
+    arguments: &[TypeSymbol],
+    arg_constants: &[ArgumentConstant],
+    version: LanguageVersion,
+) -> bool {
+    if version.supports(Feature::DefaultParameterValues) {
+        is_applicable(model, method, arguments, arg_constants, version)
+    } else {
+        is_applicable(model, &method.without_defaults(), arguments, arg_constants, version)
+    }
 }
 
 /// Whether a method applies in NORMAL form: the counts match and every argument converts
@@ -21582,7 +22886,8 @@ fn is_normal_applicable(
     model: &Model,
     method: &MethodSymbol,
     arguments: &[TypeSymbol],
-    arg_constants: &[Option<i64>],
+    arg_constants: &[ArgumentConstant],
+    version: LanguageVersion,
 ) -> bool {
     if method.is_vararg {
         let Some((last, fixed)) = arguments.split_last() else {
@@ -21598,8 +22903,9 @@ fn is_normal_applicable(
                     arg_applicable(
                         model,
                         argument,
-                        arg_constants.get(i).copied().flatten(),
+                        arg_constants.get(i).copied().unwrap_or_default(),
                         parameter,
+                        version,
                     )
                 });
     }
@@ -21611,7 +22917,7 @@ fn is_normal_applicable(
         .zip(&method.parameters)
         .enumerate()
         .all(|(i, (argument, parameter))| {
-            arg_applicable(model, argument, arg_constants.get(i).copied().flatten(), parameter)
+            arg_applicable(model, argument, arg_constants.get(i).copied().unwrap_or_default(), parameter, version)
         })
 }
 
@@ -21621,7 +22927,8 @@ fn is_applicable_expanded(
     model: &Model,
     method: &MethodSymbol,
     arguments: &[TypeSymbol],
-    arg_constants: &[Option<i64>],
+    arg_constants: &[ArgumentConstant],
+    version: LanguageVersion,
 ) -> bool {
     if !method.accepts_expanded_count(arguments.len()) {
         return false;
@@ -21633,7 +22940,7 @@ fn is_applicable_expanded(
         .zip(&method.parameters[..supplied])
         .enumerate()
         .all(|(i, (argument, parameter))| {
-            arg_applicable(model, argument, arg_constants.get(i).copied().flatten(), parameter)
+            arg_applicable(model, argument, arg_constants.get(i).copied().unwrap_or_default(), parameter, version)
         })
     {
         return false;
@@ -21645,8 +22952,9 @@ fn is_applicable_expanded(
         arg_applicable(
             model,
             argument,
-            arg_constants.get(fixed + offset).copied().flatten(),
+            arg_constants.get(fixed + offset).copied().unwrap_or_default(),
             element,
+            version,
         )
     })
 }
@@ -21657,12 +22965,13 @@ fn best_candidate<'a>(
     model: &Model,
     applicable: &[&'a MethodSymbol],
     arguments: &[TypeSymbol],
-    arg_constants: &[Option<i64>],
+    arg_constants: &[ArgumentConstant],
+    version: LanguageVersion,
 ) -> Option<&'a MethodSymbol> {
     applicable.iter().copied().find(|&candidate| {
         applicable.iter().all(|&other| {
             core::ptr::eq(candidate, other)
-                || is_better(model, candidate, other, arguments, arg_constants)
+                || is_better(model, candidate, other, arguments, arg_constants, version)
         })
     })
 }
@@ -21697,91 +23006,600 @@ fn argument_parameter_types(
         .collect()
 }
 
-/// Whether `c1` is a better function member than `c2` for the arguments (12.6.4.3): no worse a
-/// conversion for any argument and a better one for at least one -- and only when every argument
-/// converts equally well to two IDENTICAL parameter type sequences, the tie-breaks.
-///
-/// **THE CONVERSIONS DECIDE FIRST, AND THE TIE-BREAKS ONLY BREAK A TIE.** Each argument is
-/// compared against the parameter it converts to in the form its candidate applies in -- an
-/// expanded `params` candidate's element type for the arguments in its array -- so `N(1)` takes
-/// `N(params int[])` over `N(object)` (`int` is the better target), and `O(1)` takes
-/// `O(int, int b = 0)` over `O(long)`. Asking normal-versus-expanded and the parameter counts
-/// FIRST answered both the other way, silently, and made `String.Join(",", "solo")` call
-/// `Join<char>` and print `s,o,l,o`.
+/// One applicable candidate as better-function-member reads it: its parameter type for each
+/// argument, in the ARGUMENTS' order, with every parameter no argument reaches removed.
+struct Judged<'a> {
+    method: &'a MethodSymbol,
+    /// Applicable in its normal form, rather than only in its expanded one.
+    normal: bool,
+    /// The parameter type each argument converts to, argument by argument.
+    types: Vec<TypeSymbol>,
+    /// Supplied parameters in argument order, with an expanded array represented once.
+    parameter_order: Vec<usize>,
+    /// How many of its parameters the form uses, counting one a default fills and each element of
+    /// an expansion, not counting a `params` array nothing went into.
+    used: usize,
+    /// It leaves a parameter other than a `params` array to its default.
+    defaulted: bool,
+}
+
+impl<'a> Judged<'a> {
+    fn positional(
+        model: &Model,
+        method: &'a MethodSymbol,
+        arguments: &[TypeSymbol],
+        arg_constants: &[ArgumentConstant],
+        version: LanguageVersion,
+    ) -> Judged<'a> {
+        let normal = is_normal_applicable(model, method, arguments, arg_constants, version);
+        let declared = method.parameters.len();
+        let fixed = if normal { declared } else { declared.saturating_sub(1) };
+        Judged {
+            method,
+            normal,
+            types: argument_parameter_types(method, arguments.len(), normal),
+            parameter_order: (0..arguments.len().min(declared)).collect(),
+            used: if normal { declared } else { arguments.len().max(fixed) },
+            defaulted: arguments.len() < fixed,
+        }
+    }
+
+    /// A call with named arguments. `own` is the call in `method`'s parameter order, which is what
+    /// applicability and the form are judged on; the types are put back in the arguments' order.
+    fn named(
+        model: &Model,
+        method: &'a MethodSymbol,
+        own: &[TypeSymbol],
+        own_constants: &[ArgumentConstant],
+        names: &[Option<(&str, Span)>],
+        version: LanguageVersion,
+    ) -> Judged<'a> {
+        let declared = method.parameters.len();
+        let params_slot = declared.saturating_sub(1);
+        let filled = map_arguments(method, names).unwrap_or_default();
+        let params_omitted = method.is_params && filled.get(params_slot).is_some_and(Option::is_none);
+        let normal = !params_omitted && is_normal_applicable(model, method, own, own_constants, version);
+        Self::mapped(method, &filled, names.len(), normal)
+    }
+
+    /// Keeps source argument correspondence for either applicable parameter form.
+    fn mapped(
+        method: &'a MethodSymbol,
+        filled: &[Option<usize>],
+        argument_count: usize,
+        normal: bool,
+    ) -> Judged<'a> {
+        let declared = method.parameters.len();
+        let params_slot = declared.saturating_sub(1);
+        let parameter_of = |argument: usize| filled.iter().position(|slot| *slot == Some(argument));
+        let element = match method.parameters.last() {
+            Some(TypeSymbol::Array { element, .. }) if !normal => Some(&**element),
+            _ => None,
+        };
+        let types = (0..argument_count)
+            .filter_map(|argument| {
+                let parameter = parameter_of(argument)?;
+                if parameter >= params_slot && element.is_some() {
+                    element.cloned()
+                } else {
+                    method.parameters.get(parameter).cloned()
+                }
+            })
+            .collect();
+        let fixed = if normal { declared } else { params_slot };
+        let expanded_elements = filled.iter().skip(params_slot).flatten().count();
+        Judged {
+            method,
+            normal,
+            types,
+            parameter_order: (0..argument_count).filter_map(parameter_of).collect(),
+            used: if normal { declared } else { fixed + expanded_elements },
+            defaulted: filled.iter().take(fixed).any(Option::is_none),
+        }
+    }
+
+    /// Arguments packed into the array of an expanded form, excluding omitted defaults.
+    fn params_elements(&self) -> usize {
+        self.used.saturating_sub(self.method.parameters.len().saturating_sub(1))
+    }
+
+    /// Original parameter types in the same correspondence as the supplied arguments.
+    /// Optional parameters that were omitted cannot decide specificity. Through C# 7, the
+    /// unexpanded array participates even when it takes no elements; later versions compare
+    /// only the parameters that received arguments.
+    fn specificity_types(&self, open: &[TypeSymbol], version: LanguageVersion) -> Vec<TypeSymbol> {
+        let mut types: Vec<TypeSymbol> = self.parameter_order.iter()
+            .filter_map(|&parameter| open.get(parameter).cloned())
+            .collect();
+        if version < LanguageVersion::CSharp8
+            && self.method.is_params
+            && !self.normal
+            && self.params_elements() == 0
+        {
+            if let Some(array) = open.last() {
+                types.push(array.clone());
+            }
+        }
+        types
+    }
+
+    /// `Some` in either direction stops a lower-priority tie-break from reversing specificity.
+    fn compare_specificity(&self, other: &Judged<'_>, version: LanguageVersion) -> Option<bool> {
+        let (Some(left), Some(right)) = (
+            &self.method.uninstantiated_parameters,
+            &other.method.uninstantiated_parameters,
+        ) else {
+            return None;
+        };
+        let left = self.specificity_types(left, version);
+        let right = other.specificity_types(right, version);
+        if more_specific(&left, &right) {
+            Some(true)
+        } else if more_specific(&right, &left) {
+            Some(false)
+        } else {
+            None
+        }
+    }
+
+    /// Whether this is a better function member than `other` for the arguments (12.6.4.3): a better
+    /// conversion for at least one argument and a worse one for none. An argument whose two
+    /// parameter types this code cannot judge decides against both, so such a call stays CS0121
+    /// rather than binding on what the other arguments say.
+    ///
+    /// When neither is better, and from C# 8, newer than any edition of the standard, also when each
+    /// is better for some argument, csc tells two candidates apart by the parameters their forms use:
+    /// measured on csc 10.0.301, the normal form over the expanded one when the counts differ
+    /// (`J(string, int[] b = null)` over `J(char[], params int[])` for `J(null)`), and otherwise the
+    /// candidate with an argument for every parameter (`A(char[])` over `A(string, int o = 0)` for
+    /// `A(null)`, and `Q<T>(T)` over `Q(int, int b = 0)` for `Q(1)`, so non-generic over generic is NOT
+    /// among these). Two whose counts match, or neither of whose counts match the arguments, stay
+    /// tied unless their parameter types are identical.
+    ///
+    /// **THE CONVERSIONS DECIDE FIRST, AND THE TIE-BREAKS ONLY BREAK A TIE.** Each argument is
+    /// compared against the parameter it converts to in the form its candidate applies in -- an
+    /// expanded `params` candidate's element type for the arguments in its array -- so `N(1)` takes
+    /// `N(params int[])` over `N(object)` (`int` is the better target), and `O(1)` takes
+    /// `O(int, int b = 0)` over `O(long)`. Asking normal-versus-expanded and the parameter counts
+    /// FIRST answered both the other way, silently, and made `String.Join(",", "solo")` call
+    /// `Join<char>` and print `s,o,l,o`.
+    fn is_better_than(
+        &self,
+        model: &Model,
+        other: &Judged<'_>,
+        arguments: &[TypeSymbol],
+        version: LanguageVersion,
+    ) -> bool {
+        self.is_better_by(other, arguments.len(), version, |index, first, second| {
+            better_conversion(model, &arguments[index], first, second, version)
+        })
+    }
+
+    /// Expression-specific conversion comparisons feed the same edition-dependent tie rules.
+    fn is_better_by(
+        &self,
+        other: &Judged<'_>,
+        argument_count: usize,
+        version: LanguageVersion,
+        mut compare: impl FnMut(usize, &TypeSymbol, &TypeSymbol) -> Better,
+    ) -> bool {
+        let (mut better, mut worse) = (false, false);
+        for (index, (p1, p2)) in self.types.iter().zip(&other.types).enumerate() {
+            if p1 == p2 {
+                continue;
+            }
+            match compare(index, p1, p2) {
+                Better::First => better = true,
+                Better::Second => worse = true,
+                Better::Neither => {}
+                Better::NotJudged => return false,
+            }
+        }
+        if better != worse {
+            return better;
+        }
+        if version >= LanguageVersion::CSharp8 && self.used != other.used {
+            if self.normal != other.normal {
+                return self.normal;
+            }
+            return self.used == argument_count;
+        }
+        if better || self.types != other.types {
+            return false;
+        }
+        if version < LanguageVersion::CSharp2 && self.normal != other.normal {
+            // The second edition suppresses an expanded signature that matches an applicable
+            // normal signature (14.4.2.1).
+            return self.normal;
+        }
+        let (c1, c2) = (self.method, other.method);
+        // Imported methods can be generic even when the calling syntax predates generics.
+        // Their identical inferred signatures use the nongeneric preference (12.6.4.3).
+        if c1.is_generic() != c2.is_generic() {
+            return !c1.is_generic();
+        }
+        if version < LanguageVersion::CSharp2 {
+            // The second edition has no arity or specificity tie-break.
+            return false;
+        }
+        if self.normal != other.normal {
+            return self.normal;
+        }
+        if version <= LanguageVersion::CSharp4 {
+            // Fourth edition 14.4.2.2 and C# 3/4 compare declared counts. C# 4, 7.5.3.2
+            // places this before defaults and does not restrict it to expanded forms.
+            if c1.parameters.len() != c2.parameters.len() {
+                return c1.parameters.len() > c2.parameters.len();
+            }
+            if self.defaulted != other.defaulted {
+                return !self.defaulted;
+            }
+            return self.compare_specificity(other, version).unwrap_or(false);
+        }
+        // From C# 8, absence of defaults precedes specificity, even at equal used counts.
+        if version >= LanguageVersion::CSharp8 && self.defaulted != other.defaulted {
+            return !self.defaulted;
+        }
+        // Fifth through seventh editions compare actual array elements, then specificity,
+        // then defaults. Two empty expansions tie regardless of omitted optional parameters.
+        if !self.normal && self.params_elements() != other.params_elements() {
+            return self.params_elements() < other.params_elements();
+        }
+        if let Some(better) = self.compare_specificity(other, version) {
+            return better;
+        }
+        self.defaulted != other.defaulted && !self.defaulted
+    }
+}
+
+/// Whether `c1` is a better function member than `c2` for a positional argument list (12.6.4.3).
 fn is_better(
     model: &Model,
     c1: &MethodSymbol,
     c2: &MethodSymbol,
     arguments: &[TypeSymbol],
-    arg_constants: &[Option<i64>],
+    arg_constants: &[ArgumentConstant],
+    version: LanguageVersion,
 ) -> bool {
-    let c1_normal = is_normal_applicable(model, c1, arguments, arg_constants);
-    let c2_normal = is_normal_applicable(model, c2, arguments, arg_constants);
-    let q1 = argument_parameter_types(c1, arguments.len(), c1_normal);
-    let q2 = argument_parameter_types(c2, arguments.len(), c2_normal);
-    let mut strictly_better_somewhere = false;
-    for (index, (p1, p2)) in q1.iter().zip(&q2).enumerate() {
-        if p1 == p2 {
-            continue;
+    Judged::positional(model, c1, arguments, arg_constants, version).is_better_than(
+        model,
+        &Judged::positional(model, c2, arguments, arg_constants, version),
+        arguments,
+        version,
+    )
+}
+
+/// Which of two parameter types is the better conversion for one argument.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Better {
+    First,
+    Second,
+    /// The argument converts as well to one as to the other, which is no worse for either: every
+    /// edition asks only that "the implicit conversion from EX to QX is not better than the implicit
+    /// conversion from EX to PX". `null` to `char[]` and to `string` is this, so `F(null, 1)` takes
+    /// `F(char[], int)` over `F(string, long)`, as every edition and csc 10.0.301 do.
+    Neither,
+    /// The relation between the two types is one this code does not model.
+    NotJudged,
+}
+
+/// The better conversion from an argument of type `argument` (ECMA-334 2nd edition 14.4.2.3, 4th
+/// 14.4.2.3, the C# 4.0 specification 7.5.3.3 and 7.5.3.5): the type that is the argument's own,
+/// else the better conversion target.
+fn better_conversion(
+    model: &Model,
+    argument: &TypeSymbol,
+    p1: &TypeSymbol,
+    p2: &TypeSymbol,
+    version: LanguageVersion,
+) -> Better {
+    if !is_default_literal_marker(argument) && typeless_kind(argument).is_none() {
+        if argument == p1 {
+            return Better::First;
         }
-        let arg = &arguments[index];
-        // A conditional or switch expression with no type of its own converts to both the same
-        // way, by converting each arm, so for it too only the two parameter types decide.
-        let (std1, std2) = if is_default_literal_marker(arg) || typeless_kind(arg).is_some() {
-            (true, true)
-        } else {
-            (converts(model, arg, p1), converts(model, arg, p2))
-        };
-        if std1 != std2 {
-            if std1 {
-                strictly_better_somewhere = true;
-                continue;
+        if argument == p2 {
+            return Better::Second;
+        }
+    }
+    better_target(model, p1, p2, version)
+}
+
+/// The better conversion target, including numeric and recursive result-type preferences.
+fn better_target(model: &Model, p1: &TypeSymbol, p2: &TypeSymbol, version: LanguageVersion) -> Better {
+    better_target_at_depth(model, p1, p2, version, 0)
+}
+
+fn better_target_at_depth(
+    model: &Model,
+    p1: &TypeSymbol,
+    p2: &TypeSymbol,
+    version: LanguageVersion,
+    depth: u32,
+) -> Better {
+    match (
+        implicit_conversion_exists(model, p1, p2, version),
+        implicit_conversion_exists(model, p2, p1, version),
+    ) {
+        (Some(true), Some(false)) => Better::First,
+        (Some(false), Some(true)) => Better::Second,
+        (Some(true), Some(true)) => Better::Neither,
+        (Some(false), Some(false)) => {
+            if signed_preferred(p1, p2, version) {
+                Better::First
+            } else if signed_preferred(p2, p1, version) {
+                Better::Second
+            } else {
+                let task = better_task_result(model, p1, p2, version, depth);
+                if task != Better::Neither {
+                    task
+                } else {
+                    better_delegate_result(model, p1, p2, version, depth)
+                }
             }
-            return false;
         }
-        if converts(model, p1, p2) || lifted_converts(model, p1, p2) || signed_preferred(p1, p2) {
-            strictly_better_somewhere = true;
-        } else {
-            return false;
+        _ => Better::NotJudged,
+    }
+}
+
+/// `Task<S1>` over `Task<S2>` when `S1` is the better conversion target than `S2`, in the 6th edition
+/// 11.6.4.6 and the 7th 12.6.4.7, and no earlier.
+fn better_task_result(
+    model: &Model,
+    p1: &TypeSymbol,
+    p2: &TypeSymbol,
+    version: LanguageVersion,
+    depth: u32,
+) -> Better {
+    if version < LanguageVersion::CSharp6 {
+        return Better::Neither;
+    }
+    match (task_result(p1), task_result(p2)) {
+        (Some(s1), Some(s2)) if s1 == s2 => Better::Neither,
+        (Some(s1), Some(s2)) => better_projected_target(model, s1, s2, version, depth),
+        _ => Better::Neither,
+    }
+}
+
+/// Result projections share a recursion budget so recursive delegate signatures terminate.
+fn better_projected_target(
+    model: &Model,
+    p1: &TypeSymbol,
+    p2: &TypeSymbol,
+    version: LanguageVersion,
+    depth: u32,
+) -> Better {
+    if version >= LanguageVersion::CSharp8 && depth >= 101 {
+        Better::Neither
+    } else {
+        better_target_at_depth(model, p1, p2, version, depth + 1)
+    }
+}
+
+/// From C# 8, delegate and expression-tree targets compare their return types independently
+/// of their parameter lists. This preference does not create a conversion between the targets.
+fn better_delegate_result(
+    model: &Model,
+    p1: &TypeSymbol,
+    p2: &TypeSymbol,
+    version: LanguageVersion,
+    depth: u32,
+) -> Better {
+    if version < LanguageVersion::CSharp8 {
+        return Better::Neither;
+    }
+    let (Some(r1), Some(r2)) = (delegate_result(model, p1), delegate_result(model, p2)) else {
+        return Better::Neither;
+    };
+    let is_void = |ty: &TypeSymbol| matches!(ty, TypeSymbol::Special(SpecialType::Void));
+    match (is_void(&r1), is_void(&r2)) {
+        (false, true) => Better::First,
+        (true, false) => Better::Second,
+        (true, true) => Better::Neither,
+        (false, false) => better_projected_target(model, &r1, &r2, version, depth),
+    }
+}
+
+fn delegate_result(model: &Model, ty: &TypeSymbol) -> Option<TypeSymbol> {
+    let delegate = match ty {
+        TypeSymbol::Instantiation { definition, arguments }
+            if arguments.len() == 1
+                && matches!(&definition[..], [a, b, c, name]
+                    if &**a == "System" && &**b == "Linq" && &**c == "Expressions"
+                        && &**name == "Expression") => &arguments[0],
+        _ => ty,
+    };
+    let info = model.get_by_symbol(delegate)?;
+    if info.kind != TypeKind::Delegate {
+        return None;
+    }
+    info.methods.iter().find(|method| &*method.name == "Invoke").map(|method| method.return_type.clone())
+}
+
+fn task_result(ty: &TypeSymbol) -> Option<&TypeSymbol> {
+    let TypeSymbol::Instantiation { definition, arguments } = ty else {
+        return None;
+    };
+    (arguments.len() == 1
+        && matches!(&definition[..], [a, b, c, name]
+            if &**a == "System" && &**b == "Threading" && &**c == "Tasks" && &**name == "Task"))
+    .then(|| &arguments[0])
+}
+
+/// Whether an implicit conversion exists between two types (13.1), for ranking them: `None` when the
+/// answer is outside what this code models, so an unresolved type parameter stays
+/// CS0121 rather than reading as "no conversion". [`converts`] answers whether a VALUE converts
+/// and so admits what the emitter lowers; this is the wider relation the better-conversion rules are
+/// written over, and nothing is converted by it.
+fn implicit_conversion_exists(
+    model: &Model,
+    from: &TypeSymbol,
+    to: &TypeSymbol,
+    version: LanguageVersion,
+) -> Option<bool> {
+    if !type_is_modeled(model, from) || !type_is_modeled(model, to) {
+        return None;
+    }
+    if crate::conversion::converts_at_version(model, from, to, version) {
+        return Some(true);
+    }
+    if user_conversion_exists(model, from, to, version) {
+        return Some(true);
+    }
+    // Nullable target ranking recurses through the underlying relation, including
+    // tuple conversions. This query emits no nullable value conversion.
+    if let Some(target) = crate::conversion::nullable_underlying(to) {
+        let source = crate::conversion::nullable_underlying(from).unwrap_or(from);
+        return implicit_conversion_exists(model, source, target, version);
+    }
+    match (from, to) {
+        (TypeSymbol::Pointer(_), TypeSymbol::Pointer(target)) => {
+            Some(matches!(**target, TypeSymbol::Special(SpecialType::Void)))
         }
+        (_, TypeSymbol::Instantiation { .. }) => tuple_conversion_exists(model, from, to, version),
+        _ => Some(false),
     }
-    if strictly_better_somewhere {
-        return true;
+}
+
+/// Whether every part of `ty` is one the model describes. A type parameter is not, nor is anything
+/// that names one, and neither is a by-reference parameter's type.
+fn type_is_modeled(model: &Model, ty: &TypeSymbol) -> bool {
+    match ty {
+        TypeSymbol::Special(_) => true,
+        TypeSymbol::Array { element, .. } | TypeSymbol::Pointer(element) => type_is_modeled(model, element),
+        TypeSymbol::Named(_) => model.get_by_symbol(ty).is_some(),
+        TypeSymbol::Instantiation { arguments, .. } => {
+            model.get_by_symbol(ty).is_some()
+                && arguments.iter().all(|argument| type_is_modeled(model, argument))
+        }
+        _ => false,
     }
-    if q1 != q2 {
+}
+
+/// A user-defined implicit conversion (the C# 4.0 specification 6.4.4): an operator on the source
+/// type's or the target type's class chain whose parameter the source standard-converts to and whose
+/// result standard-converts to the target, or its lifted form between two nullable types.
+fn user_conversion_exists(
+    model: &Model,
+    from: &TypeSymbol,
+    to: &TypeSymbol,
+    version: LanguageVersion,
+) -> bool {
+    if crate::conversion::no_conversion_operator_can_exist(model, from, to) {
         return false;
     }
-    if c1.type_parameters.is_empty() != c2.type_parameters.is_empty() {
-        return c1.type_parameters.is_empty();
-    }
-    if c1_normal != c2_normal {
-        return c1_normal;
-    }
-    let defaulted = |method: &MethodSymbol, normal: bool| {
-        let fixed = if normal {
-            method.parameters.len()
-        } else {
-            method.parameters.len().saturating_sub(1)
-        };
-        arguments.len() < fixed
+    let standard = |source: &TypeSymbol, target: &TypeSymbol| {
+        source == target
+            || crate::conversion::converts_at_version(model, source, target, version)
+            || lifted_converts(model, source, target, version)
     };
-    let (d1, d2) = (defaulted(c1, c1_normal), defaulted(c2, c2_normal));
-    if d1 != d2 {
-        return !d1;
+    let from_value = crate::conversion::nullable_underlying(from);
+    let to_value = crate::conversion::nullable_underlying(to);
+    [from_value.unwrap_or(from), to_value.unwrap_or(to)].into_iter().any(|owner| {
+        let mut stack = alloc::vec![owner.clone()];
+        let mut seen: Vec<TypeSymbol> = Vec::new();
+        while let Some(ty) = stack.pop() {
+            if seen.contains(&ty) {
+                continue;
+            }
+            if let Some(info) = model.get_by_symbol(&ty) {
+                let found = info.methods.iter().any(|method| {
+                    if &*method.name != "op_Implicit" || method.parameters.len() != 1 {
+                        return false;
+                    }
+                    let (parameter, result) = (&method.parameters[0], &method.return_type);
+                    (standard(from, parameter) && standard(result, to))
+                        || matches!((from_value, to_value), (Some(source), Some(target))
+                            if standard(source, parameter) && standard(result, target))
+                });
+                if found {
+                    return true;
+                }
+                stack.extend(info.bases.iter().cloned());
+            }
+            seen.push(ty);
+        }
+        false
+    })
+}
+
+fn is_tuple_definition(definition: &[Box<str>]) -> bool {
+    matches!(definition, [a, name] if &**a == "System" && &**name == "ValueTuple")
+}
+
+/// The elements of a tuple, flattening only its eighth-argument Rest chain.
+/// A one-element tail completes a larger tuple; a standalone one-element
+/// ValueTuple participates in conversions only from C# 8.
+fn tuple_elements(ty: &TypeSymbol, version: LanguageVersion) -> Option<Vec<&TypeSymbol>> {
+    let mut elements = Vec::new();
+    let mut rest = ty;
+    loop {
+        let TypeSymbol::Instantiation { definition, arguments } = rest else {
+            return None;
+        };
+        if !is_tuple_definition(definition)
+            || (arguments.len() == 1 && elements.is_empty() && version < LanguageVersion::CSharp8)
+        {
+            return None;
+        }
+        match arguments.len() {
+            1..=7 => {
+                elements.extend(arguments);
+                return Some(elements);
+            }
+            8 => {
+                elements.extend(&arguments[..7]);
+                rest = &arguments[7];
+            }
+            _ => return None,
+        }
     }
-    !c1_normal && !d1 && c1.parameters.len() > c2.parameters.len()
+}
+
+/// A tuple conversion, element by element, from C# 7 (7th edition 10.2.13).
+fn tuple_conversion_exists(
+    model: &Model,
+    from: &TypeSymbol,
+    to: &TypeSymbol,
+    version: LanguageVersion,
+) -> Option<bool> {
+    if version < LanguageVersion::CSharp7 {
+        return Some(false);
+    }
+    let (Some(from), Some(to)) = (tuple_elements(from, version), tuple_elements(to, version)) else {
+        return Some(false);
+    };
+    if from.len() != to.len() {
+        return Some(false);
+    }
+    let mut answer = Some(true);
+    for (source, target) in from.into_iter().zip(to) {
+        if source == target {
+            continue;
+        }
+        match implicit_conversion_exists(model, source, target, version) {
+            Some(true) => {}
+            Some(false) => return Some(false),
+            None => answer = None,
+        }
+    }
+    answer
 }
 
 /// Whether `from` converts to `to` as two NULLABLE types whose underlying types convert: the
 /// lifted conversion `S? -> T?` (13.7.2), by which `int?` is a better parameter type than `long?`.
 ///
 /// Asked only to RANK two parameter types against each other; nothing is converted by it.
-fn lifted_converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
+fn lifted_converts(
+    model: &Model,
+    from: &TypeSymbol,
+    to: &TypeSymbol,
+    version: LanguageVersion,
+) -> bool {
     match (
         crate::conversion::nullable_underlying(from),
         crate::conversion::nullable_underlying(to),
     ) {
-        (Some(from), Some(to)) => from == to || converts(model, from, to),
+        (Some(from), Some(to)) => crate::conversion::converts_at_version(model, from, to, version),
         _ => false,
     }
 }
@@ -21791,8 +23609,19 @@ fn lifted_converts(model: &Model, from: &TypeSymbol, to: &TypeSymbol) -> bool {
 /// other (`sbyte` over byte/ushort/uint/ulong; `short` over ushort/uint/ulong; `int`
 /// over uint/ulong; `long` over ulong). This is what makes `Console.WriteLine(byte)`
 /// resolve to the `int` overload rather than report a spurious CS0121.
-fn signed_preferred(p1: &TypeSymbol, p2: &TypeSymbol) -> bool {
+///
+/// "T1 is S1 or S1? where S1 is a signed integral type" is the 6th edition 11.6.4.6's and the 7th's
+/// 12.6.4.7; every earlier text lists only the plain types, so `int?` over `uint?` starts at C# 6.
+fn signed_preferred(p1: &TypeSymbol, p2: &TypeSymbol, version: LanguageVersion) -> bool {
     use SpecialType as S;
+    let (p1, p2) = if version >= LanguageVersion::CSharp6 {
+        (
+            crate::conversion::nullable_underlying(p1).unwrap_or(p1),
+            crate::conversion::nullable_underlying(p2).unwrap_or(p2),
+        )
+    } else {
+        (p1, p2)
+    };
     let (Some(a), Some(b)) = (as_special(p1), as_special(p2)) else {
         return false;
     };
@@ -22049,10 +23878,14 @@ impl Typeless {
 /// asks that of each candidate's parameter while it sees only a type per argument. So the marker
 /// holds what that question needs about each arm: its own type, and its value when it is an
 /// integral constant -- `c ? 1 : null` reaches `byte?` only because `1` is a constant.
-fn typeless_marker(kind: Typeless, arms: &[&BoundExpr]) -> TypeSymbol {
+fn typeless_marker(
+    kind: Typeless,
+    arms: &[&BoundExpr],
+    constant: impl Fn(&BoundExpr) -> ArgumentConstant,
+) -> TypeSymbol {
     TypeSymbol::Instantiation {
         definition: [Box::from(kind.display())].into(),
-        arguments: arms.iter().map(|arm| arm_descriptor(arm)).collect(),
+        arguments: arms.iter().map(|arm| arm_descriptor(arm, constant(arm))).collect(),
     }
 }
 
@@ -22081,36 +23914,37 @@ fn typeless_arms(value: &BoundExpr) -> Vec<&BoundExpr> {
     }
 }
 
-/// One arm as a [`typeless_marker`] records it: its type, wrapped with its value when it is an
-/// `int` or `long` constant.
-fn arm_descriptor(arm: &BoundExpr) -> TypeSymbol {
-    let integral = matches!(
-        arm.ty,
-        TypeSymbol::Special(SpecialType::Int32 | SpecialType::Int64)
-    );
-    match constant_int_value(arm) {
-        Some(value) if integral => TypeSymbol::Instantiation {
-            definition: [Box::from("<constant>"), value.to_string().into()].into(),
+/// One arm's type and the expression facts needed for applicability.
+fn arm_descriptor(arm: &BoundExpr, constant: ArgumentConstant) -> TypeSymbol {
+    if constant.integer.is_some() || constant.enum_zero {
+        TypeSymbol::Instantiation {
+            definition: [
+                Box::from("<constant>"),
+                constant.integer.map_or_else(String::new, |value| value.to_string()).into(),
+                if constant.enum_zero { Box::from("enum-zero") } else { Box::from("") },
+            ].into(),
             arguments: [arm.ty.clone()].into(),
-        },
-        _ => arm.ty.clone(),
+        }
+    } else {
+        arm.ty.clone()
     }
 }
 
-/// The arms a [`typeless_marker`] carries, each as its type and its constant value.
-fn typeless_arm_types(ty: &TypeSymbol) -> Option<Vec<(TypeSymbol, Option<i64>)>> {
+/// The arms a [`typeless_marker`] carries, each as its type and constant facts.
+fn typeless_arm_types(ty: &TypeSymbol) -> Option<Vec<(TypeSymbol, ArgumentConstant)>> {
     typeless_kind(ty)?;
     let TypeSymbol::Instantiation { arguments, .. } = ty else {
         return None;
     };
     let decode = |descriptor: &TypeSymbol| match descriptor {
-        TypeSymbol::Instantiation {
-            definition,
-            arguments,
-        } if definition.len() == 2 && &*definition[0] == "<constant>" => {
-            (arguments[0].clone(), definition[1].parse::<i64>().ok())
+        TypeSymbol::Instantiation { definition, arguments }
+            if definition.len() == 3 && &*definition[0] == "<constant>" => {
+            (arguments[0].clone(), ArgumentConstant {
+                integer: definition[1].parse::<i64>().ok(),
+                enum_zero: &*definition[2] == "enum-zero",
+            })
         }
-        other => (other.clone(), None),
+        other => (other.clone(), ArgumentConstant::default()),
     };
     Some(arguments.iter().map(decode).collect())
 }
@@ -22476,6 +24310,15 @@ fn is_lvalue(expr: &BoundExpr) -> bool {
     )
 }
 
+/// The Boolean compounds whose nullable target needs the nullable binary lowering.
+fn nullable_boolean_compound(operator: BinaryOperator, target: &TypeSymbol, value: &BoundExpr) -> bool {
+    let boolean = TypeSymbol::Special(SpecialType::Boolean);
+    matches!(operator, BinaryOperator::BitwiseAnd | BinaryOperator::BitwiseOr | BinaryOperator::BitwiseXor)
+        && crate::conversion::nullable_underlying(target) == Some(&boolean)
+        && (crate::conversion::nullable_underlying(&value.ty).unwrap_or(&value.ty) == &boolean
+            || matches!(value.kind, BoundExprKind::Literal(Literal::Null)))
+}
+
 /// The binary operator underlying a compound assignment, or `None` for simple `=`.
 fn compound_binary_operator(operator: AssignmentOperator) -> Option<BinaryOperator> {
     use AssignmentOperator as A;
@@ -22597,6 +24440,17 @@ fn target_typed_arm(expr: &Expr, at_initializer: bool) -> bool {
     match &expr.kind {
         ExprKind::ObjectCreation { target: None, .. } => true,
         ExprKind::StackAlloc { .. } => at_initializer,
+        _ => false,
+    }
+}
+
+/// Whether a conditional array element has a `new()` arm, including nested conditionals.
+fn implicit_array_new_arm(expr: &Expr) -> bool {
+    match &without_parentheses(expr).kind {
+        ExprKind::ObjectCreation { target: None, .. } => true,
+        ExprKind::Conditional { when_true, when_false, .. } => {
+            implicit_array_new_arm(when_true) || implicit_array_new_arm(when_false)
+        }
         _ => false,
     }
 }
@@ -22738,7 +24592,7 @@ fn unary_operator_symbol(operator: UnaryOperator) -> &'static str {
 /// The type of a literal (9.4.4).
 pub(crate) fn literal_type(literal: &Literal) -> TypeSymbol {
     let special = match literal {
-        Literal::Integer { value, suffix } => integer_literal_type(*value, *suffix),
+        Literal::Integer { value, suffix, .. } => integer_literal_type(*value, *suffix),
         Literal::Real { suffix, .. } => match suffix {
             RealSuffix::Float => SpecialType::Single,
             RealSuffix::Decimal => SpecialType::Decimal,
@@ -23302,6 +25156,7 @@ mod tests {
             is_required: false,
         });
         widget.methods.push(MethodSymbol {
+            is_accessor: false,
             return_tuple_names: Vec::new(),
             return_required_modifiers: Vec::new(),
             explicit_interface: None,
@@ -23319,6 +25174,7 @@ mod tests {
             accessibility: crate::symbols::Accessibility::Public,
             conditional: Vec::new(),
             sets_required_members: false,
+            uninstantiated_parameters: None,
             type_parameters: Vec::new(),
             type_parameter_constraints: Vec::new(),
         });
@@ -23334,6 +25190,209 @@ mod tests {
         assert!(matches!(area.kind, BoundExprKind::MethodGroup { .. }));
         assert!(binder.diagnostics().is_empty());
         binder.bind_expression(&parse_expression("w.missing").expr);
+        assert_eq!(binder.diagnostics().last().map(Diagnostic::code), Some(1061));
+    }
+
+    #[test]
+    fn indexer_accessor_names_do_not_hide_base_fields_in_member_lookup() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let unit = parse_compilation_unit(
+            "class Root { public int get_Item; public int set_Item; } \
+             class Leaf : Root { public int this[int index] { \
+                 get { return 3; } set { } } }",
+        )
+        .unit;
+        let mut model = Model::new();
+        crate::declaration::collect_into(&mut model, &unit);
+        model.link_bases();
+        let mut binder = Binder::with_model(model);
+        binder.enter_scope();
+        binder.declare_local("leaf", type_symbol_in("", "Leaf"));
+        for name in ["get_Item", "set_Item"] {
+            let expression = parse_expression(&alloc::format!("leaf.{name}")).expr;
+            let bound = binder.bind_expression(&expression);
+            let BoundExprKind::FieldAccess { field: Some(field), .. } = &bound.kind else {
+                panic!("{name} must select the inherited field, got {:?}", bound.kind);
+            };
+            assert_eq!(field.declaring_type, type_symbol_in("", "Root"));
+            assert_eq!(bound.ty, TypeSymbol::Special(SpecialType::Int32));
+        }
+        assert!(binder.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn indexer_accessor_names_preserve_ordinary_methods_and_indexer_access() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let unit = parse_compilation_unit(
+            "class Mixed { public int this[int index] { get { return 3; } set { } } \
+                public int get_Item(string key) { return 4; } \
+                public void set_Item(string key, int value) { } }",
+        )
+        .unit;
+        let mut model = Model::new();
+        crate::declaration::collect_into(&mut model, &unit);
+        model.link_bases();
+        let mut binder = Binder::with_model(model);
+        binder.enter_scope();
+        binder.declare_local("mixed", type_symbol_in("", "Mixed"));
+        for name in ["get_Item", "set_Item"] {
+            let expression = parse_expression(&alloc::format!("mixed.{name}")).expr;
+            assert!(matches!(
+                binder.bind_expression(&expression).kind,
+                BoundExprKind::MethodGroup { .. }
+            ));
+        }
+        for source in ["mixed.get_Item(\"key\")", "mixed[0]"] {
+            let bound = binder.bind_expression(&parse_expression(source).expr);
+            assert_eq!(bound.ty, TypeSymbol::Special(SpecialType::Int32));
+        }
+        for source in ["mixed.set_Item(\"key\", 1)", "mixed[0] = 1"] {
+            binder.bind_expression(&parse_expression(source).expr);
+        }
+        assert!(binder.diagnostics().is_empty(), "{:?}", binder.diagnostics());
+    }
+
+    #[test]
+    fn indexer_accessor_names_preserve_inherited_fields_after_instantiation() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let unit = parse_compilation_unit(
+            "class Root<T> { public T get_Item; public T set_Item; } \
+             class Leaf<T> : Root<T> { public T this[int index] { \
+                 get { return default(T); } set { } } }",
+        )
+        .unit;
+        let mut model = Model::new();
+        crate::declaration::collect_into(&mut model, &unit);
+        model.link_bases();
+        let mut binder = Binder::with_model(model);
+        binder.enter_scope();
+        let int = TypeSymbol::Special(SpecialType::Int32);
+        binder.declare_local(
+            "leaf",
+            TypeSymbol::Instantiation {
+                definition: ["Leaf".into()].into(),
+                arguments: [int.clone()].into(),
+            },
+        );
+        for name in ["get_Item", "set_Item"] {
+            let bound = binder.bind_expression(&parse_expression(&alloc::format!("leaf.{name}")).expr);
+            assert!(matches!(bound.kind, BoundExprKind::FieldAccess { .. }));
+            assert_eq!(bound.ty, int);
+            let assignment = parse_expression(&alloc::format!("leaf.{name} = 4")).expr;
+            let bound = binder.bind_expression(&assignment);
+            let BoundExprKind::Assignment { target, .. } = &bound.kind else {
+                panic!("expected field assignment, got {:?}", bound.kind);
+            };
+            assert!(matches!(target.kind, BoundExprKind::FieldAccess { .. }));
+        }
+        assert!(binder.diagnostics().is_empty(), "{:?}", binder.diagnostics());
+    }
+
+    #[test]
+    fn explicit_property_does_not_hide_ordinary_property() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let unit = parse_compilation_unit(
+            "interface ICell { int Value { get; set; } } \
+             class Cell : ICell { int ICell.Value { get { return 1; } set { } } \
+                 public string Value { get { return \"ordinary\"; } } }",
+        )
+        .unit;
+        let mut model = Model::new();
+        crate::declaration::collect_into(&mut model, &unit);
+        model.link_bases();
+        let mut binder = Binder::with_model(model);
+        binder.enter_scope();
+        binder.declare_local("cell", type_symbol_in("", "Cell"));
+        binder.declare_local("view", type_symbol_in("", "ICell"));
+        let ordinary = binder.bind_expression(&parse_expression("cell.Value").expr);
+        assert_eq!(ordinary.ty, TypeSymbol::Special(SpecialType::String));
+        let interface = binder.bind_expression(&parse_expression("view.Value").expr);
+        assert_eq!(interface.ty, TypeSymbol::Special(SpecialType::Int32));
+        binder.bind_expression(&parse_expression("view.Value = 3").expr);
+        assert!(binder.diagnostics().is_empty(), "{:?}", binder.diagnostics());
+    }
+
+    #[test]
+    fn explicit_property_tuple_names_do_not_change_ordinary_element_selection() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        for ordinary_first in [false, true] {
+            let explicit = "(int a, int b) ICell.Value { get { return (1, 2); } }";
+            let ordinary = "public (int b, int a) Value { get { return (10, 20); } }";
+            let members = if ordinary_first {
+                alloc::format!("{ordinary} {explicit}")
+            } else {
+                alloc::format!("{explicit} {ordinary}")
+            };
+            let source = alloc::format!(
+                "namespace System {{ public struct ValueTuple<T1, T2> {{ \
+                    public T1 Item1; public T2 Item2; }} }} \
+                 interface ICell {{ (int a, int b) Value {{ get; }} }} \
+                 class Cell : ICell {{ {members} }}"
+            );
+            let mut model = Model::new();
+            crate::declaration::collect_into(&mut model, &parse_compilation_unit(&source).unit);
+            model.link_bases();
+            let mut binder = Binder::with_model(model);
+            binder.set_language_version(LanguageVersion::CSharp7_3);
+            binder.enter_scope();
+            binder.declare_local("cell", type_symbol_in("", "Cell"));
+            binder.declare_local("view", type_symbol_in("", "ICell"));
+            for (expression, expected) in [("cell.Value.a", "Item2"), ("view.Value.a", "Item1")] {
+                let bound = binder.bind_expression(&parse_expression(expression).expr);
+                assert!(binder.diagnostics().is_empty(), "{:?}", binder.diagnostics());
+                let BoundExprKind::FieldAccess { name, .. } = bound.kind else {
+                    panic!("expected tuple field for {expression}: {:?}", bound.kind);
+                };
+                assert_eq!(&*name, expected, "{expression}, ordinary_first={ordinary_first}");
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_property_does_not_supply_an_ordinary_setter() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        for ordinary_first in [false, true] {
+            let explicit = "int ICell.Value { get { return 1; } set { } }";
+            let ordinary = "public int Value { get { return 2; } }";
+            let members = if ordinary_first {
+                alloc::format!("{ordinary} {explicit}")
+            } else {
+                alloc::format!("{explicit} {ordinary}")
+            };
+            let source = alloc::format!(
+                "interface ICell {{ int Value {{ get; set; }} }} \
+                 class Cell : ICell {{ {members} }}"
+            );
+            let unit = parse_compilation_unit(&source).unit;
+            let mut model = Model::new();
+            crate::declaration::collect_into(&mut model, &unit);
+            model.link_bases();
+            let mut binder = Binder::with_model(model);
+            binder.enter_scope();
+            binder.declare_local("cell", type_symbol_in("", "Cell"));
+            binder.bind_expression(&parse_expression("cell.Value = 3").expr);
+            assert_eq!(
+                binder.diagnostics().iter().map(Diagnostic::code).collect::<Vec<_>>(),
+                [200]
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_property_does_not_declare_a_member_on_the_class() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let unit = parse_compilation_unit(
+            "interface ICell { int Value { get; } } \
+             class Cell : ICell { int ICell.Value { get { return 1; } } }",
+        )
+        .unit;
+        let mut model = Model::new();
+        crate::declaration::collect_into(&mut model, &unit);
+        model.link_bases();
+        let mut binder = Binder::with_model(model);
+        binder.enter_scope();
+        binder.declare_local("cell", type_symbol_in("", "Cell"));
+        binder.bind_expression(&parse_expression("cell.Value").expr);
         assert_eq!(binder.diagnostics().last().map(Diagnostic::code), Some(1061));
     }
 
@@ -23537,6 +25596,7 @@ mod tests {
             is_required: false,
         });
         widget.methods.push(MethodSymbol {
+            is_accessor: false,
             return_tuple_names: Vec::new(),
             return_required_modifiers: Vec::new(),
             explicit_interface: None,
@@ -23554,6 +25614,7 @@ mod tests {
             accessibility: crate::symbols::Accessibility::Public,
             conditional: Vec::new(),
             sets_required_members: false,
+            uninstantiated_parameters: None,
             type_parameters: Vec::new(),
             type_parameter_constraints: Vec::new(),
         });
@@ -23705,6 +25766,383 @@ mod tests {
         assert!(binder.diagnostics().is_empty());
         bound_in_scope(&mut binder, "A.Nope");
         assert!(binder.diagnostics().iter().any(|d| d.code() == 234));
+    }
+
+    #[test]
+    fn unqualified_types_search_enclosing_namespaces_nearest_first() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let unit = parse_compilation_unit(
+            "class Probe { } \
+             namespace World { class Probe { } \
+                 namespace Nested { class Probe { } class Reader { } \
+                     namespace Deep { class Reader { } } } \
+                 namespace Other { class Reader { } } } \
+             namespace Last.Other { class Reader { } }",
+        ).unit;
+        let model = collect_model(&unit);
+        for (enclosing, expected) in [
+            ("World.Nested.Reader", "World.Nested.Probe"),
+            ("World.Nested.Deep.Reader", "World.Nested.Probe"),
+            ("World.Other.Reader", "World.Probe"),
+            ("Last.Other.Reader", "Probe"),
+        ] {
+            let mut binder = Binder::with_model(model.clone());
+            binder.enter_type(named_symbol_from_dotted(enclosing));
+            binder.enter_scope();
+            let wanted = named_symbol_from_dotted(expected);
+            let name = named_symbol_from_dotted("Probe");
+            assert_eq!(bound_in_scope(&mut binder, "Probe"), wanted, "{enclosing}");
+            assert_eq!(binder.canonicalize(&name), wanted, "{enclosing}");
+            assert_eq!(binder.resolve_named_type(&name, Span::empty_at(0)), wanted, "{enclosing}");
+            assert!(binder.diagnostics().is_empty(), "{enclosing}: {:?}", binder.diagnostics());
+        }
+    }
+
+    #[test]
+    fn inherited_nested_type_names_keep_the_declaring_type_identity() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let unit = parse_compilation_unit(
+            "class Root { public class Inner { } public class Middle { public class Leaf { } } } \
+             class Derived : Root { } class Further : Derived { } class Reader { } \
+             namespace N { class Base { public class Inner { } } class Child : N.Base { } }",
+        ).unit;
+        let model = collect_model(&unit);
+        for (written, canonical) in [
+            ("Derived.Inner", "Root.Inner"),
+            ("Further.Inner", "Root.Inner"),
+            ("Derived.Middle.Leaf", "Root.Middle.Leaf"),
+            ("N.Child.Inner", "N.Base.Inner"),
+        ] {
+            let mut binder = Binder::with_model(model.clone());
+            binder.enter_type(named_symbol_from_dotted("Reader"));
+            binder.enter_scope();
+            let wanted = named_symbol_from_dotted(canonical);
+            let name = named_symbol_from_dotted(written);
+            assert_eq!(binder.canonicalize(&name), wanted, "{written}");
+            assert_eq!(binder.resolve_named_type(&name, Span::empty_at(0)), wanted, "{written}");
+            assert_eq!(bound_in_scope(&mut binder, written), wanted, "{written}");
+            assert!(binder.diagnostics().is_empty(), "{written}: {:?}", binder.diagnostics());
+        }
+    }
+
+    #[test]
+    fn inherited_nested_type_lookup_skips_inaccessible_base_declarations() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let unit = parse_compilation_unit(
+            "class Root { public class Nested { } } \
+             class Mid : Root { private new class Nested { } } \
+             class Leaf : Mid { } class Reader { }",
+        ).unit;
+        let model = collect_model(&unit);
+        for (context, written, canonical) in [
+            ("Leaf", "Leaf.Nested", "Root.Nested"),
+            ("Reader", "Leaf.Nested", "Root.Nested"),
+            ("Mid", "Mid.Nested", "Mid.Nested"),
+        ] {
+            let mut binder = Binder::with_model(model.clone());
+            binder.enter_type(named_symbol_from_dotted(context));
+            binder.enter_scope();
+            let wanted = named_symbol_from_dotted(canonical);
+            let name = named_symbol_from_dotted(written);
+            assert_eq!(binder.canonicalize(&name), wanted, "{context}: {written}");
+            assert_eq!(binder.resolve_named_type(&name, Span::empty_at(0)), wanted);
+            assert_eq!(bound_in_scope(&mut binder, written), wanted);
+            assert!(binder.diagnostics().is_empty(), "{:?}", binder.diagnostics());
+        }
+    }
+
+    #[test]
+    fn imported_outer_type_ambiguity_counts_accessible_candidates() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let unit = parse_compilation_unit(
+            "namespace A { internal class Outer { public class Inner { } } } \
+             namespace B { public class Outer { public class Inner { } } } class Reader { }"
+        ).unit;
+        for imports in [["A", "B"], ["B", "A"]] {
+            for (external, friend, public, ambiguous) in [
+                (true, false, false, false),
+                (false, false, false, true),
+                (true, true, false, true),
+                (true, false, true, true),
+            ] {
+                let mut model = collect_model(&unit);
+                let outer = model.get_mut("A", "Outer").unwrap();
+                outer.is_external = external;
+                outer.internals_visible = friend;
+                if public {
+                    outer.accessibility = Accessibility::Public;
+                }
+                let mut binder = Binder::with_model(model);
+                for namespace in imports {
+                    binder.import_namespace(namespace);
+                }
+                binder.enter_type(named_symbol_from_dotted("Reader"));
+                binder.enter_scope();
+                let written = named_symbol_from_dotted("Outer.Inner");
+                if ambiguous {
+                    assert!(binder.resolve_named_type(&written, Span::empty_at(0)).is_error(),
+                        "{imports:?}: external={external}, friend={friend}, public={public}");
+                } else {
+                    let expected = named_symbol_from_dotted("B.Outer.Inner");
+                    assert_eq!(binder.canonicalize(&written), expected, "{imports:?}");
+                    assert_eq!(binder.resolve_named_type(&written, Span::empty_at(0)), expected);
+                    assert_eq!(bound_in_scope(&mut binder, "Outer.Inner"), expected);
+                    assert_eq!(bound_in_scope(&mut binder, "Outer"), named_symbol_from_dotted("B.Outer"));
+                    assert!(binder.diagnostics().is_empty(), "{:?}", binder.diagnostics());
+                }
+            }
+        }
+        for written in ["Outer", "A.Outer"] {
+            let mut model = collect_model(&unit);
+            model.get_mut("A", "Outer").unwrap().is_external = true;
+            let mut binder = Binder::with_model(model);
+            binder.import_namespace("A");
+            binder.enter_type(named_symbol_from_dotted("Reader"));
+            assert!(binder.resolve_named_type(&named_symbol_from_dotted(written), Span::empty_at(0)).is_error());
+            assert_eq!(binder.diagnostics().last().map(Diagnostic::code), Some(122));
+        }
+    }
+
+    #[test]
+    fn imported_outer_type_ambiguity_is_not_resolved_by_its_nested_type() {
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        for (imports, local, ambiguous) in [
+            ("using B; using A; using Outer = B.Outer;", "", false),
+            ("using A; using B;", "", true),
+            ("using B; using A;", "", true),
+            ("using B;", "", false),
+            ("using B; using B;", "", false),
+            ("using A; using B;", "class Outer { public class Inner { } }", false),
+        ] {
+            let source = alloc::format!(
+                "{imports} namespace A {{ public class Outer {{ }} }} \
+                 namespace B {{ public class Outer {{ public class Inner {{ }} }} }} \
+                 {local} class Reader {{ static Outer.Inner Read() {{ return null; }} }}"
+            );
+            let unit = parse_compilation_unit(&source).unit;
+            let errors: Vec<_> = crate::bind_compilation_unit(&unit).into_iter()
+                .filter(|d| d.severity() == lamella_syntax::diagnostic::Severity::Error)
+                .collect();
+            assert_eq!(!errors.is_empty(), ambiguous, "{source}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn type_alias_qualifier_selects_the_nested_type_declaration() {
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        for (imports, target, expected_error) in [
+            ("using A; using B;", "B.Outer", false),
+            ("using B; using A;", "B.Outer", false),
+            ("using B; using A;", "A.Outer", true),
+        ] {
+            let source = alloc::format!(
+                "{imports} using Outer = {target}; \
+                 namespace A {{ public class Outer {{ }} }} \
+                 namespace B {{ public class Outer {{ public class Inner {{ }} }} }} \
+                 class Reader {{ static Outer.Inner Read() {{ return null; }} }}"
+            );
+            let unit = parse_compilation_unit(&source).unit;
+            let errors: Vec<_> = crate::bind_compilation_unit(&unit).into_iter()
+                .filter(|d| d.severity() == lamella_syntax::diagnostic::Severity::Error)
+                .collect();
+            assert_eq!(!errors.is_empty(), expected_error, "{source}: {errors:?}");
+        }
+    }
+
+    #[test]
+    fn inherited_nested_type_metadata_lookup_does_not_drop_generic_arguments() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let unit = parse_compilation_unit(
+            "class Root<T> { public class Inner { } } class Derived : Root<int> { } \
+             class Reader { }",
+        ).unit;
+        let mut binder = Binder::with_model(collect_model(&unit));
+        binder.enter_type(named_symbol_from_dotted("Reader"));
+        let written = named_symbol_from_dotted("Derived.Inner");
+        assert_eq!(binder.canonicalize(&written), written);
+        assert!(binder.nested_type_scope("Derived", "Inner").is_none());
+    }
+
+    #[test]
+    fn static_import_resolves_at_its_declaration_scope() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let members = "class M { public class Item { } public static Item V; \
+            public static Item F() { return null; } }";
+        for root in [String::new(), alloc::format!("namespace Inner {{ {members} }}")] {
+            let source = alloc::format!(
+                "{root} namespace Harbor {{ namespace Inner {{ {members} }} \
+                 namespace Deep {{ namespace Inner {{ {members} }} class Reader {{ }} }} }}"
+            );
+            let unit = parse_compilation_unit(&source).unit;
+            let mut declaring = Binder::with_model(collect_model(&unit));
+            crate::program::qualify_declared_signatures(
+                &mut declaring, &unit.usings, &unit.members, "");
+            let model = declaring.into_model();
+            for (directive, declaring, expected) in [
+                ("using static Inner.M;", "Harbor", "Harbor.Inner.M.Item"),
+                ("using static Inner.M;", "Harbor.Deep", "Harbor.Deep.Inner.M.Item"),
+                ("using static global::Inner.M;", "Harbor", "Inner.M.Item"),
+            ] {
+                if root.is_empty() && directive.contains("global::") {
+                    continue;
+                }
+                let using = parse_compilation_unit(directive).unit.usings.remove(0);
+                let mut binder = Binder::with_model(model.clone());
+                binder.import_using_in_namespace(&using.kind, declaring);
+                binder.enter_type(named_symbol_from_dotted("Harbor.Deep.Reader"));
+                binder.enter_scope();
+                let wanted = named_symbol_from_dotted(expected);
+                assert_eq!(binder.resolve_named_type(&named_symbol_from_dotted("Item"), Span::empty_at(0)),
+                    wanted, "{declaring}: {directive}");
+                assert_eq!(bound_in_scope(&mut binder, "V"), wanted, "{declaring}: {directive}");
+                assert_eq!(bound_in_scope(&mut binder, "F()"), wanted, "{declaring}: {directive}");
+                assert!(binder.diagnostics().is_empty(), "{:?}", binder.diagnostics());
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_import_resolves_at_its_declaration_scope() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        for root in ["", "namespace Inner { class Beacon { } }"] {
+            let source = alloc::format!(
+                "{root} namespace Harbor {{ namespace Inner {{ class Beacon {{ }} }} \
+                 namespace Deep {{ class Reader {{ }} }} }}"
+            );
+            let unit = parse_compilation_unit(&source).unit;
+            for declaring in ["Harbor", "Harbor.Deep"] {
+                let using = parse_compilation_unit("using Inner;").unit.usings.remove(0);
+                let mut binder = Binder::with_model(collect_model(&unit));
+                binder.import_using_in_namespace(&using.kind, declaring);
+                binder.enter_type(named_symbol_from_dotted("Harbor.Deep.Reader"));
+                binder.enter_scope();
+                let written = named_symbol_from_dotted("Beacon");
+                let expected = named_symbol_from_dotted("Harbor.Inner.Beacon");
+                assert_eq!(binder.canonicalize(&written), expected, "{declaring}: {root}");
+                assert_eq!(binder.resolve_named_type(&written, Span::empty_at(0)), expected);
+                assert_eq!(bound_in_scope(&mut binder, "Beacon"), expected);
+                assert!(binder.diagnostics().is_empty(), "{:?}", binder.diagnostics());
+            }
+        }
+    }
+
+    #[test]
+    fn global_using_alias_ignores_nearer_namespace_and_type_names() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        for shadow in [
+            "namespace Inner { class Beacon { } }",
+            "namespace Inner { class Marker { } }",
+            "class Inner { public class Beacon { } }",
+        ] {
+            let source = alloc::format!(
+                "namespace Inner {{ class Beacon {{ }} }} \
+                 namespace Harbor {{ {shadow} namespace Deep {{ class Reader {{ }} }} }}"
+            );
+            let unit = parse_compilation_unit(&source).unit;
+            for (directive, use_site) in [
+                ("using Item = global::Inner.Beacon;", "Item"),
+                ("using Scope = global::Inner;", "Scope.Beacon"),
+            ] {
+                let using = parse_compilation_unit(directive).unit.usings.remove(0);
+                let mut binder = Binder::with_model(collect_model(&unit));
+                binder.import_using_in_namespace(&using.kind, "Harbor");
+                binder.enter_type(named_symbol_from_dotted("Harbor.Deep.Reader"));
+                binder.enter_scope();
+                let wanted = named_symbol_from_dotted("Inner.Beacon");
+                let written = named_symbol_from_dotted(use_site);
+                assert_eq!(binder.canonicalize(&written), wanted, "{directive}: {shadow}");
+                assert_eq!(binder.resolve_named_type(&written, Span::empty_at(0)), wanted,
+                    "{directive}: {shadow}");
+                assert_eq!(bound_in_scope(&mut binder, use_site), wanted, "{directive}: {shadow}");
+                assert!(binder.diagnostics().is_empty(), "{:?}", binder.diagnostics());
+            }
+        }
+    }
+
+    #[test]
+    fn namespace_alias_target_keeps_its_declaration_scope_at_use_sites() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let unit = parse_compilation_unit(
+            "namespace Inner { class Beacon { } } \
+             namespace Harbor { namespace Inner { class Beacon { } } \
+                 namespace Deep { namespace Inner { class Beacon { } } class Reader { } } }",
+        ).unit;
+        let using = parse_compilation_unit("using Scope = Inner;").unit.usings.remove(0);
+        for declaring in ["Harbor", "Harbor.Other"] {
+            let mut binder = Binder::with_model(collect_model(&unit));
+            binder.import_using_in_namespace(&using.kind, declaring);
+            binder.enter_type(named_symbol_from_dotted("Harbor.Deep.Reader"));
+            binder.enter_scope();
+            let target = binder.alias_target("Scope").expect("imported alias");
+            assert_eq!(binder.aliased_namespace(&target).as_deref(), Some("Harbor.Inner"));
+            let wanted = named_symbol_from_dotted("Harbor.Inner.Beacon");
+            let named = named_symbol_from_dotted("Scope.Beacon");
+            assert_eq!(binder.canonicalize(&named), wanted);
+            assert_eq!(binder.resolve_named_type(&named, Span::empty_at(0)), wanted);
+            assert_eq!(bound_in_scope(&mut binder, "Scope.Beacon"), wanted);
+            assert!(binder.diagnostics().is_empty(), "{:?}", binder.diagnostics());
+        }
+    }
+
+    #[test]
+    fn using_aliases_yield_to_nearer_type_declarations() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        let unit = parse_compilation_unit(
+            "namespace Harbor { public class Beacon { } \
+                 public class Base { public class Pick { } } } \
+             namespace Home { public class Pick { } class Reader { } \
+                 namespace Deep { class Reader { } } \
+                 class Owner { public class Pick { } public class Reader { } } } \
+             namespace Other { class Reader { } class Derived : Harbor.Base { } } \
+             namespace Imported { public class Pick { } }",
+        ).unit;
+        let model = collect_model(&unit);
+        for (enclosing, expected) in [
+            ("Home.Reader", "Home.Pick"),
+            ("Home.Deep.Reader", "Home.Pick"),
+            ("Home.Owner.Reader", "Home.Owner.Pick"),
+            ("Other.Derived", "Harbor.Base.Pick"),
+            ("Other.Reader", "Harbor.Beacon"),
+        ] {
+            let mut binder = Binder::with_model(model.clone());
+            binder.import_alias("Pick", named_symbol_from_dotted("Harbor.Beacon"));
+            binder.import_namespace("Imported");
+            binder.enter_type(named_symbol_from_dotted(enclosing));
+            binder.enter_scope();
+            let name = named_symbol_from_dotted("Pick");
+            let wanted = named_symbol_from_dotted(expected);
+            let actual = [
+                bound_in_scope(&mut binder, "Pick"),
+                binder.resolve_type(&name),
+                binder.canonicalize(&name),
+                binder.resolve_named_type(&name, Span::empty_at(0)),
+                binder.simple_name_as_type("Pick").expect("a type"),
+            ];
+            assert!(actual.iter().all(|ty| ty == &wanted), "{enclosing}: {actual:?}");
+            assert!(binder.diagnostics().is_empty(), "{:?}", binder.diagnostics());
+        }
     }
 
     #[test]
@@ -24104,6 +26542,7 @@ mod tests {
             parameters: Vec<TypeSymbol>,
         ) -> MethodSymbol {
             MethodSymbol {
+                is_accessor: false,
                 return_tuple_names: Vec::new(),
                 return_required_modifiers: Vec::new(),
                 explicit_interface: None,
@@ -24121,6 +26560,7 @@ mod tests {
                 accessibility: crate::symbols::Accessibility::Public,
                 conditional: Vec::new(),
                 sets_required_members: false,
+                uninstantiated_parameters: None,
                 type_parameters: Vec::new(),
                 type_parameter_constraints: Vec::new(),
             }
@@ -24388,17 +26828,103 @@ mod tests {
     }
 
     #[test]
+    fn explicit_property_accessors_precede_unrelated_private_methods() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        for (property, method, is_accessor, expected) in [
+            ("int IProp.Value { get { return 1; } set { } }", "get_Value", true, true),
+            ("int IProp.Value { get { return 1; } set { } }", "set_Value", true, true),
+            ("int IOther.Value { get { return 1; } }", "get_Value", true, false),
+            ("string IProp.Value { get { return null; } }", "get_Value", true, false),
+            ("int IProp.Value { set { } }", "get_Value", true, false),
+            ("int IProp.Value { get { return 1; } }", "get_Value", false, false),
+        ] {
+            let source = alloc::format!(
+                "interface IProp {{ int Value {{ get; set; }} }} \
+                 interface IOther {{ int Value {{ get; }} }} \
+                 interface Slots {{ int get_Value(); void set_Value(int value); }} \
+                 class Impl : IProp {{ {property} \
+                     private int get_Value() {{ return 2; }} private void set_Value(int value) {{ }} }} \
+                 class Leaf : Impl, IProp {{ }}"
+            );
+            let unit = parse_compilation_unit(&source).unit;
+            let model = collect_model(&unit);
+            let mut member = model.get("", "Slots").unwrap().methods_named(method)
+                .next().unwrap().clone();
+            member.is_accessor = is_accessor;
+            for context in ["Impl", "Leaf"] {
+                let mut binder = Binder::with_model(model.clone());
+                let class = named_symbol_from_dotted(context);
+                binder.enter_type(class.clone());
+                let status = binder.interface_member_status(
+                    &class, &named_symbol_from_dotted("IProp"), &member,
+                );
+                assert_eq!(status == InterfaceMemberStatus::Implemented, expected,
+                    "{context}: {property}, {method}, accessor={is_accessor}: {status:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn inherited_property_accessors_precede_unrelated_private_methods() {
+        use crate::declaration::collect_model;
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        for (property, method, is_accessor, expected) in [
+            ("public int Value { get { return 1; } set { } }", "get_Value", true, true),
+            ("public int Value { get { return 1; } set { } }", "set_Value", true, true),
+            ("private int Value { get { return 1; } set { } }", "get_Value", true, false),
+            ("public int Value { private get { return 1; } set { } }", "get_Value", true, false),
+            ("public int Value { get { return 1; } private set { } }", "set_Value", true, false),
+            ("public string Value { get { return null; } set { } }", "get_Value", true, false),
+            ("public string Value { get { return null; } set { } }", "set_Value", true, false),
+            ("public static int Value { get { return 1; } set { } }", "get_Value", true, false),
+            ("public int Value { set { } }", "get_Value", true, false),
+            ("public int Value { get { return 1; } }", "set_Value", true, false),
+            ("int IOther.Value { get { return 1; } }", "get_Value", true, false),
+            ("public int Value { get { return 1; } set { } }", "get_Value", false, false),
+        ] {
+            let source = alloc::format!(
+                "interface IProp {{ int Value {{ get; set; }} }} \
+                 interface IOther {{ int Value {{ get; }} }} \
+                 interface Slots {{ int get_Value(); void set_Value(int value); }} \
+                 class Base {{ {property} }} \
+                 class Impl : Base, IProp {{ \
+                   private int get_Value() {{ return 2; }} private void set_Value(int value) {{ }} }} \
+                 class Leaf : Impl, IProp {{ }}"
+            );
+            let unit = parse_compilation_unit(&source).unit;
+            let model = collect_model(&unit);
+            let mut member = model.get("", "Slots").unwrap().methods_named(method)
+                .next().unwrap().clone();
+            member.is_accessor = is_accessor;
+            for context in ["Impl", "Leaf"] {
+                let mut binder = Binder::with_model(model.clone());
+                let class = named_symbol_from_dotted(context);
+                binder.enter_type(class.clone());
+                let status = binder.interface_member_status(
+                    &class, &named_symbol_from_dotted("IProp"), &member,
+                );
+                assert_eq!(status == InterfaceMemberStatus::Implemented, expected,
+                    "{context}: {property}, {method}, accessor={is_accessor}: {status:?}");
+            }
+        }
+    }
+
+    #[test]
     fn interface_accessor_implemented_by_a_property_or_event_is_not_cs0535() {
         use crate::symbols::{
             Accessibility, EventSymbol, MethodSymbol, PropertySymbol, TypeInfo, TypeKind,
         };
         let int = || TypeSymbol::Special(SpecialType::Int32);
         let accessor = |name: &str, parameters: Vec<TypeSymbol>| MethodSymbol {
+            is_accessor: true,
             return_tuple_names: Vec::new(),
             return_required_modifiers: Vec::new(),
             explicit_interface: None,
             name: name.into(),
-            return_type: int(),
+            return_type: if name.starts_with("get_") { int() } else { TypeSymbol::Special(SpecialType::Void) },
             parameters,
             parameter_info: Vec::new(),
             is_static: false,
@@ -24411,6 +26937,7 @@ mod tests {
             accessibility: Accessibility::Public,
             conditional: Vec::new(),
             sets_required_members: false,
+            uninstantiated_parameters: None,
             type_parameters: Vec::new(),
             type_parameter_constraints: Vec::new(),
         };
@@ -24463,6 +26990,9 @@ mod tests {
 
         assert!(implements(vec![property(true, true)], Vec::new(), &get_p));
         assert!(implements(vec![property(true, true)], Vec::new(), &set_p));
+        let mut invalid_setter = set_p.clone();
+        invalid_setter.return_type = int();
+        assert!(!implements(vec![property(true, true)], Vec::new(), &invalid_setter));
         assert!(implements(Vec::new(), vec![event()], &add_e));
         assert!(implements(Vec::new(), vec![event()], &remove_e));
         assert!(!implements(Vec::new(), Vec::new(), &get_p));
@@ -24771,6 +27301,83 @@ mod tests {
         ] {
             assert_eq!(codes(clean), [], "expected no diagnostic for: {clean}");
         }
+    }
+
+    #[test]
+    fn interface_mapping_skips_nonparticipating_methods_in_class_chain() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        for member in [
+            "private new int Read() { return 2; }",
+            "protected new int Read() { return 3; }",
+            "public new static int Read() { return 4; }",
+            "public new string Read() { return null; }",
+        ] {
+            let source = alloc::format!(
+                "interface IRead {{ int Read(); }} \
+                 class Root {{ public int Read() {{ return 1; }} }} \
+                 class Leaf : Root, IRead {{ {member} }}"
+            );
+            let unit = parse_compilation_unit(&source).unit;
+            let diagnostics = crate::bind_compilation_unit(&unit);
+            assert!(diagnostics.is_empty(), "{member}: {diagnostics:?}");
+        }
+    }
+
+    #[test]
+    fn interface_mapping_reuses_an_inherited_explicit_method() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        let unit = parse_compilation_unit(
+            "interface IRead { int Read(); } \
+             class Root : IRead { int IRead.Read() { return 1; } } \
+             class Leaf : Root, IRead { private int Read() { return 2; } }",
+        ).unit;
+        let diagnostics = crate::bind_compilation_unit(&unit);
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn interface_mapping_rejects_a_class_without_an_eligible_provider() {
+        use lamella_syntax::parser::parse_compilation_unit;
+        for (member, expected) in [
+            ("private int Read() { return 2; }", 737),
+            ("public string Read() { return null; }", 738),
+            ("public static int Read() { return 2; }", 535),
+        ] {
+            let source = alloc::format!(
+                "interface IRead {{ int Read(); }} class Missing : IRead {{ {member} }}"
+            );
+            let unit = parse_compilation_unit(&source).unit;
+            let codes: Vec<_> = crate::bind_compilation_unit(&unit)
+                .iter().map(Diagnostic::code).collect();
+            assert_eq!(codes, [expected], "{member}");
+        }
+    }
+
+    #[test]
+    fn implicit_interface_methods_require_matching_generic_arity() {
+        use lamella_syntax::parser::parse_compilation_unit;
+
+        for (required, implementation, expected) in [
+            ("Read()", "Read<T>()", alloc::vec![535]),
+            ("Read<T>()", "Read()", alloc::vec![535]),
+            ("Read<T>()", "Read<T, U>()", alloc::vec![535]),
+            ("Read<T>()", "Read<T>()", Vec::new()),
+        ] {
+            let source = alloc::format!(
+                "interface IRead {{ int {required}; }} \
+                 class Reader : IRead {{ public int {implementation} {{ return 1; }} }}"
+            );
+            let unit = parse_compilation_unit(&source).unit;
+            let codes: Vec<_> = crate::bind_compilation_unit(&unit)
+                .iter().map(Diagnostic::code).collect();
+            assert_eq!(codes, expected, "{source}");
+        }
+        let unit = parse_compilation_unit(
+            "interface IRead { int Read(); } \
+             class Root { public int Read() { return 1; } } \
+             class Reader : Root, IRead { public int Read<T>() { return 2; } }",
+        ).unit;
+        assert!(crate::bind_compilation_unit(&unit).is_empty());
     }
 
     #[test]
@@ -25688,6 +28295,7 @@ mod tests {
         let int = TypeSymbol::Special(SpecialType::Int32);
         let mut calc = TypeInfo::new("", "Calc", TypeKind::Class);
         calc.methods.push(MethodSymbol {
+            is_accessor: false,
             return_tuple_names: Vec::new(),
             return_required_modifiers: Vec::new(),
             explicit_interface: None,
@@ -25705,6 +28313,7 @@ mod tests {
             accessibility: crate::symbols::Accessibility::Public,
             conditional: Vec::new(),
             sets_required_members: false,
+            uninstantiated_parameters: None,
             type_parameters: Vec::new(),
             type_parameter_constraints: Vec::new(),
         });

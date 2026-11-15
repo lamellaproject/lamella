@@ -119,6 +119,17 @@ pub enum AssembleError {
         /// The reach the encoding actually has, in bytes, as `+/-limit`.
         limit: i64,
     },
+    /// An I-type or S-type immediate -- a load or store offset, or the operand of `addi`, `andi`,
+    /// `xori`, `sltiu` or `jalr` -- outside the 12 signed bits (-2048..=2047) the field holds, WITH
+    /// THE SITE AND THE VALUE ASKED FOR. The field can only keep the low 12 bits, so the
+    /// instruction would address a different byte, or compute a different value, than the one
+    /// asked for, and nothing would trap.
+    ImmediateOutOfRange {
+        /// The byte offset of the first instruction that asked for one.
+        at: u32,
+        /// The immediate it asked for.
+        imm: i32,
+    },
 }
 
 /// The finished machine-code image.
@@ -156,6 +167,12 @@ pub struct Encoder {
     fixups: Vec<(u32, Fixup, u32)>,
     /// `emit_word_diff` sites: `(word offset, base label, target label)` patched to `target - base`.
     diffs: Vec<(u32, u32, u32)>,
+    /// The first I-type or S-type immediate asked for outside -2048..=2047, as (the instruction's
+    /// byte offset, the immediate). The instruction is still emitted, holding the low 12 bits as
+    /// the field must, so every later position stays where it would be; [`Encoder::finish`]
+    /// refuses the image, and a caller lowering one function at a time reads it per function
+    /// through [`Encoder::unencodable_immediate`].
+    unencodable: Option<(u32, i32)>,
     /// Every insertion branch relaxation made, as `(position, bytes grown)`, in the order made.
     ///
     /// The encoder shifts what it OWNS (labels, fixups, diffs) itself. It cannot shift what it does
@@ -244,7 +261,16 @@ impl Encoder {
         );
     }
 
+    /// Records `imm` as unencodable when it is outside the 12 signed bits an I-type or S-type field
+    /// holds. Only the first is kept: it is where the caller's emission went wrong.
+    fn check_immediate(&mut self, imm: i32) {
+        if !(-2048..=2047).contains(&imm) && self.unencodable.is_none() {
+            self.unencodable = Some((self.position(), imm));
+        }
+    }
+
     fn i_type(&mut self, imm: i32, rs1: Reg, funct3: u32, rd: Reg, opcode: u32) {
+        self.check_immediate(imm);
         self.emit_word(
             ((imm as u32 & 0xfff) << 20)
                 | (u32::from(rs1.number()) << 15)
@@ -382,6 +408,7 @@ impl Encoder {
     /// An S-type store (`STORE` opcode `0x23`): `rs2 -> imm(rs1)`, the `funct3` selecting the width
     /// (`sb`=0, `sh`=1, `sw`=2).
     fn s_type(&mut self, imm: i32, rs2: Reg, rs1: Reg, funct3: u32) {
+        self.check_immediate(imm);
         let imm = imm as u32;
         self.emit_word(
             ((imm >> 5) & 0x7f) << 25
@@ -423,6 +450,13 @@ impl Encoder {
         if rs1 == Reg::SP {
             self.sp_store = Some((rs2, imm, self.position()));
         }
+    }
+
+    /// The first I-type or S-type immediate asked for outside -2048..=2047, as (the instruction's
+    /// byte offset, the immediate), or `None`. [`Encoder::finish`] refuses an image that has one.
+    #[must_use]
+    pub fn unencodable_immediate(&self) -> Option<(u32, i32)> {
+        self.unencodable
     }
 
     /// Whether `rd` still holds the word at `imm(sp)`: the last instruction emitted is
@@ -579,8 +613,12 @@ impl Encoder {
     }
 
     /// Resolves every label reference and returns the finished image, or an error if a label is
-    /// unbound or a target is out of range.
+    /// unbound, a target is out of range, or an instruction asked for an immediate its 12-bit field
+    /// cannot hold.
     pub fn finish(mut self) -> Result<Assembled, AssembleError> {
+        if let Some((at, imm)) = self.unencodable {
+            return Err(AssembleError::ImmediateOutOfRange { at, imm });
+        }
         while self.widen_far_conditional_branch()? {}
         for &(site, base_label, target_label) in &self.diffs {
             let base = self
@@ -674,6 +712,84 @@ impl Encoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_immediate_past_twelve_signed_bits_is_refused_with_its_site() {
+        type Form = fn(&mut Encoder, i32);
+        let forms: [(&str, Form); 13] = [
+            ("lw", |e, i| e.lw(Reg::T0, Reg::SP, i)),
+            ("lb", |e, i| e.lb(Reg::T0, Reg::SP, i)),
+            ("lbu", |e, i| e.lbu(Reg::T0, Reg::SP, i)),
+            ("lh", |e, i| e.lh(Reg::T0, Reg::SP, i)),
+            ("lhu", |e, i| e.lhu(Reg::T0, Reg::SP, i)),
+            ("sw", |e, i| e.sw(Reg::T0, Reg::SP, i)),
+            ("sh", |e, i| e.sh(Reg::T0, Reg::SP, i)),
+            ("sb", |e, i| e.sb(Reg::T0, Reg::SP, i)),
+            ("addi", |e, i| e.addi(Reg::T0, Reg::T0, i)),
+            ("andi", |e, i| e.andi(Reg::T0, Reg::T0, i)),
+            ("xori", |e, i| e.xori(Reg::T0, Reg::T0, i)),
+            ("sltiu", |e, i| e.sltiu(Reg::T0, Reg::T0, i)),
+            ("jalr", |e, i| e.jalr(Reg::RA, Reg::T0, i)),
+        ];
+        for (name, form) in forms {
+            for imm in [2048, -2049, 4096, i32::MIN] {
+                let mut enc = Encoder::new();
+                enc.addi(Reg::T0, Reg::ZERO, 1);
+                form(&mut enc, imm);
+                assert_eq!(
+                    enc.unencodable_immediate(),
+                    Some((4, imm)),
+                    "`{name}` with {imm} is recorded where it was asked for"
+                );
+                assert_eq!(
+                    enc.finish().map(|a| a.bytes),
+                    Err(AssembleError::ImmediateOutOfRange { at: 4, imm }),
+                    "`{name}` with {imm} refuses the image"
+                );
+            }
+            for imm in [2047, -2048, 0] {
+                let mut enc = Encoder::new();
+                form(&mut enc, imm);
+                assert_eq!(
+                    enc.unencodable_immediate(),
+                    None,
+                    "`{name}` with {imm} fits"
+                );
+                assert!(enc.finish().is_ok(), "`{name}` with {imm} assembles");
+            }
+        }
+    }
+
+    #[test]
+    fn the_first_unencodable_immediate_is_the_one_named() {
+        let mut enc = Encoder::new();
+        enc.lw(Reg::T0, Reg::SP, 3000);
+        enc.sw(Reg::T0, Reg::SP, 5000);
+        assert_eq!(enc.unencodable_immediate(), Some((0, 3000)));
+    }
+
+    #[test]
+    fn li_and_the_shifts_never_ask_for_an_unencodable_immediate() {
+        let mut enc = Encoder::new();
+        for v in [
+            0,
+            2047,
+            2048,
+            -2048,
+            -2049,
+            0x7FFF_FFFF,
+            i32::MIN,
+            0x1234_5800,
+            -1,
+        ] {
+            enc.li(Reg::T0, v);
+        }
+        enc.slli(Reg::T0, Reg::T0, 31);
+        enc.srli(Reg::T0, Reg::T0, 31);
+        enc.srai(Reg::T0, Reg::T0, 31);
+        assert_eq!(enc.unencodable_immediate(), None);
+        assert!(enc.finish().is_ok());
+    }
 
     #[test]
     fn a_stack_store_is_held_until_a_label_or_another_instruction() {

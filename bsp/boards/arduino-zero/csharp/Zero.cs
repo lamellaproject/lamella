@@ -61,9 +61,10 @@ namespace Lamella.Boards.Arduino
         /// <c>Configure</c> choice derived on the device from the core-clock rate.</summary>
         public Samd21SercomI2cBinding HeaderI2cBinding() { return MakeHeaderI2cBinding(); }
 
-        /// <summary>The logical bus id of the SDA/SCL header pins' I2C (D20/D21 = PA22/PA23 on
-        /// SERCOM3), as <c>I2cConnectionSettings</c> names it.</summary>
-        public const int HeaderI2cBusId = 0;
+        /// <summary>The bus id of the SDA/SCL header pins' I2C (D20/D21 = PA22/PA23), as
+        /// <c>I2cConnectionSettings</c> names it: 3, the number of SERCOM3, the block that serves
+        /// it.</summary>
+        public const int HeaderI2cBusId = 3;
 
         private static I2cDriver MakeHeaderI2c() { return new Samd21I2cDriver(MakeHeaderI2cBinding()); }
 

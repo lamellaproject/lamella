@@ -29,9 +29,10 @@ namespace Lamella.Boards.Adafruit
 
         private static GpioDriver MakeGpio() { return new Samd21GpioDriver(); }
 
-        /// <summary>The logical bus id of the Wire interface's SDA and SCL pins (PA22 and PA23, on
-        /// SERCOM3), as <c>I2cConnectionSettings</c> names it.</summary>
-        public const int HeaderI2cBusId = 0;
+        /// <summary>The bus id of the Wire interface's SDA and SCL pins (PA22 and PA23), as
+        /// <c>I2cConnectionSettings</c> names it: 3, the number of SERCOM3, the block that serves
+        /// it.</summary>
+        public const int HeaderI2cBusId = 3;
 
         private static I2cDriver MakeHeaderI2c()
         {

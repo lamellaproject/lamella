@@ -39,7 +39,14 @@ pub mod rp2350;
 const BOARDS_SELECTED: u32 = cfg!(feature = "board-raspberrypi-pico-2") as u32
     + cfg!(feature = "board-raspberrypi-pico-2-w") as u32
     + cfg!(feature = "board-pimoroni-pico-plus-2") as u32
-    + cfg!(feature = "board-pimoroni-pico-plus-2-w") as u32;
+    + cfg!(feature = "board-pimoroni-pico-plus-2-w") as u32
+    + cfg!(feature = "board-adafruit-feather-rp2350-hstx") as u32
+    + cfg!(feature = "board-adafruit-feather-rp2350-hstx-psram") as u32
+    + cfg!(feature = "board-adafruit-metro-rp2350") as u32
+    + cfg!(feature = "board-adafruit-metro-rp2350-psram") as u32
+    + cfg!(feature = "board-pimoroni-pico-lipo-2") as u32
+    + cfg!(feature = "board-pimoroni-pico-lipo-2-xl-w") as u32
+    + cfg!(feature = "board-sparkfun-iot-redboard-rp2350") as u32;
 
 #[cfg(target_os = "none")]
 const _: () = assert!(
@@ -54,6 +61,18 @@ pub use seams::psram_window;
 /// PSRAM's window for the image's heap.
 #[cfg(target_os = "none")]
 mod seams {
+    #[cfg(feature = "board-adafruit-feather-rp2350-hstx")]
+    use crate::boards::adafruit_feather_rp2350_hstx::BOARD;
+    #[cfg(feature = "board-adafruit-feather-rp2350-hstx-psram")]
+    use crate::boards::adafruit_feather_rp2350_hstx_psram::BOARD;
+    #[cfg(feature = "board-adafruit-metro-rp2350")]
+    use crate::boards::adafruit_metro_rp2350::BOARD;
+    #[cfg(feature = "board-adafruit-metro-rp2350-psram")]
+    use crate::boards::adafruit_metro_rp2350_psram::BOARD;
+    #[cfg(feature = "board-pimoroni-pico-lipo-2")]
+    use crate::boards::pimoroni_pico_lipo_2::BOARD;
+    #[cfg(feature = "board-pimoroni-pico-lipo-2-xl-w")]
+    use crate::boards::pimoroni_pico_lipo_2_xl_w::BOARD;
     #[cfg(feature = "board-pimoroni-pico-plus-2")]
     use crate::boards::pimoroni_pico_plus_2::BOARD;
     #[cfg(feature = "board-pimoroni-pico-plus-2-w")]
@@ -62,6 +81,8 @@ mod seams {
     use crate::boards::raspberrypi_pico_2::BOARD;
     #[cfg(feature = "board-raspberrypi-pico-2-w")]
     use crate::boards::raspberrypi_pico_2_w::BOARD;
+    #[cfg(feature = "board-sparkfun-iot-redboard-rp2350")]
+    use crate::boards::sparkfun_iot_redboard_rp2350::BOARD;
     use crate::registers::Mmio;
     use crate::rp2350::{self, PsramRecord, State};
 

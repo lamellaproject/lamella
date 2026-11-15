@@ -72,13 +72,13 @@
        but the compiler itself is skipped and the lamella tool writes the assembly instead, from
        _LamellaCompile, which CoreCompile calls only when the assembly is out of date. A design-time
        build, or any caller that skips the compiler itself, gets the C# compiler's command line as
-       usual and no assembly. -->
+       usual and no assembly. The tool writes the symbol file beside the assembly when MSBuild expects
+       one, as the C# compiler would: a portable PDB, which names each source by its full path. A
+       DebugType of embedded, which would put the symbols inside the assembly, gets none. -->
   <PropertyGroup Condition="'$(TargetFrameworkIdentifier)' == 'Lamella'">
     <_LamellaCompiles Condition="'$(DesignTimeBuild)' != 'true' and '$(SkipCompilerExecution)' != 'true'">true</_LamellaCompiles>
     <SkipCompilerExecution>true</SkipCompilerExecution>
     <TargetsTriggeredByCompilation>_LamellaCompile;$(TargetsTriggeredByCompilation)</TargetsTriggeredByCompilation>
-    <!-- The tool writes the assembly alone, with no symbol file beside it. -->
-    <_DebugSymbolsProduced>false</_DebugSymbolsProduced>
   </PropertyGroup>
 
   <ItemGroup Condition="'$(TargetFrameworkIdentifier)' == 'Lamella'">
@@ -268,8 +268,8 @@
        libraries, resolved by MSBuild; neither the two framework assemblies nor a package's), each
        defined symbol, the C# version, whether unsafe code is allowed, the C# compiler's features
        (FileBasedProgram among them for a file-based app, whose #: directives the compile then
-       takes), the output type, the assembly name, and where the assembly goes. A change to any of
-       them builds the assembly again. -->
+       takes), the output type, the assembly name, where the assembly goes, and where its symbol
+       file goes when the build makes one. A change to any of them builds the assembly again. -->
   <Target Name="_LamellaWriteCompileInputs"
           BeforeTargets="CoreCompile"
           DependsOnTargets="_LamellaCompileInputs"
@@ -296,6 +296,7 @@
       <_LamellaCompileInput Include="outputtype=$([MSBuild]::Escape('$(OutputType)'))" />
       <_LamellaCompileInput Include="assemblyname=$([MSBuild]::Escape('$(AssemblyName)'))" />
       <_LamellaCompileInput Include="@(IntermediateAssembly->'out=%(FullPath)')" />
+      <_LamellaCompileInput Include="@(_DebugSymbolsIntermediatePath->'pdb=%(FullPath)')" Condition="'$(_DebugSymbolsProduced)' == 'true'" />
     </ItemGroup>
   </Target>
 
@@ -348,5 +349,9 @@
        replaces, its link above all, is the last one; read only once Lamella.Rhu.targets found RHU's
        build package restored as this SDK pins it, and of this SDK's contract. -->
   <Import Project="$(LamellaRhuBuildTargets)" Condition="'$(_LamellaRhuImports)' == 'true'" />
+
+  <!-- The debug manifest a debug session's build writes for the debugger, last, so that it follows whichever
+       product published the program's image: Lamella.Debug.targets. -->
+  <Import Project="$(MSBuildThisFileDirectory)Lamella.Debug.targets" Condition="'$(_LamellaServesRun)' == 'true'" />
 
 </Project>

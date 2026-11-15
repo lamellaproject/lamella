@@ -11,7 +11,7 @@ mod repl_eval;
 pub mod protocol;
 pub mod serve;
 
-pub use adapter::Debugger;
+pub use adapter::{Chooser, Chosen, Debugger, PathMap, StartReport};
 #[cfg(all(feature = "interpreter", not(target_arch = "wasm32")))]
 pub use interp_backend::host_machine;
 #[cfg(feature = "interpreter")]

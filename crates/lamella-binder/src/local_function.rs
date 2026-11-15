@@ -223,6 +223,7 @@ impl Binder {
             name_span: function.name_span,
             scope,
             method: MethodSymbol {
+                is_accessor: false,
                 name: id.reference_name(),
                 return_type,
                 return_required_modifiers: Vec::new(),
@@ -239,6 +240,7 @@ impl Binder {
                 accessibility: Accessibility::Private,
                 conditional: Vec::new(),
                 sets_required_members: false,
+                uninstantiated_parameters: None,
                 type_parameters: function
                     .type_parameters
                     .iter()

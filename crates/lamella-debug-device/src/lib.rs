@@ -107,6 +107,20 @@ pub struct DeviceBackend<A: TargetAccess> {
     /// for. Empty until [`Self::with_unwind_tables`] is called, and then such a frame ends the walk
     /// -- which is what it did before there was a reader for them.
     unwind: crate::program::UnwindTables,
+    /// The program's console ring, followed while it runs: what the program prints joins `output`,
+    /// and the end the ring reports ends the session. `None` until [`Self::with_console`] is called,
+    /// and for a program that keeps no ring.
+    console: Option<lamella_probe_console::RingReader>,
+    /// Lines for the debug console about the program's console -- bytes it lost before they could be
+    /// read, a restart, a ring that could no longer be read -- drained by `take_debug_output`.
+    notes: String,
+    /// An end the console ring reported between polls, which the next poll reports.
+    ended: Option<lamella_probe_console::ProgramEnd>,
+    /// The code the program returned, as its console ring reported it; 0 until then.
+    exit_code: i32,
+    /// The code the board gave for a program it aborted, as its console ring reported it; `None`
+    /// until then.
+    aborted_code: Option<i32>,
 }
 
 impl<A: TargetAccess> DeviceBackend<A> {
@@ -136,16 +150,32 @@ impl<A: TargetAccess> DeviceBackend<A> {
             frame_section,
             locals: crate::program::LocalSections::default(),
             unwind: crate::program::UnwindTables::default(),
+            console: None,
+            notes: String::new(),
+            ended: None,
+            exit_code: 0,
+            aborted_code: None,
         }
     }
 
-    /// Every frame, each with THE STACK POINTER THAT FRAME HAD.
+    /// Every frame, each with THE STACK POINTER THAT FRAME HAD, and its registers as far as the walk
+    /// recovered them.
     ///
     /// The second value is what a local's frame offset resolves against, and it is only the core
     /// register for the innermost frame -- above that it is the callee's canonical frame address,
     /// which is the caller's stack pointer by definition. Computing it here rather than twice is
     /// what stops a variables pane and a call stack disagreeing about where a frame is.
-    fn walk_frames(&self) -> Vec<(Frame, u32)> {
+    ///
+    /// The registers are the core's for the innermost frame, read where the walk needs them, and
+    /// above it the ones the frames below restored or left alone: `None` for any register whose
+    /// value in that frame is not known.
+    fn walk_frames(&self) -> Vec<(Frame, u32, lamella_elf::ehabi::Registers)> {
+        self.walk(32)
+    }
+
+    /// [`Self::walk_frames`], stopped after `limit` frames: a caller that needs only the innermost
+    /// frame's caller reads no more of the stack than that.
+    fn walk(&self, limit: u32) -> Vec<(Frame, u32, lamella_elf::ehabi::Registers)> {
         let live = self.live_registers();
         let mut sections = lamella_dwarf::Sections::default();
         sections.set(".debug_frame", &self.frame_section);
@@ -158,7 +188,7 @@ impl<A: TargetAccess> DeviceBackend<A> {
             live[14].unwrap_or(0),
         );
         let mut registers = live;
-        for depth in 0..32u32 {
+        for depth in 0..limit {
             let lookup = if depth == 0 { pc } else { pc.saturating_sub(1) };
             let offset = self.image_offset(lookup);
             out.push((
@@ -168,7 +198,11 @@ impl<A: TargetAccess> DeviceBackend<A> {
                     line: self.source_line_at(offset),
                 },
                 sp,
+                registers,
             ));
+            if depth + 1 >= limit {
+                break;
+            }
 
             let row = frames.as_ref().map(|table| table.unwind(u64::from(lookup)));
             let caller = match row {
@@ -354,20 +388,38 @@ impl<A: TargetAccess> DeviceBackend<A> {
         Some(if address & 2 != 0 { (word >> 16) as u16 } else { word as u16 })
     }
 
-    /// The stack pointer frame `index` had, which is what its locals' frame offsets count from.
-    fn stack_pointer_of_frame(&self, index: usize) -> Option<u32> {
-        self.walk_frames().get(index).map(|&(_, sp)| sp)
+    /// The value at `address`: the bytes of `scalar`, a type this reads, decoded as .NET's debugger
+    /// shows them ([`show_scalar`]), and otherwise four bytes in hexadecimal, as every value was
+    /// before the type graph was read.
+    fn value_at(&self, address: u64, scalar: Option<lamella_dwarf::ScalarType<'_>>) -> String {
+        let width = scalar
+            .and_then(|scalar| usize::try_from(scalar.byte_size).ok())
+            .filter(|width| (1..=8).contains(width));
+        let bytes = self.read_memory(address, width.unwrap_or(4));
+        scalar
+            .and_then(|scalar| show_scalar(&bytes, &scalar))
+            .unwrap_or_else(|| hex_word(&bytes))
     }
 
     /// Renders one local as a value and a type, reading the target where the place says to.
     ///
     /// # THE TYPE COLUMN SAYS WHERE THE VALUE CAME FROM, NOT WHAT THE VARIABLE IS DECLARED AS
     ///
-    /// Rendering a Swift `Int` as an integer needs the type graph in `.debug_info`, which this does
-    /// not read yet -- so every value is shown as four raw bytes and the column says which place
-    /// they were read from. **That is a smaller lie than a decoded value would be**: a person can
-    /// see that `r4` is being reported and check it against the register view, where "42" for a
-    /// variable that is actually a `Float` is indistinguishable from the truth.
+    /// A value is decoded where the type graph names its declared type a scalar -- a base type, or
+    /// an enumeration as its underlying type: `scalar`, from [`lamella_dwarf::scalar_type`] -- and
+    /// shown as four raw bytes otherwise: a pointer, an object, a structure. Either way the column
+    /// says which place the bytes were read from, so a person can check a value against the
+    /// register view. A guess at an undeclared type would be the larger lie: "42" for a variable
+    /// that is actually a `Float` is indistinguishable from the truth. A value the debug information
+    /// gives outright, with no place, is decoded the same way, and the column says `constant`:
+    /// nothing was read from the target.
+    ///
+    /// # A REGISTER IS READ AS THE FRAME HAD IT
+    ///
+    /// In the frame the core is stopped in, that is the core's own register; above it, it is the
+    /// value the walk recovered for the frame, `registers`. A register no frame below restored holds
+    /// what the innermost frame left in it, and a local read from it would be a plausible number from
+    /// the wrong frame, so it is shown as not recovered.
     fn render(
         &self,
         local: &lamella_dwarf::Local<'_>,
@@ -375,12 +427,18 @@ impl<A: TargetAccess> DeviceBackend<A> {
         frame_pointer: u32,
         frame_base: &lamella_dwarf::FrameBase<'_>,
         depth: usize,
+        registers: &lamella_elf::ehabi::Registers,
+        scalar: Option<lamella_dwarf::ScalarType<'_>>,
     ) -> (String, String) {
-        let word = |bytes: &[u8]| -> String {
-            if bytes.len() < 4 {
-                "<unreadable>".to_string()
+        let register_of_frame = |number: u8| -> Result<u32, &'static str> {
+            if depth == 0 {
+                self.probe.borrow_mut().read_core_reg(number).map_err(|_| "<unreadable>")
             } else {
-                format!("0x{:08x}", u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                registers
+                    .get(usize::from(number))
+                    .copied()
+                    .flatten()
+                    .ok_or("<not recovered for an outer frame>")
             }
         };
         match local.place_at(address) {
@@ -394,32 +452,32 @@ impl<A: TargetAccess> DeviceBackend<A> {
                 let (base, spelling) = if *register == SP_DWARF_REGISTER {
                     (frame_pointer, "sp".to_string())
                 } else {
-                    if depth != 0 {
-                        return (
-                            "<frame-pointer base, not recovered for an outer frame>".to_string(),
-                            "unsupported".to_string(),
-                        );
-                    }
                     let Ok(number) = u8::try_from(*register) else {
                         return ("<register out of range>".to_string(), "unsupported".to_string());
                     };
-                    match self.probe.borrow_mut().read_core_reg(number) {
+                    match register_of_frame(number) {
                         Ok(value) => (value, format!("r{register}")),
-                        Err(_) => return ("<unreadable>".to_string(), "unsupported".to_string()),
+                        Err(_) if depth != 0 => {
+                            return (
+                                "<frame-pointer base, not recovered for an outer frame>".to_string(),
+                                "unsupported".to_string(),
+                            );
+                        }
+                        Err(why) => return (why.to_string(), "unsupported".to_string()),
                     }
                 };
                 let Some(at) = base.checked_add_signed(offset) else {
                     return ("<offset off the frame>".to_string(), "unsupported".to_string());
                 };
-                (word(&self.read_memory(u64::from(at), 4)), format!("[{spelling}{offset:+}]"))
+                (self.value_at(u64::from(at), scalar), format!("[{spelling}{offset:+}]"))
             }
             lamella_dwarf::Place::Register(register) => {
                 let Ok(number) = u8::try_from(register) else {
                     return ("<register out of range>".to_string(), "unsupported".to_string());
                 };
-                match self.probe.borrow_mut().read_core_reg(number) {
-                    Ok(value) => (format!("0x{value:08x}"), format!("r{register}")),
-                    Err(_) => ("<unreadable>".to_string(), format!("r{register}")),
+                match register_of_frame(number) {
+                    Ok(value) => (in_register(value, scalar), format!("r{register}")),
+                    Err(why) => (why.to_string(), format!("r{register}")),
                 }
             }
             lamella_dwarf::Place::RegisterOffset { register, offset } => {
@@ -427,17 +485,20 @@ impl<A: TargetAccess> DeviceBackend<A> {
                 else {
                     return ("<register out of range>".to_string(), "unsupported".to_string());
                 };
-                let read = self.probe.borrow_mut().read_core_reg(number);
-                let Ok(base) = read else {
-                    return ("<unreadable>".to_string(), format!("[r{register}{offset:+}]"));
+                let base = match register_of_frame(number) {
+                    Ok(base) => base,
+                    Err(why) => return (why.to_string(), format!("[r{register}{offset:+}]")),
                 };
                 let Some(at) = base.checked_add_signed(offset) else {
                     return ("<offset off the register>".to_string(), "unsupported".to_string());
                 };
-                (word(&self.read_memory(u64::from(at), 4)), format!("[r{register}{offset:+}]"))
+                (self.value_at(u64::from(at), scalar), format!("[r{register}{offset:+}]"))
             }
             lamella_dwarf::Place::Address(at) => {
-                (word(&self.read_memory(at, 4)), format!("[0x{at:08x}]"))
+                (self.value_at(at, scalar), format!("[0x{at:08x}]"))
+            }
+            lamella_dwarf::Place::Constant(value) => {
+                (constant(value, scalar), "constant".to_string())
             }
             lamella_dwarf::Place::Expression(_) => {
                 ("<expression>".to_string(), "unsupported".to_string())
@@ -462,6 +523,101 @@ impl<A: TargetAccess> DeviceBackend<A> {
     pub fn with_unwind_tables(mut self, unwind: crate::program::UnwindTables) -> Self {
         self.unwind = unwind;
         self
+    }
+
+    /// Follows the program's console ring at `ring`, the block of RAM its image names
+    /// ([`crate::program::DebugProgram::console`]), as `lamella run` follows it: what the program
+    /// prints joins the session's output while it runs, and the end the ring reports ends the
+    /// session, with the program's code.
+    ///
+    /// **A RING NOT SET UP YET IS NO OUTPUT YET, NEVER AN ERROR.** A session holds a program before
+    /// its startup sets the ring up for as long as its user likes, so the ring is waited for without
+    /// end. A ring a run before this one left in RAM is the writer's to clear: see
+    /// [`clear_console_ring`].
+    #[must_use]
+    pub fn with_console(mut self, ring: crate::program::DataObject) -> Self {
+        self.console = Some(lamella_probe_console::RingReader::new(
+            ring,
+            lamella_probe_console::END_MAGICS,
+            u32::MAX,
+        ));
+        self
+    }
+
+    /// The stop that ends the session where the debugger could not do `what`, a phrase such as "step
+    /// the program": in the probe's own words where it gave up on its link, so a session whose probe
+    /// stopped answering says that once, rather than naming whichever call failed next.
+    fn fault(&mut self, what: &str) -> Stop {
+        self.fault_in_words(format!("The debugger could not {what}, so the session ends here. Start it again."))
+    }
+
+    /// The stop that ends the session with `words`, or in the probe's own where it gave up on its link.
+    fn fault_in_words(&mut self, words: String) -> Stop {
+        Stop::Fault(self.probe.get_mut().stopped_answering().unwrap_or(words))
+    }
+
+    /// `stop`, unless the probe gave up on its link while it was reached: then the stop that ends
+    /// the session in its words ([`fault`](Self::fault)).
+    fn unless_the_probe_stopped(&mut self, stop: Stop) -> Stop {
+        match self.probe.get_mut().stopped_answering() {
+            Some(words) => Stop::Fault(words),
+            None => stop,
+        }
+    }
+
+    /// Looks at the program's console ring, if it keeps one: what it printed since the last look
+    /// joins the session's output, and the end it reports is returned.
+    ///
+    /// What the ring lost and a restart are noted for the debug console in the words `lamella run`
+    /// uses. A ring that cannot be read is noted once and then let go: the next look would fail the
+    /// same way, and a note at every look would bury the console. A probe that stopped answering is
+    /// not noted here: the session ends saying so ([`fault`](Self::fault)), once.
+    fn follow_console(&mut self) -> Option<lamella_probe_console::ProgramEnd> {
+        let reader = self.console.as_mut()?;
+        let seen = match reader.poll(&mut WordReads(self.probe.get_mut())) {
+            Ok(seen) => seen,
+            Err(why) => {
+                if self.probe.get_mut().stopped_answering().is_none() {
+                    self.notes.push_str(&format!("Lost the program's console: {why}\n"));
+                }
+                self.console = None;
+                return None;
+            }
+        };
+        let mut end = None;
+        for one in seen {
+            match one {
+                lamella_probe_console::Seen::Out(bytes) => self.append_console_bytes(&bytes),
+                lamella_probe_console::Seen::Lost(count) => self.notes.push_str(&format!(
+                    "{count} bytes of the board's console were overwritten on the board before they could \
+                     be read.\n"
+                )),
+                lamella_probe_console::Seen::Restarted => self
+                    .notes
+                    .push_str("The board started again; following the program from its new start.\n"),
+                lamella_probe_console::Seen::Ended(how) => end = Some(how),
+            }
+        }
+        end
+    }
+
+    /// The stop a program's end is: `Done` with the code it returned, or, for a program the board
+    /// stopped, a fault that names the code the board gives and says what it means, from the end-code
+    /// table ([`lamella_exit_codes::meaning`]). A code the table does not define is named alone.
+    fn ended_with(&mut self, end: lamella_probe_console::ProgramEnd) -> Stop {
+        match end {
+            lamella_probe_console::ProgramEnd::Returned(code) => {
+                self.exit_code = code;
+                Stop::Done
+            }
+            lamella_probe_console::ProgramEnd::Aborted(code) => {
+                self.aborted_code = Some(code);
+                Stop::Fault(match lamella_exit_codes::meaning(code) {
+                    Some(meaning) => format!("The program ended with code {code}: {meaning}."),
+                    None => format!("The program ended with code {code}."),
+                })
+            }
+        }
     }
 
     /// The 1-based source line whose native code contains `offset` (the last entry at or
@@ -714,10 +870,10 @@ impl<A: TargetAccess> DeviceBackend<A> {
 
         if let Some(armed) = armed {
             if self.probe.get_mut().set_breakpoints(&armed).is_err() {
-                return Stop::Fault("arm return breakpoint".into());
+                return self.fault("set the breakpoint that ends the step");
             }
             if self.probe.get_mut().resume().is_err() {
-                return Stop::Fault("resume into call".into());
+                return self.fault("run the call being stepped over");
             }
             let mut halted = false;
             for _ in 0..1_000_000u32 {
@@ -725,24 +881,26 @@ impl<A: TargetAccess> DeviceBackend<A> {
                     Ok(true) => match self.perform_semihosting_call() {
                         Some(true) => {
                             if self.probe.get_mut().resume().is_err() {
-                                return Stop::Fault("resume after a semihosting call".into());
+                                return self.fault("let the program run on after it printed");
                             }
                         }
                         Some(false) => {
                             halted = true;
                             break;
                         }
-                        None => return Stop::Fault("semihosting service failed".into()),
+                        None => return self.fault("read the instruction the program stopped at"),
                     },
                     Ok(false) => {}
-                    Err(_) => return Stop::Fault("poll halt".into()),
+                    Err(_) => return self.fault("tell whether the program had stopped"),
                 }
             }
             let probe = self.probe.get_mut();
             let _ = probe.set_breakpoints(&self.breakpoints);
             if !halted {
                 let _ = probe.halt();
-                return Stop::Fault("call did not return".into());
+                return self.fault_in_words(String::from(
+                    "The call being stepped over did not return, so the program was stopped inside it and \n                     the session ends here.",
+                ));
             }
             let pc = probe.read_core_reg(15).unwrap_or(0) & !1;
             return if self.breakpoints.contains(&pc) {
@@ -758,10 +916,10 @@ impl<A: TargetAccess> DeviceBackend<A> {
                 Some(true) => {}
                 Some(false) => {
                     if self.probe.get_mut().step().is_err() {
-                        return Stop::Fault("step in call".into());
+                        return self.fault("step through the call");
                     }
                 }
-                None => return Stop::Fault("semihosting service failed".into()),
+                None => return self.fault("read the instruction the program stopped at"),
             }
             let pc = self.probe.get_mut().read_core_reg(15).unwrap_or(0) & !1;
             if pc == target {
@@ -771,10 +929,9 @@ impl<A: TargetAccess> DeviceBackend<A> {
                 return Stop::Breakpoint;
             }
         }
-        self.output.push_str(
-            "[lamella] Step stopped inside a long-running call: all hardware breakpoints are in \
-             use, so it could not be run at full speed. Free a breakpoint, or set one past the \
-             call and Continue.\n",
+        self.notes.push_str(
+            "Step stopped inside a long-running call: every hardware breakpoint is in use, so the call \
+             could not run at full speed. Remove a breakpoint, or set one past the call and Continue.\n",
         );
         Stop::Breakpoint
     }
@@ -847,7 +1004,7 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
             .map_err(|error| format!("could not connect to the target: {error}"))?;
         probe
             .read_idcode()
-            .map_err(|error| format!("could not read the debug port's IDCODE: {error}"))?;
+            .map_err(|error| format!("could not reach the board's debug port: {error}"))?;
         probe
             .init_mem()
             .map_err(|error| format!("could not reach the target's memory: {error}"))?;
@@ -861,6 +1018,10 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
         Ok(())
     }
 
+    fn attach(&mut self) -> Result<(), String> {
+        self.launch()
+    }
+
     fn resume(&mut self) -> Stop {
         let bps = self.breakpoints.clone();
         let probe = self.probe.get_mut();
@@ -872,7 +1033,7 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
         }
         match probe.resume() {
             Ok(()) => Stop::Running,
-            Err(_) => Stop::Fault("resume failed".into()),
+            Err(_) => self.fault("let the program run"),
         }
     }
 
@@ -908,11 +1069,11 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
         let probe = self.probe.get_mut();
         probe
             .write_word(DHCSR, DBGKEY)
-            .map_err(|error| format!("could not turn halting debug off: {error}"))?;
+            .map_err(|error| format!("could not let the board run without the debugger: {error}"))?;
         match probe.is_halted() {
             Ok(false) => Ok(()),
             Ok(true) => {
-                Err("the core stopped again before halting debug was turned off".to_owned())
+                Err("the board stopped again as the debugger let it go".to_owned())
             }
             Err(error) => Err(format!(
                 "could not read whether the core is halted: {error}"
@@ -923,7 +1084,7 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
     fn run_to_return(&mut self) -> Stop {
         let lr = match self.probe.get_mut().read_core_reg(14) {
             Ok(lr) => lr & !1,
-            Err(_) => return Stop::Fault("read LR".into()),
+            Err(_) => return self.fault("read where the method returns to"),
         };
         self.run_to_address(lr)
     }
@@ -950,19 +1111,27 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
     }
 
     fn poll(&mut self) -> Stop {
+        if let Some(end) = self.ended.take() {
+            return self.ended_with(end);
+        }
         match self.probe.get_mut().is_halted() {
             Ok(false) if self.locked_up() => Stop::Fault(String::from(
-                "the target is locked up: an unrecoverable exception was taken and the core is \
-                 fetching from the lockup address instead of running the program. Only a reset or \
-                 an NMI leaves that state, so the session cannot continue. DHCSR.S_LOCKUP reads 1",
+                "The board's processor locked up: the program hit a fault it could not recover from, \
+                 so it stopped running. Only a reset ends that, so the session ends here.",
             )),
-            Ok(false) => Stop::Running,
+            Ok(false) => match self.follow_console() {
+                Some(end) => self.ended_with(end),
+                None => self.unless_the_probe_stopped(Stop::Running),
+            },
             Ok(true) => match self.service_semihosting() {
                 Some(true) => Stop::Running,
-                Some(false) => Stop::Breakpoint,
-                None => Stop::Fault("semihosting service failed".into()),
+                Some(false) => match self.follow_console() {
+                    Some(end) => self.ended_with(end),
+                    None => self.unless_the_probe_stopped(Stop::Breakpoint),
+                },
+                None => self.fault("read the instruction the program stopped at"),
             },
-            Err(_) => Stop::Fault("could not read halt status".into()),
+            Err(_) => self.fault("tell whether the program had stopped"),
         }
     }
 
@@ -970,19 +1139,21 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
         match self.perform_semihosting_call() {
             Some(true) => return Stop::Step,
             Some(false) => {}
-            None => return Stop::Fault("semihosting service failed".into()),
+            None => return self.fault("read the instruction the program stopped at"),
         }
         match self.probe.get_mut().step() {
             Ok(()) => Stop::Step,
-            Err(_) => Stop::Fault("step failed".into()),
+            Err(_) => self.fault("step the program"),
         }
     }
 
     fn depth(&self) -> usize {
-        self.probe
-            .borrow_mut()
-            .read_core_reg(13)
-            .map_or(0, |sp| sp.wrapping_neg() as usize)
+        let frame_address = self
+            .walk(2)
+            .get(1)
+            .map(|&(_, caller_sp, _)| caller_sp)
+            .or_else(|| self.probe.borrow_mut().read_core_reg(13).ok());
+        frame_address.map_or(0, |address| address.wrapping_neg() as usize)
     }
 
     fn set_breakpoints(&mut self, addresses: &[u64]) -> Result<(), String> {
@@ -1017,7 +1188,7 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
     }
 
     fn stack(&self) -> Vec<Frame> {
-        self.walk_frames().into_iter().map(|(frame, _)| frame).collect()
+        self.walk_frames().into_iter().map(|(frame, _, _)| frame).collect()
     }
 
     fn resolve_source_breakpoint(&self, document: &str, line: u32) -> Option<u64> {
@@ -1046,6 +1217,10 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
         })
     }
 
+    fn frame_source_location(&self, index: usize, address: u64) -> Option<SourceLocation> {
+        self.source_location(if index > 0 { address.saturating_sub(1) } else { address })
+    }
+
     fn has_source(&self) -> bool {
         !self.lines.is_empty()
     }
@@ -1067,17 +1242,16 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
         if matches!(scope, Scope::Stack) || self.locals.is_empty() {
             return Vec::new();
         }
-        let frames = self.stack();
-        let Some(entry) = frames.get(frame) else {
+        let walked = self.walk_frames();
+        let Some((entry, frame_pointer, registers)) = walked.get(frame) else {
             return Vec::new();
         };
-        let pc = entry.address;
-        let Some(frame_pointer) = self.stack_pointer_of_frame(frame) else {
-            return Vec::new();
-        };
+        let (pc, frame_pointer) = (entry.address, *frame_pointer);
 
         let sections = self.locals.view();
-        let Ok(locals) = lamella_dwarf::Locals::parse_within(&sections, &self.locals.code) else {
+        let Ok(locals) =
+            lamella_dwarf::Locals::parse_within(&sections, &self.locals.code, &self.locals.options)
+        else {
             return Vec::new();
         };
         let lookup = if frame == 0 { pc } else { pc.saturating_sub(1) };
@@ -1095,8 +1269,18 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
                     .name
                     .map(|bytes| String::from_utf8_lossy(bytes).into_owned())
                     .unwrap_or_else(|| "<unnamed>".to_string());
-                let (value, kind) =
-                    self.render(local, lookup, frame_pointer, &program.frame_base, frame);
+                let scalar = local
+                    .type_offset
+                    .and_then(|offset| lamella_dwarf::scalar_type(&sections, offset));
+                let (value, kind) = self.render(
+                    local,
+                    lookup,
+                    frame_pointer,
+                    &program.frame_base,
+                    frame,
+                    registers,
+                    scalar,
+                );
                 Variable { name, value, kind }
             })
             .collect()
@@ -1104,15 +1288,17 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
 
     fn read_memory(&self, address: u64, len: usize) -> Vec<u8> {
         let mut probe = self.probe.borrow_mut();
-        let mut out = Vec::with_capacity(len);
-        let mut addr = address as u32;
-        while out.len() < len {
+        let skip = (address & 3) as usize;
+        let mut out = Vec::with_capacity(len + skip);
+        let mut addr = (address as u32) & !3;
+        while out.len() < len + skip {
             match probe.read_word(addr) {
                 Ok(word) => out.extend_from_slice(&word.to_le_bytes()),
                 Err(_) => break,
             }
             addr = addr.wrapping_add(4);
         }
+        let mut out = out.split_off(skip.min(out.len()));
         out.truncate(len);
         out
     }
@@ -1161,10 +1347,210 @@ impl<A: TargetAccess> DebugBackend for DeviceBackend<A> {
     }
 
     fn take_output(&mut self) -> Option<String> {
+        if let Some(end) = self.follow_console() {
+            self.ended = Some(end);
+        }
         if self.output.is_empty() {
             None
         } else {
             Some(core::mem::take(&mut self.output))
         }
+    }
+
+    fn take_debug_output(&mut self) -> Option<String> {
+        if self.notes.is_empty() {
+            None
+        } else {
+            Some(core::mem::take(&mut self.notes))
+        }
+    }
+
+    fn exit_code(&self) -> i32 {
+        self.exit_code
+    }
+
+    fn fault_exit_code(&self) -> Option<i32> {
+        self.aborted_code
+    }
+}
+
+/// Clears the console ring a run before this one left at `ring`, on a part a write has just reset
+/// and holds before the new program's first instruction: its magic word, which is all a reader goes
+/// by.
+///
+/// **RAM SURVIVES THE RESET THAT ENDS A WRITE.** Until the new run's startup sets its ring up, the
+/// old ring is still there -- with an end magic, where the old program ended -- and a look at it would
+/// report the old run's output and the old run's end as the new one's. Startup clears the magic
+/// itself, first, and writes it last, so clearing it early takes nothing from the program. A ring
+/// not on a word boundary is left alone: its magic is not one word.
+///
+/// # Errors
+/// The write the probe could not make.
+pub fn clear_console_ring<A: TargetAccess>(
+    target: &mut A,
+    ring: crate::program::DataObject,
+) -> Result<(), lamella_probe_core::ProbeError> {
+    if ring.address % 4 != 0 {
+        return Ok(());
+    }
+    target.write_word(ring.address, 0)
+}
+
+/// A part's memory read through its probe without halting it, in whole words, for the console
+/// ring's reader: `lamella run` reads a ring the same way.
+struct WordReads<'p, A>(&'p mut A);
+
+impl<A: TargetAccess> lamella_probe_console::TargetMemory for WordReads<'_, A> {
+    fn read(&mut self, address: u32, into: &mut [u8]) -> Result<(), String> {
+        if into.is_empty() {
+            return Ok(());
+        }
+        let past_the_end = || format!("{} bytes from {address:#010x} run past the end of memory", into.len());
+        let first = address & !3;
+        let skip = (address - first) as usize;
+        let end = u64::try_from(into.len())
+            .ok()
+            .and_then(|length| u64::from(address).checked_add(length))
+            .filter(|&end| end <= 1 << 32)
+            .ok_or_else(past_the_end)?;
+        let words = usize::try_from((end - u64::from(first)).div_ceil(4)).map_err(|_| past_the_end())?;
+        let mut read = vec![0u32; words];
+        self.0
+            .read_words_into(first, &mut read)
+            .map_err(|error| format!("reading the board's memory at {first:#010x}: {error}"))?;
+        let bytes: Vec<u8> = read.iter().flat_map(|word| word.to_le_bytes()).collect();
+        into.copy_from_slice(&bytes[skip..skip + into.len()]);
+        Ok(())
+    }
+}
+
+/// Four bytes as one word in hexadecimal, or `<unreadable>` where fewer came back.
+fn hex_word(bytes: &[u8]) -> String {
+    match bytes.get(..4) {
+        Some(&[a, b, c, d]) => format!("0x{:08x}", u32::from_le_bytes([a, b, c, d])),
+        _ => "<unreadable>".to_string(),
+    }
+}
+
+/// A register's `value` as `scalar`, when it is a type of four bytes or fewer that this reads, and
+/// in hexadecimal otherwise.
+fn in_register(value: u32, scalar: Option<lamella_dwarf::ScalarType<'_>>) -> String {
+    scalar
+        .and_then(|scalar| {
+            let width = usize::try_from(scalar.byte_size).ok().filter(|width| *width <= 4)?;
+            show_scalar(value.to_le_bytes().get(..width)?, &scalar)
+        })
+        .unwrap_or_else(|| format!("0x{value:08x}"))
+}
+
+/// A `value` the debug information gives outright, as `scalar` reads in .NET's debugger, and in
+/// hexadecimal where the type is not one this reads, as a value read from the target is. The number
+/// is the object's contents, so a type of any width this reads takes its bytes from it.
+fn constant(value: u64, scalar: Option<lamella_dwarf::ScalarType<'_>>) -> String {
+    scalar
+        .and_then(|scalar| show_scalar(&value.to_le_bytes(), &scalar))
+        .unwrap_or_else(|| format!("0x{value:08x}"))
+}
+
+/// `bytes`, little-endian, as a value of `scalar` reads in .NET's debugger: a whole number in
+/// decimal, a boolean as `true` or `false`, a character as its code and the character, and a
+/// floating-point number in the shortest spelling that reads back as the same number. An
+/// enumeration is its number, as its underlying type reads. `None` for an encoding or a size this
+/// does not read, and for fewer bytes than the type has.
+fn show_scalar(bytes: &[u8], scalar: &lamella_dwarf::ScalarType<'_>) -> Option<String> {
+    use lamella_dwarf::types::{
+        DW_ATE_BOOLEAN, DW_ATE_FLOAT, DW_ATE_SIGNED, DW_ATE_SIGNED_CHAR, DW_ATE_UNSIGNED,
+        DW_ATE_UNSIGNED_CHAR, DW_ATE_UTF,
+    };
+    let width = usize::try_from(scalar.byte_size).ok().filter(|width| (1..=8).contains(width))?;
+    let mut raw = [0u8; 8];
+    raw[..width].copy_from_slice(bytes.get(..width)?);
+    let unsigned = u64::from_le_bytes(raw);
+    let shift = 64 - 8 * width as u32;
+    let floating = |value: f64, text: String| {
+        if value.is_nan() {
+            "NaN".to_string()
+        } else if value.is_infinite() {
+            (if value > 0.0 { "Infinity" } else { "-Infinity" }).to_string()
+        } else {
+            text
+        }
+    };
+    Some(match (scalar.encoding, width) {
+        (DW_ATE_BOOLEAN, _) => (if unsigned == 0 { "false" } else { "true" }).to_string(),
+        (DW_ATE_SIGNED | DW_ATE_SIGNED_CHAR, _) => (((unsigned << shift) as i64) >> shift).to_string(),
+        (DW_ATE_UNSIGNED | DW_ATE_UNSIGNED_CHAR, _) => unsigned.to_string(),
+        (DW_ATE_FLOAT, 4) => {
+            let value = f32::from_bits(unsigned as u32);
+            floating(f64::from(value), value.to_string())
+        }
+        (DW_ATE_FLOAT, 8) => {
+            let value = f64::from_bits(unsigned);
+            floating(value, value.to_string())
+        }
+        (DW_ATE_UTF, _) => match char::from_u32(unsigned as u32) {
+            Some(character) if !character.is_control() => format!("{unsigned} '{character}'"),
+            _ => unsigned.to_string(),
+        },
+        _ => return None,
+    })
+}
+
+#[cfg(test)]
+mod scalar_tests {
+    use super::*;
+
+    fn of(name: &'static str, encoding: u64, byte_size: u64) -> lamella_dwarf::ScalarType<'static> {
+        lamella_dwarf::ScalarType { name: Some(name.as_bytes()), encoding, byte_size, enumeration: false }
+    }
+
+    /// Each scalar a C# program's locals have reads as .NET's debugger shows it.
+    #[test]
+    fn a_scalar_reads_as_dotnets_debugger_shows_it() {
+        let int = of("int", 0x05, 4);
+        assert_eq!(show_scalar(&6i32.to_le_bytes(), &int).as_deref(), Some("6"));
+        assert_eq!(show_scalar(&(-13i32).to_le_bytes(), &int).as_deref(), Some("-13"));
+        assert_eq!(show_scalar(&u32::MAX.to_le_bytes(), &of("uint", 0x07, 4)).as_deref(), Some("4294967295"));
+        assert_eq!(show_scalar(&(-2i64).to_le_bytes(), &of("long", 0x05, 8)).as_deref(), Some("-2"));
+        assert_eq!(show_scalar(&[0xff], &of("sbyte", 0x05, 1)).as_deref(), Some("-1"));
+        assert_eq!(show_scalar(&[0xff], &of("byte", 0x08, 1)).as_deref(), Some("255"));
+        assert_eq!(show_scalar(&[1], &of("bool", 0x02, 1)).as_deref(), Some("true"));
+        assert_eq!(show_scalar(&[0], &of("bool", 0x02, 1)).as_deref(), Some("false"));
+        assert_eq!(show_scalar(&65u16.to_le_bytes(), &of("char16_t", 0x10, 2)).as_deref(), Some("65 'A'"));
+        assert_eq!(show_scalar(&1.5f32.to_le_bytes(), &of("float", 0x04, 4)).as_deref(), Some("1.5"));
+        assert_eq!(show_scalar(&0.1f64.to_le_bytes(), &of("double", 0x04, 8)).as_deref(), Some("0.1"));
+        assert_eq!(show_scalar(&f64::NAN.to_le_bytes(), &of("double", 0x04, 8)).as_deref(), Some("NaN"));
+        assert_eq!(show_scalar(&f64::NEG_INFINITY.to_le_bytes(), &of("double", 0x04, 8)).as_deref(), Some("-Infinity"));
+        let day = lamella_dwarf::ScalarType { enumeration: true, ..of("DayOfWeek", 0x05, 4) };
+        assert_eq!(show_scalar(&5i32.to_le_bytes(), &day).as_deref(), Some("5"), "an enumeration as its number");
+    }
+
+    /// What this does not read is left to the hexadecimal word, never guessed at.
+    #[test]
+    fn a_type_this_does_not_read_is_left_to_the_word() {
+        assert_eq!(show_scalar(&[1, 2, 3, 4], &of("address", 0x01, 4)), None, "an encoding it does not read");
+        assert_eq!(show_scalar(&[1, 2], &of("int", 0x05, 4)), None, "fewer bytes than the type");
+        assert_eq!(show_scalar(&[0; 16], &of("decimal", 0x05, 16)), None, "wider than eight bytes");
+        assert_eq!(in_register(6, Some(of("int", 0x05, 4))), "6");
+        assert_eq!(in_register(6, Some(of("long", 0x05, 8))), "0x00000006", "a value wider than a register");
+        assert_eq!(in_register(6, None), "0x00000006");
+    }
+
+    /// A constant the debug information gives is its declared type's value with those bits, of
+    /// any width this reads -- zero is each type's zero -- and the hexadecimal word where the type
+    /// is not one this reads, as a value read from the target is.
+    #[test]
+    fn a_constant_reads_as_its_types_value_and_as_the_word_where_the_type_is_not_read() {
+        assert_eq!(constant(0, Some(of("int", 0x05, 4))), "0");
+        assert_eq!(constant(0, Some(of("long", 0x05, 8))), "0", "wider than a register");
+        assert_eq!(constant(0, Some(of("byte", 0x08, 1))), "0");
+        assert_eq!(constant(0, Some(of("bool", 0x02, 1))), "false");
+        assert_eq!(constant(0, Some(of("char16_t", 0x10, 2))), "0", "a character's code, as zero in memory reads");
+        assert_eq!(constant(0, Some(of("float", 0x04, 4))), "0");
+        assert_eq!(constant(0, Some(of("double", 0x04, 8))), "0");
+        assert_eq!(constant(31, Some(of("int", 0x05, 4))), "31", "the largest literal");
+        assert_eq!(constant(1, Some(of("bool", 0x02, 1))), "true");
+        assert_eq!(constant(0, None), "0x00000000", "an undescribed type, as its word in memory reads");
+        assert_eq!(constant(0, Some(of("decimal", 0x05, 16))), "0x00000000", "wider than eight bytes");
     }
 }

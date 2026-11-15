@@ -84,6 +84,10 @@ lamella-cmsis-dap-nrf = { path = "../lamella-cmsis-dap-nrf", features = ["microb
 # bootloader-volume write cannot be checked at all. Never a default: a person who owns no probe has
 # to be able to flash a new Pico, so the volume stays what the board takes unless asked otherwise.
 lamella-cmsis-dap-rp2350 = { path = "../lamella-cmsis-dap-rp2350" }
+# `wifi`: the stored network's record and its two-slot writer, the firmware's own, and the plain
+# values it stores.
+lamella-stored-settings = { path = "../lamella-stored-settings" }
+lamella-net-core = { path = "../lamella-net-core" }
 # The UF2 container: emitting one, and RECOGNIZING one. Both verbs funnel through `write_image`,
 # which wraps a flat image for a volume route -- and must not wrap one that is already wrapped,
 # because a doubly-wrapped UF2 is a file the bootloader ignores without saying so.
@@ -116,8 +120,9 @@ lamella-py-bytecode = { path = "../lamella-py-bytecode" }
 # `cargo build -p lamella-cli --features bake`.
 lamella-load = { path = "../lamella-load", optional = true }
 # The bake's refusal names each member a program reaches and the board could not run, so it reads
-# the violations `lamella-load`'s module reports, whose type is this crate's.
-lamella-cil-runtime = { path = "../lamella-cil-runtime", optional = true, default-features = false }
+# the violations `lamella-load`'s module reports, whose type is this crate's. And every build reads
+# its table of end codes, which says what a board's code for a stopped program means.
+lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
 # The metadata token a violation carries, read back into the member it names.
 lamella-token = { path = "../lamella-token", optional = true }
 # The debug-channel seam `run --device` drives. It is that channel and not the deploy one because
@@ -192,7 +197,7 @@ class-library = ["lamella-aot/linked"]
 # the crate documentation as well, because a gate that cannot build the verb it is trusted to
 # cover is worse than a missing gate.
 bake = [
-    "dep:lamella-load", "lamella-load/code-in-place", "dep:lamella-cil-runtime", "dep:lamella-token",
+    "dep:lamella-load", "lamella-load/code-in-place", "dep:lamella-token",
     "lamella-wire-host/baked",
     "lamella-wire-host/debug-backend", "dep:lamella-debug-backend",
 ]

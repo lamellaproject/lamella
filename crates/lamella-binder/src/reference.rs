@@ -6,7 +6,7 @@ use crate::special::SpecialType;
 use crate::symbols::{
     TypeParameterConstraints,
     Accessibility, EventSymbol, FieldSymbol, MethodSymbol, Model, PropertySymbol, TypeInfo,
-    TypeKind,
+    TypeKind, Variance,
 };
 use crate::types::TypeSymbol;
 use alloc::boxed::Box;
@@ -73,6 +73,13 @@ pub fn load_assembly(model: &mut Model, assembly: &Assembly, compiling_assembly:
         "IsByRefLikeAttribute",
     );
     let constants = assembly.constants();
+    // Accessor identity comes from metadata associations, not a get_/set_ naming convention.
+    let accessor_methods: BTreeSet<u32> =
+        (1..=assembly.tables().row_count(table::METHOD_SEMANTICS))
+            .filter_map(|row| assembly.tables().row(table::METHOD_SEMANTICS, row))
+            .filter(|row| row.raw(0) & 0x001B != 0) // Getter, setter, event add or remove.
+            .map(|row| row.raw(1))
+            .collect();
     for type_def in assembly.type_defs() {
         let own_parameters: &[&str] = type_parameters
             .get(&type_def.token().row())
@@ -88,12 +95,20 @@ pub fn load_assembly(model: &mut Model, assembly: &Assembly, compiling_assembly:
             &sets_required,
             &by_ref_like,
             &constants,
+            &accessor_methods,
             internals_visible,
         ) {
             let mut info = info;
             if let Some(names) = type_parameters.get(&type_def.token().row()) {
                 info.type_parameters = names.iter().map(|&name| Box::from(name)).collect();
                 let owner = type_def.token().row() << 1;
+                info.type_parameter_variance = (0..info.type_parameters.len())
+                    .map(|number| match constraints.get(&(owner, number as u32)).map(|entry| entry.0 & 3) {
+                        Some(1) => Variance::Covariant,
+                        Some(2) => Variance::Contravariant,
+                        _ => Variance::Invariant,
+                    })
+                    .collect();
                 info.type_parameter_constraints = (0..info.type_parameters.len())
                     .map(|number| {
                         decode_constraints(assembly, constraints.get(&(owner, number as u32)))
@@ -186,6 +201,7 @@ fn type_info(
     sets_required: &BTreeSet<lamella_token::Token>,
     by_ref_like: &BTreeSet<lamella_token::Token>,
     constants: &BTreeMap<lamella_token::Token, ConstantValue>,
+    accessor_methods: &BTreeSet<u32>,
     internals_visible: bool,
 ) -> Option<TypeInfo> {
     let TypeName { namespace, name } = type_def.name()?;
@@ -299,6 +315,7 @@ fn type_info(
             .map(|modifier| token_type_symbol(assembly, *modifier))
             .collect();
         let symbol = MethodSymbol {
+            is_accessor: accessor_methods.contains(&method.rid()),
             return_tuple_names: Vec::new(),
             explicit_interface: None,
             return_required_modifiers,
@@ -331,6 +348,7 @@ fn type_info(
             is_override: method_is_virtual(method.flags()) && !method_is_newslot(method.flags()),
             is_sealed: method_is_final(method.flags()),
             accessibility: member_accessibility(method.flags()),
+            uninstantiated_parameters: None,
             type_parameters: method_type_parameters
                 .get(&method.rid())
                 .map(|names| names.iter().map(|&name| Box::from(name)).collect())
@@ -348,7 +366,8 @@ fn type_info(
                     .strip_prefix("set_")
                     .filter(|_| symbol.parameters.len() == 1)
                     .map(|name| (name, symbol.parameters[0].clone()))
-            });
+            })
+            .filter(|_| symbol.is_accessor);
         if let Some((property_name, ty)) = property {
             if let Some(existing) = info
                 .properties
@@ -393,6 +412,7 @@ fn type_info(
             .strip_prefix("add_")
             .or_else(|| method_name.strip_prefix("remove_"))
             .filter(|_| symbol.parameters.len() == 1)
+            .filter(|_| symbol.is_accessor)
             .map(|name| (name, symbol.parameters[0].clone()));
         if let Some((event_name, ty)) = event {
             if info.find_event(event_name).is_none() {
@@ -750,6 +770,68 @@ fn is_base(base: &Option<TypeSymbol>, namespace: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn imported_events_require_accessor_metadata() {
+        use lamella_pe::{ImageBuilder, TypeSig, method_signature};
+
+        let mut image = ImageBuilder::new("events.dll", "events");
+        let object = image.object_type();
+        let handler = image.type_ref("System", "Action");
+        let ty = image.add_type("", "Members", object, 0x81);
+        let signature = method_signature(true, &[TypeSig::Class(handler)], &TypeSig::Void);
+        for (name, flags) in [("Ordinary", 0x446), ("SpecialNameOnly", 0xc46)] {
+            image.add_abstract_method(&alloc::format!("add_{name}"), &signature, flags, &[]);
+            image.add_abstract_method(&alloc::format!("remove_{name}"), &signature, flags, &[]);
+        }
+        let add = image.add_abstract_method("add_Actual", &signature, 0xc46, &[]);
+        let remove = image.add_abstract_method("remove_Actual", &signature, 0xc46, &[]);
+        let event = image.add_event("Actual", handler);
+        image.add_event_map(ty, event);
+        image.add_method_semantics(0x8, add, event);
+        image.add_method_semantics(0x10, remove, event);
+        let bytes = image.finish(Token::new(0, 0), true);
+        let assembly = Assembly::read(&bytes).expect("metadata image");
+        let mut model = Model::new();
+        load_assembly(&mut model, &assembly, "consumer");
+        let info = model.get("", "Members").expect("imported type");
+        for name in ["Ordinary", "SpecialNameOnly"] {
+            assert!(info.find_event(name).is_none(), "{name} has no event association");
+            assert!(info.methods.iter().filter(|method| method.name.ends_with(name))
+                .all(|method| !method.is_accessor));
+        }
+        assert!(info.find_event("Actual").is_some(), "the declared event remains available");
+        assert_eq!(info.methods.iter().filter(|method| method.is_accessor).count(), 2);
+    }
+
+    #[test]
+    fn imported_properties_require_accessor_metadata() {
+        use lamella_pe::{ImageBuilder, TypeSig, method_signature, property_signature};
+
+        let mut image = ImageBuilder::new("members.dll", "members");
+        let object = image.object_type();
+        let ty = image.add_type("", "Members", object, 0x81);
+        let getter_sig = method_signature(true, &[], &TypeSig::Int32);
+        let setter_sig = method_signature(true, &[TypeSig::Int32], &TypeSig::Void);
+        image.add_abstract_method("get_Ordinary", &getter_sig, 0x446, &[]);
+        image.add_abstract_method("set_Ordinary", &setter_sig, 0x446, &[]);
+        let getter = image.add_abstract_method("get_Actual", &getter_sig, 0xc46, &[]);
+        let setter = image.add_abstract_method("set_Actual", &setter_sig, 0xc46, &[]);
+        let property = image.add_property("Actual", &property_signature(true, &[], &TypeSig::Int32), 0);
+        image.add_property_map(ty, property);
+        image.add_method_semantics(0x2, getter, property);
+        image.add_method_semantics(0x1, setter, property);
+        let bytes = image.finish(Token::new(0, 0), true);
+        let assembly = Assembly::read(&bytes).expect("metadata image");
+        let mut model = Model::new();
+        load_assembly(&mut model, &assembly, "consumer");
+        let info = model.get("", "Members").expect("imported type");
+        assert!(info.find_property("Ordinary").is_none(), "an ordinary method is not a property");
+        let actual = info.find_property("Actual").expect("declared property");
+        assert!(actual.has_getter && actual.has_setter);
+        assert!(info.methods.iter().filter(|method| method.name.ends_with("Ordinary"))
+            .all(|method| !method.is_accessor));
+    }
 
     #[test]
     fn primitive_signature_elements_map_to_special_types() {
