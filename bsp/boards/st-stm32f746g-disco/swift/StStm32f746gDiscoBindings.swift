@@ -104,10 +104,18 @@ public enum StStm32f746gDiscoBindings {
     public static let HEADER_I2C_KERNEL_HZ: UInt32 = 16000000
     public static let HEADER_I2C_TIMINGR_100K_HSI_16MHZ: UInt32 = 0x30420F13
     public static let HEADER_I2C_TIMINGR_400K_HSI_16MHZ: UInt32 = 0x10320309
-    public static let DEVICE_COUNT: UInt32 = 1
+    public static let DEVICE_COUNT: UInt32 = 3
 
     // -- on-board devices: PORT group base + pin index + mask --
     public static let WM8994_ADDRESS: UInt32 = 0x1A
+    public static let SWDIO_PORT_BASE: UInt32 = 0x40020000
+    public static let SWDIO_PIN: UInt32 = 13
+    public static let SWDIO_BANK: UInt32 = 0
+    public static let SWDIO_MASK: UInt32 = 0x2000
+    public static let SWCLK_PORT_BASE: UInt32 = 0x40020000
+    public static let SWCLK_PIN: UInt32 = 14
+    public static let SWCLK_BANK: UInt32 = 0
+    public static let SWCLK_MASK: UInt32 = 0x4000
 
     // -- memory regions the board fits: SIZE is what a program may reach, which a device's own
     // size may exceed; a region with a CONTROLLER does not exist until that instance is brought

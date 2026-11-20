@@ -349,6 +349,9 @@ pub struct WireHostBackend {
     /// and one that answered it with nothing, and only the first of those is worth telling the user
     /// about. [`DebugBackend::variables`] is the reader.
     target_caps: Capabilities,
+    /// The format of the image the board's C# runtime loads, as its HELLO stated it, or `None` when
+    /// it stated none. A launch compares the image with it before anything is sent.
+    image_format: Option<u16>,
     /// A debug session is live on the target (between the start and Done/Trap/detach).
     session_live: bool,
     /// A resume is in flight: [`DebugBackend::poll`] watches for its stop event.
@@ -444,7 +447,33 @@ impl WireHostBackend {
         image: Vec<u8>,
         timeout: Duration,
     ) -> Result<Self, OpenFailure> {
-        Self::from_transport(WireTransport::Usb(UsbTransport::open_matching(vid, pid, serial)?), image, timeout)
+        let target = match serial {
+            Some(serial) => format!("usb:{vid:04x}:{pid:04x}:{serial}"),
+            None => format!("usb:{vid:04x}:{pid:04x}"),
+        };
+        let opening = |_: &str| {
+            UsbTransport::open_matching(vid, pid, serial).map(WireTransport::Usb).map_err(crate::open_failure)
+        };
+        Self::opened_by(&target, &opening, image, timeout)
+    }
+
+    /// The backend for the board `target` names, opened by `opening` as every host reaches a board
+    /// ([`crate::reopen`]): a board on its own USB that a command just reset is waited for, and one that
+    /// resets under the HELLO, as a board that runs Python does to take back its program, is opened
+    /// again and asked again.
+    ///
+    /// # Errors
+    /// As [`Self::open`].
+    #[cfg(any(feature = "usb", test))]
+    fn opened_by(
+        target: &str,
+        opening: &dyn Fn(&str) -> Result<WireTransport, String>,
+        image: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Self, OpenFailure> {
+        let (transport, hello) = crate::reopen::opened_and_asked(target, 0, Self::asked_for(), timeout, opening)
+            .map_err(|why| OpenFailure { error: TransportError::Carrier, why: Some(why) })?;
+        Self::from_session(transport, hello.map_err(crate::failed_after_the_open)?, image, timeout)
     }
 
     /// Open by a TARGET STRING: `usb` / `usb:<serial>` / `usb:<vid>:<pid>[:<serial>]` selects the native-USB
@@ -472,7 +501,14 @@ impl WireHostBackend {
         image: Vec<u8>,
         timeout: Duration,
     ) -> Result<Self, OpenFailure> {
-        let caps = Capabilities(
+        let session =
+            hello_blocking(&mut transport, 0, Self::asked_for(), timeout).map_err(crate::failed_after_the_open)?;
+        Self::from_session(transport, session, image, timeout)
+    }
+
+    /// What this host's HELLO offers a board.
+    fn asked_for() -> Capabilities {
+        Capabilities(
             Capabilities::DEBUG_BASIC
                 | Capabilities::BREAKPOINTS
                 | Capabilities::STEPPING
@@ -481,8 +517,17 @@ impl WireHostBackend {
                 | Capabilities::PROFILE_CHIPID
                 | Capabilities::DEPLOY_PREFIX_CRC
                 | Capabilities::STRING_VALUES,
-        );
-        let session = hello_blocking(&mut transport, 0, caps, timeout).map_err(crate::failed_after_the_open)?;
+        )
+    }
+
+    /// The backend around `transport`, whose board answered this host's HELLO with `session`: refused
+    /// unless the board offers debugging.
+    fn from_session(
+        transport: WireTransport,
+        session: lamella_wire::Negotiated,
+        image: Vec<u8>,
+        timeout: Duration,
+    ) -> Result<Self, OpenFailure> {
         if !(session.caps.has(Capabilities::DEBUG_BASIC)
             && session.caps.has(Capabilities::BREAKPOINTS)
             && session.caps.has(Capabilities::STEPPING))
@@ -490,12 +535,14 @@ impl WireHostBackend {
             return Err(crate::cannot_debug());
         }
         let connect_line = identity_line(&session.identity);
+        let image_format = session.image_format(lamella_wire::msg::tier::CIL);
         Ok(Self {
             transport: RefCell::new(transport),
             image,
             timeout,
             seq: Cell::new(0),
             target_caps: session.caps,
+            image_format,
             identity: session.identity,
             session_live: false,
             running: false,
@@ -1340,6 +1387,9 @@ impl Drop for WireHostBackend {
 
 impl DebugBackend for WireHostBackend {
     fn launch(&mut self) -> Result<(), String> {
+        if let Some(refusal) = crate::image_refusal(&self.image, self.image_format) {
+            return Err(refusal.to_owned());
+        }
         self.detach_if_live();
         self.running = false;
         self.exit_code = 0;
@@ -1729,6 +1779,7 @@ mod tests {
                 ..TargetIdentity::default()
             },
             max_inbound_payload: None,
+            image_formats: None,
         };
         let mut board = MemTransport::new();
         board
@@ -1746,6 +1797,52 @@ mod tests {
         assert_eq!(backend.take_debug_output().as_deref(), Some("Lamella Link: BBC micro:bit v2\n"));
     }
 
+    /// **A BOARD THAT RESETS UNDER THE DEBUGGER's HELLO IS OPENED AGAIN AND ASKED AGAIN**, as every
+    /// other host reaches a board on its own USB (`reopen`): a board that runs Python takes back its
+    /// program by resetting, so its first carrier goes away under the HELLO. Asked again, it is refused
+    /// for what it is, a board whose firmware offers no debugging, and a board that can debug is taken.
+    #[test]
+    fn a_board_that_resets_under_the_hello_is_asked_again() {
+        let answering = |caps: u64| {
+            let ack = lamella_wire::HelloAck {
+                chosen: lamella_wire::PROTOCOL_VERSION,
+                caps: Capabilities(caps),
+                identity: TargetIdentity {
+                    product_model: lamella_wire::product_model::PICO2_W,
+                    ..TargetIdentity::default()
+                },
+                max_inbound_payload: None,
+                image_formats: None,
+            };
+            let mut board = MemTransport::new();
+            board.send(lamella_wire::msg::HELLO_ACK, 0, &ack.encode()).expect("queue the board's HELLO_ACK");
+            let mut host = MemTransport::new();
+            host.feed(&board.take_sent());
+            WireTransport::Mem(Arc::new(Mutex::new(host)))
+        };
+        let target = "usb:39e9:0001:0123456789ABCDEF";
+        for (caps, debugs) in [
+            (Capabilities::BUNDLE | Capabilities::EXEC_NO_RESET, false),
+            (Capabilities::DEBUG_BASIC | Capabilities::BREAKPOINTS | Capabilities::STEPPING, true),
+        ] {
+            let opens = Cell::new(0);
+            let opening = |_: &str| {
+                opens.set(opens.get() + 1);
+                Ok(if opens.get() == 1 { WireTransport::Gone } else { answering(caps) })
+            };
+            let opened = WireHostBackend::opened_by(target, &opening, Vec::new(), Duration::from_millis(200));
+            match opened {
+                Ok(_) => assert!(debugs, "a board without debugging was taken"),
+                Err(failure) => assert_eq!(
+                    (debugs, failure.why.as_deref()),
+                    (false, Some("it answered, and its firmware offers no debugging")),
+                    "caps {caps:#x}"
+                ),
+            }
+            assert_eq!(opens.get(), 2, "the board is opened again after it reset under the HELLO");
+        }
+    }
+
     /// A host that checks WHICH board an image is about to reach reads it from the backend, so the
     /// model the board reported has to arrive unchanged.
     #[test]
@@ -1760,6 +1857,7 @@ mod tests {
                 ..TargetIdentity::default()
             },
             max_inbound_payload: None,
+            image_formats: None,
         };
         let mut board = MemTransport::new();
         board
@@ -1807,6 +1905,7 @@ mod tests {
             timeout: Duration::from_millis(50),
             seq: Cell::new(0),
             target_caps: Capabilities(u64::MAX),
+            image_format: Some(lamella_cil_runtime::BAKED_IMAGE_FORMAT),
             identity: TargetIdentity::default(),
             session_live: true,
             running: false,
@@ -1849,12 +1948,16 @@ mod tests {
     const ANSWERED_IDLE: (u8, u16, &[u8]) = (exec::EXEC_ACK, ABORT_SEQ, &[exec::ack::IDLE]);
 
     /// The sequence number a fresh backend's launch starts its execution with: the `ABORT` takes the
-    /// first and the deploy the second, whether or not it sends anything, and a board's answer to the
-    /// start has to carry the start's own number to be read as its answer.
+    /// first, and the question about what the board holds or else the deploy the second, and a board's
+    /// answer to the start has to carry the start's own number to be read as its answer.
     const START_SEQ: u16 = 3;
 
-    /// A host with no session open, launching an empty image -- which deploys nothing, so the launch
-    /// goes straight to its start -- into an idle board whose answers are already queued, in order.
+    /// The seed of the image [`launching_into`] launches ([`an_image`]), which its board already holds.
+    const HELD: u64 = 0x0123_4567_89AB_CDEF;
+
+    /// A host with no session open, launching an image its board already holds -- so nothing is
+    /// deployed and the launch goes straight to its start -- into an idle board whose answers are
+    /// already queued, in order.
     fn launching_into(
         answers: &[(u8, u16, &[u8])],
         timeout: Duration,
@@ -1862,7 +1965,9 @@ mod tests {
         let (mut backend, shared) = live_session(0);
         backend.session_live = false;
         backend.timeout = timeout;
-        queue_board_answers(&shared, &[ANSWERED_IDLE]);
+        backend.image = an_image(HELD);
+        let held = holds_verified(super::baked_image_checksum(&backend.image).expect("the image's checksum"));
+        queue_board_answers(&shared, &[ANSWERED_IDLE, (lamella_runner::deploy::DEPLOY_STATUS_RESULT, 2, &held)]);
         queue_board_answers(&shared, answers);
         (backend, shared)
     }
@@ -1985,7 +2090,10 @@ mod tests {
             Duration::from_secs(2),
         );
         assert_eq!(backend.launch(), Ok(()));
-        assert_eq!(sent_types(&shared), vec![debug::ABORT, exec::EXEC, debug::DBG_STACK]);
+        assert_eq!(
+            sent_types(&shared),
+            vec![debug::ABORT, lamella_runner::deploy::DEPLOY_STATUS, exec::EXEC, debug::DBG_STACK]
+        );
     }
 
     #[test]
@@ -1993,6 +2101,7 @@ mod tests {
         let (mut backend, shared) = live_session(0);
         backend.session_live = false;
         backend.timeout = Duration::from_millis(50);
+        backend.image = an_image(HELD);
         let Err(reason) = backend.launch() else {
             panic!("a board that answers nothing must not be reported as launched");
         };
@@ -2003,21 +2112,61 @@ mod tests {
         assert_eq!(sent_types(&shared), vec![debug::ABORT], "and nothing is sent after it");
     }
 
-    /// A baked-image header recording `checksum`, which is all a deploy-skip reads.
+    /// **A LAUNCH REFUSES AN IMAGE THE BOARD DOES NOT LOAD, BEFORE ANYTHING IS SENT**, in the words
+    /// every host gives: an image file this Lamella does not write is rebuilt, and an image the
+    /// board's runtime does not load, or a board that states no format, is answered by which side is
+    /// older.
+    #[test]
+    fn a_launch_refuses_an_image_the_board_does_not_load_before_anything_is_sent() {
+        use lamella_wire::image_format::{PRE_RELEASE, REBUILD_IMAGE, UPDATE_FIRMWARE, UPDATE_LAMELLA};
+        let ours = an_image(0x1122_3344_5566_7788);
+        let mut format_one = ours.clone();
+        format_one[4..8].copy_from_slice(&1u32.to_le_bytes());
+        for (image, board_format, said) in [
+            (format_one, Some(lamella_cil_runtime::BAKED_IMAGE_FORMAT), REBUILD_IMAGE),
+            (ours.clone(), Some(PRE_RELEASE | 2), UPDATE_LAMELLA),
+            (ours, None, UPDATE_FIRMWARE),
+        ] {
+            let (mut backend, shared) = live_session(0);
+            backend.session_live = false;
+            backend.image = image;
+            backend.image_format = board_format;
+            assert_eq!(backend.launch(), Err(said.to_owned()), "a board stating {board_format:?}");
+            assert!(sent_types(&shared).is_empty(), "nothing was sent: {:?}", sent_types(&shared));
+        }
+    }
+
+    /// A baked image that passes the checks a board's boot makes of an image's bytes
+    /// ([`lamella_cil_runtime::baked_image_refusal`]), which a host asks of an image before it sends one:
+    /// an entry point naming its one method, whose body is one `ret`, the shortest directory the format
+    /// writes and `seed`'s eight bytes, its checksum, which is all a deploy-skip reads
+    /// ([`super::baked_image_checksum`]), the one they hash to. Those checks are not all of a boot: they
+    /// leave out the board's intrinsic registry, and of the entry's body they ask only a length of at
+    /// least one byte inside the arena, not that it runs.
     ///
-    /// Checked against the reader itself, so a header layout that moves fails HERE, by name, rather
+    /// Checked against the readers themselves, so a header layout that moves fails HERE, by name, rather
     /// than as a launch that deploys when a test says it should not.
-    fn image_with_checksum(checksum: u64) -> Vec<u8> {
+    fn an_image(seed: u64) -> Vec<u8> {
         let mut image = Vec::new();
         image.extend_from_slice(b"LML1");
-        image.extend_from_slice(&1u32.to_le_bytes());
-        image.resize(8 + 32 * 8, 0);
-        image[8 + 20 * 8..8 + 21 * 8].copy_from_slice(&checksum.to_le_bytes());
-        assert_eq!(
-            super::baked_image_checksum(&image),
-            Some(checksum),
-            "the fixture must be a header the checksum reader accepts -- the layout has moved"
-        );
+        image.extend_from_slice(&u32::from(lamella_cil_runtime::BAKED_IMAGE_FORMAT).to_le_bytes());
+        image.resize(lamella_cil_runtime::BAKED_IMAGE_MIN_LEN + 24, 0);
+        let record = lamella_cil_runtime::BAKED_IMAGE_MIN_LEN;
+        image[record + 8..record + 16].copy_from_slice(&[24, 0, 0, 0, 1, 0, 0, 0]);
+        image.push(0x2A);
+        image.extend_from_slice(&seed.to_le_bytes());
+        let word = |image: &mut Vec<u8>, index: usize, value: u64| image[8 + index * 8..16 + index * 8].copy_from_slice(&value.to_le_bytes());
+        word(&mut image, 0, 1);
+        word(&mut image, 1, 1);
+        word(&mut image, 16, (lamella_cil_runtime::BAKED_IMAGE_MIN_LEN - (8 + 19 * 8)) as u64);
+        word(&mut image, 17, 33);
+        if let Some(lamella_cil_runtime::module::BakeError::ChecksumMismatch { computed, .. }) =
+            lamella_cil_runtime::baked_image_refusal(&image)
+        {
+            word(&mut image, 18, computed);
+        }
+        assert!(lamella_cil_runtime::baked_image_holds_a_program(&image), "the fixture must be an image a board's boot takes");
+        assert!(super::baked_image_checksum(&image).is_some(), "the fixture must be a header the checksum reader accepts -- the layout has moved");
         image
     }
 
@@ -2033,8 +2182,8 @@ mod tests {
         let (mut backend, shared) = live_session(0);
         backend.session_live = false;
         backend.timeout = Duration::from_secs(2);
-        backend.image = image_with_checksum(0x1122_3344_5566_7788);
-        let held = holds_verified(0x1122_3344_5566_7788);
+        backend.image = an_image(0x1122_3344_5566_7788);
+        let held = holds_verified(super::baked_image_checksum(&backend.image).expect("the image's checksum"));
         let started: &[u8] = &[exec::ack::STARTED];
         let entry: &[u8] = &[reason::ENTRY, 0, 0, 0, 0, 0, 0, 0, 0];
         let no_frames: &[u8] = &[0, 0];
@@ -2070,10 +2219,10 @@ mod tests {
         let (mut backend, shared) = live_session(0);
         backend.session_live = false;
         backend.timeout = Duration::from_millis(500);
-        backend.image = image_with_checksum(0x1122_3344_5566_7788);
+        backend.image = an_image(0x1122_3344_5566_7788);
         let last_output: &[u8] = &[debug::output::STDOUT, 0, b'x'];
         let aborted: &[u8] = &[reason::ABORTED, 0, 0, 0, 0, 0, 0, 0, 0];
-        let held = holds_verified(0x1122_3344_5566_7788);
+        let held = holds_verified(super::baked_image_checksum(&backend.image).expect("the image's checksum"));
         let started: &[u8] = &[exec::ack::STARTED];
         let entry: &[u8] = &[reason::ENTRY, 0, 0, 0, 0, 0, 0, 0, 0];
         let no_frames: &[u8] = &[0, 0];
@@ -2105,7 +2254,7 @@ mod tests {
         let (mut backend, shared) = live_session(0);
         backend.session_live = false;
         backend.identity.product_model = lamella_wire::product_model::MICROBIT_V2;
-        backend.image = image_with_checksum(0x1122_3344_5566_7788);
+        backend.image = an_image(0x1122_3344_5566_7788);
         let mut nothing_held = vec![lamella_runner::deploy::deploy_state::NONE, 0];
         nothing_held.extend_from_slice(&0u64.to_le_bytes());
         nothing_held.extend_from_slice(&200u32.to_le_bytes());
@@ -2124,7 +2273,7 @@ mod tests {
             panic!("an image larger than the window must not be reported as launched");
         };
 
-        assert_eq!(reason, crate::image_too_large(Some("BBC micro:bit v2"), 264, 200));
+        assert_eq!(reason, crate::image_too_large(Some("BBC micro:bit v2"), backend.image.len(), 200));
         assert!(
             !sent_types(&shared).contains(&lamella_runner::deploy::DEPLOY_IMAGE),
             "and not one chunk crossed: {:?}",
@@ -2136,7 +2285,7 @@ mod tests {
     fn a_board_holding_a_different_image_is_sent_this_one() {
         let (mut backend, shared) = live_session(0);
         backend.session_live = false;
-        backend.image = image_with_checksum(0x1122_3344_5566_7788);
+        backend.image = an_image(0x1122_3344_5566_7788);
         let other = holds_verified(0x0bad_0bad_0bad_0bad);
         queue_board_answers(
             &shared,
@@ -2160,7 +2309,7 @@ mod tests {
     fn a_board_that_cannot_say_what_it_holds_is_sent_the_image() {
         let (mut backend, shared) = live_session(0);
         backend.session_live = false;
-        backend.image = image_with_checksum(0x1122_3344_5566_7788);
+        backend.image = an_image(0x1122_3344_5566_7788);
         queue_board_answers(&shared, &[ANSWERED_IDLE]);
 
         assert!(backend.launch().is_err());
@@ -2619,6 +2768,7 @@ mod variables_tests {
             timeout: Duration::from_millis(50),
             seq: Cell::new(0),
             target_caps: Capabilities(caps),
+            image_format: Some(lamella_cil_runtime::BAKED_IMAGE_FORMAT),
             identity: TargetIdentity::default(),
             session_live: true,
             running: false,

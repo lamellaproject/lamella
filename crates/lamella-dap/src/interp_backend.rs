@@ -9,7 +9,7 @@ use lamella_debug_backend::{
 };
 use lamella_metadata::{Assembly, PortablePdb, SigType, StackClass};
 use lamella_token::Token;
-use lamella_cil_runtime::{MethodId, Module, Session, Slice, Threads, Value, Vm, Watch};
+use lamella_cil_runtime::{MethodId, Module, Session, Slice, Threads, Value, Vm, Watch, module::TypeId};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// The `MethodDef` metadata table tag, for rebuilding a method token to map a PDB
@@ -104,10 +104,20 @@ pub struct InterpreterBackend {
     /// (134 for an exception the program did not catch, 1 for a trap of the interpreter's own).
     /// `None` until a run faults.
     fault_exit_code: Option<i32>,
-    /// Per method, the [`StackClass`] of each local's type by slot, from the program's local
-    /// signatures ([`InterpreterBackend::with_local_types`]): `None` for a type whose class its
-    /// signature does not decide. Empty until the backend is given the program.
-    local_classes: BTreeMap<MethodId, Vec<Option<StackClass>>>,
+    /// Per method, the [`LocalZero`] of each local by slot, from the program's local signatures
+    /// ([`InterpreterBackend::with_local_types`]): `None` for a type whose zero neither its
+    /// signature nor the module decides. Empty until the backend is given the program.
+    local_zeros: BTreeMap<MethodId, Vec<Option<LocalZero>>>,
+}
+
+/// What a local holds before its method first stores it: every local starts at its type's zero, a
+/// reference at null and a value type zeroed (ECMA-335 6th ed I.12.3.2 and II.15.4.1.3).
+#[derive(Clone, Copy)]
+enum LocalZero {
+    /// The zero of a stack class: an `int`'s 0, a `long`'s, a reference's null.
+    Class(StackClass),
+    /// The struct of this type with every field at its zero.
+    Struct(TypeId),
 }
 
 /// The process exit code an entry method's return maps to: its `int` return, or 0 for a `void` (or
@@ -142,7 +152,7 @@ impl InterpreterBackend {
             pending: Pending::Nothing,
             exit_code: 0,
             fault_exit_code: None,
-            local_classes: BTreeMap::new(),
+            local_zeros: BTreeMap::new(),
         }
     }
 
@@ -195,14 +205,15 @@ impl InterpreterBackend {
             pending: Pending::Nothing,
             exit_code: 0,
             fault_exit_code: None,
-            local_classes: BTreeMap::new(),
+            local_zeros: BTreeMap::new(),
         }
     }
 
-    /// This backend with the class of each local of `program`'s methods, from their local
+    /// This backend with the zero of each local of `program`'s methods, from their local
     /// signatures, so a frame's variables list each local its PDB names, stored or not: one the
-    /// method has not stored yet at its class's zero, the value every local starts at, or as not
-    /// assigned yet where its type decides no class ([`SigType::stack_class`]).
+    /// method has not stored yet at its type's zero, the value every local starts at -- a struct as
+    /// that struct with its fields at zero -- or as not assigned yet where neither its signature nor
+    /// the module decides that zero ([`local_type_zero`]).
     ///
     /// `program` is the assembly the backend's module was loaded from, whose portable PDB
     /// [`InterpreterBackend::with_pdb`] was given. A backend without that PDB names no local, and
@@ -210,11 +221,12 @@ impl InterpreterBackend {
     #[must_use]
     pub fn with_local_types(mut self, program: &Assembly<'_>) -> InterpreterBackend {
         let ids: BTreeMap<u32, MethodId> = self.method_rid.iter().map(|(&id, &rid)| (rid, id)).collect();
+        let asm = self.module.method_asm(self.entry);
         for type_def in program.type_defs() {
             for method in type_def.methods() {
                 if let Some(&id) = ids.get(&method.rid()) {
-                    let classes = method.local_variables().iter().map(SigType::stack_class).collect();
-                    self.local_classes.insert(id, classes);
+                    let zeros = method.local_variables().iter().map(|local| local_type_zero(&self.module, asm, local)).collect();
+                    self.local_zeros.insert(id, zeros);
                 }
             }
         }
@@ -406,40 +418,98 @@ impl InterpreterBackend {
         Some(names)
     }
 
-    /// The class `method`'s local signature gives local `slot`, where its type decides one.
-    fn local_class(&self, method: MethodId, slot: usize) -> Option<StackClass> {
-        self.local_classes.get(&method)?.get(slot).copied().flatten()
+    /// The zero `method`'s local signature gives local `slot`, where its type decides one.
+    fn local_zero(&self, method: MethodId, slot: usize) -> Option<LocalZero> {
+        self.local_zeros.get(&method)?.get(slot).copied().flatten()
+    }
+
+    /// The struct of type `type_id` with every field at its zero, as a stored struct of that type is
+    /// held.
+    fn zero_struct(&self, type_id: TypeId) -> Value {
+        Value::Struct(self.module.type_field_defaults(type_id).unwrap_or_default().into_boxed_slice())
     }
 
     /// Local `slot` of `method`, holding `value`, as a variables view shows it.
     ///
-    /// A slot below the highest one the method has stored, and not stored itself, holds a 32-bit 0
-    /// whatever its type. Under any class but `int` such a 0 is only that, since a stored `long` is
-    /// 64 bits and a stored reference a reference or null, so it is shown as its class's zero, the
-    /// value the local holds. With no class it is shown as held: an enum's 0 is that same 32-bit 0,
-    /// stored or not.
+    /// A local the method has not stored yet can hold a 32-bit 0 whatever its type: a frame starts a
+    /// struct's slot there, and every slot the loader recorded no kind for. Under any class but `int`
+    /// such a 0 is only that, since a stored `long` is 64 bits and a stored reference a reference or
+    /// null, so it is shown as its class's zero, the value the local holds; and a struct's, since a
+    /// stored struct is held as one, as that struct with its fields at zero. A local whose zero
+    /// nothing decides is shown as held: an enum's 0 is that same 32-bit 0, stored or not.
     fn shown_local(&self, method: MethodId, slot: usize, value: &Value) -> Value {
-        match self.local_class(method, slot) {
-            Some(class) if class != StackClass::Int32 && *value == Value::Int32(0) => zero(class),
+        match self.local_zero(method, slot) {
+            Some(LocalZero::Class(class)) if class != StackClass::Int32 && *value == Value::Int32(0) => zero(class),
+            Some(LocalZero::Struct(type_id)) if *value == Value::Int32(0) => self.zero_struct(type_id),
             _ => value.clone(),
         }
     }
 
     /// A row for each local `names` names in `method` at or past slot `stored`, the count of slots
-    /// the frame holds: locals the method has not stored yet, at their class's zero, or as not
-    /// assigned yet where their type decides no class.
-    fn unstored_locals(&self, method: MethodId, stored: usize, names: &BTreeMap<u16, String>) -> Vec<Variable> {
+    /// the frame holds, with that slot: locals the method has not stored yet, at their type's zero,
+    /// or as not assigned yet where nothing decides it.
+    fn unstored_locals(&self, method: MethodId, stored: usize, names: &BTreeMap<u16, String>) -> Vec<(usize, Variable)> {
         names
             .iter()
             .filter(|&(&slot, name)| usize::from(slot) >= stored && !name.is_empty())
             .map(|(&slot, name)| {
-                let (value, kind) = match self.local_class(method, usize::from(slot)) {
-                    Some(class) => format_value(&self.vm, zero(class)),
+                let (value, kind) = match self.local_zero(method, usize::from(slot)) {
+                    Some(LocalZero::Class(class)) => format_value(&self.vm, zero(class)),
+                    Some(LocalZero::Struct(type_id)) => format_value(&self.vm, self.zero_struct(type_id)),
                     None => (NOT_ASSIGNED_YET.to_owned(), String::new()),
                 };
-                Variable { name: name.clone(), value, kind }
+                (usize::from(slot), Variable { name: name.clone(), value, kind })
             })
             .collect()
+    }
+
+    /// The rows of one scope of frame `frame_index`, counted as [`DebugBackend::stack`] lists the
+    /// frames, each with the slot it shows. Locals take their names from the PDB, arguments from
+    /// the method's parameter metadata (`this` first for an instance method), and anything unnamed
+    /// `localN` / `argN` / `stackN`. Where the PDB names a method's locals, a local it does not
+    /// name, a compiler's temporary, is not listed, as .NET's debugger lists only the locals the
+    /// PDB's scopes name.
+    fn rows(&self, frame_index: usize, scope: Scope) -> Vec<(usize, Variable)> {
+        let Some(session) = self.session() else {
+            return Vec::new();
+        };
+        let Some(frame) = self
+            .session_frame(frame_index)
+            .and_then(|at| session.frame(at))
+        else {
+            return Vec::new();
+        };
+        let method = frame.method;
+        let (prefix, values) = match scope {
+            Scope::Arguments => ("arg", frame.args),
+            Scope::Locals => ("local", frame.locals),
+            Scope::Stack => ("stack", frame.stack),
+        };
+        let names = matches!(scope, Scope::Locals)
+            .then(|| self.local_names(method))
+            .flatten();
+        let arguments = matches!(scope, Scope::Arguments);
+        let locals = matches!(scope, Scope::Locals);
+        let mut rows: Vec<(usize, Variable)> = values
+            .iter()
+            .enumerate()
+            .filter_map(|(index, value)| {
+                let name = match names.as_ref() {
+                    Some(names) => names.get(&(index as u16)).filter(|name| !name.is_empty())?.clone(),
+                    None => arguments
+                        .then(|| self.module.arg_name(method, index).map(String::from))
+                        .flatten()
+                        .unwrap_or_else(|| format!("{prefix}{index}")),
+                };
+                let shown = if locals { self.shown_local(method, index, value) } else { value.clone() };
+                let (text, kind) = format_value(&self.vm, shown);
+                Some((index, Variable { name, value: text, kind }))
+            })
+            .collect();
+        if let Some(names) = names.as_ref().filter(|_| locals) {
+            rows.extend(self.unstored_locals(method, values.len(), names));
+        }
+        rows
     }
 
     /// The session's index for frame `frame`, counted as [`DebugBackend::stack`] lists the frames:
@@ -700,53 +770,7 @@ impl DebugBackend for InterpreterBackend {
     }
 
     fn variables(&self, frame_index: usize, scope: Scope) -> Vec<Variable> {
-        let Some(session) = self.session() else {
-            return Vec::new();
-        };
-        let Some(frame) = self
-            .session_frame(frame_index)
-            .and_then(|at| session.frame(at))
-        else {
-            return Vec::new();
-        };
-        let method = frame.method;
-        let (prefix, values) = match scope {
-            Scope::Arguments => ("arg", frame.args),
-            Scope::Locals => ("local", frame.locals),
-            Scope::Stack => ("stack", frame.stack),
-        };
-        let names = matches!(scope, Scope::Locals)
-            .then(|| self.local_names(method))
-            .flatten();
-        let arguments = matches!(scope, Scope::Arguments);
-        let locals = matches!(scope, Scope::Locals);
-        let mut rows: Vec<Variable> = values
-            .iter()
-            .enumerate()
-            .map(|(index, value)| {
-                let shown = if locals { self.shown_local(method, index, value) } else { value.clone() };
-                let (text, kind) = format_value(&self.vm, shown);
-                let name = names
-                    .as_ref()
-                    .and_then(|names| names.get(&(index as u16)))
-                    .cloned()
-                    .or_else(|| {
-                        arguments
-                            .then(|| self.module.arg_name(method, index).map(String::from))
-                            .flatten()
-                    })
-                    .unwrap_or_else(|| format!("{prefix}{index}"));
-                Variable {
-                    name,
-                    value: text,
-                    kind,
-                }
-            })
-            .collect();
-        if let Some(names) = names.as_ref().filter(|_| locals) {
-            rows.extend(self.unstored_locals(method, values.len(), names));
-        }
-        rows
+        self.rows(frame_index, scope).into_iter().map(|(_, variable)| variable).collect()
     }
 
     fn can_set_variables(&self) -> bool {
@@ -764,9 +788,10 @@ impl DebugBackend for InterpreterBackend {
             return None;
         }
         let slot = self
-            .variables(frame_index, scope)
-            .iter()
-            .position(|variable| variable.name == name)?;
+            .rows(frame_index, scope)
+            .into_iter()
+            .find(|(_, variable)| variable.name == name)?
+            .0;
         let at = self.session_frame(frame_index)?;
         let frame = self.session()?.frame(at)?;
         let current = match scope {
@@ -865,6 +890,24 @@ pub fn decode_address(address: u64) -> (u32, u32) {
 
 fn alloc_method_name(method: MethodId, ip: u32) -> String {
     format!("method#{method} @{ip}")
+}
+
+/// What a local of type `local` holds before its method first stores it, where its signature or the
+/// module decides it: its stack class's zero ([`SigType::stack_class`]), or, for a value type named
+/// by token that the module loaded as a struct and not an enum, that struct with its fields at zero.
+/// `None` for an enum, whose 0 is the integer its slot holds, and for a type whose zero this does
+/// not reach: a generic parameter, or a generic struct's instantiation. `asm` is the program's
+/// assembly, whose tokens the signature uses.
+fn local_type_zero(module: &Module, asm: u8, local: &SigType) -> Option<LocalZero> {
+    if let Some(class) = local.stack_class() {
+        return Some(LocalZero::Class(class));
+    }
+    let SigType::ValueType(token) = local else {
+        return None;
+    };
+    let type_id = module.type_id_of(asm, *token)?;
+    let is_enum = module.type_handle_of(type_id).is_some_and(|handle| module.is_enum_by_handle(handle));
+    (module.type_is_value_type(type_id) && !is_enum).then_some(LocalZero::Struct(type_id))
 }
 
 /// The value a local of `class` holds before its method first stores it: every local starts zeroed.

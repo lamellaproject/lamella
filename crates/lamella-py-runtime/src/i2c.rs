@@ -108,7 +108,9 @@ pub(crate) struct I2cFacts {
     pub cmd_stop: u32,
     /// IC_DATA_CMD.RESTART -- issue a repeated START before this word (write_then_read).
     pub cmd_restart: u32,
-    /// IC_TX_ABRT_SOURCE.ABRT_7B_ADDR_NOACK -- nobody answered the address.
+    /// IC_TX_ABRT_SOURCE.ABRT_7B_ADDR_NOACK -- nobody answered the address. The off-device sim
+    /// raises it, so it is compiled only there.
+    #[cfg(not(target_os = "none"))]
     pub abrt_addr_nack: u32,
     /// IC_TX_ABRT_SOURCE.ABRT_TXDATA_NOACK -- a data byte drew no ack.
     pub abrt_data_nack: u32,

@@ -431,25 +431,18 @@ fn expressible_argument(
     }
 }
 
-/// The walk's decoded arguments as this assembly's signatures, when every one of them is a type the
-/// element byte fully describes -- `int`, `string`, `object`, and arrays of those.
+/// One of the walk's decoded arguments as this assembly's signature, when its element type is the
+/// whole type, as for a primitive, `string` or `object`: one byte and no token in a signature
+/// (ECMA-335 6th ed II.23.1.16). `None` when it is not.
 ///
-/// `None` the moment one is not. Kept as the leaf [`expressible_argument`] falls through to, so the
-/// element-byte rule has one home rather than two.
-#[cfg(feature = "generics")]
-fn payload_free_arguments(arguments: &[lamella_generics::TypeArg]) -> Option<Vec<SigType>> {
-    arguments.iter().map(payload_free_argument).collect()
-}
-
-/// One argument, per [`payload_free_arguments`].
+/// The leaf [`expressible_argument`] falls through to, so the element-byte rule has one home rather
+/// than two. A one-dimensional array never reaches it, because [`expressible_argument`] takes that
+/// itself, element and all; a multi-dimensional one does, and is answered `None`.
 #[cfg(feature = "generics")]
 fn payload_free_argument(argument: &lamella_generics::TypeArg) -> Option<SigType> {
     match argument {
         lamella_generics::TypeArg::Primitive(byte) => {
             lamella_metadata::signature::payload_free_sig(*byte)
-        }
-        lamella_generics::TypeArg::SzArray(element) => {
-            Some(SigType::SzArray(Box::new(payload_free_argument(element)?)))
         }
         _ => None,
     }
@@ -1685,6 +1678,16 @@ pub(crate) fn monomorphize<'pe>(
                 }
             };
             let id = module.add_method(asm, materialize(raw), method.arg_count);
+            if let Some(definition) = assembly.method(method.token.row()) {
+                let generics = super::SlotGenerics {
+                    type_arguments: &want.arguments,
+                    type_asm: sources.get(want.world).map_or(asm, |source| source.asm),
+                    ..super::SlotGenerics::default()
+                };
+                let this_by_ref = assembly.type_def(def_row).is_some_and(|type_def| super::this_is_managed_pointer(&type_def));
+                let types = super::TypeSource { assembly, asm, type_offset: None, type_index: None, references: &[] };
+                super::record_slot_kinds(module, id, asm, &definition, this_by_ref, generics, Some(types));
+            }
             module.set_method_type(id, type_id);
             if method.name == ".cctor" {
                 module.add_static_ctor(id);
@@ -2444,6 +2447,17 @@ fn lower_method_pairs<'pe>(
             continue;
         }
         let id = module.add_method(asm, cil, arg_count(&method));
+        let generics = super::SlotGenerics {
+            method_arguments: &pair.arguments,
+            method_asm: asm,
+            ..super::SlotGenerics::default()
+        };
+        let this_by_ref = rows
+            .get(&pair.def_row)
+            .and_then(|row| assembly.type_def(*row))
+            .is_some_and(|type_def| super::this_is_managed_pointer(&type_def));
+        let types = super::TypeSource { assembly, asm, type_offset: None, type_index: None, references: &[] };
+        super::record_slot_kinds(module, id, asm, &method, this_by_ref, generics, Some(types));
         emitted_ids[position] = Some(id);
         if let Some(type_id) = rows
             .get(&pair.def_row)

@@ -1,0 +1,16 @@
+# The sources the stm32f7 build of System.Device.Gpio carries beside the library's own, one path per
+# line: the GPIO driver every STM32 family with this GPIO block shares, beside the family files
+# (an entry starting ./), and the csp/stm32f7/csharp sources it is bound with -- the generated
+# layouts of the GPIO ports, the external interrupt controller and SYSCFG and the instances, and the
+# binding that hands their numbers to the driver. build-managed compiles them into that build, and
+# build-boards leaves the csp ones out of each STM32F7 board's assembly, which references that build
+# instead, so each of these types is in exactly one assembly. The rest of csp/stm32f7/csharp is the
+# boards'.
+./stm32/Stm32ExtiLines.cs
+./stm32/Stm32GpioDriver.cs
+./stm32/Stm32GpioPorts.cs
+Stm32f7ExtiLayout.g.cs
+Stm32f7GpioBinding.cs
+Stm32f7GpioLayout.g.cs
+Stm32f7Instances.g.cs
+Stm32f7SyscfgLayout.g.cs

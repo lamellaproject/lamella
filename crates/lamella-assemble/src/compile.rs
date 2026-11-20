@@ -4863,16 +4863,6 @@ fn parameter_names(parameters: &[Parameter]) -> Vec<ParamRow> {
         .collect()
 }
 
-/// An `i64` as an unsuffixed integer [`Literal`], the shape every integral constant path here
-/// wants.
-fn integer_constant(value: i64) -> Literal {
-    Literal::Integer {
-        value: value as u64,
-        decimal: false,
-        suffix: lamella_syntax::token::IntegerSuffix::None,
-    }
-}
-
 /// The `ParameterAttributes` a parameter's modifier AND its attributes mean (II.23.1.13).
 ///
 /// **`out` AND `ref` ARE THE SAME SIGNATURE AND DIFFERENT METADATA.** Both encode a byref in the

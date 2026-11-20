@@ -13,6 +13,9 @@ publish = false
 # Only the byte form is shared; how code points group into characters differs per language and stays
 # with each caller.
 lamella-wtf8 = { path = "../lamella-wtf8" }
+# The format rule a bundle's number follows (the pre-release flag), the one every image format
+# shares. A leaf: it depends on nothing.
+lamella-wire = { path = "../lamella-wire" }
 
 [lints]
 workspace = true

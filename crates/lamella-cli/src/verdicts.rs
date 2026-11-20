@@ -477,7 +477,7 @@ mod tests {
         );
         assert_eq!(
             line_of("st-stm32f769i-disco"),
-            "<LamellaBoard Include=\"st-stm32f769i-disco\" Name=\"STM32F769I Discovery\" NativeImage=\"false\" \
+            "<LamellaBoard Include=\"st-stm32f769i-disco\" Name=\"STM32F769I Discovery\" NativeImage=\"true\" \
              ProbeFamilies=\"st-link\" />"
         );
         assert_eq!(

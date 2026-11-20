@@ -8,7 +8,7 @@ use lamella_gc::Ref;
 use lamella_py_bytecode::{BinOp, Bundle, CmpOp, CodeObject, Const, ExcEntry, Functions, Op, UnaryOp};
 
 use crate::bigint::BigInt;
-use crate::object::{DescriptorRead, DictViewKind, HashUse, InlineCache, ObjectModel};
+use crate::object::{DescriptorRead, DictViewKind, HashUse, InlineCache, ObjectModel, ValueRoot};
 #[cfg(feature = "gc-collect")]
 use crate::object::FinalizerSkip;
 use crate::trap::Trap;
@@ -668,33 +668,6 @@ fn binop_dunder_names(op: BinOp) -> (&'static str, &'static str) {
     }
 }
 
-/// Tries a binary operator's dunder protocol on user-class operands: `lhs.__op__(rhs)`, else the
-/// reflected `rhs.__rop__(lhs)`. `None` if neither operand's class defines the relevant method (the
-/// str/seq and numeric paths then apply). NotImplemented is not modeled -- a defined method is used.
-fn try_binop_dunder(
-    op: BinOp,
-    lhs: Value,
-    rhs: Value,
-    functions: &Functions,
-    model: &mut ObjectModel,
-    depth: usize,
-) -> Result<Option<Value>, Trap> {
-    let (name, reflected) = binop_dunder_names(op);
-    if let Some(method) = model.find_dunder(lhs, name) {
-        let outcome = call_value(method, &[rhs], functions, model, depth + 1)?;
-        if !outcome.is_not_implemented() {
-            return Ok(Some(outcome));
-        }
-    }
-    if let Some(method) = model.find_dunder(rhs, reflected) {
-        let outcome = call_value(method, &[lhs], functions, model, depth + 1)?;
-        if !outcome.is_not_implemented() {
-            return Ok(Some(outcome));
-        }
-    }
-    Ok(None)
-}
-
 /// The full binary-operator dispatch: a user operator dunder (`__add__`/`__radd__`/...) wins, then the
 /// interp-aware set / dict operators, then `str`/sequence operands, else numeric. Extracted from the
 /// [`Op::Binary`] handler so a bare `Trap::TypeError` (no operation applies to these operand types) can
@@ -708,9 +681,28 @@ pub(crate) fn dispatch_binary(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
-    if let Some(value) = try_binop_dunder(binop, lhs, rhs, functions, model, depth)? {
-        Ok(value)
-    } else if let Some(value) = try_set_binop_dyn(binop, lhs, rhs, functions, model, depth)? {
+    let (lhs, rhs) = if model.is_instance(lhs) || model.is_instance(rhs) {
+        let (name, reflected) = binop_dunder_names(binop);
+        let mut scope = model.root_scope();
+        let left = scope.root_value(lhs);
+        let right = scope.root_value(rhs);
+        // Either method can collect before deferring to the next implementation.
+        // Python Language Reference, 3.3.8, describes reflected arithmetic methods.
+        for (receiver, method_name, argument) in [(left, name, right), (right, reflected, left)] {
+            let receiver = scope.rooted_value(receiver);
+            if let Some(method) = scope.find_dunder(receiver, method_name) {
+                let argument = scope.rooted_value(argument);
+                let result = call_value(method, &[argument], functions, &mut scope, depth + 1)?;
+                if !result.is_not_implemented() {
+                    return Ok(result);
+                }
+            }
+        }
+        (scope.rooted_value(left), scope.rooted_value(right))
+    } else {
+        (lhs, rhs)
+    };
+    if let Some(value) = try_set_binop_dyn(binop, lhs, rhs, functions, model, depth)? {
         Ok(value)
     } else if let Some(value) = try_counter_binop_dyn(binop, lhs, rhs, functions, model, depth)? {
         Ok(value)
@@ -718,6 +710,8 @@ pub(crate) fn dispatch_binary(
         Ok(value)
     } else if let Some(value) = try_view_binop_dyn(binop, lhs, rhs, functions, model, depth)? {
         Ok(value)
+    } else if binop == BinOp::Mod && model.is_str(lhs) {
+        model.str_percent_format_dyn(lhs, rhs, functions, depth)
     } else if let Some(value) = model.py_binary(binop, lhs, rhs)? {
         Ok(value)
     } else {
@@ -846,12 +840,9 @@ fn dispatch_inplace_binary(
     dispatch_binary(binop, lhs, rhs, functions, model, depth)
 }
 
-/// The full comparison dispatch for a non-identity comparison: a user comparison dunder
-/// (`__eq__`/`__lt__`/... + reflected) wins, then the interp-aware set/dict `==`, else the built-in
-/// value comparison. Extracted from the [`Op::Compare`] handler so a bare `Trap::TypeError` (an
-/// ordering comparison on values that do not support it) can become a descriptive `TypeError`, while a
-/// dunder that itself raised (`Trap::Raised`) or any other trap propagates unchanged. `is`/`is not` are
-/// object identity and never reach here (the handler resolves them first).
+/// Dispatches comparisons through user methods, interpreter-aware containers, and native values.
+/// Identity comparisons are resolved by the bytecode handler before reaching this function.
+#[inline(never)]
 fn dispatch_compare(
     cmpop: CmpOp,
     lhs: Value,
@@ -860,34 +851,50 @@ fn dispatch_compare(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
-    if let Some(value) = try_compare_dunder(cmpop, lhs, rhs, functions, model, depth)? {
+    let _native_call = model.enter_native_call()?;
+    dispatch_compare_inner(cmpop, lhs, rhs, functions, model, depth)
+}
+
+#[inline(never)]
+fn dispatch_compare_inner(
+    cmpop: CmpOp,
+    lhs: Value,
+    rhs: Value,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let mut model = model.root_scope();
+    let left = model.root_value(lhs);
+    let right = model.root_value(rhs);
+    if let Some(value) = try_compare_dunder(cmpop, lhs, rhs, functions, &mut model, depth)? {
+        return Ok(value);
+    }
+    let lhs = model.rooted_value(left);
+    let rhs = model.rooted_value(right);
+    if let Some(value) = try_view_compare_dyn(cmpop, lhs, rhs, functions, &mut model, depth)? {
         Ok(value)
-    } else if let Some(value) = try_view_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
+    } else if let Some(value) = try_set_compare_dyn(cmpop, lhs, rhs, functions, &mut model, depth)? {
         Ok(value)
-    } else if let Some(value) = try_set_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
+    } else if let Some(value) = try_odict_compare_dyn(cmpop, lhs, rhs, functions, &mut model, depth)? {
         Ok(value)
-    } else if let Some(value) = try_odict_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
+    } else if let Some(value) = try_deque_compare_dyn(cmpop, lhs, rhs, functions, &mut model, depth)? {
         Ok(value)
-    } else if let Some(value) = try_deque_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
+    } else if let Some(value) = try_seq_compare_dyn(cmpop, lhs, rhs, functions, &mut model, depth)? {
         Ok(value)
-    } else if let Some(value) = try_seq_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
-        Ok(value)
-    } else if let Some(value) = try_dict_compare_dyn(cmpop, lhs, rhs, functions, model, depth)? {
+    } else if let Some(value) = try_dict_compare_dyn(cmpop, lhs, rhs, functions, &mut model, depth)? {
         Ok(value)
     } else {
         match model.py_compare(cmpop, lhs, rhs)? {
             Some(value) => Ok(value),
-            None => compare(cmpop, lhs, rhs, model),
+            None => compare(cmpop, lhs, rhs, &mut model),
         }
     }
 }
 
-/// `lhs OP rhs` for any operator but `is`/`is not`, exactly as the program's own comparison
-/// evaluates it: [`dispatch_compare`], with a bare TypeError from an ORDERING comparison
-/// (`< <= > >=`) on unsupported types turned into CPython's `'OP' not supported between instances
-/// of ...`. `==`/`!=` never error (identity fallback), and a dunder that itself raised propagates
-/// unchanged. Native code that compares a program's values (`_heapq`) calls this, so its `<` and
-/// the program's are one evaluation.
+/// Compares values through the same dispatch used by the bytecode interpreter. Unsupported
+/// ordering reports the operator and operand types. Unsupported equality falls back to identity;
+/// errors raised during comparison, including recursion errors, propagate unchanged.
 pub(crate) fn compare_values(
     cmpop: CmpOp,
     lhs: Value,
@@ -896,9 +903,14 @@ pub(crate) fn compare_values(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
-    match dispatch_compare(cmpop, lhs, rhs, functions, model, depth) {
+    let mut model = model.root_scope();
+    let left = model.root_value(lhs);
+    let right = model.root_value(rhs);
+    match dispatch_compare(cmpop, lhs, rhs, functions, &mut model, depth) {
         Ok(value) => Ok(value),
         Err(Trap::TypeError) if matches!(cmpop, CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge) => {
+            let lhs = model.rooted_value(left);
+            let rhs = model.rooted_value(right);
             Err(model.compare_type_error(cmpop, lhs, rhs))
         }
         Err(other) => Err(other),
@@ -951,15 +963,20 @@ fn compare_dunder_call(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
+    let mut model = model.root_scope();
+    let receiver_root = model.root_value(receiver);
+    let other_root = model.root_value(other);
     if let Some(method) = model.find_dunder(receiver, compare_dunder_name(op)) {
-        let outcome = call_value(method, &[other], functions, model, depth + 1)?;
+        let outcome = call_value(method, &[other], functions, &mut model, depth + 1)?;
         if !outcome.is_not_implemented() {
             return Ok(Some(Value::from_bool(model.py_truthy(outcome)?.unwrap_or(false))));
         }
     }
     if matches!(op, CmpOp::Ne) {
+        let receiver = model.rooted_value(receiver_root);
+        let other = model.rooted_value(other_root);
         if let Some(method) = model.find_dunder(receiver, "__eq__") {
-            let outcome = call_value(method, &[other], functions, model, depth + 1)?;
+            let outcome = call_value(method, &[other], functions, &mut model, depth + 1)?;
             if !outcome.is_not_implemented() {
                 return Ok(Some(Value::from_bool(!model.py_truthy(outcome)?.unwrap_or(false))));
             }
@@ -979,10 +996,15 @@ pub(crate) fn try_compare_dunder(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
-    if let Some(value) = compare_dunder_call(op, lhs, rhs, functions, model, depth)? {
+    let mut model = model.root_scope();
+    let left = model.root_value(lhs);
+    let right = model.root_value(rhs);
+    if let Some(value) = compare_dunder_call(op, lhs, rhs, functions, &mut model, depth)? {
         return Ok(Some(value));
     }
-    compare_dunder_call(reflected_compare(op), rhs, lhs, functions, model, depth)
+    let lhs = model.rooted_value(left);
+    let rhs = model.rooted_value(right);
+    compare_dunder_call(reflected_compare(op), rhs, lhs, functions, &mut model, depth)
 }
 
 /// Truthiness honoring a user class's `__bool__` (then `__len__ != 0`), else the built-in tag-based
@@ -1028,11 +1050,16 @@ pub(crate) fn elem_eq(
     if a == b {
         return Ok(true);
     }
+    let mut model = model.root_scope();
+    let left = model.root_value(a);
+    let right = model.root_value(b);
     if model.is_instance(a) || model.is_instance(b) {
-        if let Some(result) = try_compare_dunder(CmpOp::Eq, a, b, functions, model, depth)? {
+        if let Some(result) = try_compare_dunder(CmpOp::Eq, a, b, functions, &mut model, depth)? {
             return Ok(result == Value::TRUE);
         }
     }
+    let a = model.rooted_value(left);
+    let b = model.rooted_value(right);
     let container = |value: Value, model: &ObjectModel| {
         model.seq_value(value).is_some()
             || model.is_dict(value)
@@ -1040,11 +1067,11 @@ pub(crate) fn elem_eq(
             || model.is_frozenset(value)
             || model.is_deque(value)
     };
-    if container(a, model) && container(b, model) {
-        let outcome = compare_values(CmpOp::Eq, a, b, functions, model, depth)?;
-        return py_truthy_dyn(outcome, functions, model, depth);
+    if container(a, &model) && container(b, &model) {
+        let outcome = compare_values(CmpOp::Eq, a, b, functions, &mut model, depth)?;
+        return py_truthy_dyn(outcome, functions, &mut model, depth);
     }
-    Ok(model.key_eq(a, b))
+    model.key_eq(a, b)
 }
 
 /// Whether `elements` (a detached snapshot -- NOT a borrow of model state, since [`elem_eq`] may
@@ -1084,13 +1111,23 @@ pub(crate) fn dedup_elems(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Vec<Value>, Trap> {
-    let mut out: Vec<Value> = Vec::new();
-    for e in elements {
-        if !elems_contain(e, &out, functions, model, depth)? {
-            out.push(e);
+    let mut scope = model.root_scope();
+    let pending = scope.root_buffer(elements);
+    let mut kept = 0;
+    'next: for index in 0..scope.value_buffers[pending].len() {
+        for earlier in 0..kept {
+            let values = &scope.value_buffers[pending];
+            if elem_eq(values[earlier], values[index], functions, &mut scope, depth)? {
+                continue 'next;
+            }
         }
+        scope.value_buffers[pending].swap(kept, index);
+        kept += 1;
     }
-    Ok(out)
+    let mut result = scope.take_buffer(pending);
+    result.truncate(kept);
+    result.shrink_to_fit();
+    Ok(result)
 }
 
 /// The union of set snapshots `a` and `b` (`a`'s elements, then `b`'s new ones), interp-aware.
@@ -1254,8 +1291,8 @@ pub(crate) fn symmetric_update_dyn(
 /// Whether set snapshot `a` is a subset of set snapshot `b`. A larger `a` is not, and then no
 /// element is compared, as in CPython; otherwise as [`subset_dyn`].
 pub(crate) fn subset_sets_dyn(
-    a: &[Value],
-    b: &[Value],
+    a: Vec<Value>,
+    b: Vec<Value>,
     functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
@@ -1264,17 +1301,40 @@ pub(crate) fn subset_sets_dyn(
 }
 
 /// Whether every element of set snapshot `a` is in `b` (`a` is a subset of `b`), interp-aware.
+/// Both snapshots are traced where they stand while elements' `__eq__` run, and released with the
+/// test, so the test costs no copy of either.
 pub(crate) fn subset_dyn(
-    a: &[Value],
-    b: &[Value],
+    a: Vec<Value>,
+    b: Vec<Value>,
     functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<bool, Trap> {
-    for &x in a {
-        if !elems_contain(x, b, functions, model, depth)? {
-            return Ok(false);
+    let mut model = model.root_scope();
+    let a = model.root_buffer(a);
+    let b = model.root_buffer(b);
+    rooted_subset(a, b, functions, &mut model, depth)
+}
+
+/// Whether every value in the traced buffer `needles` equals some value in the traced buffer
+/// `candidates`. Each pair is read from its buffer when its comparison starts, so a value that a
+/// collection moved is read where it now is.
+fn rooted_subset(
+    needles: usize,
+    candidates: usize,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<bool, Trap> {
+    'needle: for needle in 0..model.value_buffers[needles].len() {
+        for candidate in 0..model.value_buffers[candidates].len() {
+            let lhs = model.value_buffers[candidates][candidate];
+            let rhs = model.value_buffers[needles][needle];
+            if elem_eq(lhs, rhs, functions, model, depth)? {
+                continue 'needle;
+            }
         }
+        return Ok(false);
     }
     Ok(true)
 }
@@ -1356,45 +1416,17 @@ fn try_set_compare_dyn(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
-    if !(model.is_set(a) || model.is_frozenset(a)) {
+    if !(model.is_set(a) || model.is_frozenset(a)) || matches!(op, CmpOp::Is | CmpOp::IsNot) {
         return Ok(None);
     }
-    let b_is_set = model.is_set(b) || model.is_frozenset(b);
-    let value = match op {
-        CmpOp::Eq | CmpOp::Ne => {
-            let equal = if b_is_set {
-                let a_elems = model.set_value(a).ok_or(Trap::TypeError)?.clone();
-                let b_elems = model.set_value(b).ok_or(Trap::TypeError)?.clone();
-                a_elems.len() == b_elems.len()
-                    && subset_dyn(&a_elems, &b_elems, functions, model, depth)?
-            } else {
-                false
-            };
-            if matches!(op, CmpOp::Ne) { !equal } else { equal }
-        }
-        CmpOp::Le | CmpOp::Ge | CmpOp::Lt | CmpOp::Gt => {
-            if !b_is_set {
-                return Err(Trap::TypeError);
-            }
-            let a_elems = model.set_value(a).ok_or(Trap::TypeError)?.clone();
-            let b_elems = model.set_value(b).ok_or(Trap::TypeError)?.clone();
-            match op {
-                CmpOp::Le => subset_sets_dyn(&a_elems, &b_elems, functions, model, depth)?,
-                CmpOp::Ge => subset_sets_dyn(&b_elems, &a_elems, functions, model, depth)?,
-                CmpOp::Lt => {
-                    a_elems.len() < b_elems.len()
-                        && subset_dyn(&a_elems, &b_elems, functions, model, depth)?
-                }
-                CmpOp::Gt => {
-                    b_elems.len() < a_elems.len()
-                        && subset_dyn(&b_elems, &a_elems, functions, model, depth)?
-                }
-                _ => unreachable!("guarded by the outer match arm"),
-            }
-        }
-        CmpOp::Is | CmpOp::IsNot => return Ok(None),
-    };
-    Ok(Some(Value::from_bool(value)))
+    if !(model.is_set(b) || model.is_frozenset(b)) {
+        return match op {
+            CmpOp::Eq => Ok(Some(Value::FALSE)),
+            CmpOp::Ne => Ok(Some(Value::TRUE)),
+            _ => Err(Trap::TypeError),
+        };
+    }
+    container_compare(op, a, b, functions, model, depth).map(Some)
 }
 
 /// Dedups `pairs` into dict entries interp-aware -- first-seen key position, last value winning (a
@@ -1406,22 +1438,27 @@ pub(crate) fn dedup_pairs(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Vec<(Value, Value)>, Trap> {
-    let mut out: Vec<(Value, Value)> = Vec::new();
-    for (key, value) in pairs {
-        model.require_hashable_as(key, HashUse::DictKey)?;
-        let mut found = None;
-        for (idx, (k, _)) in out.iter().enumerate() {
-            if elem_eq(*k, key, functions, model, depth)? {
-                found = Some(idx);
-                break;
+    let mut scope = model.root_scope();
+    let pending = scope.root_pairs(pairs);
+    let mut kept = 0;
+    'next: for index in 0..scope.pair_buffers[pending].len() {
+        let key = scope.pair_buffers[pending][index].0;
+        scope.require_hashable_as(key, HashUse::DictKey)?;
+        for earlier in 0..kept {
+            let pairs = &scope.pair_buffers[pending];
+            if elem_eq(pairs[earlier].0, pairs[index].0, functions, &mut scope, depth)? {
+                let pairs = &mut scope.pair_buffers[pending];
+                pairs[earlier].1 = pairs[index].1;
+                continue 'next;
             }
         }
-        match found {
-            Some(idx) => out[idx].1 = value,
-            None => out.push((key, value)),
-        }
+        scope.pair_buffers[pending].swap(kept, index);
+        kept += 1;
     }
-    Ok(out)
+    let mut result = core::mem::take(&mut scope.pair_buffers[pending]);
+    result.truncate(kept);
+    result.shrink_to_fit();
+    Ok(result)
 }
 
 /// The interp-aware `dict == dict` / `dict != dict`, or `None` when this is not two dicts, not an
@@ -1562,10 +1599,7 @@ fn try_counter_binop_dyn(
     Ok(Some(model.new_counter(entries)?))
 }
 
-/// The deque comparisons: two deques compare like lists -- `==`/`!=` elementwise, `< <= > >=`
-/// lexicographic (the first unequal pair decides via the full comparison dispatch; a strict
-/// prefix is less). `None` unless BOTH operands are deques: a deque never equals a list
-/// (CPython), and an ordering against a non-deque is the default TypeError.
+/// Compares deques element by element, including user methods on their elements.
 fn try_deque_compare_dyn(
     op: CmpOp,
     a: Value,
@@ -1574,50 +1608,21 @@ fn try_deque_compare_dyn(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
-    if !model.is_deque(a) || !model.is_deque(b) {
+    if !model.is_deque(a) || !model.is_deque(b) || matches!(op, CmpOp::Is | CmpOp::IsNot) {
         return Ok(None);
     }
-    if matches!(op, CmpOp::Is | CmpOp::IsNot) {
-        return Ok(None);
-    }
-    let a_elems = model.deque_elems(a).cloned().unwrap_or_default();
-    let b_elems = model.deque_elems(b).cloned().unwrap_or_default();
-    let mut split = None;
-    for (i, (&x, &y)) in a_elems.iter().zip(&b_elems).enumerate() {
-        if !elem_eq(x, y, functions, model, depth)? {
-            split = Some(i);
-            break;
-        }
-    }
-    let value = match op {
-        CmpOp::Eq => split.is_none() && a_elems.len() == b_elems.len(),
-        CmpOp::Ne => split.is_some() || a_elems.len() != b_elems.len(),
-        CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => match split {
-            Some(i) => {
-                let decided = compare_values(op, a_elems[i], b_elems[i], functions, model, depth)?;
-                return Ok(Some(decided));
-            }
-            None => match op {
-                CmpOp::Lt => a_elems.len() < b_elems.len(),
-                CmpOp::Le => a_elems.len() <= b_elems.len(),
-                CmpOp::Gt => a_elems.len() > b_elems.len(),
-                CmpOp::Ge => a_elems.len() >= b_elems.len(),
-                _ => unreachable!("guarded by the outer match arm"),
-            },
-        },
-        CmpOp::Is | CmpOp::IsNot => unreachable!("returned None above"),
-    };
-    Ok(Some(Value::from_bool(value)))
+    container_compare(op, a, b, functions, model, depth).map(Some)
 }
 
-/// `list == list` / `tuple == tuple` (and ordering) comparing ELEMENT BY ELEMENT through the full
-/// dispatch, so an element's own `__eq__` decides. Without this the comparison falls back to a
-/// native value check that cannot call a user dunder, and `[obj] == [obj2]` is False for objects
-/// their own `__eq__` calls equal.
-///
-/// A list never equals a tuple, so both operands must be the same kind -- but a namedtuple IS a
-/// tuple, which is why the tuple side tests "not a list, and sequence-shaped" rather than a
-/// concrete type.
+fn same_sequence_kind(a: Value, b: Value, model: &ObjectModel) -> bool {
+    (model.is_list(a) && model.is_list(b))
+        || (!model.is_list(a)
+            && !model.is_list(b)
+            && model.seq_value(a).is_some()
+            && model.seq_value(b).is_some())
+}
+
+/// Compares lists and tuples element by element; a named tuple follows tuple comparison.
 fn try_seq_compare_dyn(
     op: CmpOp,
     a: Value,
@@ -1626,45 +1631,79 @@ fn try_seq_compare_dyn(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
-    if matches!(op, CmpOp::Is | CmpOp::IsNot) {
+    if !same_sequence_kind(a, b, model) || matches!(op, CmpOp::Is | CmpOp::IsNot) {
         return Ok(None);
     }
-    let both_lists = model.is_list(a) && model.is_list(b);
-    let both_tuples = !model.is_list(a)
-        && !model.is_list(b)
-        && model.seq_value(a).is_some()
-        && model.seq_value(b).is_some();
-    if !both_lists && !both_tuples {
-        return Ok(None);
+    container_compare(op, a, b, functions, model, depth).map(Some)
+}
+
+/// Compares container children recursively through the guarded comparison dispatch.
+/// Each level traces its two snapshots until every pending element comparison finishes, and
+/// releases them with the comparison.
+fn container_compare(
+    op: CmpOp,
+    a: Value,
+    b: Value,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let mut model = model.root_scope();
+    let sets = model.set_value(a).is_some() && model.set_value(b).is_some();
+    let (xs, ys) = if sets {
+        (model.set_value(a), model.set_value(b))
+    } else if model.is_deque(a) && model.is_deque(b) {
+        (model.deque_elems(a), model.deque_elems(b))
+    } else {
+        (model.seq_value(a), model.seq_value(b))
+    };
+    let xs = xs.cloned().unwrap_or_default();
+    let ys = ys.cloned().unwrap_or_default();
+    let lengths = xs.len().cmp(&ys.len());
+    let common = xs.len().min(ys.len());
+    let mut xs = model.root_buffer(xs);
+    let mut ys = model.root_buffer(ys);
+    use core::cmp::Ordering::{Equal, Greater, Less};
+    if sets {
+        let lengths_allow = match op {
+            CmpOp::Eq | CmpOp::Ne => lengths == Equal,
+            CmpOp::Le => lengths != Greater,
+            CmpOp::Lt => lengths == Less,
+            CmpOp::Ge => lengths != Less,
+            CmpOp::Gt => lengths == Greater,
+            _ => unreachable!("identity is resolved before set comparison"),
+        };
+        if !lengths_allow {
+            return Ok(Value::from_bool(op == CmpOp::Ne));
+        }
+        if matches!(op, CmpOp::Ge | CmpOp::Gt) {
+            core::mem::swap(&mut xs, &mut ys);
+        }
+        let subset = rooted_subset(xs, ys, functions, &mut model, depth)?;
+        return Ok(Value::from_bool(subset != (op == CmpOp::Ne)));
     }
-    let a_elems = model.seq_value(a).cloned().unwrap_or_default();
-    let b_elems = model.seq_value(b).cloned().unwrap_or_default();
-    let mut split = None;
-    for (i, (&x, &y)) in a_elems.iter().zip(&b_elems).enumerate() {
-        if !elem_eq(x, y, functions, model, depth)? {
-            split = Some(i);
-            break;
+    for index in 0..common {
+        let a = model.value_buffers[xs][index];
+        let b = model.value_buffers[ys][index];
+        if !elem_eq(a, b, functions, &mut model, depth)? {
+            if matches!(op, CmpOp::Eq | CmpOp::Ne) {
+                return Ok(Value::from_bool(op == CmpOp::Ne));
+            }
+            let a = model.value_buffers[xs][index];
+            let b = model.value_buffers[ys][index];
+            return compare_values(op, a, b, functions, &mut model, depth);
         }
     }
-    let value = match op {
-        CmpOp::Eq => split.is_none() && a_elems.len() == b_elems.len(),
-        CmpOp::Ne => split.is_some() || a_elems.len() != b_elems.len(),
-        CmpOp::Lt | CmpOp::Le | CmpOp::Gt | CmpOp::Ge => match split {
-            Some(i) => {
-                let decided = compare_values(op, a_elems[i], b_elems[i], functions, model, depth)?;
-                return Ok(Some(decided));
-            }
-            None => match op {
-                CmpOp::Lt => a_elems.len() < b_elems.len(),
-                CmpOp::Le => a_elems.len() <= b_elems.len(),
-                CmpOp::Gt => a_elems.len() > b_elems.len(),
-                CmpOp::Ge => a_elems.len() >= b_elems.len(),
-                _ => unreachable!("guarded by the outer match arm"),
-            },
-        },
-        CmpOp::Is | CmpOp::IsNot => unreachable!("returned None above"),
+    let answer = match op {
+        CmpOp::Eq => lengths == Equal,
+        CmpOp::Ne => lengths != Equal,
+        CmpOp::Lt => lengths == Less,
+        CmpOp::Le => lengths != Greater,
+        CmpOp::Gt => lengths == Greater,
+        CmpOp::Ge => lengths != Less,
+        _ => unreachable!("identity is resolved before sequence comparison"),
     };
-    Ok(Some(Value::from_bool(value)))
+    Ok(Value::from_bool(answer))
 }
 
 /// The ORDER-SENSITIVE OrderedDict equality: `od1 == od2` compares entries pairwise IN ORDER --
@@ -1683,12 +1722,22 @@ fn try_odict_compare_dyn(
     {
         return Ok(None);
     }
+    let mut model = model.root_scope();
+    let left = model.root_value(a);
+    let right = model.root_value(b);
     let mut equal = model.dict_equal_dyn(a, b, functions, depth)?;
     if equal {
+        let a = model.rooted_value(left);
+        let b = model.rooted_value(right);
         let a_entries = model.dict_entries(a).unwrap_or_default();
         let b_entries = model.dict_entries(b).unwrap_or_default();
-        for (&(a_key, _), &(b_key, _)) in a_entries.iter().zip(&b_entries) {
-            if !elem_eq(a_key, b_key, functions, model, depth)? {
+        let pairs = a_entries.into_iter().zip(b_entries)
+            .map(|((x, _), (y, _))| (model.root_value(x), model.root_value(y)))
+            .collect::<Vec<_>>();
+        for (x, y) in pairs {
+            let a_key = model.rooted_value(x);
+            let b_key = model.rooted_value(y);
+            if !elem_eq(a_key, b_key, functions, &mut model, depth)? {
                 equal = false;
                 break;
             }
@@ -1799,7 +1848,7 @@ fn try_view_compare_dyn(
             let equal = match (set_like_elems(a, model)?, set_like_elems(b, model)?) {
                 (Some(a_elems), Some(b_elems)) => {
                     a_elems.len() == b_elems.len()
-                        && subset_dyn(&a_elems, &b_elems, functions, model, depth)?
+                        && subset_dyn(a_elems, b_elems, functions, model, depth)?
                 }
                 _ => false,
             };
@@ -1812,15 +1861,15 @@ fn try_view_compare_dyn(
                 return Err(Trap::TypeError);
             };
             match op {
-                CmpOp::Le => subset_sets_dyn(&a_elems, &b_elems, functions, model, depth)?,
-                CmpOp::Ge => subset_sets_dyn(&b_elems, &a_elems, functions, model, depth)?,
+                CmpOp::Le => subset_sets_dyn(a_elems, b_elems, functions, model, depth)?,
+                CmpOp::Ge => subset_sets_dyn(b_elems, a_elems, functions, model, depth)?,
                 CmpOp::Lt => {
                     a_elems.len() < b_elems.len()
-                        && subset_dyn(&a_elems, &b_elems, functions, model, depth)?
+                        && subset_dyn(a_elems, b_elems, functions, model, depth)?
                 }
                 CmpOp::Gt => {
                     b_elems.len() < a_elems.len()
-                        && subset_dyn(&b_elems, &a_elems, functions, model, depth)?
+                        && subset_dyn(b_elems, a_elems, functions, model, depth)?
                 }
                 _ => unreachable!("guarded by the outer match arm"),
             }
@@ -1991,6 +2040,7 @@ fn split_exception_group(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<(Option<Value>, Option<Value>), Trap> {
+    let _native_call = model.enter_native_call()?;
     if depth > MAX_CALL_DEPTH {
         return Err(Trap::RecursionError);
     }
@@ -2077,10 +2127,9 @@ fn group_condition_type_error(model: &mut ObjectModel) -> Trap {
     model.raise_named_exception("TypeError", message)
 }
 
-/// The maximum nesting of intra-module calls before the interpreter reports
-/// `RecursionError` -- a guard so a runaway recursion is bounded rather than overflowing
-/// the native stack.
-const MAX_CALL_DEPTH: usize = 256;
+/// The maximum number of Python frames on an interpreter stack. Native callbacks also
+/// observe a byte budget because each nested driver consumes native stack space.
+pub(crate) const MAX_CALL_DEPTH: usize = 256;
 
 /// Runs `code` (one function of `functions`) with `args`, returning the value it returns.
 ///
@@ -2662,12 +2711,19 @@ pub(crate) fn set_attr(
         if let Some(hook) = model.find_dunder(object, "__setattr__") {
             let name_value = model.new_str(attr)?;
             call_value(hook, &[name_value, value], functions, model, depth + 1)?;
+        } else if let Some(slot) = model.exception_slot_named(object, attr) {
+            // The args slot holds a tuple of constructor arguments (Python 3.14 Library Reference,
+            // "Built-in Exceptions", BaseException.args).
+            assign_exception_slot(object, slot, value, functions, model, depth)?;
         } else if let Some(set) = model.instance_set_descriptor(object, attr) {
             call_value(set, &[object, value], functions, model, depth + 1)?;
         } else if let Some(property) = model.class_property(object, attr) {
             let (_, fset, _) = model.property_accessors(property);
             if fset.is_none() {
-                return Err(Trap::AttributeError);
+                let message = alloc::format!(
+                    "property '{attr}' of '{}' object has no setter", model.tp_name_of(object),
+                );
+                return Err(model.raise_named_exception("AttributeError", &message));
             }
             call_value(fset, &[object, value], functions, model, depth + 1)?;
         } else {
@@ -2678,9 +2734,50 @@ pub(crate) fn set_attr(
     } else if model.is_user_function(object) {
         model.py_setattr_function(object, attr, value)?;
     } else {
-        model.py_setattr_native(object, attr, value)?;
+        // Convert a native AttributeError into this runtime's attribute-write diagnostic.
+        // Python 3.14 Library Reference, "Built-in Exceptions", AttributeError.
+        match model.py_setattr_native(object, attr, value) {
+            Err(Trap::AttributeError) => return Err(model.attribute_write_error(object, attr)),
+            other => other?,
+        }
     }
     Ok(())
+}
+
+/// Deletes an attribute for both `del object.attr` and `delattr(object, attr)`. An instance's
+/// `__delattr__` takes precedence over its descriptors; a property without a deleter refuses
+/// deletion even when the instance dictionary contains the name.
+/// Python 3.14 Language Reference, 3.3.2.3, "Invoking Descriptors".
+pub(crate) fn delete_attr(
+    object: Value,
+    attr: &str,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<(), Trap> {
+    if model.is_instance(object) {
+        if let Some(hook) = model.find_dunder(object, "__delattr__") {
+            let name_value = model.new_str(attr)?;
+            call_value(hook, &[name_value], functions, model, depth + 1)?;
+            return Ok(());
+        }
+        if let Some(delete) = model.instance_delete_descriptor(object, attr) {
+            call_value(delete, &[object], functions, model, depth + 1)?;
+            return Ok(());
+        }
+        if let Some(property) = model.class_property(object, attr) {
+            let (_, _, fdel) = model.property_accessors(property);
+            if fdel.is_none() {
+                let message = alloc::format!(
+                    "property '{attr}' of '{}' object has no deleter", model.tp_name_of(object),
+                );
+                return Err(model.raise_named_exception("AttributeError", &message));
+            }
+            call_value(fdel, &[object], functions, model, depth + 1)?;
+            return Ok(());
+        }
+    }
+    model.py_delattr(object, attr)
 }
 
 /// Dispatches a call of `callee` with `args` -- the unified callable protocol shared by the
@@ -2729,7 +2826,23 @@ fn finish_class_header(
     Ok(class)
 }
 
+// Check the native stack before entering the larger dispatch frame, including on each
+// wrapper call. Excessive nesting raises a recursion error. See the Python 3.14 Library
+// Reference, Built-in Exceptions (RecursionError).
+#[inline(never)]
 pub(crate) fn call_value(
+    callee: Value,
+    args: &[Value],
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let _native_call = model.enter_native_call()?;
+    call_value_inner(callee, args, functions, model, depth)
+}
+
+#[inline(never)]
+fn call_value_inner(
     callee: Value,
     args: &[Value],
     functions: &Functions,
@@ -2757,7 +2870,8 @@ pub(crate) fn call_value(
         let [iterable] = args else {
             return Err(Trap::TypeError);
         };
-        let items = crate::builtins::collect_iterable(model, &[*iterable], functions, depth)?;
+        let (callee, items) =
+            crate::builtins::collect_for_receiver(callee, *iterable, functions, model, depth)?;
         let list = model.new_list(items)?;
         model.call_bound_method(callee, &[list])
     } else if model.is_str_format_bound(callee) {
@@ -2803,16 +2917,10 @@ pub(crate) fn call_value(
             let elements = model.group_derive_members(*members)?;
             model.new_exception_group(message, &elements)
         } else if method_id == crate::object::NEXT_DUNDER {
+            // Generators have their own next method, which carries the generator's return value.
             match py_next_value(receiver, functions, model, depth)? {
                 Some(value) => Ok(value),
-                None => {
-                    let value = if model.is_generator(receiver) {
-                        model.take_generator_return().unwrap_or(Value::NONE)
-                    } else {
-                        Value::NONE
-                    };
-                    Err(model.raise_named_exception_with_value("StopIteration", value))
-                }
+                None => Err(model.raise_named_exception_with_value("StopIteration", Value::NONE)),
             }
         } else if model.is_builtin_dunder_method(method_id)
             && model.builtin_dunder_comparison(method_id).is_some()
@@ -2854,6 +2962,8 @@ pub(crate) fn call_value(
             model.call_list_method_dyn(callee, receiver, method_id, args, functions, depth)
         } else if model.is_tuple(receiver) && !model.is_ntinstance(receiver) {
             model.call_tuple_method_dyn(callee, receiver, method_id, args, functions, depth)
+        } else if model.slot_descriptor_slot(receiver).is_some() {
+            call_slot_descriptor_method(receiver, method_id, args, functions, model, depth)
         } else {
             model.call_bound_method(callee, args)
         }
@@ -2965,6 +3075,96 @@ fn instantiate(
     }
 }
 
+/// The exception `raise value` raises. An exception class is called with no arguments and must
+/// return an exception instance; an instance is raised as it is. Other values raise TypeError.
+/// Python 3.14 Language Reference, 7.8, "The raise statement".
+fn exception_to_raise(
+    value: Value,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let made = called_if_an_exception_class(value, ExceptionUse::Raise, functions, model, depth)?;
+    match model.raise_value(made) {
+        Err(Trap::TypeError) => {
+            Err(model.raise_named_exception("TypeError", "exceptions must derive from BaseException"))
+        }
+        other => other,
+    }
+}
+
+/// Normalizes an exception for a generator's `throw` or an async generator's `athrow`.
+/// Python 3.14 Language Reference, 6.2.10.1, "Generator-iterator methods", and 6.2.10.4,
+/// "Asynchronous generator-iterator methods".
+fn exception_to_throw(
+    value: Value,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let made = called_if_an_exception_class(value, ExceptionUse::Throw, functions, model, depth)?;
+    match model.raise_value(made) {
+        Err(Trap::TypeError) => {
+            let kind = model.type_name_of(value);
+            let message =
+                alloc::format!("exceptions must be classes or instances deriving from BaseException, not {kind}");
+            Err(model.raise_named_exception("TypeError", &message))
+        }
+        other => other,
+    }
+}
+
+/// Normalizes the cause in `raise ... from value`: None, an exception instance, or an exception
+/// class called with no arguments. Python 3.14 Language Reference, 7.8, "The raise statement".
+fn cause_to_chain(
+    value: Value,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let made = called_if_an_exception_class(value, ExceptionUse::Raise, functions, model, depth)?;
+    if made != Value::NONE && !model.has_exception_slots(made) {
+        return Err(model.raise_named_exception("TypeError", "exception causes must derive from BaseException"));
+    }
+    Ok(made)
+}
+
+/// The operation whose diagnostic reports an invalid exception constructor result.
+enum ExceptionUse {
+    Raise,
+    Throw,
+}
+
+/// Calls an exception class once and checks that its result is an exception instance. Other
+/// operands pass through for the caller to validate.
+fn called_if_an_exception_class(
+    value: Value,
+    usage: ExceptionUse,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    if model.is_exception_class(value) {
+        let made = instantiate(value, &[], &[], functions, model, depth)?;
+        if !model.has_exception_slots(made) {
+            let kind = match usage {
+                ExceptionUse::Raise => crate::builtins::type_of(made, model)
+                    .map(|class| model.repr(class))
+                    .unwrap_or_else(|| alloc::format!("<class '{}'>", model.type_name_of(made))),
+                ExceptionUse::Throw => model.type_name_of(made),
+            };
+            let message = alloc::format!(
+                "calling {} should have returned an instance of BaseException, not {kind}",
+                model.repr(value),
+            );
+            return Err(model.raise_named_exception("TypeError", &message));
+        }
+        Ok(made)
+    } else {
+        Ok(value)
+    }
+}
+
 /// What instantiating a class resolved to: a finished object, or an instance whose `__init__` still has
 /// to run.
 enum Instantiation {
@@ -3011,6 +3211,9 @@ fn plan_instantiate(
     };
     let actual = crate::builtins::type_of(instance, model).unwrap_or(class);
     let Some(init) = model.find_init(actual) else {
+        if !kwargs.is_empty() && model.has_exception_slots(instance) {
+            return Err(model.keywords_refused_by_the_init_of(instance));
+        }
         model.init_default_args(instance, posargs)?;
         return Ok(Instantiation::Done(instance));
     };
@@ -3053,7 +3256,21 @@ fn call_maybe_kw(
 /// `posargs` + `kwargs` (+ any defaults) to the callee's parameters via [`bind_arguments`]. Handles
 /// Python functions (plain + defaulted), bound methods, and class instantiation. A keyword call to a
 /// BUILT-IN is not supported (built-ins take positional arguments via `Op::Call`).
+#[inline(never)]
 fn call_value_kw(
+    callee: Value,
+    posargs: &[Value],
+    kwargs: &[(&str, Value)],
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let _native_call = model.enter_native_call()?;
+    call_value_kw_inner(callee, posargs, kwargs, functions, model, depth)
+}
+
+#[inline(never)]
+fn call_value_kw_inner(
     callee: Value,
     posargs: &[Value],
     kwargs: &[(&str, Value)],
@@ -3189,6 +3406,11 @@ fn call_value_kw(
                 return Err(model.raise_named_exception("TypeError", &message));
             }
             return model.new_ntinstance(class, elements);
+        }
+        if !kwargs.is_empty() {
+            if let Some(refusal) = model.exception_init_keywords_refusal(callee, posargs) {
+                return Err(refusal);
+            }
         }
         if model.bound_method_id(callee) == crate::object::OBJECT_NEW {
             let (class, rest) = posargs.split_first().ok_or_else(|| {
@@ -3438,7 +3660,9 @@ const AGEN_STEP_ANEXT: u32 = 0;
 const AGEN_STEP_ASEND: u32 = 1;
 const AGEN_STEP_ATHROW: u32 = 2;
 const AGEN_STEP_ACLOSE: u32 = 3;
+const AGEN_STEP_KIND_MASK: u32 = 3;
 const AGEN_STEP_RESUMED: u32 = 4;
+const AGEN_STEP_FINISHED: u32 = 8;
 
 /// The method id for a generator method `name` (`gen.send`/`.throw`/`.close`/`.__next__`), or
 /// `None`. Getattr binds these to the generator; [`call_generator_method`] dispatches them.
@@ -3484,12 +3708,86 @@ pub(crate) fn async_generator_method_id(name: &str) -> Option<u32> {
     }
 }
 
-/// `agen.__aiter__()` / `.__anext__()` / `.asend(v)` / `.athrow(e)` / `.aclose()`.
-///
-/// **Four of the five do no work.** They package a pending step and hand it back, because that is
-/// what the surface means: `__anext__()` returns an AWAITABLE and the `await` in front of it performs
-/// the step. Doing the work here instead would be the one shape that cannot support an async
-/// generator that awaits anything -- there would be nowhere for its `await` to suspend to.
+fn assign_exception_slot(
+    instance: Value,
+    slot: u32,
+    value: Value,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<(), Trap> {
+    let (instance, value) = if slot == crate::object::EXCEPTION_ARGS_SLOT {
+        let (instance, items) =
+            crate::builtins::collect_for_receiver(instance, value, functions, model, depth)?;
+        (instance, model.new_tuple(items)?)
+    } else {
+        (instance, value)
+    };
+    model.set_exception_slot_named(instance, slot, value);
+    Ok(())
+}
+
+/// Implements direct slot-descriptor calls for `BaseException.args` and `SystemExit.code`.
+/// Python 3.14 Language Reference, 3.3.2.2, "Implementing Descriptors", defines the protocol.
+/// An instance outside the descriptor's owner class is refused; `__get__(None, owner)` returns
+/// the descriptor when owner is not None. Assigning args collects an iterable in the interpreter.
+fn call_slot_descriptor_method(
+    descriptor: Value,
+    method_id: u32,
+    args: &[Value],
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    use crate::object::{SLOT_DESCRIPTOR_DELETE, SLOT_DESCRIPTOR_GET, SLOT_DESCRIPTOR_SET};
+    let slot = model.slot_descriptor_slot(descriptor).ok_or(Trap::TypeError)?;
+    let refuse = |model: &mut ObjectModel, message: String| Err(model.raise_named_exception("TypeError", &message));
+    match method_id {
+        SLOT_DESCRIPTOR_GET => {
+            let (instance, owner) = match args {
+                [] => return refuse(model, String::from("__get__ expected at least 1 argument, got 0")),
+                [instance] => (*instance, Value::NONE),
+                [instance, owner] => (*instance, *owner),
+                more => return refuse(model, alloc::format!("__get__ expected at most 2 arguments, got {}", more.len())),
+            };
+            if instance.is_none() {
+                if owner.is_none() {
+                    return refuse(model, String::from("__get__(None, None) is invalid"));
+                }
+                return Ok(descriptor);
+            }
+            if let Some(refusal) = model.slot_descriptor_refusal(descriptor, instance) {
+                return Err(refusal);
+            }
+            model.exception_slot_value(instance, slot)
+        }
+        SLOT_DESCRIPTOR_SET => {
+            let [instance, value] = args else {
+                return refuse(model, alloc::format!("__set__ expected 2 arguments, got {}", args.len()));
+            };
+            if let Some(refusal) = model.slot_descriptor_refusal(descriptor, *instance) {
+                return Err(refusal);
+            }
+            assign_exception_slot(*instance, slot, *value, functions, model, depth)?;
+            Ok(Value::NONE)
+        }
+        SLOT_DESCRIPTOR_DELETE => {
+            let [instance] = args else {
+                return refuse(model, alloc::format!("expected 1 argument, got {}", args.len()));
+            };
+            if let Some(refusal) = model.slot_descriptor_refusal(descriptor, *instance) {
+                return Err(refusal);
+            }
+            model.delete_exception_slot(*instance, slot)?;
+            Ok(Value::NONE)
+        }
+        _ => Err(Trap::AttributeError),
+    }
+}
+
+/// An async generator's `__aiter__` returns itself. Its other methods return a pending step;
+/// exception validation and the generator body run when that step resumes.
+/// Python 3.14 Language Reference, 6.2.10.4, "Asynchronous generator-iterator methods".
 fn call_async_generator_method(
     agen: Value,
     method_id: u32,
@@ -3513,10 +3811,7 @@ fn call_async_generator_method(
             _ => Err(Trap::TypeError),
         },
         AGEN_ATHROW => match args {
-            [raised] => {
-                let exc = model.raise_value(*raised)?;
-                model.new_agen_step(agen, AGEN_STEP_ATHROW, exc)
-            }
+            [raised] => model.new_agen_step(agen, AGEN_STEP_ATHROW, *raised),
             _ => Err(Trap::TypeError),
         },
         AGEN_ACLOSE => match args {
@@ -3527,17 +3822,9 @@ fn call_async_generator_method(
     }
 }
 
-/// One step of an async generator, driven by the `await` in front of the awaitable that named it.
-///
-/// >>> **THE WHOLE DIFFICULTY IS THAT THE BODY SUSPENDS TWO WAYS AND BOTH LOOK THE SAME FROM
-/// OUTSIDE.** `yield x` produces an ITEM -- the value this `await` must evaluate to, ending the step.
-/// `await f()` inside the body produces something the EVENT LOOP has to wait on, which must keep
-/// travelling outward exactly as it does from an ordinary coroutine. Both leave the frame suspended
-/// with a value in hand. The frame itself is what tells them apart: an `await` leaves it DELEGATING
-/// and a plain `yield` does not. <<<
-///
-/// So `Returned` ends the await with the item, and `Yielded` passes the wait outward -- the same two
-/// outcomes every other delegation has, decided by a different question.
+/// Advances an async-generator step. A body suspended in an `await` passes its wait outward;
+/// a plain `yield` supplies the result of the caller's await.
+/// Python 3.14 Language Reference, 6.2.10.4, "Asynchronous generator-iterator methods".
 fn advance_agen_step(
     step: Value,
     action: DelegateAction,
@@ -3546,18 +3833,34 @@ fn advance_agen_step(
     depth: usize,
 ) -> Result<DelegateStep, Trap> {
     let agen = model.agen_step_target(step);
-    let kind = model.agen_step_kind(step);
-    let resume = if kind == AGEN_STEP_RESUMED {
+    let state = model.agen_step_kind(step);
+    let kind = state & AGEN_STEP_KIND_MASK;
+    if state & AGEN_STEP_FINISHED != 0 {
+        let message = if matches!(kind, AGEN_STEP_ANEXT | AGEN_STEP_ASEND) {
+            "cannot reuse already awaited __anext__()/asend()"
+        } else {
+            "cannot reuse already awaited aclose()/athrow()"
+        };
+        return Err(model.raise_named_exception("RuntimeError", message));
+    }
+    let resumed = state & AGEN_STEP_RESUMED != 0;
+    if !resumed || kind != AGEN_STEP_ATHROW {
+        // An error or an item ends this step. Only a pending body await makes it resumable.
+        model.set_agen_step_kind(step, kind | AGEN_STEP_FINISHED);
+    }
+    let resume = if resumed {
         match action {
             DelegateAction::Send(value) => Resume::Send(value),
             DelegateAction::Throw(exc) => Resume::Throw(exc),
         }
     } else {
-        model.set_agen_step_kind(step, AGEN_STEP_RESUMED);
         match kind {
             AGEN_STEP_ANEXT => Resume::Send(Value::NONE),
             AGEN_STEP_ASEND => Resume::Send(model.agen_step_value(step)),
-            AGEN_STEP_ATHROW => Resume::Throw(model.agen_step_value(step)),
+            AGEN_STEP_ATHROW => {
+                let value = model.agen_step_value(step);
+                Resume::Throw(exception_to_throw(value, functions, model, depth)?)
+            }
             AGEN_STEP_ACLOSE => Resume::Close,
             _ => return Err(Trap::Malformed),
         }
@@ -3572,13 +3875,27 @@ fn advance_agen_step(
         return Err(model.raise_named_exception("StopAsyncIteration", ""));
     }
     if model.generator_is_delegating(agen) {
+        model.set_agen_step_kind(step, kind | AGEN_STEP_RESUMED);
         Ok(DelegateStep::Yielded(value))
     } else {
         Ok(DelegateStep::Returned(value))
     }
 }
 
+#[inline(never)]
 fn resume_generator(
+    generator: Value,
+    resume: Resume,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let _native_call = model.enter_native_call()?;
+    resume_generator_inner(generator, resume, functions, model, depth)
+}
+
+#[inline(never)]
+fn resume_generator_inner(
     generator: Value,
     resume: Resume,
     functions: &Functions,
@@ -3611,8 +3928,11 @@ fn resume_generator(
         model.set_pending_exception(exc);
         return Err(Trap::Raised);
     }
+    let mut roots = model.root_scope();
+    let model = &mut *roots;
+    let generator = model.root_value(generator);
     let outcome = drive_taken_generator(generator, frame, resume, functions, model, depth);
-    model.end_generator_resume(generator);
+    model.end_generator_resume(model.rooted_value(generator));
     outcome
 }
 
@@ -3621,7 +3941,7 @@ fn resume_generator(
 /// Split from [`resume_generator`] for that reservation alone: every exit here is an exit from a
 /// function whose caller releases it, rather than another place to remember to.
 fn drive_taken_generator(
-    generator: Value,
+    generator: ValueRoot,
     mut frame: Frame,
     resume: Resume,
     functions: &Functions,
@@ -3629,7 +3949,7 @@ fn drive_taken_generator(
     depth: usize,
 ) -> Result<Value, Trap> {
     let close_mode = matches!(resume, Resume::Close);
-    let module_id = model.generator_module(generator);
+    let module_id = model.generator_module(model.rooted_value(generator));
     let gen_functions_rc = model.managed_functions_rc(module_id);
     let gen_functions: &Functions = gen_functions_rc.as_deref().unwrap_or(functions);
     let entry = match frame.code {
@@ -3639,7 +3959,7 @@ fn drive_taken_generator(
     match resume {
         Resume::Send(value) => {
             if frame.ip == 0 && value != Value::NONE {
-                model.put_generator_frame(generator, frame);
+                model.put_generator_frame(model.rooted_value(generator), frame);
                 return Err(Trap::TypeError);
             }
             if frame.ip > 0 {
@@ -3685,7 +4005,7 @@ fn drive_taken_generator(
                     model.raise_named_exception("RuntimeError", "generator ignored GeneratorExit")
                 );
             }
-            model.put_generator_frame(generator, suspended);
+            model.put_generator_frame(model.rooted_value(generator), suspended);
             Ok(value)
         }
         Ok(DriveOutcome::Returned(returned)) => {
@@ -3737,7 +4057,7 @@ fn call_generator_method(
                 [exc] => *exc,
                 _ => return Err(Trap::TypeError),
             };
-            let exc = model.raise_value(raised)?;
+            let exc = exception_to_throw(raised, functions, model, depth)?;
             let value = resume_generator(generator, Resume::Throw(exc), functions, model, depth)?;
             stop_or_value(value, model)
         }
@@ -3874,19 +4194,89 @@ pub(crate) fn getattr_hooked(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
+    load_attr(receiver, name, slot, functions, model, depth)
+}
+
+/// `receiver.name` as Python reads it (Python 3.14 Language Reference, 3.3.2, "Customizing attribute
+/// access"): a user descriptor on the class first, then the model's lookup, a property's getter run for
+/// an instance; and when that raises `AttributeError` -- the name is not there, or a getter or a
+/// descriptor's `__get__` raised it -- the type's `__getattr__`, when it has one, with the name.
+///
+/// The one reading that `Op::LoadAttr`, the built-in `getattr` and `hasattr`, and a host reading after
+/// the run all share. A bare miss is [`Trap::AttributeError`]; `Op::LoadAttr` words it.
+#[inline]
+pub(crate) fn load_attr(
+    receiver: Value,
+    name: &str,
+    slot: &mut InlineCache,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
+    let mut roots = model.root_scope();
+    let model = &mut *roots;
+    let receiver_root = model.root_value(receiver);
+    let read = load_attr_by_lookup(receiver, name, slot, functions, model, depth);
+    let attribute_error = match read {
+        Err(Trap::AttributeError) => true,
+        Err(Trap::Raised) => model.pending_exception_is("AttributeError"),
+        _ => false,
+    };
+    if !attribute_error {
+        return read;
+    }
+    let receiver = model.rooted_value(receiver_root);
+    let Some(hook) = model.find_dunder(receiver, "__getattr__") else {
+        return read;
+    };
+    if matches!(read, Err(Trap::Raised)) {
+        let _ = model.take_pending_exception();
+    }
+    let name_value = model.new_str(name)?;
+    call_value(hook, &[name_value], functions, model, depth + 1)
+}
+
+/// [`load_attr`] without its `__getattr__` fallback.
+fn load_attr_by_lookup(
+    receiver: Value,
+    name: &str,
+    slot: &mut InlineCache,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Value, Trap> {
     if let Some(value) = descriptor_read(receiver, name, functions, model, depth)? {
         return Ok(value);
     }
-    match model.getattr(receiver, name, slot) {
-        Err(Trap::AttributeError) => match model.find_dunder(receiver, "__getattr__") {
-            Some(hook) => {
-                let name_value = model.new_str(name)?;
-                call_value(hook, &[name_value], functions, model, depth + 1)
-            }
-            None => Err(Trap::AttributeError),
-        },
-        other => other,
+    let value = model.getattr(receiver, name, slot)?;
+    if model.is_property(value) && model.is_instance(receiver) {
+        let (fget, _, _) = model.property_accessors(value);
+        if fget.is_none() {
+            return Err(Trap::AttributeError);
+        }
+        return call_value(fget, &[receiver], functions, model, depth + 1);
     }
+    Ok(value)
+}
+
+/// Reads `receiver.name` as the program's own `receiver.name` reads it -- a user descriptor's
+/// `__get__`, a property's getter and the type's `__getattr__` all run -- for a host that reads an
+/// attribute after the program ended, such as the `code` of the `SystemExit` that ended it. What it
+/// calls runs against `functions`, the program's; a read that calls none of them needs none.
+pub fn read_attr_as_the_program_does(
+    receiver: Value,
+    name: &str,
+    functions: &Functions,
+    model: &mut ObjectModel,
+) -> Result<Value, Trap> {
+    load_attr(receiver, name, &mut InlineCache::empty(), functions, model, 0)
+}
+
+/// `str(value)` as the program's own `str()` makes it -- an instance's `__str__`, else its `__repr__`,
+/// else the built-in rendering -- for a host that renders a value after the program ended, such as the
+/// code of the `SystemExit` that ended it. What it calls runs against `functions`, the program's.
+pub fn str_as_the_program_does(value: Value, functions: &Functions, model: &mut ObjectModel) -> Result<String, Trap> {
+    crate::builtins::display_arg(value, functions, model, 1)
 }
 
 /// The descriptor read hook shared by `Op::LoadAttr` and `getattr_hooked`: a class attribute whose
@@ -3901,6 +4291,22 @@ fn descriptor_read(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
+    if let Some((instance, descriptor)) = model.super_descriptor(receiver, name) {
+        // A super binding reads the class member before binding it. The instance dictionary
+        // does not participate, and a descriptor returned by the read is an ordinary value.
+        // Python 3.14 Language Reference, 3.3.2.3, "Invoking Descriptors".
+        if model.is_property(descriptor) {
+            let (fget, _, _) = model.property_accessors(descriptor);
+            if fget.is_none() {
+                return Err(Trap::AttributeError);
+            }
+            return Ok(Some(call_value(fget, &[instance], functions, model, depth + 1)?));
+        }
+        if let Some(get) = model.find_dunder(descriptor, "__get__") {
+            let objtype = model.instance_class(instance);
+            return Ok(Some(call_value(get, &[instance, objtype], functions, model, depth + 1)?));
+        }
+    }
     if name == "__dict__" {
         return Ok(None);
     }
@@ -4003,12 +4409,21 @@ pub(crate) fn iterator_for(
     }
 }
 
-/// Advances `iterator` one step: resumes a generator through the driver, or delegates to the
-/// object model's `py_next` for a built-in iterator (str/list/dict/range/...). `Some(value)` is the
-/// next item, `None` exhaustion. The ONE iteration primitive `ForIter` and every iterable-consuming
-/// built-in (`list`/`sum`/`sorted`/... via `collect_iterable`, and `next`) share -- so a generator
-/// works everywhere a built-in iterator does, not only in a `for` loop.
+/// Advances an iterator, returning its next item or None for exhaustion. Generators and user
+/// methods may reenter the interpreter, so native stack growth is checked before dispatch.
+#[inline(never)]
 pub(crate) fn py_next_value(
+    iterator: Value,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<Option<Value>, Trap> {
+    let _native_call = model.enter_native_call()?;
+    py_next_value_inner(iterator, functions, model, depth)
+}
+
+#[inline(never)]
+fn py_next_value_inner(
     iterator: Value,
     functions: &Functions,
     model: &mut ObjectModel,
@@ -4078,63 +4493,92 @@ fn zip_strict_message(index: usize, longer: bool) -> String {
     }
 }
 
-/// Advances a lazy `map`/`filter`/`zip`/`enumerate` one step, pulling from its source iterator(s)
-/// and applying its function. `None` when a source is exhausted.
+/// Pulls one item through a lazy iterator, retaining its pending values across callbacks.
+/// Each source pull enters the shared native recursion guard before descending another level.
+#[inline(never)]
 fn lazy_iter_next(
     iterator: Value,
     functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Option<Value>, Trap> {
-    let sources = model.lazy_iter_sources(iterator);
-    match model.lazy_iter_kind(iterator) {
-        crate::object::LAZY_MAP => {
+    use crate::object::{
+        LAZY_CALLABLE, LAZY_ENUMERATE, LAZY_FILTER, LAZY_GETITEM, LAZY_MAP, LAZY_ZIP,
+    };
+
+    let mut model = model.root_scope();
+    let kind = model.lazy_iter_kind(iterator);
+    let sources = model
+        .lazy_iter_sources(iterator)
+        .into_iter()
+        .map(|source| model.root_value(source))
+        .collect::<Vec<_>>();
+    let iterator = model.root_value(iterator);
+    match kind {
+        LAZY_MAP => {
             let mut row = Vec::with_capacity(sources.len());
-            for source in &sources {
-                match py_next_value(*source, functions, model, depth)? {
-                    Some(value) => row.push(value),
+            for &source in &sources {
+                let source = model.rooted_value(source);
+                match py_next_value(source, functions, &mut model, depth)? {
+                    Some(value) => row.push(model.root_value(value)),
                     None => return Ok(None),
                 }
             }
-            let func = model.lazy_iter_state(iterator);
-            Ok(Some(call_value(func, &row, functions, model, depth)?))
+            let iterator = model.rooted_value(iterator);
+            let function = model.lazy_iter_state(iterator);
+            let row = row
+                .into_iter()
+                .map(|root| model.rooted_value(root))
+                .collect::<Vec<_>>();
+            Ok(Some(call_value(
+                function, &row, functions, &mut model, depth,
+            )?))
         }
-        crate::object::LAZY_FILTER => {
-            let source = sources[0];
-            let func = model.lazy_iter_state(iterator);
+        LAZY_FILTER => {
+            let function = model.lazy_iter_state(model.rooted_value(iterator));
+            let function = model.root_value(function);
             loop {
-                let Some(value) = py_next_value(source, functions, model, depth)? else {
+                let mut candidate = model.root_scope();
+                let source = candidate.rooted_value(sources[0]);
+                let Some(value) = py_next_value(source, functions, &mut candidate, depth)? else {
                     return Ok(None);
                 };
-                let keep = if func.is_none() {
-                    py_truthy_dyn(value, functions, model, depth)?
+                let value = candidate.root_value(value);
+                let function = candidate.rooted_value(function);
+                let item = candidate.rooted_value(value);
+                let keep = if function.is_none() {
+                    py_truthy_dyn(item, functions, &mut candidate, depth)?
                 } else {
-                    let result = call_value(func, &[value], functions, model, depth)?;
-                    py_truthy_dyn(result, functions, model, depth)?
+                    let answer = call_value(function, &[item], functions, &mut candidate, depth)?;
+                    py_truthy_dyn(answer, functions, &mut candidate, depth)?
                 };
                 if keep {
-                    return Ok(Some(value));
+                    return Ok(Some(candidate.rooted_value(value)));
                 }
             }
         }
-        crate::object::LAZY_ZIP => {
+        LAZY_ZIP => {
             if sources.is_empty() {
                 return Ok(None);
             }
-            let strict = model.lazy_iter_state(iterator).is_truthy();
+            let strict = model
+                .lazy_iter_state(model.rooted_value(iterator))
+                .is_truthy();
             let mut row = Vec::with_capacity(sources.len());
-            for (i, source) in sources.iter().enumerate() {
-                match py_next_value(*source, functions, model, depth)? {
-                    Some(value) => row.push(value),
+            for (index, &source) in sources.iter().enumerate() {
+                let source = model.rooted_value(source);
+                match py_next_value(source, functions, &mut model, depth)? {
+                    Some(value) => row.push(model.root_value(value)),
                     None => {
                         if strict {
-                            if i > 0 {
-                                let message = zip_strict_message(i, false);
+                            if index > 0 {
+                                let message = zip_strict_message(index, false);
                                 return Err(model.with_message(Trap::ValueError, &message));
                             }
-                            for (j, later) in sources.iter().enumerate().skip(1) {
-                                if py_next_value(*later, functions, model, depth)?.is_some() {
-                                    let message = zip_strict_message(j, true);
+                            for (index, &later) in sources.iter().enumerate().skip(1) {
+                                let later = model.rooted_value(later);
+                                if py_next_value(later, functions, &mut model, depth)?.is_some() {
+                                    let message = zip_strict_message(index, true);
                                     return Err(model.with_message(Trap::ValueError, &message));
                                 }
                             }
@@ -4143,34 +4587,51 @@ fn lazy_iter_next(
                     }
                 }
             }
+            let row = row
+                .into_iter()
+                .map(|root| model.rooted_value(root))
+                .collect();
             Ok(Some(model.new_tuple(row)?))
         }
-        crate::object::LAZY_ENUMERATE => {
-            let source = sources[0];
-            let Some(value) = py_next_value(source, functions, model, depth)? else {
+        LAZY_ENUMERATE => {
+            let source = model.rooted_value(sources[0]);
+            let Some(value) = py_next_value(source, functions, &mut model, depth)? else {
                 return Ok(None);
             };
-            let count = model.lazy_iter_state(iterator);
+            let count = model.lazy_iter_state(model.rooted_value(iterator));
+            let next_count = model.as_i128(count).unwrap_or(0) + 1;
             let pair = model.new_tuple(alloc::vec![count, value])?;
-            let next = model.new_long(model.as_i128(count).unwrap_or(0) + 1)?;
+            let pair = model.root_value(pair);
+            let next = model.new_long(next_count)?;
+            let iterator = model.rooted_value(iterator);
             model.lazy_iter_set_state(iterator, next);
-            Ok(Some(pair))
+            Ok(Some(model.rooted_value(pair)))
         }
-        crate::object::LAZY_CALLABLE => {
-            let callable = model.lazy_iter_state(iterator);
-            let sentinel = sources.first().copied().unwrap_or(Value::NONE);
-            let result = call_value(callable, &[], functions, model, depth)?;
-            Ok((!model.key_eq(result, sentinel)).then_some(result))
+        LAZY_CALLABLE => {
+            let callable = model.lazy_iter_state(model.rooted_value(iterator));
+            let item = call_value(callable, &[], functions, &mut model, depth)?;
+            let sentinel = sources
+                .first()
+                .map(|&root| model.rooted_value(root))
+                .unwrap_or(Value::NONE);
+            Ok((!model.key_eq(item, sentinel)?).then_some(item))
         }
-        crate::object::LAZY_GETITEM => {
-            let target = sources[0];
-            let index = model.lazy_iter_state(iterator);
-            let getitem = model.find_dunder(target, "__getitem__").ok_or(Trap::TypeError)?;
-            match call_value(getitem, &[index], functions, model, depth) {
+        LAZY_GETITEM => {
+            let target = model.rooted_value(sources[0]);
+            let index = model.lazy_iter_state(model.rooted_value(iterator));
+            let index = model.root_value(index);
+            let getitem = model
+                .find_dunder(target, "__getitem__")
+                .ok_or(Trap::TypeError)?;
+            let argument = model.rooted_value(index);
+            match call_value(getitem, &[argument], functions, &mut model, depth) {
                 Ok(value) => {
-                    let next = model.new_long(model.as_i128(index).unwrap_or(0) + 1)?;
+                    let value = model.root_value(value);
+                    let count = model.as_i128(model.rooted_value(index)).unwrap_or(0);
+                    let next = model.new_long(count + 1)?;
+                    let iterator = model.rooted_value(iterator);
                     model.lazy_iter_set_state(iterator, next);
-                    Ok(Some(value))
+                    Ok(Some(model.rooted_value(value)))
                 }
                 Err(Trap::IndexError) => Ok(None),
                 Err(Trap::Raised) if model.pending_exception_is("IndexError") => {
@@ -4528,7 +4989,23 @@ fn report_deadlock(threads: &[PyThread], model: &mut ObjectModel) {
     }
 }
 
+#[inline(never)]
 fn run_frames(
+    entry: &CodeObject,
+    functions: &Functions,
+    args: &[Value],
+    cells: &[Value],
+    model: &mut ObjectModel,
+    is_module: bool,
+    depth: usize,
+    module_id: u16,
+) -> Result<Value, Trap> {
+    let _native_call = model.enter_native_call()?;
+    run_frames_inner(entry, functions, args, cells, model, is_module, depth, module_id)
+}
+
+#[inline(never)]
+fn run_frames_inner(
     entry: &CodeObject,
     functions: &Functions,
     args: &[Value],
@@ -4719,35 +5196,12 @@ fn drive_frames(
                 let [name, cache] = *code.wide_operands.get(site as usize).ok_or(Trap::Malformed)?;
                 let receiver = frame.pop()?;
                 let attr = code.names.get(name as usize).ok_or(Trap::Malformed)?;
-                if let Some(value) = descriptor_read(receiver, attr, functions, model, depth)? {
-                    frame.push(value);
-                } else {
-                    let slot = frame.caches.get_mut(cache as usize).ok_or(Trap::Malformed)?;
-                    match model.getattr(receiver, attr, slot) {
-                        Ok(value) => {
-                            if model.is_property(value) && model.is_instance(receiver) {
-                                let (fget, _, _) = model.property_accessors(value);
-                                if fget.is_none() {
-                                    return Err(Trap::AttributeError);
-                                }
-                                let result = call_value(fget, &[receiver], functions, model, depth + 1)?;
-                                frame.push(result);
-                            } else {
-                                frame.push(value);
-                            }
-                        }
-                        Err(Trap::AttributeError) => match model.find_dunder(receiver, "__getattr__") {
-                            Some(hook) => {
-                                let name_value = model.new_str(attr)?;
-                                let result =
-                                    call_value(hook, &[name_value], functions, model, depth + 1)?;
-                                frame.push(result);
-                            }
-                            None => return Err(model.attribute_error(receiver, attr)),
-                        },
-                        Err(other) => return Err(other),
-                    }
-                }
+                let slot = frame.caches.get_mut(cache as usize).ok_or(Trap::Malformed)?;
+                let value = match load_attr(receiver, attr, slot, functions, model, depth) {
+                    Err(Trap::AttributeError) => return Err(model.attribute_error(receiver, attr)),
+                    read => read?,
+                };
+                frame.push(value);
             }
             Op::Binary(binop) => {
                 let rhs = frame.pop()?;
@@ -4984,14 +5438,14 @@ fn drive_frames(
                 let exception = if argc == 2 {
                     let cause = frame.pop()?;
                     let value = frame.pop()?;
-                    let exception = model.raise_value(value)?;
-                    let cause = if model.is_class(cause) { model.new_object(cause)? } else { cause };
+                    let exception = exception_to_raise(value, functions, model, depth)?;
+                    let cause = cause_to_chain(cause, functions, model, depth)?;
                     model.py_setattr_instance(exception, "__cause__", cause)?;
                     model.py_setattr_instance(exception, "__suppress_context__", Value::TRUE)?;
                     exception
                 } else if argc == 1 {
                     let value = frame.pop()?;
-                    model.raise_value(value)?
+                    exception_to_raise(value, functions, model, depth)?
                 } else {
                     match frame.handling() {
                         Some(active) => active,
@@ -5424,18 +5878,7 @@ fn drive_frames(
             Op::DeleteAttr { name } => {
                 let object = frame.pop()?;
                 let attr = code.names.get(name as usize).ok_or(Trap::Malformed)?;
-                if model.is_instance(object) {
-                    if let Some(hook) = model.find_dunder(object, "__delattr__") {
-                        let name_value = model.new_str(attr)?;
-                        call_value(hook, &[name_value], functions, model, depth + 1)?;
-                    } else if let Some(delete) = model.instance_delete_descriptor(object, attr) {
-                        call_value(delete, &[object], functions, model, depth + 1)?;
-                    } else {
-                        model.py_delattr(object, attr)?;
-                    }
-                } else {
-                    model.py_delattr(object, attr)?;
-                }
+                delete_attr(object, attr, functions, model, depth)?;
             }
             Op::DeleteFast(idx) => {
                 if frame.local_is_unbound(idx as usize)? {
@@ -5755,6 +6198,10 @@ fn unwind_exception(
         }
     }
 }
+
+#[cfg(all(test, feature = "gc-collect"))]
+#[path = "interp/comparison_collection_tests.rs"]
+mod comparison_collection_tests;
 
 #[cfg(test)]
 mod tests {

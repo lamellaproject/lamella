@@ -97,5 +97,8 @@ libm = { version = "0.2.16", optional = true }
 [dev-dependencies]
 lamella-py-frontend = { path = "../lamella-py-frontend" }
 
+[target.'cfg(any(windows, target_os = "linux", target_os = "android", target_vendor = "apple"))'.dependencies]
+lamella-stack-host = { path = "../lamella-stack-host" }
+
 [lints]
 workspace = true

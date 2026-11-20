@@ -153,6 +153,26 @@ pin = "PA0"
 active = "high"
 source = "UM2033 Rev 5 section 5.16: the blue button B1 is available as a digital input, and when the button is depressed the logic state is 1, otherwise the logic state is 0. Its pin is PA0 -- the manual's pin table gives PA0/WKUP the board label B_USER."
 
+# --- the debug link ---------------------------------------------------------------------------
+#
+# The on-board debugger reaches the part over SWD on PA13 and PA14. Both lines are kept from a
+# program's GPIO controller: reconfiguring either would end a debug session, and with it the
+# output of a program whose console the debugger reads.
+
+[[devices]]
+name = "swdio"
+pin = "PA13"
+active = "none"
+reserved = true
+source = "MB1225 schematic rev B03 sheet 4 (STM32F769NIH6 Connexion): net SWDIO on PA13, ball A15; sheet 3 (ST-LINK/V2-1 with support of SWD only): the ST-LINK's T_JTMS reaches SWDIO through SB22."
+
+[[devices]]
+name = "swclk"
+pin = "PA14"
+active = "none"
+reserved = true
+source = "MB1225 schematic rev B03 sheet 4: net SWCLK on PA14, ball A14; sheet 3: the ST-LINK's T_JTCK reaches SWCLK through SB19."
+
 [debug]
 signals = []
 exposure = "unknown"

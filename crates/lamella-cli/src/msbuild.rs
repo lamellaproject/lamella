@@ -60,6 +60,8 @@ struct Inputs {
     defines: Vec<String>,
     /// Whether unsafe code is on.
     allow_unsafe: bool,
+    /// The C# version the project's `LangVersion` selects, where the inputs name one.
+    lang_version: Option<lamella_syntax::version::LanguageVersion>,
     /// Whether the sources are a file-based app's: MSBuild's `Features` names
     /// [`FILE_BASED_PROGRAM`].
     file_based: bool,
@@ -100,6 +102,7 @@ impl Inputs {
         let text = crate::text::read_text(path)
             .map_err(|error| format!("lamella: error: read the build's inputs {}: {error}", path.display()))?;
         let mut inputs = Self::default();
+        let mut lang_version = None;
         for line in text.lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
@@ -113,6 +116,7 @@ impl Inputs {
                 "reference" => inputs.references.push(PathBuf::from(value)),
                 "define" if !value.is_empty() => inputs.defines.push(value.to_owned()),
                 "allowunsafe" => inputs.allow_unsafe = value.eq_ignore_ascii_case("true"),
+                "langversion" => lang_version = (!value.is_empty()).then(|| value.to_owned()),
                 "features" => inputs.file_based |= names_file_based(value),
                 "assemblyname" if !value.is_empty() => inputs.assembly_name = Some(value.to_owned()),
                 "out" => inputs.out = Some(PathBuf::from(value)),
@@ -130,6 +134,11 @@ impl Inputs {
                 "manifest" if !value.is_empty() => inputs.manifest = Some(PathBuf::from(value)),
                 _ => {}
             }
+        }
+        if let Some(value) = lang_version {
+            let selected = crate::project::language_version(&value)
+                .map_err(|why| format!("lamella: error: {}: LangVersion {why}.", inputs.project))?;
+            inputs.lang_version = Some(selected);
         }
         Ok(inputs)
     }
@@ -214,10 +223,11 @@ pub fn build(args: &[String]) -> ExitCode {
     }
 }
 
-/// `refusal` as MSBuild shows an error: a sentence the tool worded for a reader, which `Exec` would
-/// pass on as a message beside its own "exited with code 1", becomes one line in MSBuild's
-/// canonical form, `<project> : error : <its first paragraph>`, with the rest after it. A refusal
-/// already in that form, as the compiler's diagnostics are, is left as it is.
+/// `refusal` as MSBuild shows an error: a sentence the tool worded for a reader, which MSBuild would
+/// otherwise show as a message beside an error saying only that the tool "exited with code 1",
+/// becomes one line in MSBuild's canonical form, `<project> : error : <its first paragraph>`, with
+/// the rest after it. A refusal already in that form, as the compiler's diagnostics are, is left as
+/// it is.
 fn as_msbuild_error(project: &str, refusal: &str) -> String {
     let first_line = refusal.lines().next().unwrap_or_default();
     if first_line.contains(": error ") || first_line.contains(": error:") {
@@ -262,7 +272,7 @@ fn project_of(inputs: &Inputs, board: Option<&str>) -> crate::project::Project {
     crate::project::Project {
         output_type: crate::project::OutputType::Exe,
         assembly_name,
-        lang_version: None,
+        lang_version: inputs.lang_version,
         allow_unsafe: inputs.allow_unsafe,
         references: inputs.references.clone(),
         sources: inputs.sources.clone(),
@@ -915,6 +925,37 @@ mod tests {
             format!("Lamella v{version}, a board this build does not know (product model 32767) (C# interpreter)")
         );
         assert_eq!(model_line(Some("raspberrypi-pico-2"), PICO2), format!("Lamella v{version}, Raspberry Pi Pico 2 (C# interpreter)"));
+    }
+
+    /// The SDK's `langversion=` line selects the version as the project reader does, and reaches the
+    /// project the compile is given. An empty value leaves the default, and a value naming no version
+    /// the compiler can select is refused with the project named.
+    #[test]
+    fn the_inputs_langversion_line_selects_the_version() {
+        use lamella_syntax::version::LanguageVersion;
+        let dir = std::env::temp_dir().join(format!("lamella-msbuild-langversion-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a scratch directory");
+        let file = dir.join("lamella.compile.txt");
+        let read = |value: &str| {
+            std::fs::write(&file, format!("project=C:\\app\\App.csproj\nlangversion={value}\n")).expect("the inputs");
+            Inputs::read(&file)
+        };
+        assert_eq!(read("10").unwrap().lang_version, Some(LanguageVersion::CSharp10));
+        assert_eq!(project_of(&read("ISO-1").unwrap(), None).lang_version, Some(LanguageVersion::CSharp1));
+        assert_eq!(read("").unwrap().lang_version, None);
+        let refused = read("14").unwrap_err();
+        assert!(
+            refused.contains("C:\\app\\App.csproj: LangVersion is \"14\", a C# version this compiler cannot select yet"),
+            "{refused}"
+        );
+        // Read once every line is in: a refusal names the project wherever its line comes, and the last
+        // `langversion=` line is the one in effect, an empty one leaving the default.
+        std::fs::write(&file, "langversion=banana\nproject=C:\\app\\App.csproj\n").expect("the inputs");
+        let early = Inputs::read(&file).unwrap_err();
+        assert!(early.contains("C:\\app\\App.csproj: LangVersion is \"banana\""), "{early}");
+        std::fs::write(&file, "project=C:\\app\\App.csproj\nlangversion=1\nlangversion=\n").expect("the inputs");
+        assert_eq!(Inputs::read(&file).unwrap().lang_version, None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

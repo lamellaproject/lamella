@@ -2,20 +2,19 @@
 //! and 29, the same on the Pico 2 W, the Pico Plus 2 W and the Pico LiPo 2 XL W): the radio's
 //! controller, made once and kept in a static for every program the firmware runs, as the network
 //! device a program's stack drives and the Wi-Fi seam a program's classes reach. The radio stays off
-//! until something asks for it: the board's start, when the network it stores -- or, in a
-//! development build that names one, the network named at build time -- joins in the background, or
-//! a program's join. Nothing waits for it: the program starts at once, and the passes of its stack
-//! bring the radio up and join beside it. The driver, its PIO engine, the station and the controller
-//! that makes them one are their own crates; this file is only what is specific to the firmware --
-//! the images the build provided, the build-time credentials, the clock, the random seed, the slot
-//! the driver reads a credential from, and the static it all lives in.
+//! until something asks for it: the board's start, when the network it stores joins in the
+//! background, or a program's join. Nothing waits for it: the program starts at once, and the passes
+//! of its stack bring the radio up and join beside it. The driver, its PIO engine, the station and
+//! the controller that makes them one are their own crates; this file is only what is specific to the
+//! firmware -- the images the build provided, the clock, the random seed, the slot the driver reads a
+//! credential from, and the static it all lives in.
 
 extern crate alloc;
 
 use alloc::boxed::Box;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use lamella_net_core::wifi::{security, BootConnection, CredentialSource, Reconnection, WifiControl};
+use lamella_net_core::wifi::{BootConnection, WifiControl};
 use lamella_wifi_cyw4343x::gspi::Gspi;
 use lamella_wifi_cyw4343x::rp2350::PioWire;
 use lamella_wifi_cyw4343x::{Clock, Micros};
@@ -56,14 +55,6 @@ const IMAGES: Images<'static> = Images {
     regulatory: include_bytes!(concat!(env!("OUT_DIR"), "/wifi-images/wifi-clm.blob")),
     version: env!("LAMELLA_WIFI_VERSION").as_bytes(),
 };
-
-/// A network named at build time, which only a development build carries; no secret is ever in this
-/// tree. `LAMELLA_WIFI_SSID` alone names an open network; with `LAMELLA_WIFI_PSK` it is a WPA2
-/// passphrase, or a WPA3 password when `LAMELLA_WIFI_SECURITY` is `wpa3`. The board joins it at
-/// start only when it stores no network of its own.
-const SSID: Option<&str> = option_env!("LAMELLA_WIFI_SSID");
-const SECRET: Option<&str> = option_env!("LAMELLA_WIFI_PSK");
-const SECURITY: Option<&str> = option_env!("LAMELLA_WIFI_SECURITY");
 
 /// How long the bring-up may take: about a second is usual (attach, upload with the bus tuned, the
 /// control path, the radio).
@@ -126,15 +117,6 @@ impl CredentialSlot<'static> for StaticSlot {
 
 static mut WIFI: Option<WifiController> = None;
 
-/// The network named at build time: its secret and the kinds a join of it accepts.
-fn build_time_network() -> (&'static [u8], u8) {
-    match (SECRET, SECURITY) {
-        (None, _) => (&[], security::OPEN),
-        (Some(secret), Some("wpa3")) => (secret.as_bytes(), security::WPA3),
-        (Some(secret), _) => (secret.as_bytes(), security::WPA2),
-    }
-}
-
 /// Make the radio's controller and start what the board's stored network asks for at start, exactly
 /// once, waiting for nothing: a network that joins in the background powers the radio here, and the
 /// passes of the program's stack bring it up and join beside the program; any other start leaves the
@@ -169,24 +151,14 @@ pub fn start_wifi(clk_sys_hz: u32, records: Box<dyn RecordStore>) {
     boot_join(wifi);
 }
 
-/// The join the board starts with its first program: the stored network as its boot setting says,
-/// or the network a development build names when none is stored. It powers the radio; nothing waits
-/// for it. Any other start leaves the radio off. A firmware that keeps no board settings reads no
-/// stored network, whatever the board holds.
+/// The join the board starts with its first program: the stored network, as its boot setting says.
+/// It powers the radio; nothing waits for it. Any other start -- no network stored, or one whose
+/// setting leaves the join to a program -- leaves the radio off.
 fn boot_join(wifi: &mut WifiController) {
     match wifi.stored_boot() {
-        Some(BootConnection::OnConnect) => {}
+        Some(BootConnection::OnConnect) | None => {}
         Some(_) => {
             wifi.begin_stored();
-        }
-        None if wifi.stored_unusable() => {
-        }
-        None => {
-            let Some(ssid) = SSID else {
-                return;
-            };
-            let (secret, kinds) = build_time_network();
-            wifi.begin(ssid.as_bytes(), secret, kinds, Reconnection::Automatic, CredentialSource::BuildTime);
         }
     }
 }

@@ -25,6 +25,12 @@ width = 32
 fields = { DELAY = [0, 14] }
 notes = "DELAY counts 256 crystal periods: a wait of t seconds is (f_crystal x t) / 256 (datasheet 8.2.4), so 1 ms with a 12 MHz crystal is 47. Its reset value, 0xC4, is 50,176 periods (Table 602: 'approx 50 000 cycles'): 4.18 ms with a 12 MHz crystal, within the 'few milliseconds' 8.2.3 gives a crystal to start."
 
+[registers.COUNT]
+offset = 0x10
+width = 32
+fields = { COUNT = [0, 16] }
+notes = "A down counter at the crystal's own rate that counts to zero and stops: writing a non-zero value starts it, and it reads 1 while it runs and 0 once it has finished. A count below 4 counts 4, and the write's synchronisation costs 2 register clock cycles that the count does not make up (Table 603)."
+
 [constants]
 CTRL_ENABLE_MAGIC = 0xFAB
 CTRL_FREQ_RANGE_1_15MHZ = 0xAA0

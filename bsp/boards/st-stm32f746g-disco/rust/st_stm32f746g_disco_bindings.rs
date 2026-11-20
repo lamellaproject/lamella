@@ -103,10 +103,18 @@ pub const HEADER_I2C_OTYPER_SDA_MASK: u32 = 0x200;
 pub const HEADER_I2C_KERNEL_HZ: u32 = 16000000;
 pub const HEADER_I2C_TIMINGR_100K_HSI_16MHZ: u32 = 0x30420F13;
 pub const HEADER_I2C_TIMINGR_400K_HSI_16MHZ: u32 = 0x10320309;
-pub const DEVICE_COUNT: u32 = 1;
+pub const DEVICE_COUNT: u32 = 3;
 
 // -- on-board devices: PORT group base + pin index + mask --
 pub const WM8994_ADDRESS: u32 = 0x1A;
+pub const SWDIO_PORT_BASE: u32 = 0x40020000;
+pub const SWDIO_PIN: u32 = 13;
+pub const SWDIO_BANK: u32 = 0;
+pub const SWDIO_MASK: u32 = 0x2000;
+pub const SWCLK_PORT_BASE: u32 = 0x40020000;
+pub const SWCLK_PIN: u32 = 14;
+pub const SWCLK_BANK: u32 = 0;
+pub const SWCLK_MASK: u32 = 0x4000;
 
 /// -- memory regions the board fits: SIZE is what a program may reach, which a device's own
 /// size may exceed; a region with a CONTROLLER does not exist until that instance is brought

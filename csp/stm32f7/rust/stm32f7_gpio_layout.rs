@@ -13,6 +13,12 @@ pub const OSPEEDR_OFF: u32 = 0x8;
 pub const OSPEEDR_WIDTH: i32 = 32;
 pub const PUPDR_OFF: u32 = 0xC;
 pub const PUPDR_WIDTH: i32 = 32;
+pub const IDR_OFF: u32 = 0x10;
+pub const IDR_WIDTH: i32 = 32;
+pub const ODR_OFF: u32 = 0x14;
+pub const ODR_WIDTH: i32 = 32;
+pub const BSRR_OFF: u32 = 0x18;
+pub const BSRR_WIDTH: i32 = 32;
 pub const AFRL_OFF: u32 = 0x20;
 pub const AFRL_WIDTH: i32 = 32;
 pub const AFRH_OFF: u32 = 0x24;
@@ -29,7 +35,13 @@ pub const AFRH_AFSEL9: u32 = 0xF0;
 pub const AFRH_AFSEL9_LSB: u32 = 4;
 
 /// -- block constants --
+pub const MODER_MODE_INPUT: u32 = 0;
+pub const MODER_MODE_OUTPUT: u32 = 1;
 pub const MODER_MODE_AF: u32 = 2;
+pub const MODER_MODE_ANALOG: u32 = 3;
+pub const MODER_MODE_RESET: u32 = 0;
 pub const OTYPER_OPEN_DRAIN: u32 = 1;
 pub const OSPEEDR_VERY_HIGH: u32 = 3;
+pub const PUPDR_NONE: u32 = 0;
 pub const PUPDR_PULL_UP: u32 = 1;
+pub const PUPDR_PULL_DOWN: u32 = 2;

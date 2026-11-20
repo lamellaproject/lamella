@@ -23,6 +23,10 @@
 //! The region: [`IMAGE_BASE`] (2 MB into the flash, clear of the firmware at `0x10000000`)
 //! running to [`SETTINGS_BASE`], the board's settings in the last two sectors of the flash -- every
 //! other byte of the part the firmware does not occupy, so no capacity is declared away.
+//!
+//! The C# interpreter firmware stores its image here through the runner's flash seam, which
+//! [`Rp2350Flash::window`] and [`Rp2350Flash::erase_window_range`] answer for it, and the Python one
+//! its bundle, through those two and [`Rp2350Flash::program_window`].
 
 extern crate alloc;
 
@@ -45,24 +49,16 @@ mod psram_flash;
 /// radio images of a Pico 2 W needs more than the first one.
 pub const IMAGE_BASE: usize = 0x1020_0000;
 
-// `BOARD_FLASH_BYTES`, which `build.rs` reads from the board's facts for the board this build
-// is for.
-include!(concat!(env!("OUT_DIR"), "/board_flash.rs"));
+/// The board's flash and its settings, the last sectors of it: their place is stated once, in a file
+/// the Python interpreter firmware reads them through too. The deploy window runs to the end of the
+/// flash this board solders (4 MB on the Pico 2 and Pico 2 W, where the window is 2 MB, and 16 MB on
+/// the Pimoroni Pico Plus 2 and Plus 2 W, where it is 14 MB), less the settings.
+#[path = "rp2350_settings.rs"]
+pub mod settings;
 
-/// One past the last byte of the board's flash. The RP2350 has no internal flash -- it executes in
-/// place from an external QSPI part -- so this is a fact of the board rather than of the chip, and
-/// it is read from the board's own facts: 4 MB on the Pico 2 and Pico 2 W, where the deploy window
-/// is 2 MB, and 16 MB on the Pimoroni Pico Plus 2 and Plus 2 W, where it is 14 MB.
-pub const FLASH_END: usize = 0x1000_0000 + BOARD_FLASH_BYTES;
-
-/// The board's settings: the last [`SETTINGS_SECTORS`] sectors of the flash, each its own erase
-/// unit, so one can be erased while the other holds what it replaces. They hold the board's stored
-/// settings, such as the Wi-Fi network it joins. A deploy never reaches them, and a firmware update
-/// -- which writes only the firmware's own pages -- leaves them as they were.
-pub const SETTINGS_SECTORS: usize = 2;
-
-/// Where the settings begin: [`SETTINGS_SECTORS`] sectors below the end of the flash.
-pub const SETTINGS_BASE: usize = FLASH_END - SETTINGS_SECTORS * SECTOR_BYTES;
+use settings::{SECTOR_BYTES, SETTINGS_BASE};
+#[cfg(all(feature = "cyw43", feature = "serve"))]
+use settings::{settings_sector, SETTINGS_SECTORS};
 
 /// The deploy window's length: from [`IMAGE_BASE`] to the board's settings.
 ///
@@ -72,8 +68,8 @@ pub const SETTINGS_BASE: usize = FLASH_END - SETTINGS_SECTORS * SECTOR_BYTES;
 /// filesystem names these addresses.
 pub const IMAGE_LEN: usize = SETTINGS_BASE - IMAGE_BASE;
 
-/// QSPI flash geometry the bootrom API enforces (RP2350 datasheet 5.4.8.9).
-pub const SECTOR_BYTES: usize = 4096;
+/// The QSPI flash's program page, which the bootrom API enforces (RP2350 datasheet 5.4.8.9); its erase
+/// sector is [`SECTOR_BYTES`].
 pub const PAGE_BYTES: usize = 256;
 
 /// Where the flash's first byte appears in the XIP window. `flash_range_erase` takes a flash
@@ -247,6 +243,49 @@ extern "C" fn range_erase_in_ram(
 }
 
 impl Rp2350Flash {
+    /// The deploy window, as the flash reads now.
+    pub fn window(&self) -> &'static [u8] {
+        unsafe { core::slice::from_raw_parts(IMAGE_BASE as *const u8, IMAGE_LEN) }
+    }
+
+    /// Erases `len` bytes of the deploy window at `offset`, both whole sectors, and answers whether
+    /// they then read erased. A range that is not whole sectors, or that leaves the window, erases
+    /// nothing and answers `false`.
+    pub fn erase_window_range(&mut self, offset: usize, len: usize) -> bool {
+        let in_window = offset.checked_add(len).is_some_and(|end| end <= IMAGE_LEN);
+        if !in_window || offset % SECTOR_BYTES != 0 || len % SECTOR_BYTES != 0 {
+            return false;
+        }
+        let flash_offset = (IMAGE_BASE - XIP_BASE + offset) as u32;
+        self.range_erase(flash_offset, len as u32) && reads_erased(offset, len)
+    }
+}
+
+#[cfg(feature = "python-serve")]
+impl Rp2350Flash {
+    /// Programs `bytes` at `offset` in the deploy window, where the window reads erased, and answers
+    /// whether it then reads them back.
+    ///
+    /// Each page the bytes touch is programmed whole, with `0xFF` around them. Programming `0xFF`
+    /// leaves a bit as it is, so `offset` need not fall on a page: a page that an earlier call
+    /// programmed in part keeps that part.
+    pub fn program_window(&mut self, offset: usize, bytes: &[u8]) -> bool {
+        let Some(end) = offset.checked_add(bytes.len()).filter(|&end| end <= IMAGE_LEN) else {
+            return false;
+        };
+        if bytes.is_empty() {
+            return true;
+        }
+        let first = offset - offset % PAGE_BYTES;
+        let mut staged: Vec<u8> = alloc::vec![0xFF; round_up(end, PAGE_BYTES) - first];
+        staged[offset - first..end - first].copy_from_slice(bytes);
+        let status = self.run_ops(0, 0, (IMAGE_BASE + first) as u32, staged.as_ptr() as u32, staged.len() as u32);
+        status == 0 && self.window()[offset..end] == *bytes
+    }
+}
+
+#[cfg(all(feature = "cyw43", feature = "serve"))]
+impl Rp2350Flash {
     /// Erases settings sector `sector` (0 or 1). Returns whether it then reads erased.
     pub fn settings_erase(&self, sector: usize) -> bool {
         if sector >= SETTINGS_SECTORS {
@@ -271,12 +310,12 @@ impl Rp2350Flash {
 }
 
 /// The board's settings as the store under its stored Wi-Fi network: one slot per sector.
-#[cfg(feature = "cyw43")]
+#[cfg(all(feature = "cyw43", feature = "serve"))]
 pub struct SettingsStore {
     flash: Rp2350Flash,
 }
 
-#[cfg(feature = "cyw43")]
+#[cfg(all(feature = "cyw43", feature = "serve"))]
 impl SettingsStore {
     /// The store over the bootrom's flash entry points.
     pub fn new() -> Self {
@@ -284,7 +323,7 @@ impl SettingsStore {
     }
 }
 
-#[cfg(feature = "cyw43")]
+#[cfg(all(feature = "cyw43", feature = "serve"))]
 impl lamella_wifi_cyw4343x_smoltcp::record::RecordStore for SettingsStore {
     fn read(&self, slot: usize) -> &[u8] {
         settings_sector(slot)
@@ -297,11 +336,6 @@ impl lamella_wifi_cyw4343x_smoltcp::record::RecordStore for SettingsStore {
     fn program(&mut self, slot: usize, offset: usize, page: &[u8; lamella_wifi_cyw4343x_smoltcp::record::PAGE]) -> bool {
         self.flash.settings_program(slot, offset, page)
     }
-}
-
-/// Settings sector `sector` as the flash reads now.
-pub fn settings_sector(sector: usize) -> &'static [u8] {
-    unsafe { core::slice::from_raw_parts((SETTINGS_BASE + sector * SECTOR_BYTES) as *const u8, SECTOR_BYTES) }
 }
 
 /// Whether the `len` bytes of the region at `offset` all read erased (`0xFF`).
@@ -340,6 +374,7 @@ fn round_up(len: usize, unit: usize) -> usize {
 
 /// Pad `bytes` to a whole number of flash pages with `0xFF` (the erased state, so the padding
 /// programs no bits), staging in RAM as the bootrom requires.
+#[cfg(feature = "serve")]
 fn page_padded(bytes: &[u8]) -> Vec<u8> {
     let mut staged = Vec::with_capacity(round_up(bytes.len(), PAGE_BYTES));
     staged.extend_from_slice(bytes);
@@ -347,9 +382,10 @@ fn page_padded(bytes: &[u8]) -> Vec<u8> {
     staged
 }
 
+#[cfg(feature = "serve")]
 impl lamella_runner::FlashSink for Rp2350Flash {
     fn image_slice(&self) -> &'static [u8] {
-        unsafe { core::slice::from_raw_parts(IMAGE_BASE as *const u8, IMAGE_LEN) }
+        self.window()
     }
 
     fn resident_corlib(&self) -> Option<&'static [u8]> {
@@ -365,12 +401,7 @@ impl lamella_runner::FlashSink for Rp2350Flash {
     }
 
     fn erase_range(&mut self, offset: usize, len: usize) -> bool {
-        let in_window = offset.checked_add(len).is_some_and(|end| end <= IMAGE_LEN);
-        if !in_window || offset % SECTOR_BYTES != 0 || len % SECTOR_BYTES != 0 {
-            return false;
-        }
-        let flash_offset = (IMAGE_BASE - XIP_BASE + offset) as u32;
-        self.range_erase(flash_offset, len as u32) && reads_erased(offset, len)
+        self.erase_window_range(offset, len)
     }
 
     fn program(&mut self, image: &[u8]) -> bool {

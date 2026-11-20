@@ -9,13 +9,14 @@ use lamella_py_bytecode::{BinOp, CmpOp, Functions};
 
 use crate::bigint::BigInt;
 use crate::interp::{
-    binary, bigint_pow, call_value, coerce_index, getattr_hooked, iterator_for, py_next_value,
+    binary, bigint_pow, call_value, coerce_index, delete_attr, getattr_hooked, iterator_for, py_next_value,
     set_attr,
 };
 use crate::object::{
     DictViewKind, InlineCache, ObjectModel, LAZY_CALLABLE, LAZY_ENUMERATE, LAZY_FILTER, LAZY_MAP,
     LAZY_ZIP,
 };
+use crate::representation::{ReprChildren, ReprForm, mapping_body, repr_children, repr_cycle, repr_join};
 use crate::trap::Trap;
 use crate::value::Value;
 
@@ -220,6 +221,18 @@ pub enum Builtin {
     /// `async def` returns. A type object only. DISTINCT from both of the above because a program can
     /// tell all three apart: this one is not an iterator AND not awaitable; it is `async for`-able.
     AsyncGeneratorType = 81,
+    /// The type object for native member descriptors, used by `SystemExit.code`.
+    /// Python 3.14 Library Reference, types, "Standard Interpreter Types", MemberDescriptorType.
+    MemberDescriptorType = 82,
+    /// The type object for native getset descriptors, used by `BaseException.args`.
+    /// Python 3.14 Library Reference, types, "Standard Interpreter Types", GetSetDescriptorType.
+    GetsetDescriptorType = 83,
+    /// `exit([code])`, which the site module adds (Python 3.14 Library Reference, "Built-in Constants",
+    /// "Constants added by the site module"): calling it raises `SystemExit(code)`, and printing it
+    /// says how to leave an interactive session.
+    Exit = 84,
+    /// `quit([code])`: [`Builtin::Exit`] under the site module's other name.
+    Quit = 85,
 }
 
 impl Builtin {
@@ -310,6 +323,10 @@ impl Builtin {
             79 => Some(Builtin::IntIsInteger),
             80 => Some(Builtin::CoroutineType),
             81 => Some(Builtin::AsyncGeneratorType),
+            82 => Some(Builtin::MemberDescriptorType),
+            83 => Some(Builtin::GetsetDescriptorType),
+            84 => Some(Builtin::Exit),
+            85 => Some(Builtin::Quit),
             _ => None,
         }
     }
@@ -404,6 +421,10 @@ impl Builtin {
             Builtin::CoroutineType => "coroutine",
             Builtin::AsyncGeneratorType => "async_generator",
             Builtin::ModuleType => "module",
+            Builtin::MemberDescriptorType => "member_descriptor",
+            Builtin::GetsetDescriptorType => "getset_descriptor",
+            Builtin::Exit => "exit",
+            Builtin::Quit => "quit",
             Builtin::Open => "open",
             Builtin::Dir => "dir",
             Builtin::IntIsInteger => "is_integer",
@@ -442,6 +463,17 @@ impl Builtin {
                 | Builtin::DictItemsType
                 | Builtin::NotImplementedType
                 | Builtin::Object
+                // These ids represent the type objects returned for native callable and descriptor
+                // values. Python 3.14 Library Reference, "Built-in Functions", type.
+                | Builtin::FunctionType
+                | Builtin::BuiltinFunctionType
+                | Builtin::MethodType
+                | Builtin::GeneratorType
+                | Builtin::ModuleType
+                | Builtin::CoroutineType
+                | Builtin::AsyncGeneratorType
+                | Builtin::MemberDescriptorType
+                | Builtin::GetsetDescriptorType
         )
     }
 }
@@ -562,6 +594,12 @@ pub(crate) fn type_of(value: Value, model: &ObjectModel) -> Option<Value> {
         Builtin::AsyncGeneratorType
     } else if model.is_module_object(value) {
         Builtin::ModuleType
+    } else if model.slot_descriptor_slot(value).is_some() {
+        if model.is_args_descriptor(value) {
+            Builtin::GetsetDescriptorType
+        } else {
+            Builtin::MemberDescriptorType
+        }
     } else {
         return None;
     };
@@ -633,6 +671,8 @@ pub fn builtin_id(name: &str) -> Option<u32> {
         "object" => Builtin::Object,
         "open" => Builtin::Open,
         "dir" => Builtin::Dir,
+        "exit" => Builtin::Exit,
+        "quit" => Builtin::Quit,
         "globals" => Builtin::Globals,
         "locals" => Builtin::Locals,
         "hash" => Builtin::Hash,
@@ -640,6 +680,38 @@ pub fn builtin_id(name: &str) -> Option<u32> {
         _ => return None,
     };
     Some(builtin.id())
+}
+
+/// Calls the site module's `exit` or `quit` as CPython 3.14.6 calls them: their one parameter is `code`,
+/// given by position or by name and `None` when not given, and the call raises `SystemExit(code)`, so
+/// `exit()` has the args `(None,)`. A call they cannot take is refused in CPython's words, which name
+/// the callable `Quitter.__call__()`: an unknown keyword first, then `code` given twice, then too many
+/// arguments (measured in that order).
+fn quitter_call(posargs: &[Value], kwargs: &[(&str, Value)], model: &mut ObjectModel) -> Result<Value, Trap> {
+    let mut code = posargs.first().copied();
+    for &(name, value) in kwargs {
+        if name != "code" {
+            let message = alloc::format!("Quitter.__call__() got an unexpected keyword argument '{name}'");
+            return Err(model.raise_named_exception("TypeError", &message));
+        }
+        if !posargs.is_empty() {
+            let message = "Quitter.__call__() got multiple values for argument 'code'";
+            return Err(model.raise_named_exception("TypeError", message));
+        }
+        code = Some(value);
+    }
+    if posargs.len() > 1 {
+        let message = alloc::format!(
+            "Quitter.__call__() takes from 1 to 2 positional arguments but {} were given",
+            posargs.len() + 1
+        );
+        return Err(model.raise_named_exception("TypeError", &message));
+    }
+    let class = model.exception_class("SystemExit").ok_or(Trap::OutOfMemory)?;
+    let exit = model.new_object(class)?;
+    model.init_default_args(exit, &[code.unwrap_or(Value::NONE)])?;
+    model.set_pending_exception(exit);
+    Err(Trap::Raised)
 }
 
 /// Whether `cls` is one of CPython's `Py_TPFLAGS_MATCH_SELF` builtin types -- those for which a single
@@ -713,6 +785,11 @@ pub fn call_builtin(
         }
         Builtin::Str => match args {
             [] => model.new_str(""),
+            // A string is its own `str()`: `str(object)` returns `type(object).__str__(object)`, which for
+            // a string is the string itself (Python 3.14.6 Library Reference, "Built-in Types", "Text
+            // Sequence Type -- str"). The same object comes back, not a copy, so a string holding a lone
+            // surrogate passes through whole instead of being rendered as text it cannot be.
+            [arg] if model.is_str(*arg) => Ok(*arg),
             [arg] => {
                 let rendered = display_arg(*arg, functions, model, depth)?;
                 model.new_str(&rendered)
@@ -787,7 +864,11 @@ pub fn call_builtin(
                 return Err(model
                     .with_message(Trap::TypeError, "sum() can't sum bytearray [use b''.join(seq) instead]"));
             }
+            let mut scope = model.root_scope();
+            let model = &mut *scope;
+            let start = model.root_value(start);
             let elements = collect_iterable(model, &[iterable], functions, depth)?;
+            let start = model.rooted_value(start);
             #[cfg(feature = "float")]
             {
                 let all_numeric = model.as_f64(start).is_some()
@@ -802,8 +883,10 @@ pub fn call_builtin(
                 }
             }
             let mut acc = start;
-            for element in elements {
-                acc = crate::interp::dispatch_binary(BinOp::Add, acc, element, functions, model, depth)?;
+            let items = scope.root_buffer(elements);
+            for index in 0..scope.value_buffers[items].len() {
+                let element = scope.value_buffers[items][index];
+                acc = crate::interp::dispatch_binary(BinOp::Add, acc, element, functions, &mut scope, depth)?;
             }
             Ok(acc)
         }
@@ -882,7 +965,7 @@ pub fn call_builtin(
                     } else {
                         let message = alloc::format!(
                             "invalid literal for int() with base 10: {}",
-                            model.repr(*x)
+                            model.try_repr(*x)?
                         );
                         Err(model.with_message(Trap::ValueError, &message))
                     }
@@ -939,7 +1022,7 @@ pub fn call_builtin(
                         None => {
                             let message = alloc::format!(
                                 "could not convert string to float: {}",
-                                model.repr(*x)
+                                model.try_repr(*x)?
                             );
                             Err(model.with_message(Trap::ValueError, &message))
                         }
@@ -1040,33 +1123,23 @@ pub fn call_builtin(
             let sources = source_iters(model, args, functions, depth)?;
             model.new_lazy_iter(LAZY_ZIP, Value::NONE, sources)
         }
-        Builtin::Any => {
+        builtin @ (Builtin::Any | Builtin::All) => {
+            let any = matches!(builtin, Builtin::Any);
             let [iterable] = args else {
+                let name = if any { "any" } else { "all" };
                 let given = args.len();
-                let message = alloc::format!("any() takes exactly one argument ({given} given)");
+                let message = alloc::format!("{name}() takes exactly one argument ({given} given)");
                 return Err(model.raise_named_exception("TypeError", &message));
             };
             let iterator = iterator_for(*iterable, functions, model, depth)?;
-            while let Some(element) = crate::interp::py_next_value(iterator, functions, model, depth)? {
-                if crate::interp::py_truthy_dyn(element, functions, model, depth)? {
-                    return Ok(Value::TRUE);
+            let mut model = model.root_scope();
+            let iterator = model.root_value(iterator);
+            while let Some(element) = py_next_value(model.rooted_value(iterator), functions, &mut model, depth)? {
+                if crate::interp::py_truthy_dyn(element, functions, &mut model, depth)? == any {
+                    return Ok(Value::from_bool(any));
                 }
             }
-            Ok(Value::FALSE)
-        }
-        Builtin::All => {
-            let [iterable] = args else {
-                let given = args.len();
-                let message = alloc::format!("all() takes exactly one argument ({given} given)");
-                return Err(model.raise_named_exception("TypeError", &message));
-            };
-            let iterator = iterator_for(*iterable, functions, model, depth)?;
-            while let Some(element) = crate::interp::py_next_value(iterator, functions, model, depth)? {
-                if !crate::interp::py_truthy_dyn(element, functions, model, depth)? {
-                    return Ok(Value::FALSE);
-                }
-            }
-            Ok(Value::TRUE)
+            Ok(Value::from_bool(!any))
         }
         Builtin::Dict => match args {
             [] => model.new_dict(Vec::new()),
@@ -1236,12 +1309,15 @@ pub fn call_builtin(
                 let message = alloc::format!("'{type_name}' object is not an iterator");
                 return Err(model.raise_named_exception("TypeError", &message));
             }
-            match py_next_value(iterator, functions, model, depth)? {
+            let mut model = model.root_scope();
+            let saved_iterator = model.root_value(iterator);
+            let default = default.map(|value| model.root_value(value));
+            match py_next_value(iterator, functions, &mut model, depth)? {
                 Some(value) => Ok(value),
                 None => match default {
-                    Some(d) => Ok(d),
+                    Some(root) => Ok(model.rooted_value(root)),
                     None => {
-                        let value = if model.is_generator(iterator) {
+                        let value = if model.is_generator(model.rooted_value(saved_iterator)) {
                             model.take_generator_return().unwrap_or(Value::NONE)
                         } else {
                             Value::NONE
@@ -1380,7 +1456,11 @@ pub fn call_builtin(
                 let result = call_value(method, &[spec_value], functions, model, depth + 1)?;
                 return Ok(result);
             }
-            let rendered = model.format_value_spec(value, &spec)?;
+            let rendered = if spec.is_empty() {
+                display_arg(value, functions, model, depth)?
+            } else {
+                model.format_value_spec(value, &spec)?
+            };
             model.new_str(&rendered)
         }
         Builtin::IntFromBytes => {
@@ -1456,7 +1536,9 @@ pub fn call_builtin(
         | Builtin::GeneratorType
         | Builtin::CoroutineType
         | Builtin::AsyncGeneratorType
-        | Builtin::ModuleType) => {
+        | Builtin::ModuleType
+        | Builtin::MemberDescriptorType
+        | Builtin::GetsetDescriptorType) => {
             let message = alloc::format!("cannot create '{}' instances", only_a_type.python_name());
             Err(model.raise_named_exception("TypeError", &message))
         }
@@ -1534,6 +1616,7 @@ pub fn call_builtin(
             };
             model.open_file(&path, parsed)
         }
+        Builtin::Exit | Builtin::Quit => quitter_call(args, &[], model),
         Builtin::Vars => {
             let [obj] = args else {
                 let message = "vars() with no arguments is not supported";
@@ -1598,7 +1681,7 @@ pub fn call_builtin(
                 return Err(Trap::TypeError);
             };
             let attr = String::from(model.str_text(*name)?);
-            model.py_delattr(*obj, &attr)?;
+            delete_attr(*obj, &attr, functions, model, depth)?;
             Ok(Value::NONE)
         }
         Builtin::Hash => {
@@ -1647,14 +1730,30 @@ pub fn call_builtin(
     }
 }
 
+// Reserve a bounded part of the native stack for a tuple of types.
+const MAX_CLASSINFO_DEPTH: usize = 64;
+
 /// `isinstance(value, classinfo)`: whether `value` is of type `classinfo` -- a built-in type
 /// constructor (`int`/`str`/`list`/`tuple`/`dict`/`set`/`frozenset`/`bool`) used as a type, a user
 /// class (checked against its base chain), or a tuple of those (any match). A non-type `classinfo`
 /// is a `TypeError`.
 fn isinstance_of(value: Value, classinfo: Value, model: &ObjectModel) -> Result<bool, Trap> {
+    isinstance_at_depth(value, classinfo, model, 0)
+}
+
+#[inline(never)]
+fn isinstance_at_depth(
+    value: Value,
+    classinfo: Value,
+    model: &ObjectModel,
+    depth: usize,
+) -> Result<bool, Trap> {
+    if depth >= MAX_CLASSINFO_DEPTH {
+        return Err(Trap::RecursionError);
+    }
     if model.is_tuple(classinfo) {
         for class in model.seq_elements(classinfo).unwrap_or_default() {
-            if isinstance_of(value, class, model)? {
+            if isinstance_at_depth(value, class, model, depth + 1)? {
                 return Ok(true);
             }
         }
@@ -1708,6 +1807,10 @@ fn isinstance_of(value: Value, classinfo: Value, model: &ObjectModel) -> Result<
             Some(Builtin::CoroutineType) => model.is_coroutine(value),
             Some(Builtin::AsyncGeneratorType) => model.is_async_generator(value),
             Some(Builtin::ModuleType) => model.is_module_object(value),
+            Some(Builtin::MemberDescriptorType) => {
+                model.slot_descriptor_slot(value).is_some() && !model.is_args_descriptor(value)
+            }
+            Some(Builtin::GetsetDescriptorType) => model.is_args_descriptor(value),
             _ => return Err(Trap::TypeError),
         };
         return Ok(matches);
@@ -1726,6 +1829,19 @@ fn isinstance_of(value: Value, classinfo: Value, model: &ObjectModel) -> Result<
 /// otherwise identity); a user class walks its base chain. (There is no `object` root type, so a
 /// user class is not reported as a subclass of a built-in type -- a small documented divergence.)
 fn issubclass_of(cls: Value, classinfo: Value, model: &ObjectModel) -> Result<bool, Trap> {
+    issubclass_at_depth(cls, classinfo, model, 0)
+}
+
+#[inline(never)]
+fn issubclass_at_depth(
+    cls: Value,
+    classinfo: Value,
+    model: &ObjectModel,
+    depth: usize,
+) -> Result<bool, Trap> {
+    if depth >= MAX_CLASSINFO_DEPTH {
+        return Err(Trap::RecursionError);
+    }
     let is_type = |v: Value| {
         model.is_class(v)
             || model.is_ntclass(v)
@@ -1737,7 +1853,7 @@ fn issubclass_of(cls: Value, classinfo: Value, model: &ObjectModel) -> Result<bo
     }
     if model.is_tuple(classinfo) {
         for target in model.seq_elements(classinfo).unwrap_or_default() {
-            if issubclass_of(cls, target, model)? {
+            if issubclass_at_depth(cls, target, model, depth + 1)? {
                 return Ok(true);
             }
         }
@@ -1815,6 +1931,7 @@ pub fn call_builtin_kw(
         Builtin::Print => print_kw(posargs, kwargs, functions, model, depth),
         Builtin::Enumerate => enumerate_kw(posargs, kwargs, functions, model, depth),
         Builtin::Zip => zip_kw(posargs, kwargs, functions, model, depth),
+        Builtin::Exit | Builtin::Quit => quitter_call(posargs, kwargs, model),
         Builtin::IntFromBytes => {
             let mut byteorder = String::from("big");
             let bytes = match posargs {
@@ -1986,18 +2103,11 @@ fn sorted_kw(
             _ => return Err(Trap::TypeError),
         }
     }
-    let mut elements = collect_iterable(model, &[*iterable], functions, depth)?;
-    let keys = if key.is_none() {
-        None
-    } else {
-        let mut computed = Vec::with_capacity(elements.len());
-        for &element in &elements {
-            computed.push(call_value(key, &[element], functions, model, depth)?);
-        }
-        Some(computed)
-    };
-    sort_python(&mut elements, keys, reverse, functions, model, depth)?;
-    model.new_list(elements)
+    let mut scope = model.root_scope();
+    let key = scope.root_value(key);
+    let mut elements = collect_iterable(&mut scope, &[*iterable], functions, depth)?;
+    sort_with_key(&mut elements, scope.rooted_value(key), reverse, functions, &mut scope, depth)?;
+    scope.new_list(elements)
 }
 
 /// `dict(**kwargs)` / `dict(mapping_or_pairs, **kwargs)`: a dict whose keyword arguments become
@@ -2010,27 +2120,56 @@ fn dict_kw(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
+    let mut scope = model.root_scope();
+    let keyword_values = match posargs {
+        [arg] if !scope.is_dict(*arg) && !scope.is_driving() => {
+            Some(scope.root_buffer(kwargs.iter().map(|&(_, value)| value).collect()))
+        }
+        _ => None,
+    };
     let mut entries: Vec<(Value, Value)> = match posargs {
         [] => Vec::new(),
-        [arg] if model.is_dict(*arg) => model.dict_entries(*arg).unwrap_or_default(),
+        [arg] if scope.is_dict(*arg) => scope.dict_entries(*arg).unwrap_or_default(),
         [arg] => {
-            let pairs = collect_iterable(model, &[*arg], functions, depth)?;
+            let pairs = collect_iterable(&mut scope, &[*arg], functions, depth)?;
             let mut kv = Vec::with_capacity(pairs.len());
             for pair in pairs {
-                let parts = model.unpack_sequence(pair, 2)?;
+                let parts = scope.unpack_sequence(pair, 2)?;
                 kv.push((parts[0], parts[1]));
             }
             kv
         }
         _ => return Err(Trap::TypeError),
     };
-    for &(name, value) in kwargs {
-        match entries.iter().position(|(k, _)| model.str_bytes(*k) == Some(name.as_bytes())) {
+    let positional = entries.len();
+    let defer_names = keyword_values.is_some();
+    for (index, &(name, value)) in kwargs.iter().enumerate() {
+        let value = keyword_values.map_or(value, |buffer| scope.value_buffers[buffer][index]);
+        match entries.iter().position(|(k, _)| scope.str_bytes(*k) == Some(name.as_bytes())) {
             Some(i) => entries[i].1 = value,
             None => {
-                let key = model.new_str(name)?;
+                let key = if defer_names { Value::NONE } else { scope.new_str(name)? };
                 entries.push((key, value));
             }
+        }
+    }
+    drop(scope);
+    if defer_names && entries.len() > positional {
+        // The entries now own every value. Allocate new string keys after releasing the
+        // callback roots, including when the embedder supplies many keyword arguments.
+        let (original, added) = entries.split_at_mut(positional);
+        let mut next = 0;
+        for &(name, _) in kwargs {
+            let matches = |key| model.str_bytes(key) == Some(name.as_bytes());
+            if original.iter().any(|&(key, _)| matches(key)) {
+                continue;
+            }
+            let previous = added[..next].iter().find(|&&(key, _)| matches(key));
+            added[next].0 = match previous {
+                Some(&(key, _)) => key,
+                None => model.new_str(name)?,
+            };
+            next += 1;
         }
     }
     model.new_dict(entries)
@@ -2079,155 +2218,172 @@ fn call_str_dunder(
     }
 }
 
-/// The display form of `value` for `print`/`str`: an instance's `__str__`, else its `__repr__`
-/// (Python's `str` falls back to `repr`), else the default rendering (int/str/container/...).
-fn display_arg(
+/// The display form used by `print` and `str`. If method lookup leaves an exception for
+/// native formatting, its stored arguments determine its text. For Python 3.14, see
+/// Python Library Reference, Built-in Exceptions (BaseException.args).
+#[inline(never)]
+pub(crate) fn display_arg(
     value: Value,
     functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<String, Trap> {
+    let _native_call = model.enter_native_call()?;
+    let mut model = model.root_scope();
+    let _ = model.root_value(value);
     if let Some(method) = model.find_dunder(value, "__str__") {
-        return call_str_dunder(method, functions, model, depth);
+        return call_str_dunder(method, functions, &mut model, depth);
+    }
+    if let Some(args) = model.exception_args(value).map(|args| args.to_vec()) {
+        if model.is_exception_group(value) {
+            return crate::representation::native_render(value, true, &model);
+        }
+        return match args.as_slice() {
+            [] => Ok(String::new()),
+            [one] => {
+                let key_error = model
+                    .exc_class_lookup("KeyError")
+                    .is_some_and(|class| model.is_instance_of(value, class));
+                if key_error {
+                    repr_arg(*one, functions, &mut model, depth + 1)
+                } else {
+                    display_arg(*one, functions, &mut model, depth + 1)
+                }
+            }
+            _ => {
+                let args: Vec<_> = args.into_iter().map(|arg| model.root_value(arg)).collect();
+                let mut parts = Vec::with_capacity(args.len());
+                for arg in args {
+                    parts.push(repr_arg(
+                        model.rooted_value(arg),
+                        functions,
+                        &mut model,
+                        depth + 1,
+                    )?);
+                }
+                Ok(alloc::format!("({})", parts.join(", ")))
+            }
+        };
     }
     if let Some(method) = model.find_dunder(value, "__repr__") {
-        return call_str_dunder(method, functions, model, depth);
+        return call_str_dunder(method, functions, &mut model, depth);
     }
     if model.seq_value(value).is_some()
         || model.set_value(value).is_some()
         || model.dict_value(value).is_some()
         || model.is_dict_view(value)
     {
-        return repr_arg(value, functions, model, depth);
+        return repr_arg(value, functions, &mut model, depth);
     }
-    model.display(value)
+    crate::representation::native_render(value, true, &model)
 }
 
-/// The repr form of `value` for `repr()`: an instance's `__repr__`, else the default repr. Recurses
-/// into containers so a nested instance uses its own `__repr__` (`print([obj])`), which `model.repr`
-/// cannot do without the interpreter. A self-referential container is a `RecursionError`.
-fn repr_arg(
+/// Renders the children selected by the interpreter's representation plan. Each level
+/// roots its pending children and metadata while a user method runs. Active containers
+/// retain their cycle markers until that level returns. For the `__repr__` protocol in
+/// Python 3.14, see Python Language Reference, 3.3.1.
+#[inline(never)]
+pub(crate) fn repr_arg(
     value: Value,
     functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<String, Trap> {
-    if depth > 256 {
-        return Err(Trap::RecursionError);
+    let _native_call = model.enter_native_call()?;
+    if let Some(arg) = single_exception_arg(value, model) {
+        // A single exception argument needs no child vector. Keep its metadata rooted
+        // until the child returns, since a callback can rename or relocate its class.
+        let mut model = model.root_scope();
+        let metadata = model.root_value(value);
+        let inner = repr_arg(arg, functions, &mut model, depth + 1)?;
+        return Ok(join_single_exception(
+            model.rooted_value(metadata),
+            inner,
+            &model,
+        ));
     }
+    repr_composite(value, functions, model, depth)
+}
+
+#[inline(never)]
+fn single_exception_arg(value: Value, model: &mut ObjectModel) -> Option<Value> {
+    let args = model.exception_args(value)?;
+    let [arg] = args else {
+        return None;
+    };
+    let arg = *arg;
+    model
+        .find_dunder(value, "__repr__")
+        .is_none()
+        .then_some(arg)
+}
+
+#[inline(never)]
+fn join_single_exception(value: Value, inner: String, model: &ObjectModel) -> String {
+    let name = model.exception_type_name(value).unwrap_or("BaseException");
+    alloc::format!("{name}({inner})")
+}
+
+#[inline(never)]
+fn repr_composite(
+    value: Value,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<String, Trap> {
+    let mut model = model.root_scope();
+    let root = model.root_value(value);
+    let cycle = repr_cycle(value, &model);
+    let repeated = model.is_rendering(value);
     if let Some(method) = model.find_dunder(value, "__repr__") {
-        return call_str_dunder(method, functions, model, depth);
+        return call_str_dunder(method, functions, &mut model, depth);
     }
-    if let Some(class) = model.ntinstance_class(value) {
-        let fields = model.ntclass_fields(class);
-        let elems = model.seq_value(value).cloned().unwrap_or_default();
-        let mut parts = Vec::with_capacity(fields.len());
-        for (field, element) in fields.iter().zip(&elems) {
-            let rendered = repr_arg(*element, functions, model, depth + 1)?;
-            parts.push(alloc::format!("{field}={rendered}"));
-        }
-        return Ok(alloc::format!("{}({})", model.ntclass_name(class), parts.join(", ")));
+    // The object model renders slice and bound-method fields directly.
+    if model.is_slice(value) || model.is_py_bound(value) {
+        return crate::representation::native_render(value, false, &model);
     }
-    if let Some(elems) = model.seq_value(value).cloned() {
-        let is_tuple = model.is_tuple(value);
-        let mut parts = Vec::with_capacity(elems.len());
-        for element in &elems {
-            parts.push(repr_arg(*element, functions, model, depth + 1)?);
+    let plan = if repeated && cycle.is_some() {
+        cycle
+    } else {
+        if cycle.is_some() {
+            model.enter_rendering(root);
         }
-        let inner = parts.join(", ");
-        return Ok(if is_tuple {
-            if elems.len() == 1 {
-                alloc::format!("({inner},)")
-            } else {
-                alloc::format!("({inner})")
-            }
-        } else {
-            alloc::format!("[{inner}]")
-        });
+        repr_children(value, &model)
+    };
+    let Some(ReprChildren {
+        form,
+        metadata,
+        children,
+    }) = plan
+    else {
+        return Ok(model.repr_leaf(value));
+    };
+    if let ReprForm::Literal(text) = form {
+        return Ok(text);
     }
-    if let Some(elements) = model.set_value(value).cloned() {
-        let frozen = model.is_frozenset(value);
-        if elements.is_empty() {
-            return Ok(String::from(if frozen { "frozenset()" } else { "set()" }));
-        }
-        let mut parts = Vec::with_capacity(elements.len());
-        for element in &elements {
-            parts.push(repr_arg(*element, functions, model, depth + 1)?);
-        }
-        let inner = parts.join(", ");
-        return Ok(if frozen {
-            alloc::format!("frozenset({{{inner}}})")
-        } else {
-            alloc::format!("{{{inner}}}")
-        });
+    let metadata = model.root_value(metadata);
+    // The children are traced where they stand while each one renders, and released with the
+    // representation.
+    let count = children.len();
+    let children = model.root_buffer(children);
+    let mut parts = Vec::with_capacity(count);
+    for index in 0..count {
+        let child = model.value_buffers[children][index];
+        parts.push(repr_arg(child, functions, &mut model, depth + 1)?);
     }
-    if let Some(entries) = model.dict_value(value).cloned() {
-        if model.is_counter(value) {
-            if entries.is_empty() {
-                return Ok(String::from("Counter()"));
-            }
-            let entries = model.counter_display_entries(entries);
-            let mut parts = Vec::with_capacity(entries.len());
-            for (key, val) in &entries {
-                let key = repr_arg(*key, functions, model, depth + 1)?;
-                let val = repr_arg(*val, functions, model, depth + 1)?;
-                parts.push(alloc::format!("{key}: {val}"));
-            }
-            return Ok(alloc::format!("Counter({{{}}})", parts.join(", ")));
+    if matches!(form, ReprForm::Mapping) {
+        if let Some(factory) = model.defaultdict_factory(model.rooted_value(metadata)) {
+            let inner = mapping_body(&parts);
+            let factory = repr_arg(factory, functions, &mut model, depth + 1)?;
+            return Ok(repr_join(
+                ReprForm::DefaultDict(inner),
+                model.rooted_value(metadata),
+                alloc::vec![factory],
+                &model,
+            ));
         }
-        let mut parts = Vec::with_capacity(entries.len());
-        for (key, val) in &entries {
-            let key = repr_arg(*key, functions, model, depth + 1)?;
-            let val = repr_arg(*val, functions, model, depth + 1)?;
-            parts.push(alloc::format!("{key}: {val}"));
-        }
-        if let Some(factory) = model.defaultdict_factory(value) {
-            let factory = repr_arg(factory, functions, model, depth + 1)?;
-            return Ok(alloc::format!("defaultdict({factory}, {{{}}})", parts.join(", ")));
-        }
-        if model.is_ordereddict(value) {
-            return Ok(if parts.is_empty() {
-                String::from("OrderedDict()")
-            } else {
-                alloc::format!("OrderedDict({{{}}})", parts.join(", "))
-            });
-        }
-        return Ok(alloc::format!("{{{}}}", parts.join(", ")));
     }
-    if let Some(elems) = model.deque_elems(value).cloned() {
-        let mut parts = Vec::with_capacity(elems.len());
-        for element in &elems {
-            parts.push(repr_arg(*element, functions, model, depth + 1)?);
-        }
-        let inner = parts.join(", ");
-        return Ok(match model.deque_maxlen(value).unwrap_or(None) {
-            Some(m) => alloc::format!("deque([{inner}], maxlen={m})"),
-            None => alloc::format!("deque([{inner}])"),
-        });
-    }
-    if let Some(kind) = model.dict_view_kind(value) {
-        let entries = model.dict_view_dict(value);
-        let entries = model.dict_value(entries).cloned().unwrap_or_default();
-        let mut parts = Vec::with_capacity(entries.len());
-        for (key, val) in &entries {
-            parts.push(match kind {
-                DictViewKind::Keys => repr_arg(*key, functions, model, depth + 1)?,
-                DictViewKind::Values => repr_arg(*val, functions, model, depth + 1)?,
-                DictViewKind::Items => alloc::format!(
-                    "({}, {})",
-                    repr_arg(*key, functions, model, depth + 1)?,
-                    repr_arg(*val, functions, model, depth + 1)?
-                ),
-            });
-        }
-        let name = match kind {
-            DictViewKind::Keys => "dict_keys",
-            DictViewKind::Values => "dict_values",
-            DictViewKind::Items => "dict_items",
-        };
-        return Ok(alloc::format!("{name}([{}])", parts.join(", ")));
-    }
-    Ok(model.repr(value))
+    Ok(repr_join(form, model.rooted_value(metadata), parts, &model))
 }
 
 /// Escapes every non-ASCII code point of `s` as `\xNN` / `\uNNNN` / `\UNNNNNNNN` (Python's `ascii()`).
@@ -2267,13 +2423,13 @@ fn python_less(
 /// order), and stops at the first comparison that raises. A `reverse` order is stable too: the
 /// indices are reversed before the sort and again after it.
 fn stable_order(
-    keys: &[Value],
+    keys: usize,
     reverse: bool,
     functions: &Functions,
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Vec<usize>, Trap> {
-    let count = keys.len();
+    let count = model.value_buffers[keys].len();
     let mut order: Vec<usize> = (0..count).collect();
     if reverse {
         order.reverse();
@@ -2287,9 +2443,10 @@ fn stable_order(
             let end = (start + 2 * width).min(count);
             let (mut left, mut right) = (start, middle);
             for slot in &mut merged[start..end] {
+                let values = &model.value_buffers[keys];
                 let take_right = right < end
                     && (left == middle
-                        || python_less(keys[order[right]], keys[order[left]], functions, model, depth)?);
+                        || python_less(values[order[right]], values[order[left]], functions, model, depth)?);
                 if take_right {
                     *slot = order[right];
                     right += 1;
@@ -2328,17 +2485,51 @@ pub(crate) fn sort_python(
         Err(Trap::TypeError) => {}
         outcome => return outcome,
     }
-    let keys = keys.unwrap_or_else(|| original.clone());
-    match stable_order(&keys, reverse, functions, model, depth) {
+    let mut scope = model.root_scope();
+    let original = scope.root_buffer(original);
+    let keys = keys.map_or(original, |values| scope.root_buffer(values));
+    match stable_order(keys, reverse, functions, &mut scope, depth) {
         Ok(order) => {
-            *elements = order.iter().map(|&i| original[i]).collect();
+            for (slot, index) in elements.iter_mut().zip(order) {
+                *slot = scope.value_buffers[original][index];
+            }
             Ok(())
         }
         Err(trap) => {
-            *elements = original;
+            *elements = scope.take_buffer(original);
             Err(trap)
         }
     }
+}
+
+/// Computes the keys once, in input order. A callback may move both the input and earlier keys.
+fn sort_with_key(
+    elements: &mut Vec<Value>,
+    key: Value,
+    reverse: bool,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<(), Trap> {
+    let keys = if key.is_none() {
+        None
+    } else {
+        let mut scope = model.root_scope();
+        let key = scope.root_value(key);
+        let count = elements.len();
+        let input = scope.root_buffer(core::mem::take(elements));
+        let computed = scope.root_buffer(Vec::with_capacity(count));
+        let outcome = (0..count).try_for_each(|index| {
+            let element = scope.value_buffers[input][index];
+            let value = call_value(scope.rooted_value(key), &[element], functions, &mut scope, depth)?;
+            scope.value_buffers[computed].push(value);
+            Ok(())
+        });
+        *elements = scope.take_buffer(input);
+        outcome?;
+        Some(scope.take_buffer(computed))
+    };
+    sort_python(elements, keys, reverse, functions, model, depth)
 }
 
 /// `list.sort(key=key, reverse=reverse)`, in place. As in CPython the elements are out of the list
@@ -2354,30 +2545,16 @@ pub(crate) fn list_sort_python(
     depth: usize,
 ) -> Result<Value, Trap> {
     let mut elements = core::mem::take(model.list_items_mut(list).ok_or(Trap::TypeError)?);
-    let mut outcome = Ok(());
-    let mut keys = None;
-    if !key.is_none() {
-        let mut computed = Vec::with_capacity(elements.len());
-        for &element in &elements {
-            match call_value(key, &[element], functions, model, depth) {
-                Ok(value) => computed.push(value),
-                Err(trap) => {
-                    outcome = Err(trap);
-                    break;
-                }
-            }
-        }
-        keys = Some(computed);
-    }
-    if outcome.is_ok() {
-        outcome = sort_python(&mut elements, keys, reverse, functions, model, depth);
-    }
-    let items = model.list_items_mut(list).ok_or(Trap::TypeError)?;
+    let mut scope = model.root_scope();
+    let list = scope.root_value(list);
+    let outcome = sort_with_key(&mut elements, key, reverse, functions, &mut scope, depth);
+    let list = scope.rooted_value(list);
+    let items = scope.list_items_mut(list).ok_or(Trap::TypeError)?;
     let modified = !items.is_empty();
     *items = elements;
     outcome?;
     if modified {
-        return Err(model.raise_named_exception("ValueError", "list modified during sort"));
+        return Err(scope.raise_named_exception("ValueError", "list modified during sort"));
     }
     Ok(Value::NONE)
 }
@@ -2456,6 +2633,20 @@ fn source_iters(
     model.new_tuple(iters)
 }
 
+/// Keeps the receiver of an iterable operation live while Python code supplies its items.
+pub(crate) fn collect_for_receiver(
+    receiver: Value,
+    iterable: Value,
+    functions: &Functions,
+    model: &mut ObjectModel,
+    depth: usize,
+) -> Result<(Value, Vec<Value>), Trap> {
+    let mut scope = model.root_scope();
+    let receiver = scope.root_value(receiver);
+    let items = collect_iterable(&mut scope, &[iterable], functions, depth)?;
+    Ok((scope.rooted_value(receiver), items))
+}
+
 /// Drains `list(...)`/`tuple(...)`'s optional single iterable argument into a vector (empty for
 /// the no-argument form), via the iterator protocol so any iterable works. Also the RHS collector
 /// for slice assignment.
@@ -2471,11 +2662,13 @@ pub(crate) fn collect_iterable(
         _ => return Err(Trap::TypeError),
     };
     let iterator = iterator_for(iterable, functions, model, depth)?;
-    let mut elems = Vec::new();
-    while let Some(item) = py_next_value(iterator, functions, model, depth)? {
-        elems.push(item);
+    let mut scope = model.root_scope();
+    let iterator = scope.root_value(iterator);
+    let items = scope.root_buffer(Vec::new());
+    while let Some(item) = py_next_value(scope.rooted_value(iterator), functions, &mut scope, depth)? {
+        scope.value_buffers[items].push(item);
     }
-    Ok(elems)
+    Ok(scope.take_buffer(items))
 }
 
 /// Parses a `str` the way Python's `float()` does: surrounding whitespace stripped, an optional
@@ -2766,12 +2959,16 @@ fn min_max_kw(
             _ => return Err(Trap::TypeError),
         }
     }
+    let mut scope = model.root_scope();
+    let key = scope.root_value(key);
+    let default = default.map(|value| scope.root_value(value));
     let elements = match posargs {
         [] => return Err(Trap::TypeError),
-        [single] => collect_iterable(model, &[*single], functions, depth)?,
+        [single] => collect_iterable(&mut scope, &[*single], functions, depth)?,
         many => many.to_vec(),
     };
-    min_max_impl(elements, keep, key, default, functions, model, depth)
+    let default = default.map(|root| scope.rooted_value(root));
+    min_max_impl(elements, keep, scope.rooted_value(key), default, functions, &mut scope, depth)
 }
 
 /// The shared min/max fold: orders `elements` by their `key`-mapped ordering key (the element
@@ -2786,43 +2983,61 @@ fn min_max_impl(
     model: &mut ObjectModel,
     depth: usize,
 ) -> Result<Value, Trap> {
-    let mapped = |element: Value, model: &mut ObjectModel| -> Result<Value, Trap> {
-        if key.is_none() {
-            Ok(element)
-        } else {
-            call_value(key, &[element], functions, model, depth)
-        }
+    if elements.is_empty() {
+        return default.ok_or_else(|| {
+            let name = if keep == Ordering::Less { "min" } else { "max" };
+            let message = alloc::format!("{name}() iterable argument is empty");
+            model.raise_named_exception("ValueError", &message)
+        });
+    }
+    let mut scope = model.root_scope();
+    let key = scope.root_value(key);
+    let items = scope.root_buffer(elements);
+    let mapped = |element, model: &mut ObjectModel| {
+        let key = model.rooted_value(key);
+        if key.is_none() { Ok(element) } else { call_value(key, &[element], functions, model, depth) }
     };
-    let mut iter = elements.into_iter();
-    let mut best = match iter.next() {
-        Some(first) => first,
-        None => {
-            return match default {
-                Some(value) => Ok(value),
-                None => {
-                    let name = if keep == Ordering::Less { "min" } else { "max" };
-                    let message = alloc::format!("{name}() iterable argument is empty");
-                    Err(model.raise_named_exception("ValueError", &message))
-                }
-            };
-        }
-    };
-    let mut best_key = mapped(best, model)?;
+    let mut best = 0;
+    let first_key = mapped(scope.value_buffers[items][0], &mut scope)?;
+    let best_key = scope.root_value(first_key);
     let op = if keep == Ordering::Less { CmpOp::Lt } else { CmpOp::Gt };
-    for element in iter {
-        let element_key = mapped(element, model)?;
-        let outcome = crate::interp::compare_values(op, element_key, best_key, functions, model, depth)?;
-        if crate::interp::py_truthy_dyn(outcome, functions, model, depth)? {
-            best = element;
-            best_key = element_key;
+    for index in 1..scope.value_buffers[items].len() {
+        let mut step = scope.root_scope();
+        let element = step.value_buffers[items][index];
+        let candidate = mapped(element, &mut step)?;
+        let candidate = step.root_value(candidate);
+        let outcome = crate::interp::compare_values(
+            op, step.rooted_value(candidate), step.rooted_value(best_key), functions, &mut step, depth,
+        )?;
+        if crate::interp::py_truthy_dyn(outcome, functions, &mut step, depth)? {
+            best = index;
+            let new_key = step.rooted_value(candidate);
+            step.replace_root(best_key, new_key);
         }
     }
-    Ok(best)
+    Ok(scope.value_buffers[items][best])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quitter_reports_out_of_memory_before_system_exit_is_built() {
+        let mut model = ObjectModel::new(Vec::new(), 4096);
+        assert!(model.set_handler_reserve(0));
+        assert_eq!(model.exc_class_lookup("SystemExit"), None);
+        let mut allocated = 0;
+        while model.new_str("x").is_ok() {
+            allocated += 1;
+            assert!(allocated < 4096);
+        }
+        assert!(allocated > 0);
+        assert_eq!(model.new_str("x"), Err(Trap::OutOfMemory));
+        assert_eq!(quitter_call(&[], &[], &mut model), Err(Trap::OutOfMemory));
+        assert_eq!(model.exc_class_lookup("SystemExit"), None);
+        assert_eq!(model.take_pending_exception(), None);
+    }
 
     #[test]
     fn round_half_even_matches_python_bankers_rounding() {

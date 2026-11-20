@@ -12,18 +12,11 @@ use lamella_syntax::ast::{Parameter, ParameterModifier, TypeRef, TypeRefKind};
 /// `TupleElementNamesAttribute` all agree on that shape because they were all written to it.
 const TUPLE_CHUNK: usize = 7;
 
-/// The `System.ValueTuple<...>` a tuple type IS (C# 7.0, 8.3.11).
-///
-/// **NOT A CONVERSION AND NOT A LOWERING -- AN IDENTITY.** `(int, string)` and
-/// `System.ValueTuple<int, string>` are the same type: each converts to the other by the identity
-/// conversion, they share every member, and metadata has only the second name for either. So the
-/// binder answers with the instantiation and no pass after this one has to know what a tuple is.
-///
+/// One `System.ValueTuple` over exactly these arguments, WITHOUT the chunking.
 ///
 /// For a caller whose list is already in the eight-slot shape -- seven elements and a nested rest
-/// -- because [`value_tuple`] would then split it a SECOND time and wrap the rest twice. That is
-/// not hypothetical: it is what a fifteen-element tuple did, producing a
-/// `ValueTuple<ValueTuple<int>>` where the type said `ValueTuple<int>`.
+/// (ECMA-334 7th ed 8.3.11) -- because [`value_tuple`] would then split it a SECOND time and wrap
+/// the rest twice.
 #[must_use]
 pub fn value_tuple_exact(arguments: &[TypeSymbol]) -> TypeSymbol {
     TypeSymbol::Instantiation {
@@ -36,6 +29,13 @@ pub fn value_tuple_exact(arguments: &[TypeSymbol]) -> TypeSymbol {
     }
 }
 
+/// The `System.ValueTuple<...>` a tuple type IS (ECMA-334 7th ed 8.3.11).
+///
+/// **NOT A CONVERSION AND NOT A LOWERING -- AN IDENTITY.** `(int, string)` and
+/// `System.ValueTuple<int, string>` are the same type: each converts to the other by the identity
+/// conversion, they share every member, and metadata has only the second name for either. So the
+/// binder answers with the instantiation and no pass after this one has to know what a tuple is.
+///
 #[must_use]
 pub fn value_tuple(elements: &[TypeSymbol]) -> TypeSymbol {
     let definition: alloc::boxed::Box<[alloc::boxed::Box<str>]> =

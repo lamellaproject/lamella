@@ -245,6 +245,11 @@ pub struct DescQualifiers {
     /// what this struct already carries to every object-emitting path. `None` (a build with no
     /// resolvable `System.String`) lays literals exactly as before.
     pub string: Option<u32>,
+    /// `System.Type`'s handle, when this build can name the type -- the header of the `Type` object
+    /// every descriptor carries (see [`lamella_ir::Inst::TypeObject`]). Set only by a build that also
+    /// stages the type's description among its descriptors, so the header's addend is known wherever
+    /// the copy is laid. `None` lays the header as 0, in a build that has nothing to hand a `Type` out.
+    pub system_type: Option<u32>,
 }
 
 /// The AMBIENT `System.String` descriptor: one data word holding the address of `System.String`'s
@@ -313,6 +318,34 @@ pub(crate) fn qualified_type_name(namespace: &str, name: &str) -> alloc::boxed::
     }
 }
 
+/// The name a descriptor lays for a type that is not a constructed generic -- what `Type.FullName` and
+/// `ToString()` answer: `Ns.Name`, and for a NESTED type its enclosing types' names joined by `+` after
+/// the outermost one's namespace, `Ns.Outer+Inner`: `.` separates namespace identifiers and `+`
+/// precedes a nested class (ECMA-335 4th ed, IV.5.5, the library XML's
+/// `System.Type.AssemblyQualifiedName`, which gives the name syntax). A nested type's enclosing type is
+/// recorded in the NestedClass table (ECMA-335 4th ed, II.22.32), not in its own row, so the row's
+/// namespace and name alone give only `Inner`. `None` for a token that names no type, and for a
+/// nesting cycle, which only malformed metadata can hold.
+pub(crate) fn dotnet_type_name(assembly: &Assembly<'_>, token: Token) -> Option<alloc::boxed::Box<str>> {
+    let own = assembly.type_token_name(token)?;
+    let mut names = alloc::vec![own.name];
+    let mut namespace = own.namespace;
+    let mut seen = alloc::vec![token];
+    let mut current = assembly.enclosing_token(token);
+    while let Some(outer) = current {
+        if seen.contains(&outer) {
+            return None;
+        }
+        seen.push(outer);
+        let outer_name = assembly.type_token_name(outer)?;
+        names.push(outer_name.name);
+        namespace = outer_name.namespace;
+        current = assembly.enclosing_token(outer);
+    }
+    names.reverse();
+    Some(qualified_type_name(namespace, &names.join("+")))
+}
+
 /// The type `token` names, spelled by the pair it is IDENTIFIED by ([`Assembly::type_token_full_name`])
 /// in [`qualified_type_name`]'s form: `Ns.Name` for a top-level type, exactly as its own row spells
 /// it, and the enclosing chain in place of the namespace for a nested one, `Ns.Outer.Name`. `None`
@@ -369,6 +402,11 @@ pub struct MetadataResolver<'a> {
     /// the module. Empty for single-method lowering, where a call keeps its rid (a one-
     /// function lowering does not dispatch internal calls anyway).
     rid_to_index: Vec<(u32, u32)>,
+    /// The CALLER's [`Self::rid_to_index`] while this resolver is rebased, and empty otherwise: how a
+    /// body lowered out of another assembly names a method of the assembly its type arguments were
+    /// written in -- a struct argument's own override, which a constrained call on that argument
+    /// calls directly, on the value (ECMA-335 4th ed, III.2.1).
+    argument_rid_to_index: Vec<(u32, u32)>,
     /// The type arguments in force while lowering ONE monomorphized body -- `[I4]` while lowering
     /// `Box<int>`'s copy of `Box`1`'s methods. Empty for every ordinary body, which is what keeps
     /// the non-generic path byte-identical.
@@ -418,6 +456,9 @@ pub struct MetadataResolver<'a> {
     /// corlib's own bodies unbox. A box target already has a descriptor -- boxing it laid one -- so
     /// bounding the set this way costs compares instead of vtables.
     box_target_tokens: Vec<Token>,
+    /// Primitive and enum box descriptors resolved from planned bodies or carried from a caller.
+    /// Caller handles retain the argument-world mark until the body's identities are rebased.
+    resolved_box_targets: Vec<BoxTarget>,
     /// The initialization thunk of each type demanding precise timing, as `(TypeDef row, function
     /// index)`. Empty for an eager build, and empty answers nothing -- which is what keeps every
     /// image with no such type byte-identical.
@@ -427,6 +468,11 @@ pub struct MetadataResolver<'a> {
     /// index, and a resolver handed the map late emits no call, leaving a site that reads the
     /// uninitialized field and answers from zeroed storage.
     type_init_thunks: Vec<(u32, u32)>,
+    /// The CALLER's [`Self::type_init_thunks`] while this resolver is rebased, and empty otherwise:
+    /// how a body lowered out of another assembly runs the initializer of a struct its type arguments
+    /// name in the caller, before a constrained call on that struct calls the struct's own method, as
+    /// .NET 11.0.0 does (measured; ECMA-335 4th ed I.8.9.5 names no trigger for an instance call).
+    argument_type_init_thunks: Vec<(u32, u32)>,
     /// The initialization thunk of each generic INSTANTIATION whose definition declares a type
     /// initializer, as `(canonical instantiation spelling, function index)` -- keyed by spelling,
     /// like the plan and the static band, because one definition row stands for every instantiation.
@@ -503,6 +549,131 @@ fn box_target_tokens(assembly: &Assembly) -> Vec<Token> {
     tokens
 }
 
+/// A boxed primitive or enum descriptor and its exact primitive form for unbox compatibility.
+/// Enum/underlying compatibility follows ECMA-335 4th ed I.8.5.2 and III.4.33.
+#[derive(Clone, Copy)]
+struct BoxTarget {
+    handle: TypeHandle,
+    normal_form: u8,
+}
+
+/// The primitive and enum boxes a planned body creates through `box !n` or `box !!n`
+/// (ECMA-335 4th ed III.4.1).
+/// Arguments are read in the module's world, while each body is read in its owner's world.
+/// Primitive arguments can be encoded without type tokens (ECMA-335 4th ed II.23.2.12), so the
+/// population carries descriptor handles and their unbox normal forms instead of tokens.
+fn planned_box_targets(
+    resolver: &MetadataResolver<'_>,
+    plan: &crate::generics::MonoPlan,
+) -> Vec<BoxTarget> {
+    // The generic-parameter positions the body boxes: `!n` for type parameters and `!!n` for
+    // method parameters (ECMA-335 4th ed II.9; VAR and MVAR encodings in II.23.2.12).
+    let boxed_positions = |owner: &Assembly<'_>, rid: u32, method_level: bool| -> Vec<usize> {
+        let Some(body) = owner.method(rid).and_then(|method| method.body()) else {
+            return Vec::new();
+        };
+        body.code
+            .iter()
+            .filter_map(|inst| match (inst.opcode, &inst.operand) {
+                (Opcode::Box, Operand::Token(token)) if token.table() == table::TYPE_SPEC => {
+                    match owner.type_spec_signature(*token)? {
+                        SigType::Var(n) if !method_level => Some(n as usize),
+                        SigType::MVar(n) if method_level => Some(n as usize),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    };
+    let owner_of = |owner: crate::generics::BodyOwner| match owner {
+        crate::generics::BodyOwner::Own => Some(resolver.assembly),
+        crate::generics::BodyOwner::Reference(ordinal) => {
+            resolver.references.get(usize::from(ordinal)).copied()
+        }
+    };
+    let mut targets = Vec::new();
+    let mut take = |arguments: &[SigType], positions: Vec<usize>| {
+        targets.extend(positions.into_iter().filter_map(|position| {
+            let (handle, normal_form) = match arguments.get(position)? {
+                SigType::ValueType(token) => (
+                    resolver.qualified_type_handle(*token),
+                    unbox_normal_form(resolver.assembly, *token, resolver.references())?,
+                ),
+                signature => {
+                    let (namespace, name) = primitive_sig_name(signature)?;
+                    let primitive = primitive_sig_type(namespace, name)?;
+                    (
+                        resolver.primitive_box_handle(namespace, name)?,
+                        sig_element_byte(&primitive),
+                    )
+                }
+            };
+            Some(BoxTarget { handle, normal_form })
+        }));
+    };
+    for body in plan.bodies() {
+        let Some(owner) = owner_of(body.owner) else {
+            continue;
+        };
+        let positions = boxed_positions(owner, body.rid, false);
+        if positions.is_empty() {
+            continue;
+        }
+        let arguments = match &body.arguments {
+            Some(arguments) => arguments.clone(),
+            None => match resolver.assembly.type_spec_signature(body.spec) {
+                Some(SigType::GenericInst { arguments, .. }) => arguments,
+                _ => continue,
+            },
+        };
+        take(&arguments, positions);
+    }
+    for body in plan.method_bodies() {
+        let Some(owner) = owner_of(body.owner) else {
+            continue;
+        };
+        let positions = boxed_positions(owner, body.rid, true);
+        take(&body.arguments, positions);
+    }
+    targets.sort_unstable_by_key(|target| (target.handle.0, target.normal_form));
+    targets.dedup_by_key(|target| (target.handle.0, target.normal_form));
+    targets
+}
+
+/// How a value type answers for the method a `constrained.` call names -- ECMA-335 4th ed III.2.1's
+/// question, whether the type implements it. See [`MetadataResolver::value_type_implementation`].
+enum ValueTypeImplementation<'a> {
+    /// It does not: the method is `System.ValueType`'s, `System.Object`'s or `System.Enum`'s, so the
+    /// value is boxed and the call dispatches on the box (ECMA-335 4th ed III.2.1).
+    Inherited,
+    /// It does, by a method it declares, in the assembly that declares it.
+    Declared(&'a Assembly<'a>, Method<'a>),
+    /// It does, and this is what its own interface table holds for the call.
+    Dispatched(CallTarget),
+    /// It does, or may, and nothing here names the implementation. Refuse the call to preserve the
+    /// original value required by ECMA-335 4th ed III.2.1; boxing would lose receiver mutations.
+    Unbound,
+}
+
+/// Whether `type_def`, read in `assembly`, is an enum: its immediate base is `System.Enum`
+/// (ECMA-335 4th ed II.14.3).
+fn extends_system_enum(assembly: &Assembly<'_>, type_def: &TypeDef<'_>) -> bool {
+    assembly
+        .type_token_name(type_def.extends())
+        .is_some_and(|base| base.namespace == "System" && base.name == "Enum")
+}
+
+/// A method's function index in a module whose `(MethodDef rid, function index)` pairs are `map`,
+/// or the rid itself when `map` is empty (a single-method lowering, where a call keeps its rid).
+/// `None` for a rid the map does not hold.
+fn index_of_rid(map: &[(u32, u32)], rid: u32) -> Option<u32> {
+    if map.is_empty() {
+        return Some(rid);
+    }
+    map.iter().find(|&&(r, _)| r == rid).map(|&(_, index)| index)
+}
+
 impl<'a> MetadataResolver<'a> {
     /// Wraps an assembly to resolve the tokens of a single method (no inter-method calls).
     #[must_use]
@@ -512,6 +683,7 @@ impl<'a> MetadataResolver<'a> {
             method_owners: assembly.method_owners(),
             references: Vec::new(),
             rid_to_index: Vec::new(),
+            argument_rid_to_index: Vec::new(),
             type_arguments: Vec::new(),
             layout_arguments: Vec::new(),
             argument_assembly: None,
@@ -519,7 +691,9 @@ impl<'a> MetadataResolver<'a> {
             method_arguments: Vec::new(),
             mono: crate::generics::MonoPlan::default(),
             box_target_tokens: box_target_tokens(assembly),
+            resolved_box_targets: Vec::new(),
             type_init_thunks: Vec::new(),
+            argument_type_init_thunks: Vec::new(),
             generic_type_init_thunks: Vec::new(),
             reference_owner: None,
         }
@@ -545,7 +719,12 @@ impl<'a> MetadataResolver<'a> {
     ///
     /// The monomorphization plan is CARRIED, because it is keyed by canonical spelling and a
     /// spelling is assembly-independent; `rid_to_index` and the init-thunk indices are DROPPED,
-    /// because both are this-module indices and the owner's rows do not occupy them.
+    /// because both are this-module indices and the owner's rows do not occupy them. The CALLER's
+    /// `rid_to_index` and init thunks are kept apart, as [`Self::argument_rid_to_index`] and
+    /// [`Self::argument_type_init_thunks`], for the one call a rebased body makes to the caller's own
+    /// code: a constrained call on a struct argument that implements the method itself, which calls
+    /// it directly on the value (ECMA-335 4th ed III.2.1). Its initialization check uses the caller's
+    /// thunk indices.
     ///
     /// `None` when `ordinal` names no attached reference -- a plan built against a different
     /// reference list than the one being consumed, which is a wrong bind rather than a lookup miss.
@@ -555,11 +734,31 @@ impl<'a> MetadataResolver<'a> {
         symbols: Vec<Option<alloc::string::String>>,
     ) -> Option<MetadataResolver<'a>> {
         let owner = *self.references.get(usize::from(ordinal))?;
+        // Resolve caller tokens before changing assemblies. These descriptors already name the
+        // caller's types, so rebase_identities must remove their mark without remapping their rows.
+        let mut resolved_box_targets: Vec<_> = self
+            .box_target_tokens
+            .iter()
+            .filter_map(|token| {
+                Some(BoxTarget {
+                    handle: self.qualified_type_handle(*token),
+                    normal_form: unbox_normal_form(self.assembly, *token, self.references())?,
+                })
+            })
+            .chain(self.resolved_box_targets.iter().copied())
+            .map(|target| BoxTarget {
+                handle: TypeHandle(target.handle.0 | ARGUMENT_WORLD_BIT),
+                ..target
+            })
+            .collect();
+        resolved_box_targets.sort_unstable_by_key(|target| (target.handle.0, target.normal_form));
+        resolved_box_targets.dedup_by_key(|target| (target.handle.0, target.normal_form));
         Some(MetadataResolver {
             assembly: owner,
             method_owners: owner.method_owners(),
             references: self.references[..usize::from(ordinal)].to_vec(),
             rid_to_index: Vec::new(),
+            argument_rid_to_index: self.rid_to_index.clone(),
             type_arguments: Vec::new(),
             layout_arguments: Vec::new(),
             argument_assembly: Some(self.assembly),
@@ -567,7 +766,9 @@ impl<'a> MetadataResolver<'a> {
             method_arguments: Vec::new(),
             mono: self.mono.clone(),
             box_target_tokens: box_target_tokens(owner),
+            resolved_box_targets,
             type_init_thunks: Vec::new(),
+            argument_type_init_thunks: self.type_init_thunks.clone(),
             generic_type_init_thunks: self.generic_type_init_thunks.clone(),
             reference_owner: Some(ReferenceOwner::new(ordinal, symbols)),
         })
@@ -654,11 +855,31 @@ impl<'a> MetadataResolver<'a> {
     ///
     /// For an ordinary resolver this is just `references`. For a rebased one it is the CALLER's
     /// full list rather than the owner's truncated one, which is what lets a lookup keyed to the
-    /// module (the generic static band) be answered from inside a body lowered next door.
+    /// module (the generic static band) be answered from inside a body lowered next door, and what
+    /// resolves a type argument's token wherever a layout reads one: [`Self::caller_resolved`],
+    /// [`Self::slot_type`] and every layout site that may meet a marked token.
     pub(crate) fn argument_world_references(&self) -> &[&'a Assembly<'a>] {
         self.argument_references
             .as_deref()
             .unwrap_or(&self.references)
+    }
+
+    /// `arguments` re-expressed for LAYOUT by [`caller_resolved_arguments`]: resolved in
+    /// [`Self::argument_world`], through that world's own references.
+    ///
+    /// The two travel together because a type argument's token is read in the assembly that wrote
+    /// it, and only that assembly's reference list can resolve it there: a token is scoped to the
+    /// metadata binary that holds it (ECMA-335 4th ed, I.9.2.1), and a type token in a signature is a
+    /// row of that module's TypeDef, TypeRef or TypeSpec table (II.23.2.8). A rebased resolver's own
+    /// `references` are the OWNER's, and the owner need not reference what the caller does: a
+    /// program's `TimeSpan?` closes the class library's `Nullable<T>` over the program's TypeRef
+    /// to `System.TimeSpan`, and the class library itself references nothing.
+    fn caller_resolved(&self, arguments: &[SigType]) -> Option<Vec<SigType>> {
+        caller_resolved_arguments(
+            arguments,
+            self.argument_world(),
+            self.argument_world_references(),
+        )
     }
 
     /// The canonical spelling of the instantiation a `TypeSpec` of [`Self::assembly`] names, closed
@@ -737,6 +958,7 @@ impl<'a> MetadataResolver<'a> {
     /// bodies exist. Collect, assign indices, THEN walk.
     #[must_use]
     pub fn with_monomorphized(mut self, plan: crate::generics::MonoPlan) -> MetadataResolver<'a> {
+        self.resolved_box_targets = planned_box_targets(&self, &plan);
         self.mono = plan;
         self
     }
@@ -825,16 +1047,9 @@ impl<'a> MetadataResolver<'a> {
     ) -> Option<CallInfo> {
         let has_result = !matches!(signature.return_type, SigType::Void);
         let result_type = if has_result {
-            let arguments =
-                caller_resolved_arguments(arguments, self.argument_world(), &self.references)?;
+            let arguments = self.caller_resolved(arguments)?;
             let closed = crate::generics::substitute_sig(&signature.return_type, &arguments)?;
-            Some(mir_type_across(
-                &closed,
-                self.assembly,
-                self.argument_assembly,
-                &self.references,
-                &TargetLayout::ilp32(),
-            )?)
+            Some(self.slot_type(&closed)?)
         } else {
             None
         };
@@ -977,16 +1192,9 @@ impl<'a> MetadataResolver<'a> {
         let rid = declared.rid();
         let has_result = !matches!(signature.return_type, SigType::Void);
         let result_type = if has_result {
-            let arguments =
-                caller_resolved_arguments(&arguments, self.argument_world(), &self.references)?;
+            let arguments = self.caller_resolved(&arguments)?;
             let closed = crate::generics::substitute_sig(&signature.return_type, &arguments)?;
-            Some(mir_type_across(
-                &closed,
-                self.assembly,
-                self.argument_assembly,
-                &self.references,
-                &TargetLayout::ilp32(),
-            )?)
+            Some(self.slot_type(&closed)?)
         } else {
             None
         };
@@ -1016,23 +1224,20 @@ impl<'a> MetadataResolver<'a> {
         })
     }
 
-    /// A `constrained.` call whose constraint is a VALUE-type INSTANTIATION that provides the method
-    /// itself -- `foreach` disposing `Dictionary<TKey, TValue>.Enumerator`, `using` on a generic
-    /// struct -- bound to that instantiation's monomorphized body and called on the byref, with no
-    /// box (ECMA-335 III.2.1's first case).
+    /// Binds a `constrained.` call on a constructed value type to its planned implementation,
+    /// passing the original managed pointer without boxing (ECMA-335 4th ed III.2.1).
     ///
-    /// **THE CALL IS TYPED BY WHAT THE CALL SITE NAMES, AND ONLY ITS TARGET COMES FROM THE STRUCT.**
-    /// The `callvirt` names the declaration it dispatches on -- `IDisposable::Dispose()`,
-    /// `object::ToString()` -- in the caller's own tables, so the arguments and the result are read
-    /// from it exactly as an unconstrained call to it reads them. The body is then the plan's, found
-    /// by the struct's own declaration: the method of the definition with the call's name and
-    /// parameter key, under its declared parameters, which is how the plan records a body.
+    /// The call site's declaration supplies the argument and result types; the struct supplies
+    /// the target. Constructed member references retain the declaration's uninstantiated signature
+    /// (ECMA-335 4th ed II.9.8), so resolution closes it using the call site's arguments. The plan
+    /// identifies the implementation by its declaring type, name and parameter key.
     ///
-    /// `None` -- and the box the lowering then takes -- when the constraint is not a value type, the
-    /// definition does not declare the method under that name (an explicit implementation is named
-    /// for its interface), or the plan does not carry the body.
+    /// Interface selection gives MethodImpl entries precedence over name matching (ECMA-335
+    /// 4th ed II.12.2 and II.22.27); a class virtual requires an override of its slot (II.10.3.1).
+    /// Returns `None` if the constraint is not a value type, no implementation matches, or the plan
+    /// has no body for it. The caller handles fallback dispatch and refusal.
     fn constrained_instantiation_call(&self, spec: Token, method: Token) -> Option<CallInfo> {
-        let (owner, type_def, _) = self.instantiated_parent(spec)?;
+        let (owner, type_def, arguments) = self.instantiated_parent(spec)?;
         if !type_def.is_value_type() {
             return None;
         }
@@ -1044,17 +1249,33 @@ impl<'a> MetadataResolver<'a> {
             signature.generic_param_count,
             &signature.parameters,
         );
-        let provided = type_def.methods().find(|candidate| {
+        let of_the_call = |candidate: &Method<'a>| {
             candidate.is_virtual()
                 && candidate.name() == Some(name)
                 && decodable_signature(candidate).is_some_and(|sig| {
                     param_key(owner, sig.generic_param_count, &sig.parameters) == key
                 })
-        })?;
+        };
+        let provided = match self.interface_call_tag(&Operand::Token(method)) {
+            Some(tag) => {
+                let explicit = type_def.method_impls().find_map(|(body, declaration)| {
+                    let (_, implemented) =
+                        self.explicit_interface_dispatch(owner, declaration, &arguments)?;
+                    (implemented == tag && body.table() == table::METHOD_DEF).then_some(body)
+                });
+                match explicit {
+                    Some(body) => owner.method(body.row())?,
+                    None => type_def.methods().find(|candidate| of_the_call(candidate))?,
+                }
+            }
+            None => type_def
+                .methods()
+                .find(|candidate| of_the_call(candidate) && candidate.flags() & 0x0100 == 0)?,
+        };
         let declared = decodable_signature(&provided)?;
-        let index = self
-            .mono
-            .index_of(&self.spelled_spec(spec)?, name, &declared.parameters)?;
+        let index =
+            self.mono
+                .index_of(&self.spelled_spec(spec)?, provided.name()?, &declared.parameters)?;
         let call = self.resolve(&Operand::Token(method))?;
         Some(CallInfo {
             args: signature.parameters.len() + 1,
@@ -1063,6 +1284,275 @@ impl<'a> MetadataResolver<'a> {
             result_type: call.result_type,
             target: CallTarget::Internal(index),
         })
+    }
+
+    /// A `constrained.` call whose constraint is a type PARAMETER bound to a struct or an enum that
+    /// implements the method itself, bound to that implementation and called on the byref, with no
+    /// box: ECMA-335 4th ed III.2.1's case for a value type that implements the method. `None` when
+    /// the operand is not bound to a named value type or the type does not implement the method --
+    /// the call then boxes, III.2.1's case for a value type that does not -- and when nothing here
+    /// names the implementation, which `constrained_implementation_unbound` then refuses.
+    ///
+    /// The implementation receives the original value, so changes to its fields persist. For
+    /// `HasValue == true`, `Nullable<T>.ToString` returns `Value.ToString()` (ECMA-335 4th ed IV.7.1,
+    /// library XML member `System.Nullable<T>.ToString`). The corlib's constrained call therefore
+    /// lets a struct override update the nullable's stored value; boxing would update a copy.
+    ///
+    /// Which method that is: [`Self::value_type_implementation`]. A method the struct declares is
+    /// called where the struct is declared: see [`Self::argument_method_target`].
+    fn constrained_argument_call(&self, spec: Token, method: Token) -> Option<CallInfo> {
+        self.implementation_call(self.argument_implementation(spec, method)?, method)
+    }
+
+    /// The direct call a `constrained.` call makes to `implementation`, the value type's own answer for
+    /// `method` (the call's method token), on the byref: ECMA-335 4th ed III.2.1's case for a value
+    /// type that implements the method. `None` where the type inherits the method, and where nothing
+    /// here names the implementation or types its result.
+    fn implementation_call(
+        &self,
+        implementation: ValueTypeImplementation<'a>,
+        method: Token,
+    ) -> Option<CallInfo> {
+        let target = match implementation {
+            ValueTypeImplementation::Declared(declaring, provided) => {
+                self.argument_method_target(declaring, provided.rid())?
+            }
+            ValueTypeImplementation::Dispatched(target) => target,
+            ValueTypeImplementation::Inherited | ValueTypeImplementation::Unbound => return None,
+        };
+        // A MethodSpec identifies its generic declaration (ECMA-335 4th ed II.22.29). Read the
+        // parameter count there; resolve the instantiated call below to obtain its result type.
+        let declared = if method.table() == table::METHOD_SPEC {
+            self.assembly.method_spec_method(method)?
+        } else {
+            method
+        };
+        let named = self.method_owners.resolve_method(declared)?;
+        let signature = named.signature.as_ref()?;
+        let call = self.resolve(&Operand::Token(method))?;
+        if call.has_result && call.result_type.is_none() {
+            return None;
+        }
+        Some(CallInfo {
+            args: signature.parameters.len() + 1,
+            has_result: call.has_result,
+            has_this: true,
+            result_type: call.result_type,
+            target,
+        })
+    }
+
+    /// How the struct or enum a type-parameter operand `spec` is bound to answers for `method` (see
+    /// [`Self::value_type_implementation`]); `None` when the operand is not bound to a named value
+    /// type.
+    ///
+    /// Read where the argument was written: the identity list holds the token as that assembly
+    /// spelled it, so it resolves there, through that assembly's references -- a token is scoped to
+    /// the metadata binary that holds it (ECMA-335 4th ed, I.9.2.1; II.23.2.8 for a signature's).
+    fn argument_implementation(
+        &self,
+        spec: Token,
+        method: Token,
+    ) -> Option<ValueTypeImplementation<'a>> {
+        let SigType::ValueType(named) = self.closed_type_parameter(spec)? else {
+            return None;
+        };
+        let (declaring, type_def) = resolve_value_type_def(
+            self.argument_world(),
+            named,
+            self.argument_world_references(),
+        )?;
+        Some(self.value_type_implementation(declaring, type_def, method))
+    }
+
+    /// How the value type `type_def`, declared in `declaring`, answers for the method `method` a
+    /// `constrained.` call names: ECMA-335 4th ed III.2.1 asks whether the type implements it.
+    ///
+    /// Interface calls use the type's interface table, as dispatch on a box would. MethodImpl
+    /// entries take precedence over name matching (ECMA-335 4th ed II.12.2 and II.22.27).
+    /// Constructed-interface signatures use the interface's arguments (II.9.8), and generic
+    /// method instantiations use their MethodSpec arguments (II.22.29).
+    ///
+    /// Only a type this module lays out has its table in reach. `System.ValueType` declares no
+    /// interfaces (ECMA-335 4th ed IV.7.1, library XML type `System.ValueType`), so a struct's
+    /// interface implementation must be found on the struct. Refuse the call if it cannot be bound.
+    /// Enums declare no methods or interfaces of their own and inherit from `System.Enum`
+    /// (ECMA-335 4th ed II.14.3).
+    ///
+    /// **A CLASS VIRTUAL IS IMPLEMENTED ONLY BY AN OVERRIDE**: see [`Self::class_virtual_override`].
+    fn value_type_implementation(
+        &self,
+        declaring: &'a Assembly<'a>,
+        type_def: TypeDef<'a>,
+        method: Token,
+    ) -> ValueTypeImplementation<'a> {
+        if let Some(tag) = self.interface_call_tag(&Operand::Token(method)) {
+            if extends_system_enum(declaring, &type_def) {
+                return ValueTypeImplementation::Inherited;
+            }
+            if !core::ptr::eq(declaring, self.assembly) || self.reference_owner.is_some() {
+                return ValueTypeImplementation::Unbound;
+            }
+            let slots = self.vtable_methods(type_def);
+            let entries = self.interface_entries(self.assembly, type_def, &slots, &[], &|rid| {
+                self.function_index(rid)
+            });
+            return match entries.into_iter().find(|(entry, _)| *entry == tag) {
+                Some((_, VtableEntry::Func(index))) => {
+                    ValueTypeImplementation::Dispatched(CallTarget::Internal(index))
+                }
+                Some((_, VtableEntry::Extern(symbol))) => {
+                    ValueTypeImplementation::Dispatched(CallTarget::External(symbol.into()))
+                }
+                None => ValueTypeImplementation::Unbound,
+            };
+        }
+        match self.class_virtual_override(declaring, type_def, method) {
+            Some(Some(provided)) => ValueTypeImplementation::Declared(declaring, provided),
+            Some(None) => ValueTypeImplementation::Inherited,
+            None => ValueTypeImplementation::Unbound,
+        }
+    }
+
+    /// The override the value type `type_def`, declared in `declaring`, gives the class virtual
+    /// `method` (`Object.ToString`, `ValueType.Equals`, ...): `Some(None)` when it gives none and
+    /// inherits the method, `None` when that is not decided here -- the method does not resolve, or
+    /// an explicit override (`MethodImpl`, ECMA-335 4th ed II.22.27) names a class method of that name
+    /// and signature, or its declaration cannot be resolved.
+    ///
+    /// An override is a virtual method of the method's name and parameters that takes over the
+    /// inherited slot, which a `newslot` one does not (ECMA-335 4th ed II.10.3.1), whatever interface
+    /// it implements. A new slot leaves the inherited `Object.ToString` slot unchanged.
+    /// That is the rule [`Self::vtable_methods`] numbers slots by, so a direct call and a box agree.
+    fn class_virtual_override(
+        &self,
+        declaring: &'a Assembly<'a>,
+        type_def: TypeDef<'a>,
+        method: Token,
+    ) -> Option<Option<Method<'a>>> {
+        let target = self.method_owners.resolve_method(method)?;
+        let name = target.name?;
+        let signature = target.signature.as_ref()?;
+        let key = param_key(
+            self.assembly,
+            signature.generic_param_count,
+            &signature.parameters,
+        );
+        for (_, declaration) in type_def.method_impls() {
+            let declared = declaring.resolve_method(declaration)?;
+            if declared.name != Some(name) {
+                continue;
+            }
+            let declared_signature = declared.signature.as_ref()?;
+            if declared_signature.has_this != signature.has_this
+                || declared_signature.explicit_this != signature.explicit_this
+                || declared_signature.is_vararg != signature.is_vararg
+                || param_key(
+                    declaring,
+                    declared_signature.generic_param_count,
+                    &declared_signature.parameters,
+                ) != key
+                || param_key(
+                    declaring,
+                    0,
+                    core::slice::from_ref(&declared_signature.return_type),
+                ) != param_key(
+                    self.assembly,
+                    0,
+                    core::slice::from_ref(&signature.return_type),
+                )
+            {
+                continue;
+            }
+            // A MethodImpl names the declaration it implements (ECMA-335 4th ed II.22.27).
+            // Resolve that declaration in its own assembly and reference list: an interface
+            // method does not override a class virtual, even when their signatures match.
+            let declaration_resolver =
+                MetadataResolver::new(declaring).with_references(self.argument_world_references());
+            let owner = declaration_resolver
+                .method_home(declaring, declaration)
+                .map(|(_, _, owner)| owner)
+                .or_else(|| {
+                    if declaration.table() != table::MEMBER_REF {
+                        return None;
+                    }
+                    let parent = declaring.member_ref(declaration.row())?.parent();
+                    declaration_resolver
+                        .instantiated_parent(parent)
+                        .map(|(_, owner, _)| owner)
+                })?;
+            if !owner.is_interface() {
+                return None;
+            }
+        }
+        Some(type_def.methods().find(|candidate| {
+            // ECMA-335 4th ed II.23.1.10: NewSlot (0x0100) requests a new virtual slot.
+            candidate.is_virtual()
+                && candidate.flags() & 0x0100 == 0
+                && candidate.name() == Some(name)
+                && decodable_signature(candidate).is_some_and(|sig| {
+                    param_key(declaring, sig.generic_param_count, &sig.parameters) == key
+                })
+        }))
+    }
+
+    /// How this resolver's body names method `rid` of `declaring`, the assembly that declares a type
+    /// argument's struct: [`Self::own_call_target`] when that is the assembly whose body this is; the
+    /// caller's own function index when it is the assembly that wrote the argument, while this
+    /// resolver is rebased; and otherwise the symbol a referenced library's own object defines for
+    /// the method, from that library's own naming. `None` when none of the three names it.
+    fn argument_method_target(&self, declaring: &'a Assembly<'a>, rid: u32) -> Option<CallTarget> {
+        if core::ptr::eq(declaring, self.assembly) {
+            return self.own_call_target(rid);
+        }
+        if self
+            .argument_assembly
+            .is_some_and(|caller| core::ptr::eq(declaring, caller))
+        {
+            return Some(CallTarget::Internal(index_of_rid(
+                &self.argument_rid_to_index,
+                rid,
+            )?));
+        }
+        let references = self.argument_world_references();
+        let ordinal = references
+            .iter()
+            .position(|reference| core::ptr::eq(*reference, declaring))?;
+        let symbols = crate::build::library_function_symbols(declaring, &references[..ordinal])?;
+        Some(CallTarget::External(
+            symbols.get(rid as usize)?.as_deref()?.into(),
+        ))
+    }
+
+    /// The initialization thunk of the struct or enum `named`, a type argument's token read where the
+    /// argument was written, as [`Self::argument_method_target`] names its methods: this assembly's own
+    /// thunk for a type it declares (the owner's exported one while rebased), the caller's index for a
+    /// type of the assembly that wrote the argument, and the thunk a referenced library's object exports
+    /// otherwise. `None` for a type with no thunk, whose initializer, if any, is not run at this site.
+    fn argument_type_init_thunk(&self, named: Token) -> Option<crate::cil::TypeInitThunk> {
+        use crate::cil::TypeInitThunk;
+        let (declaring, type_def) = resolve_value_type_def(
+            self.argument_world(),
+            named,
+            self.argument_world_references(),
+        )?;
+        let row = type_def.token().row();
+        let local = |thunks: &[(u32, u32)]| {
+            thunks
+                .iter()
+                .find(|(type_row, _)| *type_row == row)
+                .map(|(_, index)| TypeInitThunk::Local(*index))
+        };
+        if core::ptr::eq(declaring, self.assembly) && self.reference_owner.is_none() {
+            return local(&self.type_init_thunks);
+        }
+        if self
+            .argument_assembly
+            .is_some_and(|caller| core::ptr::eq(declaring, caller))
+        {
+            return local(&self.argument_type_init_thunks);
+        }
+        cross_assembly_type_init(declaring, &type_def).map(|(_, symbol)| TypeInitThunk::Extern(symbol))
     }
 
     /// The GENERIC METHOD twin of [`Self::monomorphized_call`]: a call site naming a `MethodSpec`
@@ -1373,6 +1863,7 @@ impl<'a> MetadataResolver<'a> {
             method_owners: assembly.method_owners(),
             references: Vec::new(),
             rid_to_index,
+            argument_rid_to_index: Vec::new(),
             type_arguments: Vec::new(),
             layout_arguments: Vec::new(),
             argument_assembly: None,
@@ -1380,7 +1871,9 @@ impl<'a> MetadataResolver<'a> {
             method_arguments: Vec::new(),
             mono: crate::generics::MonoPlan::default(),
             box_target_tokens: box_target_tokens(assembly),
+            resolved_box_targets: Vec::new(),
             type_init_thunks: Vec::new(),
+            argument_type_init_thunks: Vec::new(),
             generic_type_init_thunks: Vec::new(),
             reference_owner: None,
         }
@@ -1390,14 +1883,7 @@ impl<'a> MetadataResolver<'a> {
     /// through for single-method lowering. `None` if the call names a method outside the
     /// module being lowered.
     fn function_index(&self, rid: u32) -> Option<u32> {
-        if self.rid_to_index.is_empty() {
-            Some(rid)
-        } else {
-            self.rid_to_index
-                .iter()
-                .find(|&&(r, _)| r == rid)
-                .map(|&(_, index)| index)
-        }
+        index_of_rid(&self.rid_to_index, rid)
     }
 
     /// The type token a metadata token names: a type token as-is (`TypeRef`/`TypeDef`/
@@ -1904,10 +2390,9 @@ impl<'a> MetadataResolver<'a> {
             .assembly
             .type_defs()
             .filter_map(|type_def| {
-                let name = self.assembly.type_token_name(type_def.token())?;
                 Some((
                     TypeHandle(type_def.token().0),
-                    qualified_type_name(name.namespace, name.name),
+                    dotnet_type_name(self.assembly, type_def.token())?,
                 ))
             })
             .collect();
@@ -2012,11 +2497,7 @@ impl<'a> MetadataResolver<'a> {
                 let base = self
                     .instantiated_parent_named(name, spec)
                     .and_then(|(owner, type_def, arguments)| {
-                        let layout_args = caller_resolved_arguments(
-                            &arguments,
-                            self.argument_world(),
-                            &self.references,
-                        )?;
+                        let layout_args = self.caller_resolved(&arguments)?;
                         self.base_edge(owner, type_def.extends(), &layout_args)
                     });
                 let mut words = alloc::vec![
@@ -2090,8 +2571,7 @@ impl<'a> MetadataResolver<'a> {
             return None;
         }
         let (owner, type_def, arguments) = self.instantiated_parent_named(name, spec)?;
-        let arguments =
-            caller_resolved_arguments(&arguments, self.argument_world(), &self.references)?;
+        let arguments = self.caller_resolved(&arguments)?;
         self.unlaid_chain_field(owner, type_def, &arguments)
     }
 
@@ -2329,10 +2809,26 @@ impl<'a> MetadataResolver<'a> {
     /// does: this-assembly when building corlib, reference-owned in a program.
     #[must_use]
     pub fn string_type_meta(&self) -> Option<TypeMeta> {
+        self.system_namespace_meta("String")
+    }
+
+    /// `System.Type`'s own [`TypeMeta`] -- the header of the `Type` object every descriptor carries
+    /// ([`lamella_ir::Inst::TypeObject`]), so a virtual call on a `Type` (`ToString`, `Equals`,
+    /// `GetHashCode`) dispatches through this vtable like a call on any object.
+    ///
+    /// Answers in both directions, as [`string_type_meta`](Self::string_type_meta) does: this-assembly
+    /// when building corlib, reference-owned in a program.
+    #[must_use]
+    pub fn system_type_meta(&self) -> Option<TypeMeta> {
+        self.system_namespace_meta("Type")
+    }
+
+    /// The [`TypeMeta`] of `System.<name>`, declared by this assembly or by a reference.
+    fn system_namespace_meta(&self, name: &str) -> Option<TypeMeta> {
         let own = self.assembly.type_defs().find(|type_def| {
             self.assembly
                 .type_token_name(type_def.token())
-                .is_some_and(|name| name.namespace == "System" && name.name == "String")
+                .is_some_and(|n| n.namespace == "System" && n.name == name)
         });
         if let Some(type_def) = own {
             let handle = TypeHandle(type_def.token().0);
@@ -2341,7 +2837,7 @@ impl<'a> MetadataResolver<'a> {
                 .into_iter()
                 .find(|meta| meta.handle == handle);
         }
-        let (ordinal, _, type_def) = self.find_reference_type("System", "String")?;
+        let (ordinal, _, type_def) = self.find_reference_type("System", name)?;
         self.reference_type_meta(reference_handle(ordinal, type_def.token().0))
     }
 
@@ -2467,7 +2963,7 @@ impl<'a> MetadataResolver<'a> {
         Some(TypeMeta {
             handle,
             type_tag: exception_tag_for_name(name.namespace, name.name),
-            full_name: Some(qualified_type_name(name.namespace, name.name)),
+            full_name: dotnet_type_name(reference, type_def.token()),
             vtable,
             itable: self.reference_itable(reference, type_def),
             base,
@@ -4131,12 +4627,19 @@ impl<'a> MetadataResolver<'a> {
     /// is indistinguishable here from a scalar") and `field_type` has always passed them; the
     /// call-RESULT positions were the ones left. Going through here means the next position cannot
     /// be added without this answer.
+    ///
+    /// **THE REFERENCES ARE THE ARGUMENT WORLD'S.** A token a type argument put in `sig` is read in
+    /// the assembly that wrote it, and only that assembly's list resolves it there: a token is scoped
+    /// to the metadata binary that holds it (ECMA-335 4th ed, I.9.2.1), and a type token in a
+    /// signature is a row of that module's TypeDef, TypeRef or TypeSpec table (II.23.2.8). The
+    /// argument world's list begins with the owner's own, so a token of the owner reads the same
+    /// through it.
     fn slot_type(&self, sig: &SigType) -> Option<MirType> {
         mir_type_across(
             sig,
             self.assembly,
             self.argument_assembly,
-            &self.references,
+            self.argument_world_references(),
             &TargetLayout::ilp32(),
         )
     }
@@ -4407,10 +4910,6 @@ impl<'a> MetadataResolver<'a> {
             .collect()
     }
 
-    /// A `TypeSpec`'s own signature with the instantiation in force applied -- the form to SPELL,
-    /// because a spelling is an IDENTITY and `` Box`1[!0] `` is not one.
-    ///
-    /// It is [`Self::close_arguments`] one level out: that one closes the arguments a consumer
     /// The canonical SPELLING of a `TypeSpec`, with each side decoded in its own world.
     ///
     /// **THE ONE SPELLER FOR AN INSTANTIATION NAMED BY A ROW, BECAUSE SUBSTITUTING FIRST AND
@@ -4434,13 +4933,15 @@ impl<'a> MetadataResolver<'a> {
         .or_else(|| crate::generics::spell_sig(self.assembly, &open))
     }
 
-    /// substitutes WITH, this one closes the whole constructed type a consumer NAMES.
+    /// A `TypeSpec`'s signature with the current type and method arguments substituted.
+    /// Both parameter lists are independently in scope in a generic method's body
+    /// (ECMA-335 4th ed II.9.3). Identity arguments retain named types instead of their layout forms.
     fn closed_spec_signature(&self, spec: Token) -> Option<SigType> {
         let signature = self.assembly.type_spec_signature(spec)?;
-        if self.type_arguments.is_empty() {
+        if self.type_arguments.is_empty() && self.method_arguments.is_empty() {
             return Some(signature);
         }
-        crate::generics::substitute_sig(&signature, &self.type_arguments)
+        crate::generics::substitute_sig_with(&signature, &self.type_arguments, &self.method_arguments)
     }
 
     /// [`Self::cast_subtype_handles`]'s CONSTRUCTED-TARGET arm: every handle a `castclass` or
@@ -4603,6 +5104,12 @@ impl<'a> MetadataResolver<'a> {
                 handles.push(self.qualified_type_handle(*candidate));
             }
         }
+        handles.extend(
+            self.resolved_box_targets
+                .iter()
+                .filter(|candidate| candidate.normal_form == form)
+                .map(|candidate| candidate.handle),
+        );
         handles.sort_unstable_by_key(|h| h.0);
         handles.dedup_by_key(|h| h.0);
         Some(handles)
@@ -4674,7 +5181,7 @@ impl<'a> MetadataResolver<'a> {
                     self.assembly,
                     self.argument_assembly,
                     *token,
-                    self.references(),
+                    self.argument_world_references(),
                     &TargetLayout::ilp32(),
                 )?;
                 if !layout.reference_offsets.is_empty() {
@@ -4733,6 +5240,36 @@ impl<'a> MetadataResolver<'a> {
         } else {
             owned
         }
+    }
+
+    /// The box of a value type a type argument names, `named` as the instantiation in force spells it:
+    /// laid out where the argument was written, and carrying the descriptor that a `box` of the type in
+    /// that assembly names, by [`Self::argument_element_handle`]'s rule.
+    ///
+    /// **THE IDENTITY READING, BECAUSE A BOX IS AN IDENTITY.** An enum's one instance field is of its
+    /// underlying integer type, and boxing it keeps the enum's own type (ECMA-335 4th ed, II.14.3). The
+    /// layout reading makes an enum argument that integer, and a box of that is a boxed `Int32`: its
+    /// `ToString` prints the number where `Enum.ToString` names a declared constant. Its `Equals`
+    /// accepts any boxed `int` of the same value where `Enum.Equals` asks for the same enumeration type
+    /// (ECMA-335 4th ed IV.7.1, the library XML's `System.Enum.ToString`, `System.Enum.Equals` and
+    /// `System.Int32.Equals`). The identity reading keeps the enum, whose own layout is that integer.
+    fn argument_box_layout(&self, named: Token) -> Option<ReferenceLayout> {
+        let written = match self.argument_assembly {
+            Some(_) => in_argument_world(named),
+            None => named,
+        };
+        let layout = value_type_layout_across(
+            self.assembly,
+            self.argument_assembly,
+            written,
+            self.argument_world_references(),
+            &TargetLayout::ilp32(),
+        )?;
+        Some(ReferenceLayout {
+            handle: self.argument_element_handle(written),
+            size: layout.size,
+            reference_offsets: layout.reference_offsets,
+        })
     }
 
     /// The element a rectangular array's signature spells, as every question about the array asks it:
@@ -4889,11 +5426,7 @@ impl<'a> MetadataResolver<'a> {
                 let declared = member.field_type()?;
                 if member.parent().table() == table::TYPE_SPEC {
                     let (_, _, arguments) = self.instantiated_parent(member.parent())?;
-                    let arguments = caller_resolved_arguments(
-                        &arguments,
-                        self.argument_world(),
-                        &self.references,
-                    )?;
+                    let arguments = self.caller_resolved(&arguments)?;
                     crate::generics::substitute_sig(&declared, &arguments)
                 } else {
                     Some(declared)
@@ -4960,8 +5493,7 @@ impl<'a> MetadataResolver<'a> {
         if type_def.is_value_type() {
             return None;
         }
-        let layout_args =
-            caller_resolved_arguments(&arguments, self.argument_world(), &self.references)?;
+        let layout_args = self.caller_resolved(&arguments)?;
         let chain = self.cross_class_chain(owner, type_def, &layout_args);
         let mut size = 0u32;
         let mut reference_offsets = Vec::new();
@@ -4985,8 +5517,7 @@ impl<'a> MetadataResolver<'a> {
         if type_def.is_value_type() {
             return None;
         }
-        let layout_args =
-            caller_resolved_arguments(&arguments, self.argument_world(), &self.references)?;
+        let layout_args = self.caller_resolved(&arguments)?;
         let chain = self.cross_class_chain(owner, type_def, &layout_args);
         let mut size = 0u32;
         let mut reference_offsets = Vec::new();
@@ -5094,7 +5625,7 @@ impl<'a> MetadataResolver<'a> {
             nested,
             owner,
             Some(argument_world),
-            &self.references,
+            self.argument_world_references(),
             &target,
         )
     }
@@ -5577,8 +6108,7 @@ impl CallResolver for MetadataResolver<'_> {
                         .fields()
                         .filter(|field| !field.is_static())
                         .position(|field| field.name() == Some(name))?;
-                    let arguments =
-                        caller_resolved_arguments(&arguments, self.argument_world(), &self.references)?;
+                    let arguments = self.caller_resolved(&arguments)?;
                     let layout = self.instantiated_layout(owner, type_def, &arguments)?;
                     return Some(
                         self.class_block_start(owner, type_def)?
@@ -5624,13 +6154,7 @@ impl CallResolver for MetadataResolver<'_> {
         let Operand::Token(token) = operand else {
             return None;
         };
-        mir_type_across(
-            &self.closed_field_sig(*token)?,
-            self.assembly,
-            self.argument_assembly,
-            &self.references,
-            &TargetLayout::ilp32(),
-        )
+        self.slot_type(&self.closed_field_sig(*token)?)
     }
 
     fn field_narrow(&self, operand: &Operand) -> Option<lamella_ir::ConvKind> {
@@ -5751,11 +6275,7 @@ impl CallResolver for MetadataResolver<'_> {
                 match parent.table() {
                     table::TYPE_SPEC => {
                         let (owner, type_def, arguments) = self.instantiated_parent(parent)?;
-                        let arguments = caller_resolved_arguments(
-                            &arguments,
-                            self.argument_world(),
-                            &self.references,
-                        )?;
+                        let arguments = self.caller_resolved(&arguments)?;
                         self.unlaid_chain_field(owner, type_def, &arguments)
                     }
                     table::TYPE_DEF => self.unlaid_chain_field(
@@ -5850,7 +6370,7 @@ impl CallResolver for MetadataResolver<'_> {
                 &closed,
                 self.assembly,
                 self.argument_assembly,
-                &self.references,
+                self.argument_world_references(),
                 &TargetLayout::ilp32(),
             );
         }
@@ -6013,13 +6533,7 @@ impl CallResolver for MetadataResolver<'_> {
                 .or_else(|| self.assembly.type_spec_signature(*token));
             match spec {
                 Some(spec) if crate::generics::is_value_type_instantiation(&spec) => {
-                    match mir_type_across(
-                        &spec,
-                        self.assembly,
-                        self.argument_assembly,
-                        self.references(),
-                        &TargetLayout::ilp32(),
-                    )? {
+                    match self.slot_type(&spec)? {
                         MirType::ValueType { size, .. } => Some(size),
                         _ => return None,
                     }
@@ -6219,6 +6733,14 @@ impl CallResolver for MetadataResolver<'_> {
         } else {
             *token
         };
+        // Substitute the constrained type parameter before selecting its initializer (ECMA-335
+        // 4th ed II.9). A named struct uses a VALUETYPE signature, distinct from a GENERICINST
+        // signature (II.23.2.12), and needs the named type's thunk.
+        if trigger == InitTrigger::ValueTypeCall {
+            if let Some(SigType::ValueType(named)) = self.closed_type_parameter(*token) {
+                return self.argument_type_init_thunk(named);
+            }
+        }
         if let Some(spec) = self.instantiation_named(*token, trigger) {
             let name = self.closed_instantiation_name(spec)?;
             return self
@@ -6564,6 +7086,12 @@ impl CallResolver for MetadataResolver<'_> {
                 handles.push(self.qualified_type_handle(*candidate));
             }
         }
+        handles.extend(
+            self.resolved_box_targets
+                .iter()
+                .filter(|candidate| candidate.normal_form == form)
+                .map(|candidate| candidate.handle),
+        );
         handles.sort_unstable_by_key(|h| h.0);
         handles.dedup_by_key(|h| h.0);
         handles
@@ -6605,6 +7133,9 @@ impl CallResolver for MetadataResolver<'_> {
             return None;
         };
         let handle = self.qualified_type_handle(*token);
+        if let Some(SigType::ValueType(named)) = self.closed_type_parameter(*token) {
+            return self.argument_box_layout(named);
+        }
         if let Some(closed) = self.closed_operand_sig(*token) {
             if let Some((namespace, name)) = primitive_sig_name(&closed) {
                 let boxed = self.primitive_box_handle(namespace, name)?;
@@ -6651,13 +7182,7 @@ impl CallResolver for MetadataResolver<'_> {
             return None;
         };
         if let Some(closed) = self.closed_operand_sig(*token) {
-            return mir_type_across(
-                &closed,
-                self.assembly,
-                self.argument_assembly,
-                self.references(),
-                &TargetLayout::ilp32(),
-            );
+            return self.slot_type(&closed);
         }
         if let Some(name) = self.assembly.type_token_name(*token) {
             if name.namespace == "System" {
@@ -6702,13 +7227,7 @@ impl CallResolver for MetadataResolver<'_> {
             return None;
         };
         if let Some(closed) = self.closed_operand_sig(*token) {
-            return mir_type_across(
-                &closed,
-                self.assembly,
-                self.argument_assembly,
-                self.references(),
-                &TargetLayout::ilp32(),
-            );
+            return self.slot_type(&closed);
         }
         // A value-type instantiation spelled closed already -- `initobj Pair<int>` in an ordinary
         // method, where no instantiation is in force to close it -- is the substituted value type,
@@ -6718,13 +7237,7 @@ impl CallResolver for MetadataResolver<'_> {
             && let Some(spec) = self.assembly.type_spec_signature(*token)
             && crate::generics::is_value_type_instantiation(&spec)
         {
-            return mir_type_across(
-                &spec,
-                self.assembly,
-                self.argument_assembly,
-                self.references(),
-                &TargetLayout::ilp32(),
-            );
+            return self.slot_type(&spec);
         }
         if let Some(name) = self.assembly.type_token_name(*token) {
             if name.namespace == "System" {
@@ -6931,43 +7444,96 @@ impl CallResolver for MetadataResolver<'_> {
         }
     }
 
+    fn constrained_implementation_unbound(&self, constrained: &Operand, method: &Operand) -> bool {
+        let (Operand::Token(type_token), Operand::Token(method_token)) = (constrained, method)
+        else {
+            return false;
+        };
+        // After direct binding fails, refuse any own implementation that this guard cannot bind.
+        // For the operands handled here, only an inherited method can use the boxing fallback;
+        // an own implementation must receive the original byref (ECMA-335 4th ed III.2.1).
+        let implementation = match type_token.table() {
+            table::TYPE_SPEC => self.argument_implementation(*type_token, *method_token),
+            table::TYPE_DEF => self
+                .assembly
+                .type_def(type_token.row())
+                .filter(|type_def| type_def.is_value_type())
+                .map(|type_def| {
+                    self.value_type_implementation(self.assembly, type_def, *method_token)
+                }),
+            _ => None,
+        };
+        matches!(
+            implementation,
+            Some(
+                ValueTypeImplementation::Declared(..)
+                    | ValueTypeImplementation::Dispatched(_)
+                    | ValueTypeImplementation::Unbound
+            )
+        )
+    }
+
+    fn constrained_runs_own_method(&self, constrained: &Operand, method: &Operand) -> bool {
+        let (Operand::Token(type_token), Operand::Token(method_token)) = (constrained, method)
+        else {
+            return false;
+        };
+        let (declaring, type_def) = match type_token.table() {
+            table::TYPE_DEF => match self.assembly.type_def(type_token.row()) {
+                Some(type_def) => (self.assembly, type_def),
+                None => return false,
+            },
+            table::TYPE_REF => match self.reference_type_of(self.assembly, *type_token) {
+                Some((_, owner, type_def)) => (owner, type_def),
+                None => return false,
+            },
+            _ => return false,
+        };
+        // Enums declare no methods or interfaces of their own (ECMA-335 4th ed II.14.3).
+        if !type_def.is_value_type() || extends_system_enum(declaring, &type_def) {
+            return false;
+        }
+        // A struct's interface methods are its own: System.ValueType declares no interfaces
+        // (ECMA-335 4th ed IV.7.1, library XML type System.ValueType).
+        if self
+            .interface_call_tag(&Operand::Token(*method_token))
+            .is_some()
+        {
+            return true;
+        }
+        matches!(
+            self.class_virtual_override(declaring, type_def, *method_token),
+            Some(Some(_))
+        )
+    }
+
     fn constrained_call(&self, constrained: &Operand, method: &Operand) -> Option<CallInfo> {
         let (Operand::Token(type_token), Operand::Token(method_token)) = (constrained, method)
         else {
             return None;
         };
         if type_token.table() == table::TYPE_SPEC {
-            return self.constrained_instantiation_call(*type_token, *method_token);
+            return self
+                .constrained_instantiation_call(*type_token, *method_token)
+                .or_else(|| self.constrained_argument_call(*type_token, *method_token));
         }
         if type_token.table() != table::TYPE_DEF {
             return None;
         }
         let type_def = self.assembly.type_def(type_token.row())?;
-        let target = self.method_owners.resolve_method(*method_token)?;
-        let name = target.name?;
-        let signature = target.signature.as_ref()?;
-        let key = param_key(
-            self.assembly,
-            signature.generic_param_count,
-            &signature.parameters,
-        );
-        let own = type_def.methods().find(|m| {
-            m.is_virtual()
-                && m.name() == Some(name)
-                && decodable_signature(m).is_some_and(|sig| {
-                    param_key(self.assembly, sig.generic_param_count, &sig.parameters) == key
-                })
-        })?;
-        let has_result = !matches!(signature.return_type, SigType::Void);
-        Some(CallInfo {
-            args: signature.parameters.len() + 1,
-            has_result,
-            has_this: true,
-            result_type: has_result
-                .then(|| self.slot_type(&signature.return_type))
-                .flatten(),
-            target: self.own_call_target(own.rid())?,
-        })
+        // Direct binding here requires a value type. The CLI's reference-type constrained case
+        // dereferences the receiver before callvirt (ECMA-335 4th ed III.2.1).
+        if !type_def.is_value_type() {
+            return None;
+        }
+        // Use the same selection as a type parameter bound to this struct. Interface MethodImpls
+        // take precedence over name matching (ECMA-335 4th ed II.12.2); a class virtual needs an
+        // override of its slot (II.10.3.1). Read the result through the call site's resolution:
+        // a constructed interface's signature carries its uninstantiated parameters (II.9.8).
+        self.implementation_call(
+            self.value_type_implementation(self.assembly, type_def, *method_token),
+            *method_token,
+        )
     }
 }
 

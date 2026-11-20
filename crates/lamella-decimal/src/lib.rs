@@ -66,11 +66,12 @@ pub struct Dec {
 }
 
 impl Dec {
-    /// Flips the sign, which is how subtraction reaches [`add`].
+    /// Flips the sign, a zero's included, which is how subtraction reaches [`add`]. .NET's unary
+    /// minus flips the sign bit of a zero too (ECMA-335 6th ed IV.5.7 gives a zero result no sign),
+    /// so `a - b` and `a + (-b)` agree only if this does: `0m - 0.0m` is a negative zero there, as
+    /// `0m + (-0.0m)` is.
     fn negate(&mut self) {
-        if !is_zero(&self.mag) {
-            self.negative = !self.negative;
-        }
+        self.negative = !self.negative;
     }
 }
 
@@ -225,7 +226,10 @@ fn round_off(mag: &mut [u32; LIMBS], drop: u32) {
 ///
 /// The sign is used as given, including for a zero magnitude: .NET's decimal has a signed zero
 /// and each operation decides its own, so normalizing one here would overwrite an answer the
-/// caller had already got right.
+/// caller had already got right. The standard says otherwise, and this kernel answers as .NET does:
+/// ECMA-335 6th ed IV.5.7's `System.Decimal(Int32[])` remarks give "any zero result" a sign of 0,
+/// and ECMA-334 2nd ed 11.1.6 gives decimal no signed zero (4th ed 11.1.7: it "does not
+/// necessarily support" one).
 fn finish(mut mag: [u32; LIMBS], mut scale: u32, negative: bool) -> Result<[u32; 4], Fault> {
     while exceeds_96(&mag) || scale > MAX_SCALE {
         if scale == 0 {
@@ -240,12 +244,8 @@ fn finish(mut mag: [u32; LIMBS], mut scale: u32, negative: bool) -> Result<[u32;
             div10(&mut probe);
             drop += 1;
         }
-        let dropped_past_64_bits = drop >= PLACES_PAST_64_BITS;
         round_off(&mut mag, drop);
         scale -= drop;
-        if is_zero(&mag) && dropped_past_64_bits {
-            return Ok(encode(&[0u32; LIMBS], 0, false));
-        }
     }
     Ok(encode(&mag, scale, negative))
 }
@@ -280,10 +280,22 @@ fn align(a: &mut Dec, b: &mut Dec) -> Option<u32> {
 ///
 /// An EXACT CANCELLATION -- equal magnitudes with opposite signs -- still has a sign, because
 /// .NET's decimal zero carries one, and the sign it carries is the LOWER-SCALED operand's:
-/// `-1m + 1m` is a negative zero, `1m + -1m` a positive one, and `1.0000000000000000000000000000m
-/// + -1m` a negative one even though the negative operand is on the right. Equal scales make that
-/// the left operand's sign, which is the same rule with nothing to choose between.
+/// `-1m + 1m` is a negative zero, `1m + -1m` a positive one, and
+/// `1.0000000000000000000000000000m + -1m` a negative one even though the negative operand is on
+/// the right. Equal scales make that the left operand's sign, which is the same rule with nothing
+/// to choose between.
+///
+/// A ZERO with fewer places than the other operand is not a cancellation: the sum is the other
+/// operand as it stands, its sign and scale included, a zero's too. `0m + -0.0m` is `-0.0`, and
+/// `-0.0m + 0m` is `-0.0` as well, where the cancellation rule would take the zero `0m`'s sign.
+/// Those are .NET's zero signs; ECMA-335 6th ed IV.5.7 gives a zero result no sign.
 pub fn add(mut a: Dec, mut b: Dec) -> Result<[u32; 4], Fault> {
+    if a.scale < b.scale && is_zero(&a.mag) {
+        return Ok(encode(&b.mag, b.scale, b.negative));
+    }
+    if b.scale < a.scale && is_zero(&b.mag) {
+        return Ok(encode(&a.mag, a.scale, a.negative));
+    }
     let cancelled = if a.scale <= b.scale {
         a.negative
     } else {
@@ -342,38 +354,54 @@ pub fn multiply(a: Dec, b: Dec) -> Result<[u32; 4], Fault> {
         }
     }
     let negative = a.negative != b.negative;
+    let scale = a.scale + b.scale;
+    let narrow = !wider_than_32(&a.mag) && !wider_than_32(&b.mag);
+    if narrow && !is_zero(&product) && scale.saturating_sub(MAX_SCALE) >= PLACES_PAST_64_BITS {
+        return Ok(encode(&[0u32; LIMBS], 0, false));
+    }
     if is_zero(&product) {
-        if wider_than_32(&a.mag) || wider_than_32(&b.mag) {
+        if !narrow || scale.saturating_sub(MAX_SCALE) >= PLACES_PAST_64_BITS {
             return Ok(encode(&product, 0, false));
         }
-        let scale = (a.scale + b.scale).min(MAX_SCALE);
-        return Ok(encode(&product, scale, negative));
+        return Ok(encode(&product, scale.min(MAX_SCALE), negative));
     }
-    finish(product, a.scale + b.scale, negative)
+    finish(product, scale, negative)
 }
 
 /// The quotient `a / b`, at the scale .NET gives it.
 ///
-/// The result starts at the NATURAL scale, `a.scale - b.scale`, which is what makes an exact
-/// division keep its places: `100.00m / 1m` is `100.00`, not `100`. A negative natural scale
-/// means the dividend has fewer places than the divisor, and the dividend is scaled up by the
-/// difference so the quotient starts at zero places.
+/// The result starts at the NATURAL scale, `a.scale - b.scale` (the "preferred scale" of ECMA-334
+/// 4th ed 14.7.2), which is what makes an exact division keep its places: `100.00m / 1m` is
+/// `100.00`, not `100`. A negative natural scale means the dividend has fewer places than the
+/// divisor, and the dividend is scaled up by the difference so the quotient starts at zero places.
 ///
 /// Fractional digits are then appended one at a time -- quotient times ten plus the next digit --
 /// until the division terminates, another digit would leave 96 bits, or the scale reaches 28.
 /// Whatever tail is left is rounded half-to-even.
 ///
-/// Finally the APPENDED digits are unwound while they are zeros, which is why `2m / 1.15m` is
-/// `1.739130434782608695652173913` (27 places) rather than the same value with a 28th place of
-/// zero. The unwinding stops at the natural scale, so it never eats a place the operands had.
+/// Finally, a quotient that was NOT exact at the natural scale gives up every trailing zero, the
+/// operands' own places included, down to none: `2m / 1.15m` is `1.739130434782608695652173913`
+/// (27 places) rather than the same value with a 28th place of zero, and
+/// `0.9999999999999999999999999999m / 2m`, which rounds to a half, is `0.5`. A quotient that was
+/// exact there keeps the natural scale: `1.00m / 2m` is `0.50`. Read literally, ECMA-334 4th ed
+/// 14.7.2 and 11.1.7 (2nd ed 14.7.2 and 11.1.6) give the scale of the exact quotient "before any
+/// rounding" and then round "to fit the representation", which keeps every place that rounding
+/// leaves: `0.9999999999999999999999999999m / 2.0m` would be `0.5000000000000000000000000000`.
+/// .NET drops those trailing zeros, and so does this kernel.
 ///
-/// A quotient that comes out zero -- an exact zero dividend, or a value that underflows past the
-/// 28th place -- carries no places at all, only the sign of the division.
+/// A ZERO DIVIDEND gives a zero at the natural scale, or at none if that is negative, with the sign
+/// of the division: `0.000m / 2.5m` is `0.00`, and `-0.0m / 2m` is `-0.0`. A nonzero quotient that
+/// underflows past the 28th place is a different zero, with no places at all and only the sign of
+/// the division. Those are .NET's zero signs; ECMA-335 6th ed IV.5.7 gives a zero result no sign.
 pub fn divide(mut a: Dec, b: Dec) -> Result<[u32; 4], Fault> {
     if is_zero(&b.mag) {
         return Err(Fault::DivideByZero);
     }
     let natural = a.scale as i32 - b.scale as i32;
+    if is_zero(&a.mag) {
+        let scale = if natural > 0 { natural as u32 } else { 0 };
+        return Ok(encode(&a.mag, scale, a.negative != b.negative));
+    }
     let mut result_scale = if natural < 0 {
         if !scale_up(&mut a.mag, natural.unsigned_abs()) {
             return Err(Fault::Overflow);
@@ -387,6 +415,7 @@ pub fn divide(mut a: Dec, b: Dec) -> Result<[u32; 4], Fault> {
     if exceeds_96(&quotient) {
         return Err(Fault::Overflow);
     }
+    let exact = is_zero(&remainder);
     while !is_zero(&remainder) && result_scale < MAX_SCALE {
         let mut scaled = remainder;
         if mul_small(&mut scaled, 10) != 0 {
@@ -419,7 +448,13 @@ pub fn divide(mut a: Dec, b: Dec) -> Result<[u32; 4], Fault> {
             one[0] = 1;
             add_into(&mut quotient, &one);
             if exceeds_96(&quotient) {
-                return Err(Fault::Overflow);
+                if result_scale == 0 {
+                    return Err(Fault::Overflow);
+                }
+                if div10(&mut quotient) >= 5 {
+                    add_into(&mut quotient, &one);
+                }
+                result_scale -= 1;
             }
         }
     }
@@ -427,7 +462,7 @@ pub fn divide(mut a: Dec, b: Dec) -> Result<[u32; 4], Fault> {
     if is_zero(&quotient) {
         return Ok(encode(&quotient, 0, negative));
     }
-    let floor = if natural > 0 { natural as u32 } else { 0 };
+    let floor = if exact && natural > 0 { natural as u32 } else { 0 };
     while result_scale > floor {
         let mut reduced = quotient;
         if div10(&mut reduced) != 0 {
@@ -440,7 +475,9 @@ pub fn divide(mut a: Dec, b: Dec) -> Result<[u32; 4], Fault> {
 }
 
 /// The remainder `a % b` (.NET's `Decimal.Remainder`): the result has the sign of the dividend,
-/// including when it is zero, and `|a % b| < |b|`.
+/// including when it is zero (ECMA-334 2nd ed and 4th ed 14.7.3 give a nonzero result the
+/// dividend's sign; a zero's is .NET's, and ECMA-335 6th ed IV.5.7 gives a zero result no sign),
+/// and `|a % b| < |b|`.
 ///
 /// A dividend SMALLER in magnitude than the divisor is already the remainder, and .NET returns it
 /// untouched -- so `1m % 1.5m` is `1`, not the numerically equal `1.0` that computing it at the
@@ -519,128 +556,155 @@ fn shl1(mag: &mut [u32; LIMBS]) {
     }
 }
 
-/// Converts an `f64` to a [`Dec`] the way .NET's `Decimal(double)` ctor does: round the
-/// value to 15 significant decimal digits (double's reliable precision), then express that as
-/// a 96-bit mantissa with the matching scale. NaN, an infinity, or a magnitude outside the
-/// `Decimal` range is [`Fault::Overflow`], which is the `OverflowException` the managed
-/// constructor raises.
+/// Converts an `f64` to a [`Dec`] by the standard's rule (ECMA-334 2nd ed 13.2.1: "the source value is converted
+/// to decimal representation and rounded to the nearest number after the 28th decimal place if required"; 4th ed
+/// 13.2.1 says the same). The double's exact binary value keeps its own number of places when that is at most 28
+/// and its integer fits 96 bits; otherwise it is rounded once, to the nearest value at the largest scale that
+/// fits, a tie going to the even neighbor. A result of zero is `0`, with no places and no sign. NaN, an infinity,
+/// and a value whose integer part needs more than 96 bits are [`Fault::Overflow`], the `OverflowException` the
+/// managed constructor raises.
 #[cfg(feature = "float")]
 pub fn from_double(value: f64) -> Result<[u32; 4], Fault> {
-    // Decimal.MaxValue is 2^96 - 1. Reject the source magnitude before rounding
-    // significant digits can bring an out-of-range value back into range.
-    if !value.is_finite() || value.abs() >= (1u128 << 96) as f64 {
+    if !value.is_finite() {
         return Err(Fault::Overflow);
     }
-    if value == 0.0 {
-        return finish([0u32; LIMBS], 0, false);
-    }
-    let negative = value < 0.0;
-    let magnitude = value.abs();
-    let mut exp = floor_log10(magnitude);
-    let mut digits15 = magnitude / pow10_f64(exp - 14);
-    if digits15 >= 1e15 {
-        exp += 1;
-        digits15 = magnitude / pow10_f64(exp - 14);
-    } else if digits15 < 1e14 {
-        exp -= 1;
-        digits15 = magnitude / pow10_f64(exp - 14);
-    }
-    let rounded = round_half_even_f64(digits15);
-    let mut int_digits = rounded as u128;
-    if int_digits == 0 {
-        return finish([0u32; LIMBS], 0, false);
-    }
-    let mut scale_pow = exp - 14;
-    while int_digits % 10 == 0 {
-        int_digits /= 10;
-        scale_pow += 1;
-    }
-    let mut mag = [0u32; LIMBS];
-    mag[0] = int_digits as u32;
-    mag[1] = (int_digits >> 32) as u32;
-    mag[2] = (int_digits >> 64) as u32;
-    let words = if scale_pow >= 0 {
-        if !scale_up(&mut mag, scale_pow as u32) {
-            return Err(Fault::Overflow);
-        }
-        finish(mag, 0, negative)?
-    } else {
-        finish(mag, (-scale_pow) as u32, negative)?
-    };
-    if words[0] | words[1] | words[2] == 0 {
+    let bits = value.to_bits();
+    let negative = bits >> 63 == 1;
+    let biased = ((bits >> 52) & 0x7FF) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    let (mut significand, mut exponent) =
+        if biased == 0 { (fraction, -1074) } else { (fraction | (1u64 << 52), biased - 1075) };
+    if significand == 0 {
         return Ok([0, 0, 0, 0]);
     }
-    Ok(words)
-}
-
-/// `floor(log10(x))` for a finite positive `x`, without a math library: bracket the value
-/// between consecutive integer powers of ten (the range of magnitudes is small).
-#[cfg(feature = "float")]
-fn floor_log10(x: f64) -> i32 {
-    let mut exp = 0i32;
-    let mut v = x;
-    while v >= 10.0 {
-        v /= 10.0;
-        exp += 1;
+    while significand & 1 == 0 && exponent < 0 {
+        significand >>= 1;
+        exponent += 1;
     }
-    while v < 1.0 {
-        v *= 10.0;
-        exp -= 1;
+    if exponent >= 0 {
+        let width = 64 - significand.leading_zeros() + exponent as u32;
+        if width > 96 {
+            return Err(Fault::Overflow);
+        }
+        let whole = u128::from(significand) << exponent;
+        let mut mag = [0u32; LIMBS];
+        mag[0] = whole as u32;
+        mag[1] = (whole >> 32) as u32;
+        mag[2] = (whole >> 64) as u32;
+        return Ok(encode(&mag, 0, negative));
     }
-    exp
-}
-
-/// `10^n` as an `f64` for a small signed exponent, by repeated multiply/divide (exact for the
-/// |n| <= ~22 range where 10^n is representable exactly in a double; good enough beyond).
-#[cfg(feature = "float")]
-fn pow10_f64(n: i32) -> f64 {
-    let mut result = 1.0f64;
-    let mut k = n.abs();
-    while k > 0 {
-        result *= 10.0;
-        k -= 1;
+    let places = (-exponent) as u32;
+    if places > 147 {
+        return Ok([0, 0, 0, 0]);
     }
-    if n < 0 { 1.0 / result } else { result }
-}
-
-/// Rounds an `f64` to the nearest integer, ties to even.
-#[cfg(feature = "float")]
-fn round_half_even_f64(x: f64) -> f64 {
-    let floor = floor_f64(x);
-    let frac = x - floor;
-    if frac < 0.5 {
-        floor
-    } else if frac > 0.5 {
-        floor + 1.0
-    } else if (floor as i64) & 1 == 0 {
-        floor
-    } else {
-        floor + 1.0
+    let mut scale = places.min(MAX_SCALE);
+    loop {
+        let mut mag = [0u32; LIMBS];
+        mag[0] = significand as u32;
+        mag[1] = (significand >> 32) as u32;
+        let fits = scale_up(&mut mag, scale);
+        debug_assert!(fits, "53 bits times 10^28 fit the buffer");
+        round_shift_right(&mut mag, places);
+        if !exceeds_96(&mag) {
+            if is_zero(&mag) {
+                return Ok([0, 0, 0, 0]);
+            }
+            return Ok(encode(&mag, scale, negative));
+        }
+        if scale == 0 {
+            return Err(Fault::Overflow);
+        }
+        scale -= 1;
     }
 }
 
-/// `floor(x)` for a non-negative `x` within the i64 range (the 15-digit integers here),
-/// without a math library.
+/// Shifts a magnitude right by `bits`, rounding to the nearest, a tie to even (`bits` below the buffer's width).
 #[cfg(feature = "float")]
-fn floor_f64(x: f64) -> f64 {
-    let truncated = x as i64 as f64;
-    if truncated > x { truncated - 1.0 } else { truncated }
+fn round_shift_right(mag: &mut [u32; LIMBS], bits: u32) {
+    if bits == 0 {
+        return;
+    }
+    let bit = |m: &[u32; LIMBS], i: u32| (m[(i / 32) as usize] >> (i % 32)) & 1 == 1;
+    let half = bit(mag, bits - 1);
+    let mut below = false;
+    for i in 0..bits - 1 {
+        if bit(mag, i) {
+            below = true;
+            break;
+        }
+    }
+    let words = (bits / 32) as usize;
+    let shift = bits % 32;
+    for i in 0..LIMBS {
+        let low = if i + words < LIMBS { mag[i + words] } else { 0 };
+        let high = if i + words + 1 < LIMBS { mag[i + words + 1] } else { 0 };
+        mag[i] = if shift == 0 { low } else { (low >> shift) | (high << (32 - shift)) };
+    }
+    if half && (below || mag[0] & 1 == 1) {
+        let mut one = [0u32; LIMBS];
+        one[0] = 1;
+        add_into(mag, &one);
+    }
 }
 
-/// Converts a decoded decimal to the nearest `f64` (.NET's `(double)dec` operator): the
-/// 96-bit mantissa as a float divided by `10^scale`. Double's rounding gives the same
-/// result as .NET here for the values the corpus exercises.
+/// Converts a decoded decimal to the nearest `f64`, a tie going to the even neighbor (ECMA-334 2nd ed 13.2.1:
+/// "the decimal value is rounded to the nearest double or float value"; 4th ed 13.2.1 says the same).
 #[cfg(feature = "float")]
 pub fn to_double(a: Dec) -> f64 {
-    let mantissa =
-        u128::from(a.mag[0]) | (u128::from(a.mag[1]) << 32) | (u128::from(a.mag[2]) << 64);
-    let mut value = mantissa as f64;
-    value /= pow10_f64(a.scale as i32);
-    if a.negative {
-        -value
-    } else {
-        value
+    let sign = if a.negative { 1u64 << 63 } else { 0 };
+    match nearest_binary(&a, 53) {
+        Some((significand, exponent)) => {
+            let biased = (exponent + 52 + 1023) as u64;
+            f64::from_bits(sign | (biased << 52) | (significand as u64 & ((1u64 << 52) - 1)))
+        }
+        None => f64::from_bits(sign),
     }
+}
+
+/// The nearest binary floating-point value to a decimal, with `width` significant bits: `Some((q, e))` where
+/// `q` has exactly `width` bits and the value is `q * 2^e`, a tie going to even; `None` for a zero.
+#[cfg(feature = "float")]
+fn nearest_binary(a: &Dec, width: u32) -> Option<(u128, i32)> {
+    let numerator =
+        u128::from(a.mag[0]) | (u128::from(a.mag[1]) << 32) | (u128::from(a.mag[2]) << 64);
+    if numerator == 0 {
+        return None;
+    }
+    let divisor = 10u128.pow(a.scale);
+    let bit_length = |x: u128| 128 - x.leading_zeros();
+    let wanted = width + 1;
+    let mut quotient = numerator / divisor;
+    let mut remainder = numerator % divisor;
+    let mut exponent = 0i32;
+    let sticky;
+    if bit_length(quotient) > wanted {
+        let drop = bit_length(quotient) - wanted;
+        sticky = quotient & ((1u128 << drop) - 1) != 0 || remainder != 0;
+        quotient >>= drop;
+        exponent = drop as i32;
+    } else {
+        while bit_length(quotient) < wanted {
+            remainder <<= 1;
+            quotient <<= 1;
+            if remainder >= divisor {
+                remainder -= divisor;
+                quotient |= 1;
+            }
+            exponent -= 1;
+        }
+        sticky = remainder != 0;
+    }
+    let round = quotient & 1 == 1;
+    quotient >>= 1;
+    exponent += 1;
+    if round && (sticky || quotient & 1 == 1) {
+        quotient += 1;
+        if bit_length(quotient) > width {
+            quotient >>= 1;
+            exponent += 1;
+        }
+    }
+    Some((quotient, exponent))
 }
 
 /// The signed difference `a - b`, which is `a + (-b)`: the sign of the subtrahend is flipped and
@@ -656,7 +720,7 @@ mod tests {
     use super::{Fault, from_double};
 
     #[test]
-    fn from_double_checks_range_before_rounding_significant_digits() {
+    fn from_double_refuses_two_to_the_96th_and_accepts_the_double_below() {
         let boundary = (1u128 << 96) as f64;
         for value in [boundary, f64::from_bits(boundary.to_bits() + 1)] {
             for signed in [value, -value] {

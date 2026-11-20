@@ -28,16 +28,21 @@ fn arm_float_abi(target: &str) -> &'static str {
     if target.ends_with("eabihf") { "-mfloat-abi=hard" } else { "-mfloat-abi=soft" }
 }
 
-/// The -mcpu matching the Rust target's architecture floor.
-fn arm_cpu(target: &str) -> &'static str {
+/// The core to compile for, matching the Rust target's architecture floor.
+///
+/// An ARMv8-M Mainline target gets the Cortex-M33's tuning (`-mtune`) rather than the core
+/// (`-mcpu`): the `cc` crate already names that target's architecture with `-march`, without the
+/// DSP extension a Cortex-M33 implies, and GCC builds to `-march` and warns when `-mcpu` disagrees
+/// with it.
+fn arm_cpu_flag(target: &str) -> &'static str {
     if target.starts_with("thumbv7em") {
-        "cortex-m4"
+        "-mcpu=cortex-m4"
     } else if target.starts_with("thumbv6m") {
-        "cortex-m0plus"
+        "-mcpu=cortex-m0plus"
     } else if target.starts_with("thumbv8m.main") {
-        "cortex-m33"
+        "-mtune=cortex-m33"
     } else {
-        "cortex-m3"
+        "-mcpu=cortex-m3"
     }
 }
 
@@ -91,7 +96,7 @@ fn main() {
             .archiver(&ar)
             .define("LAMELLA_FREESTANDING_LIBC", None)
             .flag("-fno-builtin")
-            .flag(format!("-mcpu={}", arm_cpu(&target)))
+            .flag(arm_cpu_flag(&target))
             .flag("-mthumb")
             .flag(arm_float_abi(&target))
             .flag("-Os")

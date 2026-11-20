@@ -200,7 +200,27 @@ pub mod load {
         /// **The kind check runs BEFORE the allocation**, and it has to. Nothing above it looks at what the
         /// payload IS, so without it an artifact the caller can never run reserves the whole budget
         /// and is acknowledged as a good transfer.
+        ///
+        /// **A chunk refused after a COMPLETED transfer lets go of the artifact**, so an `EXEC` that
+        /// follows finds nothing to run rather than the artifact before. A transfer still in flight
+        /// stays live: the chunk that was actually next is taken.
         pub fn take_chunk(
+            &mut self,
+            payload: &[u8],
+            capacity: usize,
+            accepts: impl FnOnce(&[u8]) -> bool,
+        ) -> u8 {
+            let held = self.complete();
+            let status = self.assemble(payload, capacity, accepts);
+            if status != xfer::MATCHED && held {
+                self.clear();
+            }
+            status
+        }
+
+        /// [`LoadBuffer::take_chunk`]'s assembly of one chunk, before the rule for a completed
+        /// transfer.
+        fn assemble(
             &mut self,
             payload: &[u8],
             capacity: usize,
@@ -1176,6 +1196,11 @@ fn resident_surface_symbols() -> u64 {
         | (u64::from(RESIDENT_SURFACE_HI.load(Ordering::Relaxed)) << 32)
 }
 
+/// The format of the image each surface of [`profile_identity`] loads, in its order, which a HELLO
+/// acknowledgement states: the one CIL runtime's, a baked image of this build's format.
+#[cfg(feature = "baked-image")]
+const IMAGE_FORMATS: [u16; 1] = [lamella_cil_runtime::BAKED_IMAGE_FORMAT];
+
 #[cfg(feature = "baked-image")]
 fn hello_reply_caps(
     transport: &mut impl Transport,
@@ -1191,6 +1216,7 @@ fn hello_reply_caps(
             caps,
             profile_identity(),
             transport.max_inbound_payload(),
+            Some(&IMAGE_FORMATS),
         ) {
             Ok(ack) => {
                 STRING_VALUES_AGREED.store(
@@ -1332,6 +1358,7 @@ fn encode_location(location: &lamella_cil_runtime::Location, out: &mut Vec<u8>) 
         Location::Static { slot } => (8, *slot as u32, 0, 0),
         Location::Boxed { object } => (9, object.index(), 0, 0),
         Location::Nested { base, slot } => (10, *slot, location_kind(base), 0),
+        Location::StaticBytes { slot, byte_offset } => (11, *slot as u32, *byte_offset, 0),
     };
     out.push(kind);
     out.extend_from_slice(&a.to_le_bytes());
@@ -1355,6 +1382,7 @@ fn location_kind(location: &lamella_cil_runtime::Location) -> u32 {
         Location::Static { .. } => 8,
         Location::Boxed { .. } => 9,
         Location::Nested { .. } => 10,
+        Location::StaticBytes { .. } => 11,
     }
 }
 
@@ -2131,7 +2159,8 @@ pub fn run_debug_session_static(
 /// # Errors
 /// A message naming what was wrong: an unrecognized artifact, a PE with no resident corlib to
 /// resolve against, a malformed assembly, an image that records no entry point, or -- on the
-/// constrained tier -- a corlib member the resident corlib does not carry.
+/// constrained tier -- a corlib member the resident corlib does not carry. An image of another
+/// format gets the board's answer alone, [`lamella_wire::image_format::REDEPLOY_PROGRAM`].
 #[cfg(feature = "baked-image")]
 pub fn load_deployed(
     artifact: &'static [u8],
@@ -2141,6 +2170,9 @@ pub fn load_deployed(
         Some(b"LM") => match lamella_cil_runtime::Module::from_baked(artifact) {
             Ok((module, Some(entry))) => Ok((module, entry)),
             Ok((_, None)) => Err(String::from("image records no entry point")),
+            Err(lamella_cil_runtime::module::BakeError::WrongVersion(_)) => {
+                Err(String::from(lamella_wire::image_format::REDEPLOY_PROGRAM))
+            }
             Err(error) => Err(format!("image does not boot: {error:?}")),
         },
         Some(b"MZ") => {
@@ -2358,8 +2390,8 @@ pub trait ImageResidence {
     fn admit(&mut self, image: Vec<u8>) -> Option<&'static [u8]>;
 
     /// The transfer arena has let go of the image this residence placed last: a new transfer has
-    /// begun, or the host cleared the arena. Nothing borrows that image now, so a residence that
-    /// reuses memory may reclaim it here, before the next transfer reserves its own.
+    /// begun, a chunk was refused, or the host cleared the arena. Nothing borrows that image now, so
+    /// a residence that reuses memory may reclaim it here, before the next transfer reserves its own.
     ///
     /// Called with nothing executing, because an execution refuses every transfer while it exists.
     /// A residence that never reclaims does nothing, which is the default.
@@ -2438,6 +2470,19 @@ impl ArtifactLoad {
         self.bytes.extend_from_slice(data);
         self.complete = self.bytes.len() == total;
         xfer::MATCHED
+    }
+
+    /// [`ArtifactLoad::chunk`] for a `LOAD_x` chunk: a REFUSED chunk lets go of a COMPLETED artifact,
+    /// so an [`exec::EXEC`] that follows answers that there is nothing to run rather than starting
+    /// what an earlier transfer placed. A transfer still in flight stays live, so the chunk that was
+    /// actually next is taken, as [`load::LoadBuffer`] takes it.
+    fn load_chunk(&mut self, kind: u8, payload: &[u8]) -> u8 {
+        let held = self.complete;
+        let status = self.chunk(kind, payload);
+        if status != lamella_wire::msg::xfer::MATCHED && held {
+            self.clear();
+        }
+        status
     }
 
     /// Discard everything: the transfer in progress, and any completed artifact.
@@ -2873,9 +2918,12 @@ fn serve_frame_baked(
                 load.clear();
                 residence.release();
             }
-            let mut status = load.chunk(frame.msg_type, &frame.payload);
+            let mut status = load.load_chunk(frame.msg_type, &frame.payload);
             if status == lamella_wire::msg::xfer::MATCHED && !load.place(residence) {
                 status = lamella_wire::msg::xfer::WRITE_FAILED;
+            }
+            if status != lamella_wire::msg::xfer::MATCHED {
+                residence.release();
             }
             send_xfer_result(transport, frame.seq, status, load.crc32())?;
         }
@@ -3714,9 +3762,9 @@ fn hello_reply_repl(
     use lamella_wire::{Hello, PROTOCOL_VERSION, ProtocolRange, msg, target_respond};
     let range = ProtocolRange { min: PROTOCOL_VERSION, max: PROTOCOL_VERSION };
     #[cfg(feature = "baked-image")]
-    let identity = profile_identity();
+    let (identity, formats) = (profile_identity(), Some(&IMAGE_FORMATS[..]));
     #[cfg(not(feature = "baked-image"))]
-    let identity = lamella_wire::TargetIdentity::default();
+    let (identity, formats) = (lamella_wire::TargetIdentity::default(), None);
     match Hello::decode(&frame.payload) {
         Some(hello) => match target_respond(
             &hello,
@@ -3724,6 +3772,7 @@ fn hello_reply_repl(
             repl_caps(),
             identity,
             transport.max_inbound_payload(),
+            formats,
         ) {
             Ok(ack) => transport.send(msg::HELLO_ACK, frame.seq, &ack.encode()),
             Err(nak) => transport.send(msg::HELLO_NAK, frame.seq, &nak.encode()),
@@ -3864,7 +3913,7 @@ fn serve_repl_frame(
         lamella_wire::msg::HELLO => hello_reply_repl(transport, &frame)?,
         #[cfg(not(feature = "baked-image"))]
         load::LOAD_PE => {
-            let status = load.chunk(frame.msg_type, &frame.payload);
+            let status = load.load_chunk(frame.msg_type, &frame.payload);
             send_xfer_result(transport, frame.seq, status, load.crc32())?;
         }
         #[cfg(not(feature = "baked-image"))]
@@ -3949,7 +3998,7 @@ pub fn serve_one_with(
     };
     match frame.msg_type {
         load::LOAD_PE | load::LOAD_IMAGE => {
-            let status = load.chunk(frame.msg_type, &frame.payload);
+            let status = load.load_chunk(frame.msg_type, &frame.payload);
             send_xfer_result(transport, frame.seq, status, load.crc32())?;
         }
         load::LOAD_CLEAR => {
@@ -5051,6 +5100,83 @@ mod tests {
         assert_eq!(serve_one_deploy(&mut runner, &mut flash, &mut arena).unwrap(), Served::Handled);
         driver.feed(&runner.take_sent());
         assert_eq!(every_frame(&mut driver), [(exec::EXEC_ACK, 4, Some(exec::ack::NOTHING_TO_RUN))]);
+    }
+
+    /// One `LOAD_x` chunk: `offset(u32 LE)`, `total(u32 LE)`, then the bytes.
+    fn chunk_payload(offset: u32, total: u32, body: &[u8]) -> Vec<u8> {
+        let mut payload = offset.to_le_bytes().to_vec();
+        payload.extend_from_slice(&total.to_le_bytes());
+        payload.extend_from_slice(body);
+        payload
+    }
+
+    /// **A REFUSED LOAD CHUNK LETS GO OF THE ARTIFACT HELD BEFORE IT**, so an EXEC that follows
+    /// answers that there is nothing to run rather than starting what an earlier LOAD placed. The
+    /// refusals are the three a chunk can draw after a completed transfer: a gap, a switched kind,
+    /// and a header too short to read.
+    #[cfg(feature = "baked-image")]
+    #[test]
+    fn after_a_refused_load_chunk_an_exec_has_nothing_to_run() {
+        use lamella_wire::MemTransport;
+        use lamella_wire::msg::xfer;
+        let refusals = [
+            (load::LOAD_IMAGE, chunk_payload(8, 16, b"abcd")),
+            (load::LOAD_PE, chunk_payload(4, 8, b"abcd")),
+            (load::LOAD_IMAGE, vec![1, 0, 0]),
+        ];
+        for (kind, refused) in refusals {
+            let mut flash = Holding(&[0xFF; 64]);
+            let (mut driver, mut runner, mut arena) = (MemTransport::new(), MemTransport::new(), ArtifactLoad::new());
+            driver.send(load::LOAD_IMAGE, 1, &chunk_payload(0, 4, b"LMxx")).unwrap();
+            driver.send(kind, 2, &refused).unwrap();
+            driver.send(exec::EXEC, 3, &[exec::exec_source::LOADED, 0]).unwrap();
+            runner.feed(&driver.take_sent());
+            for _ in 0..3 {
+                assert_eq!(serve_one_deploy(&mut runner, &mut flash, &mut arena).unwrap(), Served::Handled);
+            }
+            driver.feed(&runner.take_sent());
+            let frames = every_frame(&mut driver);
+            let expected = [
+                (load::XFER_RESULT, 1, Some(xfer::MATCHED)),
+                (load::XFER_RESULT, 2, Some(xfer::RANGE_REJECTED)),
+                (exec::EXEC_ACK, 3, Some(exec::ack::NOTHING_TO_RUN)),
+            ];
+            assert_eq!(frames.get(..3), Some(&expected[..]), "after {kind:#x} {refused:?}: {frames:?}");
+        }
+    }
+
+    /// A refused chunk lets go of a completed artifact and of nothing else: a transfer still in flight
+    /// stays live, and the chunk that was actually next completes it, as `LoadBuffer`'s rows hold for
+    /// the assembler the other runtimes use.
+    #[test]
+    fn a_chunk_refused_in_flight_leaves_the_transfer_live() {
+        use lamella_wire::msg::xfer;
+        let mut arena = ArtifactLoad::new();
+        assert_eq!(arena.load_chunk(load::LOAD_PE, &chunk_payload(0, 6, b"ab")), xfer::MATCHED);
+        assert_eq!(arena.load_chunk(load::LOAD_PE, &chunk_payload(4, 6, b"ef")), xfer::RANGE_REJECTED);
+        assert_eq!(arena.load_chunk(load::LOAD_PE, &chunk_payload(2, 6, b"cd")), xfer::MATCHED);
+        assert_eq!(arena.load_chunk(load::LOAD_PE, &chunk_payload(4, 6, b"ef")), xfer::MATCHED);
+        assert_eq!(arena.held(), Some((load::LOAD_PE, &b"abcdef"[..])));
+    }
+
+    /// The reference runner keeps the same rule: after a refused chunk, an EXEC has nothing to run.
+    #[test]
+    fn the_reference_runner_has_nothing_to_run_after_a_refused_load_chunk() {
+        use lamella_wire::{MemTransport, Transport};
+        let (mut driver, mut runner, mut arena) = (MemTransport::new(), MemTransport::new(), ArtifactLoad::new());
+        driver.send(load::LOAD_PE, 1, &chunk_payload(0, 4, b"MZxx")).unwrap();
+        driver.send(load::LOAD_PE, 2, &chunk_payload(8, 16, b"abcd")).unwrap();
+        driver.send(exec::EXEC, 3, &[exec::exec_source::LOADED, 0]).unwrap();
+        runner.feed(&driver.take_sent());
+        for _ in 0..3 {
+            assert!(serve_one(&mut runner, &[], &mut arena).unwrap());
+        }
+        driver.feed(&runner.take_sent());
+        let mut frames = Vec::new();
+        while let Some(frame) = driver.poll().unwrap() {
+            frames.push((frame.msg_type, frame.seq, frame.payload.first().copied()));
+        }
+        assert_eq!(frames.get(2), Some(&(exec::EXEC_ACK, 3, Some(exec::ack::NOTHING_TO_RUN))), "{frames:?}");
     }
 
     /// What a panic handler writes with [`report_abort`] ends a run the way any trap does: a host

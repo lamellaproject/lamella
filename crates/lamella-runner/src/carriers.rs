@@ -556,6 +556,17 @@ impl Transport for CarrierSet<'_, '_> {
         }
     }
 
+    /// What the carrier whose request is being answered can absorb in one frame, as that carrier
+    /// declares it; `None` while no request is being answered.
+    ///
+    /// A `HELLO` arrives on one carrier and its acknowledgement goes back over that carrier, so the
+    /// limit the acknowledgement states is that carrier's, and the carriers of one set differ: a
+    /// board's serial ring holds a few hundred bytes where its USB endpoint is refilled only as fast
+    /// as the firmware drains it.
+    fn max_inbound_payload(&self) -> Option<usize> {
+        self.carriers.get(self.reply_to?)?.transport.max_inbound_payload()
+    }
+
     /// The same routing as [`Transport::send`], for a caller above this set that has an unsolicited
     /// frame of its own and does not want to block on a carrier nobody is reading.
     fn try_send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<bool, TransportError> {
@@ -638,6 +649,8 @@ mod tests {
         last_packet_pending: bool,
         /// How many times the blocking `send` was used on this line.
         blocking_sends: usize,
+        /// What this line says it can absorb in one frame.
+        declares: Option<usize>,
     }
 
     /// One carrier, as a handle the test keeps a clone of. The set holds one clone and the test the
@@ -681,6 +694,11 @@ mod tests {
         fn blocking_sends(&self) -> usize {
             self.0.borrow().blocking_sends
         }
+
+        /// The line says it can absorb `payload` bytes in one frame.
+        fn declare(&self, payload: usize) {
+            self.0.borrow_mut().declares = Some(payload);
+        }
     }
 
     impl Transport for Line {
@@ -701,6 +719,10 @@ mod tests {
                 return Err(TransportError::Closed);
             }
             Ok(state.reader.next_frame())
+        }
+
+        fn max_inbound_payload(&self) -> Option<usize> {
+            self.0.borrow().declares
         }
 
         fn try_send(
@@ -730,6 +752,27 @@ mod tests {
         payload.extend_from_slice(&64u32.to_le_bytes());
         payload.extend_from_slice(&[0xAA; 4]);
         payload
+    }
+
+    #[test]
+    fn a_set_states_the_limit_of_the_carrier_whose_request_it_answers() {
+        set_now(0);
+        let uart = Line::default();
+        let tcp = Line::default();
+        uart.declare(lamella_wire::max_payload_for_ring(512));
+        tcp.declare(lamella_wire::MAX_PAYLOAD);
+        let (mut uart_t, mut tcp_t) = (uart.clone(), tcp.clone());
+        let mut carriers = [Carrier::physical(&mut uart_t), Carrier::network(&mut tcp_t)];
+        let mut set = CarrierSet::new(&mut carriers, now_ms, windows()).expect("two carriers");
+        assert_eq!(set.max_inbound_payload(), None, "nothing is being answered yet");
+
+        tcp.host_sends(msg::HELLO, 1, &[]);
+        assert!(set.poll().unwrap().is_some(), "the network host is served");
+        assert_eq!(set.max_inbound_payload(), Some(lamella_wire::MAX_PAYLOAD), "the network carrier's");
+
+        uart.host_sends(msg::HELLO, 2, &[]);
+        assert!(set.poll().unwrap().is_some(), "a cable takes the board at once");
+        assert_eq!(set.max_inbound_payload(), Some(502), "the serial carrier's: a 512-byte ring's 511 bytes, less the framing");
     }
 
     #[test]

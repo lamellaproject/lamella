@@ -53,11 +53,20 @@ namespace System
             return current;
         }
 
+#if LAMELLA_SURFACE_NETFX_2_0
+        /// <summary>Gets the runtime type of the current instance.</summary>
+        /// <returns>The exact runtime type of the current instance.</returns>
+        public new Type GetType()
+        {
+            return base.GetType();
+        }
+#endif
+
         public override string ToString()
         {
             string message = Message;
-            Type type = GetType();
-            string text = (object)type == null ? base.ToString() : type.FullName;
+            Type type = ((object)this).GetType();
+            string text = (object)type == null ? base.ToString() : type.ToString();
             if (message != null && message.Length != 0)
             {
                 text = text + ": " + message;

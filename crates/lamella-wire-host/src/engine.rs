@@ -1213,6 +1213,7 @@ mod tests {
                     ..lamella_wire::TargetIdentity::default()
                 },
                 max_inbound_payload: None,
+                image_formats: None,
             };
             let mut board = MemTransport::new();
             lamella_wire::Transport::send(&mut board, lamella_wire::msg::HELLO_ACK, 0, &ack.encode())
@@ -1381,6 +1382,7 @@ mod tests {
     }
 
     /// A scratch directory named for the test using it, so two tests never collide.
+    #[cfg(feature = "repl-host")]
     pub(super) fn scratch(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("lamella-refset-{name}"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -1390,6 +1392,7 @@ mod tests {
 
     /// **THE CLASS LIBRARY `csharp/build-managed.ps1` WRITES IS FOUND WITH NOTHING SET**, so a clone that
     /// has followed the README's two build steps runs a program with no variable to set.
+    #[cfg(feature = "repl-host")]
     #[test]
     fn a_build_for_use_ends_its_search_at_the_class_library_of_its_own_source_tree() {
         let tree = LcscCompiler::source_tree().expect("a test build is a build from a source tree");
@@ -1405,6 +1408,7 @@ mod tests {
 
     /// **NOTHING BUILT FOR USE LOOKS AT THE TEST CORLIB**, so no program runs against a test input
     /// while the tool says nothing.
+    #[cfg(feature = "repl-host")]
     #[test]
     fn a_build_for_use_never_looks_at_the_test_corlib() {
         let tests = LcscCompiler::source_tree()
@@ -1419,6 +1423,7 @@ mod tests {
 
     /// **A TEST BUILD BINDS THE TEST CORLIB, AND LOOKS AT IT FIRST**, so every test binds the same
     /// corlib whatever else the tree holds: a `managed/` built from older sources included.
+    #[cfg(feature = "repl-host")]
     #[test]
     fn a_test_build_looks_at_the_test_corlib_before_any_other_place() {
         let fixture = ["crates", "lamella-load", "tests", "fixtures", "corlib.dll"]
@@ -1435,6 +1440,7 @@ mod tests {
     /// **A RELEASE ARCHIVE's CLASS LIBRARY IS FOUND IN THE `csharp` FOLDER BESIDE THE EXECUTABLE**, and
     /// nothing is looked for beside the executable itself, so the archive keeps the C# class library
     /// out of the tool's own folder.
+    #[cfg(feature = "repl-host")]
     #[test]
     fn the_class_library_of_a_release_archive_is_looked_for_in_its_csharp_folder() {
         let exe = std::env::current_exe().expect("the test's own executable");
@@ -1474,6 +1480,7 @@ mod tests {
 
     /// **A PACKAGED BUILD THAT FINDS NO CLASS LIBRARY SAYS WHERE ITS ARCHIVE CARRIES ONE**, then how
     /// to name another.
+    #[cfg(feature = "repl-host")]
     #[test]
     fn a_packaged_build_that_finds_none_names_the_folder_its_archive_carries_it_in() {
         let archive = std::path::Path::new("lamella-0.4.0-win-x64").join("csharp");
@@ -1495,6 +1502,7 @@ mod tests {
 
     /// **A NAMED FOLDER OUTRANKS A NAMED CORLIB, AND EITHER OUTRANKS EVERY PLACE.** Each holds a
     /// different file here, so the answer says which one was taken.
+    #[cfg(feature = "repl-host")]
     #[test]
     fn a_named_folder_outranks_a_named_corlib_and_both_outrank_every_place() {
         let dir = scratch("ranks");
@@ -1516,6 +1524,7 @@ mod tests {
     /// **WITH NOTHING FOUND, THE REFUSAL NAMES THE BUILD STEP THAT WRITES THE CLASS LIBRARY**, and
     /// where it writes it. A bare `lcsc` line cannot build it: the corlib needs the capability
     /// symbols `csharp/build-managed.ps1` passes.
+    #[cfg(feature = "repl-host")]
     #[test]
     fn with_nothing_found_the_refusal_names_the_build_step_and_where_it_writes() {
         let error = LcscCompiler::search(None, None, &[], None).expect_err("there is nothing to find");
@@ -1529,6 +1538,7 @@ mod tests {
 
     /// **A FOLDER GIVEN ON A COMMAND LINE OUTRANKS THE ONE `LAMELLA_REF_DIR` NAMES**, and the
     /// variable still names one when no folder is given.
+    #[cfg(feature = "repl-host")]
     #[test]
     fn a_folder_given_on_a_command_line_outranks_the_one_the_variable_names() {
         let given = std::path::Path::new("given");
@@ -1540,6 +1550,7 @@ mod tests {
 
     /// **A COMMAND LINE THAT TAKES THE FOLDER AS AN OPTION IS TOLD OF THE OPTION**, beside the
     /// variable, and one that takes no option keeps its words.
+    #[cfg(feature = "repl-host")]
     #[test]
     fn with_nothing_found_the_refusal_names_the_option_beside_the_variable() {
         let error = LcscCompiler::search(None, None, &[], Some("--ref-dir")).expect_err("there is nothing to find");

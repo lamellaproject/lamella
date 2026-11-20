@@ -49,6 +49,19 @@ namespace Lamella.Generated
         public const uint GPIOI_RCC_EN_OFF = 48;
         public const uint GPIOI_RCC_EN_BIT = 8;
         public const uint GPIOI_RCC_EN_MASK = 0x100;
+        public const uint GPIOJ_BASE = 0x40022400;
+        public const uint GPIOJ_RCC_EN_OFF = 48;
+        public const uint GPIOJ_RCC_EN_BIT = 9;
+        public const uint GPIOJ_RCC_EN_MASK = 0x200;
+        public const uint GPIOK_BASE = 0x40022800;
+        public const uint GPIOK_RCC_EN_OFF = 48;
+        public const uint GPIOK_RCC_EN_BIT = 10;
+        public const uint GPIOK_RCC_EN_MASK = 0x400;
+        public const uint EXTI_BASE = 0x40013C00;
+        public const uint SYSCFG_BASE = 0x40013800;
+        public const uint SYSCFG_RCC_EN_OFF = 68;
+        public const uint SYSCFG_RCC_EN_BIT = 14;
+        public const uint SYSCFG_RCC_EN_MASK = 0x4000;
         public const uint RCC_BASE = 0x40023800;
         public const uint I2C1_BASE = 0x40005400;
         public const uint I2C1_RCC_EN_OFF = 64;
@@ -66,5 +79,9 @@ namespace Lamella.Generated
         public const uint QUADSPI_RCC_EN_OFF = 56;
         public const uint QUADSPI_RCC_EN_BIT = 1;
         public const uint QUADSPI_RCC_EN_MASK = 0x2;
+        public const uint TIM5_BASE = 0x40000C00;
+        public const uint TIM5_RCC_EN_OFF = 64;
+        public const uint TIM5_RCC_EN_BIT = 3;
+        public const uint TIM5_RCC_EN_MASK = 0x8;
     }
 }

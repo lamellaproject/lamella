@@ -64,6 +64,187 @@
     <_LamellaServesRun Condition="'$(TargetFrameworkIdentifier)' == 'Lamella' or '$(_LamellaRhuDispatch)' == 'true'">true</_LamellaServesRun>
   </PropertyGroup>
 
+  <!-- How this SDK runs a program, the lamella tool above all: LamellaRunProgram runs it as Exec runs a command, but with
+       no shell between. Each item of Arguments is one argument, which the program receives exactly as the item's value,
+       so a path holding a %, a $, a backtick or a double quote reaches it unchanged, where cmd.exe or /bin/sh would
+       expand it, substitute it or run part of it. An item whose Option metadata is set stands for two arguments: that
+       option, then the item, always in double quotes. Program is the program's full path, or a bare name, which the
+       PATH is searched for. ArgumentLine is the arguments as the program is given them; with Start false nothing is
+       started, for a caller that starts the program itself, as dotnet run starts RunCommand with RunArguments.
+
+       What else this SDK uses of Exec means what it means there: EnvironmentVariables, StandardOutputImportance,
+       StandardErrorImportance and EchoOff come from ToolTask, as Exec's do, and IgnoreExitCode,
+       IgnoreStandardErrorWarningFormat, ConsoleToMSBuild, ConsoleOutput and ExitCode are as Exec's. A program that
+       cannot be started fails the task; with IgnoreExitCode, the reason is a line of its output instead, and its exit
+       code is the one a POSIX shell gives (The Open Group Base Specifications Issue 8, Shell Command Language, 2.8.2
+       "Exit Status for Commands"): 127 when there is no such file, 126 when there is one that cannot be run, a
+       folder among them. -->
+  <UsingTask TaskName="LamellaRunProgram" TaskFactory="RoslynCodeTaskFactory" AssemblyFile="$(MSBuildToolsPath)\Microsoft.Build.Tasks.Core.dll">
+    <Task>
+      <Code Type="Class" Language="cs"><![CDATA[
+using System;
+using System.Collections.Generic;
+using System.ComponentModel;
+using System.IO;
+using System.Text;
+using Microsoft.Build.Framework;
+using Microsoft.Build.Utilities;
+
+public sealed class LamellaRunProgram : ToolTask
+{
+    private static readonly Encoding Utf8 = new UTF8Encoding(false);
+    private readonly List<ITaskItem> output = new List<ITaskItem>();
+
+    [Required] public string Program { get; set; }
+    public ITaskItem[] Arguments { get; set; }
+    public bool IgnoreExitCode { get; set; }
+    public bool IgnoreStandardErrorWarningFormat { get; set; }
+    public bool ConsoleToMSBuild { get; set; }
+    [Output] public ITaskItem[] ConsoleOutput { get { return output.ToArray(); } }
+
+    // ToolTask's own ExitCode cannot be set here, and a program refused before it starts needs one; this is ToolTask's
+    // after a run, and the refusal's otherwise.
+    [Output] public new int ExitCode { get; private set; }
+
+    public bool Start { get; set; } = true;
+    [Output] public string ArgumentLine { get; private set; }
+
+    public override bool Execute()
+    {
+        ArgumentLine = GenerateCommandLineCommands();
+        if (!Start) return true;
+        // ToolTask refuses a full path that names no file, a folder among them, before it starts anything and before
+        // ExecuteTool, with an error IgnoreExitCode cannot turn into output; so that refusal is made here first.
+        if (IgnoreExitCode && Path.IsPathRooted(Program) && !File.Exists(Program))
+        {
+            bool folder = Directory.Exists(Program);
+            MessageImportance importance;
+            if (!Enum.TryParse(StandardErrorImportance, true, out importance)) importance = MessageImportance.Normal;
+            LogEventsFromTextOutput(Program + (folder ? ": a folder, not a program" : ": no such file"), importance);
+            ExitCode = folder ? 126 : 127;
+            return true;
+        }
+        bool done = base.Execute();
+        ExitCode = base.ExitCode;
+        return done;
+    }
+
+    protected override string ToolName { get { return Path.GetFileName(Program); } }
+
+    // The lamella tool and its debugger write UTF-8, whatever code page a console would use.
+    protected override Encoding StandardOutputEncoding { get { return Utf8; } }
+    protected override Encoding StandardErrorEncoding { get { return Utf8; } }
+
+    protected override string GenerateFullPathToTool() { return Program; }
+
+    protected override string GenerateCommandLineCommands()
+    {
+        var line = new StringBuilder();
+        foreach (ITaskItem argument in Arguments ?? new ITaskItem[0])
+        {
+            string option = argument.GetMetadata("Option");
+            if (option.Length != 0) Append(line, option, false);
+            Append(line, argument.ItemSpec, option.Length != 0);
+        }
+        return line.ToString();
+    }
+
+    // Appends one argument so that the program receives it unchanged. .NET starts a program with its arguments as one
+    // line, ProcessStartInfo.Arguments, which "are parsed and interpreted by the target application" on Windows
+    // (Microsoft Learn, "ProcessStartInfo.Arguments Property") and which .NET splits itself on Linux and macOS, by the
+    // Microsoft C runtime's rules either way (Microsoft Learn, "Parsing C command-line arguments"; dotnet/runtime,
+    // System.Diagnostics.Process, ProcessUtils.Unix.cs, ParseArgumentsIntoList: "This follows the rules outlined in
+    // 'Parsing C++ Command-Line Arguments'"): white space separates arguments, a double quote begins or ends a quoted
+    // run, and a backslash is itself unless a run of them ends at a double quote, where each pair stands for one
+    // backslash and an odd one makes the quote literal. So an argument
+    // with no white space and no double quote goes as it is, unless quote asks for the quotes anyway; any other goes in
+    // double quotes, each double quote in it escaped, and each run of backslashes that ends at a double quote or at the
+    // closing quote doubled.
+    private static void Append(StringBuilder line, string argument, bool quote)
+    {
+        if (line.Length != 0) line.Append(' ');
+        if (!quote && argument.Length != 0 && !NeedsQuotes(argument))
+        {
+            line.Append(argument);
+            return;
+        }
+        line.Append('"');
+        int backslashes = 0;
+        foreach (char c in argument)
+        {
+            if (c == '\\')
+            {
+                backslashes++;
+                continue;
+            }
+            line.Append('\\', c == '"' ? backslashes * 2 + 1 : backslashes);
+            line.Append(c);
+            backslashes = 0;
+        }
+        line.Append('\\', backslashes * 2);
+        line.Append('"');
+    }
+
+    private static bool NeedsQuotes(string argument)
+    {
+        foreach (char c in argument)
+        {
+            if (char.IsWhiteSpace(c) || c == '"') return true;
+        }
+        return false;
+    }
+
+    protected override void LogEventsFromTextOutput(string singleLine, MessageImportance messageImportance)
+    {
+        if (IgnoreStandardErrorWarningFormat) Log.LogMessage(messageImportance, singleLine, null);
+        else base.LogEventsFromTextOutput(singleLine, messageImportance);
+        if (ConsoleToMSBuild)
+        {
+            string trimmed = singleLine.TrimEnd();
+            if (trimmed.Length != 0) output.Add(new TaskItem(Escape(trimmed)));
+        }
+    }
+
+    protected override int ExecuteTool(string pathToTool, string responseFileCommands, string commandLineCommands)
+    {
+        try
+        {
+            return base.ExecuteTool(pathToTool, responseFileCommands, commandLineCommands);
+        }
+        catch (Win32Exception error) when (IgnoreExitCode)
+        {
+            LogEventsFromTextOutput(Program + ": " + error.Message, StandardErrorLoggingImportance);
+            // NativeErrorCode is the system's own. Windows gives 2 or 3 for a file or a folder that is not there,
+            // ERROR_FILE_NOT_FOUND and ERROR_PATH_NOT_FOUND (Microsoft Learn, "System Error Codes (0-499)"); Linux and
+            // macOS give 2, their number for ENOENT, "No such file or directory" (The Open Group Base Specifications
+            // Issue 8, <errno.h>).
+            return error.NativeErrorCode == 2 || error.NativeErrorCode == 3 ? 127 : 126;
+        }
+    }
+
+    protected override bool HandleTaskExecutionErrors()
+    {
+        return IgnoreExitCode || base.HandleTaskExecutionErrors();
+    }
+
+    // A line as an item's value: MSBuild reads %, *, ?, @, $, (, ), ; and ' in a value as its own syntax, so each is
+    // written as %XX, which MSBuild reads back as the character itself (Microsoft Learn, "MSBuild special
+    // characters").
+    private static string Escape(string text)
+    {
+        var escaped = new StringBuilder(text.Length);
+        foreach (char c in text)
+        {
+            if ("%*?@$();'".IndexOf(c) >= 0) escaped.Append('%').Append(((int)c).ToString("X2"));
+            else escaped.Append(c);
+        }
+        return escaped.ToString();
+    }
+}
+]]></Code>
+    </Task>
+  </UsingTask>
+
   <!-- The packages the lamella tool provides for lamella1.0, as _LamellaProvidedPackage, written by
        that tool when this SDK was packed. -->
   <Import Project="$(_LamellaPackagesFile)" Condition="'$(_LamellaPackagesFile)' != '' and Exists('$(_LamellaPackagesFile)')" />
@@ -158,10 +339,11 @@
   <!-- The package Lamella.Tools.RID records no file mode, so on a machine other than Windows the tool
        restored from it is made executable before it is run. -->
   <Target Name="_LamellaToolExecutable" DependsOnTargets="_LamellaToolFault">
-    <Exec Condition="'$(_LamellaToolFault)' == '' and '$(LamellaToolPath)' == '' and !$([MSBuild]::IsOSPlatform('Windows'))"
-          Command="chmod u+x &quot;$(_LamellaTool)&quot;"
-          ContinueOnError="true"
-          StandardOutputImportance="low" />
+    <LamellaRunProgram Condition="'$(_LamellaToolFault)' == '' and '$(LamellaToolPath)' == '' and !$([MSBuild]::IsOSPlatform('Windows'))"
+                       Program="chmod"
+                       Arguments="u+x;$(_LamellaTool)"
+                       ContinueOnError="true"
+                       StandardOutputImportance="low" />
   </Target>
 
   <Target Name="_LamellaCheckTool" DependsOnTargets="_LamellaToolFault;_LamellaToolExecutable">
@@ -233,10 +415,11 @@
     <MakeDir Directories="$(_LamellaIntermediateDir)" />
     <WriteLinesToFile File="$(_LamellaReferencesInputsFile)" Lines="@(_LamellaProjectInput)" Overwrite="true" WriteOnlyWhenDifferent="true" />
     <Delete Files="$(_LamellaReferencesFile)" />
-    <Exec Command="&quot;$(_LamellaTool)&quot; build --msbuild-references &quot;$(_LamellaReferencesInputsFile)&quot;"
-          EnvironmentVariables="LAMELLA_REF_DIR=$(LamellaRefDir);LAMELLA_RUNTIME_SUPPORT_DIR=$(LamellaRuntimeSupportDir)"
-          StandardOutputImportance="normal"
-          StandardErrorImportance="normal" />
+    <LamellaRunProgram Program="$(_LamellaTool)"
+                       Arguments="build;--msbuild-references;$(_LamellaReferencesInputsFile)"
+                       EnvironmentVariables="LAMELLA_REF_DIR=$(LamellaRefDir);LAMELLA_RUNTIME_SUPPORT_DIR=$(LamellaRuntimeSupportDir)"
+                       StandardOutputImportance="normal"
+                       StandardErrorImportance="normal" />
     <Error Condition="!Exists('$(_LamellaReferencesFile)')" Code="LAMSDK0009" Text="The lamella tool chose no references: it wrote nothing at '$(_LamellaReferencesFile)'." />
     <MSBuild Projects="$(_LamellaReferencesFile)" Targets="LamellaReferences" Properties="LamellaReferencesStamp=$([System.DateTime]::UtcNow.Ticks)">
       <Output TaskParameter="TargetOutputs" ItemName="_LamellaSelectedReference" />
@@ -301,10 +484,11 @@
   </Target>
 
   <Target Name="_LamellaCompile" DependsOnTargets="_LamellaCheckTool" Condition="'$(_LamellaCompiles)' == 'true'">
-    <Exec Command="&quot;$(_LamellaTool)&quot; build --msbuild-compile &quot;$(_LamellaCompileInputsFile)&quot;"
-          EnvironmentVariables="LAMELLA_REF_DIR=$(LamellaRefDir);LAMELLA_RUNTIME_SUPPORT_DIR=$(LamellaRuntimeSupportDir)"
-          StandardOutputImportance="normal"
-          StandardErrorImportance="normal" />
+    <LamellaRunProgram Program="$(_LamellaTool)"
+                       Arguments="build;--msbuild-compile;$(_LamellaCompileInputsFile)"
+                       EnvironmentVariables="LAMELLA_REF_DIR=$(LamellaRefDir);LAMELLA_RUNTIME_SUPPORT_DIR=$(LamellaRuntimeSupportDir)"
+                       StandardOutputImportance="normal"
+                       StandardErrorImportance="normal" />
   </Target>
 
   <!-- For a build whose runs this SDK serves, Lamella.Run.targets gives dotnet run its list of devices

@@ -67,11 +67,13 @@ pub(crate) fn facts() -> AdcFacts {
     AdcFacts {
         cs: CS,
         result: RESULT,
+        #[cfg(not(target_os = "none"))]
         clk_ctrl: CLK_ADC_CTRL,
         cs_enabled: CS_EN_TS_EN,
         cs_start: CS_EN_TS_EN | CS_START_ONCE,
         cs_ready: CS_READY,
         cs_err: CS_ERR,
+        #[cfg(not(target_os = "none"))]
         clk_enabled: CLK_ADC_ENABLED,
         result_mask: RESULT_MASK,
         bits: RESOLUTION_BITS,

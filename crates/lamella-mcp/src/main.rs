@@ -8,7 +8,7 @@ use lamella_wire_host::engine::{
     CompileFailure, LcscCompiler, LoopbackLink, Outcome, Repl, ReplCompiler, install_host_clock,
 };
 use lamella_wire_host::boards::ReferenceSet;
-use lamella_wire_host::{AnyTransport, UsbTransport, deployed_status_blocking, hello_blocking, list_serial, open_target};
+use lamella_wire_host::{AnyTransport, UsbTransport, deployed_status_blocking, list_serial, open_target, reopen};
 #[cfg(feature = "bake")]
 use lamella_wire_host::bake::{Baked, Refused, Role};
 #[cfg(feature = "bake")]
@@ -267,22 +267,29 @@ fn text_result(text: String, is_error: bool) -> Value {
 /// **THROUGH `open_target`, THE ONE PLACE THAT KNOWS THE TARGET SYNTAX**, as the `lamella` command
 /// opens one: `usb[:...]` the board's own USB, `tcp:<host>[:<port>]` a board on a network, anything
 /// else a serial port. A carrier added there reaches these tools the same day.
+///
+/// A board on its own USB that is not there is waited for a moment, as the `lamella` command waits
+/// for it ([`lamella_wire_host::reopen::opened`]): a deploy that starts its program resets the board.
 fn open(target: &str) -> Result<AnyTransport, Value> {
+    lamella_wire_host::reopen::opened(target, &opening).map_err(|text| text_result(text, true))
+}
+
+/// The carrier `target` names, opened at once, or the sentence saying why not: how [`open`] opens it,
+/// and how a board that resets under a HELLO is opened again.
+fn opening(target: &str) -> Result<AnyTransport, String> {
     open_target(target, BAUD, CONNECT_TIMEOUT).map_err(|error| {
-        text_result(
-            format!(
-                "cannot open {target}: {}. This server can open: {}. lamella_list_devices lists \
-                 what is attached, and the target to give for each.",
-                lamella_wire_host::open_failure(error),
-                lamella_wire_host::available_carriers().join(", ")
-            ),
-            true,
+        format!(
+            "cannot open {target}: {}. This server can open: {}. lamella_list_devices lists what is \
+             attached, and the target to give for each.",
+            lamella_wire_host::open_failure(error),
+            lamella_wire_host::available_carriers().join(", ")
         )
     })
 }
 
 /// A generous host capability set to advertise on HELLO -- offering `PROFILE_CHIPID` so a target that fills its
-/// chip identity sends it. The negotiated set is this intersected with the target's, so it reflects the board.
+/// chip identity sends it. The negotiated set is this intersected with the target's; the identify prints the
+/// target's own set, which says what the board is.
 fn host_caps() -> Capabilities {
     Capabilities(
         Capabilities::PROFILE_CHIPID
@@ -459,7 +466,7 @@ fn tool_list_devices() -> Value {
 /// Render the identity a HELLO negotiated: Lamella Link version, capabilities, the board, its target
 /// ABI, which firmware build is answering, the chip's own identity, and one line per resident runtime.
 fn format_identity(target: &str, neg: &Negotiated) -> String {
-    let mut s = format!("target: {target}\nLamella Link version: {}\ncapabilities: {:#010x}\n", neg.version, neg.caps.0);
+    let mut s = format!("target: {target}\nLamella Link version: {}\ncapabilities: {:#010x}\n", neg.version, neg.target_caps.0);
     let identity = &neg.identity;
     let board = product_model_name(identity.product_model).unwrap_or("(unrecognized product_model)");
     s.push_str(&format!("board: {board} (product_model {})\n", identity.product_model));
@@ -486,11 +493,7 @@ fn format_identity(target: &str, neg: &Negotiated) -> String {
         s.push_str("resident runtimes: (none reported)\n");
     }
     for surface in &identity.surfaces {
-        let version = surface.lib_version;
-        s.push_str(&format!(
-            "resident runtime: tier {} abi {} hash {:#018x} library {}.{}.{}.{}\n",
-            surface.tier, surface.abi, surface.hash, version[0], version[1], version[2], version[3]
-        ));
+        s.push_str(&format!("resident runtime: {}\n", lamella_wire_host::describe_runtime(neg, surface)));
     }
     if let Some((tier, field)) = neg.unreadable_surface_version() {
         s.push_str(&format!(
@@ -506,23 +509,45 @@ fn tool_identify_device(scope: &DeviceScope, target: &str) -> Value {
     if target.is_empty() {
         return text_result("identify: a 'target' (COM port or usb[:...]) is required.".to_owned(), true);
     }
-    let mut transport = match open(target) {
+    let transport = match open(target) {
         Ok(t) => t,
         Err(answer) => return answer,
     };
-    identify_over(scope, &mut transport, target)
+    identify_over(scope, transport, target, &opening)
 }
 
 /// What `lamella_identify_device` answers over an open connection: the board's identity, when the
-/// board that answered the HELLO is one the scope's `board:` terms name.
-fn identify_over(scope: &DeviceScope, transport: &mut impl lamella_wire::Transport, target: &str) -> Value {
-    match hello_blocking(transport, 1, host_caps(), Duration::from_secs(3)) {
+/// board that answered the HELLO is one the scope's `board:` terms name. A board that resets under
+/// the HELLO is opened again with `opening`.
+fn identify_over<T: lamella_wire::Transport>(
+    scope: &DeviceScope,
+    transport: T,
+    target: &str,
+    opening: &dyn Fn(&str) -> Result<T, String>,
+) -> Value {
+    let hello = match reopen::hello_reopening(transport, target, 1, host_caps(), Duration::from_secs(3), opening) {
+        Ok((_transport, hello)) => hello,
+        Err(why) => return text_result(why, true),
+    };
+    match hello {
         Ok(neg) => match scope.permits_link_board(neg.identity.product_model) {
             Ok(()) => text_result(format_identity(target, &neg), false),
             Err(why) => text_result(why, true),
         },
         Err(lamella_wire::TransportError::VersionMismatch { target_min, target_max }) => text_result(
             format!("{target}: {}", lamella_wire_host::version_mismatch(lamella_wire::PROTOCOL_VERSION, target_min, target_max)),
+            true,
+        ),
+        Err(lamella_wire::TransportError::Refused { reason, .. }) => text_result(
+            format!("{target} answered and refused: {}", lamella_wire_host::describe_refusal(reason)),
+            true,
+        ),
+        Err(e) if lamella_wire_host::has_link_identity(target) => text_result(
+            format!(
+                "no answer to a HELLO from {target} ({}): {}.",
+                lamella_wire_host::link_failure(e),
+                lamella_wire_host::SILENT_WITH_FIRMWARE
+            ),
             true,
         ),
         Err(e) => text_result(
@@ -669,18 +694,27 @@ fn fits_on(board: &str, image_bytes: usize) -> Result<String, String> {
 
 /// Query the resident deployed image on a target: HELLO to enter serve mode, then DEPLOY_STATUS.
 fn tool_deploy_status(scope: &DeviceScope, target: &str) -> Value {
-    let mut t = match open(target) {
+    let t = match open(target) {
         Ok(t) => t,
         Err(answer) => return answer,
     };
-    deploy_status_over(scope, &mut t, target)
+    deploy_status_over(scope, t, target, &opening)
 }
 
 /// What `lamella_deploy_status` answers over an open connection, asked only of a board the scope's
-/// `board:` terms name.
-fn deploy_status_over(scope: &DeviceScope, t: &mut impl lamella_wire::Transport, target: &str) -> Value {
+/// `board:` terms name. A board that resets under the HELLO is opened again with `opening`.
+fn deploy_status_over<T: lamella_wire::Transport>(
+    scope: &DeviceScope,
+    t: T,
+    target: &str,
+    opening: &dyn Fn(&str) -> Result<T, String>,
+) -> Value {
     let timeout = Duration::from_secs(5);
-    let session = match hello_blocking(&mut *t, 0, host_caps(), timeout) {
+    let (mut t, hello) = match reopen::hello_reopening(t, target, 0, host_caps(), timeout, opening) {
+        Ok(asked) => asked,
+        Err(why) => return text_result(why, true),
+    };
+    let session = match hello {
         Ok(session) => session,
         Err(e) => {
             return text_result(format!("no answer to a HELLO from {target}: {}.", lamella_wire_host::link_failure(e)), true);
@@ -689,7 +723,7 @@ fn deploy_status_over(scope: &DeviceScope, t: &mut impl lamella_wire::Transport,
     if let Err(why) = scope.permits_link_board(session.identity.product_model) {
         return text_result(why, true);
     }
-    match deployed_status_blocking(&mut *t, 1, timeout) {
+    match deployed_status_blocking(&mut t, 1, timeout) {
         Ok(Some(sum)) => text_result(format!("{target} holds a resident image, checksum {sum:#018x}"), false),
         Ok(None) => text_result(format!("{target} has no resident image."), false),
         Err(e) => text_result(format!("status query on {target} failed: {}.", lamella_wire_host::link_failure(e)), true),
@@ -1167,12 +1201,12 @@ Verification: {}.",
         if let Err(why) = self.compiles(code, references) {
             return text_result(why, true);
         }
-        let mut t = match open(target) {
+        let t = match open(target) {
             Ok(t) => t,
             Err(answer) => return answer,
         };
         let then = if run { Then::Start } else { Then::Rest };
-        to_firmware(&self.scope, &mut t, target, |board| self.image_for(board, references, code), then)
+        to_firmware(&self.scope, t, target, &opening, |board| self.image_for(board, references, code), then)
     }
 
     /// `lamella_run_on_device`: compile, then HELLO the board, bake for the board that answered,
@@ -1183,12 +1217,12 @@ Verification: {}.",
         if let Err(why) = self.compiles(code, references) {
             return text_result(why, true);
         }
-        let mut t = match open(target) {
+        let t = match open(target) {
             Ok(t) => t,
             Err(answer) => return answer,
         };
         let then = Then::Run(Watch::for_at_most(self.run_timeout));
-        to_firmware(&self.scope, &mut t, target, |board| self.image_for(board, references, code), then)
+        to_firmware(&self.scope, t, target, &opening, |board| self.image_for(board, references, code), then)
     }
 
     /// Whether `code` compiles for no board against the corlib and the libraries `references`
@@ -1439,21 +1473,37 @@ enum Then {
 /// `image_for` takes the id of the board whose product model answered (`None` for a model no board
 /// this build knows declares) and gives back what to say about the image, and the image.
 #[cfg(feature = "bake")]
-fn to_firmware(
+fn to_firmware<T: lamella_wire::Transport>(
     scope: &DeviceScope,
-    t: &mut impl lamella_wire::Transport,
+    t: T,
     target: &str,
+    opening: &dyn Fn(&str) -> Result<T, String>,
     image_for: impl FnOnce(Option<&str>) -> Result<(String, Vec<u8>), String>,
     then: Then,
 ) -> Value {
     let runs = matches!(then, Then::Run(_));
     let caps = if runs { on_device::run_caps() } else { on_device::host_caps() };
-    let session = match hello_blocking(&mut *t, 0, caps, on_device::TIMEOUT) {
+    let (mut t, hello) = match reopen::hello_reopening(t, target, 0, caps, on_device::TIMEOUT, opening) {
+        Ok(asked) => asked,
+        Err(why) => return text_result(why, true),
+    };
+    let t = &mut t;
+    let session = match hello {
         Ok(session) => session,
         Err(error) => return text_result(no_session(target, error), true),
     };
     if let Err(why) = scope.permits_link_board(session.identity.product_model) {
         return text_result(why, true);
+    }
+    if on_device::runs_python_only(&session) {
+        let board = on_device::the_board(lamella_wire_host::board_name(session.identity.product_model));
+        return text_result(
+            format!(
+                "{} at {target} runs Python programs, and this server sends C#. Nothing was built or sent.",
+                on_device::capitalized(&board)
+            ),
+            true,
+        );
     }
     if runs && !session.caps.has(Capabilities::EXEC_NO_RESET) {
         return text_result("The board cannot start a stored program.".to_owned(), true);
@@ -1507,6 +1557,11 @@ fn no_session(target: &str, error: lamella_wire::TransportError) -> String {
         lamella_wire::TransportError::VersionMismatch { target_min, target_max } => format!(
             "cannot talk to {target}: {}",
             lamella_wire_host::version_mismatch(lamella_wire::PROTOCOL_VERSION, target_min, target_max)
+        ),
+        error if lamella_wire_host::has_link_identity(target) => format!(
+            "{target} did not answer a HELLO ({}): {}. Nothing was written.",
+            lamella_wire_host::link_failure(error),
+            lamella_wire_host::SILENT_WITH_FIRMWARE
         ),
         error => format!(
             "{target} did not answer a HELLO ({}). It opened, so the board is attached and the \
@@ -2238,6 +2293,19 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    /// **A SILENT BOARD ON LAMELLA LINK's OWN USB IDENTITY IS NOT SAID TO LACK FIRMWARE** by a device
+    /// tool that opened no session: only Lamella's firmware enumerates as one, so its silence is said as
+    /// its program's, as `lamella devices --identify` and `lamella deploy` say it.
+    #[cfg(feature = "bake")]
+    #[test]
+    fn a_silent_board_of_the_link_identity_is_not_said_to_lack_firmware() {
+        let link = super::no_session("usb:39e9:0001:0123456789ABCDEF", lamella_wire::TransportError::Closed);
+        assert!(link.contains(lamella_wire_host::SILENT_WITH_FIRMWARE), "{link}");
+        assert!(!link.contains("not running Lamella firmware"), "{link}");
+        let other = super::no_session("COM7", lamella_wire::TransportError::Closed);
+        assert!(other.contains("the usual reason is that the board is not running Lamella firmware"), "{other}");
+    }
+
     #[cfg(feature = "bake")]
     pub(super) mod a_program_and_its_references {
         use super::super::tools;
@@ -2302,27 +2370,43 @@ mod tests {
         pub(super) struct Board {
             replies: MemTransport,
             model: u16,
+            /// Its firmware runs Python programs, as the Python firmware's HELLO says it does.
+            python: bool,
             pub(super) sent: Vec<u8>,
         }
 
         impl Board {
             pub(super) fn answering_as(model: u16) -> Self {
-                Board { replies: MemTransport::new(), model, sent: Vec::new() }
+                Board { replies: MemTransport::new(), model, python: false, sent: Vec::new() }
+            }
+
+            /// A board `model` whose firmware runs Python programs.
+            pub(super) fn running_python(model: u16) -> Self {
+                Board { python: true, ..Board::answering_as(model) }
             }
         }
 
         impl Transport for Board {
             fn send(&mut self, msg_type: u8, seq: u16, _payload: &[u8]) -> Result<(), TransportError> {
+                use lamella_wire::Capabilities;
                 self.sent.push(msg_type);
                 let reply = if msg_type == msg::HELLO {
+                    let identity =
+                        lamella_wire::TargetIdentity { product_model: self.model, ..lamella_wire::TargetIdentity::default() };
+                    let (caps, identity, formats) = if self.python {
+                        let python = lamella_wire::Surface { tier: msg::tier::PYTHON, ..lamella_wire::Surface::default() };
+                        (Capabilities::BUNDLE | Capabilities::EXEC_NO_RESET, identity.with_surface(python), None)
+                    } else {
+                        let cil = lamella_wire::Surface { tier: msg::tier::CIL, ..lamella_wire::Surface::default() };
+                        let formats = Some(vec![lamella_cil_runtime::BAKED_IMAGE_FORMAT]);
+                        (Capabilities::BAKED_IMAGE, identity.with_surface(cil), formats)
+                    };
                     let ack = lamella_wire::HelloAck {
                         chosen: lamella_wire::PROTOCOL_VERSION,
-                        caps: lamella_wire::Capabilities(lamella_wire::Capabilities::BAKED_IMAGE),
-                        identity: lamella_wire::TargetIdentity {
-                            product_model: self.model,
-                            ..lamella_wire::TargetIdentity::default()
-                        },
-                        max_inbound_payload: None,
+                        caps: Capabilities(caps),
+                        identity,
+                        max_inbound_payload: formats.as_ref().map(|_| lamella_wire::MAX_PAYLOAD as u16),
+                        image_formats: formats,
                     };
                     (msg::HELLO_ACK, ack.encode())
                 } else {
@@ -2341,6 +2425,92 @@ mod tests {
             answer["content"][0]["text"].as_str().expect("the answer is text")
         }
 
+        /// A board a test lends to a route that takes its carrier: every call goes to the board, which
+        /// is the test's to read afterwards.
+        pub(crate) struct Lent<'a, T>(pub(crate) &'a mut T);
+
+        impl<T: Transport> Transport for Lent<'_, T> {
+            fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
+                self.0.send(msg_type, seq, payload)
+            }
+
+            fn poll(&mut self) -> Result<Option<lamella_wire::Frame>, TransportError> {
+                self.0.poll()
+            }
+        }
+
+        /// How these tests open a board again, which none of them does: a serial port's carrier error
+        /// is not a board resetting.
+        pub(crate) fn not_again<T>(target: &str) -> Result<T, String> {
+            Err(format!("{target} is not opened again"))
+        }
+
+        /// A board on its own USB whose firmware runs Python: behind the first handle it resets at the
+        /// HELLO, to take back the program it runs, and leaves the bus; behind a later one it is back.
+        pub(super) struct Resetting(pub(super) Option<Board>);
+
+        impl Transport for Resetting {
+            fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
+                match &mut self.0 {
+                    Some(board) => board.send(msg_type, seq, payload),
+                    None => Ok(()),
+                }
+            }
+
+            fn poll(&mut self) -> Result<Option<lamella_wire::Frame>, TransportError> {
+                match &mut self.0 {
+                    Some(board) => board.poll(),
+                    None => Err(TransportError::Carrier),
+                }
+            }
+        }
+
+        /// The board opened again after its reset: a Pico 2 W that runs Python, serving.
+        pub(super) fn back_again(_: &str) -> Result<Resetting, String> {
+            Ok(Resetting(Some(Board::running_python(lamella_wire::product_model::PICO2_W))))
+        }
+
+        /// **A BOARD THAT RESETS UNDER THE HELLO IS OPENED AGAIN AND ASKED AGAIN**, by the identify and
+        /// the deploy status, as the `lamella` command opens one (`lamella_wire_host::reopen`): a board
+        /// that runs Python takes back the program it runs by resetting.
+        #[test]
+        fn a_board_that_resets_under_the_hello_is_opened_again_and_asked_again() {
+            let usb = "usb:39e9:0001:D4C3";
+            let answer = identify_over(&bare(), Resetting(None), usb, &back_again);
+            assert_eq!(answer["isError"], json!(false), "{}", text(&answer));
+            assert!(text(&answer).contains("resident runtime: Python"), "{}", text(&answer));
+            let answer = deploy_status_over(&bare(), Resetting(None), usb, &back_again);
+            assert!(!text(&answer).contains("no answer to a HELLO"), "{}", text(&answer));
+        }
+
+        /// A board that answers every HELLO with a refusal: another carrier holds its session.
+        struct SessionHeld(MemTransport);
+
+        impl Transport for SessionHeld {
+            fn send(&mut self, _msg_type: u8, seq: u16, _payload: &[u8]) -> Result<(), TransportError> {
+                let refusal = lamella_wire::error::session_held(2);
+                self.0.feed(&lamella_wire::encode_frame(msg::ERROR, seq, &refusal).expect("a frame"));
+                Ok(())
+            }
+
+            fn poll(&mut self) -> Result<Option<lamella_wire::Frame>, TransportError> {
+                self.0.poll()
+            }
+        }
+
+        /// **A REFUSAL IS AN ANSWER, ON LAMELLA LINK's OWN USB TOO**: a board whose session another
+        /// carrier holds answers the identify's HELLO and refuses, and the identify says that refusal,
+        /// not the silence of a program that computes.
+        #[test]
+        fn a_refusal_on_the_links_own_usb_is_said_as_the_answer_it_is() {
+            let usb = "usb:39e9:0001:0123456789ABCDEF";
+            let answer = identify_over(&bare(), SessionHeld(MemTransport::new()), usb, &not_again);
+            assert_eq!(answer["isError"], json!(true), "{}", text(&answer));
+            let held = lamella_wire_host::describe_refusal(lamella_wire::error::SESSION_HELD);
+            assert!(text(&answer).contains(&held), "the refusal is said: {}", text(&answer));
+            assert!(!text(&answer).contains(lamella_wire_host::SILENT_WITH_FIRMWARE), "{}", text(&answer));
+        }
+
         pub(crate) fn scoped(term: &str) -> DeviceScope {
             DeviceScope::parse([format!("--allow-device={term}")].into_iter()).expect("the term parses")
         }
@@ -2356,14 +2526,14 @@ mod tests {
         fn identifying_a_board_the_scope_does_not_name_is_refused_after_its_hello() {
             let v2 = lamella_wire::product_model::MICROBIT_V2;
             let mut board = Board::answering_as(v2);
-            let answer = identify_over(&scoped("board:raspberrypi-pico-2"), &mut board, "COM0");
+            let answer = identify_over(&scoped("board:raspberrypi-pico-2"), Lent(&mut board), "COM0", &not_again);
             assert_eq!(answer["isError"], json!(true));
             assert!(text(&answer).contains("may not write this board"), "{}", text(&answer));
             assert!(text(&answer).contains("BBC micro:bit v2"), "it names the board: {}", text(&answer));
             assert!(board.sent.iter().all(|sent| *sent == msg::HELLO), "only a HELLO was sent: {:?}", board.sent);
 
             let mut board = Board::answering_as(v2);
-            let answer = identify_over(&scoped("board:bbc-micro-bit-v2"), &mut board, "COM0");
+            let answer = identify_over(&scoped("board:bbc-micro-bit-v2"), Lent(&mut board), "COM0", &not_again);
             assert_eq!(answer["isError"], json!(false), "{}", text(&answer));
             assert!(text(&answer).contains("board: BBC micro:bit v2"), "{}", text(&answer));
         }
@@ -2374,13 +2544,13 @@ mod tests {
         fn a_deploy_status_of_a_board_the_scope_does_not_name_stops_at_its_hello() {
             let v2 = lamella_wire::product_model::MICROBIT_V2;
             let mut board = Board::answering_as(v2);
-            let answer = deploy_status_over(&scoped("board:raspberrypi-pico-2"), &mut board, "COM0");
+            let answer = deploy_status_over(&scoped("board:raspberrypi-pico-2"), Lent(&mut board), "COM0", &not_again);
             assert_eq!(answer["isError"], json!(true));
             assert!(text(&answer).contains("may not write this board"), "{}", text(&answer));
             assert!(board.sent.iter().all(|sent| *sent == msg::HELLO), "only a HELLO was sent: {:?}", board.sent);
 
             let mut board = Board::answering_as(v2);
-            let answer = deploy_status_over(&bare(), &mut board, "COM0");
+            let answer = deploy_status_over(&bare(), Lent(&mut board), "COM0", &not_again);
             assert!(!text(&answer).contains("may not write"), "{}", text(&answer));
             assert!(board.sent.iter().any(|sent| *sent != msg::HELLO), "the query was sent: {:?}", board.sent);
         }
@@ -2388,15 +2558,18 @@ mod tests {
 
     #[cfg(feature = "bake")]
     mod a_route_to_firmware {
-        use super::a_board_answering_a_hello::{Board, bare, scoped, text};
+        use super::a_board_answering_a_hello::{Board, Lent, Resetting, back_again, bare, not_again, scoped, text};
         use super::super::{Then, to_firmware};
         use lamella_wire::{MemTransport, Transport, TransportError, msg};
         use serde_json::json;
         use std::time::Duration;
 
-        /// An image of sixteen zero bytes, whatever board it is built for.
-        fn sixteen_bytes(_: Option<&str>) -> Result<(String, Vec<u8>), String> {
-            Ok((String::new(), vec![0; 16]))
+        /// The smallest program a host sends, whatever board it is built for: an image of one method that
+        /// returns, recorded as its entry point, as this build bakes it.
+        fn a_program(_: Option<&str>) -> Result<(String, Vec<u8>), String> {
+            let mut module = lamella_cil_runtime::Module::new();
+            let entry = module.add_method(0, lamella_cil_runtime::module::RawCil::Flash(&[0x06, 0x2A]), 0);
+            module.write_baked(Some(entry)).map(|image| (String::new(), image)).map_err(|error| format!("{error:?}"))
         }
 
         /// **THE IMAGE IS BUILT FOR THE BOARD THAT ANSWERED THE HELLO**, by the id its product model
@@ -2412,7 +2585,7 @@ mod tests {
                     asked = Some(board.map(str::to_owned));
                     Err("built nothing".to_owned())
                 };
-                let answer = to_firmware(&bare(), &mut Board::answering_as(model), "COM0", image, Then::Start);
+                let answer = to_firmware(&bare(), Lent(&mut Board::answering_as(model)), "COM0", &not_again, image, Then::Start);
                 assert_eq!(asked, Some(expected.map(str::to_owned)), "product model {model}");
                 assert_eq!(text(&answer), "built nothing", "a build that fails is the answer");
             }
@@ -2424,17 +2597,50 @@ mod tests {
         fn a_deploy_to_a_board_the_scope_does_not_name_stops_at_its_hello() {
             let v2 = lamella_wire::product_model::MICROBIT_V2;
             let mut board = Board::answering_as(v2);
-            let answer = to_firmware(&scoped("board:raspberrypi-pico-2"), &mut board, "COM0", sixteen_bytes, Then::Start);
+            let answer = to_firmware(&scoped("board:raspberrypi-pico-2"), Lent(&mut board), "COM0", &not_again, a_program, Then::Start);
             assert_eq!(answer["isError"], json!(true));
             assert!(text(&answer).contains("may not write this board"), "{}", text(&answer));
             assert!(text(&answer).contains("BBC micro:bit v2"), "it names the board: {}", text(&answer));
             assert!(board.sent.iter().all(|sent| *sent == msg::HELLO), "only a HELLO was sent: {:?}", board.sent);
 
             let mut board = Board::answering_as(v2);
-            let answer = to_firmware(&scoped("board:bbc-micro-bit-v2"), &mut board, "COM0", sixteen_bytes, Then::Start);
+            let answer = to_firmware(&scoped("board:bbc-micro-bit-v2"), Lent(&mut board), "COM0", &not_again, a_program, Then::Start);
             assert!(!text(&answer).contains("may not write"), "{}", text(&answer));
             assert!(text(&answer).contains("COM0 refused the deploy: the board's firmware does not support this request"), "{}", text(&answer));
             assert!(board.sent.iter().any(|sent| *sent != msg::HELLO), "the deploy began: {:?}", board.sent);
+        }
+
+        /// **A BOARD WHOSE FIRMWARE RUNS PYTHON IS REFUSED BEFORE ANYTHING IS BUILT**, for a deploy and
+        /// for a run, as the command line refuses it: this server sends C#.
+        #[test]
+        fn a_board_that_runs_python_is_refused_before_anything_is_built() {
+            let run = || Then::Run(lamella_wire_host::on_device::Watch::for_at_most(Duration::from_secs(5)));
+            for then in [Then::Rest, Then::Start, run()] {
+                let mut board = Board::running_python(lamella_wire::product_model::PICO2_W);
+                let answer = to_firmware(&bare(), Lent(&mut board), "COM0", &not_again, |_| panic!("nothing is built"), then);
+                assert_eq!(answer["isError"], json!(true));
+                assert_eq!(
+                    text(&answer),
+                    "The Raspberry Pi Pico 2 W at COM0 runs Python programs, and this server sends C#. Nothing was built or sent."
+                );
+                assert_eq!(board.sent, [msg::HELLO], "nothing but the HELLO was sent");
+            }
+        }
+
+        /// **A DEPLOY OR A RUN OPENS AGAIN A BOARD THAT RESETS UNDER ITS HELLO**, as `lamella deploy` and
+        /// `lamella run` do, and then answers for what that board runs: a running Python board takes its
+        /// program back by resetting, and comes back serving.
+        #[test]
+        fn a_board_that_resets_under_its_hello_is_opened_again_and_answered_for() {
+            let usb = "usb:39e9:0001:D4C3";
+            let run = || Then::Run(lamella_wire_host::on_device::Watch::for_at_most(Duration::from_secs(5)));
+            for then in [Then::Start, run()] {
+                let answer = to_firmware(&bare(), Resetting(None), usb, &back_again, |_| panic!("nothing is built"), then);
+                assert_eq!(
+                    text(&answer),
+                    format!("The Raspberry Pi Pico 2 W at {usb} runs Python programs, and this server sends C#. Nothing was built or sent.")
+                );
+            }
         }
 
         /// **A RUN NEEDS A BOARD THAT STARTS A STORED PROGRAM WITHOUT A RESET**, and one whose firmware
@@ -2443,7 +2649,7 @@ mod tests {
         fn a_run_on_a_board_that_cannot_start_a_stored_program_is_refused() {
             let mut board = Board::answering_as(lamella_wire::product_model::PICO2_W);
             let run = Then::Run(lamella_wire_host::on_device::Watch::for_at_most(Duration::from_secs(5)));
-            let answer = to_firmware(&bare(), &mut board, "COM0", |_| panic!("nothing is built"), run);
+            let answer = to_firmware(&bare(), Lent(&mut board), "COM0", &not_again, |_| panic!("nothing is built"), run);
             assert_eq!(answer["isError"], json!(true));
             assert_eq!(text(&answer), "The board cannot start a stored program.");
             assert_eq!(board.sent, [msg::HELLO], "nothing but the HELLO was sent");
@@ -2463,13 +2669,15 @@ mod tests {
                 use lamella_wire_host::deploy;
                 let reply = match msg_type {
                     msg::HELLO => {
+                        let cil = lamella_wire::Surface { tier: msg::tier::CIL, ..lamella_wire::Surface::default() };
                         let ack = lamella_wire::HelloAck {
                             chosen: lamella_wire::PROTOCOL_VERSION,
                             caps: lamella_wire::Capabilities(
                                 lamella_wire::Capabilities::BAKED_IMAGE | lamella_wire::Capabilities::DEPLOY_PREFIX_CRC,
                             ),
-                            identity: lamella_wire::TargetIdentity::default(),
-                            max_inbound_payload: None,
+                            identity: lamella_wire::TargetIdentity::default().with_surface(cil),
+                            max_inbound_payload: Some(lamella_wire::MAX_PAYLOAD as u16),
+                            image_formats: Some(vec![lamella_cil_runtime::BAKED_IMAGE_FORMAT]),
                         };
                         (msg::HELLO_ACK, ack.encode())
                     }
@@ -2505,8 +2713,8 @@ mod tests {
         /// the image wrong is refused at that chunk, with both CRCs, rather than reported deployed.
         #[test]
         fn a_deploy_to_a_board_that_stored_it_wrong_is_refused_at_the_chunk() {
-            let image = |_: Option<&str>| Ok((String::new(), vec![0x5A; 1000]));
-            let answer = to_firmware(&bare(), &mut Miswriting::default(), "COM0", image, Then::Rest);
+            let image = a_program;
+            let answer = to_firmware(&bare(), Lent(&mut Miswriting::default()), "COM0", &not_again, image, Then::Rest);
             assert_eq!(answer["isError"], json!(true), "{}", text(&answer));
             assert!(text(&answer).contains("does not hold the image that was sent"), "{}", text(&answer));
         }

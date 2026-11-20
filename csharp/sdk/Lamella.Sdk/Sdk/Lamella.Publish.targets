@@ -37,10 +37,11 @@
     <Message Importance="high" Text="$(MSBuildProjectName) publishes for $(LamellaTargetBoard) as $(_LamellaImageModel), $(_LamellaImageName)." />
     <WriteLinesToFile File="$(_LamellaPublishInputsFile)" Lines="@(_LamellaPublishInput)" Overwrite="true" />
     <Delete Files="$(_LamellaImage);$(_LamellaImage).manifest.json" />
-    <Exec Command="&quot;$(_LamellaTool)&quot; build --msbuild-publish &quot;$(_LamellaPublishInputsFile)&quot;"
-          EnvironmentVariables="LAMELLA_REF_DIR=$(LamellaRefDir);LAMELLA_RUNTIME_SUPPORT_DIR=$(LamellaRuntimeSupportDir)"
-          StandardOutputImportance="normal"
-          StandardErrorImportance="normal" />
+    <LamellaRunProgram Program="$(_LamellaTool)"
+                       Arguments="build;--msbuild-publish;$(_LamellaPublishInputsFile)"
+                       EnvironmentVariables="LAMELLA_REF_DIR=$(LamellaRefDir);LAMELLA_RUNTIME_SUPPORT_DIR=$(LamellaRuntimeSupportDir)"
+                       StandardOutputImportance="normal"
+                       StandardErrorImportance="normal" />
     <ItemGroup>
       <ResolvedFileToPublish Remove="@(ResolvedFileToPublish)" />
       <ResolvedFileToPublish Include="$(_LamellaImage)" RelativePath="$(_LamellaImageName)" CopyToPublishDirectory="PreserveNewest" />

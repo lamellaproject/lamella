@@ -40,10 +40,15 @@ namespace Lamella.Generated
         public const uint AFRH_AFSEL10_LSB = 8;
 
         // -- block constants --
+        public const uint MODER_MODE_INPUT = 0;
         public const uint MODER_MODE_OUTPUT = 1;
         public const uint MODER_MODE_AF = 2;
+        public const uint MODER_MODE_ANALOG = 3;
+        public const uint MODER_MODE_RESET = 0;
         public const uint OTYPER_OPEN_DRAIN = 1;
         public const uint OSPEEDR_VERY_HIGH = 3;
+        public const uint PUPDR_NONE = 0;
         public const uint PUPDR_PULL_UP = 1;
+        public const uint PUPDR_PULL_DOWN = 2;
     }
 }

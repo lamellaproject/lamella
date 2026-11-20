@@ -149,8 +149,8 @@ fn a_store_that_keeps_nothing_is_told_apart_from_a_board_that_stores_no_network(
     assert_eq!(empty.stored_boot(), None, "and then it stores no network");
 }
 
-/// Feeds the radio `steps` and pumps until they are taken.
-fn feed(c: &mut Under, steps: Vec<Step>) {
+/// Feeds the radio `steps` and pumps until they are taken, whatever store holds the settings.
+fn feed<S: RecordStore>(c: &mut Controller<'static, Script, TestClock, S, Slot>, steps: Vec<Step>) {
     c.station_mut().radio.steps.extend(steps);
     for _ in 0..8 {
         c.station_mut().next_poll = 0;
@@ -202,8 +202,8 @@ fn request<'a>(ssid: &'a [u8], secret: &'a [u8], kinds: u8) -> JoinRequest<'a> {
     JoinRequest { ssid, secret, security: kinds, reconnection: Reconnection::Automatic }
 }
 
-/// The driver's joins, as (name, kind, secret).
-fn driver_joins(c: &Under) -> Vec<(Vec<u8>, &'static str, Vec<u8>)> {
+/// The driver's joins, as (name, kind, secret), whatever store holds the settings.
+fn driver_joins<S: RecordStore>(c: &Controller<'static, Script, TestClock, S, Slot>) -> Vec<(Vec<u8>, &'static str, Vec<u8>)> {
     c.station().radio().joins.clone()
 }
 
@@ -901,4 +901,73 @@ fn a_deauthentication_during_the_handshake_keeps_the_ordinary_retry() {
     assert!(state.last_failure.unwrap().detail.contains("supplicant reason 14"));
     assert!(!requests(&c).contains(&"disconnect"));
     assert_eq!(slot_counts(&c), (1, 0));
+}
+
+/// A store that reads the board's settings and never writes them: its erase and program answer
+/// false, as the store of a firmware with no way to store, change or clear a network does.
+struct ReadOnly(Flash);
+
+impl RecordStore for ReadOnly {
+    fn read(&self, slot: usize) -> &[u8] {
+        self.0.read(slot)
+    }
+
+    fn erase(&mut self, _slot: usize) -> bool {
+        false
+    }
+
+    fn program(&mut self, _slot: usize, _offset: usize, _page: &[u8; PAGE]) -> bool {
+        false
+    }
+}
+
+/// A replacement cut short leaves both slots holding an undamaged copy. The newer copy is the
+/// stored network: a store that cannot erase the older one still reads past it, and the board joins
+/// the newer network with the newer setting.
+#[test]
+fn a_store_that_cannot_write_reads_the_newer_of_two_copies_and_joins_it() {
+    let older = crate::record::Record::new(
+        b"older-net",
+        b"older-pass",
+        security::WPA2,
+        Reconnection::Automatic,
+        BootConnection::OnConnect,
+    )
+    .expect("a network");
+    let newer = crate::record::Record::new(
+        b"newer-net",
+        b"newer-pass",
+        security::WPA2,
+        Reconnection::Automatic,
+        BootConnection::Background,
+    )
+    .expect("a network");
+    let mut flash = Flash { units: [[0xFF; UNIT]; SLOTS] };
+    assert_eq!(crate::record::store(&mut flash, &older), RecordWrite::Written);
+    let first = flash.units;
+    assert_eq!(crate::record::store(&mut flash, &newer), RecordWrite::Written);
+    // The older copy goes back where it was, as a cut between writing the newer copy and erasing the
+    // older one leaves it.
+    for slot in 0..SLOTS {
+        if first[slot] != [0xFF; UNIT] {
+            flash.units[slot] = first[slot];
+        }
+    }
+    assert!(flash.units.iter().all(|unit| unit != &[0xFF; UNIT]), "both slots hold a copy");
+
+    let mut script = Script::new(Vec::new());
+    script.ready = true;
+    script.driver_like = true;
+    let mut station = Station::new(script, TestClock { now: 0 });
+    station.address = Some(OURS);
+    let mut c = Controller::new(station, ReadOnly(flash), Slot::default());
+
+    assert_eq!(c.stored_boot(), Some(BootConnection::Background), "the newer copy's setting, not the older's");
+    feed(&mut c, vec![caps(true)]);
+    c.begin_stored().unwrap();
+    feed(&mut c, vec![joined()]);
+    let joins = driver_joins(&c);
+    assert_eq!(joins.len(), 1, "one join");
+    assert_eq!((joins[0].0.as_slice(), joins[0].2.as_slice()), (&b"newer-net"[..], &b"newer-pass"[..]));
+    assert_eq!((c.state().link, c.state().join_outcome), (WifiLink::Connected, Some(JoinStatus::Success)));
 }

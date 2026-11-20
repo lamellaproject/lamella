@@ -19,8 +19,7 @@ use crate::target::falls_through;
 pub use crate::resolver::DescQualifiers;
 pub use crate::stackmaps::AssemblyStatics;
 use crate::stackmaps::{
-    encode_stackmap_record, pinned_values, STACKMAP_KIND_MANAGED_PTR, STACKMAP_KIND_OBJECT_REF,
-    STACKMAP_KIND_PINNED, STACKMAP_KIND_TAGGED, STACKMAP_MODE_METHOD_SLOTS, STACKMAP_MODE_STATICS,
+    encode_stackmap_record, pinned_values, STACKMAP_MODE_METHOD_SLOTS, STACKMAP_MODE_STATICS,
 };
 
 /// Why a function could not be lowered to RV32IM.
@@ -539,10 +538,12 @@ fn is_float(value_types: &[MirType], value: ValueId) -> bool {
     )
 }
 
-/// The compiler-rt soft-float routine for a float ARITHMETIC `Binary`, keyed by the (float) result width;
-/// `None` when the result is not a float (an integer op). `f32` -> `__addsf3`/... called `(a0, a1) -> a0`;
-/// `f64` -> `__adddf3`/... called `(a0:a1, a2:a3) -> a0:a1`. Float `%` has no compiler-rt helper (it is a
-/// library `fmod`), so `Rem` returns `None` and the caller rejects a float remainder as `Unsupported`.
+/// The soft-float routine for a float ARITHMETIC `Binary`, keyed by the (float) result width; `None` when
+/// the result is not a float (an integer op). `f32` -> `__addsf3`/... called `(a0, a1) -> a0`; `f64` ->
+/// `__adddf3`/... called `(a0:a1, a2:a3) -> a0:a1`. A remainder is the C library's `fmod`/`fmodf`, under the
+/// same calling convention: ECMA-335 4th ed III.3.55 defines a floating-point `rem` as the integer one with
+/// a quotient truncated toward zero (NaN for a zero divisor or an infinite dividend, the dividend for an
+/// infinite divisor), which is `fmod`'s definition, and compiler-rt has no remainder routine.
 fn soft_float_arith(op: BinOp, result_ty: Option<&MirType>) -> Option<&'static str> {
     let is_f64 = matches!(result_ty, Some(MirType::F64));
     if !is_f64 && !matches!(result_ty, Some(MirType::F32)) {
@@ -557,6 +558,8 @@ fn soft_float_arith(op: BinOp, result_ty: Option<&MirType>) -> Option<&'static s
         (BinOp::Sub, false) => "__subsf3",
         (BinOp::Mul, false) => "__mulsf3",
         (BinOp::DivSigned | BinOp::DivUnsigned, false) => "__divsf3",
+        (BinOp::RemSigned | BinOp::RemUnsigned, true) => "fmod",
+        (BinOp::RemSigned | BinOp::RemUnsigned, false) => "fmodf",
         _ => return None,
     })
 }
@@ -884,6 +887,7 @@ fn lower_module_inner(
         false,
         None,
         None,
+        None,
     )
         .map(|(bytes, ..)| bytes)
 }
@@ -919,6 +923,7 @@ type LoweredModule = (
     LibraryStubReport,
     Vec<Vec<(u32, u32)>>,
     Option<u32>,
+    u32,
 );
 
 /// One function's `.lamella_stackmaps` METHOD_SLOTS record material (the shared format in
@@ -979,6 +984,7 @@ fn lower_module_to_image(
     tolerant: bool,
     debug: Option<&crate::debugmap::ObjectDebug>,
     string_handle: Option<u32>,
+    type_handle: Option<u32>,
 ) -> Result<LoweredModule, LowerError> {
     let mut program = funcs.to_vec();
     if !relocate {
@@ -1097,6 +1103,7 @@ fn lower_module_to_image(
         }
         method_lines.push(lines);
     }
+    let mut code_end = enc.position();
     let names_want_header = !cfg!(feature = "strip-type-names")
         && descriptors.iter().any(|m| m.full_name.is_some());
     let lays_ambient_word = relocate && !tolerant;
@@ -1123,6 +1130,26 @@ fn lower_module_to_image(
             }
         }
     }
+    let type_handle = type_handle.filter(|_| relocate && !descriptors.is_empty()).and_then(|handle| {
+        let handle = TypeHandle(handle);
+        if !type_desc_labels.iter().any(|(h, _)| *h == handle) {
+            let words = descriptors
+                .iter()
+                .find(|m| m.handle == handle)
+                .and_then(|m| m.words.as_deref())?;
+            let label = enc.new_label();
+            type_descs.push(DescEmit {
+                label,
+                vtable: descriptor_vtable(descriptors, handle, externs),
+                words: words.to_vec(),
+                itable: descriptor_itable(descriptors, handle, externs),
+                base: descriptors.iter().find(|m| m.handle == handle).and_then(|m| m.base),
+                element: None,
+            });
+            type_desc_labels.push((handle, label));
+        }
+        Some(handle.0)
+    });
     if lays_ambient_word && string_header.is_none() && !descriptors.is_empty() {
         if let Some(seam) = STRING_ALLOCATING_SEAMS
             .iter()
@@ -1247,6 +1274,7 @@ fn lower_module_to_image(
             abs_desc_relocs: &mut abs_desc_relocs,
             type_names,
             string_header: name_header,
+            type_header: relocate.then_some(type_handle).flatten(),
         },
     );
     let assembled = enc
@@ -1290,6 +1318,7 @@ fn lower_module_to_image(
         if let Some(at) = &mut string_typedesc_position {
             *at = lamella_asm_riscv32::shift_position(shifts, *at);
         }
+        code_end = lamella_asm_riscv32::shift_position(shifts, code_end);
     }
     Ok((
         bytes,
@@ -1302,6 +1331,7 @@ fn lower_module_to_image(
         stub_report,
         method_lines,
         string_typedesc_position,
+        code_end,
     ))
 }
 
@@ -1590,6 +1620,7 @@ fn lower_object_relocatable(
         stub_report,
         method_lines,
         string_typedesc_position,
+        code_end,
     ) = lower_module_to_image(
         &program,
         alloc,
@@ -1600,6 +1631,7 @@ fn lower_object_relocatable(
         tolerant,
         debug,
         qualifiers.string,
+        qualifiers.system_type,
     )?;
     let method_records: Vec<(usize, MethodRecordInfo)> = method_records
         .into_iter()
@@ -1614,7 +1646,7 @@ fn lower_object_relocatable(
     let smstat_name = statics.map(AssemblyStatics::record_symbol);
     let mut symbols: Vec<lamella_elf::Symbol> = (0..program.len())
         .map(|i| {
-            let end = offsets.get(i + 1).copied().unwrap_or(text.len() as u32);
+            let end = offsets.get(i + 1).copied().unwrap_or(code_end);
             lamella_elf::Symbol {
                 name: names[i],
                 value: offsets[i],
@@ -1815,7 +1847,6 @@ fn lower_object_relocatable(
             addend: final_addend,
         });
     }
-    let code_end = text.len() as u32;
     for (record_index, (i, record)) in method_records.iter().enumerate() {
         while text.len() % 4 != 0 {
             text.push(0);
@@ -2103,6 +2134,8 @@ fn lower_function_body(
                     | Inst::InterfaceHasTag { .. }
                     | Inst::InterfaceHasArrayElementTag { .. }
                     | Inst::DescriptorWord { .. }
+                    | Inst::TypeName { .. }
+                    | Inst::TypeObject { .. }
                     | Inst::CallNative { .. }
                     | Inst::AllocArrayMD { .. }
                     | Inst::ArrayMDLoad { .. }
@@ -4337,6 +4370,8 @@ fn lower_inst_spilled(
             slot_store(enc, t0, slot(result));
         }
         Inst::TypeName { descriptor } => {
+            let class = enc.new_label();
+            let walk = enc.new_label();
             let miss = enc.new_label();
             let done = enc.new_label();
             slot_load(enc, t0, slot(*descriptor));
@@ -4344,11 +4379,15 @@ fn lower_inst_spilled(
             enc.lw(t1, t0, 0);
             enc.srli(t1, t1, 24);
             enc.li(t2, (ARRAY_DESC_MARK >> 24) as i32);
-            enc.branch(BranchCond::Eq, t1, t2, miss);
+            enc.branch(BranchCond::Ne, t1, t2, class);
+            enc.addi(t1, t0, crate::resolver::ARRAY_ITABLE_OFFSET as i32);
+            enc.j(walk);
+            enc.bind_label(class);
             enc.lw(t1, t0, 4);
             enc.slli(t1, t1, 2);
             enc.addi(t1, t1, 16);
             enc.add(t1, t0, t1);
+            enc.bind_label(walk);
             enc.lw(t2, t1, 0);
             enc.slli(t2, t2, 3);
             enc.add(t1, t1, t2);
@@ -4358,6 +4397,34 @@ fn lower_inst_spilled(
             enc.j(done);
             enc.bind_label(miss);
             enc.li(t0, 0);
+            enc.bind_label(done);
+            slot_store(enc, t0, slot(result));
+        }
+        Inst::TypeObject { descriptor } => {
+            if !relocate {
+                return Err(LowerError::Unsupported);
+            }
+            let class = enc.new_label();
+            let walk = enc.new_label();
+            let done = enc.new_label();
+            slot_load(enc, t0, slot(*descriptor));
+            enc.branch(BranchCond::Eq, t0, Reg::ZERO, done);
+            enc.lw(t1, t0, 0);
+            enc.srli(t1, t1, 24);
+            enc.li(t2, (ARRAY_DESC_MARK >> 24) as i32);
+            enc.branch(BranchCond::Ne, t1, t2, class);
+            enc.addi(t1, t0, crate::resolver::ARRAY_ITABLE_OFFSET as i32);
+            enc.j(walk);
+            enc.bind_label(class);
+            enc.lw(t1, t0, 4);
+            enc.slli(t1, t1, 2);
+            enc.addi(t1, t1, 16);
+            enc.add(t1, t0, t1);
+            enc.bind_label(walk);
+            enc.lw(t2, t1, 0);
+            enc.slli(t2, t2, 3);
+            enc.add(t0, t1, t2);
+            enc.addi(t0, t0, 12);
             enc.bind_label(done);
             slot_store(enc, t0, slot(result));
         }
@@ -4868,6 +4935,9 @@ struct DescEmitCtx<'a> {
     type_names: bool,
     /// `System.String`'s handle for a name's object header; `None` on the flat path.
     string_header: Option<u32>,
+    /// `System.Type`'s handle for the header of the `Type` object each descriptor carries (laid in THIS
+    /// object by the ensure-block, so its addend is 0); `None` on the flat path, where the header is 0.
+    type_header: Option<u32>,
 }
 
 fn emit_descriptors(
@@ -4884,6 +4954,7 @@ fn emit_descriptors(
         abs_desc_relocs,
         type_names,
         string_header,
+        type_header,
     } = ctx;
     let mut desc_syms: Vec<DescSym> = Vec::new();
     for (desc, (handle, _)) in type_descs.iter().zip(type_desc_labels) {
@@ -4993,10 +5064,23 @@ fn emit_descriptors(
             })
             .flatten()
             .and_then(|units| crate::stringgen::string_blob_bytes(&units).ok());
-        match &name {
-            Some(blob) => {
-                let name_label = enc.new_label();
-                enc.emit_word_diff(desc.label, name_label);
+        let name_label = name.as_ref().map(|_| enc.new_label());
+        match name_label {
+            Some(label) => enc.emit_word_diff(desc.label, label),
+            None => enc.emit_word(0),
+        }
+        match type_header {
+            Some(type_handle) => {
+                abs_desc_relocs.push((enc.position(), DESC_SYMBOL_FLAG | type_handle, 0));
+                enc.emit_word(0);
+            }
+            None => enc.emit_word(0),
+        }
+        let type_label = enc.new_label();
+        enc.bind_label(type_label);
+        enc.emit_word_diff(type_label, desc.label);
+        match (&name, name_label) {
+            (Some(blob), Some(name_label)) => {
                 if let Some(string_handle) = string_header {
                     abs_desc_relocs.push((enc.position(), DESC_SYMBOL_FLAG | string_handle, 0));
                     enc.emit_word(0);
@@ -5007,7 +5091,7 @@ fn emit_descriptors(
                     enc.emit_bytes(&[0]);
                 }
             }
-            None => enc.emit_word(0),
+            _ => {}
         }
         desc_syms.push((
             handle.0,
@@ -5502,6 +5586,7 @@ fn emit_fill_block(enc: &mut Encoder, dst: Reg, value: Reg, size: Reg) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::stackmaps::{STACKMAP_KIND_MANAGED_PTR, STACKMAP_KIND_OBJECT_REF, STACKMAP_KIND_PINNED};
     use lamella_ir::{BasicBlock, BlockId};
 
     #[test]
@@ -6347,6 +6432,7 @@ mod tests {
         };
         let lib_qualifiers = DescQualifiers {
             string: None,
+            system_type: None,
             own: Some("0bd4d82a".into()),
             references: Vec::new(),
         };
@@ -6366,6 +6452,7 @@ mod tests {
         let reference_handle = (crate::resolver::REFERENCE_HANDLE_TABLE << 24) | (1 << 20) | 5;
         let prog_qualifiers = DescQualifiers {
             string: None,
+            system_type: None,
             own: None,
             references: vec!["aaaaaaaa".into(), "0bd4d82a".into()],
         };
@@ -6405,6 +6492,113 @@ mod tests {
                 !obj.symbols.iter().any(|s| s.name == "__lamella_typedesc_33554437"),
                 "the unqualified raw-token name (the collision surface) must not appear"
             );
+        }
+    }
+
+    /// No function's symbol spans a descriptor or the ambient `String` word, the LAST function's
+    /// included: it ends where the code does, as ARM's ends at its `code_end_label`. Run to the end of
+    /// the text, the last function's span held every descriptor laid after it, so a dead-strip that
+    /// kept the function followed each one's vtable and itable entries, called or not: a corlib whose
+    /// last function a boxed corlib enum's `ToString` reaches kept `Environment.TickCount`, and the
+    /// image failed to link on the clock seam no RISC-V archive defines.
+    #[test]
+    fn no_function_symbol_spans_a_descriptor() {
+        let alloc_fn = |handle: u32| Function {
+            params: Vec::new(),
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(
+                    ValueId(0),
+                    Inst::Alloc {
+                        handle: TypeHandle(handle),
+                        payload_size: 4,
+                        ref_offsets: Vec::new().into_boxed_slice(),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let leaf = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(ValueId(0), Inst::ConstInt { ty: MirType::I32, value: 7 })],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let library = lamella_elf::read_object(
+            &lower_object_library_statics(
+                &[alloc_fn(0x0200_0005), leaf.clone()],
+                &["L0bd4d82a.f1", "L0bd4d82a.f2"],
+                &[],
+                &[],
+                None,
+                &[],
+                &DescQualifiers {
+                    string: None,
+                    system_type: None,
+                    own: Some("0bd4d82a".into()),
+                    references: Vec::new(),
+                },
+            )
+            .expect("the library lowers"),
+        )
+        .expect("read the library object");
+        let program = lamella_elf::read_object(
+            &lower_object_profile_statics_references(
+                &[alloc_fn(0x0200_0005), leaf],
+                &["f0", "f1"],
+                &[],
+                &[],
+                None,
+                &[],
+                &DescQualifiers {
+                    string: None,
+                    system_type: None,
+                    own: None,
+                    references: Vec::new(),
+                },
+                RiscvProfile::Rv32im,
+            )
+            .expect("the program lowers"),
+        )
+        .expect("read the program object");
+        for (what, obj) in [("library", &library), ("program", &program)] {
+            let laid: Vec<&lamella_elf::ParsedSymbol> = obj
+                .symbols
+                .iter()
+                .filter(|s| {
+                    s.defined
+                        && (s.name.starts_with(lamella_elf::TYPE_DESC_PREFIX)
+                            || s.name == STRING_TYPEDESC_SYMBOL)
+                })
+                .collect();
+            assert!(
+                laid.iter().any(|s| s.name.starts_with(lamella_elf::TYPE_DESC_PREFIX)),
+                "the {what}'s allocation lays a descriptor"
+            );
+            for function in obj
+                .symbols
+                .iter()
+                .filter(|s| s.defined && s.kind == lamella_elf::SymbolType::Func)
+            {
+                let span = function.value..function.value + function.size;
+                for data in &laid {
+                    assert!(
+                        !span.contains(&data.value),
+                        "the {what}'s {} ({span:#x?}) spans {} at {:#x}",
+                        function.name,
+                        data.name,
+                        data.value
+                    );
+                }
+            }
         }
     }
 
@@ -6787,11 +6981,55 @@ mod tests {
         };
         assert!(
             reads_from_t0_at(0),
-            "the walk must read the descriptor's mark word, to refuse an array"
+            "the walk must read the descriptor's mark word, to tell an array-form descriptor"
+        );
+        let addi = |w: u32, imm: i32| w & 0x7f == 0x13 && (w >> 12) & 0x7 == 0 && i_imm(w) == imm;
+        assert!(
+            words.iter().any(|&w| addi(w, crate::resolver::ARRAY_ITABLE_OFFSET as i32)),
+            "an array-form descriptor's itable is walked from its fixed offset, not refused"
         );
         assert!(
             reads_from_t0_at(4),
             "the walk must read the reference count at desc+4, which locates the itable"
+        );
+    }
+
+    #[test]
+    fn a_type_object_walks_to_the_name_word_and_answers_past_its_header() {
+        let func = Function {
+            params: vec![MirType::NativeInt],
+            ret: Some(MirType::ObjectRef),
+            value_types: vec![MirType::NativeInt, MirType::ObjectRef],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: vec![ValueId(0)],
+                insts: vec![(
+                    ValueId(1),
+                    Inst::TypeObject {
+                        descriptor: ValueId(0),
+                    },
+                )],
+                terminator: Some(Terminator::Return(Some(ValueId(1)))),
+            }],
+        };
+        assert!(matches!(lower(&func), Err(LowerError::Unsupported)), "no Type object on the flat path");
+        let bytes = lower_object(&[func], &["m"], &[], &[]).expect("a type-object read lowers");
+        let words: Vec<u32> = bytes
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        let i_imm = |w: u32| (w as i32) >> 20;
+        let reads_from_t0_at = |off: i32| words.iter().any(|&w| lw_t1_from_t0(w) && i_imm(w) == off);
+        assert!(reads_from_t0_at(0), "the walk must read the descriptor's mark word");
+        assert!(reads_from_t0_at(4), "the walk must read a class's reference count at desc+4");
+        let addi = |w: u32, imm: i32| w & 0x7f == 0x13 && (w >> 12) & 0x7 == 0 && i_imm(w) == imm;
+        assert!(
+            words.iter().any(|&w| addi(w, 12)),
+            "the object is 12 bytes past the last itable entry: the count, the name word and its header"
+        );
+        assert!(
+            words.iter().any(|&w| addi(w, crate::resolver::ARRAY_ITABLE_OFFSET as i32)),
+            "an array-form descriptor's itable is found at its fixed offset"
         );
     }
 
@@ -7308,6 +7546,78 @@ mod tests {
     fn the_flat_path_rejects_float_conversion() {
         let func = convert_function(ConvKind::IntToFloat32);
         assert_eq!(lower(&func), Err(LowerError::Unsupported));
+    }
+
+    #[test]
+    fn the_object_path_lowers_a_float_remainder_to_fmod() {
+        let n = ValueId;
+        let rem = |lhs, rhs| Inst::Binary {
+            op: BinOp::RemSigned,
+            lhs,
+            rhs,
+        };
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![
+                MirType::F32,
+                MirType::F32,
+                MirType::F32,
+                MirType::F64,
+                MirType::F64,
+                MirType::F64,
+                MirType::I32,
+            ],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        n(0),
+                        Inst::ConstInt {
+                            ty: MirType::F32,
+                            value: i64::from(7.5f32.to_bits()),
+                        },
+                    ),
+                    (
+                        n(1),
+                        Inst::ConstInt {
+                            ty: MirType::F32,
+                            value: i64::from(2.0f32.to_bits()),
+                        },
+                    ),
+                    (n(2), rem(n(0), n(1))),
+                    (
+                        n(3),
+                        Inst::ConstInt {
+                            ty: MirType::F64,
+                            value: 7.5f64.to_bits() as i64,
+                        },
+                    ),
+                    (
+                        n(4),
+                        Inst::ConstInt {
+                            ty: MirType::F64,
+                            value: 2.0f64.to_bits() as i64,
+                        },
+                    ),
+                    (n(5), rem(n(3), n(4))),
+                    (
+                        n(6),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 0,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(n(6)))),
+            }],
+        };
+        let bytes = lower_object(&[func], &["f0"], &[], &[]).expect("a float remainder lowers");
+        let obj = lamella_elf::read_object(&bytes).unwrap();
+        let has = |name: &str| obj.symbols.iter().any(|s| s.name == name && !s.defined);
+        assert!(has("fmodf"), "f32 % -> fmodf");
+        assert!(has("fmod"), "f64 % -> fmod");
     }
 
     #[test]

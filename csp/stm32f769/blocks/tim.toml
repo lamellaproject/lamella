@@ -1,0 +1,56 @@
+# BLOCK: the STM32F76x/F77x general-purpose timers TIM2 to TIM5, as far as a free-running counter
+# needs them. Offsets are relative to a TIMx instance's base in ../instances.toml.
+#
+# A timer counts its clock, divided by its prescaler, up from 0 to its auto-reload value and wraps
+# to 0. TIM2 and TIM5 count 32 bits and TIM3 and TIM4 count 16, so a counter meant to run for weeks
+# without being read takes one of the first two.
+#
+# THE PRESCALER IS BUFFERED. A value written to PSC takes effect at the next update event, so a
+# driver that writes it and starts the counter runs the first period at the old ratio. Setting UG
+# raises an update at once: it loads the prescaler and clears the counter.
+
+[table]
+kind = "block"
+family = "stm32f769"
+block = "tim"
+sources = [
+    "STM32F76xxx/STM32F77xxx reference manual RM0410 Rev 5 section 26.4, register descriptions, each stating its own address offset and reset value: 26.4.1 TIMx_CR1 0x00 (reset 0x0000, CEN bit 0, page 999), 26.4.6 TIMx_EGR 0x14 (UG bit 0, page 1007), 26.4.12 TIMx_CNT 0x24 (reset 0x0000 0000, 'CNT[31:16]: Most significant part counter value (TIM2 and TIM5)', page 1015), 26.4.14 TIMx_PSC 0x28 (PSC bits 15:0, page 1016), 26.4.15 TIMx_ARR 0x2C (reset 0xFFFF FFFF, page 1017).",
+    "RM0410 Rev 5 section 26.4.14 (TIMx_PSC): 'The counter clock frequency CK_CNT is equal to fCK_PSC / (PSC[15:0] + 1). PSC contains the value to be loaded in the active prescaler register at each update event (including when the counter is cleared through UG bit of TIMx_EGR register ...)'.",
+    "RM0410 Rev 5 section 26.4.6 (TIMx_EGR), bit 0 UG: 'Re-initialize the counter and generates an update of the registers. Note that the prescaler counter is cleared too (anyway the prescaler ratio is not affected). The counter is cleared if the center-aligned mode is selected or if DIR=0 (upcounting)'.",
+    "RM0410 Rev 5 section 26.4: 'The peripheral registers can be accessed by half-words (16-bit) or words (32-bit).'",
+]
+notes = [
+    "CNT READS THE WHOLE 32-BIT COUNT ONLY WHILE CR1's UIFREMAP (bit 11) IS CLEAR, which is its reset value (26.4.1 and 26.4.13): set, it turns bit 31 of TIMx_CNT into a copy of the update flag.",
+    "CR1, EGR and PSC are 16-bit registers. Every register here is reached by a word access, which the manual allows.",
+]
+
+[registers.CR1]
+offset = 0x00
+width = 32
+fields = { CEN = [0, 1] }
+notes = "Control. Resets to 0x0000: the counter stopped, counting up, edge-aligned, its auto-reload unbuffered and no flag remapped into CNT. CEN starts it."
+
+[registers.EGR]
+offset = 0x14
+width = 32
+fields = { UG = [0, 1] }
+notes = "Event generation, written only; each bit clears itself. UG loads the buffered registers, the prescaler among them, and clears a counter that counts up."
+
+[registers.CNT]
+offset = 0x24
+width = 32
+notes = "The count: 32 bits on TIM2 and TIM5, 16 on TIM3 and TIM4. Resets to 0."
+
+[registers.PSC]
+offset = 0x28
+width = 32
+fields = { PSC = [0, 16] }
+notes = "The prescaler: the counter advances once every PSC + 1 cycles of the timer's clock. Buffered: a value written takes effect at the next update event."
+
+[registers.ARR]
+offset = 0x2C
+width = 32
+notes = "The auto-reload value the counter wraps after. Resets to 0xFFFF FFFF, which on TIM2 and TIM5 is the counter's whole range."
+
+[constants]
+ARR_RESET = 0xFFFFFFFF

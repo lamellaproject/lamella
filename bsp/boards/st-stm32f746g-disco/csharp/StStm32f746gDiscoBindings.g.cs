@@ -109,10 +109,18 @@ namespace Lamella.Generated
         public const uint HEADER_I2C_KERNEL_HZ = 16000000;
         public const uint HEADER_I2C_TIMINGR_100K_HSI_16MHZ = 0x30420F13;
         public const uint HEADER_I2C_TIMINGR_400K_HSI_16MHZ = 0x10320309;
-        public const uint DEVICE_COUNT = 1;
+        public const uint DEVICE_COUNT = 3;
 
         // -- on-board devices: PORT group base + pin index + mask --
         public const uint WM8994_ADDRESS = 0x1A;
+        public const uint SWDIO_PORT_BASE = 0x40020000;
+        public const uint SWDIO_PIN = 13;
+        public const uint SWDIO_BANK = 0;
+        public const uint SWDIO_MASK = 0x2000;
+        public const uint SWCLK_PORT_BASE = 0x40020000;
+        public const uint SWCLK_PIN = 14;
+        public const uint SWCLK_BANK = 0;
+        public const uint SWCLK_MASK = 0x4000;
 
         /// -- memory regions the board fits: SIZE is what a program may reach, which a device's own
         /// size may exceed; a region with a CONTROLLER does not exist until that instance is brought

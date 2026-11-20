@@ -208,7 +208,7 @@ namespace System
 #endif
 
 #if LAMELLA_SURFACE_DECIMAL
-        public static Decimal Abs(Decimal value) { return value < Decimal.Zero ? Decimal.Negate(value) : value; }
+        public static Decimal Abs(Decimal value) { return value.IsNegative ? -value : value; }
 
         public static int Sign(Decimal value)
         {
@@ -217,9 +217,18 @@ namespace System
         }
 
         public static Decimal Max(Decimal val1, Decimal val2) { return val1 >= val2 ? val1 : val2; }
-        public static Decimal Min(Decimal val1, Decimal val2) { return val1 <= val2 ? val1 : val2; }
+        public static Decimal Min(Decimal val1, Decimal val2) { return val1 < val2 ? val1 : val2; }
 
         public static Decimal Round(Decimal d) { return Decimal.Round(d, 0); }
+
+        public static Decimal Round(Decimal d, int decimals) { return Decimal.Round(d, decimals); }
+#if LAMELLA_SURFACE_NETFX_2_0
+        public static Decimal Ceiling(Decimal d) { return Decimal.Ceiling(d); }
+        public static Decimal Floor(Decimal d) { return Decimal.Floor(d); }
+        public static Decimal Truncate(Decimal d) { return Decimal.Truncate(d); }
+        public static Decimal Round(Decimal d, MidpointRounding mode) { return Decimal.Round(d, mode); }
+        public static Decimal Round(Decimal d, int decimals, MidpointRounding mode) { return Decimal.Round(d, decimals, mode); }
+#endif
 #endif
 
 #if LAMELLA_SURFACE_MATH_TRANSCENDENTAL

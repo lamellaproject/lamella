@@ -16,6 +16,8 @@ namespace Lamella.Generated
         public const int STATUS_WIDTH = 32;
         public const uint STARTUP_OFF = 0xC;
         public const int STARTUP_WIDTH = 32;
+        public const uint COUNT_OFF = 0x10;
+        public const int COUNT_WIDTH = 32;
 
         // -- fields: <REG>_<FIELD> = the shifted mask; _LSB = the shift --
         public const uint CTRL_FREQ_RANGE = 0xFFF;
@@ -26,6 +28,8 @@ namespace Lamella.Generated
         public const uint STATUS_STABLE_LSB = 31;
         public const uint STARTUP_DELAY = 0x3FFF;
         public const uint STARTUP_DELAY_LSB = 0;
+        public const uint COUNT_COUNT = 0xFFFF;
+        public const uint COUNT_COUNT_LSB = 0;
 
         // -- block constants --
         public const uint CTRL_ENABLE_MAGIC = 0xFAB;

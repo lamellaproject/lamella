@@ -108,6 +108,10 @@ mod startup;
 #[path = "../rp2350_flash.rs"]
 mod rp2350_flash;
 
+#[cfg(target_os = "none")]
+#[path = "../../../lamella-serve-core/src/one_loaded_image.rs"]
+mod one_loaded_image;
+
 // THE BOARD, ONE BLOCK EACH: its generated bindings (the board's console pins, clock plan and
 // memory, as its facts state them), the identity the firmware answers a host with, and, on a board
 // whose PSRAM joins the heap, the descriptor that brings the PSRAM up. A board feature picks its
@@ -221,7 +225,7 @@ use lamella_board_support::boards::sparkfun_iot_redboard_rp2350::BOARD as DESCRI
 const _: () = {
     assert!(BOARD == board_bindings::BOARD_MODEL, "the board block's identity is not its bindings' board");
     assert!(
-        rp2350_flash::FLASH_END - 0x1000_0000 == board_bindings::MEMORY_FLASH_SIZE as usize,
+        rp2350_flash::settings::FLASH_END - 0x1000_0000 == board_bindings::MEMORY_FLASH_SIZE as usize,
         "build.rs sized the deploy window by another board's flash than this firmware's bindings state"
     );
 };
@@ -699,6 +703,13 @@ mod serve {
     }
 
     impl Transport for UartTransport {
+        /// One 256-byte chunk and the header ahead of it. This carrier has no receive ring: the serve
+        /// loop reads the UART's FIFO as each byte lands, so no buffer bounds a frame for it to state,
+        /// and it states the frame a host sends a serial carrier that declares nothing.
+        fn max_inbound_payload(&self) -> Option<usize> {
+            Some(256 + lamella_wire::msg::CHUNK_HEADER_LEN)
+        }
+
         fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
             for byte in encode_frame(msg_type, seq, payload).ok_or(TransportError::PayloadTooLarge)? {
                 uart_tx(byte);
@@ -740,25 +751,39 @@ mod serve {
     #[unsafe(link_section = ".noinit")]
     static mut BOOT_FLAG: u32 = 0;
     const FAULT_MAGIC: u32 = 0xB007_5E11;
+    #[cfg(not(feature = "usb"))]
     const SCB_AIRCR: usize = 0xe000_ed0c;
+    #[cfg(not(feature = "usb"))]
     const AIRCR_SYSRESETREQ: u32 = 0x05fa_0004; // VECTKEY 0x05FA | SYSRESETREQ (bit 2)
 
     fn reset_to_serve() -> ! {
         unsafe { core::ptr::write_volatile(&raw mut BOOT_FLAG, FAULT_MAGIC) };
         uart_drain();
-        write_register(SCB_AIRCR, AIRCR_SYSRESETREQ);
-        loop {}
+        system_reset()
     }
 
     /// A clean self-reset into the boot-run path (the host's EXEC of the deployed artifact): clear
     /// the recovery flag so the reboot runs the freshly deployed image (rather than waiting for
-    /// the host), then SYSRESETREQ. The EXEC_ACK was flushed before this, so nothing is pending on
-    /// the wire.
+    /// the host), then reset ([`system_reset`]). The EXEC_ACK was flushed before this, so nothing
+    /// is pending on the wire.
     fn reset_to_run() -> ! {
         unsafe { core::ptr::write_volatile(&raw mut BOOT_FLAG, 0) };
         uart_drain();
-        write_register(SCB_AIRCR, AIRCR_SYSRESETREQ);
-        loop {}
+        system_reset()
+    }
+
+    /// Resets the processors with SYSRESETREQ, which keeps `.noinit` and so [`BOOT_FLAG`]. With USB
+    /// the board first leaves the bus for long enough that the host sees it go
+    /// (`rp2350_usb::detach_and_reset`): the reset restarts only the processors, and the USB
+    /// controller would keep its pull-up through it.
+    fn system_reset() -> ! {
+        #[cfg(feature = "usb")]
+        rp2350_usb::detach_and_reset();
+        #[cfg(not(feature = "usb"))]
+        {
+            write_register(SCB_AIRCR, AIRCR_SYSRESETREQ);
+            loop {}
+        }
     }
 
     /// Any exception or fault vector lands here: the next boot comes back up waiting for the host.
@@ -920,6 +945,8 @@ mod serve {
         unsafe {
             ALLOCATOR.init(start, bytes);
         }
+        #[cfg(feature = "usb")]
+        rp2350_usb::detach_at_boot();
         clocks_uart_init();
         crate::rp2350_pin_events::init();
 
@@ -1024,8 +1051,10 @@ mod serve {
             }
         }
 
+        // SAFETY: the residence goes only to `serve_one_deploy_with_residence` below, beside `load`,
+        // and is made first so that it would be dropped after it; the loop never ends, so neither is.
+        let mut loaded = unsafe { crate::one_loaded_image::OneLoadedImage::new() };
         let mut load = lamella_runner::ArtifactLoad::new();
-        let mut loaded = OneLoadedImage::default();
         loop {
             let served = serve_one_deploy_with_residence(
                 &mut transport,
@@ -1042,40 +1071,6 @@ mod serve {
                 Ok(Served::RunRequested) => reset_to_run(), // EXEC(deployed): boot the deployed image
                 Ok(Served::ResetRequested) => reset_to_serve(),
                 Ok(Served::Handled | Served::Nothing) | Err(_) => {}
-            }
-        }
-    }
-
-    /// Where a LOADED artifact lives while a plain run or a debug session borrows it: one heap
-    /// allocation, freed when the transfer arena lets go of it.
-    ///
-    /// The runner can only leak an image to give the loader the `'static` bytes it borrows, and with
-    /// the arena held across frames every LOAD completes, so leaking would keep one image per run
-    /// until the heap ran out. This keeps one at a time.
-    #[derive(Default)]
-    struct OneLoadedImage {
-        /// The image placed last: its pointer, length and capacity, as the `Vec` it arrived in.
-        held: Option<(*mut u8, usize, usize)>,
-    }
-
-    impl lamella_runner::ImageResidence for OneLoadedImage {
-        fn admit(&mut self, image: alloc::vec::Vec<u8>) -> Option<&'static [u8]> {
-            lamella_runner::ImageResidence::release(self);
-            let mut image = core::mem::ManuallyDrop::new(image);
-            let held = (image.as_mut_ptr(), image.len(), image.capacity());
-            self.held = Some(held);
-            // SAFETY: the allocation is live until `release` rebuilds the Vec it came from and drops
-            // it, and `release` runs only when the arena has let go of these bytes with nothing
-            // executing -- an execution refuses every transfer while it exists -- so no borrow of
-            // the slice outlives the allocation.
-            Some(unsafe { core::slice::from_raw_parts(held.0, held.1) })
-        }
-
-        fn release(&mut self) {
-            if let Some((pointer, len, capacity)) = self.held.take() {
-                // SAFETY: the three parts are exactly those of the Vec `admit` took apart, and it was
-                // never dropped; the arena has let go of the slice handed out (see `admit`).
-                drop(unsafe { alloc::vec::Vec::from_raw_parts(pointer, len, capacity) });
             }
         }
     }

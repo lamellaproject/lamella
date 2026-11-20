@@ -118,15 +118,30 @@ pub(crate) enum UartOp {
 
 /// How a chip reports its FIFO state -- the two shapes the tables have produced so far.
 pub(crate) enum UartStatus {
-    /// One status register carrying byte COUNTS (ESP32-C6 style): `any()` is exact.
-    Counts { status: u32, rx_shift: u32, rx_mask: u32, tx_shift: u32, tx_mask: u32 },
+    /// One status register carrying byte COUNTS (ESP32-C6 style): `any()` is exact. Only the
+    /// off-device sim reads the TX count, so its place is compiled only there.
+    Counts {
+        status: u32,
+        rx_shift: u32,
+        rx_mask: u32,
+        #[cfg(not(target_os = "none"))]
+        tx_shift: u32,
+        #[cfg(not(target_os = "none"))]
+        tx_mask: u32,
+    },
     /// FLAG bits only (PL011 style): an rx-empty bit, no count -- `any()` honestly reports
     /// 0 or 1 ("at least one byte is immediately readable"), matching what the silicon can say.
     Flags { flags: u32, rx_empty_mask: u32 },
     /// FLAG bits where a SET bit means READY (SAMD21 SERCOM style): one INTFLAG register carries both
     /// TX-ready (DRE) and RX-ready (RXC). `any()` reports readable = the rx-ready bit is set -- the
-    /// OPPOSITE polarity to `Flags`'s rx-empty bit.
-    FlagsReady { flags: u32, tx_ready_mask: u32, rx_ready_mask: u32 },
+    /// OPPOSITE polarity to `Flags`'s rx-empty bit. Only the off-device sim reads the TX-ready bits,
+    /// so they are compiled only there.
+    FlagsReady {
+        flags: u32,
+        #[cfg(not(target_os = "none"))]
+        tx_ready_mask: u32,
+        rx_ready_mask: u32,
+    },
 }
 
 /// A config-rejected-by-this-chip reason (validation the generic layer cannot do).
@@ -138,17 +153,22 @@ pub(crate) enum UartConfigError {
 }
 
 /// The per-instance registers every per-op path needs (FIFO push/pop, the status shape), plus
-/// the sim's behavioral facts. The full bring-up lives in the board's `open_ops`.
+/// the sim's behavioral facts, which are compiled only off the device, where the sim runs. The full
+/// bring-up lives in the board's `open_ops`.
 pub(crate) struct UartFacts {
     /// The data register: a write pushes one TX byte; a read pops one RX byte.
     pub fifo: u32,
     /// How RX/TX readiness is reported.
     pub status: UartStatus,
     /// A config-latch register the sim must self-clear on read (0 = the chip has none).
+    #[cfg(not(target_os = "none"))]
     pub self_clear_reg: u32,
     /// Read-only READY registers the sim must present as already-true (a stable-crystal bit,
     /// reset-done bits) so the driver's real init polls terminate off-device.
+    #[cfg(not(target_os = "none"))]
     pub sim_ready: &'static [(u32, u32)],
+    /// The receive FIFO's depth in bytes: the most received bytes the sim reports waiting.
+    #[cfg(not(target_os = "none"))]
     pub fifo_depth: u32,
 }
 

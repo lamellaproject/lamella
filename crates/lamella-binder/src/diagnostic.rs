@@ -6,20 +6,6 @@ use lamella_syntax::diagnostic::Severity;
 use lamella_syntax::span::Span;
 use lamella_syntax::version::LanguageVersion;
 
-/// The language version this compilation is targeting -- **the one seam a selectable
-/// `/langversion` will be wired through**, and deliberately a single function rather than a
-/// literal repeated at each gate.
-///
-/// It answers [`LanguageVersion::DEFAULT`], which is DERIVED from what this build implements
-/// rather than pinned to ISO-1 -- so a gate here fires only for a construct the default rung does
-/// not admit, and the gate code is the default rung's rather than always `CS8022`. The value is
-/// nonetheless carried on the diagnostic rather than assumed where the message is formatted,
-/// because the code and the message's "in C# N" both derive from it: a second dialect changes five
-/// call sites through here, not thirty through a format string.
-pub(crate) fn compiling_version() -> LanguageVersion {
-    LanguageVersion::DEFAULT
-}
-
 /// Which validation phase reported a diagnostic. A compilation is checked in the
 /// order the language is defined: DECLARATIONS first -- signatures, base clauses, interface
 /// implementation, const values, enum members, attributes -- and then METHOD BODIES, which are

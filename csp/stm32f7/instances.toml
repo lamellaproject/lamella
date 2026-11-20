@@ -16,6 +16,8 @@ sources = [
     "STM32F7 reference manual RM0385 Rev 9: memory map (GPIOC 0x40020800, GPIOD 0x40020C00, GPIOE 0x40021000, GPIOF 0x40021400, GPIOG 0x40021800, GPIOH 0x40021C00); RCC_AHB1ENR 5.3.10 (GPIOCEN bit 2 through GPIOHEN bit 7). Every one of the six ports carries a signal of an external memory proven on silicon.",
     "STM32F7 reference manual RM0385 Rev 9: memory map (I2C1 0x40005400, I2C3 0x40005C00); RCC_APB1ENR 5.3.13 (address offset 0x40, I2C1EN bit 21, I2C3EN bit 23). Both rows confirmed on silicon by walking every address of each bus.",
     "STM32F7 reference manual RM0385 Rev 9: memory map (GPIOI 0x40022000); RCC_AHB1ENR 5.3.10 (GPIOIEN bit 8). Port I is on the larger packages only, and the 216-pin part brings four of its pins out to a board header.",
+    "STM32F7 reference manual RM0385 Rev 9: Table 1 register boundary addresses, pages 71 and 72: GPIOJ 0x40022400 and GPIOK 0x40022800 on AHB1, EXTI 0x40013C00 and SYSCFG 0x40013800 on APB2; RCC_AHB1ENR 5.3.10 (GPIOJEN bit 9, GPIOKEN bit 10); RCC_APB2ENR 5.3.14 (address offset 0x44, SYSCFGEN bit 14, 'System configuration controller clock enable'). No RCC register names an EXTI enable.",
+    "STM32F7 reference manual RM0385 Rev 9: Table 1 register boundary addresses, page 73: TIM5 0x40000C00 to 0x40000FFF; RCC_APB1ENR 5.3.13 (address offset 0x40, reset value 0x0000 0000, TIM5EN bit 3, 'TIM5 clock enable').",
 ]
 notes = [
     "Every bit position here is taken from the reference manual's per-bit descriptions rather than from its register bit-map diagram: the diagram is a wide table whose columns do not survive a text conversion, and the per-bit prose states the same fact unambiguously.",
@@ -102,6 +104,42 @@ rcc_en_off = 0x30   # RCC_AHB1ENR
 rcc_en_bit = 8      # GPIOIEN
 
 [[instances]]
+name = "gpioj"
+block = "gpio"
+base = 0x40022400
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 9      # GPIOJEN
+
+# Port K's registers carry sixteen fields while the package bonds eight of its pads, PK0 to PK7
+# (../parts.toml).
+[[instances]]
+name = "gpiok"
+block = "gpio"
+base = 0x40022800
+rcc_en_off = 0x30   # RCC_AHB1ENR
+rcc_en_bit = 10     # GPIOKEN
+
+# --- the external interrupt controller and the register that routes pins to it ------------------
+#
+# Two instances because they are two peripherals and only one of them has a clock. EXTI is gated
+# by no RCC register, so its row states no enable; SYSCFG is gated, and a pin cannot be routed to
+# a line without it. The vectors the lines arrive on are stated in blocks/exti.toml.
+
+[[instances]]
+name = "exti"
+block = "exti"
+base = 0x40013C00
+rcc_en_off = -1     # NOT ABSENT: EXTI has no enable bit in any RCC register
+rcc_en_bit = -1
+
+[[instances]]
+name = "syscfg"
+block = "syscfg"    # its EXTICR bank is what binds a line to a port
+base = 0x40013800
+rcc_en_off = 0x44   # RCC_APB2ENR
+rcc_en_bit = 14     # SYSCFGEN
+
+[[instances]]
 name = "rcc"
 block = "rcc"
 base = 0x40023800
@@ -147,3 +185,13 @@ block = "quadspi"
 base = 0xA0001000
 rcc_en_off = 0x38   # RCC_AHB3ENR
 rcc_en_bit = 1      # QSPIEN
+
+# The timer a board's millisecond clock counts on: one of the two 32-bit general-purpose timers, so
+# its count wraps after 2^32 ticks rather than 2^16. It gates from APB1.
+
+[[instances]]
+name = "tim5"
+block = "tim"
+base = 0x40000C00
+rcc_en_off = 0x40   # RCC_APB1ENR
+rcc_en_bit = 3      # TIM5EN

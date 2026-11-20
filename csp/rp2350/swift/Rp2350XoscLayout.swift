@@ -12,6 +12,8 @@ public enum Rp2350XoscLayout {
     public static let STATUS_WIDTH: Int32 = 32
     public static let STARTUP_OFF: UInt32 = 0xC
     public static let STARTUP_WIDTH: Int32 = 32
+    public static let COUNT_OFF: UInt32 = 0x10
+    public static let COUNT_WIDTH: Int32 = 32
 
     // -- fields: <REG>_<FIELD> = the shifted mask; _LSB = the shift --
     public static let CTRL_FREQ_RANGE: UInt32 = 0xFFF
@@ -22,6 +24,8 @@ public enum Rp2350XoscLayout {
     public static let STATUS_STABLE_LSB: UInt32 = 31
     public static let STARTUP_DELAY: UInt32 = 0x3FFF
     public static let STARTUP_DELAY_LSB: UInt32 = 0
+    public static let COUNT_COUNT: UInt32 = 0xFFFF
+    public static let COUNT_COUNT_LSB: UInt32 = 0
 
     // -- block constants --
     public static let CTRL_ENABLE_MAGIC: UInt32 = 0xFAB

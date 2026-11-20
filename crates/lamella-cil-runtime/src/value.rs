@@ -157,6 +157,18 @@ pub enum Location {
         /// The static-field storage slot.
         slot: usize,
     },
+    /// A byte-displaced pointer into (or one past the end of) a static's storage -- produced only
+    /// by unsafe pointer arithmetic on the address of a static (C# 25.5.6: `int* q = p + 1;` after
+    /// `fixed (int* p = &S.F)`). `byte_offset == 0` addresses the static itself; a dereference reads
+    /// or writes the static's bytes, laid out by the storage the loader recorded for it. Arithmetic,
+    /// comparison and pointer difference treat the slot as the allocation base, as
+    /// [`Location::LocalBytes`] treats a local's.
+    StaticBytes {
+        /// The static-field storage slot.
+        slot: usize,
+        /// The raw byte displacement from the static's base.
+        byte_offset: u32,
+    },
     /// The value inside a box -- the managed pointer `unbox` yields for in-place access.
     Boxed {
         /// The boxed object.

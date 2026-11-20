@@ -4,7 +4,6 @@ use std::process::ExitCode;
 
 mod args;
 mod bootprot;
-#[cfg(feature = "bake")]
 mod attach;
 #[cfg(feature = "bake")]
 mod bake;
@@ -21,6 +20,7 @@ mod packages;
 mod ports;
 mod program;
 mod project;
+mod python_on_device;
 // Test-only: the one place that says what a rendered message may and may not contain.
 #[cfg(test)]
 mod rendered;

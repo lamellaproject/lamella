@@ -1388,6 +1388,15 @@ const STM32F769: Stm32Part = Stm32Part {
     flash_base: STM32_FLASH_BASE,
     ram_top: 0x2008_0000,
 };
+/// The STM32F746 (Cortex-M7): 320 KB of SRAM from `0x2000_0000`, the 64 KB DTCM followed by SRAM1 at
+/// `0x2001_0000` and SRAM2 at `0x2004_C000`, up to `0x2005_0000`, where the reserved range begins
+/// (RM0385 2.3 and Figure 2). All of it is clocked from reset: SRAM1 and SRAM2 have no clock enable,
+/// and RCC_AHB1ENR's reset value, 0x0010 0000, sets DTCMRAMEN (RM0385 5.3.10).
+#[cfg(feature = "linked")]
+const STM32F746: Stm32Part = Stm32Part {
+    flash_base: STM32_FLASH_BASE,
+    ram_top: 0x2005_0000,
+};
 /// The STM32U5A5 (Cortex-M33): SRAM1, SRAM2, SRAM3 and SRAM5 run on from `0x2000_0000` to
 /// `0x2027_0000`, 2,496 KB, and all four are clocked from reset (RM0456 2.3.2, 11.8.29 to 11.8.31).
 #[cfg(feature = "linked")]
@@ -1414,6 +1423,7 @@ const STM32H747_CM7: Stm32Part = Stm32Part {
 /// The linked tier's STM32 parts, each with its row. A dual-core part names its core.
 #[cfg(feature = "linked")]
 const STM32_LINKED_PARTS: &[(&str, Stm32Part)] = &[
+    ("stm32f746", STM32F746),
     ("stm32f769", STM32F769),
     ("stm32u5a5", STM32U5A5),
     ("stm32u585", STM32U585),
@@ -1475,6 +1485,13 @@ impl LinkedPart {
             LinkedPart::Stm32(part) => (STM32_STATICS_BASE, part.statics_capacity().unwrap_or(0)),
         }
     }
+}
+
+/// Whether the linked tier has an image plan for `target`: the RP2350, a Nordic part, or an STM32 row.
+#[cfg(feature = "linked")]
+#[must_use]
+pub fn links(target: &str) -> bool {
+    linked_part(target).is_ok()
 }
 
 /// The part `target` names, or [`BuildError::UnsupportedTarget`] for a target the linked tier has no
@@ -3701,6 +3718,10 @@ fn build_program_object(
             .with_references(&references)
             .string_type_meta()
             .map(|m| m.handle.0),
+        system_type: MetadataResolver::new(&assembly)
+            .with_references(&references)
+            .system_type_meta()
+            .map(|m| m.handle.0),
         own: None,
         references: corlib
             .iter()
@@ -3974,7 +3995,8 @@ fn append_reference_descriptors(
 ) {
     let mut added: Vec<u32> = Vec::new();
     let array_base = resolver.system_array_meta();
-    if funcs.iter().any(|f| {
+    if !descriptors.is_empty()
+        || funcs.iter().any(|f| {
         f.blocks.iter().flat_map(|b| &b.insts).any(|(_, i)| {
             matches!(
                 i,
@@ -3987,6 +4009,12 @@ fn append_reference_descriptors(
                 added.push(meta.handle.0);
                 descriptors.push(meta);
             }
+        }
+    }
+    if let Some(meta) = resolver.system_type_meta() {
+        if !descriptors.iter().any(|d| d.handle == meta.handle) {
+            added.push(meta.handle.0);
+            descriptors.push(meta);
         }
     }
     for func in funcs {
@@ -4739,7 +4767,6 @@ fn build_object_riscv_inner(
     let references: Vec<&Assembly> = reference_assemblies.iter().collect();
     let entry = find_main(&assembly).ok_or(BuildError::NoEntryPoint)?;
     let resolver = MetadataResolver::new(&assembly).with_references(&references);
-    let mut descriptors = resolver.type_descriptors();
     let mut reference_cctors: Vec<alloc::string::String> = Vec::new();
     for (bytes, reference) in reference_cils.iter().zip(&reference_assemblies) {
         let prefix = library_prefix(bytes);
@@ -4752,7 +4779,7 @@ fn build_object_riscv_inner(
     let (mut funcs, plan) =
         lower_reachable(&assembly, entry, &references, &reference_cctors, BuildKind::Release)?;
     let resolver = resolver.with_monomorphized(plan);
-    descriptors = resolver.type_descriptors();
+    let mut descriptors = resolver.type_descriptors();
     descriptors.extend(resolver.instantiation_descriptors());
     let mut names: Vec<alloc::string::String> =
         (0..funcs.len()).map(|i| alloc::format!("f{i}")).collect();
@@ -4782,6 +4809,7 @@ fn build_object_riscv_inner(
     let reference_region_refs: Vec<&str> = reference_regions.iter().map(|s| s.as_str()).collect();
     let qualifiers = crate::resolver::DescQualifiers {
         string: resolver.string_type_meta().map(|m| m.handle.0),
+        system_type: resolver.system_type_meta().map(|m| m.handle.0),
         own: None,
         references: reference_cils
             .iter()
@@ -4892,7 +4920,7 @@ pub fn lower_monomorphized_body<'a>(
             &layout_arguments,
             owner_assembly,
             argument_world,
-            definitions.references(),
+            definitions.argument_world_references(),
         )
     };
     let signature = method.signature();
@@ -4920,7 +4948,7 @@ pub fn lower_monomorphized_body<'a>(
                 &layout_arguments,
                 owner_assembly,
                 argument_world,
-                definitions.references(),
+                definitions.argument_world_references(),
             )
             .ok_or_else(|| gap(MonoGap::UnsubstitutedSlot))?,
         );
@@ -5012,6 +5040,10 @@ fn rebase_identities(
                 | Inst::TypeDescAddr { handle }
                 | Inst::AllocArray2D { handle, .. }
                 | Inst::AllocArrayMD { handle, .. } => {
+                    if let Some(caller) = crate::resolver::argument_world_handle(*handle) {
+                        *handle = caller;
+                        continue;
+                    }
                     let assembly_independent =
                         handle.0 >> 24 == crate::generics::INSTANTIATION_HANDLE_TABLE;
                     *handle = rebase(*handle)?;
@@ -5170,7 +5202,7 @@ fn names_a_value_type(sig: &SigType) -> bool {
 ///
 /// `None` (the whole list) for an owner with no file bytes (an [`Assembly::from_image`] parse):
 /// there is no content hash, so there is no `L<hash>.` family to call into and nothing to name.
-fn library_function_symbols<'a>(
+pub(crate) fn library_function_symbols<'a>(
     owner: &'a Assembly<'a>,
     owner_references: &[&'a Assembly<'a>],
 ) -> Option<Vec<Option<alloc::string::String>>> {
@@ -5553,6 +5585,16 @@ fn lower_one_reachable(
                     &signature,
                 );
             };
+            if type_def.name().is_some_and(|name| {
+                traps_in_place_of_its_body(
+                    name.namespace,
+                    name.name,
+                    method.name(),
+                    signature.as_ref().map_or(0, |sig| sig.parameters.len()),
+                )
+            }) {
+                return Ok(Some(deferred_trap_body()));
+            }
             let mut arg_types = Vec::new();
             if let Some(sig) = &signature {
                 if sig.has_this {
@@ -5665,6 +5707,7 @@ fn build_library_object_riscv_inner(
     let reference_region_refs: Vec<&str> = reference_regions.iter().map(|s| s.as_str()).collect();
     let qualifiers = crate::resolver::DescQualifiers {
         string: resolver.string_type_meta().map(|m| m.handle.0),
+        system_type: resolver.system_type_meta().map(|m| m.handle.0),
         own: Some(alloc::format!(
             "{:08x}",
             lamella_metadata::fnv1a32(0x811c_9dc5, cil)
@@ -5795,15 +5838,18 @@ pub enum SeamDisposition {
     /// validation errors" because 0 is also its "clean" encoding).
     Placeholder,
     /// A TRAP body: reaching it faults. Not silent, so it needs no build-time refusal -- the fault
-    /// IS the enforcement. `System.Array`'s untyped element primitives take this until they are
-    /// synthesized.
+    /// IS the enforcement -- except for a seam trapped because its placeholder misleads through a
+    /// slot, whose DIRECT calls are refused as a placeholder's are ([`refuses_a_direct_call`]).
+    /// `System.Array`'s untyped element primitives take this until they are synthesized.
     Trap,
 }
 
 /// A CALL EDGE from emitted code into a `[RuntimeProvided]` seam this build left as a SILENT
 /// placeholder (no synthesis, no `[IntendedDefault]`, no trap) -- the caller will be told a constant
-/// and cannot tell. This is the edge a strict build refuses over
-/// ([`BuildError::SilentSeamCallEdge`]); an edge into a marked or trapped seam is not one.
+/// and cannot tell -- or trapped because its placeholder misleads through a slot, which a direct call
+/// names as plainly ([`refuses_a_direct_call`]). This is the edge a strict build refuses over
+/// ([`BuildError::SilentSeamCallEdge`]); an edge into a marked seam, or one trapped for any other
+/// reason, is not one.
 #[derive(Debug, Clone)]
 pub struct SeamCallEdge {
     /// The METHOD_DEF rid of the calling method.
@@ -6016,6 +6062,10 @@ fn build_library_object_core(
             .with_references(&reference_list)
             .string_type_meta()
             .map(|m| m.handle.0),
+        system_type: MetadataResolver::new(&assembly)
+            .with_references(&reference_list)
+            .system_type_meta()
+            .map(|m| m.handle.0),
         own: Some(alloc::format!("{:08x}", lamella_metadata::fnv1a32(0x811c_9dc5, cil))),
         references: references
             .iter()
@@ -6224,8 +6274,9 @@ fn vtable_slot_rids(resolver: &MetadataResolver<'_>) -> Vec<u32> {
         .collect()
 }
 
-/// Every direct CALL EDGE from `funcs` into a seam of `seams` whose disposition is SILENT -- an
-/// unmarked, untrapped placeholder. Both edge kinds a rid names directly are counted: a `call`
+/// Every direct CALL EDGE from `funcs` into a seam of `seams` that [`refuses_a_direct_call`] -- an
+/// unmarked placeholder, or a seam trapped because its placeholder misleads through a slot, the
+/// question [`imported_silent_seams`] asks of a reference's. Both edge kinds a rid names directly are counted: a `call`
 /// ([`Inst::Call`]) and taking the method's ADDRESS ([`Inst::FuncAddr`], a `ldftn` behind a delegate
 /// -- deferring the call does not make the answer less wrong).
 ///
@@ -6244,12 +6295,29 @@ fn silent_seam_call_edges(
     seams: &[SeamRow],
     display_names: &[Option<alloc::string::String>],
 ) -> Vec<SeamCallEdge> {
+    let mut declared: alloc::collections::BTreeMap<
+        u32,
+        (lamella_metadata::TypeName<'_>, lamella_metadata::Method<'_>),
+    > = alloc::collections::BTreeMap::new();
+    for type_def in assembly.type_defs() {
+        let Some(type_name) = type_def.name() else {
+            continue;
+        };
+        for method in type_def.methods() {
+            if seams.iter().any(|(seam, ..)| *seam == method.rid()) {
+                declared.insert(method.rid(), (type_name, method));
+            }
+        }
+    }
     let silent: Vec<u32> = seams
         .iter()
         .filter(|(rid, disposition, folded)| {
-            *disposition == SeamDisposition::Placeholder
-                && !*folded
+            let placeholder = *disposition == SeamDisposition::Placeholder;
+            !*folded
                 && !assembly.is_intended_default(Token::new(table::METHOD_DEF, *rid))
+                && declared.get(rid).map_or(placeholder, |(type_name, method)| {
+                    refuses_a_direct_call(placeholder, type_name, method)
+                })
         })
         .map(|(rid, ..)| *rid)
         .collect();
@@ -6359,11 +6427,11 @@ fn imported_silent_seams<'a>(
             if !reference.is_runtime_provided(token) || reference.is_intended_default(token) {
                 continue;
             }
-            let signature = method.signature();
-            if !matches!(
-                synthesized_seam_body(reference, reference_refs, &type_name, &method, &signature),
+            let placeholder = matches!(
+                synthesized_seam_body(reference, reference_refs, &type_name, &method, &method.signature()),
                 SeamEmission::Placeholder
-            ) {
+            );
+            if !refuses_a_direct_call(placeholder, &type_name, &method) {
                 continue;
             }
             found.push((
@@ -7807,20 +7875,31 @@ fn synthesize_runtime_reader(
     }
 }
 
-/// A synthesized MIR body for the two `[RuntimeProvided]` seams that make `typeof(T)` real.
+/// A synthesized MIR body for the `[RuntimeProvided]` seams of `System.Type` this tier backs:
+/// `GetTypeFromHandle`, `HandleEquals`, `FullName` and `ToString`.
 ///
-/// `System.Type` is HANDLE-BACKED (the model `corlib/System/Type.cs` documents): `typeof(T)` compiles
-/// to `ldtoken T ; call GetTypeFromHandle`, and `ldtoken` already lowers to the type's CANONICAL
-/// descriptor address (`Inst::TypeDescAddr`). So that address IS the `Type`, which makes
-/// `GetTypeFromHandle(handle)` the IDENTITY -- it retypes the incoming word to a reference and
-/// returns it (`IntToRef` is a pure retype, a no-op at the machine level) -- and makes
-/// `HandleEquals(a, b)` a POINTER COMPARE of the two descriptor addresses.
-/// A descriptor is canonical per type (one symbol, dedup'd strong/weak across assemblies), so pointer
-/// equality IS type identity: `typeof(P) == typeof(P)` holds and two distinct types never collide.
+/// `typeof(T)` is the one `System.Type` object for `T` (ECMA-334 4th ed, 14.5.11), and csc and lcsc
+/// compile it to `ldtoken T ; call GetTypeFromHandle`: `ldtoken` pushes the type's `RuntimeTypeHandle`
+/// for the library's reflection methods (ECMA-335 4th ed, III.4.17), and `GetTypeFromHandle` answers the
+/// `Type` that handle references (IV.5.2, the library XML's `System.Type.GetTypeFromHandle`). Here
+/// `ldtoken` lowers to the type's CANONICAL descriptor address (`Inst::TypeDescAddr`).
+/// The `Type` is the read-only object that descriptor carries ([`Inst::TypeObject`]): a header naming
+/// `System.Type`'s descriptor, so a virtual call on it dispatches through `System.Type`'s vtable, and one
+/// payload word naming the descriptor back. So `GetTypeFromHandle(handle)` is `TypeObject(handle)` and
+/// `HandleEquals(a, b)` is a POINTER COMPARE: one descriptor per type (one symbol, dedup'd strong/weak
+/// across assemblies) carries one object per type, so `typeof(P) == typeof(P)` holds and two distinct
+/// types never collide -- the identity both standards ask for: one `Type` object for any given type
+/// (ECMA-334 4th ed, 14.5.11), and `Type`s that `ReferenceEquals` for two objects of identical run-time
+/// types (ECMA-335 4th ed, IV.5.3, the library XML's `System.Object.GetType`). `FullName` is
+/// [`synthesize_type_full_name`] and `ToString` is [`synthesize_type_to_string`].
+///
+/// The `Type` USED TO BE the descriptor address itself, and a descriptor has no object header -- the word
+/// before it is a vtable slot -- so `Equals`, `GetHashCode` or `ToString` on a `Type` read a code address
+/// as its descriptor and jumped into code: a lockup on ARM, a trap on RISC-V.
 ///
 /// Without these the placeholders lower AS WRITTEN -- `GetTypeFromHandle` returns `null` and
-/// `HandleEquals` returns `false` -- so `typeof(P) == typeof(P)` is silently FALSE on device (the
-/// `[RuntimeProvided]`-compiled-out-returns-default hazard). Both seams are static: no receiver.
+/// `HandleEquals` `false` -- so `typeof(P) == typeof(P)` is silently FALSE on device (the
+/// `[RuntimeProvided]`-compiled-out-returns-default hazard).
 fn synthesize_type_seam(
     namespace: &str,
     type_name: &str,
@@ -7840,14 +7919,15 @@ fn synthesize_type_seam(
                 params: vec![ValueId(0)],
                 insts: vec![(
                     ValueId(1),
-                    Inst::Convert {
-                        value: ValueId(0),
-                        kind: ConvKind::IntToRef,
+                    Inst::TypeObject {
+                        descriptor: ValueId(0),
                     },
                 )],
                 terminator: Some(Terminator::Return(Some(ValueId(1)))),
             }],
         }),
+        (Some("get_FullName"), 0) => Some(synthesize_type_full_name()),
+        (Some("ToString"), 0) => Some(synthesize_type_to_string()),
         (Some("HandleEquals"), 2) => Some(Function {
             params: vec![MirType::ObjectRef, MirType::ObjectRef],
             ret: Some(MirType::I32),
@@ -7890,6 +7970,504 @@ fn synthesize_type_seam(
         }),
         _ => None,
     }
+}
+
+/// What the synthesis table answers for `MemberInfo.get_Name`: [`synthesize_member_name`]'s body, or a
+/// trap where that body cannot be right.
+///
+/// * With no `System.Type` to check the receiver against, no `Type` can reach the getter, and a
+///   receiver that does is one the body cannot read.
+/// * In the UTF-8 storage tiers (`string-utf8`, `string-utf8-wtf8`) a string is its unit count, its
+///   byte length and its bytes, where the body reads UTF-16 units from offset 4 -- and the substring
+///   seam it cuts with (`lamella_string_substring`) reads UTF-16 too. A trap there rather than a slice
+///   of the wrong bytes.
+fn member_name_emission(system_type: Option<TypeHandle>) -> SeamEmission {
+    match system_type {
+        Some(handle) if !crate::resolver::STORAGE_IS_BYTES => SeamEmission::Synthesized(synthesize_member_name(handle)),
+        _ => SeamEmission::Trap(deferred_trap_body()),
+    }
+}
+
+/// A synthesized MIR body for `[RuntimeProvided] System.Type.get_FullName`: the NAME of the descriptor
+/// this `Type` belongs to -- the object's payload word is the descriptor relative to the object, so
+/// adding it back reaches the descriptor, and `TypeName` answers its name.
+///
+/// A type laid with no name (the `strip-type-names` tier, a synthetic handle) TRAPS: a type's
+/// `FullName` is null only for an unassigned generic type parameter (ECMA-335 4th ed, IV.5.3, the
+/// library XML's `System.Type.FullName`), which this tier never hands out as a `Type`.
+///
+/// A nested type's name is `Ns.Outer+Inner`, `FullName`'s own form: `.` separates namespace identifiers
+/// and `+` precedes a nested class (ECMA-335 4th ed, IV.5.5, the library XML's
+/// `System.Type.AssemblyQualifiedName`, which gives the name syntax). A CONSTRUCTED generic type's name
+/// is its `ToString()` text, ``Pair`2[System.Int32,System.String]``, its arguments qualified by
+/// namespace and nested type but not by assembly (IV.5.3, `System.Type.ToString`), where `FullName`
+/// qualifies each type argument by its assembly (IV.5.3, `System.Type.FullName`), and this tier carries
+/// no assembly identity to print: that answer is short of .NET's.
+///
+/// A null receiver never arrives: the `callvirt` that reaches an instance getter tests it first
+/// (ECMA-335 4th ed, III.4.2).
+fn synthesize_type_full_name() -> Function {
+    let objt = MirType::ObjectRef;
+    let i32t = MirType::I32;
+    let (mut mb, params) = MirBuilder::new(&[objt]);
+    let this = params[0];
+    let named = mb.block();
+    let trap = mb.block();
+
+    mb.at(0);
+    let object = mb.emit(
+        i32t,
+        Inst::Convert {
+            value: this,
+            kind: ConvKind::RefToInt,
+        },
+    );
+    let relative = mb.emit(
+        i32t,
+        Inst::Load {
+            address: object,
+            width: 4,
+            signed: false,
+        },
+    );
+    let descriptor = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: object,
+            rhs: relative,
+        },
+    );
+    let full = mb.emit(objt, Inst::TypeName { descriptor });
+    let text = mb.emit(
+        i32t,
+        Inst::Convert {
+            value: full,
+            kind: ConvKind::RefToInt,
+        },
+    );
+    let zero = mb.emit(i32t, Inst::ConstInt { ty: i32t, value: 0 });
+    let is_null = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: text,
+            rhs: zero,
+        },
+    );
+    mb.branch(is_null, trap, named);
+
+    mb.at(named);
+    mb.ret(full);
+
+    mb.at(trap);
+    mb.unreachable();
+    mb.finish(Some(objt))
+}
+
+/// A synthesized MIR body for `[RuntimeProvided] System.Type.ToString()`: the NAME of the descriptor
+/// this `Type` belongs to, the body [`synthesize_type_full_name`] gives `FullName`.
+///
+/// `ToString` answers `FullName` (ECMA-335 4th ed, IV.5.3, the library XML's `System.Type.ToString`),
+/// except that for a generic type "the type and its type arguments are qualified by namespace and by
+/// nested type, but not by assembly", where `FullName` qualifies the type arguments by their assembly
+/// (IV.5.3, `System.Type.FullName`). The descriptor's name is the first form -- `Ns.Outer+Inner`,
+/// `System.Int32`, ``Ns.Pair`2[System.Int32,System.String]``, ``Ns.Holder`1+Inner[System.Int32]`` --
+/// so for every type this tier hands out as a `Type` this seam answers the standard's text, where
+/// `FullName` falls short of it for a constructed generic type. The two stay separate seams so that
+/// `FullName` can come to qualify its type arguments without moving this answer, which
+/// `Exception.ToString` names an exception's type by.
+///
+/// A `callvirt` reaches it through `System.Type`'s vtable slot with no `call` naming it, so the caller
+/// audit cannot see it ([`UnsynthesizedSeam::in_vtable_slot`]). Left as the placeholder, it answered
+/// null, and every exception's text lost its type name: `: the reason` for `System.Exception: the
+/// reason`.
+///
+/// A type laid with no name (the `strip-type-names` tier, a synthetic handle) traps, as `FullName`
+/// does, rather than answering null: the standard's `ToString` names every type, an unassigned type
+/// parameter by its unqualified name (IV.5.3), and this tier never hands out a type parameter as a
+/// `Type`.
+fn synthesize_type_to_string() -> Function {
+    synthesize_type_full_name()
+}
+
+/// A synthesized MIR body for `[RuntimeProvided] System.Reflection.MemberInfo.get_Name` on a `Type`:
+/// its SIMPLE name, not its fully qualified one (ECMA-335 4th ed, IV.5.5, the library XML's
+/// `System.Reflection.MemberInfo.Name`) -- `Int32` for `System.Int32`, `Inner` for a nested type, and
+/// ``List`1`` for a constructed `List<int>`, a generic type's name being its `name`arity` encoding
+/// (I.10.7.2).
+///
+/// The `Type` is the read-only object its descriptor carries ([`Inst::TypeObject`]), and the
+/// descriptor's NAME is the qualified text `Type.FullName` answers. The simple name is the part of
+/// that text after its last `.` or `+`, up to the `[` that opens a constructed type's arguments (the
+/// name syntax of IV.5.5's `System.Type.AssemblyQualifiedName`), so
+/// ``System.Collections.Generic.List`1[System.Int32]`` gives ``List`1`` and the `.` inside the
+/// arguments is never read, and a nested type spelled with its enclosing type, `Ns.Outer+Inner`,
+/// gives `Inner`. A name with no namespace is answered as the very string `FullName` answers; any
+/// other part is a new string. A type this build laid no name for (the `strip-type-names` tier, a
+/// synthetic handle) TRAPS: every type has a name, a TypeDef's being a non-empty string (ECMA-335 4th
+/// ed, II.22.37, rule 3), so `MemberInfo.Name` never answers null.
+///
+/// The scan reads UTF-16 units, so the UTF-8 storage tiers do not use this body: see
+/// [`member_name_emission`].
+///
+/// THE RECEIVER MUST BE A `Type`, AND THE BODY CHECKS THAT IT IS: its header must name
+/// `system_type`'s descriptor, and any other receiver traps. This is the getter a member inherits
+/// unless it overrides it. The other members this tier can hand out, `PropertyInfo` and `EventInfo`,
+/// override it, so a receiver that is not a `Type` is a member whose name this body cannot read,
+/// and a trap is the honest answer for it where reading its words as a `Type`'s would be a guess.
+fn synthesize_member_name(system_type: TypeHandle) -> Function {
+    let objt = MirType::ObjectRef;
+    let i32t = MirType::I32;
+    let (mut mb, params) = MirBuilder::new(&[objt]);
+    let this = params[0];
+    let read = mb.block();
+    let foreign = mb.block();
+    let unnamed = mb.block();
+    let scan = mb.block();
+    let head = mb.block();
+    let ended = mb.block();
+    let body = mb.block();
+    let bracket = mb.block();
+    let step = mb.block();
+    let dot = mb.block();
+    let other = mb.block();
+    let cut = mb.block();
+    let whole = mb.block();
+    let part = mb.block();
+    let int = |mb: &mut MirBuilder, value: i64| mb.emit(i32t, Inst::ConstInt { ty: i32t, value });
+
+    mb.at(0);
+    let header = mb.emit(i32t, Inst::LoadTypeDesc { object: this });
+    let expected = mb.emit(i32t, Inst::TypeDescAddr { handle: system_type });
+    let is_type = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: header,
+            rhs: expected,
+        },
+    );
+    mb.branch(is_type, read, foreign);
+
+    mb.at(foreign);
+    mb.unreachable();
+
+    mb.at(read);
+    let object = mb.emit(
+        i32t,
+        Inst::Convert {
+            value: this,
+            kind: ConvKind::RefToInt,
+        },
+    );
+    let relative = mb.emit(
+        i32t,
+        Inst::Load {
+            address: object,
+            width: 4,
+            signed: false,
+        },
+    );
+    let descriptor = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: object,
+            rhs: relative,
+        },
+    );
+    let full = mb.emit(objt, Inst::TypeName { descriptor });
+    let text = mb.emit(
+        i32t,
+        Inst::Convert {
+            value: full,
+            kind: ConvKind::RefToInt,
+        },
+    );
+    let zero = int(&mut mb, 0);
+    let is_null = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: text,
+            rhs: zero,
+        },
+    );
+    mb.branch(is_null, unnamed, scan);
+
+    mb.at(unnamed);
+    mb.unreachable();
+
+    mb.at(scan);
+    let length = mb.emit(
+        i32t,
+        Inst::Load {
+            address: text,
+            width: 4,
+            signed: false,
+        },
+    );
+    let one = int(&mut mb, 1);
+    let four = int(&mut mb, 4);
+    let open = int(&mut mb, i64::from(b'['));
+    let period = int(&mut mb, i64::from(b'.'));
+    let plus = int(&mut mb, i64::from(b'+'));
+    mb.jump(head, vec![zero, zero]);
+
+    let at = mb.enter(head, &[i32t, i32t]);
+    let (index, start) = (at[0], at[1]);
+    let more = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::SignedLt,
+            lhs: index,
+            rhs: length,
+        },
+    );
+    mb.branch(more, body, ended);
+
+    mb.at(ended);
+    mb.jump(cut, vec![length, start]);
+
+    mb.at(body);
+    let doubled = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: index,
+            rhs: index,
+        },
+    );
+    let offset = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: doubled,
+            rhs: four,
+        },
+    );
+    let address = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: text,
+            rhs: offset,
+        },
+    );
+    let unit = mb.emit(
+        i32t,
+        Inst::Load {
+            address,
+            width: 2,
+            signed: false,
+        },
+    );
+    let is_open = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: unit,
+            rhs: open,
+        },
+    );
+    mb.branch(is_open, bracket, step);
+
+    mb.at(bracket);
+    mb.jump(cut, vec![index, start]);
+
+    mb.at(step);
+    let next = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Add,
+            lhs: index,
+            rhs: one,
+        },
+    );
+    let is_period = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: unit,
+            rhs: period,
+        },
+    );
+    let is_plus = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: unit,
+            rhs: plus,
+        },
+    );
+    let separates = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Or,
+            lhs: is_period,
+            rhs: is_plus,
+        },
+    );
+    mb.branch(separates, dot, other);
+
+    mb.at(dot);
+    mb.jump(head, vec![next, next]);
+
+    mb.at(other);
+    mb.jump(head, vec![next, start]);
+
+    let range = mb.enter(cut, &[i32t, i32t]);
+    let (end, first) = (range[0], range[1]);
+    let from_start = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: first,
+            rhs: zero,
+        },
+    );
+    let to_end = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: end,
+            rhs: length,
+        },
+    );
+    let all = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::And,
+            lhs: from_start,
+            rhs: to_end,
+        },
+    );
+    mb.branch(all, whole, part);
+
+    mb.at(whole);
+    mb.ret(full);
+
+    mb.at(part);
+    let count = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::Sub,
+            lhs: end,
+            rhs: first,
+        },
+    );
+    let name = mb.emit(
+        objt,
+        Inst::PInvoke {
+            import: "lamella_string_substring".into(),
+            args: vec![text, first, count],
+        },
+    );
+    mb.ret(name);
+    mb.finish(Some(objt))
+}
+
+/// A synthesized MIR body for `[RuntimeProvided] System.Object.GetType()`: the `Type` object the
+/// receiver's descriptor carries ([`Inst::TypeObject`]), or a TRAP for an array.
+///
+/// ECMA-335 4th ed, IV.5.3, the library XML's `System.Object.GetType`, asks that two objects with
+/// identical run-time types answer `Type`s for which `ReferenceEquals` is true. One
+/// descriptor per type, and so one `Type`, holds for a class, a struct and a constructed generic
+/// type, whose descriptors are canonical across the link. It does NOT hold for an array: each
+/// assembly that allocates an `int[]` lays its own array-form descriptor, so `int[]`s made in two
+/// assemblies would answer two `Type`s and compare unequal. An array-form receiver therefore traps
+/// rather than answering a `Type` that breaks identity, and since `typeof` of an array is refused at
+/// build, no array's `Type` exists on this tier at all -- which also keeps `Name` and `FullName`,
+/// which an array's descriptor cannot answer, from being reached on one.
+///
+/// `System.String` is laid in the array form too, but by one owner, so its descriptor IS canonical
+/// and `string`'s receiver answers its `Type`: `string` is matched by its own descriptor's address,
+/// the corlib's `string`, when the build declaring `Object` declares it. A null receiver's 0 answers
+/// null; the `callvirt` reaching this has already refused one (ECMA-335 4th ed, III.4.2: a null `obj`
+/// raises NullReferenceException).
+fn synthesize_object_get_type(string: Option<TypeHandle>) -> Function {
+    let objt = MirType::ObjectRef;
+    let i32t = MirType::I32;
+    let (mut mb, params) = MirBuilder::new(&[objt]);
+    let this = params[0];
+    let check = mb.block();
+    let array = mb.block();
+    let trap = mb.block();
+    let answer = mb.block();
+
+    mb.at(0);
+    let descriptor = mb.emit(i32t, Inst::LoadTypeDesc { object: this });
+    let zero = mb.emit(i32t, Inst::ConstInt { ty: i32t, value: 0 });
+    let is_null = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: descriptor,
+            rhs: zero,
+        },
+    );
+    mb.branch(is_null, answer, check);
+
+    mb.at(check);
+    let word = mb.emit(
+        i32t,
+        Inst::Load {
+            address: descriptor,
+            width: 4,
+            signed: false,
+        },
+    );
+    let shift = mb.emit(i32t, Inst::ConstInt { ty: i32t, value: 24 });
+    let high = mb.emit(
+        i32t,
+        Inst::Binary {
+            op: BinOp::ShrUnsigned,
+            lhs: word,
+            rhs: shift,
+        },
+    );
+    let mark = mb.emit(
+        i32t,
+        Inst::ConstInt {
+            ty: i32t,
+            value: i64::from(crate::resolver::ARRAY_DESC_MARK >> 24),
+        },
+    );
+    let is_array = mb.emit(
+        i32t,
+        Inst::Compare {
+            op: CmpOp::Eq,
+            lhs: high,
+            rhs: mark,
+        },
+    );
+    mb.branch(is_array, array, answer);
+
+    mb.at(array);
+    match string {
+        Some(handle) => {
+            let expected = mb.emit(i32t, Inst::TypeDescAddr { handle });
+            let is_string = mb.emit(
+                i32t,
+                Inst::Compare {
+                    op: CmpOp::Eq,
+                    lhs: descriptor,
+                    rhs: expected,
+                },
+            );
+            mb.branch(is_string, answer, trap);
+        }
+        None => mb.jump(trap, Vec::new()),
+    }
+
+    mb.at(trap);
+    mb.unreachable();
+
+    mb.at(answer);
+    let object = mb.emit(objt, Inst::TypeObject { descriptor });
+    mb.ret(object);
+    mb.finish(Some(objt))
 }
 
 /// A synthesized MIR body for `[RuntimeProvided] System.Object.ReferenceEquals(object, object)` --
@@ -9047,6 +9625,17 @@ fn synthesized_seam_body<'a>(
     {
         return SeamEmission::Synthesized(func);
     }
+    if (type_name.namespace, type_name.name) == ("System.Reflection", "MemberInfo")
+        && method.name() == Some("get_Name")
+        && params == 0
+    {
+        let system_type = assembly.type_defs().find(|type_def| {
+            assembly
+                .type_token_name(type_def.token())
+                .is_some_and(|n| n.namespace == "System" && n.name == "Type")
+        });
+        return member_name_emission(system_type.map(|type_def| TypeHandle(type_def.token().0)));
+    }
     if (type_name.namespace, type_name.name) == ("System", "Object")
         && method.name() == Some("ToString")
         && params == 0
@@ -9075,6 +9664,20 @@ fn synthesized_seam_body<'a>(
                 terminator: Some(Terminator::Return(Some(ValueId(2)))),
             }],
         });
+    }
+    if (type_name.namespace, type_name.name) == ("System", "Object")
+        && method.name() == Some("GetType")
+        && params == 0
+    {
+        let string = assembly
+            .type_defs()
+            .find(|type_def| {
+                assembly
+                    .type_token_name(type_def.token())
+                    .is_some_and(|n| n.namespace == "System" && n.name == "String")
+            })
+            .map(|type_def| TypeHandle(type_def.token().0));
+        return SeamEmission::Synthesized(synthesize_object_get_type(string));
     }
     if (type_name.namespace, type_name.name) == ("System", "Object")
         && method.name() == Some("ReferenceEquals")
@@ -9312,7 +9915,87 @@ fn synthesized_seam_body<'a>(
     if timed_seam_placeholder_lies(type_name.namespace, type_name.name, method.name()) {
         return SeamEmission::Trap(deferred_trap_body());
     }
+    if slot_seam_placeholder_misleads(type_name.namespace, type_name.name, method.name(), params) {
+        return SeamEmission::Trap(deferred_trap_body());
+    }
     SeamEmission::Placeholder
+}
+
+/// Whether a DIRECT call to the `[RuntimeProvided]` seam `method` of `type_name` -- a `call` naming
+/// it, or `ldftn` taking its address -- is refused at build, given whether this build left it as its
+/// placeholder. Both halves of the caller audit ask this one question, [`silent_seam_call_edges`] of
+/// a seam the assembly declares itself and [`imported_silent_seams`] of a reference's, so a seam is
+/// refused alike whichever assembly declares it:
+///
+/// * a seam left as its PLACEHOLDER answers a constant no caller can tell from a real answer;
+/// * a seam TRAPPED because its placeholder misleads through a slot
+///   ([`slot_seam_placeholder_misleads`]) is trapped for the call no build can see, a dispatch. A
+///   direct call names it -- `base.Equals(obj)` in a struct names `ValueType.Equals`, a base access
+///   binding the base class's member rather than the one `this`'s run-time type implements (ECMA-334
+///   4th ed, 14.5.8) and a struct's base class being `System.ValueType` (18.3.2) -- so the build
+///   refuses it before any image ships, as it did while the seam was a placeholder, rather than the
+///   image faulting where the call runs.
+///
+/// Any other trapped seam refuses nothing: its trap is the whole answer, a direct call included.
+fn refuses_a_direct_call(
+    placeholder: bool,
+    type_name: &lamella_metadata::TypeName<'_>,
+    method: &lamella_metadata::Method<'_>,
+) -> bool {
+    let params = method.signature().as_ref().map_or(0, |sig| sig.parameters.len());
+    placeholder
+        || slot_seam_placeholder_misleads(type_name.namespace, type_name.name, method.name(), params)
+}
+
+/// The VIRTUAL `[RuntimeProvided]` seams this tier does not back whose placeholder answer is wrong
+/// rather than degraded, and which a program reaches through a vtable slot:
+///
+/// * `MemberInfo.GetCustomAttributes(bool)` answers null, so a type that carries attributes reports
+///   none, where .NET's answers the attributes the type carries (dotnet/runtime v11.0.0,
+///   `src/libraries/System.Private.CoreLib/src/System/RuntimeType.cs`, lines 53-56; the member is
+///   .NET's, `MemberInfo.cs`, line 35 there: ECMA-335 4th ed's library declares no such member);
+/// * `MemberInfo.DeclaringType` answers null, so a nested type reports no enclosing type, where the
+///   enclosing type is the answer (ECMA-335 4th ed, IV.5.5, the library XML's `System.Type.DeclaringType`);
+/// * `ValueType.Equals(object)` answers false, so two equal structs or enums compare unequal, where
+///   it is true for an instance "of the same type" that represents "the same value" (ECMA-335 4th ed,
+///   IV.5.3, the library XML's `System.ValueType.Equals`), and a collection cannot find a value it holds.
+///
+/// A program that calls one of these DIRECTLY is refused at build, whichever assembly declares it
+/// ([`refuses_a_direct_call`]). All of these are virtual, so a program reaches them by dispatch,
+/// which names no seam to refuse -- `Object.Equals` on a boxed struct lands in `ValueType.Equals`
+/// through the slot, `callvirt` choosing the method by the exact type of its object (ECMA-335 4th ed,
+/// III.4.2) and a boxed struct's closest named base class being `System.ValueType` (I.8.2.4) -- and
+/// the placeholder answers as though it were real. A trap makes the gap loud at the first call instead.
+fn slot_seam_placeholder_misleads(
+    namespace: &str,
+    type_name: &str,
+    method: Option<&str>,
+    params: usize,
+) -> bool {
+    matches!(
+        (namespace, type_name, method, params),
+        ("System.Reflection", "MemberInfo", Some("GetCustomAttributes"), 1)
+            | ("System.Reflection", "MemberInfo", Some("get_DeclaringType"), 0)
+            | ("System", "ValueType", Some("Equals"), 1)
+    )
+}
+
+/// The methods with a body that this tier lowers to a trap instead, because what the body promises
+/// needs a runtime path this tier does not have, and the body would answer as though it had one:
+///
+/// * `Lamella.Hardware.PinEvents.Register`, which records the callback a GPIO driver is given for a
+///   pin's edges. Nothing in an image this tier builds carries an interrupt to managed code, so a
+///   callback registered here would never run while the registration reported success.
+///
+/// These are not seams, so neither of the seam rules reaches them. And refusing the build would be
+/// wrong: a driver's vtable keeps the method that registers in every image that uses the driver,
+/// including every image that never registers. The trap faults at the call, which only a program
+/// that registers reaches.
+fn traps_in_place_of_its_body(namespace: &str, type_name: &str, method: Option<&str>, params: usize) -> bool {
+    matches!(
+        (namespace, type_name, method, params),
+        ("Lamella.Hardware", "PinEvents", Some("Register"), 5)
+    )
 }
 
 /// The unmapped TIMED thread seams whose placeholder is a false statement about another thread,
@@ -9579,6 +10262,17 @@ fn lower_assembly_seams<'a>(
             }
             continue;
         };
+        if type_name.as_ref().is_some_and(|name| {
+            traps_in_place_of_its_body(
+                name.namespace,
+                name.name,
+                method.name(),
+                signature.as_ref().map_or(0, |sig| sig.parameters.len()),
+            )
+        }) {
+            bodies.write(*rid, deferred_trap_body());
+            continue;
+        }
         let folded = type_name.as_ref().is_some_and(|name| {
             crate::resolver::folded_intrinsic(
                 name.namespace,
@@ -12252,7 +12946,7 @@ mod tests {
     #[cfg(feature = "linked")]
     #[test]
     fn a_debug_elfs_entry_is_the_images_entry_on_every_part() {
-        for target in ["rp2350", "microbit", "nrf52833", "stm32f769", "stm32u5a5", "stm32u585", "stm32h747-cm7"] {
+        for target in ["rp2350", "microbit", "nrf52833", "stm32f746", "stm32f769", "stm32u5a5", "stm32u585", "stm32h747-cm7"] {
             let part = linked_part(target).expect("a linked part");
             let entry_offset = 0x40;
             let image = vec![0xBFu8; (part.text_base() - part.image_base()) as usize + 0x100];
@@ -13211,22 +13905,232 @@ mod tests {
     #[cfg(feature = "arm32")]
     #[test]
     fn synthesized_type_seams_verify_and_lower() {
-        for (name, params) in [("GetTypeFromHandle", 1usize), ("HandleEquals", 2usize)] {
+        for (name, params) in [
+            ("GetTypeFromHandle", 1usize),
+            ("HandleEquals", 2usize),
+            ("get_FullName", 0usize),
+            ("ToString", 0usize),
+        ] {
             let f = synthesize_type_seam("System", "Type", Some(name), params)
                 .unwrap_or_else(|| panic!("Type.{name} not synthesized"));
             lamella_ir::verify(&f).unwrap_or_else(|e| panic!("Type.{name} verify: {e:?}"));
-            crate::arm32::lower(&f).unwrap_or_else(|e| panic!("Type.{name} lower: {e:?}"));
+            crate::arm32::lower_object(&[f], &["m"], &[])
+                .unwrap_or_else(|e| panic!("Type.{name} lower: {e:?}"));
+        }
+        for name in ["GetTypeFromHandle", "get_FullName", "ToString"] {
+            let params = usize::from(name == "GetTypeFromHandle");
+            let f = synthesize_type_seam("System", "Type", Some(name), params).unwrap();
+            assert!(
+                matches!(crate::arm32::lower(&f), Err(crate::arm32::LowerError::CallUnsupported)),
+                "Type.{name} must not lower on the flat path"
+            );
         }
         let g = synthesize_type_seam("System", "Type", Some("GetTypeFromHandle"), 1).unwrap();
         assert_eq!(g.params.len(), 1, "the handle is the single argument");
         assert_eq!(g.ret, Some(MirType::ObjectRef), "a Type is a reference");
+        let insts: Vec<&Inst> = g.blocks.iter().flat_map(|b| b.insts.iter().map(|(_, i)| i)).collect();
+        assert!(
+            matches!(insts.as_slice(), [Inst::TypeObject { descriptor: ValueId(0) }]),
+            "GetTypeFromHandle is the handle's TypeObject: {insts:?}"
+        );
+        let full = synthesize_type_seam("System", "Type", Some("get_FullName"), 0).unwrap();
+        assert_eq!(full.params, vec![MirType::ObjectRef], "an instance getter: `this` alone");
+        assert_eq!(full.ret, Some(MirType::ObjectRef), "a String is a reference");
+        let insts: Vec<&Inst> = full.blocks.iter().flat_map(|b| b.insts.iter().map(|(_, i)| i)).collect();
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::TypeName { .. }))
+                && insts.iter().any(|i| matches!(i, Inst::Load { width: 4, .. })),
+            "FullName is the TypeName of the descriptor the object's payload word names: {insts:?}"
+        );
+        assert!(
+            full.blocks.iter().any(|b| b.terminator == Some(Terminator::Unreachable)),
+            "a type laid with no name traps rather than answering null: {insts:?}"
+        );
+        let to_string = synthesize_type_seam("System", "Type", Some("ToString"), 0).unwrap();
+        assert_eq!(
+            to_string, full,
+            "ToString is the descriptor's name, as FullName's body reads it"
+        );
         assert!(
             synthesize_type_seam("System", "Type", Some("GetHashCode"), 0).is_none(),
             "unlisted Type members keep their placeholder body"
         );
         assert!(
+            synthesize_type_seam("System", "Type", Some("ToString"), 1).is_none(),
+            "only the parameterless ToString is the seam"
+        );
+        assert!(
             synthesize_type_seam("System", "String", Some("HandleEquals"), 2).is_none(),
             "the seams are System.Type's alone"
+        );
+    }
+
+    #[test]
+    fn a_member_name_reads_a_type_object_and_traps_on_anything_else() {
+        let system_type = TypeHandle(0x0200_0009);
+        let f = synthesize_member_name(system_type);
+        lamella_ir::verify(&f).unwrap_or_else(|e| panic!("MemberInfo.get_Name verify: {e:?}"));
+        assert_eq!(f.params, vec![MirType::ObjectRef], "an instance getter: `this` alone");
+        assert_eq!(f.ret, Some(MirType::ObjectRef), "a String is a reference");
+        let entry = &f.blocks[f.entry.0 as usize];
+        assert!(
+            entry.insts.iter().any(|(_, i)| matches!(i, Inst::LoadTypeDesc { object: ValueId(0) }))
+                && entry.insts.iter().any(|(_, i)| matches!(i, Inst::TypeDescAddr { handle } if *handle == system_type)),
+            "the receiver's descriptor is compared with System.Type's before anything is read: {entry:?}"
+        );
+        assert!(
+            f.blocks.iter().any(|b| b.terminator == Some(Terminator::Unreachable)),
+            "a receiver that is not a Type traps"
+        );
+        let insts: Vec<&Inst> = f.blocks.iter().flat_map(|b| b.insts.iter().map(|(_, i)| i)).collect();
+        assert!(
+            insts.iter().any(|i| matches!(i, Inst::TypeName { .. }))
+                && insts.iter().any(|i| matches!(i, Inst::Load { width: 2, signed: false, .. }))
+                && insts
+                    .iter()
+                    .any(|i| matches!(i, Inst::PInvoke { import, .. } if &**import == "lamella_string_substring")),
+            "the simple name is cut from the descriptor's NAME, unit by unit: {insts:?}"
+        );
+        for (unit, why) in [
+            (b'.', "a namespace separator"),
+            (b'+', "a nested type's separator"),
+            (b'[', "the start of a constructed type's arguments"),
+        ] {
+            assert!(
+                insts
+                    .iter()
+                    .any(|i| matches!(i, Inst::ConstInt { value, .. } if *value == i64::from(unit))),
+                "the scan stops at {why}"
+            );
+        }
+        #[cfg(feature = "arm32")]
+        crate::arm32::lower_object(&[f.clone()], &["m"], &[])
+            .unwrap_or_else(|e| panic!("MemberInfo.get_Name lower (ARM): {e:?}"));
+        #[cfg(feature = "riscv32")]
+        crate::riscv32::lower_object(&[f], &["m"], &[], &[])
+            .unwrap_or_else(|e| panic!("MemberInfo.get_Name lower (RISC-V): {e:?}"));
+    }
+
+    #[test]
+    fn the_virtual_seams_whose_placeholder_misleads_trap() {
+        assert!(slot_seam_placeholder_misleads("System.Reflection", "MemberInfo", Some("GetCustomAttributes"), 1));
+        assert!(slot_seam_placeholder_misleads("System.Reflection", "MemberInfo", Some("get_DeclaringType"), 0));
+        assert!(slot_seam_placeholder_misleads("System", "ValueType", Some("Equals"), 1));
+        assert!(!slot_seam_placeholder_misleads("System.Reflection", "MemberInfo", Some("GetCustomAttributes"), 2));
+        assert!(!slot_seam_placeholder_misleads("System", "ValueType", Some("GetHashCode"), 0));
+        assert!(!slot_seam_placeholder_misleads("System", "Object", Some("Equals"), 1));
+        assert!(!slot_seam_placeholder_misleads("System.Reflection", "MemberInfo", Some("get_Name"), 0));
+    }
+
+    #[test]
+    fn a_pin_change_registration_traps_in_place_of_its_body_and_nothing_beside_it_does() {
+        assert!(traps_in_place_of_its_body("Lamella.Hardware", "PinEvents", Some("Register"), 5));
+        assert!(!traps_in_place_of_its_body("Lamella.Hardware", "PinEvents", Some("Unregister"), 2));
+        assert!(!traps_in_place_of_its_body("Lamella.Hardware", "PinEvents", Some("Dispatch"), 2));
+        assert!(!traps_in_place_of_its_body("Lamella.Hardware", "PinEvents", Some("ReportLost"), 0));
+        assert!(!traps_in_place_of_its_body("Lamella.Hardware", "PinEvents", Some("Register"), 4));
+        assert!(!traps_in_place_of_its_body("Lamella.Hardware", "BusFactory", Some("Register"), 5));
+        assert!(!traps_in_place_of_its_body("Lamella.Hardware", "PinEvents", None, 5));
+    }
+
+    /// Where a synthesized `Object.GetType` body sends one receiver: `true` when it returns the
+    /// `TypeObject` it built, `false` when it reaches the trap. The receiver is modeled by its
+    /// descriptor's address, which `LoadTypeDesc` answers, and the descriptor's word 0, which a
+    /// `Load` of that address answers; `TypeDescAddr` of `string` answers `string_descriptor`. Only
+    /// the instructions the body uses are interpreted and any other panics, so a body that grows a
+    /// step cannot be judged by a model that skips it.
+    fn get_type_answers(
+        f: &Function,
+        string: Option<TypeHandle>,
+        descriptor: u32,
+        word0: u32,
+        string_descriptor: u32,
+    ) -> bool {
+        let mut values: alloc::collections::BTreeMap<u32, u32> = alloc::collections::BTreeMap::new();
+        let mut answer = None;
+        let mut block = f.entry;
+        loop {
+            let at = &f.blocks[block.0 as usize];
+            for (value, inst) in &at.insts {
+                let read = |v: &ValueId| values[&v.0];
+                let result = match inst {
+                    Inst::LoadTypeDesc { .. } => descriptor,
+                    Inst::ConstInt { value, .. } => *value as u32,
+                    Inst::Compare { op: CmpOp::Eq, lhs, rhs } => u32::from(read(lhs) == read(rhs)),
+                    Inst::Load { address, width: 4, .. } => {
+                        assert_eq!(read(address), descriptor, "only the receiver's descriptor is read");
+                        word0
+                    }
+                    Inst::Binary { op: BinOp::ShrUnsigned, lhs, rhs } => read(lhs) >> read(rhs),
+                    Inst::TypeDescAddr { handle } => {
+                        assert_eq!(Some(*handle), string, "only string's descriptor is named");
+                        string_descriptor
+                    }
+                    Inst::TypeObject { .. } => {
+                        answer = Some(value.0);
+                        descriptor
+                    }
+                    other => panic!("the model does not interpret {other:?}"),
+                };
+                values.insert(value.0, result);
+            }
+            match at.terminator.as_ref().expect("every block ends") {
+                Terminator::Branch { cond, if_true, if_false, .. } => {
+                    block = if values[&cond.0] != 0 { *if_true } else { *if_false };
+                }
+                Terminator::Jump { target, .. } => block = *target,
+                Terminator::Return(returned) => {
+                    assert_eq!(returned.map(|v| v.0), answer, "it returns the Type object it built");
+                    return true;
+                }
+                Terminator::Unreachable => return false,
+            }
+        }
+    }
+
+    #[test]
+    fn get_type_traps_on_an_array_receiver_but_answers_a_string() {
+        let string = TypeHandle(0x0200_0003);
+        let f = synthesize_object_get_type(Some(string));
+        lamella_ir::verify(&f).unwrap_or_else(|e| panic!("Object.GetType verify: {e:?}"));
+        let mark = crate::resolver::ARRAY_DESC_MARK;
+        let (string_at, class_at, array_at) = (0x8000_1000, 0x8000_2000, 0x8000_3000);
+        let class = (class_at, 12);
+        let int_array = (array_at, mark | 1);
+        let string_receiver = (string_at, mark | 1);
+        let answers = |f: &Function, string: Option<TypeHandle>, (at, word0): (u32, u32)| {
+            get_type_answers(f, string, at, word0, string_at)
+        };
+        assert!(answers(&f, Some(string), (0, 0)), "a null descriptor answers, as null");
+        assert!(answers(&f, Some(string), class), "a class answers its Type");
+        assert!(answers(&f, Some(string), string_receiver), "a string answers its Type");
+        assert!(!answers(&f, Some(string), int_array), "an int[] traps");
+        let bare = synthesize_object_get_type(None);
+        lamella_ir::verify(&bare).unwrap_or_else(|e| panic!("bare Object.GetType verify: {e:?}"));
+        assert!(answers(&bare, None, class), "a class answers its Type with no string to match");
+        assert!(!answers(&bare, None, string_receiver), "a string traps with no string to match");
+        assert!(!answers(&bare, None, int_array), "an int[] traps with no string to match");
+        #[cfg(feature = "arm32")]
+        crate::arm32::lower_object(&[f.clone()], &["m"], &[])
+            .unwrap_or_else(|e| panic!("Object.GetType lower (ARM): {e:?}"));
+        #[cfg(feature = "riscv32")]
+        crate::riscv32::lower_object(&[f], &["m"], &[], &[])
+            .unwrap_or_else(|e| panic!("Object.GetType lower (RISC-V): {e:?}"));
+    }
+
+    #[test]
+    fn a_member_name_traps_on_a_null_name_and_in_the_utf8_tiers() {
+        let f = synthesize_member_name(TypeHandle(0x0200_0009));
+        let traps = f.blocks.iter().filter(|b| b.terminator == Some(Terminator::Unreachable)).count();
+        assert_eq!(traps, 2, "a receiver that is not a Type traps, and so does a type with no name");
+        let emission = member_name_emission(Some(TypeHandle(0x0200_0009)));
+        match (crate::resolver::STORAGE_IS_BYTES, emission) {
+            (false, SeamEmission::Synthesized(_)) | (true, SeamEmission::Trap(_)) => {}
+            (bytes, _) => panic!("Name with STORAGE_IS_BYTES = {bytes} took the wrong emission"),
+        }
+        assert!(
+            matches!(member_name_emission(None), SeamEmission::Trap(_)),
+            "with no System.Type to check against, the getter traps"
         );
     }
 
@@ -14506,7 +15410,8 @@ mod tests {
     #[test]
     fn each_stm32_row_lays_its_statics_heap_and_stack_in_its_own_band() {
         let rows = [
-            ("stm32f769", 0x2008_0000u32),
+            ("stm32f746", 0x2005_0000u32),
+            ("stm32f769", 0x2008_0000),
             ("stm32u5a5", 0x2027_0000),
             ("stm32u585", 0x200C_0000),
             ("stm32h747-cm7", 0x2002_0000),

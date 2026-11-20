@@ -462,6 +462,11 @@ fn carrier_write(buf: &[u8]) -> usize {
 struct BoardCarrier;
 
 impl Transport for BoardCarrier {
+    /// The protocol floor, which is where this carrier's reader stops assembling a frame.
+    fn max_inbound_payload(&self) -> Option<usize> {
+        Some(lamella_wire::MIN_INBOUND_PAYLOAD)
+    }
+
     fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
         let frame = encode_frame(msg_type, seq, payload).ok_or(TransportError::PayloadTooLarge)?;
         let mut sent = 0;
@@ -628,6 +633,7 @@ fn serve_hello(
         image_caps_with(window_len, fw_len),
         image_identity(board),
         carrier.max_inbound_payload(),
+        None,
     ) {
         Ok(ack) => carrier.send(msg::HELLO_ACK, frame.seq, &ack.encode()),
         Err(nak) => carrier.send(msg::HELLO_NAK, frame.seq, &nak.encode()),

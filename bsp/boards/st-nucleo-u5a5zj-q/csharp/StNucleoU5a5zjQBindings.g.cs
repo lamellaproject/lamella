@@ -52,7 +52,7 @@ namespace Lamella.Generated
         public const uint SUPPLY_VDDIO2_RCC_EN_MASK = 0x4;
         public const uint SUPPLY_VDDIO2_VALID_REG = 0x46020810;
         public const uint SUPPLY_VDDIO2_VALID_MASK = 0x20000000;
-        public const uint DEVICE_COUNT = 4;
+        public const uint DEVICE_COUNT = 6;
 
         // -- on-board devices: PORT group base + pin index + mask --
         public const uint LED0_PORT_BASE = 0x42020800;
@@ -77,5 +77,111 @@ namespace Lamella.Generated
         public const uint BUTTON0_ACTIVE_LOW = 0;
         public const uint BUTTON0_PULL_UP = 0;
         public const uint BUTTON0_PULL_DOWN = 1;
+        public const uint SWDIO_PORT_BASE = 0x42020000;
+        public const uint SWDIO_PIN = 13;
+        public const uint SWDIO_BANK = 0;
+        public const uint SWDIO_MASK = 0x2000;
+        public const uint SWCLK_PORT_BASE = 0x42020000;
+        public const uint SWCLK_PIN = 14;
+        public const uint SWCLK_BANK = 0;
+        public const uint SWCLK_MASK = 0x4000;
+
+        /// -- connectors: the sockets a removable module plugs into. The socket is board truth --
+        /// it is on the schematic and identical on every unit -- and what is plugged into it is not,
+        /// so no row here names a module. A socket brings out whole BUSES, each named by the binding
+        /// role that serves it, and single LINES, each named by the standard's own name for that
+        /// position and carrying the port wiring a driver needs to drive it. Which of a socket's
+        /// protocols an attached module speaks is a property of the module, so a board that offers
+        /// several states all of them and chooses none --
+        public const uint CONNECTOR_COUNT = 1;
+        public const string CONNECTOR_ARDUINO_STANDARD = "arduino-uno-v3";
+        public const uint CONNECTOR_ARDUINO_A0_PORT_BASE = 0x42020000;
+        public const uint CONNECTOR_ARDUINO_A0_PIN = 3;
+        public const uint CONNECTOR_ARDUINO_A0_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_A0_MASK = 0x8;
+        public const uint CONNECTOR_ARDUINO_A1_PORT_BASE = 0x42020000;
+        public const uint CONNECTOR_ARDUINO_A1_PIN = 2;
+        public const uint CONNECTOR_ARDUINO_A1_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_A1_MASK = 0x4;
+        public const uint CONNECTOR_ARDUINO_A2_PORT_BASE = 0x42020800;
+        public const uint CONNECTOR_ARDUINO_A2_PIN = 3;
+        public const uint CONNECTOR_ARDUINO_A2_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_A2_MASK = 0x8;
+        public const uint CONNECTOR_ARDUINO_A3_PORT_BASE = 0x42020400;
+        public const uint CONNECTOR_ARDUINO_A3_PIN = 0;
+        public const uint CONNECTOR_ARDUINO_A3_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_A3_MASK = 0x1;
+        public const uint CONNECTOR_ARDUINO_A4_PORT_BASE = 0x42020800;
+        public const uint CONNECTOR_ARDUINO_A4_PIN = 1;
+        public const uint CONNECTOR_ARDUINO_A4_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_A4_MASK = 0x2;
+        public const uint CONNECTOR_ARDUINO_A5_PORT_BASE = 0x42020800;
+        public const uint CONNECTOR_ARDUINO_A5_PIN = 0;
+        public const uint CONNECTOR_ARDUINO_A5_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_A5_MASK = 0x1;
+        public const uint CONNECTOR_ARDUINO_D0_PORT_BASE = 0x42021800;
+        public const uint CONNECTOR_ARDUINO_D0_PIN = 8;
+        public const uint CONNECTOR_ARDUINO_D0_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_D0_MASK = 0x100;
+        public const uint CONNECTOR_ARDUINO_D1_PORT_BASE = 0x42021800;
+        public const uint CONNECTOR_ARDUINO_D1_PIN = 7;
+        public const uint CONNECTOR_ARDUINO_D1_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_D1_MASK = 0x80;
+        public const uint CONNECTOR_ARDUINO_D2_PORT_BASE = 0x42021400;
+        public const uint CONNECTOR_ARDUINO_D2_PIN = 15;
+        public const uint CONNECTOR_ARDUINO_D2_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_D2_MASK = 0x8000;
+        public const uint CONNECTOR_ARDUINO_D3_PORT_BASE = 0x42021000;
+        public const uint CONNECTOR_ARDUINO_D3_PIN = 13;
+        public const uint CONNECTOR_ARDUINO_D3_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_D3_MASK = 0x2000;
+        public const uint CONNECTOR_ARDUINO_D4_PORT_BASE = 0x42021400;
+        public const uint CONNECTOR_ARDUINO_D4_PIN = 14;
+        public const uint CONNECTOR_ARDUINO_D4_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_D4_MASK = 0x4000;
+        public const uint CONNECTOR_ARDUINO_D5_PORT_BASE = 0x42021000;
+        public const uint CONNECTOR_ARDUINO_D5_PIN = 11;
+        public const uint CONNECTOR_ARDUINO_D5_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_D5_MASK = 0x800;
+        public const uint CONNECTOR_ARDUINO_D6_PORT_BASE = 0x42021000;
+        public const uint CONNECTOR_ARDUINO_D6_PIN = 9;
+        public const uint CONNECTOR_ARDUINO_D6_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_D6_MASK = 0x200;
+        public const uint CONNECTOR_ARDUINO_D7_PORT_BASE = 0x42021400;
+        public const uint CONNECTOR_ARDUINO_D7_PIN = 13;
+        public const uint CONNECTOR_ARDUINO_D7_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_D7_MASK = 0x2000;
+        public const uint CONNECTOR_ARDUINO_D8_PORT_BASE = 0x42021400;
+        public const uint CONNECTOR_ARDUINO_D8_PIN = 12;
+        public const uint CONNECTOR_ARDUINO_D8_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_D8_MASK = 0x1000;
+        public const uint CONNECTOR_ARDUINO_D9_PORT_BASE = 0x42020C00;
+        public const uint CONNECTOR_ARDUINO_D9_PIN = 15;
+        public const uint CONNECTOR_ARDUINO_D9_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_D9_MASK = 0x8000;
+        public const uint CONNECTOR_ARDUINO_D10_PORT_BASE = 0x42020C00;
+        public const uint CONNECTOR_ARDUINO_D10_PIN = 14;
+        public const uint CONNECTOR_ARDUINO_D10_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_D10_MASK = 0x4000;
+        public const uint CONNECTOR_ARDUINO_D11_PORT_BASE = 0x42020000;
+        public const uint CONNECTOR_ARDUINO_D11_PIN = 7;
+        public const uint CONNECTOR_ARDUINO_D11_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_D11_MASK = 0x80;
+        public const uint CONNECTOR_ARDUINO_D12_PORT_BASE = 0x42020000;
+        public const uint CONNECTOR_ARDUINO_D12_PIN = 6;
+        public const uint CONNECTOR_ARDUINO_D12_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_D12_MASK = 0x40;
+        public const uint CONNECTOR_ARDUINO_D13_PORT_BASE = 0x42020000;
+        public const uint CONNECTOR_ARDUINO_D13_PIN = 5;
+        public const uint CONNECTOR_ARDUINO_D13_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_D13_MASK = 0x20;
+        public const uint CONNECTOR_ARDUINO_D14_PORT_BASE = 0x42020400;
+        public const uint CONNECTOR_ARDUINO_D14_PIN = 9;
+        public const uint CONNECTOR_ARDUINO_D14_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_D14_MASK = 0x200;
+        public const uint CONNECTOR_ARDUINO_D15_PORT_BASE = 0x42020400;
+        public const uint CONNECTOR_ARDUINO_D15_PIN = 8;
+        public const uint CONNECTOR_ARDUINO_D15_BANK = 0;
+        public const uint CONNECTOR_ARDUINO_D15_MASK = 0x100;
     }
 }

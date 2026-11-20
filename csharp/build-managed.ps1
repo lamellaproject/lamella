@@ -60,7 +60,8 @@ $DefaultSurface = @(
     'LAMELLA_SURFACE_NETFX_4_0',
     'LAMELLA_SURFACE_NETFX_4_5',
     # The rung above 4.5: members .NET Core 2.0 introduced, each gated where it was introduced, like
-    # the four eras below it. It takes no language version of its own.
+    # the four eras below it. It takes no language version of its own. It requires
+    # LAMELLA_SURFACE_STRING_COMPARISON as well: OSPlatform compares names through StringComparison.
     'LAMELLA_SURFACE_NETCORE_2_0',
     # The rung above it: what .NET Core 2.1 introduced, such as System.Buffers.Binary.BinaryPrimitives.
     # Every .NET Core 2.1 shipped with spans, so it requires LAMELLA_SURFACE_SPAN as well.
@@ -86,22 +87,26 @@ $DefaultSurface = @(
 )
 if ($PrintSurface) { $DefaultSurface | ForEach-Object { Write-Output $_ }; exit 0 }
 
-# The `csp/<family>/csharp` sources `libs/System.Device.Gpio/Families/<family>.sources` lists, as
-# paths relative to that directory with '/' separators: what the family's System.Device.Gpio carries.
-# A blank line or one that starts with '#' is not an entry. An entry that names no source there is
-# refused, so a source renamed or removed cannot leave the family build without a type it was meant to
-# carry.
+# The sources `libs/System.Device.Gpio/Families/<family>.sources` lists, with '/' separators: what the
+# family's System.Device.Gpio carries beside the library's own. An entry is a path relative to
+# `csp/<family>/csharp`, or, starting with `./`, one relative to `libs/System.Device.Gpio/Families`: a
+# driver several families share, kept beside the family files and named by each family that carries it.
+# A blank line or one that starts with '#' is not an entry. An entry that names no source is refused,
+# so a source renamed or removed cannot leave the family build without a type it was meant to carry.
 function Get-FamilySources([string]$family) {
     $list = Join-Path $root "libs/System.Device.Gpio/Families/$family.sources"
     if (-not (Test-Path -LiteralPath $list)) {
-        throw "libs/System.Device.Gpio/Families/$family.sources does not exist: it lists the csp/$family/csharp sources the $family build of System.Device.Gpio carries"
+        throw "libs/System.Device.Gpio/Families/$family.sources does not exist: it lists the sources the $family build of System.Device.Gpio carries"
     }
     $entries = @()
     foreach ($line in [IO.File]::ReadAllLines($list)) {
         $entry = $line.Trim()
         if (-not $entry -or $entry.StartsWith('#')) { continue }
-        if (-not $entry.EndsWith('.cs') -or -not (Test-Path -LiteralPath (Join-Path $root "csp/$family/csharp/$entry") -PathType Leaf)) {
-            throw "libs/System.Device.Gpio/Families/$family.sources lists '$entry', which is not a C# source in csp/$family/csharp"
+        $shared = $entry.StartsWith('./')
+        $where = if ($shared) { 'libs/System.Device.Gpio/Families' } else { "csp/$family/csharp" }
+        $path = Join-Path $root "$where/$(if ($shared) { $entry.Substring(2) } else { $entry })"
+        if (-not $entry.EndsWith('.cs') -or -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw "libs/System.Device.Gpio/Families/$family.sources lists '$entry', which is not a C# source in $where"
         }
         $entries += $entry
     }
@@ -118,13 +123,18 @@ if (-not $Define) { $Define = $DefaultSurface }
 # into "you get told why". One dependency is not in this table: `Lamella.Hardware` names
 # `IReadOnlyList<T>`, so a surface without `LAMELLA_SURFACE_NETFX_4_5` stops at that library's compile.
 $SurfaceRequires = [ordered]@{
-    'LAMELLA_SURFACE_NETFX_2_0' = @('LAMELLA_SURFACE_GENERICS')
+    # A .NET Framework rung stands on the one below it: 2.0's members without 1.1's, 4.0's without
+    # 2.0's, or 4.5's without 4.0's describe no .NET Framework that ever shipped.
+    'LAMELLA_SURFACE_NETFX_2_0' = @('LAMELLA_SURFACE_GENERICS', 'LAMELLA_SURFACE_NETFX_1_1')
+    'LAMELLA_SURFACE_NETFX_4_0' = @('LAMELLA_SURFACE_NETFX_2_0')
+    'LAMELLA_SURFACE_NETFX_4_5' = @('LAMELLA_SURFACE_NETFX_4_0')
     'LAMELLA_SURFACE_SERIAL'    = @('LAMELLA_SURFACE_NETFX_2_0')
     'LAMELLA_SURFACE_SPAN'      = @('LAMELLA_SURFACE_GENERICS')
     'LAMELLA_SURFACE_TUPLES'    = @('LAMELLA_SURFACE_GENERICS')
     # A rung stands on the one below it: .NET Core 2.0 members without the 4.5 surface describe no
-    # .NET that ever shipped.
-    'LAMELLA_SURFACE_NETCORE_2_0' = @('LAMELLA_SURFACE_NETFX_4_5')
+    # .NET that ever shipped. Nor do they without StringComparison, which .NET Framework 2.0
+    # introduced: OSPlatform's names compare and hash through it.
+    'LAMELLA_SURFACE_NETCORE_2_0' = @('LAMELLA_SURFACE_NETFX_4_5', 'LAMELLA_SURFACE_STRING_COMPARISON')
     # And .NET Core 2.1 without spans describes none either.
     'LAMELLA_SURFACE_NETCORE_2_1' = @('LAMELLA_SURFACE_NETCORE_2_0', 'LAMELLA_SURFACE_SPAN')
     'LAMELLA_SURFACE_NETCORE_3_0' = @('LAMELLA_SURFACE_NETCORE_2_1')
@@ -333,9 +343,10 @@ foreach ($assembly in $Assemblies) {
 # need cannot come from a board's assembly: each family with a `libs/System.Device.Gpio/Families/
 # <family>.cs` gets a System.Device.Gpio of its own, at `families/<family>/System.Device.Gpio.dll`,
 # holding the drivers that file constructs from a board's bus table. It is built from the shared
-# sources, that file (in place of BoardDrivers.cs, by LAMELLA_FAMILY_DRIVERS) and the
-# `csp/<family>/csharp` sources `Families/<family>.sources` lists: those drivers and the bindings and
-# register layouts they take. The build for a board takes it in place of the shared one, so it
+# sources, that file (in place of BoardDrivers.cs, by LAMELLA_FAMILY_DRIVERS) and the sources
+# `Families/<family>.sources` lists: those drivers and the bindings and register layouts they take,
+# from `csp/<family>/csharp`, and a driver several families share, from beside the family files (an
+# entry starting `./`). The build for a board takes it in place of the shared one, so it
 # presents the shared one's public surface unchanged, and beside it the csp types it carries, public.
 #
 # EACH OF THOSE TYPES IS IN EXACTLY ONE ASSEMBLY. csharp/build-boards.ps1 leaves the listed sources out of
@@ -357,11 +368,18 @@ foreach ($familyFile in $familyFiles) {
     if (Test-Path $work) { Remove-Item -Recurse -Force $work }
     $copies = @()
     # In the order Get-Sources sorts them, not the list's, so the metadata layout does not depend on
-    # how the list is written.
-    foreach ($file in @(Get-Sources $csp -Recurse)) {
-        $relative = $file.Substring($csp.TrimEnd('\', '/').Length + 1).Replace('\', '/')
+    # how the list is written: the csp sources first, then the shared ones beside the family files,
+    # each matched as its list entry spells it.
+    $shared = Join-Path $root 'libs/System.Device.Gpio/Families'
+    $candidates = @(Get-Sources $csp -Recurse | ForEach-Object {
+            [pscustomobject]@{ File = $_; Entry = $_.Substring($csp.TrimEnd('\', '/').Length + 1).Replace('\', '/') } })
+    $candidates += @(Get-Sources $shared -Recurse | ForEach-Object {
+            [pscustomobject]@{ File = $_; Entry = './' + $_.Substring($shared.TrimEnd('\', '/').Length + 1).Replace('\', '/') } })
+    foreach ($candidate in $candidates) {
+        $file = $candidate.File
+        $relative = $candidate.Entry
         if ($listed -notcontains $relative) { continue }
-        $copy = Join-Path $work $relative
+        $copy = Join-Path $work ($relative -replace '^\./', 'shared/')
         New-Item -ItemType Directory -Force (Split-Path $copy -Parent) | Out-Null
         # Bytes in and bytes out, so the copy differs from its original only where a declaration
         # changed: csharp/build-managed.sh makes the same edit with sed, and the two outputs are compared.
@@ -376,7 +394,7 @@ foreach ($familyFile in $familyFiles) {
         $copies += $copy
     }
     if ($copies.Count -ne $listed.Count) {
-        throw "libs/System.Device.Gpio/Families/$family.sources lists $($listed.Count) sources and csp/$family/csharp yielded $($copies.Count) of them"
+        throw "libs/System.Device.Gpio/Families/$family.sources lists $($listed.Count) sources and csp/$family/csharp and libs/System.Device.Gpio/Families yielded $($copies.Count) of them"
     }
     $src = $gpioSrc + @($familyFile) + $copies
     $dir = Join-Path $out "families/$family"

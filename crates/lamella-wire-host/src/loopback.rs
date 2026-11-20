@@ -98,23 +98,38 @@ pub struct LoopbackBoard {
 }
 
 impl LoopbackBoard {
-    /// A board whose flash is `flash`, serving nothing yet.
+    /// A board whose flash is `flash`, serving nothing yet, on a carrier that declares room for any
+    /// frame, as a board's firmware on a network carrier does. Its HELLO acknowledgement states that
+    /// limit, and so the format of the image its runtime loads.
     #[must_use]
     pub fn on(flash: RamFlash) -> Self {
         Self {
             replies: lamella_wire::MemTransport::new(),
-            carrier: lamella_wire::MemTransport::new(),
+            carrier: lamella_wire::MemTransport::new().with_max_inbound_payload(lamella_wire::MAX_PAYLOAD),
             flash,
             load: lamella_runner::ArtifactLoad::new(),
             reset: false,
             chunks: 0,
         }
     }
+
+    /// This board on a carrier that declares `limit` (a carrier's
+    /// [`Transport::max_inbound_payload`]), or none: a board whose carrier declares none states no
+    /// image format, as firmware built before its carriers declared their limits does.
+    #[must_use]
+    pub fn declaring(mut self, limit: Option<usize>) -> Self {
+        let carrier = lamella_wire::MemTransport::new();
+        self.carrier = match limit {
+            Some(limit) => carrier.with_max_inbound_payload(limit),
+            None => carrier,
+        };
+        self
+    }
 }
 
 impl Transport for LoopbackBoard {
     fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
-        if msg_type == crate::deploy::DEPLOY_IMAGE {
+        if msg_type == crate::deploy::DEPLOY_IMAGE || msg_type == crate::deploy::DEPLOY_BUNDLE {
             self.chunks += 1;
         }
         let mut host = lamella_wire::MemTransport::new();
@@ -143,15 +158,46 @@ impl Transport for LoopbackBoard {
 /// until the host goes away or asks for the reset that starts the stored program: for a board on
 /// a carrier a test hands a host, such as a socket.
 ///
+/// The board declares the limit `carrier` declares, or else room for any frame, as a board's
+/// firmware on a network carrier does, so its HELLO acknowledgement states the format of the image
+/// its runtime loads.
+///
 /// # Errors
 /// The carrier's error once the host has gone, which is how this ends unless a reset was asked for.
 pub fn serve(carrier: &mut impl Transport, flash: &mut RamFlash) -> Result<(), TransportError> {
+    let mut carrier = Declaring(carrier);
     let mut load = lamella_runner::ArtifactLoad::new();
     loop {
-        match lamella_runner::serve_one_deploy(carrier, flash, &mut load)? {
+        match lamella_runner::serve_one_deploy(&mut carrier, flash, &mut load)? {
             lamella_runner::Served::RunRequested => return Ok(()),
             lamella_runner::Served::Nothing => std::thread::sleep(std::time::Duration::from_millis(1)),
             _ => {}
         }
+    }
+}
+
+/// A carrier as [`serve`]'s board holds it: the carrier's own, declaring its limit, or else the
+/// protocol's.
+struct Declaring<'a, T>(&'a mut T);
+
+impl<T: Transport> Transport for Declaring<'_, T> {
+    fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), TransportError> {
+        self.0.send(msg_type, seq, payload)
+    }
+
+    fn poll(&mut self) -> Result<Option<lamella_wire::Frame>, TransportError> {
+        self.0.poll()
+    }
+
+    fn max_inbound_payload(&self) -> Option<usize> {
+        self.0.max_inbound_payload().or(Some(lamella_wire::MAX_PAYLOAD))
+    }
+
+    fn try_send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<bool, TransportError> {
+        self.0.try_send(msg_type, seq, payload)
+    }
+
+    fn discarded_bytes(&self) -> Option<u64> {
+        self.0.discarded_bytes()
     }
 }

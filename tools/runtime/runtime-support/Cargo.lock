@@ -88,25 +88,25 @@ dependencies = [
 
 [[package]]
 name = "lamella-board-buses"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "lamella-board-support"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "lamella-psram-qspi",
 ]
 
 [[package]]
 name = "lamella-cil"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "lamella-token",
 ]
 
 [[package]]
 name = "lamella-cil-runtime"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "lamella-board-buses",
  "lamella-cil",
@@ -116,16 +116,17 @@ dependencies = [
  "lamella-pin-events",
  "lamella-reactor",
  "lamella-token",
+ "lamella-wire",
  "lamella-wtf8",
 ]
 
 [[package]]
 name = "lamella-console-ring"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "lamella-debug-agent"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "lamella-mmio",
  "lamella-wire",
@@ -133,38 +134,38 @@ dependencies = [
 
 [[package]]
 name = "lamella-decimal"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "lamella-exit-codes"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "lamella-fw-store"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "lamella-wire",
 ]
 
 [[package]]
 name = "lamella-gc"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "lamella-heap"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "lamella-mmio"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "lamella-net-core"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "lamella-net-smoltcp"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "lamella-net-core",
  "smoltcp",
@@ -172,7 +173,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-pin-events"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "lamella-psram-qspi"
@@ -180,7 +181,7 @@ version = "0.1.0"
 
 [[package]]
 name = "lamella-reactor"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "lamella-runtime-support"
@@ -198,7 +199,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-runtime-support-debug"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "lamella-debug-agent",
  "lamella-fw-store",
@@ -207,7 +208,7 @@ dependencies = [
 
 [[package]]
 name = "lamella-runtime-support-net"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "lamella-cil-runtime",
  "lamella-heap",
@@ -218,11 +219,11 @@ dependencies = [
 
 [[package]]
 name = "lamella-softmath"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "lamella-tls-mbedtls"
-version = "0.5.0"
+version = "0.6.0"
 dependencies = [
  "cc",
  "lamella-cil-runtime",
@@ -230,15 +231,15 @@ dependencies = [
 
 [[package]]
 name = "lamella-token"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "lamella-wire"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "lamella-wtf8"
-version = "0.5.0"
+version = "0.6.0"
 
 [[package]]
 name = "managed"

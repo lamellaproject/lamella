@@ -3,7 +3,9 @@
 //! The SSPCLK is clk_peri, so the crystal/clk_peri bring-up is the
 //! same first-seven steps as uart_rp2350 (SSPCLK = clk_peri = the 12 MHz crystal).
 
-use crate::spi::{SpiConfig, SpiConfigError, SpiFacts, SpiOp};
+#[cfg(not(target_os = "none"))]
+use crate::spi::SpiFacts;
+use crate::spi::{SpiConfig, SpiConfigError, SpiOp};
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -56,7 +58,9 @@ const CR0_SPO: u32 = 1 << 6;
 const CR0_SPH: u32 = 1 << 7;
 /// SSPCR1: SSE (bit 1) enables the port; master mode is MS (bit 2) clear.
 const CR1_SSE: u32 = 1 << 1;
-/// SSPSR flags: TFE (TX FIFO empty), TNF (TX FIFO not full), RNE (RX FIFO not empty).
+/// SSPSR flags: TFE (TX FIFO empty), TNF (TX FIFO not full), RNE (RX FIFO not empty). Only the
+/// off-device sim reads TFE.
+#[cfg(not(target_os = "none"))]
 const SR_TFE: u32 = 1 << 0;
 const SR_TNF: u32 = 1 << 1;
 const SR_RNE: u32 = 1 << 2;
@@ -70,6 +74,8 @@ pub(crate) const FUNCTION_PINS: &[u32] = &[16, 17, 18, 19];
 /// The `(sck, mosi, miso)` pins for the `busio.SPI(clock, MOSI, MISO)` pin check (GP18/GP19/GP16).
 pub(crate) const SCK_MOSI_MISO: (u32, u32, u32) = (18, 19, 16);
 
+/// The facts the off-device sim models SPI0 with.
+#[cfg(not(target_os = "none"))]
 pub(crate) fn facts() -> SpiFacts {
     SpiFacts {
         data_reg: SSPDR,

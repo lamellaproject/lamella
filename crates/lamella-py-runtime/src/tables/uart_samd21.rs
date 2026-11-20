@@ -75,11 +75,15 @@ pub(crate) fn facts(f: &Samd21UartFacts) -> UartFacts {
         fifo: f.sercom_base + DATA,
         status: UartStatus::FlagsReady {
             flags: f.sercom_base + INTFLAG,
+            #[cfg(not(target_os = "none"))]
             tx_ready_mask: INTFLAG_DRE | INTFLAG_TXC,
             rx_ready_mask: INTFLAG_RXC,
         },
+        #[cfg(not(target_os = "none"))]
         self_clear_reg: 0,
+        #[cfg(not(target_os = "none"))]
         sim_ready: &[],
+        #[cfg(not(target_os = "none"))]
         fifo_depth: 1,
     }
 }

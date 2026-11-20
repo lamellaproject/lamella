@@ -45,7 +45,7 @@ namespace Lamella.Generated
         public const uint VCP_RX_AFR_VALUE = 0x700;
         public const uint VCP_PCLK_HZ = 16000000;
         public const uint VCP_BRR_115200_HSI_16MHZ = 0x8B;
-        public const uint DEVICE_COUNT = 3;
+        public const uint DEVICE_COUNT = 5;
 
         // -- on-board devices: PORT group base + pin index + mask --
         public const uint LED0_PORT_BASE = 0x40022400;
@@ -63,6 +63,14 @@ namespace Lamella.Generated
         public const uint BUTTON0_BANK = 0;
         public const uint BUTTON0_MASK = 0x1;
         public const uint BUTTON0_ACTIVE_LOW = 0;
+        public const uint SWDIO_PORT_BASE = 0x40020000;
+        public const uint SWDIO_PIN = 13;
+        public const uint SWDIO_BANK = 0;
+        public const uint SWDIO_MASK = 0x2000;
+        public const uint SWCLK_PORT_BASE = 0x40020000;
+        public const uint SWCLK_PIN = 14;
+        public const uint SWCLK_BANK = 0;
+        public const uint SWCLK_MASK = 0x4000;
 
         /// -- memory regions the board fits: SIZE is what a program may reach, which a device's own
         /// size may exceed; a region with a CONTROLLER does not exist until that instance is brought

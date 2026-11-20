@@ -3,18 +3,14 @@
 
 use crate::SpiBus;
 
-/// Command bytes: start nibble 4'b1100 | type (SDG 17.1.1).
-pub const CMD_DMA_WRITE: u8 = 0xc1;
-pub const CMD_DMA_READ: u8 = 0xc2;
-pub const CMD_INTERNAL_WRITE: u8 = 0xc3;
-pub const CMD_INTERNAL_READ: u8 = 0xc4;
-pub const CMD_TERMINATE: u8 = 0xc5;
-pub const CMD_REPEAT: u8 = 0xc6;
-pub const CMD_DMA_EXT_WRITE: u8 = 0xc7;
-pub const CMD_DMA_EXT_READ: u8 = 0xc8;
-pub const CMD_SINGLE_WRITE: u8 = 0xc9;
-pub const CMD_SINGLE_READ: u8 = 0xca;
-pub const CMD_RESET: u8 = 0xcf;
+// The command bytes this driver sends: start nibble 4'b1100 | type (SDG 17.1.1).
+const CMD_INTERNAL_WRITE: u8 = 0xc3;
+const CMD_INTERNAL_READ: u8 = 0xc4;
+const CMD_DMA_EXT_WRITE: u8 = 0xc7;
+const CMD_DMA_EXT_READ: u8 = 0xc8;
+const CMD_SINGLE_WRITE: u8 = 0xc9;
+const CMD_SINGLE_READ: u8 = 0xca;
+const CMD_RESET: u8 = 0xcf;
 
 /// The chip-identity register (vendor driver `nmasic.h`: `NMI_CHIPID` at the peripheral base).
 pub const NMI_CHIPID: u32 = 0x1000;
@@ -40,11 +36,19 @@ pub enum SpiError {
     /// The underlying SPI transport failed.
     Bus,
     /// No command echo arrived within the retry budget.
-    NoEcho { cmd: u8, last: u8 },
+    NoEcho {
+        /// The command byte whose echo was awaited.
+        cmd: u8,
+        /// The last byte the module returned instead.
+        last: u8,
+    },
     /// The state byte after the echo was not the no-error value 0x00.
     BadState(u8),
     /// No data-packet header (start nibble 4'b1111) arrived within the retry budget.
-    NoDataHeader { last: u8 },
+    NoDataHeader {
+        /// The last byte the module returned instead.
+        last: u8,
+    },
     /// A module-side operation (a flash-controller transfer, a program/erase) never
     /// reported done within its poll budget.
     Timeout,
@@ -74,11 +78,14 @@ pub struct Link<S> {
 }
 
 impl<S: SpiBus> Link<S> {
+    /// Wraps a board's bus. CRC framing starts on, as the module comes out of reset;
+    /// [`init`](Self::init) turns it off.
     pub fn new(bus: S) -> Self {
         Self { bus, crc_enabled: true }
     }
 
-    pub fn into_bus(self) -> S {
+    /// Releases the board's bus.
+    pub(crate) fn into_bus(self) -> S {
         self.bus
     }
 
@@ -308,7 +315,7 @@ impl<S: SpiBus> Link<S> {
             if !found {
                 return Err(SpiError::NoDataHeader { last });
             }
-            let mut tx = [0u8; 64];
+            let tx = [0u8; 64];
             let mut taken = 0;
             while taken < take {
                 let n = (take - taken).min(tx.len());
@@ -322,7 +329,6 @@ impl<S: SpiBus> Link<S> {
                 self.bus.transfer(&[0; 2], &mut crc_rx).map_err(|_| SpiError::Bus)?;
             }
             done += take;
-            let _ = tx;
         }
         Ok(())
     }

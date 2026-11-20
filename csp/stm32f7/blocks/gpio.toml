@@ -1,5 +1,6 @@
-# BLOCK layout: the STM32F7 GPIO port block -- the registers a uart binding muxes through.
-# PARTIAL: MODER/AFRL/AFRH fields are stated for the pins bindings claim and grow as more do.
+# BLOCK layout: the STM32F7 GPIO port block -- the registers a uart binding muxes through and a GPIO
+# driver drives. PARTIAL: MODER/AFRL/AFRH fields are stated for the pins bindings claim and grow as
+# more do.
 # Offsets are instance-base-relative; port instance bases live in ../instances.toml.
 #
 # A pin's alternate function is selected in TWO registers, which is the thing to get right: MODER
@@ -20,6 +21,7 @@ block = "gpio"
 sources = [
     "STM32F7 reference manual RM0385 Rev 9: GPIOx_MODER 6.4.1 (address offset 0x00), GPIOx_AFRL 6.4.9 (0x20), GPIOx_AFRH 6.4.10 (0x24)",
     "STM32F7 reference manual RM0385 Rev 9: GPIOx_OTYPER 6.4.2 (address offset 0x04, one bit per pin, 1 = open drain), GPIOx_OSPEEDR 6.4.3 (0x08, 2 bits per pin, 11 = very high speed), GPIOx_PUPDR 6.4.4 (0x0C, 2 bits per pin, 01 = pull-up)",
+    "STM32F7 reference manual RM0385 Rev 9: GPIOx_IDR 6.4.5 (address offset 0x10), GPIOx_ODR 6.4.6 (0x14), GPIOx_BSRR 6.4.7 (0x18: BR[15:0] in bits 31:16 reset a pin's ODR bit, BS[15:0] in bits 15:0 set it, and 'If both BSx and BRx are set, BSx has priority')",
 ]
 notes = [
     "GPIO config is read-modify-write: MODER holds 2 bits per pin and an AFR nibble 4, so a pin's field span is cleared before the set value is OR-ed in.",
@@ -53,6 +55,24 @@ width = 32
 fields = { }
 notes = "Pull-up/pull-down, 2 bits per pin at [2n]: 00 none (reset), 01 pull-up, 10 pull-down. An open-drain bus needs a pull somewhere; whether the internal one is enough is a board fact, never this table's."
 
+[registers.IDR]
+offset = 0x10
+width = 32
+fields = { }
+notes = "Input data, ONE bit per pin at [n], read-only. What a button row is read through."
+
+[registers.ODR]
+offset = 0x14
+width = 32
+fields = { }
+notes = "Output data, ONE bit per pin at [n]. Read-modify-write; BSRR is the single-write alternative."
+
+[registers.BSRR]
+offset = 0x18
+width = 32
+fields = { }
+notes = "Bit set/reset, write-only: bit [n] SETS pin n and bit [n+16] CLEARS it, and where a write sets both bits of one pin the set wins."
+
 [registers.AFRL]
 offset = 0x20
 width = 32
@@ -65,8 +85,22 @@ width = 32
 fields = { AFSEL9 = [4, 4] }
 notes = "Alternate function for pins 8..15, 4 bits per pin at [4*(n-8), 4] (PARTIAL: pin 9 stated)."
 
+# MODER's four modes and PUPDR's three codes are RM0385 6.4.1's and 6.4.4's: MODER 00 input, 01
+# general purpose output, 10 alternate function, 11 analog; PUPDR 00 no pull-up or pull-down, 01
+# pull-up, 10 pull-down, and 11 reserved.
+#
+# MODER_MODE_RESET is the mode a pin leaves reset in, for every pin outside the debug port: 6.4.1
+# gives MODER's reset value as 0x0000 0000 for every port but A and B, and its field description
+# names 00, input, the reset state. A GPIO driver returns a closed pin to it, so a pin a program
+# closes is in the state a pin no program touched is in.
 [constants]
+MODER_MODE_INPUT = 0
+MODER_MODE_OUTPUT = 1
 MODER_MODE_AF = 2
+MODER_MODE_ANALOG = 3
+MODER_MODE_RESET = 0
 OTYPER_OPEN_DRAIN = 1
 OSPEEDR_VERY_HIGH = 3
+PUPDR_NONE = 0
 PUPDR_PULL_UP = 1
+PUPDR_PULL_DOWN = 2

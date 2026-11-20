@@ -44,6 +44,19 @@ public enum Stm32f7Instances {
     public static let GPIOI_RCC_EN_OFF: UInt32 = 48
     public static let GPIOI_RCC_EN_BIT: UInt32 = 8
     public static let GPIOI_RCC_EN_MASK: UInt32 = 0x100
+    public static let GPIOJ_BASE: UInt32 = 0x40022400
+    public static let GPIOJ_RCC_EN_OFF: UInt32 = 48
+    public static let GPIOJ_RCC_EN_BIT: UInt32 = 9
+    public static let GPIOJ_RCC_EN_MASK: UInt32 = 0x200
+    public static let GPIOK_BASE: UInt32 = 0x40022800
+    public static let GPIOK_RCC_EN_OFF: UInt32 = 48
+    public static let GPIOK_RCC_EN_BIT: UInt32 = 10
+    public static let GPIOK_RCC_EN_MASK: UInt32 = 0x400
+    public static let EXTI_BASE: UInt32 = 0x40013C00
+    public static let SYSCFG_BASE: UInt32 = 0x40013800
+    public static let SYSCFG_RCC_EN_OFF: UInt32 = 68
+    public static let SYSCFG_RCC_EN_BIT: UInt32 = 14
+    public static let SYSCFG_RCC_EN_MASK: UInt32 = 0x4000
     public static let RCC_BASE: UInt32 = 0x40023800
     public static let I2C1_BASE: UInt32 = 0x40005400
     public static let I2C1_RCC_EN_OFF: UInt32 = 64
@@ -61,4 +74,8 @@ public enum Stm32f7Instances {
     public static let QUADSPI_RCC_EN_OFF: UInt32 = 56
     public static let QUADSPI_RCC_EN_BIT: UInt32 = 1
     public static let QUADSPI_RCC_EN_MASK: UInt32 = 0x2
+    public static let TIM5_BASE: UInt32 = 0x40000C00
+    public static let TIM5_RCC_EN_OFF: UInt32 = 64
+    public static let TIM5_RCC_EN_BIT: UInt32 = 3
+    public static let TIM5_RCC_EN_MASK: UInt32 = 0x8
 }

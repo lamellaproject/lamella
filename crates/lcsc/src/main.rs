@@ -257,7 +257,12 @@ fn strip_option<'a>(arg: &'a str, prefixes: &[&str]) -> Option<&'a str> {
 /// csc oracle the differential runs against).
 #[cfg(windows)]
 fn host_ansi_code_page() -> u16 {
-    unsafe { windows_sys::Win32::Globalization::GetACP() as u16 }
+    // SAFETY: Rust reaches a Win32 function only through FFI, which is `unsafe`, and the standard
+    // library does not expose the ANSI code page. `GetACP` takes no argument and cannot fail.
+    #[allow(unsafe_code)]
+    unsafe {
+        windows_sys::Win32::Globalization::GetACP() as u16
+    }
 }
 
 #[cfg(not(windows))]

@@ -63,7 +63,8 @@ lamella-net-core = { path = "../lamella-net-core" }
 # The ahead-of-time backend, for the census that proves every board in the table names a target it
 # actually knows and builds a bootable image. A DEV dependency: the routes do not compile anything,
 # but a table row that names a target the backend cannot build is a row nothing else would catch.
-lamella-aot = { path = "../lamella-aot" }
+# With its linked tier, since a target may be one only that tier builds.
+lamella-aot = { path = "../lamella-aot", features = ["linked"] }
 
 [lints]
 workspace = true

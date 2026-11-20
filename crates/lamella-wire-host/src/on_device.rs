@@ -51,14 +51,16 @@ pub fn store_image_worded(
 /// The capabilities a host offers when it stores a program on a board.
 ///
 /// [`Capabilities::DEPLOY_PREFIX_CRC`] is among them so that each chunk's acknowledgement is
-/// compared with what was sent: a capability works only where both ends offered it.
+/// compared with what was sent: a capability works only where both ends offered it. So is
+/// [`Capabilities::BUNDLE`], since this host stores Python bundles ([`store_bundle`]).
 #[must_use]
 pub fn host_caps() -> Capabilities {
     Capabilities(
         Capabilities::BAKED_IMAGE
             | Capabilities::REPL_RUN
             | Capabilities::PROFILE_CHIPID
-            | Capabilities::DEPLOY_PREFIX_CRC,
+            | Capabilities::DEPLOY_PREFIX_CRC
+            | Capabilities::BUNDLE,
     )
 }
 
@@ -70,6 +72,16 @@ pub fn run_caps() -> Capabilities {
 }
 
 pub use crate::describe_refusal;
+
+/// Whether the board `session` reached runs Python programs and no C# ones: a Python runtime that
+/// takes bundles is among those it holds, and no C# runtime is. A host refuses a C# program for such a
+/// board before it builds anything.
+#[must_use]
+pub fn runs_python_only(session: &Negotiated) -> bool {
+    use lamella_wire::msg::tier;
+    let holds = |tier: u8| session.identity.surfaces.iter().any(|surface| surface.tier == tier);
+    holds(tier::PYTHON) && session.target_caps.has(Capabilities::BUNDLE) && !holds(tier::CIL)
+}
 
 /// "the" and the board's product name, or "the board" when its HELLO named none.
 #[must_use]
@@ -133,6 +145,117 @@ pub fn store_image(
     store_image_worded(transport, session, target, image, out, Wording::Full)
 }
 
+/// Put the Python `bundle` in the flash of the board at the other end of `transport`, whose HELLO
+/// `session` is, as [`store_image`] puts an image there: the same steps, said in the same words, the
+/// board's answer about what it holds compared with [`crate::bundle_checksum`].
+///
+/// # Errors
+/// As [`store_image`].
+pub fn store_bundle(
+    transport: &mut impl Transport,
+    session: &Negotiated,
+    target: &str,
+    bundle: &[u8],
+    out: &mut dyn Write,
+) -> Result<Stored, String> {
+    store_bundle_worded(transport, session, target, bundle, out, Wording::Full)
+}
+
+/// Store a bundle with the caller's choice of progress detail.
+///
+/// # Errors
+/// As [`store_image`].
+pub fn store_bundle_worded(
+    transport: &mut impl Transport,
+    session: &Negotiated,
+    target: &str,
+    bundle: &[u8],
+    out: &mut dyn Write,
+    wording: Wording,
+) -> Result<Stored, String> {
+    store_with_clock(transport, session, target, Artifact::Bundle(bundle), out, TIMEOUT, wording, Instant::now)
+}
+
+/// What a store puts on a board: a baked C# image, or a Python bundle. The steps are the same, and
+/// the sentences; what differs is how a board's answer about what it holds is compared, and which
+/// message carries the chunks.
+#[derive(Clone, Copy)]
+enum Artifact<'a> {
+    Image(&'a [u8]),
+    Bundle(&'a [u8]),
+}
+
+impl Artifact<'_> {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Image(bytes) | Self::Bundle(bytes) => bytes,
+        }
+    }
+
+    /// The checksum a board that holds this artifact reports for it, verified.
+    fn checksum(&self) -> Option<u64> {
+        match self {
+            Self::Image(image) => baked_image_checksum(image),
+            Self::Bundle(bundle) => Some(crate::bundle_checksum(bundle)),
+        }
+    }
+
+    /// Why the board `session` answered for cannot load this artifact's format, or `None` when it can.
+    /// An image is asked as [`crate::image_refusal`] asks, against the format the board's C# runtime
+    /// states. A bundle carries its format number after its four-byte magic; a board states the one
+    /// its Python runtime loads. Bytes without the magic, or with the reserved number
+    /// [`lamella_wire::image_format::LOADS_NONE`] where the format belongs, are no bundle at all, so
+    /// the answer is to rebuild them, and so is a bundle of a format this Lamella does not build
+    /// ([`lamella_wire::image_format::file_refusal`]), whatever its number.
+    fn format_refusal(&self, session: &Negotiated) -> Option<&'static str> {
+        use lamella_wire::image_format::{LOADS_NONE, REBUILD_IMAGE};
+        let bundle = match self {
+            Self::Image(image) => {
+                return crate::image_refusal(image, session.image_format(lamella_wire::msg::tier::CIL));
+            }
+            Self::Bundle(bundle) => bundle,
+        };
+        let format = match bundle.get(..6) {
+            Some(head) if head[..4] == *b"LPYC" => u16::from_le_bytes([head[4], head[5]]),
+            _ => return Some(REBUILD_IMAGE),
+        };
+        if format == LOADS_NONE {
+            return Some(REBUILD_IMAGE);
+        }
+        if let Some(refusal) =
+            lamella_wire::image_format::file_refusal(Some(u32::from(format)), lamella_py_bytecode::BUNDLE_FORMAT_VERSION)
+        {
+            return Some(refusal);
+        }
+        lamella_wire::image_format::refusal(session.image_format(lamella_wire::msg::tier::PYTHON), format)
+    }
+
+    /// The sentence for a deploy the board answered and did not accept.
+    fn refused(&self, ack: crate::TransferAck, board: Option<&str>) -> String {
+        match self {
+            Self::Image(_) => ack.describe(board),
+            Self::Bundle(_) => ack.describe_program(board),
+        }
+    }
+
+    /// The deploy, in chunks of `chunk_len`.
+    fn deploy(
+        &self,
+        transport: &mut impl Transport,
+        chunk_len: usize,
+        timeout: Duration,
+        caps: Capabilities,
+        report: &mut dyn FnMut(crate::DeployProgress),
+    ) -> Result<crate::TransferAck, TransportError> {
+        match self {
+            Self::Image(image) => deploy_image_reporting(transport, DEPLOY_SEQ, image, chunk_len, timeout, caps, report),
+            Self::Bundle(bundle) => {
+                crate::deploy_bundle_reporting(transport, DEPLOY_SEQ, bundle, chunk_len, timeout, caps, report)
+            }
+        }
+    }
+}
+
 /// [`store_image`], waiting `timeout` for each of the board's answers.
 #[allow(clippy::too_many_arguments)]
 fn store_image_within(
@@ -156,8 +279,26 @@ fn store_image_with_clock(
     out: &mut dyn Write,
     timeout: Duration,
     wording: Wording,
+    now: impl FnMut() -> Instant,
+) -> Result<Stored, String> {
+    store_with_clock(transport, session, target, Artifact::Image(image), out, timeout, wording, now)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn store_with_clock(
+    transport: &mut impl Transport,
+    session: &Negotiated,
+    target: &str,
+    artifact: Artifact<'_>,
+    out: &mut dyn Write,
+    timeout: Duration,
+    wording: Wording,
     mut now: impl FnMut() -> Instant,
 ) -> Result<Stored, String> {
+    let image = artifact.bytes();
+    if let Some(refusal) = artifact.format_refusal(session) {
+        return Err(refusal.to_owned());
+    }
     let name = board_name(session.identity.product_model);
     let board = the_board(name);
     match abort_blocking(transport, TAKE_BACK_SEQ, timeout) {
@@ -184,7 +325,7 @@ fn store_image_with_clock(
     let held = deploy_status_blocking(transport, STORED_SEQ, timeout)
         .ok()
         .and_then(|status| status.checksum);
-    if held.is_some() && held == baked_image_checksum(image) {
+    if held.is_some() && held == artifact.checksum() {
         if wording == Wording::Full {
             let _ = writeln!(out, "{} already stores this program, so nothing was sent.", capitalized(&board));
         }
@@ -202,10 +343,8 @@ fn store_image_with_clock(
     let mut quarters = Quarters::of(image.len());
     let mut first_wait = None;
     let mut acknowledged = 0;
-    let sent = deploy_image_reporting(
+    let sent = artifact.deploy(
         transport,
-        DEPLOY_SEQ,
-        image,
         chunk_len,
         timeout,
         session.caps,
@@ -250,12 +389,12 @@ fn store_image_with_clock(
             }
             Ok(Stored::Written)
         }
-        Ok(not_accepted) => Err(format!("{}.", not_accepted.describe(name))),
+        Ok(not_accepted) => Err(format!("{}.", artifact.refused(not_accepted, name))),
         Err(TransportError::Refused { reason, .. }) => {
             Err(format!("{target} refused the deploy: {}", describe_refusal(reason)))
         }
         Err(TransportError::Closed) => {
-            let wanted = baked_image_checksum(image);
+            let wanted = artifact.checksum();
             let asked = deploy_status_blocking(transport, ASKED_AGAIN_SEQ, timeout);
             let waited = match first_wait {
                 Some(wait) if acknowledged == 0 => wait,
@@ -352,19 +491,32 @@ pub const START_PATIENCE: Duration = Duration::from_secs(2);
 /// The board refused the start, did not acknowledge it, or the carrier failed: each says the image
 /// is on the board, because the store succeeded and only the start did not.
 pub fn start_deployed(transport: &mut impl Transport, patience: Duration) -> Result<&'static str, String> {
+    start_deployed_as(transport, patience, "image")
+}
+
+/// [`start_deployed`] after a Python bundle was stored, which the sentences call the program, as
+/// [`crate::TransferAck::describe_program`] does.
+///
+/// # Errors
+/// As [`start_deployed`]'s, each saying the program is on the board.
+pub fn start_deployed_program(transport: &mut impl Transport, patience: Duration) -> Result<&'static str, String> {
+    start_deployed_as(transport, patience, "program")
+}
+
+/// The start of what was stored, `what` naming it in the sentences.
+fn start_deployed_as(transport: &mut impl Transport, patience: Duration, what: &str) -> Result<&'static str, String> {
     use crate::StartFailure;
     match start_execution(transport, 2, exec::exec_source::DEPLOYED, 0, patience) {
         Ok(()) => Ok("started it."),
-        Err(StartFailure::NoAnswer) => Err(
-            "the image is on the board, and the board did not acknowledge the start, so whether it is \
+        Err(StartFailure::NoAnswer) => Err(format!(
+            "the {what} is on the board, and the board did not acknowledge the start, so whether it is \
              running is not known. Resetting the board runs it."
-                .to_owned(),
-        ),
+        )),
         Err(failure @ (StartFailure::Refused(_) | StartFailure::Transport(TransportError::Refused { .. }))) => {
-            Err(format!("the image is on the board, and {failure}."))
+            Err(format!("the {what} is on the board, and {failure}."))
         }
         Err(failure @ StartFailure::Transport(_)) => {
-            Err(format!("the image is on the board, and {failure}. Resetting the board runs it."))
+            Err(format!("the {what} is on the board, and {failure}. Resetting the board runs it."))
         }
     }
 }
@@ -749,6 +901,12 @@ mod tests {
         let silent = start_deployed(&mut Answering::with(|_| {}), quick).expect_err("silence is not a start");
         assert!(silent.contains("did not acknowledge"), "{silent}");
         assert!(silent.contains("the image is on the board"), "{silent}");
+
+        let refused = start_deployed_program(&mut acknowledging(exec::ack::NOTHING_TO_RUN), quick)
+            .expect_err("a refused start did not start");
+        assert!(refused.starts_with("the program is on the board, and "), "{refused}");
+        let silent = start_deployed_program(&mut Answering::with(|_| {}), quick).expect_err("silence is not a start");
+        assert!(silent.starts_with("the program is on the board, and the board did not acknowledge"), "{silent}");
     }
 
     /// **A QUARTER IS SAID ONCE, AND THE LAST ONE NOT AT ALL**: the store's closing line says that,
@@ -802,6 +960,11 @@ mod tests {
         window: Option<u32>,
         watching: Option<Shared>,
         heard: Option<String>,
+        /// What it holds came by `DEPLOY_BUNDLE`, so it is a Python bundle, and what it reports for
+        /// it is the bundle's checksum.
+        holds_bundle: bool,
+        /// It answers every chunk that it could not write it.
+        refusing: bool,
     }
 
     impl Storing {
@@ -819,7 +982,18 @@ mod tests {
                 window: Some(64 * 1024),
                 watching: None,
                 heard: None,
+                holds_bundle: false,
+                refusing: false,
             }
+        }
+
+        /// A board that runs Python and already stores `bundle`.
+        fn holding_bundle(bundle: &[u8]) -> Self {
+            let mut board = Self::losing(usize::MAX, false);
+            board.image = bundle.to_vec();
+            board.total = bundle.len();
+            board.holds_bundle = true;
+            board
         }
 
         /// A board that loses no acknowledgement, and answers chunk `chunk` only `after` it came.
@@ -855,7 +1029,11 @@ mod tests {
                     let mut answer = vec![0u8; 10];
                     if self.total > 0 && self.image.len() == self.total {
                         answer[0] = crate::deploy::deploy_state::VERIFIED;
-                        let held = baked_image_checksum(&self.image).unwrap_or(0);
+                        let held = if self.holds_bundle {
+                            crate::bundle_checksum(&self.image)
+                        } else {
+                            baked_image_checksum(&self.image).unwrap_or(0)
+                        };
                         answer[2..10].copy_from_slice(&held.to_le_bytes());
                     }
                     if let Some(window) = self.window {
@@ -863,16 +1041,21 @@ mod tests {
                     }
                     self.reply(crate::deploy::DEPLOY_STATUS_RESULT, seq, &answer);
                 }
-                crate::deploy::DEPLOY_IMAGE => {
+                crate::deploy::DEPLOY_IMAGE | crate::deploy::DEPLOY_BUNDLE => {
                     let word =
                         |at: usize| u32::from_le_bytes(payload[at..at + 4].try_into().unwrap());
                     if word(0) == 0 {
                         self.image.clear();
                     }
-                    self.image.extend_from_slice(&payload[8..]);
-                    self.total = word(4) as usize;
+                    self.holds_bundle = msg_type == crate::deploy::DEPLOY_BUNDLE;
                     let chunk = self.chunks;
                     self.chunks += 1;
+                    if self.refusing {
+                        self.reply(crate::deploy::XFER_RESULT, seq, &[crate::deploy::xfer::WRITE_FAILED, 0, 0, 0, 0]);
+                        return Ok(());
+                    }
+                    self.image.extend_from_slice(&payload[8..]);
+                    self.total = word(4) as usize;
                     if chunk == self.lost {
                         self.dropped = true;
                     } else {
@@ -932,24 +1115,50 @@ mod tests {
 
     /// The session a host has with [`Storing`]: a baked-image board, over its own USB.
     fn storing_session() -> Negotiated {
+        let cil = lamella_wire::Surface { tier: lamella_wire::msg::tier::CIL, ..lamella_wire::Surface::default() };
         Negotiated {
             version: lamella_wire::PROTOCOL_VERSION,
             caps: Capabilities(Capabilities::BAKED_IMAGE),
             target_caps: Capabilities(Capabilities::BAKED_IMAGE),
-            identity: lamella_wire::TargetIdentity::default(),
-            max_inbound_payload: None,
+            identity: lamella_wire::TargetIdentity::default().with_surface(cil),
+            max_inbound_payload: Some(lamella_wire::MAX_PAYLOAD as u16),
+            image_formats: Some(vec![lamella_cil_runtime::BAKED_IMAGE_FORMAT]),
         }
     }
 
-    /// `len` bytes that a host reads as a baked image whose header records `checksum`: the fixed
-    /// header [`baked_image_checksum`] reads, which is the magic, the version and the checksum
-    /// word.
-    fn headed(checksum: u64, len: usize) -> Vec<u8> {
+    /// `len` bytes that a host reads as a baked image. Where `len` has room for a program (the fewest
+    /// bytes an image takes, [`lamella_cil_runtime::BAKED_IMAGE_MIN_LEN`], one method's record and its
+    /// body), an image that passes the checks a board's boot makes of an image's bytes
+    /// ([`lamella_cil_runtime::baked_image_refusal`]): an entry point naming its one method, whose body is
+    /// one `ret`, the shortest directory the format writes, and an arena of bytes that `seed` and their
+    /// place vary, its checksum the one they hash to. Those checks are not all of a boot: they leave out
+    /// the board's intrinsic registry, and of the entry's body they ask only a length of at least one byte
+    /// inside the arena, not that it runs. Shorter, a header alone whose checksum is `seed`.
+    fn headed(seed: u64, len: usize) -> Vec<u8> {
+        use lamella_cil_runtime::BAKED_IMAGE_MIN_LEN;
         let mut image = vec![0u8; len];
         image[..4].copy_from_slice(b"LML1");
-        image[4..8].copy_from_slice(&1u32.to_le_bytes());
-        image[168..176].copy_from_slice(&checksum.to_le_bytes());
-        assert_eq!(baked_image_checksum(&image), Some(checksum), "the header as a host reads it");
+        image[4..8].copy_from_slice(&u32::from(lamella_cil_runtime::BAKED_IMAGE_FORMAT).to_le_bytes());
+        let word = |image: &mut Vec<u8>, index: usize, value: u64| image[8 + index * 8..16 + index * 8].copy_from_slice(&value.to_le_bytes());
+        let Some(arena) = len.checked_sub(BAKED_IMAGE_MIN_LEN).filter(|&arena| arena >= 25) else {
+            word(&mut image, 18, seed);
+            return image;
+        };
+        word(&mut image, 0, 1);
+        word(&mut image, 1, 1);
+        word(&mut image, 16, (BAKED_IMAGE_MIN_LEN - 160) as u64);
+        word(&mut image, 17, arena as u64);
+        image[BAKED_IMAGE_MIN_LEN + 8..BAKED_IMAGE_MIN_LEN + 16].copy_from_slice(&[24, 0, 0, 0, 1, 0, 0, 0]);
+        image[BAKED_IMAGE_MIN_LEN + 24] = 0x2A;
+        for (at, byte) in image[BAKED_IMAGE_MIN_LEN + 25..].iter_mut().enumerate() {
+            *byte = seed.to_le_bytes()[at % 8].wrapping_add((at % 251) as u8);
+        }
+        if let Some(lamella_cil_runtime::module::BakeError::ChecksumMismatch { computed, .. }) =
+            lamella_cil_runtime::baked_image_refusal(&image)
+        {
+            word(&mut image, 18, computed);
+        }
+        assert!(lamella_cil_runtime::baked_image_holds_a_program(&image), "an image a board's boot takes");
         image
     }
 
@@ -1005,6 +1214,239 @@ mod tests {
         let failed = "deploy to usb failed: the board stopped answering";
         assert!(refused.starts_with(failed), "{refused}");
         assert!(refused.contains("so whether it stores this program is not known"), "{refused}");
+    }
+
+    /// The bundle format these tests' boards load and their bundles carry: a first pre-release one.
+    const TEST_FORMAT: u16 = lamella_wire::image_format::PRE_RELEASE | 1;
+
+    /// The session a host has with a board whose Python runtime loads [`TEST_FORMAT`].
+    fn storing_python_session() -> Negotiated {
+        let python = lamella_wire::Surface { tier: lamella_wire::msg::tier::PYTHON, ..lamella_wire::Surface::default() };
+        Negotiated {
+            identity: lamella_wire::TargetIdentity::default().with_surface(python),
+            max_inbound_payload: Some(lamella_wire::MAX_PAYLOAD as u16),
+            image_formats: Some(vec![TEST_FORMAT]),
+            ..storing_session()
+        }
+    }
+
+    /// **A HOST THAT STORES BUNDLES OFFERS TO**: a capability works only where both ends offered it, so
+    /// a board that stores Python bundles negotiates [`Capabilities::BUNDLE`] only with a host that
+    /// offers it, in both the store's capabilities and the run's.
+    #[test]
+    fn a_host_that_stores_bundles_offers_the_bundle_capability() {
+        assert!(host_caps().has(Capabilities::BUNDLE), "{:#x}", host_caps().0);
+        assert!(run_caps().has(Capabilities::BUNDLE), "{:#x}", run_caps().0);
+    }
+
+    /// **BYTES THAT ARE NOT A BUNDLE ARE REFUSED AS ONE TO REBUILD, BEFORE THE BOARD IS TAKEN BACK**:
+    /// no bundle magic, or the reserved tag 0 where a format belongs, is no format at all, so neither
+    /// side is older and the answer is the file's, not the board's firmware. A bundle of the board's own
+    /// format passes.
+    #[test]
+    fn bytes_that_are_not_a_bundle_are_refused_as_one_to_rebuild() {
+        use lamella_wire::image_format::REBUILD_IMAGE;
+        let session = storing_python_session();
+        let mut not_magic = b"MZ".to_vec();
+        not_magic.extend_from_slice(&[0, 0]);
+        not_magic.extend_from_slice(&TEST_FORMAT.to_le_bytes());
+        let mut tag_zero = b"LPYC".to_vec();
+        tag_zero.extend_from_slice(&[0, 0, 1, 2, 3]);
+        for (name, bytes) in [("no magic", not_magic), ("tag 0", tag_zero), ("empty", Vec::new()), ("magic alone", b"LPYC".to_vec())] {
+            assert_eq!(Artifact::Bundle(&bytes).format_refusal(&session), Some(REBUILD_IMAGE), "{name}");
+        }
+        assert_eq!(Artifact::Bundle(&bundle_of(64)).format_refusal(&session), None, "a bundle of the board's format");
+    }
+
+    /// **A BUNDLE THIS LAMELLA DOES NOT BUILD IS REFUSED AS ONE TO REBUILD**, through the library as
+    /// through the `lamella` command: 0.5.0's bundles carry 0x801F, a count this format has not
+    /// reached, so the board's firmware is not the older side, and the answer is the file's.
+    #[test]
+    fn a_bundle_this_lamella_does_not_build_is_refused_as_one_to_rebuild() {
+        use lamella_wire::image_format::REBUILD_IMAGE;
+        let session = storing_python_session();
+        let mut old = bundle_of(64);
+        old[4..6].copy_from_slice(&0x801F_u16.to_le_bytes());
+        assert_eq!(Artifact::Bundle(&old).format_refusal(&session), Some(REBUILD_IMAGE));
+    }
+
+    /// [`store_bundle`], waiting `wait` for each answer.
+    fn store_bundle_waiting(board: &mut Storing, bundle: &[u8], out: &mut Vec<u8>, wait: Duration) -> Result<Stored, String> {
+        let session = storing_python_session();
+        store_with_clock(board, &session, "usb", Artifact::Bundle(bundle), out, wait, Wording::Full, Instant::now)
+    }
+
+    /// `len` bytes for a bundle: a bundle's magic and [`TEST_FORMAT`], then bytes whose content the
+    /// board checks.
+    fn bundle_of(len: usize) -> Vec<u8> {
+        let mut bundle: Vec<u8> = (0..len).map(|at| (at % 253) as u8).collect();
+        bundle[..4].copy_from_slice(b"LPYC");
+        bundle[4..6].copy_from_slice(&TEST_FORMAT.to_le_bytes());
+        bundle
+    }
+
+    /// **A BUNDLE OF ANOTHER FORMAT IS REFUSED BEFORE THE BOARD IS TAKEN BACK**, in the words every
+    /// host gives, by which side is older; a board that states no format is told to update.
+    #[test]
+    fn a_bundle_whose_format_the_board_does_not_load_is_refused_before_anything_is_sent() {
+        use lamella_wire::image_format::{UPDATE_FIRMWARE, UPDATE_LAMELLA};
+        let newer = lamella_wire::image_format::PRE_RELEASE | 2;
+        for (board_format, said) in [(Some(newer), UPDATE_LAMELLA), (Some(1), UPDATE_LAMELLA), (None, UPDATE_FIRMWARE)] {
+            let mut session = storing_python_session();
+            session.image_formats = board_format.map(|format| vec![format]);
+            let mut board = Storing::losing(usize::MAX, false);
+            let mut out = Vec::new();
+            let bundle = bundle_of(1_000);
+            let stored = store_with_clock(&mut board, &session, "usb", Artifact::Bundle(&bundle), &mut out,
+                Duration::from_secs(5), Wording::Full, Instant::now);
+            assert_eq!(stored, Err(said.to_owned()), "a board stating {board_format:?}");
+            assert_eq!(board.chunks, 0, "nothing was written");
+            assert!(board.replies.take_sent().is_empty() && out.is_empty(), "and nothing was said or asked");
+        }
+    }
+
+    /// **AN IMAGE THAT HOLDS NO PROGRAM IS REFUSED AS ONE TO REBUILD, BEFORE THE BOARD IS TAKEN BACK**: a
+    /// file shorter than the directory and arena its header records, its magic and format alone among
+    /// them; a header alone, recording an empty directory; an image whose header records no entry
+    /// point; one whose directory is shorter than any this format writes; and one whose content does
+    /// not hash to the checksum its header records: none holds a program the board's boot takes, and
+    /// sending it would erase the program the board holds.
+    #[test]
+    fn an_image_that_holds_no_program_is_refused_before_the_board_is_taken_back() {
+        use lamella_wire::image_format::REBUILD_IMAGE;
+        let session = storing_session();
+        let whole = headed(0x1122_3344_5566_7788, 10_000);
+        let word = |index: usize| 8 + index * 8..8 + (index + 1) * 8;
+        let mut recorded_past_its_end = whole.clone();
+        recorded_past_its_end[word(17)].copy_from_slice(&100_000u64.to_le_bytes());
+        let mut header_alone = whole[..8 + 19 * 8].to_vec();
+        header_alone[word(16)].fill(0);
+        header_alone[word(17)].fill(0);
+        let mut no_entry = whole.clone();
+        no_entry[word(0)].fill(0);
+        let mut short_directory = whole.clone();
+        short_directory[word(16)].copy_from_slice(&8u64.to_le_bytes());
+        let mut corrupt = whole.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        for (name, bytes) in [
+            ("magic and format", whole[..8].to_vec()),
+            ("part of a header", whole[..100].to_vec()),
+            ("an arena past the file's end", recorded_past_its_end),
+            ("a header alone", header_alone),
+            ("no entry point", no_entry),
+            ("a directory shorter than any this format writes", short_directory),
+            ("content that does not hash to its header's checksum", corrupt),
+        ] {
+            let mut board = Storing::losing(usize::MAX, false);
+            let mut out = Vec::new();
+            let stored = store_with_clock(&mut board, &session, "usb", Artifact::Image(&bytes), &mut out,
+                Duration::from_secs(5), Wording::Full, Instant::now);
+            assert_eq!(stored, Err(REBUILD_IMAGE.to_owned()), "{name}");
+            assert_eq!(board.chunks, 0, "{name}: nothing was written");
+            assert!(board.replies.take_sent().is_empty() && out.is_empty(), "{name}: nothing was said or asked");
+        }
+    }
+
+    /// **AN IMAGE THIS LAMELLA DOES NOT WRITE IS REFUSED AS ONE TO REBUILD, BEFORE THE BOARD IS TAKEN
+    /// BACK**: an image file of another format, 0.5.0's format 1 among them, and bytes without an
+    /// image's magic are no image this host writes, so the answer is the file's, whatever the board
+    /// loads. An image of the format the board loads passes.
+    #[test]
+    fn an_image_this_lamella_does_not_write_is_refused_as_one_to_rebuild() {
+        use lamella_wire::image_format::REBUILD_IMAGE;
+        let session = storing_session();
+        let mut format_one = headed(0x1122_3344_5566_7788, 1_000);
+        format_one[4..8].copy_from_slice(&1u32.to_le_bytes());
+        for (name, bytes) in
+            [("format 1", format_one), ("no magic", vec![0x5A; 1_000]), ("empty", Vec::new()), ("magic alone", b"LML1".to_vec())]
+        {
+            assert_eq!(Artifact::Image(&bytes).format_refusal(&session), Some(REBUILD_IMAGE), "{name}");
+        }
+        assert_eq!(Artifact::Image(&headed(1, 10_000)).format_refusal(&session), None, "an image of the board's format");
+    }
+
+    /// **AN IMAGE OF A FORMAT THE BOARD's RUNTIME DOES NOT LOAD IS REFUSED BEFORE THE BOARD IS TAKEN
+    /// BACK**, in the words every host gives, by which side is older; a board that states no format,
+    /// or that its runtime loads none, is told to update its firmware.
+    #[test]
+    fn an_image_whose_format_the_board_does_not_load_is_refused_before_anything_is_sent() {
+        use lamella_wire::image_format::{LOADS_NONE, PRE_RELEASE, UPDATE_FIRMWARE, UPDATE_LAMELLA};
+        for (board_format, said) in [
+            (Some(PRE_RELEASE | 2), UPDATE_LAMELLA),
+            (Some(1), UPDATE_LAMELLA),
+            (Some(LOADS_NONE), UPDATE_FIRMWARE),
+            (None, UPDATE_FIRMWARE),
+        ] {
+            let mut session = storing_session();
+            session.image_formats = board_format.map(|format| vec![format]);
+            let mut board = Storing::losing(usize::MAX, false);
+            let mut out = Vec::new();
+            let image = headed(0x1122_3344_5566_7788, 10_000);
+            let stored = store_with_clock(&mut board, &session, "usb", Artifact::Image(&image), &mut out,
+                Duration::from_secs(5), Wording::Full, Instant::now);
+            assert_eq!(stored, Err(said.to_owned()), "a board stating {board_format:?}");
+            assert_eq!(board.chunks, 0, "nothing was written");
+            assert!(board.replies.take_sent().is_empty() && out.is_empty(), "and nothing was said or asked");
+        }
+    }
+
+    /// **A BUNDLE IS STORED AS AN IMAGE IS, BY ITS OWN MESSAGE**: in 8 KB chunks over USB, said in the
+    /// same lines, and the board holds the bundle's bytes.
+    #[test]
+    fn a_bundle_is_stored_by_deploy_bundle_in_the_lines_an_image_is() {
+        let bundle = bundle_of(20_000);
+        let mut board = Storing::losing(usize::MAX, false);
+        let mut out = Vec::new();
+        let stored = store_bundle_waiting(&mut board, &bundle, &mut out, Duration::from_secs(5));
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(stored, Ok(Stored::Written), "{out}");
+        assert!(board.holds_bundle, "every chunk went by DEPLOY_BUNDLE");
+        assert_eq!(board.chunks, 3, "20,000 bytes is three chunks of 8 KB or fewer");
+        assert_eq!(board.image, bundle, "the board holds the bundle");
+        assert!(out.contains("Deploying 20000 B to usb, 8192 B per chunk"), "{out}");
+        assert!(out.contains("   25%  8192 B") && out.contains("   75%  16384 B"), "{out}");
+        assert!(out.contains("Deployed 20000 B to usb in "), "{out}");
+    }
+
+    /// **A BOARD THAT HOLDS THIS BUNDLE IS SENT NOTHING**: it reports the CRC-32 of the bundle it
+    /// stores, verified, which is the checksum of the one the host would send.
+    #[test]
+    fn a_board_that_already_holds_this_bundle_is_sent_nothing() {
+        let bundle = bundle_of(5_000);
+        let mut board = Storing::holding_bundle(&bundle);
+        let mut out = Vec::new();
+        let stored = store_bundle_waiting(&mut board, &bundle, &mut out, Duration::from_secs(5));
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(stored, Ok(Stored::AlreadyThere), "{out}");
+        assert_eq!(board.chunks, 0, "nothing was sent");
+        assert!(out.contains("The board already stores this program, so nothing was sent."), "{out}");
+        let mut other = bundle.clone();
+        other[100] ^= 1;
+        let mut out = Vec::new();
+        let stored = store_bundle_waiting(&mut board, &other, &mut out, Duration::from_secs(5));
+        assert_eq!(stored, Ok(Stored::Written), "a bundle that differs in one byte is sent");
+    }
+
+    /// A bundle store whose last acknowledgement is lost asks again, as an image store does, and the
+    /// board's answer is compared with the bundle's checksum.
+    #[test]
+    fn a_bundle_store_whose_last_acknowledgement_is_lost_asks_again_and_keeps_the_stored_program() {
+        let bundle = bundle_of(10_000);
+        let mut board = Storing::losing(1, false);
+        let mut out = Vec::new();
+        let stored = store_bundle_waiting(&mut board, &bundle, &mut out, Duration::from_millis(300));
+        let out = String::from_utf8(out).unwrap();
+        assert_eq!(stored, Ok(Stored::Written), "{out}");
+        assert!(out.contains("asked again, it stores this program, verified"), "{out}");
+    }
+
+    /// A chunk the board could not write is said of the program, not of an image.
+    #[test]
+    fn a_bundle_the_board_could_not_store_is_said_of_the_program() {
+        let mut board = Storing { refusing: true, ..Storing::losing(usize::MAX, false) };
+        let mut out = Vec::new();
+        let stored = store_bundle_waiting(&mut board, &bundle_of(1_000), &mut out, Duration::from_secs(5));
+        assert_eq!(stored, Err("this board could not store the program.".to_owned()));
     }
 
     /// The deploy [`store_image`] makes, of `image` to `board` in 8 KiB chunks, each chunk given
@@ -1241,11 +1683,11 @@ mod tests {
         Watch { quiet, limit: None, stop: None }
     }
 
-    fn fast_store_chunk_lines(target: &str, chunks: usize) {
+    fn fast_store_chunk_lines(target: &str, session: &Negotiated, chunks: usize) {
         let image = headed(42, 10_000);
         let mut board = Storing::reporting_no_window();
         let mut out = Vec::new();
-        assert_eq!(store_image_worded(&mut board, &storing_session(), target, &image,
+        assert_eq!(store_image_worded(&mut board, session, target, &image,
             &mut out, Wording::Brief), Ok(Stored::Written));
         assert_eq!(board.chunks, chunks, "the carrier's actual chunk size");
         assert_eq!(board.image, image, "every chunk was still sent");
@@ -1255,17 +1697,19 @@ mod tests {
 
     #[test]
     fn fast_usb_store_chunk_lines_only_report_the_final_chunk() {
-        fast_store_chunk_lines("usb", 2);
+        fast_store_chunk_lines("usb", &storing_session(), 2);
     }
 
     #[test]
     fn fast_serial_store_chunk_lines_only_report_the_final_chunk() {
-        fast_store_chunk_lines("usb-serial:stub", 40);
+        let ring = u16::try_from(lamella_wire::max_payload_for_ring(512)).expect("a ring's limit fits the field");
+        let session = Negotiated { max_inbound_payload: Some(ring), ..storing_session() };
+        fast_store_chunk_lines("usb-serial:stub", &session, 40);
     }
 
     #[test]
     fn fast_tcp_store_chunk_lines_only_report_the_final_chunk() {
-        fast_store_chunk_lines("tcp:127.0.0.1:1234", 2);
+        fast_store_chunk_lines("tcp:127.0.0.1:1234", &storing_session(), 2);
     }
 
     struct TimedStore {
@@ -1409,9 +1853,9 @@ mod tests {
     fn a_brief_store_does_not_claim_an_erase_from_an_unknown_flash_state() {
         let mut board = Storing::reporting_no_window();
         let mut out = Vec::new();
-        let result = store_image_worded(&mut board, &storing_session(), "usb", &headed(42, 256), &mut out, Wording::Brief);
+        let result = store_image_worded(&mut board, &storing_session(), "usb", &headed(42, 2_000), &mut out, Wording::Brief);
         assert_eq!(result, Ok(Stored::Written));
-        assert_eq!(out, b"Writing flash: 256 of 256 bytes.\nFlash complete\n");
+        assert_eq!(out, b"Writing flash: 2000 of 2000 bytes.\nFlash complete\n");
     }
 
     /// A project-run failure names the missing program without a protocol timeout.
@@ -1726,7 +2170,7 @@ mod tests {
         /// carrier, every chunk's CRC compared, with a line each quarter of the way.
         #[test]
         fn a_store_writes_in_chunks_for_its_carrier_and_says_each_quarter() {
-            let image: Vec<u8> = (0..40_000u32).map(|at| (at % 251) as u8).collect();
+            let image = super::headed(0x1122_3344_5566_7788, 40_000);
             let mut board = LoopbackBoard::on(RamFlash::holding(&[]));
             let session = hello(&mut board, host_caps());
             assert!(
@@ -1746,18 +2190,70 @@ mod tests {
             assert_eq!(&board.flash.region[..image.len()], &image[..], "the board's flash holds the image");
         }
 
-        /// **A SERIAL LINE GETS THE SMALL CHUNKS**, which the smallest receive rings in this tree hold.
+        /// **A BUNDLE AGAINST A FIRMWARE's OWN DEPLOY SERVE**: its chunks go by `DEPLOY_BUNDLE`, and
+        /// every acknowledgement's CRC over the prefix the board read back matches the bundle's.
+        #[test]
+        fn a_bundle_store_is_taken_by_a_firmware_deploy_serve_chunk_by_chunk() {
+            let mut bundle: Vec<u8> = (0..20_000u32).map(|at| (at % 241) as u8).collect();
+            let format = lamella_wire::image_format::PRE_RELEASE | 1;
+            bundle[..4].copy_from_slice(b"LPYC");
+            bundle[4..6].copy_from_slice(&format.to_le_bytes());
+            let mut board = LoopbackBoard::on(RamFlash::holding(&[]));
+            let mut session = hello(&mut board, host_caps());
+            assert!(session.caps.has(Capabilities::DEPLOY_PREFIX_CRC), "every acknowledgement is compared");
+            let python = lamella_wire::Surface { tier: lamella_wire::msg::tier::PYTHON, ..lamella_wire::Surface::default() };
+            session.identity = session.identity.with_surface(python);
+            session.image_formats = Some(vec![lamella_wire::image_format::LOADS_NONE, format]);
+            let mut out = Vec::new();
+            let stored = store_bundle(&mut board, &session, "usb", &bundle, &mut out);
+            let out = String::from_utf8(out).unwrap();
+            assert_eq!(stored, Ok(Stored::Written), "{out}");
+            assert_eq!(board.chunks, 3, "20,000 bytes is three chunks of 8 KB or fewer");
+            assert_eq!(&board.flash.region[..bundle.len()], &bundle[..], "the board's flash holds the bundle");
+        }
+
+        /// **A SERIAL LINE GETS THE SMALL CHUNKS**: a board draining its line into a 512-byte receive
+        /// ring declares what the ring holds, and is sent chunks that fit it.
         #[test]
         fn a_store_over_a_serial_line_sends_256_byte_chunks() {
-            let image = vec![0x5Au8; 1000];
-            let mut board = LoopbackBoard::on(RamFlash::holding(&[]));
+            let image = super::headed(0x1122_3344_5566_7788, 2_000);
+            let mut board =
+                LoopbackBoard::on(RamFlash::holding(&[])).declaring(Some(lamella_wire::max_payload_for_ring(512)));
             let session = hello(&mut board, host_caps());
             let mut out = Vec::new();
             let stored = store_image(&mut board, &session, "COM8", &image, &mut out);
             let out = String::from_utf8(out).unwrap();
             assert_eq!(stored, Ok(Stored::Written), "{out}");
-            assert!(out.contains("Deploying 1000 B to COM8, 256 B per chunk"), "{out}");
-            assert_eq!(board.chunks, 4, "1000 bytes is four chunks of 256 bytes or fewer");
+            assert!(out.contains("Deploying 2000 B to COM8, 256 B per chunk"), "{out}");
+            assert_eq!(board.chunks, 8, "2000 bytes is eight chunks of 256 bytes or fewer");
+        }
+
+        /// The firmware's own serve, on a carrier that declares its limit, states the format of the
+        /// image its C# runtime loads, which is the format this host writes.
+        #[test]
+        fn the_firmware_serve_states_the_format_this_host_writes() {
+            let mut board = LoopbackBoard::on(RamFlash::holding(&[]));
+            let session = hello(&mut board, host_caps());
+            assert_eq!(
+                session.image_format(lamella_wire::msg::tier::CIL),
+                Some(lamella_cil_runtime::BAKED_IMAGE_FORMAT)
+            );
+        }
+
+        /// **A BOARD WHOSE FIRMWARE STATES NO FORMAT IS TOLD TO UPDATE IT, BEFORE ANYTHING IS SENT**:
+        /// firmware on a carrier that declares no limit states no image format, as firmware built
+        /// before boards stated their formats does, so the host cannot know the board loads the image.
+        #[test]
+        fn a_board_whose_firmware_states_no_format_is_told_to_update_it() {
+            let mut board = LoopbackBoard::on(RamFlash::holding(&[])).declaring(None);
+            let session = hello(&mut board, host_caps());
+            assert_eq!(session.image_formats, None, "the board stated no format");
+            let image = super::headed(0x1122_3344_5566_7788, 10_000);
+            let mut out = Vec::new();
+            let stored = store_image(&mut board, &session, "usb", &image, &mut out);
+            assert_eq!(stored, Err(lamella_wire::image_format::UPDATE_FIRMWARE.to_owned()));
+            assert_eq!(board.chunks, 0, "nothing was written");
+            assert!(out.is_empty(), "and nothing was said: {}", String::from_utf8_lossy(&out));
         }
     }
 }

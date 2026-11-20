@@ -841,18 +841,38 @@ pub trait CallResolver {
 
     /// Where a `constrained. T` prefix names a value type that ITSELF provides the method the
     /// following `callvirt` names, the implementation to call -- directly, on the byref receiver,
-    /// with no box (ECMA-335 III.2.1's first case).
+    /// with no box (ECMA-335 4th ed, III.2.1's first case).
     ///
     /// `constrained` is the prefix's type token and `method` the `callvirt`'s method token, which
     /// names the BASE declaration (`object::ToString()`); the answer is T's override of it, so the
     /// returned target differs from what [`resolve`](Self::resolve) gives for the same operand.
     ///
-    /// `None` means T inherits the method, and the lowering then takes III.2.1's second case:
-    /// dereference the byref, BOX the value, and dispatch on the boxed object. That is also the
-    /// default, so a resolver that does not answer this is never wrong -- only unoptimized, since
-    /// boxing reaches the same implementation through the object's TypeDesc.
+    /// `None` means T inherits the method, and the lowering then takes ECMA-335 4th ed III.2.1's
+    /// second case: dereference the byref, BOX the value, and dispatch on the boxed object. That is
+    /// also the default. Boxing reaches the same implementation through the object's TypeDesc, but on
+    /// a COPY: where T implements the method itself and the implementation changes its own receiver,
+    /// the change lands in the box rather than in the caller's value.
+    /// [`constrained_implementation_unbound`](Self::constrained_implementation_unbound) is how a
+    /// resolver says that a box would be such a copy, and the lowering then refuses the call.
     fn constrained_call(&self, _constrained: &Operand, _method: &Operand) -> Option<CallInfo> {
         None
+    }
+
+    /// Whether `constrained`'s type implements `method` itself while
+    /// [`constrained_call`](Self::constrained_call) bound no direct call to that implementation, so
+    /// that boxing would run it on a copy where ECMA-335 4th ed, III.2.1 runs it on the original
+    /// value. The lowering refuses such a call rather than box it. Defaults to `false`.
+    fn constrained_implementation_unbound(&self, _constrained: &Operand, _method: &Operand) -> bool {
+        false
+    }
+
+    /// Whether a `constrained.` call selects the value type's own class-virtual override or
+    /// interface implementation, rather than an inherited `System.Object`, `System.ValueType`
+    /// or `System.Enum` method (ECMA-335 4th ed III.2.1). Enums declare no methods of their own
+    /// (II.14.3). This classification is independent of direct binding and controls the receiver's
+    /// initialization check. Defaults to `false`, where only a direct binding counts.
+    fn constrained_runs_own_method(&self, _constrained: &Operand, _method: &Operand) -> bool {
+        false
     }
 }
 
@@ -2659,6 +2679,85 @@ fn new_value(value_types: &mut Vec<MirType>, ty: MirType) -> ValueId {
     id
 }
 
+/// Negates the float `x` (`ty` is `F32` or `F64`) by reversing its sign bit, and returns the result.
+///
+/// ECMA-335 4th ed I.12.1.3 says floating-point calculations follow IEC 60559:1989, whose negation
+/// reverses the sign; `0 - x` does not, because `0.0 - 0.0` is +0.0 where `-x` of +0.0 is -0.0. .NET
+/// reverses a NaN's sign too. MIR has no bitcast, so the bit goes through memory, as
+/// `System.BitConverter`'s synthesized bodies reinterpret: `x` is written into a one-cell value type,
+/// the 32-bit word holding the sign is read, its top bit flipped and written back, and the cell is read
+/// as the float. Every target is little-endian, so that word is the cell's first (`F32`) or second
+/// (`F64`), and no step rounds, so every bit but the sign is `x`'s own.
+fn negate_float(
+    value_types: &mut Vec<MirType>,
+    insts: &mut Vec<(ValueId, Inst)>,
+    x: ValueId,
+    ty: MirType,
+) -> ValueId {
+    let cell = new_value(
+        value_types,
+        MirType::ValueType {
+            handle: TypeHandle(0),
+            refs: lamella_ir::RefWords::NONE,
+            size: ty.stack_slot_bytes(),
+        },
+    );
+    insts.push((cell, Inst::InitStruct));
+    let stored = new_value(value_types, MirType::I32);
+    insts.push((
+        stored,
+        Inst::FieldStore {
+            base: cell,
+            offset: 0,
+            value: x,
+        },
+    ));
+    let sign_word = if matches!(ty, MirType::F64) { 4 } else { 0 };
+    let word = new_value(value_types, MirType::I32);
+    insts.push((
+        word,
+        Inst::FieldLoad {
+            base: cell,
+            offset: sign_word,
+        },
+    ));
+    let sign = new_value(value_types, MirType::I32);
+    insts.push((
+        sign,
+        Inst::ConstInt {
+            ty: MirType::I32,
+            value: i64::from(i32::MIN),
+        },
+    ));
+    let flipped = new_value(value_types, MirType::I32);
+    insts.push((
+        flipped,
+        Inst::Binary {
+            op: BinOp::Xor,
+            lhs: word,
+            rhs: sign,
+        },
+    ));
+    let restored = new_value(value_types, MirType::I32);
+    insts.push((
+        restored,
+        Inst::FieldStore {
+            base: cell,
+            offset: sign_word,
+            value: flipped,
+        },
+    ));
+    let result = new_value(value_types, ty);
+    insts.push((
+        result,
+        Inst::FieldLoad {
+            base: cell,
+            offset: 0,
+        },
+    ));
+    result
+}
+
 /// Emits the type-initializer check a trigger site requires, immediately before the operation itself.
 /// A no-op unless [`CallResolver::type_init_thunk`] names one, which it does only for a type that
 /// demands precise timing -- so an assembly with no such type lowers byte-identically.
@@ -3842,17 +3941,22 @@ fn apply_value_op(
         Opcode::Neg => {
             let x = stack.pop().ok_or(CilError::StackUnderflow)?;
             let ty = value_types.get(x.index()).copied().unwrap_or(MirType::I32);
-            let zero = new_value(value_types, ty);
-            insts.push((zero, Inst::ConstInt { ty, value: 0 }));
-            let result = new_value(value_types, ty);
-            insts.push((
-                result,
-                Inst::Binary {
-                    op: BinOp::Sub,
-                    lhs: zero,
-                    rhs: x,
-                },
-            ));
+            let result = if matches!(ty, MirType::F32 | MirType::F64) {
+                negate_float(value_types, insts, x, ty)
+            } else {
+                let zero = new_value(value_types, ty);
+                insts.push((zero, Inst::ConstInt { ty, value: 0 }));
+                let result = new_value(value_types, ty);
+                insts.push((
+                    result,
+                    Inst::Binary {
+                        op: BinOp::Sub,
+                        lhs: zero,
+                        rhs: x,
+                    },
+                ));
+                result
+            };
             stack.push(result);
         }
         Opcode::Not => {
@@ -4043,15 +4147,6 @@ fn apply_value_op(
         }
         Opcode::Call | Opcode::Callvirt => {
             let constrained = pending_constrained.take();
-            if let Some(operand) = &constrained {
-                emit_type_init_check(
-                    resolver,
-                    operand,
-                    InitTrigger::ValueTypeCall,
-                    value_types,
-                    insts,
-                );
-            }
             emit_type_init_check(
                 resolver,
                 &inst.operand,
@@ -4382,6 +4477,22 @@ fn apply_value_op(
                 .as_ref()
                 .and_then(|token| resolver.constrained_call(token, &inst.operand));
             let direct = constrained_direct.is_some();
+            // Classify the selected implementation independently of direct binding. An inherited
+            // Object, ValueType or Enum method is not the receiver's own implementation
+            // (ECMA-335 4th ed III.2.1).
+            let runs_own = direct
+                || constrained
+                    .as_ref()
+                    .is_some_and(|operand| resolver.constrained_runs_own_method(operand, &inst.operand));
+            if let (Some(operand), true) = (&constrained, runs_own) {
+                emit_type_init_check(
+                    resolver,
+                    operand,
+                    InitTrigger::ValueTypeCall,
+                    value_types,
+                    insts,
+                );
+            }
             let info = match constrained_direct {
                 Some(info) => info,
                 None => resolver
@@ -4461,6 +4572,11 @@ fn apply_value_op(
                     )?),
                     _ => stack.pop(),
                 },
+                (Some(token), false)
+                    if resolver.constrained_implementation_unbound(token, &inst.operand) =>
+                {
+                    return Err(CilError::UnresolvedCall);
+                }
                 (Some(token), false) => Some(box_constrained_receiver(
                     token,
                     resolver,
@@ -14684,14 +14800,106 @@ mod tests {
         let func = lower_method(&body).unwrap();
         assert!(lamella_ir::verify(&func).is_ok());
         assert_eq!(func.ret, Some(MirType::F64));
-        let insts: Vec<_> = func.blocks.iter().flat_map(|b| &b.insts).collect();
-        assert!(insts.iter().any(|(_, i)| matches!(
-            i,
-            Inst::ConstInt {
-                ty: MirType::F64,
-                value: 0
-            }
-        )));
+    }
+
+    /// Runs a one-block body made of the instructions a float negation lowers to, over each value's
+    /// bits (an `F64` or `I64` value is 64 bits, any other 32), and answers the returned value's
+    /// bits. A float `Sub` computes in Rust's `f32`/`f64`, which round as IEC 60559 does. Any other
+    /// instruction panics, so a lowering that grows a step cannot be judged by a model that skips it.
+    fn run_straight_line(func: &Function) -> u64 {
+        let mut values: alloc::collections::BTreeMap<u32, u64> = alloc::collections::BTreeMap::new();
+        let mut cells: alloc::collections::BTreeMap<u32, [u8; 8]> = alloc::collections::BTreeMap::new();
+        let width = |t: MirType| if matches!(t, MirType::F64 | MirType::I64) { 8 } else { 4 };
+        let block = &func.blocks[func.entry.0 as usize];
+        for (value, inst) in &block.insts {
+            let bits = match inst {
+                Inst::ConstInt { ty, value } if width(*ty) == 8 => *value as u64,
+                Inst::ConstInt { value, .. } => u64::from(*value as u32),
+                Inst::Binary { op: BinOp::Sub, lhs, rhs } => match func.value_types[lhs.index()] {
+                    MirType::F64 => {
+                        (f64::from_bits(values[&lhs.0]) - f64::from_bits(values[&rhs.0])).to_bits()
+                    }
+                    MirType::F32 => u64::from(
+                        (f32::from_bits(values[&lhs.0] as u32) - f32::from_bits(values[&rhs.0] as u32))
+                            .to_bits(),
+                    ),
+                    other => panic!("the model subtracts floats only, not {other:?}"),
+                },
+                Inst::Binary { op: BinOp::Xor, lhs, rhs } => values[&lhs.0] ^ values[&rhs.0],
+                Inst::InitStruct => {
+                    cells.insert(value.0, [0; 8]);
+                    0
+                }
+                Inst::FieldStore { base, offset, value: stored } => {
+                    let w = width(func.value_types[stored.index()]);
+                    let at = *offset as usize;
+                    let cell = cells.get_mut(&base.0).expect("a store into a cell");
+                    cell[at..at + w].copy_from_slice(&values[&stored.0].to_le_bytes()[..w]);
+                    0
+                }
+                Inst::FieldLoad { base, offset } => {
+                    let w = width(func.value_types[value.index()]);
+                    let at = *offset as usize;
+                    let mut word = [0u8; 8];
+                    word[..w].copy_from_slice(&cells[&base.0][at..at + w]);
+                    u64::from_le_bytes(word)
+                }
+                other => panic!("the model does not interpret {other:?}"),
+            };
+            values.insert(value.0, bits);
+        }
+        match &block.terminator {
+            Some(Terminator::Return(Some(returned))) => values[&returned.0],
+            other => panic!("a one-block body returns one value, not {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lowers_a_float_neg_as_a_sign_flip() {
+        let negation = |load: Instruction| MethodBodyImage {
+            max_stack: 1,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![load, Instruction::simple(Opcode::Neg), Instruction::simple(Opcode::Ret)]
+                .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        for bits in [
+            0u64,
+            1 << 63,
+            1.5f64.to_bits(),
+            f64::INFINITY.to_bits(),
+            f64::NEG_INFINITY.to_bits(),
+            0x7FF8_0000_0000_0000,
+            0xFFF8_0000_0000_0000,
+            1,
+        ] {
+            let load = Instruction::new(Opcode::LdcR8, Operand::Float64(f64::from_bits(bits)));
+            let func = lower_method(&negation(load)).unwrap();
+            assert!(lamella_ir::verify(&func).is_ok());
+            assert_eq!(func.ret, Some(MirType::F64));
+            assert_eq!(run_straight_line(&func), bits ^ (1 << 63), "-({bits:#018x}) as a double");
+        }
+        for bits in [
+            0u32,
+            1 << 31,
+            1.5f32.to_bits(),
+            f32::INFINITY.to_bits(),
+            f32::NEG_INFINITY.to_bits(),
+            0x7FC0_0000,
+            0xFFC0_0000,
+            1,
+        ] {
+            let load = Instruction::new(Opcode::LdcR4, Operand::Float32(f32::from_bits(bits)));
+            let func = lower_method(&negation(load)).unwrap();
+            assert!(lamella_ir::verify(&func).is_ok());
+            assert_eq!(func.ret, Some(MirType::F32));
+            assert_eq!(
+                run_straight_line(&func),
+                u64::from(bits ^ (1 << 31)),
+                "-({bits:#010x}) as a float"
+            );
+        }
     }
 
     #[test]
@@ -16273,6 +16481,89 @@ mod tests {
                 .any(|(_, i)| matches!(i, Inst::CallVirtual { .. })),
             "a devirtualized constrained call must not also dispatch virtually"
         );
+    }
+
+    /// The initializer precedes a constrained call when this mock selects the value type's own
+    /// method. Its other case selects an inherited method, which uses the boxing path described
+    /// by ECMA-335 4th ed III.2.1. The mock does not model boxed dispatch to an own implementation.
+    #[cfg(any(feature = "arm32", feature = "riscv32"))]
+    #[test]
+    fn a_constrained_call_runs_the_value_types_initializer_only_where_it_calls_the_types_own_method() {
+        use lamella_token::Token;
+        struct Precise {
+            direct: bool,
+        }
+        impl CallResolver for Precise {
+            fn resolve(&self, _: &Operand) -> Option<CallInfo> {
+                Some(CallInfo {
+                    args: 1,
+                    has_result: true,
+                    result_type: Some(MirType::I32),
+                    has_this: true,
+                    target: CallTarget::Internal(3),
+                })
+            }
+            fn constrained_call(&self, _: &Operand, _: &Operand) -> Option<CallInfo> {
+                self.direct.then_some(CallInfo {
+                    args: 1,
+                    has_result: true,
+                    result_type: Some(MirType::I32),
+                    has_this: true,
+                    target: CallTarget::Internal(11),
+                })
+            }
+            fn boxed_layout(&self, _: &Operand) -> Option<ReferenceLayout> {
+                Some(ReferenceLayout {
+                    handle: lamella_ir::TypeHandle(9),
+                    size: 4,
+                    reference_offsets: Vec::new(),
+                })
+            }
+            fn virtual_slot(&self, _: &Operand) -> Option<usize> {
+                Some(1)
+            }
+            fn type_init_thunk(&self, _: &Operand, trigger: InitTrigger) -> Option<TypeInitThunk> {
+                (trigger == InitTrigger::ValueTypeCall).then_some(TypeInitThunk::Local(77))
+            }
+        }
+        let body = MethodBodyImage {
+            max_stack: 2,
+            init_locals: false,
+            local_var_sig: None,
+            code: vec![
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                Instruction::new(Opcode::Constrained, Operand::Token(Token::new(0x02, 4))),
+                Instruction::new(Opcode::Callvirt, Operand::Token(Token::new(0x0A, 2))),
+                Instruction::simple(Opcode::Ret),
+            ]
+            .into_boxed_slice(),
+            handlers: Vec::new().into_boxed_slice(),
+        };
+        for direct in [false, true] {
+            let (func, _) = lower_method_typed(
+                &body,
+                &Precise { direct },
+                &[],
+                &[MirType::I32],
+                Returns::FromBody,
+                Narrowing::default(),
+            )
+            .unwrap();
+            let callees: Vec<u32> = func
+                .blocks
+                .iter()
+                .flat_map(|b| &b.insts)
+                .filter_map(|(_, inst)| match inst {
+                    Inst::Call { callee, .. } => Some(*callee),
+                    _ => None,
+                })
+                .collect();
+            if direct {
+                assert_eq!(callees, [77, 11], "the type's own method: its initializer, then the call");
+            } else {
+                assert!(!callees.contains(&77), "a boxed call runs no initializer: {callees:?}");
+            }
+        }
     }
 
     /// A catch handler whose body is `stloc.0` then the given instruction stream, wrapped in a try

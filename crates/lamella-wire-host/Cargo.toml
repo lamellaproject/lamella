@@ -14,6 +14,9 @@ lamella-clock-host = { path = "../lamella-clock-host" }
 # it pulls in the interpreter stack (lamella-load / -cil-runtime / -metadata) transitively.
 lamella-runner = { path = "../lamella-runner" }
 lamella-wire = { path = "../lamella-wire" }
+# The format number of the Python bundles this Lamella builds, so a bundle stored through this library
+# is refused as one to rebuild when another Lamella built it, as the `lamella` command refuses it.
+lamella-py-bytecode = { path = "../lamella-py-bytecode" }
 # Host-only: the operating system's serial port, the carrier for the USB-CDC / UART transport.
 # OPTIONAL + behind the `serial` feature, so a WASM build (Lamella Code's REPL worker) compiles the
 # carrier-neutral REPL core -- run_program + the driver + the protocol -- without it.
@@ -104,6 +107,31 @@ debug-backend = ["serial", "dep:lamella-debug-backend", "dep:lamella-metadata", 
 
 # (The interactive REPL CLI lives in the dedicated `lamella-repl` crate; lamella-wire-host is
 # the host library that CLI builds on.)
+
+[[package.metadata.lamella.test-configuration]]
+name = "default"
+args = []
+why = "the crate as a consumer that takes its default features builds it, with no carrier but serial"
+
+[[package.metadata.lamella.test-configuration]]
+name = "every-carrier"
+args = ["--features", "usb,tcp,baked,debug-backend,loopback-board"]
+why = "every carrier, the baked-image link, the debug backend and the in-process board, which reach the tests the default build leaves out"
+
+[[package.metadata.lamella.test-configuration]]
+name = "no-default-features"
+args = ["--no-default-features"]
+why = "the carrier-neutral core with no host compiler, as the browser's REPL builds it"
+
+[[package.metadata.lamella.test-configuration]]
+name = "host-compiler-alone"
+args = ["--no-default-features", "--features", "repl-host"]
+why = "the host compiler with no carrier, as lamella-dap builds it"
+
+[[package.metadata.lamella.test-configuration]]
+name = "tcp-alone"
+args = ["--no-default-features", "--features", "tcp"]
+why = "one carrier with no host compiler"
 
 [lints]
 workspace = true

@@ -1,9 +1,22 @@
 //! Reading the part of an SDK-style `.csproj` that a Lamella build needs: which sources compile,
 //! which assemblies they bind against, and what the program is called.
 
+use lamella_syntax::version::{LanguageVersion, LanguageVersionError};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+
+/// The C# version a project's `LangVersion` names, read as the compiler's `/langversion` reads it, or
+/// why it names none the compiler can select, as a phrase that follows the value's name.
+pub fn language_version(value: &str) -> Result<LanguageVersion, String> {
+    LanguageVersion::parse_flag(value).map_err(|error| match error {
+        LanguageVersionError::Unsupported => format!(
+            "is {value:?}, a C# version this compiler cannot select yet; the newest it can is {}",
+            LanguageVersion::SELECTABLE_MAX.flag_value()
+        ),
+        LanguageVersionError::Invalid => format!("is {value:?}, which names no C# version"),
+    })
+}
 
 /// The framework identifier a Lamella project targets.
 ///
@@ -67,8 +80,9 @@ pub struct Project {
     pub output_type: OutputType,
     /// The assembly's name; the project file's own stem when it says nothing.
     pub assembly_name: String,
-    /// The `LangVersion` the project asks for, where it asks for one.
-    pub lang_version: Option<String>,
+    /// The C# version the project's `LangVersion` selects, where it names one; the compiler's default
+    /// where it does not.
+    pub lang_version: Option<LanguageVersion>,
     /// Whether `AllowUnsafeBlocks` is on.
     pub allow_unsafe: bool,
     /// The assemblies to bind and link against, **in the order the project declared them**.
@@ -443,7 +457,10 @@ impl Project {
         let mut included = Vec::new();
         let mut removed = Vec::new();
 
+        let mut conditioned = Vec::new();
         for group in &document.children {
+            conditioned.extend(Conditioned::of(group));
+            conditioned.extend(group.children.iter().filter_map(Conditioned::of));
             if group.name.eq_ignore_ascii_case("PropertyGroup") {
                 for property in &group.children {
                     let value = property.text.clone();
@@ -453,7 +470,7 @@ impl Project {
                         "targetframework" => moniker = Some((value, property.line)),
                         "outputtype" => output_type = Some((value, property.line)),
                         "assemblyname" => assembly_name = Some(value),
-                        "langversion" => lang_version = Some(value),
+                        "langversion" => lang_version = Some((value, property.line)),
                         "allowunsafeblocks" => allow_unsafe = value.eq_ignore_ascii_case("true"),
                         "lamellatargetboard" => {
                             board = (!value.is_empty())
@@ -508,6 +525,9 @@ impl Project {
             }
         }
 
+        if !conditioned.is_empty() {
+            return Err(conditioned_refusal(verb, path, &conditioned, &unrecognized));
+        }
         if UNRECOGNIZED_IS_FATAL && !unrecognized.is_empty() {
             return Err(unrecognized_refusal(verb, path, &unrecognized));
         }
@@ -525,6 +545,12 @@ impl Project {
                     path.display()
                 ));
             }
+        };
+        let lang_version = match lang_version.as_ref().map(|(value, line)| (value.trim(), *line)) {
+            Some((value, line)) if !value.is_empty() => Some(language_version(value).map_err(|why| {
+                format!("lamella {verb}: {}, line {line}: LangVersion {why}.\n\nNothing was built.", path.display())
+            })?),
+            _ => None,
         };
 
         let directory = project_directory(path);
@@ -558,7 +584,7 @@ impl Project {
         Ok(Self {
             output_type,
             assembly_name,
-            lang_version: lang_version.filter(|value| !value.is_empty()),
+            lang_version,
             allow_unsafe,
             references,
             sources,
@@ -678,6 +704,7 @@ impl BoardCheck {
     ///
     /// # Errors
     /// A project that cannot be read, and one naming a board this build does not know.
+    #[cfg(any(feature = "bake", test))]
     pub fn for_file(verb: &str, path: &Path) -> Result<Option<Self>, String> {
         if !crate::flash::is_project(path) {
             return Ok(None);
@@ -915,6 +942,49 @@ fn check_framework(
     Ok(())
 }
 
+/// A group or an element that carries a `Condition`: this reader evaluates none, so what it sets may or may
+/// not be in effect, and it is refused rather than taken. An empty `Condition` is none, as MSBuild reads it.
+struct Conditioned {
+    /// What it was called.
+    name: String,
+    /// The condition, as written.
+    condition: String,
+    /// The line it opened on.
+    line: u32,
+}
+
+impl Conditioned {
+    /// `element`'s condition, where it has one that is not empty.
+    fn of(element: &Element) -> Option<Self> {
+        let condition = element.attribute("Condition")?.trim();
+        (!condition.is_empty()).then(|| Self { name: element.name.clone(), condition: condition.to_owned(), line: element.line })
+    }
+}
+
+/// The refusal of a project that sets something under a `Condition`, listing every one, and every element
+/// this build does not recognize as well, so nothing waits behind the first.
+fn conditioned_refusal(verb: &str, path: &Path, found: &[Conditioned], unrecognized: &[Unrecognized]) -> String {
+    let mut listed = String::new();
+    for one in found {
+        let _ = write!(listed, "\n    line {}: <{} Condition=\"{}\">", one.line, one.name, one.condition);
+    }
+    let mut also = String::new();
+    if !unrecognized.is_empty() {
+        let _ = write!(also, "\n\nIt also uses elements this build does not recognize:\n");
+        for one in unrecognized {
+            let _ = write!(also, "\n    line {}: <{}>, inside <{}>", one.line, one.name, one.within);
+        }
+    }
+    format!(
+        "lamella {verb}: {} sets {} under a Condition, which this build does not evaluate:\n{listed}\n\n\
+         What a condition decides may or may not be in effect, and this build cannot tell which, so it is \
+         refused rather\nthan taken. `dotnet build` evaluates conditions: build the project with it, or set the value \
+         without one.{also}\n\nNothing was built.",
+        path.display(),
+        if found.len() == 1 { "something" } else { "things" }
+    )
+}
+
 /// Everything the reader did not recognize, named in one pass.
 ///
 /// **EVERY ONE OF THEM, NOT THE FIRST.** A refusal that surfaces one element per run turns adapting
@@ -985,6 +1055,49 @@ mod tests {
         let text = format!("{HEAD}  </PropertyGroup>\n{SOURCES}{body}</Project>\n");
         let document = read(&text).map_err(|error| format!("scan: {error}"))?;
         Project::from_document(&document, Path::new("Fixture.csproj"), "build")
+    }
+
+    /// A value set under a `Condition` is never taken. This reader evaluates no condition, so a group or an
+    /// element carrying one is refused, with its condition and its line, and the refusal points to
+    /// `dotnet build`, which evaluates it. An empty `Condition` is none, as MSBuild reads it.
+    #[test]
+    fn a_value_set_under_a_condition_is_refused_and_never_taken() {
+        let both = parse(
+            "  <PropertyGroup><LangVersion>10</LangVersion></PropertyGroup>\n  \
+             <PropertyGroup Condition=\"'1' == '2'\"><LangVersion>12</LangVersion></PropertyGroup>\n",
+        )
+        .unwrap_err();
+        assert!(both.contains("line 8: <PropertyGroup Condition=\"'1' == '2'\">"), "{both}");
+        assert!(both.contains("dotnet build"), "{both}");
+        assert!(!both.contains("cannot select"), "the conditioned value was read: {both}");
+        let output = parse(
+            "  <PropertyGroup><OutputType Condition=\"'$(Configuration)' == 'Release'\">Library</OutputType></PropertyGroup>\n",
+        )
+        .unwrap_err();
+        assert!(output.contains("line 7: <OutputType Condition=\"'$(Configuration)' == 'Release'\">"), "{output}");
+        let item = parse("  <ItemGroup><Reference Include=\"Lib\" Condition=\"false\" /></ItemGroup>\n").unwrap_err();
+        assert!(item.contains("line 7: <Reference Condition=\"false\">"), "{item}");
+        let empty = parse("  <PropertyGroup Condition=\" \"><LangVersion>10</LangVersion></PropertyGroup>\n").unwrap();
+        assert_eq!(empty.lang_version, Some(LanguageVersion::CSharp10));
+    }
+
+    /// A project's `LangVersion` is read as the compiler's `/langversion` reads it, and a value that
+    /// names a version the compiler cannot select, or no version at all, is refused at its line.
+    #[test]
+    fn lang_version_selects_the_version_the_compiler_takes() {
+        let with = |value: &str| parse(&format!("  <PropertyGroup><LangVersion>{value}</LangVersion></PropertyGroup>\n"));
+        assert_eq!(with("10").unwrap().lang_version, Some(LanguageVersion::CSharp10));
+        assert_eq!(with("ISO-1").unwrap().lang_version, Some(LanguageVersion::CSharp1));
+        assert_eq!(with("latest").unwrap().lang_version, Some(LanguageVersion::SELECTABLE_MAX));
+        assert_eq!(with("").unwrap().lang_version, None);
+        assert_eq!(parse("").unwrap().lang_version, None);
+        let future = with("12").unwrap_err();
+        assert!(
+            future.contains("line 7: LangVersion is \"12\", a C# version this compiler cannot select yet; the newest it can is 11"),
+            "{future}"
+        );
+        let nonsense = with("banana").unwrap_err();
+        assert!(nonsense.contains("line 7: LangVersion is \"banana\", which names no C# version"), "{nonsense}");
     }
 
     /// **DOCUMENT ORDER IS THE ANSWER, NOT AN ARTIFACT OF IT.** Precedence across a reference set is

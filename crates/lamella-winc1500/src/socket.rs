@@ -2,31 +2,39 @@
 //! decoders for the WINC's on-module TCP/IP + TLS stack -- the layer the interpreter's
 //! `NetBackend` mapping will drive once an association is up.
 
-/// `m2m_socket_host_if.h` command values (HIF group 2 opcodes; 0x53..0x57 are the 19.7-era
-/// additions).
+/// `m2m_socket_host_if.h` command values (HIF group 2 opcodes).
 pub const CMD_BIND: u8 = 0x41;
+/// Starts listening on a bound socket ([`listen_cmd`]).
 pub const CMD_LISTEN: u8 = 0x42;
-pub const CMD_ACCEPT: u8 = 0x43;
+/// A connection accepted on a listening socket, which the module reports unasked
+/// ([`AcceptReply`]).
+pub(crate) const CMD_ACCEPT: u8 = 0x43;
+/// Connects a TCP socket ([`connect_cmd`]).
 pub const CMD_CONNECT: u8 = 0x44;
+/// Sends on a connected socket ([`send_cmd`]).
 pub const CMD_SEND: u8 = 0x45;
+/// Posts a receive on a connected socket ([`recv_cmd`]).
 pub const CMD_RECV: u8 = 0x46;
+/// Sends a datagram to an address ([`send_cmd`] given one).
 pub const CMD_SENDTO: u8 = 0x47;
-pub const CMD_RECVFROM: u8 = 0x48;
+/// Posts a receive on a datagram socket.
+pub(crate) const CMD_RECVFROM: u8 = 0x48;
+/// Closes a socket ([`close_cmd`]).
 pub const CMD_CLOSE: u8 = 0x49;
-pub const CMD_DNS_RESOLVE: u8 = 0x4a;
+/// Resolves a host name; [`dns_reply_ip`] reads the reply.
+pub(crate) const CMD_DNS_RESOLVE: u8 = 0x4a;
+/// Connects a TLS socket ([`connect_cmd`]).
 pub const CMD_SSL_CONNECT: u8 = 0x4b;
+/// Sends on a connected TLS socket ([`send_cmd`]).
 pub const CMD_SSL_SEND: u8 = 0x4c;
+/// Posts a receive on a connected TLS socket ([`recv_cmd`]).
 pub const CMD_SSL_RECV: u8 = 0x4d;
+/// Closes a TLS socket ([`close_cmd`]).
 pub const CMD_SSL_CLOSE: u8 = 0x4e;
-pub const CMD_SET_SOCKET_OPTION: u8 = 0x4f;
+/// Creates the module's TLS state for a socket, before its options are set and it connects.
 pub const CMD_SSL_CREATE: u8 = 0x50;
+/// Sets a value-carrying TLS option on a socket ([`ssl_set_sock_opt_cmd`]).
 pub const CMD_SSL_SET_SOCK_OPT: u8 = 0x51;
-pub const CMD_PING: u8 = 0x52;
-pub const CMD_SSL_SET_CS_LIST: u8 = 0x53;
-pub const CMD_SSL_BIND: u8 = 0x54;
-pub const CMD_SSL_EXP_CHECK: u8 = 0x55;
-pub const CMD_SECURE: u8 = 0x56;
-pub const CMD_SSL_CONNECT_ALPN: u8 = 0x57;
 
 /// `socket.h`: request on-module TLS for a TCP socket (create with [`CMD_SSL_CREATE`], connect
 /// with [`CMD_SSL_CONNECT`], move data with the SSL send/recv commands).
@@ -36,20 +44,19 @@ pub const FLAG_SSL: u8 = 0x01;
 /// `SSL_FLAGS_*`). The 19.7 driver creates every SSL socket with `ACTIVE | NO_TX_COPY` and ORs
 /// in the option-driven bits; a successful connect reply's opcode does NOT depend on them.
 pub const SSL_ACTIVE: u8 = 0x01;
+/// The module does not verify the server's certificate.
 pub const SSL_BYPASS_X509: u8 = 0x02;
-pub const SSL_CACHE_SESSION: u8 = 0x10;
+/// The flag the reference sets on every TLS socket with [`SSL_ACTIVE`].
 pub const SSL_NO_TX_COPY: u8 = 0x20;
-pub const SSL_CHECK_SNI: u8 = 0x40;
-pub const SSL_DELAY: u8 = 0x80;
 
 /// `socket.h` SSL socket options for [`ssl_set_sock_opt_cmd`] (level `SOL_SSL_SOCKET`). The
 /// flag-valued options (bypass/caching/SNI-validation) never reach the wire in the reference --
 /// they fold into the connect command's flag byte -- so only [`SO_SSL_SNI`] and [`SO_SSL_ALPN`]
 /// are sent as [`CMD_SSL_SET_SOCK_OPT`] requests.
 pub const SO_SSL_BYPASS_X509_VERIF: u8 = 0x01;
+/// The server name the module offers in its ClientHello: the hostname with its NUL.
 pub const SO_SSL_SNI: u8 = 0x02;
-pub const SO_SSL_ENABLE_SESSION_CACHING: u8 = 0x03;
-pub const SO_SSL_ENABLE_SNI_VALIDATION: u8 = 0x04;
+/// The application protocols the module offers (ALPN).
 pub const SO_SSL_ALPN: u8 = 0x05;
 
 /// `HOSTNAME_MAX_SIZE`: the SNI value (hostname + NUL) must stay under this; it is also the
@@ -58,7 +65,7 @@ pub const HOSTNAME_MAX: usize = 64;
 
 /// Host-assigned socket-number partitions (`socket.h`).
 pub const TCP_SOCKETS: core::ops::Range<i8> = 0..7;
-pub const UDP_SOCKETS: core::ops::Range<i8> = 7..11;
+const UDP_SOCKETS: core::ops::Range<i8> = 7..11;
 
 /// AF_INET, the only family the module speaks.
 pub const AF_INET: u16 = 2;
@@ -69,8 +76,8 @@ pub const AF_INET: u16 = 2;
 /// offset its connect/accept reply carried (equal to these on current firmware); a UDP sendto
 /// has no reply to learn from, so it uses the constant.
 pub const TCP_TX_OFFSET: u16 = 80;
-pub const UDP_TX_OFFSET: u16 = 68;
-pub const SSL_TX_OFFSET: u16 = 85;
+/// A datagram's send-payload offset.
+pub(crate) const UDP_TX_OFFSET: u16 = 68;
 
 /// `SOCKET_BUFFER_MAX_LENGTH`: the largest payload one send/sendto command may carry.
 pub const SEND_MAX: usize = 1400;
@@ -82,7 +89,9 @@ pub const ERR_TIMEOUT: i16 = -13;
 /// `tstrSockAddr` (8 bytes): family, then port and address in NETWORK byte order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SockAddr {
+    /// The port number.
     pub port: u16,
+    /// The IPv4 address, first octet first.
     pub ip: [u8; 4],
 }
 
@@ -120,12 +129,17 @@ pub fn connect_cmd(sock: i8, addr: &SockAddr, ssl_flags: u8, session: u16) -> [u
 /// both opcodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConnectReply {
+    /// The socket the reply is for.
     pub sock: i8,
+    /// The firmware's error code: 0 when the socket connected.
     pub error: i8,
+    /// On success, where a send's payload sits in its HIF message body. On failure, the error's
+    /// source and code ([`err_source`](Self::err_source), [`err_code`](Self::err_code)).
     pub app_data_offset: u16,
 }
 
 impl ConnectReply {
+    /// Decodes the reply's four bytes.
     pub fn decode(raw: &[u8; 4]) -> Self {
         Self {
             sock: raw[0] as i8,
@@ -220,14 +234,14 @@ pub fn listen_cmd(sock: i8, backlog: u8, session: u16) -> [u8; 4] {
 /// `tstrBindReply` / `tstrListenReply` (4 bytes, one shape): the socket, a status (0 = ok,
 /// negative = the firmware refused), and the session echo.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct StatusReply {
-    pub sock: i8,
-    pub status: i8,
-    pub session: u16,
+pub(crate) struct StatusReply {
+    pub(crate) sock: i8,
+    pub(crate) status: i8,
+    pub(crate) session: u16,
 }
 
 impl StatusReply {
-    pub fn decode(raw: &[u8; 4]) -> Self {
+    pub(crate) fn decode(raw: &[u8; 4]) -> Self {
         Self {
             sock: raw[0] as i8,
             status: raw[1] as i8,
@@ -240,15 +254,15 @@ impl StatusReply {
 /// the listener it arrived on, the FIRMWARE-assigned connected socket number, and the connected
 /// socket's send app-data offset (same meaning as the connect reply's).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AcceptReply {
-    pub remote: SockAddr,
-    pub listen_sock: i8,
-    pub connected_sock: i8,
-    pub app_data_offset: u16,
+pub(crate) struct AcceptReply {
+    pub(crate) remote: SockAddr,
+    pub(crate) listen_sock: i8,
+    pub(crate) connected_sock: i8,
+    pub(crate) app_data_offset: u16,
 }
 
 impl AcceptReply {
-    pub fn decode(raw: &[u8; 12]) -> Self {
+    pub(crate) fn decode(raw: &[u8; 12]) -> Self {
         Self {
             remote: SockAddr::decode(&raw[..8]),
             listen_sock: raw[8] as i8,
@@ -263,14 +277,14 @@ impl AcceptReply {
 /// under plain [`CMD_SEND`] (reply-opcode folding) -- match send replies by
 /// SOCKET, accepting the whole send-opcode trio.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SendReply {
-    pub sock: i8,
-    pub sent: i16,
-    pub session: u16,
+pub(crate) struct SendReply {
+    pub(crate) sock: i8,
+    pub(crate) sent: i16,
+    pub(crate) session: u16,
 }
 
 impl SendReply {
-    pub fn decode(raw: &[u8; 8]) -> Self {
+    pub(crate) fn decode(raw: &[u8; 8]) -> Self {
         Self {
             sock: raw[0] as i8,
             sent: i16::from_le_bytes([raw[2], raw[3]]),
@@ -290,14 +304,21 @@ pub fn dns_reply_ip(raw: &[u8; 68]) -> [u8; 4] {
 /// payload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecvReply {
+    /// The address the bytes came from.
     pub remote: SockAddr,
+    /// How many bytes arrived, or a negative socket error ([`ERR_TIMEOUT`] when the window
+    /// passed with none).
     pub status: i16,
+    /// Where the received bytes start within the reply message's payload.
     pub data_offset: u16,
+    /// The socket the reply is for.
     pub sock: i8,
+    /// The session id, echoed from the request.
     pub session: u16,
 }
 
 impl RecvReply {
+    /// Decodes the reply's sixteen bytes.
     pub fn decode(raw: &[u8; 16]) -> Self {
         Self {
             remote: SockAddr::decode(&raw[..8]),
@@ -319,6 +340,7 @@ pub struct SocketTable {
 }
 
 impl SocketTable {
+    /// A table with every socket number free and no session issued.
     pub fn new() -> Self {
         Self::default()
     }

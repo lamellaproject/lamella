@@ -663,6 +663,7 @@ pub fn intrinsic_at(index: u16) -> Option<IntrinsicFn> {
 /// Crate-private: [`Module::intrinsic_id`](crate::module::Module) is the form a caller wants, and
 /// an index is this module's own bookkeeping.
 #[must_use]
+#[cfg(all(feature = "code-in-place", any(feature = "bcl", test)))]
 pub(crate) fn id_at(index: u16) -> Option<u32> {
     REGISTRY.get(index as usize).map(|(id, _)| *id)
 }

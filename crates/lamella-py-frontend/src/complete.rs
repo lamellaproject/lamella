@@ -161,6 +161,7 @@ const BUILTINS: &[BuiltinName] = &[
         is_type: false,
         needs: None,
     },
+    BuiltinName { label: "exit", signature: "exit([code])", is_type: false, needs: None },
     BuiltinName {
         label: "filter",
         signature: "filter(func_or_None, iterable)",
@@ -235,6 +236,7 @@ const BUILTINS: &[BuiltinName] = &[
         is_type: true,
         needs: None,
     },
+    BuiltinName { label: "quit", signature: "quit([code])", is_type: false, needs: None },
     BuiltinName {
         label: "range",
         signature: "range([start,] stop[, step])",

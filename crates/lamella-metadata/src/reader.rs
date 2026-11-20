@@ -1335,15 +1335,22 @@ impl<'a> Assembly<'a> {
     /// consumer: the DEFINING assembly reaches the type as a `TypeDef` and the referencing one as
     /// a `TypeRef`, and they meet only if both spell it the same way.
     ///
-    /// Only the OUTERMOST type carries a namespace, so reaching one ends the walk. The walk is
-    /// bounded: a malformed cyclic `NestedClass` or `ResolutionScope` cannot spin here.
+    /// Only the OUTERMOST type carries a namespace, so reaching one ends the walk. THE WALK FOLLOWS THE
+    /// WHOLE CHAIN, however deep: one bounded at sixteen enclosers gave two types that differ only
+    /// above their sixteenth encloser a single pair, so a lookup by it found one of them for both. Each
+    /// type has one encloser (II.22.32, rule 5), so a chain meeting a token twice is a cycle, which
+    /// only malformed metadata can hold: that type has no pair (`None`) rather than a spinning walk.
     #[must_use]
     pub fn type_token_full_name(&self, token: Token) -> Option<(String, String)> {
         let own = self.type_token_name(token)?;
         let mut prefix = String::new();
+        let mut seen = alloc::vec![token];
         let mut current = self.enclosing_token(token);
-        for _ in 0..16 {
-            let Some(outer) = current else { break };
+        while let Some(outer) = current {
+            if seen.contains(&outer) {
+                return None;
+            }
+            seen.push(outer);
             let outer_name = self.type_token_name(outer)?;
             let mut next = String::from(outer_name.name);
             if !prefix.is_empty() {
@@ -1369,7 +1376,8 @@ impl<'a> Assembly<'a> {
     /// type lives in a different place for each table -- `NestedClass` for a `TypeDef` (II.22.32),
     /// the `ResolutionScope` for a `TypeRef` (II.22.38) -- and a `ResolutionScope` that is NOT a
     /// `TypeRef` is an assembly or module, which means top level.
-    fn enclosing_token(&self, token: Token) -> Option<Token> {
+    #[must_use]
+    pub fn enclosing_token(&self, token: Token) -> Option<Token> {
         match token.table() {
             table::TYPE_DEF => self
                 .type_def(token.row())
@@ -1572,14 +1580,6 @@ impl<'a> Assembly<'a> {
         self.has_attribute(method_token, "Lamella.Runtime", "IntendedDefaultAttribute")
     }
 
-    /// Every `CustomAttribute` row (II.22.10) whose parent is `parent`, in table order, each
-    /// carrying its constructor token and its raw value blob (II.23.3).
-    ///
-    /// **THIS SCANS THE WHOLE TABLE FOR ONE PARENT, so a call per member is rows x members.** It is
-    /// the right entry point for a caller holding a SINGLE token; a caller asking about every member
-    /// of an assembly wants [`Assembly::tokens_with_attribute`], which indexes the table in one pass.
-    /// The same warning on [`Assembly::has_attribute`] records what the difference measured.
-    #[must_use]
     /// Every custom attribute in the assembly, paired with the token it is attached to.
     ///
     /// [`custom_attributes`](Self::custom_attributes) filters this table for ONE parent, so asking it
@@ -1600,6 +1600,14 @@ impl<'a> Assembly<'a> {
         })
     }
 
+    /// Every `CustomAttribute` row (ECMA-335 6th ed II.22.10) whose parent is `parent`, in table
+    /// order, each carrying its constructor token and its raw value blob (ECMA-335 6th ed II.23.3).
+    ///
+    /// **THIS SCANS THE WHOLE TABLE FOR ONE PARENT, so a call per member is rows x members.** It is
+    /// the right entry point for a caller holding a SINGLE token; a caller asking about every member
+    /// of an assembly wants [`Assembly::tokens_with_attribute`], which indexes the table in one pass.
+    /// The same warning on [`Assembly::has_attribute`] records what the difference measured.
+    #[must_use]
     pub fn custom_attributes(
         &self,
         parent: Token,

@@ -7577,16 +7577,6 @@ pub fn type_get_methods(
     Ok(Some(Value::Object(array)))
 }
 
-/// `System.Reflection.FieldInfo.get_FieldType` (`FieldInfo.FieldType`) and
-/// `System.Reflection.MethodInfo.get_ReturnType` (`MethodInfo.ReturnType`): the member's type as a
-/// `Type` (its asm-folded handle). The loader recorded each member's type at load. Null when the
-/// type was not resolvable as a `Type` handle (an array / pointer / unresolved cross-assembly type
-/// -- not modeled yet); the common primitive / string / object / same-assembly class+struct cases
-/// resolve.
-///
-/// # Errors
-/// [`Trap::TypeMismatch`] if the receiver is not a member handle.
-#[cfg(feature = "reflection")]
 /// `System.Reflection.MemberInfo.get_DeclaringType`: the type that declares the handle-backed member
 /// `this`, as a `Type` handle, or null when it has none the module records.
 ///
@@ -7614,6 +7604,15 @@ pub fn member_declaring_type(
     }))
 }
 
+/// `System.Reflection.FieldInfo.get_FieldType` (`FieldInfo.FieldType`) and
+/// `System.Reflection.MethodInfo.get_ReturnType` (`MethodInfo.ReturnType`): the member's type as a
+/// `Type` (its asm-folded handle), as the loader recorded it at load. The Reflection library
+/// specifies both as the member's `System.Type`, `System.Void`'s for a method that returns nothing
+/// (ECMA-335 6th ed IV.5.5; the members are specified in its CLILibraryTypes.xml).
+///
+/// # Errors
+/// [`Trap::TypeMismatch`] if the receiver is not a member handle.
+#[cfg(feature = "reflection")]
 pub fn member_get_type(
     vm: &mut Vm,
     module: &Module,
@@ -10624,14 +10623,17 @@ mod tests {
         assert_eq!(r, Err(Trap::DivideByZero));
     }
 
+    /// A double converts to the decimal nearest its exact binary value (ECMA-334 2nd ed 13.2.1:
+    /// "rounded to the nearest number after the 28th decimal place if required"), so 0.1 and 1/3
+    /// keep every place up to the 28th, and a value with fewer places keeps its own.
     #[cfg(feature = "float")]
     #[test]
-    fn decimal_from_double_rounds_to_fifteen_digits() {
+    fn decimal_from_double_is_the_nearest_decimal_to_its_exact_value() {
         let mut vm = Vm::new();
         let r = decimal_from_double(&mut vm, &Module::new(), &[Value::Float(0.1)])
             .unwrap()
             .unwrap();
-        assert_eq!(dec_parts(&r), (1, 1, false));
+        assert_eq!(dec_parts(&r), (1_000_000_000_000_000_055_511_151_231, 28, false));
         let r = decimal_from_double(&mut vm, &Module::new(), &[Value::Float(1.5)])
             .unwrap()
             .unwrap();
@@ -10643,7 +10645,7 @@ mod tests {
         let r = decimal_from_double(&mut vm, &Module::new(), &[Value::Float(1.0 / 3.0)])
             .unwrap()
             .unwrap();
-        assert_eq!(dec_parts(&r), (333_333_333_333_333, 15, false));
+        assert_eq!(dec_parts(&r), (3_333_333_333_333_333_148_296_162_562, 28, false));
     }
 
     #[cfg(feature = "float")]

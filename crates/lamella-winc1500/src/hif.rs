@@ -1,5 +1,5 @@
 //! The WINC Host Interface (HIF) message layer: every Wi-Fi control operation and socket
-//! exchange is a HIF message -- an 8-byte header (group id, opcode, 16-bit big-endian length
+//! exchange is a HIF message -- an 8-byte header (group id, opcode, 16-bit little-endian length
 //! covering the header) followed by request-specific payload -- carried through module memory
 //! the firmware allocates per message.
 
@@ -9,11 +9,10 @@ use crate::spi::{Link, SpiError};
 
 /// HIF request groups (vendor `tenuM2mReqGroup`).
 pub const GROUP_MAIN: u8 = 0;
-pub const GROUP_WIFI: u8 = 1;
+/// The Wi-Fi control group: scans, joins and connection events.
+pub(crate) const GROUP_WIFI: u8 = 1;
+/// The IP group: socket requests and their replies (see [`crate::socket`]).
 pub const GROUP_IP: u8 = 2;
-pub const GROUP_HIF: u8 = 3;
-pub const GROUP_OTA: u8 = 4;
-pub const GROUP_SSL: u8 = 5;
 
 /// The data-message marker: an opcode's bit 7 flags a data (not configuration) request.
 pub const OPCODE_DATA_BIT: u8 = 0x80;
@@ -42,7 +41,9 @@ const ALLOC_RETRIES: u32 = 20_000;
 /// Module-memory access -- registers plus DMA block transfers -- the HIF exchange needs;
 /// implemented by the live [`Link`], faked in tests.
 pub trait ModuleBus: Registers {
+    /// Reads `buf.len()` bytes of module memory starting at `addr`.
     fn read_block(&mut self, addr: u32, buf: &mut [u8]) -> Result<(), SpiError>;
+    /// Writes `data` to module memory starting at `addr`.
     fn write_block(&mut self, addr: u32, data: &[u8]) -> Result<(), SpiError>;
 }
 
@@ -58,15 +59,21 @@ impl<S: SpiBus> ModuleBus for Link<S> {
 /// A HIF send/receive failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HifError {
+    /// A register or block access failed on the SPI link.
     Spi(SpiError),
     /// The message (header + payload) exceeds [`MAX_MESSAGE`].
-    TooLong { length: usize },
+    TooLong {
+        /// The message's length in bytes, its header included.
+        length: usize,
+    },
     /// The firmware never allocated a receive buffer for the announced message.
     AllocTimeout,
     /// The written message did not read back intact (CRC framing is off after init, so a
-    /// noisy transport corrupts silently -- this is the integrity net; `offset` is the first
-    /// differing byte within the failed block).
-    WriteVerify { offset: usize },
+    /// noisy transport corrupts silently -- this is the integrity net).
+    WriteVerify {
+        /// The first differing byte within the failed block.
+        offset: usize,
+    },
 }
 
 impl From<SpiError> for HifError {
@@ -75,14 +82,19 @@ impl From<SpiError> for HifError {
     }
 }
 
-/// A received HIF message's identity: the payload (`length` bytes) sits in module memory at
-/// `address` -- block-read it (fully or piecewise, e.g. a socket recv draining into a small
-/// buffer), then acknowledge with [`set_receive_done`].
+/// A received HIF message's identity: the message (`length` bytes, its header included) sits in
+/// module memory at `address` -- block-read its payload (fully or piecewise, e.g. a socket recv
+/// draining into a small buffer), then acknowledge with [`set_receive_done`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HifEvent {
+    /// The request group the message belongs to.
     pub group: u8,
+    /// The message's opcode within its group.
     pub opcode: u8,
+    /// The message's length in bytes, its header included.
     pub length: u16,
+    /// Where the message starts in module memory; its payload follows the header, at
+    /// `address + HEADER_LEN`.
     pub address: u32,
 }
 

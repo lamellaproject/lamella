@@ -7,11 +7,12 @@
 
 /// The .NET 1.1 era members of types the base contract already carries.
 pub const NETFX_1_1: u64 = 1 << 0;
-/// The .NET 2.0 era members of types the base contract already carries.
+/// The .NET 2.0 era members of types the base contract already carries. Requires [`NETFX_1_1`] and
+/// [`GENERICS`].
 pub const NETFX_2_0: u64 = 1 << 1;
-/// The .NET 4.0 era members of types the base contract already carries.
+/// The .NET 4.0 era members of types the base contract already carries. Requires [`NETFX_2_0`].
 pub const NETFX_4_0: u64 = 1 << 2;
-/// The .NET 4.5 era members of types the base contract already carries.
+/// The .NET 4.5 era members of types the base contract already carries. Requires [`NETFX_4_0`].
 pub const NETFX_4_5: u64 = 1 << 3;
 
 /// Binary floating point: `System.Double`, `System.Single`, and the execution model's built-in
@@ -55,7 +56,7 @@ pub const SPAN: u64 = 1 << 19;
 /// [`GENERICS`].
 pub const TUPLES: u64 = 1 << 20;
 /// The .NET Core 2.0 members of types the base contract already carries: the rung above
-/// [`NETFX_4_5`].
+/// [`NETFX_4_5`]. Requires [`STRING_COMPARISON`], through which `OSPlatform` compares names.
 pub const NETCORE_2_0: u64 = 1 << 21;
 /// The .NET Core 2.1 members: the rung above [`NETCORE_2_0`]. Requires [`SPAN`], because .NET Core
 /// 2.1 never shipped without span types.

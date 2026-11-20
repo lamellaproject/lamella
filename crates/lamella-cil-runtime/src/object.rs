@@ -242,8 +242,9 @@ pub enum Object {
     MdArray {
         /// The length of each dimension.
         dims: Box<[i32]>,
-        /// The elements, row-major; one per product-of-dims slot.
-        elements: Box<[Value]>,
+        /// The elements, row-major, one per product-of-dims slot: packed bytes for a sized primitive
+        /// or enum element type, as a vector's are, and one [`Value`] slot each for everything else.
+        store: ArrayStorage,
         /// The asm-folded token carrying the array's cast shape, or 0 for an untracked allocation.
         array_type: u64,
     },
@@ -450,20 +451,23 @@ impl ArrayStorage {
 
 /// The type-DEFAULT value with the same shape as `value` -- the zero a boxed array slot takes on
 /// `Array.Clear`: `0` for a number, `null` for any reference, and a struct whose every field is
-/// recursively zeroed for a value type. A managed pointer / typed reference has no default (it
-/// cannot be an array element in verified IL), so it is left unchanged.
+/// recursively zeroed for a value type. A pointer to a variable is held where an unmanaged pointer
+/// is, as a managed pointer is never an array element or a field in correct CIL (ECMA-335 6th ed
+/// III.1.1.1), so it zeroes as the null pointer, the native int 0 (I.12.1.1.1). A typed reference has
+/// no default and is left unchanged.
 pub(crate) fn zeroed_value(value: &Value) -> Value {
     match value {
         Value::Int32(_) => Value::Int32(0),
         Value::Int64(_) => Value::Int64(0),
-        Value::NativeInt(_) => Value::NativeInt(0),
+        Value::NativeInt(_) | Value::ByRef(_) => Value::NativeInt(0),
         #[cfg(feature = "float")]
         Value::Float(_) => Value::Float(0.0),
         #[cfg(feature = "float")]
         Value::Single(_) => Value::Single(0.0),
         Value::Object(_) | Value::Null => Value::Null,
         Value::Struct(fields) => Value::Struct(fields.iter().map(zeroed_value).collect()),
-        other => other.clone(),
+        #[cfg(feature = "typed-references")]
+        Value::TypedRef { .. } => value.clone(),
     }
 }
 
@@ -990,9 +994,9 @@ impl Heap {
                 element_type: *element_type,
                 element_width: *element_width,
             },
-            Object::MdArray { dims, elements, array_type } => Object::MdArray {
+            Object::MdArray { dims, store, array_type } => Object::MdArray {
                 dims: dims.clone(),
-                elements: elements.clone(),
+                store: store.clone(),
                 array_type: *array_type,
             },
             _ => return None,
@@ -1155,8 +1159,7 @@ impl Heap {
     #[must_use]
     pub fn array_len(&self, reference: ObjectRef) -> Option<usize> {
         match self.get(reference)? {
-            Object::Array { store, .. } => Some(store.len()),
-            Object::MdArray { elements, .. } => Some(elements.len()),
+            Object::Array { store, .. } | Object::MdArray { store, .. } => Some(store.len()),
             _ => None,
         }
     }
@@ -1194,16 +1197,75 @@ impl Heap {
             Object::Array {
                 store: ArrayStorage::Packed { kind, .. },
                 ..
+            }
+            | Object::MdArray {
+                store: ArrayStorage::Packed { kind, .. },
+                ..
             } => return Some(kind.byte_width()),
             Object::Array { element_width: Some(width), .. } => return Some(*width),
             Object::Array {
                 store: ArrayStorage::Values(elements),
                 ..
+            }
+            | Object::MdArray {
+                store: ArrayStorage::Values(elements),
+                ..
             } => elements.first(),
-            Object::MdArray { elements, .. } => elements.first(),
             _ => return None,
         };
         first.and_then(value_storage_width)
+    }
+
+    /// The width in bytes of an element of the array at `reference` when the array records it: a
+    /// packed primitive array's element kind, or a typed value array's declared layout size. `None`
+    /// for an array whose width [`Heap::array_element_width`] can only read off an element's value.
+    #[must_use]
+    pub fn array_declared_element_width(&self, reference: ObjectRef) -> Option<usize> {
+        match self.get(reference)? {
+            Object::Array {
+                store: ArrayStorage::Packed { kind, .. },
+                ..
+            }
+            | Object::MdArray {
+                store: ArrayStorage::Packed { kind, .. },
+                ..
+            } => Some(kind.byte_width()),
+            Object::Array { element_width: Some(width), .. } => Some(*width),
+            _ => None,
+        }
+    }
+
+    /// The element bytes of the array at `reference` and the width of one element, when its
+    /// elements are packed: a vector's in index order, a rectangular array's in row-major order,
+    /// each little-endian. `None` for an array whose elements are value slots.
+    #[must_use]
+    pub fn packed_array_bytes(&self, reference: ObjectRef) -> Option<(&[u8], usize)> {
+        match self.get(reference)? {
+            Object::Array {
+                store: ArrayStorage::Packed { bytes, kind },
+                ..
+            }
+            | Object::MdArray {
+                store: ArrayStorage::Packed { bytes, kind },
+                ..
+            } => Some((bytes, kind.byte_width())),
+            _ => None,
+        }
+    }
+
+    /// [`Heap::packed_array_bytes`], to write them.
+    pub fn packed_array_bytes_mut(&mut self, reference: ObjectRef) -> Option<(&mut [u8], usize)> {
+        match self.objects.get_mut(reference.0 as usize)? {
+            Object::Array {
+                store: ArrayStorage::Packed { bytes, kind },
+                ..
+            }
+            | Object::MdArray {
+                store: ArrayStorage::Packed { bytes, kind },
+                ..
+            } => Some((bytes, kind.byte_width())),
+            _ => None,
+        }
     }
 
     /// The element type's true byte width of the array at `reference` -- the .NET element size
@@ -1229,8 +1291,7 @@ impl Heap {
     #[must_use]
     pub fn array_get(&self, reference: ObjectRef, index: usize) -> Option<Value> {
         match self.get(reference)? {
-            Object::Array { store, .. } => store.get(index),
-            Object::MdArray { elements, .. } => elements.get(index).cloned(),
+            Object::Array { store, .. } | Object::MdArray { store, .. } => store.get(index),
             _ => None,
         }
     }
@@ -1240,14 +1301,7 @@ impl Heap {
     /// `index` is the row-major flat index (matching `array_get`).
     pub fn array_set(&mut self, reference: ObjectRef, index: usize, value: Value) -> bool {
         match self.objects.get_mut(reference.0 as usize) {
-            Some(Object::Array { store, .. }) => store.set(index, value),
-            Some(Object::MdArray { elements, .. }) => match elements.get_mut(index) {
-                Some(slot) => {
-                    *slot = value;
-                    true
-                }
-                None => false,
-            },
+            Some(Object::Array { store, .. } | Object::MdArray { store, .. }) => store.set(index, value),
             _ => false,
         }
     }
@@ -1488,11 +1542,31 @@ impl Heap {
     /// Allocates a rectangular array tagged with the token carrying its cast shape.
     /// Elements are initialized to int32 zero, as in [`Self::alloc_md_array`].
     pub fn alloc_md_array_typed(&mut self, dims: Vec<i32>, array_type: u64) -> ObjectRef {
+        self.alloc_md_array_of(dims, Value::Int32(0), array_type)
+    }
+
+    /// Allocates a rectangular array tagged with the token carrying its cast shape, each element
+    /// starting as `zero`, its element type's zero value (ECMA-335 6th ed II.13.2).
+    pub fn alloc_md_array_of(&mut self, dims: Vec<i32>, zero: Value, array_type: u64) -> ObjectRef {
         let total: usize = dims.iter().map(|&d| d.max(0) as usize).product();
-        let elements = alloc::vec![Value::Int32(0); total].into_boxed_slice();
         self.alloc(Object::MdArray {
             dims: dims.into_boxed_slice(),
-            elements,
+            store: ArrayStorage::Values(alloc::vec![zero; total]),
+            array_type,
+        })
+    }
+
+    /// Allocates a rectangular array of a sized primitive element `kind`, its elements packed as a
+    /// vector's are and zero-initialized by the allocation itself, tagged with the token carrying
+    /// its cast shape.
+    pub fn alloc_md_array_packed(&mut self, dims: Vec<i32>, kind: PrimKind, array_type: u64) -> ObjectRef {
+        let total: usize = dims.iter().map(|&d| d.max(0) as usize).product();
+        self.alloc(Object::MdArray {
+            dims: dims.into_boxed_slice(),
+            store: ArrayStorage::Packed {
+                bytes: alloc::vec![0u8; total * kind.byte_width()],
+                kind,
+            },
             array_type,
         })
     }
@@ -1510,29 +1584,23 @@ impl Heap {
     /// if it is such an array with every index in bounds.
     #[must_use]
     pub fn md_array_get(&self, reference: ObjectRef, indices: &[i32]) -> Option<Value> {
-        let Object::MdArray { dims, elements, .. } = self.get(reference)? else {
+        let Object::MdArray { dims, store, .. } = self.get(reference)? else {
             return None;
         };
-        elements.get(md_flat_index(dims, indices)?).cloned()
+        store.get(md_flat_index(dims, indices)?)
     }
 
     /// Stores `value` at `indices` of the multi-dimensional array at `reference`; returns
     /// `false` if `reference` is not such an array or an index is out of range.
     pub fn md_array_set(&mut self, reference: ObjectRef, indices: &[i32], value: Value) -> bool {
-        let Some(Object::MdArray { dims, elements, .. }) = self.objects.get_mut(reference.0 as usize)
+        let Some(Object::MdArray { dims, store, .. }) = self.objects.get_mut(reference.0 as usize)
         else {
             return false;
         };
         let Some(flat) = md_flat_index(dims, indices) else {
             return false;
         };
-        match elements.get_mut(flat) {
-            Some(slot) => {
-                *slot = value;
-                true
-            }
-            None => false,
-        }
+        store.set(flat, value)
     }
 
     /// The row-major flat index of `indices` into the multi-dimensional array at `reference`
@@ -1663,12 +1731,17 @@ impl Heap {
 
     /// Fills the packed array at `reference` from a raw little-endian element blob (the
     /// `RuntimeHelpers.InitializeArray` RVA initializer): a straight prefix memcpy, since the
-    /// packed image and the blob share the layout. A short blob fills a prefix (matching the
-    /// element-at-a-time funnel's behavior); a long one is truncated to the array. `false` if
-    /// `reference` is not a packed array -- the caller then takes the per-element path.
+    /// packed image and the blob share the layout, a rectangular array's in row-major order. A
+    /// short blob fills a prefix (matching the element-at-a-time funnel's behavior); a long one is
+    /// truncated to the array. `false` if `reference` is not a packed array -- the caller then
+    /// takes the per-element path.
     pub fn packed_init_from_blob(&mut self, reference: ObjectRef, data: &[u8]) -> bool {
         match self.objects.get_mut(reference.0 as usize) {
             Some(Object::Array {
+                store: ArrayStorage::Packed { bytes, .. },
+                ..
+            }
+            | Object::MdArray {
                 store: ArrayStorage::Packed { bytes, .. },
                 ..
             }) => {
@@ -1987,6 +2060,7 @@ fn location_refs<F: FnMut(ObjectRef)>(location: &Location, visit: &mut F) {
         | Location::LocalBytes { .. }
         | Location::ArgBytes { .. }
         | Location::Static { .. }
+        | Location::StaticBytes { .. }
         | Location::Stack { .. } => {}
     }
 }
@@ -2013,12 +2087,19 @@ fn object_refs<F: FnMut(ObjectRef)>(object: &Object, visit: &mut F) {
         Object::Array {
             store: ArrayStorage::Packed { .. },
             ..
+        }
+        | Object::MdArray {
+            store: ArrayStorage::Packed { .. },
+            ..
         } => {}
         Object::Array {
             store: ArrayStorage::Values(elements),
             ..
+        }
+        | Object::MdArray {
+            store: ArrayStorage::Values(elements),
+            ..
         } => elements.iter().for_each(|e| collect_refs(e, visit)),
-        Object::MdArray { elements, .. } => elements.iter().for_each(|e| collect_refs(e, visit)),
         Object::Boxed { value, .. } => collect_refs(value, visit),
         Object::Delegate { invocations, .. } => invocations
             .iter()
@@ -2042,6 +2123,7 @@ fn remap_location(location: &mut Location, remap: &[Option<u32>]) {
         | Location::LocalBytes { .. }
         | Location::ArgBytes { .. }
         | Location::Static { .. }
+        | Location::StaticBytes { .. }
         | Location::Stack { .. } => {}
     }
 }
@@ -2067,12 +2149,19 @@ fn remap_object(object: &mut Object, remap: &[Option<u32>]) {
         Object::Array {
             store: ArrayStorage::Packed { .. },
             ..
+        }
+        | Object::MdArray {
+            store: ArrayStorage::Packed { .. },
+            ..
         } => {}
         Object::Array {
             store: ArrayStorage::Values(elements),
             ..
+        }
+        | Object::MdArray {
+            store: ArrayStorage::Values(elements),
+            ..
         } => elements.iter_mut().for_each(|e| remap_value(e, remap)),
-        Object::MdArray { elements, .. } => elements.iter_mut().for_each(|e| remap_value(e, remap)),
         Object::Boxed { value, .. } => remap_value(value, remap),
         Object::Delegate { invocations, .. } => invocations
             .iter_mut()
@@ -2109,16 +2198,23 @@ fn remap_ref(reference: &mut ObjectRef, remap: &[Option<u32>]) {
 /// primitive arrays use packed storage; aggregates require their recorded layout size.
 #[must_use]
 fn value_storage_width(value: &Value) -> Option<usize> {
+    value_storage_width_at(value, crate::native_pointer_size() as usize)
+}
+
+/// [`value_storage_width`] for a target whose native int is `native` bytes wide: a native int, an
+/// object reference and a pointer are each as wide as the target maps a native int (ECMA-335 6th
+/// ed I.12.1.1).
+#[must_use]
+fn value_storage_width_at(value: &Value, native: usize) -> Option<usize> {
     Some(match value {
         Value::Int32(_) => 4,
         Value::Int64(_) => 8,
-        Value::NativeInt(_) => 8,
         #[cfg(feature = "float")]
         Value::Float(_) => 8,
         #[cfg(feature = "float")]
         Value::Single(_) => 4,
         Value::Struct(_) => return None,
-        _ => core::mem::size_of::<usize>(),
+        _ => native,
     })
 }
 
@@ -2348,6 +2444,25 @@ mod gc_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clearing_an_element_that_points_at_a_variable_leaves_the_null_pointer() {
+        let mut heap = Heap::new();
+        let pointer = Value::ByRef(crate::value::Location::Local { frame: 0, slot: 0 });
+        let array = heap.alloc_array(alloc::vec![pointer.clone(), Value::NativeInt(5)]);
+        let inner = Value::Struct(alloc::vec![pointer, Value::Int32(7)].into_boxed_slice());
+        let structs = heap.alloc_array(alloc::vec![inner]);
+        assert!(heap.clear_range(array, 0, 2));
+        assert!(heap.clear_range(structs, 0, 1));
+        assert_eq!((heap.array_get(array, 0), heap.array_get(array, 1)), (Some(Value::NativeInt(0)), Some(Value::NativeInt(0))));
+        assert_eq!(heap.array_get(structs, 0), Some(Value::Struct(alloc::vec![Value::NativeInt(0), Value::Int32(0)].into_boxed_slice())));
+    }
+
+    #[test]
+    fn a_native_int_element_is_as_wide_as_the_targets_native_int() {
+        assert_eq!(value_storage_width_at(&Value::NativeInt(0), 4), Some(4));
+        assert_eq!(value_storage_width_at(&Value::NativeInt(0), 8), Some(8));
+    }
 
     /// The WTF-8 byte forms, taken from the encoding rules rather than from the encoder under test --
     /// an expectation produced by the thing under test proves only that it is self-consistent.

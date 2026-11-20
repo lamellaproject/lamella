@@ -31,7 +31,8 @@ impl Language {
     /// or a `.rs` is asking two questions at once -- which files this verb takes, and where theirs
     /// is handled. Naming only the first answers half of it and reads as the second.
     fn of(path: &Path) -> Result<Language, String> {
-        match path.extension().and_then(|extension| extension.to_str()) {
+        // Match the language after folding the extension's ASCII letters to lowercase.
+        match path.extension().and_then(|extension| extension.to_str()).map(str::to_ascii_lowercase).as_deref() {
             Some("cs") => Ok(Language::CSharp),
             Some("py") => Ok(Language::Python),
             Some("js") => Ok(Language::JavaScript),
@@ -72,8 +73,8 @@ Arguments:
   <args>...  The program's own arguments. Everything after -- goes to the program unread.
 
 Options:
-  --device <device>               Run a C# program on the board at <device>, a run target ID that
-                                  `lamella devices` prints. Default: this computer.
+  --device <device>               Run a C# or Python program on the board at <device>, a run
+                                  target ID that `lamella devices` prints. Default: this computer.
   --ref-dir <folder>              The class library's folder, which holds corlib.dll and the
                                   libraries a C# program is compiled against. Default:
                                   LAMELLA_REF_DIR.
@@ -109,8 +110,13 @@ Details:
   With --device, the board is sent a .lmli image for its resident interpreter firmware: the program
   with the corlib and the libraries it was compiled against, System.Device.Gpio among them, keeping
   only what Main reaches. A board that already stores exactly this program is sent nothing. On the
-  board, threads, locks and blocking calls such as a socket's work as they do on this computer. A
-  Python or JavaScript program runs on this computer only.
+  board, threads, locks and blocking calls such as a socket's work as they do on this computer.
+
+  A Python program runs with --device on a board whose Lamella firmware runs Python: it is sent as
+  a .lpyc bundle, with every module it imports, and its exit code is the one `python` gives it. A
+  board reads its USB while the program prints, sleeps or waits on the network, so a program that
+  does none of those is not taken back until it does. A JavaScript program runs on this computer
+  only.
 
   A project built with the Lamella SDK names both folders for you.
 
@@ -315,9 +321,17 @@ fn seed() -> u64 {
         .map_or(1, |since| since.as_nanos() as u64)
 }
 
-/// Run on a board in a build that can, and name the missing feature in one that cannot.
-#[cfg(feature = "bake")]
+/// Run on a board: a Python program in every build, since a bundle is not baked, and a C# program in
+/// a build that can bake it, the missing feature named in one that cannot.
 fn run_on_target(path: &Path, target: &str, folders: &Folders) -> Ended {
+    if crate::python_on_device::is_python(path) {
+        return crate::attach::run_python_on_target(path, target);
+    }
+    run_csharp_on_target(path, target, folders)
+}
+
+#[cfg(feature = "bake")]
+fn run_csharp_on_target(path: &Path, target: &str, folders: &Folders) -> Ended {
     crate::attach::run_on_target(path, target, folders)
 }
 
@@ -352,16 +366,17 @@ pub(crate) fn run_built_on_target(
     _first_line: impl FnOnce(u16) -> String,
     folders: &Folders,
 ) -> Ended {
-    run_on_target(path, target, folders)
+    run_csharp_on_target(path, target, folders)
 }
 
 #[cfg(not(feature = "bake"))]
-fn run_on_target(_path: &Path, _target: &str, _folders: &Folders) -> Ended {
+fn run_csharp_on_target(_path: &Path, _target: &str, _folders: &Folders) -> Ended {
     eprintln!(
-        "lamella run: this build cannot run a program on a board.\n\n\
+        "lamella run: this build cannot run a C# program on a board.\n\n\
          Doing so bakes it into an image first, which needs the `bake` feature:\n\
          \x20   cargo build -p lamella-cli --features bake\n\n\
-         Without a --device this build runs the program on THIS machine, which needs nothing."
+         Without a --device this build runs the program on THIS machine, which needs nothing. A Python\n\
+         program runs on a board in this build."
     );
     Ended::Failed
 }
@@ -583,69 +598,27 @@ fn python_run(path: &Path, source: &str, board: Option<&str>) -> Result<HostRun,
     let mut model = lamella_py_runtime::ObjectModel::new(Vec::new(), 16 * 1024 * 1024);
     model.set_clock(host_wall_ns, host_monotonic_ns, host_sleep_ns);
     let outcome = lamella_py_runtime::run_bundle(bundle, &mut model);
-    let stdout = model.take_stdout();
-    let mut stderr = model.take_stderr();
-    let ended = match outcome {
-        Ok(_) => Ended::Program(0),
-        Err(trap) => {
-            let (ended, said) = python_ending(&mut model, &trap);
-            stderr.push_str(&said);
-            ended
-        }
+    let (ended, said) = match outcome {
+        Ok(_) => (Ended::Program(0), String::new()),
+        Err(trap) => python_ending(&mut model, &trap),
     };
+    let stdout = model.take_stdout();
+    let stderr = model.take_stderr() + &said;
     Ok(HostRun { stdout, stderr, ended })
 }
 
 /// How a Python program a trap stopped ended, and what is said about it on standard error.
 ///
 /// **`SystemExit` IS AN EXIT, NOT A FAILURE**: it is what `sys.exit` raises, and its code is the
-/// program's own (see [`system_exit`]). Any other exception nothing caught is 1, reported as
-/// CPython's last line reports it, its type and its message.
+/// program's own. Any other exception nothing caught is 1, reported as CPython's last line reports
+/// it, its type and its message. The runtime decides it ([`lamella_py_runtime::trapped_end`]), for
+/// this machine and every board alike.
 fn python_ending(
     model: &mut lamella_py_runtime::ObjectModel,
     trap: &lamella_py_runtime::Trap,
 ) -> (Ended, String) {
-    let Some(exception) = model.take_pending_exception() else {
-        return (Ended::Uncaught, format!("{trap:?}\n"));
-    };
-    let Some(name) = model.exception_type_name(exception).map(str::to_owned) else {
-        return (Ended::Uncaught, format!("{trap:?}\n"));
-    };
-    if name == "SystemExit" {
-        return system_exit(model, exception);
-    }
-    match model.exception_message(exception).filter(|message| !message.is_empty()) {
-        Some(message) => (Ended::Uncaught, format!("{name}: {message}\n")),
-        None => (Ended::Uncaught, format!("{name}\n")),
-    }
-}
-
-/// The ending a `SystemExit` asks for, as Python's documentation gives it: no argument, or `None`,
-/// is 0; an integer is that code; anything else is printed on standard error, and is 1.
-///
-/// An integer outside the 32 bits an exit code carries is printed and is 1 as well.
-fn system_exit(
-    model: &mut lamella_py_runtime::ObjectModel,
-    exception: lamella_py_runtime::Value,
-) -> (Ended, String) {
-    let args = model
-        .getattr(exception, "args", &mut lamella_py_runtime::InlineCache::default())
-        .ok();
-    let elements = args.and_then(|args| model.seq_elements(args)).unwrap_or_default();
-    let code = match (elements.as_slice(), args) {
-        ([], _) => return (Ended::Program(0), String::new()),
-        ([one], _) => *one,
-        (_, Some(tuple)) => tuple,
-        (_, None) => return (Ended::Program(1), String::new()),
-    };
-    if code.is_none() {
-        return (Ended::Program(0), String::new());
-    }
-    if let Some(number) = code.as_int().and_then(|number| i32::try_from(number).ok()) {
-        return (Ended::Program(number), String::new());
-    }
-    let text = model.display(code).unwrap_or_else(|_| model.repr(code));
-    (Ended::Program(1), format!("{text}\n"))
+    let end = lamella_py_runtime::trapped_end(model, &format!("{trap:?}"));
+    (if end.exited { Ended::Program(end.code) } else { Ended::Uncaught }, end.said)
 }
 
 /// Compile a Python program to a bundle: the entry module plus every module its imports reach.
@@ -1393,6 +1366,7 @@ fn elf_refusal(tier: crate::flash::Tier) -> Option<String> {
 /// The name of each artifact this verb can produce, named once so the rule about those names is
 /// asked of the names the code uses rather than of a copy of them.
 const BAKED_FLASH_IMAGE: &str = "baked flash image";
+#[cfg(any(test, not(feature = "bake")))]
 const ASSEMBLY: &str = "assembly";
 const PYTHON_BUNDLE: &str = "Python bundle";
 
@@ -1960,6 +1934,7 @@ fn compile_project_against(
         unsafe_code: project.allow_unsafe,
         file_based: project.file_based,
         defines: project.defines.iter().map(|symbol| symbol.as_str().into()).collect(),
+        version: project.lang_version.unwrap_or_default(),
         ..Default::default()
     };
     let compiled = lamella_assemble::compile_sources_with(
@@ -2054,6 +2029,15 @@ fn render_diagnostics(
 }
 
 /// Compile a Python program to the bundle a device runs.
+/// The bundle `lamella build <path> --board <board>` writes, for a board that runs Python: the bytes a
+/// `--device` route sends it.
+///
+/// # Errors
+/// A program that does not compile, or a bundle that does not read back.
+pub(crate) fn python_bundle(path: &Path, source: &str, board: Option<&str>) -> Result<Vec<u8>, String> {
+    build_python(path, source, board).map(|built| built.bytes)
+}
+
 fn build_python(path: &Path, source: &str, board: Option<&str>) -> Result<Built, String> {
     let bundle = compile_python(path, source, board)?;
     let modules = bundle.modules.len();
@@ -2117,14 +2101,12 @@ fn no_carrier_refusal(
 /// **THIS IS THE HALF `fit` CANNOT REACH ON ITS OWN.** `lamella fit` wants an image size, and this
 /// is the verb that produces one; without it the question can be asked only by somebody who
 /// already knows the answer.
-struct FitAnswer<'a> {
-    /// The board the build was for.
-    board_id: &'a str,
-    /// The verdict about the artifact's size on it.
+struct FitAnswer {
+    /// The verdict about the artifact's size on the board the build was for.
     verdict: lamella_bsp_gen::fit::FitVerdict,
 }
 
-impl FitAnswer<'_> {
+impl FitAnswer {
     /// By how many bytes the artifact is too large for the board, when it is.
     fn over(&self) -> Option<i64> {
         match self.verdict.flash_fit {
@@ -2152,14 +2134,14 @@ impl FitAnswer<'_> {
 /// # Errors
 /// A board that resolves to no part row, an artifact too large to measure, and a board with no
 /// firmware for the artifact to be loaded into.
-fn fit_of<'a>(board_id: &'a str, built: &Built) -> Result<FitAnswer<'a>, String> {
+fn fit_of(board_id: &str, built: &Built) -> Result<FitAnswer, String> {
     let (board, part) = catalog::resolve(board_id).map_err(|error| format!("lamella build: {error}"))?;
     let image_bytes = i64::try_from(built.bytes.len())
         .map_err(|_| "lamella build: the artifact is too large to compare against a budget".to_owned())?;
     if let Some(refusal) = no_carrier_refusal(board_id, &board, built) {
         return Err(refusal);
     }
-    Ok(FitAnswer { board_id, verdict: fit(&board, &part, image_bytes) })
+    Ok(FitAnswer { verdict: fit(&board, &part, image_bytes) })
 }
 
 /// Read a source file and decide its language.
@@ -2414,6 +2396,108 @@ mod tests {
         let said = python("print('first')\nimport sys\nsys.exit('bye')\n");
         assert_eq!((said.ended, said.stdout.as_str(), said.stderr.as_str()), (Ended::Program(1), "first\n", "bye\n"));
         assert_eq!(python("print('done')\n").ended, Ended::Program(0));
+    }
+
+    /// **`SystemExit` IS THE BUILT-IN CLASS AND ITS SUBCLASSES, NOT A NAME**: a program's own class
+    /// called `SystemExit` is an exception nothing caught, a subclass of the built-in one exits with its
+    /// code, and an integer code past the interpreter's small integers is still that integer.
+    #[test]
+    fn system_exit_is_the_built_in_class_and_its_code_any_integer() {
+        let own = python("class SystemExit(Exception):\n    pass\nraise SystemExit()\n");
+        assert_eq!((own.ended, own.stderr.as_str()), (Ended::Uncaught, "SystemExit\n"));
+        let sub = python("class ExitOK(SystemExit):\n    pass\nraise ExitOK(7)\n");
+        assert_eq!((sub.ended, sub.stderr.as_str()), (Ended::Program(7), ""));
+        let big = python("raise SystemExit(1073741824)\n");
+        assert_eq!((big.ended, big.stderr.as_str()), (Ended::Program(1_073_741_824), ""));
+    }
+
+    /// **A `SystemExit`'s CODE IS ITS `code` ATTRIBUTE**, as CPython 3.14's `python` reads it: a code
+    /// the program assigned wins over the arguments the exception was made with, the program reads the
+    /// code it would end with, and a subclass whose `__init__` passes nothing up ends with 0. Each
+    /// expectation is CPython 3.14.6's for the same program.
+    #[test]
+    fn a_system_exits_code_is_its_code_attribute() {
+        let cases = [
+            ("e = SystemExit('failure')\ne.code = 0\nraise e\n", Ended::Program(0), "", ""),
+            ("e = SystemExit(0)\ne.code = 7\nraise e\n", Ended::Program(7), "", ""),
+            ("e = SystemExit()\ne.code = 5\nraise e\n", Ended::Program(5), "", ""),
+            (
+                "class AppExit(SystemExit):\n    def __init__(self, msg, rc):\n        super().__init__(msg)\n        \
+                 self.code = rc\nraise AppExit('shutting down', 3)\n",
+                Ended::Program(3),
+                "",
+                "",
+            ),
+            ("e = SystemExit(2)\ne.code = 'gone'\nraise e\n", Ended::Program(1), "", "gone\n"),
+            (
+                "e = SystemExit(4)\nprint(e.code)\nprint(SystemExit().code)\nprint(SystemExit(1, 2).code)\n",
+                Ended::Program(0),
+                "4\nNone\n(1, 2)\n",
+                "",
+            ),
+            ("class Quiet(SystemExit):\n    def __init__(self, rc):\n        pass\nraise Quiet(5)\n", Ended::Program(0), "", ""),
+        ];
+        for (source, ended, stdout, stderr) in cases {
+            let run = python(source);
+            assert_eq!((run.ended, run.stdout.as_str(), run.stderr.as_str()), (ended, stdout, stderr), "{source}");
+        }
+    }
+
+    /// **A `SystemExit`'s CODE IS WHAT ITS `__init__` LAST SET, NOT ITS `args`**: `__init__` sets the
+    /// code from the arguments it is given, and sets nothing when given none; a later change to `args`
+    /// leaves the code alone; and a class attribute named `code` on a subclass is what the program and
+    /// its exit read. Each expectation is CPython 3.14.6's for the same program.
+    #[test]
+    fn a_system_exits_code_is_set_by_its_init_and_not_read_from_its_args() {
+        let cases = [
+            ("e = SystemExit(5)\ne.args = ()\nraise e\n", Ended::Program(5), "", ""),
+            ("e = SystemExit(0)\ne.args = ('failure',)\nraise e\n", Ended::Program(0), "", ""),
+            ("e = SystemExit(7)\ne.args = (0,)\nprint(e.code)\nraise e\n", Ended::Program(7), "7\n", ""),
+            ("e = SystemExit(0)\ne.code = 7\ne.__init__(0)\nraise e\n", Ended::Program(0), "", ""),
+            ("e = SystemExit(7)\ne.code = 0\ne.__init__(5)\nprint(e.code)\nraise e\n", Ended::Program(5), "5\n", ""),
+            ("e = SystemExit(7)\ne.code = 0\ne.__init__()\nprint(e.code)\nraise e\n", Ended::Program(0), "0\n", ""),
+            ("e = SystemExit(1, 2)\ne.__init__(3)\nprint(e.code)\nraise e\n", Ended::Program(3), "3\n", ""),
+            ("class E(SystemExit):\n    pass\ne = E(3)\ne.args = ()\nraise e\n", Ended::Program(3), "", ""),
+            ("e = SystemExit(4)\ne.__init__(1, 2)\nprint(e.code)\n", Ended::Program(0), "(1, 2)\n", ""),
+            ("class Exit(SystemExit):\n    code = 9\ne = Exit(0)\nprint(e.code)\nraise e\n", Ended::Program(9), "9\n", ""),
+        ];
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter_map(|&(source, ended, stdout, stderr)| {
+                let run = python(source);
+                let got = (run.ended, run.stdout.as_str(), run.stderr.as_str());
+                (got != (ended, stdout, stderr)).then(|| format!("{source:?}: {got:?}, CPython {:?}", (ended, stdout, stderr)))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{} of {} end otherwise than CPython:\n{}", wrong.len(), cases.len(), wrong.join("\n"));
+    }
+
+    /// **A `SystemExit`'s CODE IS READ AS THE PROGRAM READS IT**: a `code` property on a subclass runs
+    /// its getter for the exit as it does for the program, and a getter that raises ends the run with
+    /// 1, the exception's text on standard error. Each expectation is CPython 3.14.6's.
+    #[test]
+    fn a_system_exits_code_is_read_as_the_program_reads_it() {
+        let property = "class Exit(SystemExit):\n    @property\n    def code(self):\n        return 7\n";
+        let cases = [
+            (format!("{property}e = Exit(0)\nprint(e.code)\nraise e\n"), Ended::Program(7), "7\n", ""),
+            (
+                "class Exit(SystemExit):\n    @property\n    def code(self):\n        raise ValueError('no code')\n\
+                 raise Exit(0)\n"
+                    .to_string(),
+                Ended::Program(1),
+                "",
+                "0\n",
+            ),
+        ];
+        let wrong: Vec<String> = cases
+            .iter()
+            .filter_map(|(source, ended, stdout, stderr)| {
+                let run = python(source);
+                let got = (run.ended, run.stdout.as_str(), run.stderr.as_str());
+                (got != (*ended, *stdout, *stderr)).then(|| format!("{source:?}: {got:?}, CPython {:?}", (ended, stdout, stderr)))
+            })
+            .collect();
+        assert!(wrong.is_empty(), "{} of {} end otherwise than CPython:\n{}", wrong.len(), cases.len(), wrong.join("\n"));
     }
 
     /// **AN EXCEPTION NOTHING CAUGHT IS 1, REPORTED AS PYTHON'S LAST LINE REPORTS IT**, and what
@@ -2761,6 +2845,19 @@ mod tests {
         );
     }
 
+    /// Mixed-case extensions reach the same language branches after ASCII case folding.
+    #[test]
+    fn an_extension_names_its_language_whatever_its_case() {
+        for (name, language) in [
+            ("Blink.CS", Language::CSharp),
+            ("MAIN.PY", Language::Python),
+            ("Main.Py", Language::Python),
+            ("APP.JS", Language::JavaScript),
+        ] {
+            assert_eq!(Language::of(Path::new(name)), Ok(language), "{name}");
+        }
+    }
+
     #[test]
     fn the_language_comes_from_the_extension_and_an_unknown_one_names_the_known_ones() {
         assert_eq!(Language::of(Path::new("Program.cs")), Ok(Language::CSharp));
@@ -3060,12 +3157,11 @@ mod tests {
             !RUN_USAGE.contains("would FIT"),
             "`run --board` does not answer fit -- `build --board` does:\n{RUN_USAGE}"
         );
-        for (flag, language) in [("--device <device>", "C#")] {
+        for (flag, languages) in [("--device <device>", ["C#", "Python"])] {
             let entry = entry(RUN_USAGE, flag);
-            assert!(
-                entry.contains(language),
-                "`{flag}` serves {language} only today and the usage does not say so:\n{entry}"
-            );
+            for language in languages {
+                assert!(entry.contains(language), "`{flag}` serves {language} and the usage does not say so:\n{entry}");
+            }
         }
     }
 }

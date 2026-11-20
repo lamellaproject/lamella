@@ -19,8 +19,8 @@
     <ItemGroup>
       <_LamellaRhuRoute Include="@(_LamellaRhuRouteFound)" Condition="'%(Identity)' != 'fault'" />
       <_LamellaDeviceRouteArgument Include="@(_LamellaRhuRoute)">
-        <Argument>--route &quot;%(_LamellaRhuRoute.Identity):%(_LamellaRhuRoute.Board):%(_LamellaRhuRoute.Machine):%(_LamellaRhuRoute.Available)&quot;</Argument>
-        <Argument Condition="'%(_LamellaRhuRoute.Identity)' == 'probe'">--route &quot;probe:%(_LamellaRhuRoute.Board)&quot;</Argument>
+        <Route>%(_LamellaRhuRoute.Identity):%(_LamellaRhuRoute.Board):%(_LamellaRhuRoute.Machine):%(_LamellaRhuRoute.Available)</Route>
+        <Route Condition="'%(_LamellaRhuRoute.Identity)' == 'probe'">probe:%(_LamellaRhuRoute.Board)</Route>
       </_LamellaDeviceRouteArgument>
     </ItemGroup>
     <PropertyGroup>
@@ -31,23 +31,28 @@
 
   <Target Name="_LamellaListAttached" DependsOnTargets="_LamellaToolFault;_LamellaToolExecutable;_LamellaPrepareRhuDeviceList">
     <PropertyGroup>
-      <_LamellaListOptions>--framework &quot;$(TargetFramework)&quot;</_LamellaListOptions>
-      <_LamellaListOptions Condition="'$(LamellaTargetBoard)' != ''">$(_LamellaListOptions) --board &quot;$(LamellaTargetBoard)&quot;</_LamellaListOptions>
-      <_LamellaListOptions Condition="'$(_LamellaRhuEmulatorBoard)' == 'true'">$(_LamellaListOptions) --emulator-board</_LamellaListOptions>
-      <_LamellaListOptions Condition="'$(_LamellaRhuBoardFromDevice)' == 'true'">$(_LamellaListOptions) --qualified</_LamellaListOptions>
-      <_LamellaListOptions>$(_LamellaListOptions) @(_LamellaDeviceRouteArgument->'%(Argument)', ' ')</_LamellaListOptions>
       <_LamellaListExit>-1</_LamellaListExit>
     </PropertyGroup>
+    <ItemGroup>
+      <_LamellaListArgument Include="devices" />
+      <_LamellaListArgument Include="$(_LamellaDevicesFile)" Option="--msbuild" />
+      <_LamellaListArgument Include="$(TargetFramework)" Option="--framework" />
+      <_LamellaListArgument Include="$(LamellaTargetBoard)" Option="--board" Condition="'$(LamellaTargetBoard)' != ''" />
+      <_LamellaListArgument Include="--emulator-board" Condition="'$(_LamellaRhuEmulatorBoard)' == 'true'" />
+      <_LamellaListArgument Include="--qualified" Condition="'$(_LamellaRhuBoardFromDevice)' == 'true'" />
+      <_LamellaListArgument Include="@(_LamellaDeviceRouteArgument->'%(Route)')" Option="--route" />
+    </ItemGroup>
     <MakeDir Condition="'$(_LamellaToolFault)' == ''" Directories="$(_LamellaIntermediateDir)" />
     <Delete Files="$(_LamellaDevicesFile)" />
-    <Exec Condition="'$(_LamellaToolFault)' == '' and '$(_LamellaRhuRouteFault)' == ''"
-          Command="&quot;$(_LamellaTool)&quot; devices --msbuild &quot;$(_LamellaDevicesFile)&quot; $(_LamellaListOptions)"
-          EnvironmentVariables="LAMELLA_REF_DIR=$(LamellaRefDir);LAMELLA_RUNTIME_SUPPORT_DIR=$(LamellaRuntimeSupportDir)"
-          IgnoreExitCode="true" IgnoreStandardErrorWarningFormat="true" ConsoleToMSBuild="true"
-          EchoOff="true" StandardOutputImportance="low" StandardErrorImportance="low">
+    <LamellaRunProgram Condition="'$(_LamellaToolFault)' == '' and '$(_LamellaRhuRouteFault)' == ''"
+                       Program="$(_LamellaTool)"
+                       Arguments="@(_LamellaListArgument)"
+                       EnvironmentVariables="LAMELLA_REF_DIR=$(LamellaRefDir);LAMELLA_RUNTIME_SUPPORT_DIR=$(LamellaRuntimeSupportDir)"
+                       IgnoreExitCode="true" IgnoreStandardErrorWarningFormat="true" ConsoleToMSBuild="true"
+                       EchoOff="true" StandardOutputImportance="low" StandardErrorImportance="low">
       <Output TaskParameter="ExitCode" PropertyName="_LamellaListExit" />
       <Output TaskParameter="ConsoleOutput" ItemName="_LamellaListOutput" />
-    </Exec>
+    </LamellaRunProgram>
     <PropertyGroup Condition="'$(_LamellaListExit)' != '0' and '$(_LamellaListExit)' != '-1'">
       <_LamellaListFailure>@(_LamellaListOutput, '%0A')</_LamellaListFailure>
       <_LamellaListFailure Condition="'$(_LamellaListFailure)' == ''">The device list could not be read (exit code $(_LamellaListExit)).</_LamellaListFailure>
@@ -271,15 +276,16 @@
 
        Anywhere else: the lamella tool, given the built assembly, the class library's folder and the
        runtime support archives' folder, and the device dotnet run chose, if any, or for a file-based
-       app the lone device; the device local is this computer. The backslashes that end a folder are
-       doubled, so that they do not escape the quote that closes it. With a device, the board the
+       app the lone device; the device local is this computer. With a device, the board the
        project names goes too, and the tool sends the program only when the board that answers is
        that one: the device list names each device by its USB identity alone, so it cannot say which
        board is behind a bridge. The tool finds the program's own libraries beside the assembly, where
        the build copies them.
 
        Either way the bare double dash ends the tool's arguments, so anything dotnet run appends after
-       it is the program's. -->
+       it is the program's. LamellaRunProgram writes the arguments as one line, by the rule it starts a
+       program by, so the tool reads each path back as it is, a double quote or a backslash in it
+       included. -->
   <Target Name="_LamellaComputeRunArguments"
           DependsOnTargets="_LamellaRunDeviceChosen;_LamellaProbeRun;_LamellaInterpreterRun"
           Condition="'$(TargetFrameworkIdentifier)' == 'Lamella'" />
@@ -304,9 +310,19 @@
   </Target>
 
   <Target Name="_LamellaProbeRun" DependsOnTargets="_LamellaProbeRunImage;_LamellaPrepareFlashRegions" Condition="'$(_LamellaRunNative)' == '1'">
+    <ItemGroup>
+      <_LamellaRunArgument Remove="@(_LamellaRunArgument)" />
+      <_LamellaRunArgument Include="run" />
+      <_LamellaRunArgument Include="$(_LamellaRunManifest)" Option="--manifest" />
+      <_LamellaRunArgument Include="@(_LamellaRunDevice->'%(Serial)')" Option="--probe" />
+      <_LamellaRunArgument Include="@(LamellaFlashRegion->'%(FullPath)')" Option="--region" />
+      <_LamellaRunArgument Include="--" />
+    </ItemGroup>
+    <LamellaRunProgram Program="$(_LamellaTool)" Arguments="@(_LamellaRunArgument)" Start="false">
+      <Output TaskParameter="ArgumentLine" PropertyName="RunArguments" />
+    </LamellaRunProgram>
     <PropertyGroup>
       <RunCommand>$(_LamellaTool)</RunCommand>
-      <RunArguments>run --manifest &quot;$(_LamellaRunManifest)&quot; --probe &quot;@(_LamellaRunDevice->'%(Serial)')&quot;@(LamellaFlashRegion->' --region &quot;%(FullPath)&quot;', '') --</RunArguments>
       <RunWorkingDirectory>$(MSBuildProjectDirectory)</RunWorkingDirectory>
     </PropertyGroup>
   </Target>
@@ -314,13 +330,22 @@
   <Target Name="_LamellaInterpreterRun" Condition="'$(_LamellaRunNative)' != '1'">
     <PropertyGroup>
       <_LamellaRunDeviceId Condition="'$(_LamellaRunDeviceId)' == ''">$(Device)</_LamellaRunDeviceId>
-      <_LamellaRefDirArgument>$([System.Text.RegularExpressions.Regex]::Replace('$(LamellaRefDir)', '(\\+)$', '$1$1'))</_LamellaRefDirArgument>
-      <_LamellaRuntimeSupportDirArgument>$([System.Text.RegularExpressions.Regex]::Replace('$(LamellaRuntimeSupportDir)', '(\\+)$', '$1$1'))</_LamellaRuntimeSupportDirArgument>
+    </PropertyGroup>
+    <ItemGroup>
+      <_LamellaRunArgument Remove="@(_LamellaRunArgument)" />
+      <_LamellaRunArgument Include="run" />
+      <_LamellaRunArgument Include="$(TargetPath)" Option="--built" />
+      <_LamellaRunArgument Include="$(LamellaRefDir)" Option="--ref-dir" />
+      <_LamellaRunArgument Include="$(LamellaRuntimeSupportDir)" Option="--runtime-support-dir" />
+      <_LamellaRunArgument Include="$(_LamellaRunDeviceId)" Option="--device" Condition="'$(_LamellaRunDeviceId)' != '' and '$(_LamellaRunDeviceId)' != 'local'" />
+      <_LamellaRunArgument Include="$(LamellaTargetBoard)" Option="--board" Condition="'$(_LamellaRunDeviceId)' != '' and '$(_LamellaRunDeviceId)' != 'local' and '$(LamellaTargetBoard)' != ''" />
+      <_LamellaRunArgument Include="--" />
+    </ItemGroup>
+    <LamellaRunProgram Program="$(_LamellaTool)" Arguments="@(_LamellaRunArgument)" Start="false">
+      <Output TaskParameter="ArgumentLine" PropertyName="RunArguments" />
+    </LamellaRunProgram>
+    <PropertyGroup>
       <RunCommand>$(_LamellaTool)</RunCommand>
-      <RunArguments>run --built &quot;$(TargetPath)&quot; --ref-dir &quot;$(_LamellaRefDirArgument)&quot; --runtime-support-dir &quot;$(_LamellaRuntimeSupportDirArgument)&quot;</RunArguments>
-      <RunArguments Condition="'$(_LamellaRunDeviceId)' != '' and '$(_LamellaRunDeviceId)' != 'local'">$(RunArguments) --device &quot;$(_LamellaRunDeviceId)&quot;</RunArguments>
-      <RunArguments Condition="'$(_LamellaRunDeviceId)' != '' and '$(_LamellaRunDeviceId)' != 'local' and '$(LamellaTargetBoard)' != ''">$(RunArguments) --board &quot;$(LamellaTargetBoard)&quot;</RunArguments>
-      <RunArguments>$(RunArguments) --</RunArguments>
     </PropertyGroup>
   </Target>
 
@@ -359,9 +384,20 @@
   </Target>
 
   <Target Name="_LamellaRhuProbeRun" DependsOnTargets="_LamellaProbeRunImage;_LamellaPrepareFlashRegions" Condition="'$(_LamellaRunRoute)' == 'probe'">
+    <ItemGroup>
+      <_LamellaRunArgument Remove="@(_LamellaRunArgument)" />
+      <_LamellaRunArgument Include="run" />
+      <_LamellaRunArgument Include="$(_LamellaRunManifest)" Option="--manifest" />
+      <_LamellaRunArgument Include="@(_LamellaRunDevice->'%(Serial)')" Option="--probe" />
+      <_LamellaRunArgument Include="--no-banner" />
+      <_LamellaRunArgument Include="@(LamellaFlashRegion->'%(FullPath)')" Option="--region" />
+      <_LamellaRunArgument Include="--" />
+    </ItemGroup>
+    <LamellaRunProgram Program="$(_LamellaTool)" Arguments="@(_LamellaRunArgument)" Start="false">
+      <Output TaskParameter="ArgumentLine" PropertyName="RunArguments" />
+    </LamellaRunProgram>
     <PropertyGroup>
       <RunCommand>$(_LamellaTool)</RunCommand>
-      <RunArguments>run --manifest &quot;$(_LamellaRunManifest)&quot; --probe &quot;@(_LamellaRunDevice->'%(Serial)')&quot; --no-banner@(LamellaFlashRegion->' --region &quot;%(FullPath)&quot;', '') --</RunArguments>
       <RunWorkingDirectory>$(MSBuildProjectDirectory)</RunWorkingDirectory>
     </PropertyGroup>
   </Target>
@@ -384,8 +420,22 @@
     <PropertyGroup>
       <_LamellaRhuEmulator>$([System.String]::Copy('$(RunCommand)').Trim().Trim('"'))</_LamellaRhuEmulator>
       <_LamellaRhuEmulatorArguments>$(RunArguments)</_LamellaRhuEmulatorArguments>
+    </PropertyGroup>
+    <ItemGroup>
+      <_LamellaRunArgument Remove="@(_LamellaRunArgument)" />
+      <_LamellaRunArgument Include="run" />
+      <_LamellaRunArgument Include="$(_LamellaRhuEmulator)" Option="--emulator" />
+      <_LamellaRunArgument Include="$(_LamellaRunDeviceId)" Option="--device" />
+      <_LamellaRunArgument Include="$(_LamellaRunBoard)" Option="--board" />
+      <_LamellaRunArgument Include="--no-banner" />
+      <_LamellaRunArgument Include="--" />
+    </ItemGroup>
+    <LamellaRunProgram Program="$(_LamellaTool)" Arguments="@(_LamellaRunArgument)" Start="false">
+      <Output TaskParameter="ArgumentLine" PropertyName="_LamellaRunToolArguments" />
+    </LamellaRunProgram>
+    <PropertyGroup>
       <RunCommand>$(_LamellaTool)</RunCommand>
-      <RunArguments>run --emulator &quot;$(_LamellaRhuEmulator)&quot; --device &quot;$(_LamellaRunDeviceId)&quot; --board &quot;$(_LamellaRunBoard)&quot; --no-banner -- $(_LamellaRhuEmulatorArguments)</RunArguments>
+      <RunArguments>$(_LamellaRunToolArguments) $(_LamellaRhuEmulatorArguments)</RunArguments>
     </PropertyGroup>
   </Target>
 

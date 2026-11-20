@@ -18,6 +18,12 @@ namespace Lamella.Generated
         public const int OSPEEDR_WIDTH = 32;
         public const uint PUPDR_OFF = 0xC;
         public const int PUPDR_WIDTH = 32;
+        public const uint IDR_OFF = 0x10;
+        public const int IDR_WIDTH = 32;
+        public const uint ODR_OFF = 0x14;
+        public const int ODR_WIDTH = 32;
+        public const uint BSRR_OFF = 0x18;
+        public const int BSRR_WIDTH = 32;
         public const uint AFRL_OFF = 0x20;
         public const int AFRL_WIDTH = 32;
         public const uint AFRH_OFF = 0x24;
@@ -34,9 +40,15 @@ namespace Lamella.Generated
         public const uint AFRH_AFSEL9_LSB = 4;
 
         // -- block constants --
+        public const uint MODER_MODE_INPUT = 0;
+        public const uint MODER_MODE_OUTPUT = 1;
         public const uint MODER_MODE_AF = 2;
+        public const uint MODER_MODE_ANALOG = 3;
+        public const uint MODER_MODE_RESET = 0;
         public const uint OTYPER_OPEN_DRAIN = 1;
         public const uint OSPEEDR_VERY_HIGH = 3;
+        public const uint PUPDR_NONE = 0;
         public const uint PUPDR_PULL_UP = 1;
+        public const uint PUPDR_PULL_DOWN = 2;
     }
 }

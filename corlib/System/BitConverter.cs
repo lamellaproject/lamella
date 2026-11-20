@@ -16,8 +16,22 @@ namespace System
 #if LAMELLA_SURFACE_FLOAT
         [Lamella.Runtime.RuntimeProvided] public static long DoubleToInt64Bits(double value) { return 0; }
         [Lamella.Runtime.RuntimeProvided] public static double Int64BitsToDouble(long value) { return 0; }
+#if LAMELLA_SURFACE_NETCORE_2_0
+        /// <summary>Returns the bits of a single-precision value as a 32-bit integer.</summary>
+        /// <param name="value">The value to convert.</param>
+        /// <returns>The IEEE 754 binary32 encoding of <paramref name="value"/> (ECMA-335 6th ed
+        /// I.12.1: a float32 is a 32-bit IEC 60559:1989 value).</returns>
+        [Lamella.Runtime.RuntimeProvided] public static int SingleToInt32Bits(float value) { return 0; }
+
+        /// <summary>Returns the single-precision value whose bits are a 32-bit integer.</summary>
+        /// <param name="value">The IEEE 754 binary32 encoding (ECMA-335 6th ed I.12.1: a float32 is a
+        /// 32-bit IEC 60559:1989 value).</param>
+        /// <returns>The value <paramref name="value"/> encodes.</returns>
+        [Lamella.Runtime.RuntimeProvided] public static float Int32BitsToSingle(int value) { return 0; }
+#else
         [Lamella.Runtime.RuntimeProvided] internal static int SingleToInt32Bits(float value) { return 0; }
         [Lamella.Runtime.RuntimeProvided] internal static float Int32BitsToSingle(int value) { return 0; }
+#endif
 #endif
 
         public static byte[] GetBytes(bool value)

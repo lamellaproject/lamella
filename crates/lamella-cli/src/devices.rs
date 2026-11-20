@@ -3,7 +3,7 @@
 use crate::args::{self, Spec};
 use lamella_flash_routes::behind_probe::Behind;
 use lamella_wire::{Capabilities, Negotiated};
-use lamella_wire_host::{UsbTransport, hello_blocking};
+use lamella_wire_host::UsbTransport;
 use serde_json::{Value, json};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
@@ -856,26 +856,44 @@ pub(crate) fn raises_lines(usb: Option<(u16, u16)>) -> bool {
 /// It is opened as `--device` opens a device, by [`crate::deploy::open_named`], the one place that
 /// knows how: a second copy of that rule here would be the one a listing's caller trusts.
 fn ask(target: &str) -> Answer {
-    let mut transport = match crate::deploy::open_named(target, IDENTIFY_TIMEOUT) {
-        Ok(transport) => transport,
-        Err(why) => return Answer { board: None, status: CANNOT_OPEN, detail: why },
-    };
-    answer_of(hello_blocking(&mut transport, 1, host_caps(), IDENTIFY_TIMEOUT))
+    asked(target, &|target| crate::deploy::open_named(target, IDENTIFY_TIMEOUT))
+}
+
+/// [`ask`], of the board `opening` opens, as a deploy opens and asks one
+/// ([`lamella_wire_host::reopen::opened_and_asked`]): a board that resets under the HELLO is opened again.
+fn asked<T: lamella_wire::Transport>(target: &str, opening: &dyn Fn(&str) -> Result<T, String>) -> Answer {
+    match lamella_wire_host::reopen::opened_and_asked(target, 1, host_caps(), IDENTIFY_TIMEOUT, opening) {
+        Ok((_, hello)) => answer_of(target, hello),
+        Err(why) => Answer { board: None, status: CANNOT_OPEN, detail: why },
+    }
 }
 
 /// The board the device `target` names answers as, by its HELLO, as a run takes it to bake for that
 /// board ([`lamella_wire_host::boards::board_answering`]), or why there is none: the device could
-/// not be opened, it did not answer, or it answered as a board this build does not know.
+/// not be opened, it did not answer, it answered as a board this build does not know, or its
+/// firmware runs Python programs and no C# ones.
 ///
 /// It is opened as `--device` opens a device, by [`crate::deploy::open_named`], and asked as
-/// `--identify` asks.
+/// `--identify` asks, opened again if it resets under the HELLO.
 pub(crate) fn board_of(target: &str) -> Result<String, String> {
-    let mut transport = crate::deploy::open_named(target, IDENTIFY_TIMEOUT)?;
-    let negotiated = match hello_blocking(&mut transport, 1, host_caps(), IDENTIFY_TIMEOUT) {
+    board_from(target, &|target| crate::deploy::open_named(target, IDENTIFY_TIMEOUT))
+}
+
+/// [`board_of`], of the board `opening` opens.
+fn board_from<T: lamella_wire::Transport>(target: &str, opening: &dyn Fn(&str) -> Result<T, String>) -> Result<String, String> {
+    let (_, hello) = lamella_wire_host::reopen::opened_and_asked(target, 1, host_caps(), IDENTIFY_TIMEOUT, opening)?;
+    let negotiated = match hello {
         Ok(negotiated) => negotiated,
-        Err(error) => return Err(format!("The device {target} did not say which board it is: {}", answer_of(Err(error)).detail)),
+        Err(error) => return Err(format!("The device {target} did not say which board it is: {}", answer_of(target, Err(error)).detail)),
     };
     let model = negotiated.identity.product_model;
+    if lamella_wire_host::on_device::runs_python_only(&negotiated) {
+        return Err(format!(
+            "The device {target} answered as {}, whose firmware runs Python programs, so no C# image can be \
+             made for it.",
+            answered_as(model)
+        ));
+    }
     lamella_wire_host::boards::board_answering(model).ok_or_else(|| {
         format!(
             "The device {target} answered as {}, which is no board this build knows, so no image can be made \
@@ -894,7 +912,7 @@ pub(crate) fn answered_as(model: u16) -> String {
 }
 
 /// What the outcome of a HELLO says about the device that was asked.
-fn answer_of(hello: Result<Negotiated, lamella_wire::TransportError>) -> Answer {
+fn answer_of(target: &str, hello: Result<Negotiated, lamella_wire::TransportError>) -> Answer {
     match hello {
         Ok(negotiated) => {
             let board = answered_as(negotiated.identity.product_model);
@@ -916,10 +934,18 @@ fn answer_of(hello: Result<Negotiated, lamella_wire::TransportError>) -> Answer 
         Err(error) => Answer {
             board: None,
             status: "Offline",
-            detail: format!(
-                "no answer ({}) -- this is normal unless Lamella firmware is running on it",
-                lamella_wire_host::link_failure(error)
-            ),
+            detail: if lamella_wire_host::has_link_identity(target) {
+                format!(
+                    "no answer ({}) -- {}",
+                    lamella_wire_host::link_failure(error),
+                    lamella_wire_host::SILENT_WITH_FIRMWARE
+                )
+            } else {
+                format!(
+                    "no answer ({}) -- this is normal unless Lamella firmware is running on it",
+                    lamella_wire_host::link_failure(error)
+                )
+            },
         },
     }
 }
@@ -954,7 +980,10 @@ fn described(one: &Attached, answer: Option<&Answer>) -> String {
             if let Some(refused) = answer.filter(|answer| answer.status == BUSY) {
                 return refused.detail.clone();
             }
-            let board = answer.and_then(|answer| answer.board.as_deref()).or(named_by_usb);
+            let board = match (answer.and_then(|answer| answer.board.as_deref()), named_by_usb) {
+                (Some(said), Some(string)) if adds_a_note(string, said) => Some(string),
+                (said, string) => said.or(string),
+            };
             let bridge = one.facts.bridge_of.is_some() || is_probe_bridge(one.facts.usb);
             if board.is_some() || firmware || bridge {
                 return interpreter_description(board, bridge);
@@ -967,6 +996,12 @@ fn described(one: &Attached, answer: Option<&Answer>) -> String {
             text
         }
     }
+}
+
+/// Whether the board's name in a USB product string, `string`, is the board `said` names followed by a
+/// note on the build, as `"SAM4S Xplained Pro, bank B"` is `"SAM4S Xplained Pro"`'s.
+fn adds_a_note(string: &str, said: &str) -> bool {
+    string.strip_prefix(said).is_some_and(|note| note.starts_with(", "))
 }
 
 /// The board a row's USB product string names, when the row is a board running Lamella firmware and the
@@ -1235,8 +1270,8 @@ fn table(text: &mut String, headings: &[&str], rows: &[Vec<String>]) {
 }
 
 /// A generous host capability set to advertise on HELLO -- offering `PROFILE_CHIPID` so a target
-/// that fills its chip identity sends it. The negotiated set is this intersected with the target's,
-/// so what comes back describes the board.
+/// that fills its chip identity sends it. The negotiated set is this intersected with the target's;
+/// `--identify` prints the target's own set, which says what the board is.
 fn host_caps() -> Capabilities {
     Capabilities(
         Capabilities::PROFILE_CHIPID
@@ -1250,11 +1285,12 @@ fn host_caps() -> Capabilities {
 }
 
 /// Render a negotiated identity: the board, its target ABI, which firmware build is answering, the
-/// chip's own identity, and one line per resident runtime.
+/// chip's own identity, and one line per resident runtime
+/// ([`lamella_wire_host::describe_runtime`]).
 fn render_identity(negotiated: &Negotiated) -> String {
     let mut text = format!(
         "Lamella Link version {}, capabilities {:#010x}\n",
-        negotiated.version, negotiated.caps.0
+        negotiated.version, negotiated.target_caps.0
     );
     let identity = &negotiated.identity;
     let board = lamella_wire::product_model::name(identity.product_model)
@@ -1277,12 +1313,7 @@ fn render_identity(negotiated: &Negotiated) -> String {
         text.push_str(&format!("chip id (kind {}) {hex}\n", identity.chip_id_kind));
     }
     for surface in &identity.surfaces {
-        let v = surface.lib_version;
-        let f = surface.lib_file_version;
-        text.push_str(&format!(
-            "resident runtime: tier {} abi {} hash {:#018x} library {}.{}.{}.{} build {}.{}.{}.{}\n",
-            surface.tier, surface.abi, surface.hash, v[0], v[1], v[2], v[3], f[0], f[1], f[2], f[3]
-        ));
+        text.push_str(&format!("resident runtime: {}\n", lamella_wire_host::describe_runtime(negotiated, surface)));
     }
     if let Some((tier, field)) = negotiated.unreadable_surface_version() {
         text.push_str(&format!(
@@ -1346,6 +1377,151 @@ fn passed_over_note(passed_over: &[lamella_probe::PassedOver], all_devices: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a Pico 2 W whose firmware runs Python answers a HELLO with.
+    fn python_ack() -> lamella_wire::HelloAck {
+        let python = lamella_wire::Surface { tier: lamella_wire::msg::tier::PYTHON, ..lamella_wire::Surface::default() };
+        lamella_wire::HelloAck {
+            chosen: lamella_wire::PROTOCOL_VERSION,
+            caps: Capabilities(Capabilities::BUNDLE | Capabilities::EXEC_NO_RESET),
+            identity: lamella_wire::TargetIdentity {
+                product_model: lamella_wire::product_model::PICO2_W,
+                ..lamella_wire::TargetIdentity::default()
+            }
+            .with_surface(python),
+            max_inbound_payload: Some(lamella_wire::MAX_PAYLOAD as u16),
+            image_formats: Some(vec![lamella_py_bytecode::BUNDLE_FORMAT_VERSION]),
+        }
+    }
+
+    /// A Pico 2 W on its own USB whose firmware runs Python: behind the first handle it resets at the
+    /// HELLO, to take back the program it runs, and leaves the bus; behind a later one it is back, and
+    /// answers.
+    struct TakesItsProgramBack {
+        first: bool,
+        wire: lamella_wire::MemTransport,
+    }
+
+    impl lamella_wire::Transport for TakesItsProgramBack {
+        fn send(&mut self, msg_type: u8, seq: u16, _payload: &[u8]) -> Result<(), lamella_wire::TransportError> {
+            if !self.first && msg_type == lamella_wire::msg::HELLO {
+                let mut board = lamella_wire::MemTransport::new();
+                lamella_wire::Transport::send(&mut board, lamella_wire::msg::HELLO_ACK, seq, &python_ack().encode())?;
+                self.wire.feed(&board.take_sent());
+            }
+            Ok(())
+        }
+
+        fn poll(&mut self) -> Result<Option<lamella_wire::Frame>, lamella_wire::TransportError> {
+            if self.first {
+                return Err(lamella_wire::TransportError::Carrier);
+            }
+            lamella_wire::Transport::poll(&mut self.wire)
+        }
+    }
+
+    /// **`--identify` OPENS AGAIN A BOARD THAT RESET UNDER ITS HELLO, AND ASKS AGAIN**, as a deploy and
+    /// a run do: a board that runs Python takes back the program it runs by resetting, and comes back
+    /// serving.
+    #[test]
+    fn identify_opens_again_a_board_that_reset_under_its_hello() {
+        let opened = std::cell::Cell::new(0);
+        let opening = |_: &str| {
+            opened.set(opened.get() + 1);
+            Ok(TakesItsProgramBack { first: opened.get() == 1, wire: lamella_wire::MemTransport::new() })
+        };
+        let answer = asked("usb:39e9:0001:D4C3", &opening);
+        assert_eq!(answer.status, "Online", "{}", answer.detail);
+        assert_eq!(answer.board.as_deref(), Some("Raspberry Pi Pico 2 W"));
+        assert_eq!(opened.get(), 2, "it was opened again, once");
+    }
+
+    /// **THE C# DEBUG BUILD MAKES NO IMAGE FOR A BOARD WHOSE FIRMWARE RUNS PYTHON**: it asks the device
+    /// which board to bake for, and that board runs no C# program.
+    #[test]
+    fn the_debug_build_makes_no_image_for_a_board_that_runs_python() {
+        let opening = |_: &str| Ok(TakesItsProgramBack { first: false, wire: lamella_wire::MemTransport::new() });
+        let refused = board_from("usb:39e9:0001:D4C3", &opening).expect_err("no C# image for a Python board");
+        assert_eq!(
+            refused,
+            "The device usb:39e9:0001:D4C3 answered as Raspberry Pi Pico 2 W, whose firmware runs Python programs, \
+             so no C# image can be made for it."
+        );
+    }
+
+    /// **AN IDENTIFIED BOARD KEEPS THE NOTE ITS USB STRING ADDS TO ITS NAME** when its answer names the
+    /// same board, so a SAM4S Xplained Pro running from its second bank is listed as one, asked or not.
+    #[test]
+    fn an_identified_board_keeps_the_note_its_usb_string_adds() {
+        let seen = |product: &str| BoardSeen {
+            vendor_id: lamella_wire::usb::VID,
+            product_id: lamella_wire::usb::PID,
+            serial: Some("A0000000000000C1".to_owned()),
+            product: Some(product.to_owned()),
+        };
+        let (attached, _) = assemble(Vec::new(), Vec::new(), vec![seen("Lamella Link (SAM4S Xplained Pro, bank B)")], &[]);
+        let listed = "SAM4S Xplained Pro, bank B: deploy to interpreter";
+        assert_eq!(described(&attached[0], None), listed);
+        let answered = Answer { board: Some("SAM4S Xplained Pro".to_owned()), status: "Online", detail: String::new() };
+        assert_eq!(described(&attached[0], Some(&answered)), listed);
+        let (pico, _) = assemble(Vec::new(), Vec::new(), vec![seen("Lamella Link (Raspberry Pi Pico 2 W)")], &[]);
+        let near = Answer { board: Some("Raspberry Pi Pico 2".to_owned()), status: "Online", detail: String::new() };
+        assert_eq!(
+            described(&pico[0], Some(&near)),
+            "Raspberry Pi Pico 2: deploy to interpreter",
+            "a board whose name merely begins the string's is another board"
+        );
+    }
+
+    /// **A BOARD WHOSE FIRMWARE RUNS PYTHON IS LISTED BY ITS BOARD's NAME ALONE**, asked or not: its USB
+    /// string names the board as a C# firmware's does, and its answer names the board and not the build.
+    /// What it runs is in `--identify`'s detail, from the HELLO.
+    #[test]
+    fn a_board_whose_firmware_runs_python_is_listed_by_its_boards_name() {
+        let seen = BoardSeen {
+            vendor_id: lamella_wire::usb::VID,
+            product_id: lamella_wire::usb::PID,
+            serial: Some("A0000000000000C1".to_owned()),
+            product: Some("Lamella Link (Raspberry Pi Pico 2 W)".to_owned()),
+        };
+        let (attached, _) = assemble(Vec::new(), Vec::new(), vec![seen], &[]);
+        let listed = "Raspberry Pi Pico 2 W: deploy to interpreter";
+        assert_eq!(described(&attached[0], None), listed);
+        let opening = |_: &str| Ok(TakesItsProgramBack { first: false, wire: lamella_wire::MemTransport::new() });
+        let answered = asked("usb:39e9:0001:A0000000000000C1", &opening);
+        assert_eq!(answered.board.as_deref(), Some("Raspberry Pi Pico 2 W"), "{}", answered.detail);
+        assert_eq!(described(&attached[0], Some(&answered)), listed);
+        assert!(answered.detail.contains("\nresident runtime: Python, image format "), "{}", answered.detail);
+    }
+
+    /// **`--identify` NAMES EACH RUNTIME A BOARD HOLDS AND THE IMAGE FORMAT IT LOADS**, and gives the
+    /// managed library's fields for the C# runtime alone: no other runtime carries one, and its zeros
+    /// read as a version.
+    #[test]
+    fn identify_names_each_runtime_and_the_image_format_it_loads() {
+        let crossed = |ack: &lamella_wire::HelloAck| lamella_wire::HelloAck::decode(&ack.encode()).expect("it decodes");
+        assert_eq!(crossed(&python_ack()), python_ack(), "the Python board's answer survives the wire");
+        let mut ack = python_ack();
+        ack.image_formats = Some(vec![lamella_wire::image_format::PRE_RELEASE | 1]);
+        let python = render_identity(&lamella_wire::host_finish(&crossed(&ack), host_caps()));
+        assert!(python.contains("\nresident runtime: Python, image format 0x8001 (pre-release 1)\n"), "{python}");
+        assert!(python.contains(&format!("capabilities {:#010x}\n", ack.caps.0)), "the board's own: {python}");
+        assert!(!python.contains("library"), "{python}");
+        let cil = lamella_wire::Surface { tier: lamella_wire::msg::tier::CIL, abi: 3, ..lamella_wire::Surface::default() };
+        ack.identity = lamella_wire::TargetIdentity::default().with_surface(cil);
+        ack.image_formats = None;
+        let csharp = render_identity(&lamella_wire::host_finish(&ack, host_caps()));
+        assert!(
+            csharp.contains("\nresident runtime: C#, abi 3 hash 0x0000000000000000 library 0.0.0.0 build 0.0.0.0\n"),
+            "a board that states no format is given none: {csharp}"
+        );
+        ack.image_formats = Some(vec![2]);
+        let production = render_identity(&lamella_wire::host_finish(&ack, host_caps()));
+        assert!(production.contains(" build 0.0.0.0, image format 0x0002\n"), "{production}");
+        ack.image_formats = Some(vec![lamella_wire::image_format::LOADS_NONE]);
+        let none = render_identity(&lamella_wire::host_finish(&ack, host_caps()));
+        assert!(none.contains(" build 0.0.0.0, loads no image\n"), "{none}");
+    }
 
     #[test]
     fn a_devices_description_names_the_board_and_action_without_repeating_its_id() {
@@ -1551,7 +1727,7 @@ mod tests {
     /// running Lamella firmware, which the sentence for silence says it is not.
     #[test]
     fn an_identify_refusal_is_an_answer_and_says_why() {
-        let refused = answer_of(Err(lamella_wire::TransportError::Refused {
+        let refused = answer_of("COM7", Err(lamella_wire::TransportError::Refused {
             reason: lamella_wire::error::SESSION_HELD,
             msg_type: lamella_wire::msg::HELLO,
             holder: Some(2),
@@ -1563,13 +1739,26 @@ mod tests {
             refused.detail
         );
 
-        let silent = answer_of(Err(lamella_wire::TransportError::Closed));
+        let silent = answer_of("COM7", Err(lamella_wire::TransportError::Closed));
         assert_eq!(silent.status, "Offline");
         assert_eq!(
             silent.detail,
             "no answer (nothing came back in time, or the connection closed) -- this is normal unless Lamella firmware \
              is running on it"
         );
+    }
+
+    /// **A SILENT BOARD ON LAMELLA LINK's OWN USB IDENTITY HAS FIRMWARE**: only Lamella's firmware
+    /// enumerates as one, so its silence is said as its program's, the way `deploy` and the MCP say
+    /// it, and a device of any other identity is said as before.
+    #[test]
+    fn a_silent_board_of_the_link_identity_is_not_said_to_lack_firmware() {
+        let link = answer_of("usb:39e9:0001:0123456789ABCDEF", Err(lamella_wire::TransportError::Closed));
+        assert_eq!(link.status, "Offline");
+        assert!(link.detail.contains(lamella_wire_host::SILENT_WITH_FIRMWARE), "{}", link.detail);
+        assert!(!link.detail.contains("unless Lamella firmware is running"), "{}", link.detail);
+        let other = answer_of("usb:2e8a:000c:FEDCBA9876543210", Err(lamella_wire::TransportError::Closed));
+        assert!(other.detail.ends_with("this is normal unless Lamella firmware is running on it"), "{}", other.detail);
     }
 
     /// **THE DEVICES ARE LISTED AS .NET LISTS THEM, AND ONLY THEY ARE IN THAT TABLE.** Each device

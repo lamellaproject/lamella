@@ -764,7 +764,7 @@ pub const PROGRAMMING: &[Programming] = &[
     },
     Programming {
         board: "st-nucleo-u5a5zj-q",
-        aot_target: None,
+        aot_target: Some("stm32u5a5"),
         programmer: Programmer::StlinkOnboard {
             family: StFamily::U5,
             probe_id: lamella_stlink::product_id::V3E,
@@ -782,7 +782,7 @@ pub const PROGRAMMING: &[Programming] = &[
     },
     Programming {
         board: "st-stm32f746g-disco",
-        aot_target: None,
+        aot_target: Some("stm32f746"),
         programmer: Programmer::StlinkOnboard {
             family: StFamily::F7,
             probe_id: lamella_stlink::product_id::V2_1,
@@ -791,7 +791,7 @@ pub const PROGRAMMING: &[Programming] = &[
     },
     Programming {
         board: "st-stm32f769i-disco",
-        aot_target: None,
+        aot_target: Some("stm32f769"),
         programmer: Programmer::StlinkOnboard {
             family: StFamily::F7,
             probe_id: lamella_stlink::product_id::V2_1,
@@ -2746,6 +2746,9 @@ pub fn aot_target_for(board_id: &str) -> Result<&'static str, NoAotTarget> {
     }
 }
 
+/// The text `lamella flash` refuses `board` with when no programming row says how to write it: the
+/// boards it can write and how, why that list is short, and what `lamella build --board` does for
+/// the board instead.
 pub fn cannot_write(board: &str) -> String {
     let mut text = format!("lamella flash: nothing states how to write {board}.\n\n");
     text.push_str("it can write:\n");
@@ -4323,8 +4326,9 @@ mod tests {
             );
             if let Some(target) = row.aot_target {
                 assert!(
-                    lamella_aot::build::CORTEX_M_TARGETS.contains(&target),
-                    "{}: the backend does not know a chip called {:?}; it knows {:?}",
+                    lamella_aot::build::CORTEX_M_TARGETS.contains(&target) || lamella_aot::build::links(target),
+                    "{}: the backend does not know a chip called {:?}; its flat tier knows {:?}, and its \
+                     linked tier has no plan for it either",
                     row.board,
                     target,
                     lamella_aot::build::CORTEX_M_TARGETS

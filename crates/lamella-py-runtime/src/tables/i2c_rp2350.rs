@@ -52,6 +52,7 @@ const INTR_STOP_DET: u32 = 1 << 9;
 const CMD_READ: u32 = 1 << 8;
 const CMD_STOP: u32 = 1 << 9;
 const CMD_RESTART: u32 = 1 << 10;
+#[cfg(not(target_os = "none"))]
 const ABRT_7B_ADDR_NOACK: u32 = 1 << 0;
 const ABRT_TXDATA_NOACK: u32 = 1 << 3;
 
@@ -76,6 +77,7 @@ pub(crate) fn facts() -> I2cFacts {
         cmd_read: CMD_READ,
         cmd_stop: CMD_STOP,
         cmd_restart: CMD_RESTART,
+        #[cfg(not(target_os = "none"))]
         abrt_addr_nack: ABRT_7B_ADDR_NOACK,
         abrt_data_nack: ABRT_TXDATA_NOACK,
     }

@@ -1,0 +1,105 @@
+# BLOCK: the STM32U5A5 extended interrupt and event controller, for the sixteen lines GPIO pins
+# drive. Offsets are relative to the EXTI instance's base in ../instances.toml.
+#
+# This controller is not the STM32F7's, and three differences decide how a driver and a handler
+# use it:
+#
+# A line is bound to a port HERE. Each of EXTICR1 to EXTICR4 holds four lines, EIGHT bits a line,
+# and the field's value selects the port: 0x00 PA[x] through 0x09 PJ[x]. There is no SYSCFG step
+# and no SYSCFG clock to enable, where an STM32F7 routes the same choice through SYSCFG's EXTICR
+# bank, four bits a line.
+#
+# A detected edge is pending in one of TWO registers, by its direction: RPR1 for a rising edge and
+# FPR1 for a falling one, each bit write-one-to-clear. A handler clears whichever holds the line's
+# bit. On a line armed for both edges both can be set by the time it reads them, and clearing one
+# leaves the other to re-enter the vector.
+#
+# Every line has a vector of its own. EXTI0 to EXTI15 are positions 11 to 26 of the vector table,
+# one each, where an STM32F7 shares one vector among lines 5 to 9 and another among 10 to 15.
+#
+# The interrupt mask is IMR1, at 0x80 rather than at the base: the registers from the base are the
+# trigger and pending ones. IMR1 is zero from reset, so a configured trigger raises no interrupt
+# until its bit is set.
+
+[table]
+kind = "block"
+family = "stm32u5a5"
+block = "exti"
+sources = [
+    "STM32U5 series reference manual RM0456 Rev 7 section 23.6, register descriptions, each stating its own address offset: 23.6.1 EXTI_RTSR1 0x000, 23.6.2 EXTI_FTSR1 0x004, 23.6.3 EXTI_SWIER1 0x008, 23.6.4 EXTI_RPR1 0x00C, 23.6.5 EXTI_FPR1 0x010, 23.6.8 EXTI_EXTICRm 0x060 + 0x4 * (m - 1) for m = 1 to 4, 23.6.10 EXTI_IMR1 0x080, 23.6.11 EXTI_EMR1 0x084.",
+    "RM0456 Rev 7 section 23.6.8 (EXTI_EXTICRm), which gives each register four eight-bit fields, EXTI{4*(m-1)} in bits 7:0 through EXTI{4*(m-1)+3} in bits 31:24, and the port encoding in its own words: 'These bits are written by software to select the source input for EXTI{4*(m-1)+3} external interrupt', 0x00 PA, 0x01 PB, 0x02 PC, 0x03 PD, 0x04 PE, 0x05 PF, 0x06 PG, 0x07 PH, 0x08 PI, 0x09 PJ, others reserved.",
+    "RM0456 Rev 7 sections 23.6.4 and 23.6.5: RPIFx is set 'when the rising edge event or an EXTI_SWIER software trigger arrives on the configurable event line' and FPIFx 'when the falling edge event arrives', and each 'is cleared by writing 1 to it'.",
+    "RM0456 Rev 7 Table 186 (STM32U5 series vector table): EXTI0 to EXTI15 at positions 11 to 26, vector addresses 0x0000 006C to 0x0000 00A8, each 0x40 + 4 x its position.",
+    "RM0456 Rev 7 Table 6 (memory map and peripheral register boundary addresses): EXTI at secure 0x5602 2000 and nonsecure 0x4602 2000, 1 Kbyte, on AHB3, present on every sub-group. No RCC enable register names an EXTI clock: the controller runs from the AHB bus clock.",
+]
+notes = [
+    "THE PENDING BITS SAY WHICH EDGE ARRIVED, WHERE THE STM32F7's ONE PR BIT DOES NOT. A handler can still report the pad's level rather than the edge, as every handler of the pin-event seam does, so one handler shape serves both controllers.",
+    "WITH TRUSTZONE OFF (TZEN = 0, how the NUCLEO-U5A5ZJ-Q arrives) every line is nonsecure and unprivileged after reset, so SECCFGR1 and PRIVCFGR1 govern nothing here and are not laid out.",
+    "THE RESET VALUE OF EXTICR IS ZERO, WHICH IS A SELECTION. Zero selects PA[x], so a line is bound to a port A pin until something writes otherwise.",
+]
+
+[registers.RTSR1]
+offset = 0x000
+width = 32
+fields = { RT = [0, 26] }
+notes = "Rising trigger enable, one bit per line. Setting this and FTSR1 together is a both-edge trigger."
+
+[registers.FTSR1]
+offset = 0x004
+width = 32
+fields = { FT = [0, 26] }
+notes = "Falling trigger enable, one bit per line."
+
+[registers.SWIER1]
+offset = 0x008
+width = 32
+fields = { SWI = [0, 26] }
+notes = "Software trigger, one bit per line: sets the line's rising pending bit with no pad activity."
+
+[registers.RPR1]
+offset = 0x00C
+width = 32
+fields = { RPIF = [0, 26] }
+notes = "WRITE-ONE-TO-CLEAR rising-edge pending bits. A handler that leaves one set re-enters its vector."
+
+[registers.FPR1]
+offset = 0x010
+width = 32
+fields = { FPIF = [0, 26] }
+notes = "WRITE-ONE-TO-CLEAR falling-edge pending bits."
+
+[registers.EXTICR1]
+offset = 0x060
+width = 32
+fields = { EXTI0 = [0, 8], EXTI1 = [8, 8], EXTI2 = [16, 8], EXTI3 = [24, 8] }
+notes = "The port of lines 0 to 3, eight bits a line."
+
+[registers.EXTICR2]
+offset = 0x064
+width = 32
+fields = { EXTI4 = [0, 8], EXTI5 = [8, 8], EXTI6 = [16, 8], EXTI7 = [24, 8] }
+notes = "The port of lines 4 to 7."
+
+[registers.EXTICR3]
+offset = 0x068
+width = 32
+fields = { EXTI8 = [0, 8], EXTI9 = [8, 8], EXTI10 = [16, 8], EXTI11 = [24, 8] }
+notes = "The port of lines 8 to 11."
+
+[registers.EXTICR4]
+offset = 0x06C
+width = 32
+fields = { EXTI12 = [0, 8], EXTI13 = [8, 8], EXTI14 = [16, 8], EXTI15 = [24, 8] }
+notes = "The port of lines 12 to 15."
+
+[registers.IMR1]
+offset = 0x080
+width = 32
+fields = { IM = [0, 26] }
+notes = "Interrupt mask, one bit per line, 1 unmasked. Zero from reset: a line raises no interrupt until its bit is set."
+
+[registers.EMR1]
+offset = 0x084
+width = 32
+fields = { EM = [0, 26] }
+notes = "Event mask, one bit per line, routing a detection to the event system rather than to the NVIC."

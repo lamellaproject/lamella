@@ -33,7 +33,13 @@ mod platform {
     /// `GetTickCount64` is milliseconds since the system started, 64-bit so it does not wrap at
     /// 49.7 days the way the 32-bit `GetTickCount` does.
     pub(super) fn uptime_millis() -> u64 {
-        unsafe { windows_sys::Win32::System::SystemInformation::GetTickCount64() }
+        // SAFETY: Rust reaches a Win32 function only through FFI, which is `unsafe`, and the
+        // standard library offers no time since boot. `GetTickCount64` takes no argument and
+        // cannot fail, so the call has nothing to uphold.
+        #[allow(unsafe_code)]
+        unsafe {
+            windows_sys::Win32::System::SystemInformation::GetTickCount64()
+        }
     }
 }
 
@@ -64,6 +70,11 @@ mod platform {
     ///
     ///
     pub(super) fn uptime_millis() -> u64 {
+        // SAFETY: Rust reaches a C function only through FFI, which is `unsafe`, and the standard
+        // library offers no time since boot. `clock_gettime_nsec_np` takes a clock id by value and
+        // returns a number; `CLOCK_MONOTONIC` is a clock it knows, so the call has nothing else to
+        // uphold.
+        #[allow(unsafe_code)]
         let nanos = unsafe { clock_gettime_nsec_np(CLOCK_MONOTONIC) };
         nanos / 1_000_000
     }
@@ -73,6 +84,10 @@ mod platform {
     ///
     const CLOCK_MONOTONIC: u32 = 6;
 
+    // SAFETY: a function libSystem provides can be declared only in an `unsafe extern` block. The
+    // declaration matches Darwin's `<time.h>`: `uint64_t clock_gettime_nsec_np(clockid_t)`, whose
+    // `clockid_t` is a C enum of small non-negative values, an `unsigned int`.
+    #[allow(unsafe_code)]
     unsafe extern "C" {
         fn clock_gettime_nsec_np(clock_id: u32) -> u64;
     }

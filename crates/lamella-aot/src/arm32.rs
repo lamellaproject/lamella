@@ -393,7 +393,8 @@ fn lower_inst(
         | Inst::InterfaceHasTag { .. }
         | Inst::InterfaceHasArrayElementTag { .. }
         | Inst::DescriptorWord { .. }
-        | Inst::TypeName { .. } => {
+        | Inst::TypeName { .. }
+        | Inst::TypeObject { .. } => {
             return Err(LowerError::CallUnsupported);
         }
         Inst::SemihostWrite { .. }
@@ -1456,6 +1457,11 @@ fn lower_spilled_inst(
             enc.bind_label(done);
         }
         Inst::TypeName { descriptor } => {
+            if !relocate {
+                return Err(LowerError::CallUnsupported);
+            }
+            let class = enc.new_label();
+            let walk = enc.new_label();
             let miss = enc.new_label();
             let done = enc.new_label();
             slot_load(enc, Reg::R0, slot(*descriptor))?;
@@ -1468,7 +1474,13 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.cmp_imm(Reg::R1, (ARRAY_DESC_MARK >> 24) as u8)
                 .map_err(|_| LowerError::TooManyValues)?;
-            enc.b_cond(Cond::Eq, miss);
+            enc.b_cond(Cond::Ne, class);
+            enc.movs_imm(Reg::R1, crate::resolver::ARRAY_ITABLE_OFFSET as u8)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds(Reg::R1, Reg::R0, Reg::R1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b(walk);
+            enc.bind_label(class);
             enc.ldr_imm(Reg::R1, Reg::R0, 4)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.lsls_imm(Reg::R1, Reg::R1, 2)
@@ -1477,6 +1489,7 @@ fn lower_spilled_inst(
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.adds(Reg::R1, Reg::R0, Reg::R1)
                 .map_err(|_| LowerError::TooManyValues)?;
+            enc.bind_label(walk);
             enc.ldr_imm(Reg::R2, Reg::R1, 0)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.lsls_imm(Reg::R2, Reg::R2, 3)
@@ -1493,6 +1506,49 @@ fn lower_spilled_inst(
             enc.b(done);
             enc.bind_label(miss);
             enc.movs_imm(Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.bind_label(done);
+        }
+        Inst::TypeObject { descriptor } => {
+            if !relocate {
+                return Err(LowerError::CallUnsupported);
+            }
+            let class = enc.new_label();
+            let walk = enc.new_label();
+            let done = enc.new_label();
+            slot_load(enc, Reg::R0, slot(*descriptor))?;
+            enc.cmp_imm(Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Eq, done);
+            enc.ldr_imm(Reg::R1, Reg::R0, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.lsrs_imm(Reg::R1, Reg::R1, 24)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.cmp_imm(Reg::R1, (ARRAY_DESC_MARK >> 24) as u8)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b_cond(Cond::Ne, class);
+            enc.movs_imm(Reg::R1, crate::resolver::ARRAY_ITABLE_OFFSET as u8)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds(Reg::R1, Reg::R0, Reg::R1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.b(walk);
+            enc.bind_label(class);
+            enc.ldr_imm(Reg::R1, Reg::R0, 4)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.lsls_imm(Reg::R1, Reg::R1, 2)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds_imm8(Reg::R1, 16)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds(Reg::R1, Reg::R0, Reg::R1)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.bind_label(walk);
+            enc.ldr_imm(Reg::R2, Reg::R1, 0)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.lsls_imm(Reg::R2, Reg::R2, 3)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds(Reg::R0, Reg::R1, Reg::R2)
+                .map_err(|_| LowerError::TooManyValues)?;
+            enc.adds_imm8(Reg::R0, 12)
                 .map_err(|_| LowerError::TooManyValues)?;
             enc.bind_label(done);
         }
@@ -4226,6 +4282,8 @@ fn prepare_as(func: &Function, debug: bool) -> Result<Assignment, LowerError> {
                     | Inst::InterfaceHasTag { .. }
                     | Inst::InterfaceHasArrayElementTag { .. }
                     | Inst::DescriptorWord { .. }
+                    | Inst::TypeName { .. }
+                    | Inst::TypeObject { .. }
                     | Inst::PyIntrinsic { .. }
                     | Inst::CallIndirect { .. }
                     | Inst::CallNative { .. }
@@ -5317,9 +5375,13 @@ pub struct ObjectBuildMode<'a> {
     pub debug_bodies: core::ops::Range<usize>,
 }
 
-/// The `__aeabi_*` soft-float helper for a float arithmetic `Binary` op, keyed by the operand type;
-/// `None` for an integer op (a different type) or a non-arithmetic op. ARM AAPCS soft-float passes
-/// f32 in a core register and f64 in a register pair, which falls out of the C-ABI arg lowering.
+/// The soft-float helper for a float arithmetic `Binary` op, keyed by the operand type; `None` for an
+/// integer op (a different type) or a non-arithmetic op. `+ - * /` are the RTABI's `__aeabi_*`
+/// helpers. A remainder is C's `fmod`/`fmodf`: ECMA-335 4th ed III.3.55 defines a floating-point `rem`
+/// as the integer one with a quotient truncated toward zero (NaN for a zero divisor or an infinite
+/// dividend, the dividend for an infinite divisor), which is `fmod`'s definition, and the RTABI has no
+/// remainder helper. ARM AAPCS soft-float passes f32 in a core register and f64 in a register pair,
+/// which falls out of the C-ABI arg lowering for both families.
 fn aeabi_float_helper(op: BinOp, operand_ty: Option<MirType>) -> Option<&'static str> {
     match operand_ty {
         Some(MirType::F32) => Some(match op {
@@ -5327,6 +5389,7 @@ fn aeabi_float_helper(op: BinOp, operand_ty: Option<MirType>) -> Option<&'static
             BinOp::Sub => "__aeabi_fsub",
             BinOp::Mul => "__aeabi_fmul",
             BinOp::DivSigned | BinOp::DivUnsigned => "__aeabi_fdiv",
+            BinOp::RemSigned | BinOp::RemUnsigned => "fmodf",
             _ => return None,
         }),
         Some(MirType::F64) => Some(match op {
@@ -5334,6 +5397,7 @@ fn aeabi_float_helper(op: BinOp, operand_ty: Option<MirType>) -> Option<&'static
             BinOp::Sub => "__aeabi_dsub",
             BinOp::Mul => "__aeabi_dmul",
             BinOp::DivSigned | BinOp::DivUnsigned => "__aeabi_ddiv",
+            BinOp::RemSigned | BinOp::RemUnsigned => "fmod",
             _ => return None,
         }),
         _ => None,
@@ -6504,7 +6568,7 @@ fn emit_object_pass(
     };
     let blob_table: Option<&[Box<[u16]>]> = emit_entry.then_some(string_table.as_slice());
     let emit = descriptor_emit_set(funcs, descriptors, externs, emit_entry);
-    let string_header: Option<(u32, i32)> = mode.qualifiers.string.map(|handle| {
+    let header_for = |handle: u32| {
         let vtable_bytes = if emit.iter().any(|(h, ..)| *h == handle) {
             0
         } else {
@@ -6514,7 +6578,9 @@ fn emit_object_pass(
                 .map_or(0, |m| m.vtable.len() as i32 * 4)
         };
         (handle, vtable_bytes)
-    });
+    };
+    let string_header: Option<(u32, i32)> = mode.qualifiers.string.map(header_for);
+    let type_header: Option<(u32, i32)> = mode.qualifiers.system_type.map(header_for);
     let type_names = !cfg!(feature = "strip-type-names");
     let mut map_ranges: Vec<(usize, usize)> = Vec::with_capacity(funcs.len());
     let mut stub_report: LibraryStubReport = Vec::new();
@@ -6677,24 +6743,32 @@ fn emit_object_pass(
                         .map(|n| n.encode_utf16().collect())
                 })
                 .flatten();
-            match &name {
-                Some(units) => {
-                    let name_label = enc.new_label();
-                    enc.data_word_diff(words_label, name_label);
-                    if let Some((string_handle, vtable_bytes)) = string_header {
-                        enc.data_word_symbol_addend(DESC_SYMBOL_FLAG | string_handle, vtable_bytes);
-                    }
-                    enc.bind_label(name_label);
-                    let blob = unencodable(crate::stringgen::string_blob_bytes(units))?;
-                    enc.emit_bytes(&blob);
-                    let header_words = u32::from(string_header.is_some());
-                    itable_words += 1 + header_words + (blob.len() as u32).div_ceil(4);
-                    enc.align_to_word();
+            let name_label = name.as_ref().map(|_| enc.new_label());
+            match name_label {
+                Some(label) => enc.data_word_diff(words_label, label),
+                None => enc.emit_word(0),
+            }
+            itable_words += 1;
+            match type_header {
+                Some((type_handle, vtable_bytes)) => {
+                    enc.data_word_symbol_addend(DESC_SYMBOL_FLAG | type_handle, vtable_bytes);
                 }
-                None => {
-                    enc.emit_word(0);
-                    itable_words += 1;
+                None => enc.emit_word(0),
+            }
+            let type_label = enc.new_label();
+            enc.bind_label(type_label);
+            enc.data_word_diff(type_label, words_label);
+            itable_words += 2;
+            if let (Some(units), Some(label)) = (&name, name_label) {
+                if let Some((string_handle, vtable_bytes)) = string_header {
+                    enc.data_word_symbol_addend(DESC_SYMBOL_FLAG | string_handle, vtable_bytes);
                 }
+                enc.bind_label(label);
+                let blob = unencodable(crate::stringgen::string_blob_bytes(units))?;
+                enc.emit_bytes(&blob);
+                let header_words = u32::from(string_header.is_some());
+                itable_words += header_words + (blob.len() as u32).div_ceil(4);
+                enc.align_to_word();
             }
             desc_syms.push((
                 *handle,
@@ -7518,6 +7592,7 @@ mod tests {
         );
         let lib = DescQualifiers {
             string: None,
+            system_type: None,
             own: Some("0bd4d82a".into()),
             references: alloc::vec::Vec::new(),
         };
@@ -7528,6 +7603,7 @@ mod tests {
         let handle = (crate::resolver::REFERENCE_HANDLE_TABLE << 24) | (1 << 20) | 5;
         let refs = DescQualifiers {
             string: None,
+            system_type: None,
             own: None,
             references: alloc::vec!["aaaaaaaa".into(), "0bd4d82a".into()],
         };
@@ -7577,6 +7653,7 @@ mod tests {
         );
         let lib = DescQualifiers {
             string: None,
+            system_type: None,
             own: Some("0bd4d82a".into()),
             references: alloc::vec::Vec::new(),
         };
@@ -11437,7 +11514,7 @@ mod tests {
             .filter(|s| s.name == desc_name && s.defined)
             .collect();
         assert_eq!(descs.len(), 1, "the alloc and the type-test share ONE descriptor");
-        assert_eq!(descs[0].size, 28, "the alloc's richer header wins the dedup");
+        assert_eq!(descs[0].size, 36, "the alloc's richer header wins the dedup");
         let desc_index = obj.symbols.iter().position(|s| s.name == desc_name).unwrap() as u32;
         let refs = obj
             .relocations
@@ -11562,7 +11639,11 @@ mod tests {
         );
         if cfg!(feature = "strip-type-names") {
             assert_eq!(word, 0, "a stripped build lays the name word as absent, not as nothing");
-            assert_eq!(desc.size, 4 * 4 + 4 + 4, "vtable 0 + words 4 + itable 1 + name 1");
+            assert_eq!(
+                desc.size,
+                4 * 4 + 4 + 4 + 8,
+                "vtable 0 + words 4 + itable 1 + name 1 + the Type object's header and payload"
+            );
             return;
         }
         let blob = crate::stringgen::string_blob_bytes(
@@ -11626,7 +11707,7 @@ mod tests {
             .iter()
             .find(|s| s.name == alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, handle.0))
             .expect("the descriptor is laid");
-        assert_eq!(desc.size, 32, "the descriptor symbol spans vtable + words + itable + name");
+        assert_eq!(desc.size, 40, "the descriptor symbol spans vtable + words + itable + name + Type object");
         let f1 = obj.symbols.iter().position(|s| s.name == "f1").unwrap() as u32;
         let slot = obj
             .relocations
@@ -11634,6 +11715,140 @@ mod tests {
             .find(|r| r.kind == lamella_elf::arm::R_LAMELLA_REL_DESC && r.symbol == f1)
             .expect("the itable method slot's relocation targets the implementation");
         assert_eq!(slot.addend, 24);
+    }
+
+    #[test]
+    fn every_descriptor_lays_its_type_object_after_the_name_word() {
+        let foo = lamella_ir::TypeHandle(0x0200_0005);
+        let system_type = lamella_ir::TypeHandle(0x0200_0009);
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32, MirType::I32, MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (ValueId(0), Inst::TypeDescAddr { handle: foo }),
+                    (ValueId(1), Inst::TypeDescAddr { handle: system_type }),
+                    (
+                        ValueId(2),
+                        Inst::Binary {
+                            op: BinOp::Add,
+                            lhs: ValueId(0),
+                            rhs: ValueId(1),
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(2)))),
+            }],
+        };
+        let meta = |handle, type_tag| TypeMeta {
+            handle,
+            type_tag,
+            vtable: Vec::new(),
+            itable: Vec::new(),
+            base: None,
+            words: None,
+            exported: true,
+            full_name: None,
+        };
+        let descriptors = alloc::vec![meta(foo, 0xAB), meta(system_type, 0xCD)];
+        let statics = AssemblyStatics {
+            suffix: alloc::string::String::from("11223344"),
+            region_bytes: 0,
+            roots: Vec::new(),
+        };
+        let qualifiers = DescQualifiers {
+            system_type: Some(system_type.0),
+            ..DescQualifiers::default()
+        };
+        let bytes =
+            lower_object_vtables_statics(&[func], &["f0"], &[], &descriptors, &statics, &qualifiers).unwrap();
+        let obj = lamella_elf::read_object(&bytes).unwrap();
+        let symbol = |handle: lamella_ir::TypeHandle| {
+            let name = alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, handle.0);
+            obj.symbols
+                .iter()
+                .position(|s| s.name == name && s.defined)
+                .expect("the descriptor is laid")
+        };
+        let (foo_index, type_index) = (symbol(foo), symbol(system_type));
+        let foo_symbol = &obj.symbols[foo_index];
+        assert_eq!(foo_symbol.size, 32, "words + count + name word + the Type object's two words");
+        let word = |offset: u32| {
+            let at = (foo_symbol.value + offset) as usize;
+            u32::from_le_bytes([obj.text[at], obj.text[at + 1], obj.text[at + 2], obj.text[at + 3]])
+        };
+        assert_eq!(word(20), 0, "the name word still leads, 0 for a meta that names no type");
+        let header = obj
+            .relocations
+            .iter()
+            .find(|r| r.offset == foo_symbol.value + 24)
+            .expect("the Type object's header is relocated");
+        assert_eq!(header.kind, lamella_elf::arm::R_ARM_ABS32, "a header is an absolute address");
+        assert_eq!(header.symbol as usize, type_index, "the header names System.Type's descriptor");
+        assert_eq!(header.addend, 0, "laid in this object: the reference resolves to its words");
+        assert_eq!(
+            word(28) as i32,
+            -28,
+            "the payload is the descriptor's words relative to the object, so FullName can add it back"
+        );
+    }
+
+    #[test]
+    fn a_type_header_across_the_link_lands_on_system_types_words() {
+        let foo = lamella_ir::TypeHandle(0x0200_0005);
+        let system_type = lamella_ir::TypeHandle(0x0200_0009);
+        let func = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![MirType::I32],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![(ValueId(0), Inst::TypeDescAddr { handle: foo })],
+                terminator: Some(Terminator::Return(Some(ValueId(0)))),
+            }],
+        };
+        let meta = |handle, type_tag, slots: usize| TypeMeta {
+            handle,
+            type_tag,
+            vtable: alloc::vec![crate::resolver::VtableEntry::Func(0); slots],
+            itable: Vec::new(),
+            base: None,
+            words: None,
+            exported: false,
+            full_name: None,
+        };
+        let descriptors = alloc::vec![meta(foo, 0xAB, 0), meta(system_type, 0xCD, 3)];
+        let statics = AssemblyStatics {
+            suffix: alloc::string::String::from("11223344"),
+            region_bytes: 0,
+            roots: Vec::new(),
+        };
+        let qualifiers = DescQualifiers {
+            system_type: Some(system_type.0),
+            ..DescQualifiers::default()
+        };
+        let bytes =
+            lower_object_vtables_statics(&[func], &["f0"], &[], &descriptors, &statics, &qualifiers).unwrap();
+        let obj = lamella_elf::read_object(&bytes).unwrap();
+        let named = |handle: lamella_ir::TypeHandle| alloc::format!("{}{}", lamella_elf::TYPE_DESC_PREFIX, handle.0);
+        let foo_symbol = obj
+            .symbols
+            .iter()
+            .find(|s| s.name == named(foo) && s.defined)
+            .expect("foo's descriptor is laid");
+        let header = obj
+            .relocations
+            .iter()
+            .find(|r| r.offset == foo_symbol.value + 24)
+            .expect("the Type object's header is relocated");
+        let target = &obj.symbols[header.symbol as usize];
+        assert_eq!(target.name, named(system_type), "the header names System.Type's descriptor");
+        assert!(!target.defined, "System.Type is laid by another object here");
+        assert_eq!(header.addend, 12, "three vtable slots: the header lands on the words after them");
     }
 
     fn stub_returning_int() -> Function {
@@ -12093,6 +12308,78 @@ mod tests {
         assert!(has("__aeabi_fcmpeq"), "f32 != -> fcmpeq (inverted)");
         assert!(has("__aeabi_dcmplt"), "f64 < -> dcmplt");
         assert_eq!(code_relocations(&obj).len(), 3);
+    }
+
+    #[test]
+    fn lower_object_lowers_a_float_remainder_to_fmod() {
+        let rem = |lhs, rhs| Inst::Binary {
+            op: BinOp::RemSigned,
+            lhs,
+            rhs,
+        };
+        let main = Function {
+            params: Vec::new(),
+            ret: Some(MirType::I32),
+            value_types: vec![
+                MirType::F32,
+                MirType::F32,
+                MirType::F64,
+                MirType::F64,
+                MirType::F32,
+                MirType::F64,
+                MirType::I32,
+            ],
+            entry: BlockId(0),
+            blocks: vec![BasicBlock {
+                params: Vec::new(),
+                insts: vec![
+                    (
+                        ValueId(0),
+                        Inst::ConstInt {
+                            ty: MirType::F32,
+                            value: i64::from(7.5f32.to_bits()),
+                        },
+                    ),
+                    (
+                        ValueId(1),
+                        Inst::ConstInt {
+                            ty: MirType::F32,
+                            value: i64::from(2.0f32.to_bits()),
+                        },
+                    ),
+                    (
+                        ValueId(2),
+                        Inst::ConstInt {
+                            ty: MirType::F64,
+                            value: 7.5f64.to_bits() as i64,
+                        },
+                    ),
+                    (
+                        ValueId(3),
+                        Inst::ConstInt {
+                            ty: MirType::F64,
+                            value: 2.0f64.to_bits() as i64,
+                        },
+                    ),
+                    (ValueId(4), rem(ValueId(0), ValueId(1))),
+                    (ValueId(5), rem(ValueId(2), ValueId(3))),
+                    (
+                        ValueId(6),
+                        Inst::ConstInt {
+                            ty: MirType::I32,
+                            value: 0,
+                        },
+                    ),
+                ],
+                terminator: Some(Terminator::Return(Some(ValueId(6)))),
+            }],
+        };
+        let obj =
+            lamella_elf::read_object(&lower_object(&[main], &["main"], &[]).unwrap()).unwrap();
+        let has = |n: &str| obj.symbols.iter().any(|s| s.name == n && !s.defined);
+        assert!(has("fmodf"), "f32 % -> fmodf");
+        assert!(has("fmod"), "f64 % -> fmod");
+        assert_eq!(code_relocations(&obj).len(), 2);
     }
 
     /// All FOUR float-to-long helpers, named. This is a table test rather than a lowering test for
@@ -13017,6 +13304,7 @@ mod tests {
         };
         let qualifiers = DescQualifiers {
             string: None,
+            system_type: None,
             own: None,
             references: alloc::vec![
                 alloc::string::String::from("aaaa0001"),

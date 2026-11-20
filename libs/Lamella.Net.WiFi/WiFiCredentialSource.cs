@@ -14,7 +14,7 @@ namespace Lamella.Net.WiFi
         /// <summary>The network stored on the board.</summary>
         StoredRecord = 2,
 
-        /// <summary>The network named when the firmware was built, which only a development build carries.</summary>
+        /// <summary>A network named when the firmware was built. No Lamella firmware names one, so no board reports this source.</summary>
         BuildTime = 3,
     }
 }

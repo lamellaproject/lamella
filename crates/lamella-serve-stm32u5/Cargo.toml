@@ -1,0 +1,41 @@
+[package]
+name = "lamella-serve-stm32u5"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Interpreter firmware for STM32U5 boards (the NUCLEO-U5A5ZJ-Q): it runs the C# interpreter, takes programs from the lamella CLI over the virtual COM port of the board's ST-LINK, and keeps a deployed program in the chip's own flash."
+publish = false
+
+[dependencies]
+lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
+# The firmware's Lamella Link side: the framed protocol and the baked-image runner core.
+lamella-wire = { path = "../lamella-wire", optional = true }
+lamella-runner = { path = "../lamella-runner", optional = true, default-features = false, features = [
+    "baked-image",
+] }
+# The reclaiming O(1) segregated global allocator. The M33 has the atomic CAS its spin lock needs.
+lamella-heap = { path = "../lamella-heap", optional = true }
+# The pin-change event queue the external interrupt controller's handler fills (the shared
+# stm32_pin_events.rs and pin_events.rs), and the critical section that queue takes. Behind
+# `serve`, the firmware that runs programs.
+lamella-pin-events = { path = "../lamella-pin-events", optional = true }
+critical-section = { version = "1", optional = true, features = ["restore-state-bool"] }
+
+[features]
+# The firmware that takes programs from the lamella CLI: lamella-wire framing and the lamella-runner
+# baked-image core. Combine with a board feature -- `serve,st-nucleo-u5a5zj-q`.
+serve = ["dep:lamella-wire", "dep:lamella-runner", "dep:lamella-pin-events", "dep:critical-section"]
+# The firmware's allocator, the reclaiming heap. The board feature takes it.
+reclaim-heap = ["dep:lamella-heap"]
+# The NUCLEO-U5A5ZJ-Q board (STM32U5A5ZJ, Cortex-M33): 4 MB of flash in two 2 MB banks and 2,496 KB
+# of contiguous SRAM. The full class-library surface and the reclaiming heap. Combine with `serve`.
+st-nucleo-u5a5zj-q = ["lamella-runner?/profile-full", "reclaim-heap"]
+
+# The C# interpreter firmware, with the deploy tier: a program stored in the part's own flash runs
+# from reset. Needs a board feature as well as `serve`.
+[[bin]]
+name = "stm32u5-csharp-interpreter"
+path = "src/bin/stm32u5-csharp-interpreter.rs"
+required-features = ["serve"]

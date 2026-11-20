@@ -259,10 +259,7 @@ namespace System
             return HandleEquals(c, typeof(object));
         }
 
-        public override string ToString()
-        {
-            return FullName;
-        }
+        [Lamella.Runtime.RuntimeProvided] public override string ToString() { return null; }
 
         [Lamella.Runtime.RuntimeProvided] public static Type GetTypeFromHandle(RuntimeTypeHandle handle) { return null; }
 

@@ -225,8 +225,7 @@ const MAX_BLOCK_MS: u64 = 16;
 /// while remaining reachable, which is what makes it recoverable. `Capabilities::MONOTONIC_CLOCK` is
 /// what tells a host which of the two it is talking to.
 ///
-/// It spins rather than stopping the core, matching `systimer_clock` and unlike the SysTick fold,
-/// which offers each pass to a registered `idle_block::WakeSource`.
+/// It spins rather than stopping the core, as `systimer_clock` and the SysTick fold do.
 pub fn sleep_ms(millis: u64) {
     if !RUNNING.load(Ordering::Relaxed) {
         return;

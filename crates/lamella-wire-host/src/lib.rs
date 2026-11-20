@@ -17,6 +17,8 @@ pub mod boards;
 pub mod bake;
 #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
 pub mod on_device;
+#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+pub mod reopen;
 #[cfg(all(feature = "baked", any(test, feature = "loopback-board")))]
 pub mod loopback;
 
@@ -438,6 +440,22 @@ pub fn link_failure(error: TransportError) -> String {
     }
 }
 
+/// Whether `target` names a board by Lamella Link's own USB identity. Only Lamella's firmware
+/// enumerates as one, so a board reached that way has firmware, and its silence is not a missing one.
+#[must_use]
+pub fn has_link_identity(target: &str) -> bool {
+    classify_target(target) == TargetKind::Usb && {
+        let (vid, pid, _) = parse_usb_target(target);
+        (vid, pid) == (lamella_wire::usb::VID, lamella_wire::usb::PID)
+    }
+}
+
+/// Why a board on Lamella Link's own USB identity ([`has_link_identity`]) can be silent, for every host to
+/// say the one way, after a colon or a dash.
+pub const SILENT_WITH_FIRMWARE: &str = "its USB says it runs Lamella firmware, so it has firmware: a board \
+    stops reading its USB while its program computes and neither prints nor sleeps, as Lamella's Python \
+    firmware does, and answers once the program prints, sleeps or ends";
+
 /// A link to a board that could not be opened: what the rest of the link reads it as, and the operating
 /// system's own words where it gave some.
 ///
@@ -510,7 +528,9 @@ pub(crate) fn cannot_debug() -> OpenFailure {
 /// - `usb:<serial>` -- the Lamella Link VID/PID, board picked by a case-insensitive serial
 /// substring (chip-id serials are hex, so a single token is ALWAYS a serial -- overriding
 /// the ids requires the full pair form).
-#[cfg(feature = "usb")]
+///
+/// It reads only the text, so every build has it, as every build has [`has_link_identity`], which
+/// calls it.
 pub fn parse_usb_target(target: &str) -> (u16, u16, Option<String>) {
     fn hex4(s: &str) -> Option<u16> {
         (s.len() == 4).then(|| u16::from_str_radix(s, 16).ok()).flatten()
@@ -1285,16 +1305,27 @@ impl TransferAck {
     /// of it.
     #[must_use]
     pub fn describe(self, board: Option<&str>) -> String {
+        self.describe_as(board, "image")
+    }
+
+    /// [`TransferAck::describe`] for a Python bundle, which the sentences call the program.
+    #[must_use]
+    pub fn describe_program(self, board: Option<&str>) -> String {
+        self.describe_as(board, "program")
+    }
+
+    /// The sentence for this outcome, naming what was sent `what`.
+    fn describe_as(self, board: Option<&str>, what: &str) -> String {
         let place = the_board(board);
         match self {
-            Self::Accepted => format!("{place} accepted the whole image"),
-            Self::Rejected { .. } => format!("{place} could not store the image"),
+            Self::Accepted => format!("{place} accepted the whole {what}"),
+            Self::Rejected { .. } => format!("{place} could not store the {what}"),
             Self::Mismatched { .. } => {
-                format!("{place} does not hold the image that was sent: what it stored differs from it")
+                format!("{place} does not hold the {what} that was sent: what it stored differs from it")
             }
-            Self::TooLarge { image, window } => image_too_large(board, image, window),
+            Self::TooLarge { image, window } => too_large(board, what, image, window),
             Self::OutOfRange { .. } => {
-                format!("the image is too large for {place}: it reaches past its program area")
+                format!("the {what} is too large for {place}: it reaches past its program area")
             }
         }
     }
@@ -1318,6 +1349,42 @@ pub fn board_name(model: u16) -> Option<&'static str> {
     lamella_wire::product_model::name(model)
 }
 
+/// One resident runtime of the board a session reached, as a person reads it: the language it runs,
+/// the managed library of a C# runtime, and the image format the runtime loads when its board states
+/// one -- `Python, image format 0x8001 (pre-release 1)`, or `C#, abi 3 hash 0x... library 1.0.0.0
+/// build 1.0.0.0`.
+///
+/// **THE LIBRARY's FIELDS ARE THE C# RUNTIME's ALONE.** No other runtime carries a managed library, so
+/// its fields are zeros, and zeros printed as a version read as one.
+#[must_use]
+pub fn describe_runtime(negotiated: &lamella_wire::Negotiated, surface: &lamella_wire::Surface) -> String {
+    use lamella_wire::image_format::{LOADS_NONE, PRE_RELEASE};
+    use lamella_wire::msg::tier;
+    let mut line = match surface.tier {
+        tier::CIL => "C#".to_owned(),
+        tier::PYTHON => "Python".to_owned(),
+        tier::ECMASCRIPT => "JavaScript".to_owned(),
+        tier::NATIVE => "native code".to_owned(),
+        other => format!("tier {other}"),
+    };
+    if surface.tier == tier::CIL {
+        let (v, f) = (surface.lib_version, surface.lib_file_version);
+        line.push_str(&format!(
+            ", abi {} hash {:#018x} library {}.{}.{}.{} build {}.{}.{}.{}",
+            surface.abi, surface.hash, v[0], v[1], v[2], v[3], f[0], f[1], f[2], f[3]
+        ));
+    }
+    match negotiated.image_format(surface.tier) {
+        None => {}
+        Some(LOADS_NONE) => line.push_str(", loads no image"),
+        Some(format) if format & PRE_RELEASE != 0 => {
+            line.push_str(&format!(", image format {format:#06x} (pre-release {})", format & !PRE_RELEASE));
+        }
+        Some(format) => line.push_str(&format!(", image format {format:#06x}")),
+    }
+    line
+}
+
 /// The sentence a host shows when an image does not fit the board's deploy window
 /// ([`TransferAck::TooLarge`]): both sizes, the board, and that nothing was sent.
 ///
@@ -1326,10 +1393,15 @@ pub fn board_name(model: u16) -> Option<&'static str> {
 /// HELLO, or `None` when it named none.
 #[must_use]
 pub fn image_too_large(board: Option<&str>, image: usize, window: usize) -> String {
-    let over = image.saturating_sub(window);
+    too_large(board, "image", image, window)
+}
+
+/// [`image_too_large`], naming what was sent `what`.
+fn too_large(board: Option<&str>, what: &str, len: usize, window: usize) -> String {
+    let over = len.saturating_sub(window);
     let place = the_board(board);
     format!(
-        "the image is {image} bytes, {over} more than the {window}-byte program area on {place}, \
+        "the {what} is {len} bytes, {over} more than the {window}-byte program area on {place}, \
          so nothing was sent"
     )
 }
@@ -1490,6 +1562,29 @@ pub fn clear_deployed_blocking(
 /// without one.
 pub const CHUNK_DATA_CAP: usize = ((u16::MAX as usize - 8) / 512) * 512;
 
+/// Why a host must not send `image` to a board whose C# runtime loads the format `board`, as the
+/// board's HELLO stated it, or `None` when it may: one sentence, the one every host and firmware gives
+/// ([`lamella_wire::image_format`]).
+///
+/// The image's own format is asked first: an image file of another format than this Lamella writes,
+/// or bytes without an image's magic, is answered with the file's remedy, whatever the board loads,
+/// because a format this host does not write need not order with the board's. So is an image that
+/// holds no program the board's boot runs, by the checks that boot makes of an image's bytes
+/// ([`lamella_cil_runtime::baked_image_holds_a_program`]): no entry point, a directory or an arena past
+/// the file's end, content that does not hash to the checksum its header records, or a directory that
+/// is not this format's; sending it would erase the program the board holds and leave nothing to run. Only
+/// an image that holds a program is compared with the board's format, where a board that stated no
+/// format loads none this host writes. A host asks before it takes the board back from a program it
+/// runs, so a refused image leaves the board as it was.
+#[must_use]
+pub fn image_refusal(image: &[u8], board: Option<u16>) -> Option<&'static str> {
+    use lamella_cil_runtime::BAKED_IMAGE_FORMAT;
+    use lamella_wire::image_format::{REBUILD_IMAGE, file_refusal, refusal};
+    file_refusal(lamella_cil_runtime::baked_image_format(image), BAKED_IMAGE_FORMAT)
+        .or_else(|| (!lamella_cil_runtime::baked_image_holds_a_program(image)).then_some(REBUILD_IMAGE))
+        .or_else(|| refusal(board, BAKED_IMAGE_FORMAT))
+}
+
 /// Host driver, blocking: deploy a baked image to flash in CHUNKS, and say what the
 /// acknowledgements said. Chunked so that an image larger than one wire frame can cross, because a
 /// frame's LEN is a `u16`. Sends `DEPLOY_IMAGE(offset, total, bytes)` frames in ascending order,
@@ -1648,7 +1743,11 @@ fn deploy_image_reporting(
 ///   drops, and the rings in this tree run 256, 512 and 4,096 bytes.
 ///
 /// The result is a multiple of 256 bytes whenever it is at least that, so each chunk starts on the
-/// flash write unit of every board whose unit is 256 bytes or a divisor of it.
+/// flash write unit of every board whose unit is 256 bytes or a divisor of it. Below that it is the
+/// largest power of two that fits, so each chunk starts on the unit of every board whose unit is no
+/// larger. A carrier that cannot take a 256-byte chunk has a small receive ring, and the boards with
+/// one write in small units: the nRF51 and nRF52833 by the word, the SAMD21 by its 64-byte page. A
+/// board whose unit is larger than its carrier can carry cannot take a deploy over that carrier.
 #[must_use]
 pub fn deploy_chunk_len(session: &lamella_wire::Negotiated, carrier: TargetKind) -> usize {
     const ROOMY: usize = 8 * 1024;
@@ -1658,7 +1757,7 @@ pub fn deploy_chunk_len(session: &lamella_wire::Negotiated, carrier: TargetKind)
         None if carrier == TargetKind::Serial => SERIAL,
         None => ROOMY,
     };
-    if len >= SERIAL { len - len % SERIAL } else { len }
+    if len >= SERIAL { len - len % SERIAL } else { len.checked_ilog2().map_or(0, |bits| 1 << bits) }
 }
 
 /// The largest bundle slice one frame can carry: the frame's `u16` LEN cap, less the 8-byte
@@ -1682,6 +1781,7 @@ pub fn deploy_chunk_len(session: &lamella_wire::Negotiated, carrier: TargetKind)
 /// erases per page; the bundle path erases once up front, so word alignment is all its stores
 /// require. Reusing the image cap here would work, and would quietly demand 128x more alignment
 /// than the target asks for.
+#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
 pub(crate) const BUNDLE_CHUNK_DATA_CAP: usize = ((u16::MAX as usize - 8) / 4) * 4;
 
 /// Host driver: put ONE planned chunk of a bundle on the wire as a LOAD -- into the target's RAM,
@@ -1989,24 +2089,58 @@ pub fn deploy_bundle_blocking(
     timeout: Duration,
     session_caps: lamella_wire::Capabilities,
 ) -> Result<TransferAck, TransportError> {
-    let first_wait = match window_before_deploy(transport, seq, bundle.len(), timeout) {
-        Ok(window) => timeout.saturating_add(first_chunk_allowance(window)),
+    deploy_bundle_reporting(transport, seq, bundle, chunk_len, timeout, session_caps, &mut |_| {})
+}
+
+/// [`deploy_bundle_blocking`], telling `report` what [`deploy_image_reporting`] tells its caller: the
+/// longer wait of the first chunk, before it begins, and each acknowledged chunk, by how many of the
+/// bundle's bytes the target holds.
+///
+/// # Errors
+/// As [`deploy_bundle_blocking`].
+#[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
+fn deploy_bundle_reporting(
+    transport: &mut impl Transport,
+    seq: u16,
+    bundle: &[u8],
+    chunk_len: usize,
+    timeout: Duration,
+    session_caps: lamella_wire::Capabilities,
+    report: &mut dyn FnMut(DeployProgress),
+) -> Result<TransferAck, TransportError> {
+    let window = match window_before_deploy(transport, seq, bundle.len(), timeout) {
+        Ok(window) => window,
         Err(refused) => return Ok(refused),
     };
+    let first_wait = timeout.saturating_add(first_chunk_allowance(window));
     let compare = session_caps.has(lamella_wire::Capabilities::DEPLOY_PREFIX_CRC);
     let mut chunks = BundleChunks::new(bundle, chunk_len);
     let mut index = 0usize;
+    let mut held = 0usize;
     while let Some(chunk) = chunks.next() {
         send_bundle_chunk(transport, seq, &chunk)?;
         let expected = compare.then(|| chunks.prefix_crc());
         let wait = if index == 0 { first_wait } else { timeout };
+        if index == 0 && first_wait > timeout {
+            report(DeployProgress::Clearing { wait, expected: expected_clear(window) });
+        }
         let outcome = await_transfer_ack(transport, seq, index, expected, wait)?;
         if outcome != TransferAck::Accepted {
             return Ok(outcome);
         }
+        held += chunk.len().saturating_sub(8);
+        report(DeployProgress::Acknowledged(held));
         index += 1;
     }
     Ok(TransferAck::Accepted)
+}
+
+/// The content checksum a board that runs Python reports for the bundle it stores, verified against
+/// the bundle's bytes: the CRC-32 of those bytes ([`lamella_wire::crc32`]), widened to the field's 64
+/// bits. Compare it with [`deploy_status_blocking`]'s to skip sending a bundle the board already holds.
+#[must_use]
+pub fn bundle_checksum(bundle: &[u8]) -> u64 {
+    u64::from(lamella_wire::crc32::update(0, bundle))
 }
 
 /// Host driver, blocking: query the deployed artifact's content checksum -- `Some(checksum)` when
@@ -2514,7 +2648,39 @@ mod usb_target_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
     use lamella_wire::MemTransport;
+
+    /// **A RESIDENT RUNTIME IS NAMED BY THE LANGUAGE IT RUNS AND THE IMAGE FORMAT IT LOADS**, and only
+    /// the C# runtime's line gives a library, which no other runtime carries.
+    #[test]
+    fn a_resident_runtime_is_named_by_its_language_and_its_image_format() {
+        use lamella_wire::image_format::{LOADS_NONE, PRE_RELEASE};
+        use lamella_wire::msg::tier;
+        let surface = |tier: u8| lamella_wire::Surface { tier, abi: 3, lib_version: [1, 2, 3, 4], ..lamella_wire::Surface::default() };
+        let stating = |tier: u8, formats: Option<Vec<u16>>| lamella_wire::Negotiated {
+            version: lamella_wire::PROTOCOL_VERSION,
+            caps: lamella_wire::Capabilities(0),
+            target_caps: lamella_wire::Capabilities(0),
+            identity: lamella_wire::TargetIdentity::default().with_surface(surface(tier)),
+            max_inbound_payload: None,
+            image_formats: formats,
+        };
+        let said = |tier: u8, formats: Option<Vec<u16>>| describe_runtime(&stating(tier, formats), &surface(tier));
+        assert_eq!(said(tier::PYTHON, Some(vec![PRE_RELEASE | 1])), "Python, image format 0x8001 (pre-release 1)");
+        assert_eq!(
+            said(tier::CIL, None),
+            "C#, abi 3 hash 0x0000000000000000 library 1.2.3.4 build 0.0.0.0",
+            "a board that states no format is given none"
+        );
+        assert_eq!(
+            said(tier::CIL, Some(vec![2])),
+            "C#, abi 3 hash 0x0000000000000000 library 1.2.3.4 build 0.0.0.0, image format 0x0002"
+        );
+        assert_eq!(said(tier::ECMASCRIPT, Some(vec![LOADS_NONE])), "JavaScript, loads no image");
+        assert_eq!(said(tier::NATIVE, None), "native code");
+        assert_eq!(said(9, None), "tier 9", "a runtime this tool does not know is named by its number");
+    }
 
     /// A board running a program the way a resumed debug session runs one -- the runner's mid-run
     /// `service_wire`: it drops every request but a few, and stops on an `ABORT`, answering with the
@@ -2940,6 +3106,7 @@ mod tests {
 
     /// A target's answer to the question a deploy asks first: nothing deployed, and a deploy window
     /// of `window` bytes.
+    #[cfg(any(feature = "serial", feature = "usb", feature = "tcp"))]
     fn holds_nothing_with_a_window_of(seq: u16, window: u32) -> Vec<u8> {
         let mut payload = vec![deploy::deploy_state::NONE, 0];
         payload.extend_from_slice(&0u64.to_le_bytes());
@@ -3002,7 +3169,7 @@ mod tests {
         use lamella_wire::{Capabilities, HelloAck, TargetIdentity, host_finish};
         let session = |max_inbound_payload| {
             host_finish(
-                &HelloAck { chosen: 1, caps: Capabilities(0), identity: TargetIdentity::default(), max_inbound_payload },
+                &HelloAck { chosen: 1, caps: Capabilities(0), identity: TargetIdentity::default(), max_inbound_payload, image_formats: None },
                 Capabilities(0),
             )
         };
@@ -3017,9 +3184,74 @@ mod tests {
         assert_eq!(deploy_chunk_len(&session(Some(60_000)), TargetKind::Usb), 8192, "never above 8 KiB");
         assert_eq!(
             deploy_chunk_len(&session(Some(100)), TargetKind::Usb),
-            232,
-            "a target that under-declares is sent the floor's chunk"
+            128,
+            "a target that under-declares is sent the floor's chunk, as a power of two"
         );
+    }
+
+    /// **A CHUNK TOO SHORT FOR A 256-BYTE PAGE IS A POWER OF TWO**, so each chunk starts on the write
+    /// unit of every board whose unit is no larger. A 256-byte receive ring declares 246 bytes, which
+    /// carries 238 of chunk, and a second chunk at offset 238 is on no 4-byte unit or larger.
+    #[test]
+    fn a_chunk_below_a_page_is_a_power_of_two() {
+        use lamella_wire::{Capabilities, HelloAck, MIN_INBOUND_PAYLOAD, TargetIdentity, host_finish, max_payload_for_ring};
+        let session = |declared: usize| {
+            let ack = HelloAck {
+                chosen: 1,
+                caps: Capabilities(0),
+                identity: TargetIdentity::default(),
+                max_inbound_payload: None,
+                image_formats: None,
+            }
+            .with_max_inbound_payload(declared);
+            host_finish(&ack, Capabilities(0))
+        };
+        assert_eq!(deploy_chunk_len(&session(max_payload_for_ring(256)), TargetKind::Serial), 128, "a 256-byte ring");
+        assert_eq!(deploy_chunk_len(&session(MIN_INBOUND_PAYLOAD), TargetKind::Usb), 128, "the floor");
+        for declared in 0..=600 {
+            let chunk = deploy_chunk_len(&session(declared), TargetKind::Serial);
+            assert!(chunk <= session(declared).max_chunk_data(), "{declared}: {chunk} is more than the target takes");
+            assert!(chunk % 256 == 0 || (chunk < 256 && chunk.is_power_of_two()), "{declared}: {chunk}");
+        }
+    }
+
+    /// **A TARGET's IMAGE FORMATS DO NOT CHANGE WHAT IT IS SENT**: they ride after its carrier's
+    /// limit, so a target states them only over a carrier that declared one, and a target whose
+    /// carrier declared nothing is sent by what that carrier is, formats or no. Through the bytes
+    /// of its acknowledgement, as a host reads them.
+    #[test]
+    fn a_target_stating_its_formats_is_sent_what_its_carrier_takes() {
+        use lamella_wire::{
+            Capabilities, Hello, HelloAck, PROTOCOL_VERSION, ProtocolRange, Surface, TargetIdentity, host_finish,
+            image_format, msg, target_respond,
+        };
+        let identity = TargetIdentity::default().with_surface(Surface { tier: msg::tier::CIL, ..Surface::default() });
+        let format = image_format::PRE_RELEASE | 1;
+        let hello = Hello { range: ProtocolRange::single(PROTOCOL_VERSION), caps: Capabilities(0) };
+        let session = |inbound: Option<usize>| {
+            let ack = target_respond(
+                &hello,
+                ProtocolRange::single(PROTOCOL_VERSION),
+                Capabilities(0),
+                identity.clone(),
+                inbound,
+                Some(&[format]),
+            )
+            .expect("one version both speak");
+            host_finish(&HelloAck::decode(&ack.encode()).expect("an acknowledgement decodes"), Capabilities(0))
+        };
+        let silent = session(None);
+        assert_eq!(deploy_chunk_len(&silent, TargetKind::Usb), 8192);
+        assert_eq!(deploy_chunk_len(&silent, TargetKind::Tcp), 8192);
+        assert_eq!(deploy_chunk_len(&silent, TargetKind::Serial), 256);
+        assert_eq!(silent.max_inbound_payload, None, "no limit was made up for the carrier");
+        assert_eq!(silent.image_format(msg::tier::CIL), None, "so the formats, which follow one, were not sent");
+        let usb = session(Some(lamella_wire::MAX_PAYLOAD));
+        assert_eq!(deploy_chunk_len(&usb, TargetKind::Usb), 8192);
+        assert_eq!(usb.image_format(msg::tier::CIL), Some(format), "a carrier that declares carries them");
+        let ring = session(Some(lamella_wire::max_payload_for_ring(512)));
+        assert_eq!(deploy_chunk_len(&ring, TargetKind::Serial), 256);
+        assert_eq!(ring.image_format(msg::tier::CIL), Some(format));
     }
 
     /// **A DEPLOY's PROGRESS IS WHAT THE TARGET ACKNOWLEDGED**, once per chunk, ending at the whole

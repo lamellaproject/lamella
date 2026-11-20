@@ -137,11 +137,29 @@ namespace System.Device.Gpio
         }
 
         /// <summary>Sets the mode of a pin.</summary>
-        /// <exception cref="System.InvalidOperationException">The pin is not open.</exception>
+        /// <exception cref="System.InvalidOperationException">The pin is not open, or it does not support
+        /// <paramref name="mode"/>.</exception>
         public virtual void SetPinMode(int pinNumber, PinMode mode)
         {
             CheckOpen(pinNumber, "Can not set a mode to pin ");
+            if (!IsPinModeSupported(pinNumber, mode))
+            {
+                string refusal = "Pin " + pinNumber.ToString() + " does not support mode ";
+                throw new System.InvalidOperationException(refusal + ModeName(mode) + ".");
+            }
             _driver.SetPinMode(pinNumber, mode);
+        }
+
+        private static string ModeName(PinMode mode)
+        {
+            switch (mode)
+            {
+                case PinMode.Input: return "Input";
+                case PinMode.Output: return "Output";
+                case PinMode.InputPullDown: return "InputPullDown";
+                case PinMode.InputPullUp: return "InputPullUp";
+                default: return ((int)mode).ToString();
+            }
         }
 
         /// <summary>Gets the mode of a pin.</summary>

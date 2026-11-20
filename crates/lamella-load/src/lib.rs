@@ -187,7 +187,7 @@ use lamella_cil_runtime::intrinsics::{
     math_pow_f64, math_sin_f64, math_sinh_f64, math_sqrt_f64, math_tan_f64, math_tanh_f64,
 };
 use lamella_cil_runtime::module::{
-    AttrValue, BoxedPrimitive, IntrinsicType, LoadedAttribute, RawCil, VarargSite, asm_key,
+    AttrValue, BoxedPrimitive, IntrinsicType, LoadedAttribute, RawCil, SlotKind, VarargSite, asm_key,
 };
 #[cfg(feature = "reflection")]
 use lamella_cil_runtime::module::{
@@ -219,6 +219,8 @@ mod array_base_scope_tests;
 #[cfg(test)]
 mod fixed_string_tests;
 
+#[cfg(test)]
+mod slot_kind_tests;
 #[cfg(test)]
 mod stack_struct_tests;
 #[cfg(test)]
@@ -636,18 +638,6 @@ fn ram_cil(bytes: &[u8]) -> RawCil {
     RawCil::Ram(bytes.to_vec().into_boxed_slice())
 }
 
-/// Builds a runnable [`Program`] from `assembly`.
-///
-/// Every method with a body is added and bound to its MethodDef token (methods
-/// iterate in table order, so the running 1-based count is the row that, tagged
-/// [`METHOD_DEF`], reconstructs the token). `ldstr` and recognized BCL calls are
-/// then resolved. The entry point is found by matching the CLI header's
-/// entry-point token.
-///
-/// # Errors
-/// [`LoadError::NoEntryPoint`] if the assembly names no entry point, or
-/// [`LoadError::EntryHasNoBody`] if that token has no loadable body.
-
 /// The names a reference may spell although two assemblies declare them: the attributes a compiler
 /// writes into an assembly whose target lacks them, and `IsExternalInit`, which a library declares so
 /// that its `init` setters compile. A name that starts with `<` is never a reference's to spell.
@@ -828,6 +818,22 @@ fn refuse_unmet_demands(assemblies: &[&Assembly<'_>]) -> Result<(), LoadError> {
     Ok(())
 }
 
+/// Builds a runnable [`Program`] from `assembly`.
+///
+/// Every method with a body is added and bound to its MethodDef token (methods
+/// iterate in table order, so the running 1-based count is the row that, tagged
+/// [`METHOD_DEF`], reconstructs the token: a token's top byte names the table and
+/// its rows are numbered from one, ECMA-335 6th ed III.1.9). `ldstr` and
+/// recognized BCL calls are then resolved. The entry point is found by matching the
+/// CLI header's entry-point token (ECMA-335 6th ed II.25.3.3).
+///
+/// # Errors
+/// [`LoadError::UnmetDemand`] if the assembly demands something this runtime does not
+/// implement (a required custom modifier, ECMA-335 6th ed II.7.1.1, or a
+/// `CompilerFeatureRequiredAttribute`, a .NET attribute that ECMA-335 6th ed's standard
+/// libraries do not define: IV.5, whose CLILibraryTypes.xml names no such type),
+/// [`LoadError::NoEntryPoint`] if the assembly names no entry point, or
+/// [`LoadError::EntryHasNoBody`] if that token has no loadable body.
 pub fn load<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Program, LoadError> {
     refuse_unmet_demands(&[assembly])?;
     if assembly.image().entry_point_token() == 0 {
@@ -908,6 +914,7 @@ pub fn load_library<'pe>(assembly: &SourceAssembly<'pe>) -> Result<Module, LoadE
         &mut field_index,
         false,
         &mut heirs,
+        &[],
     );
     #[cfg(feature = "generics")]
     {
@@ -1871,6 +1878,7 @@ pub fn load_program_lazy_corlib_with_libraries_unfrozen<'c, 'l, 'p>(
             &mut resolution.field_index,
             true,
             &mut heirs,
+            &[corlib],
         );
     }
     let program_type_offset = module.type_count();
@@ -1884,6 +1892,7 @@ pub fn load_program_lazy_corlib_with_libraries_unfrozen<'c, 'l, 'p>(
         &mut resolution.field_index,
         true,
         &mut heirs,
+        &[corlib],
     );
     let mut override_sources = alloc::vec![(LAZY_CORLIB_ASM, corlib), (program_asm, program)];
     override_sources.extend(libraries.iter().enumerate().map(|(position, library)| {
@@ -2673,6 +2682,8 @@ fn materialize_corlib_method_row<'c>(
                 return;
             };
             let id = module.add_method(LAZY_CORLIB_ASM, flash_cil(raw_il), arg_count(&method));
+            let types = TypeSource { assembly: corlib, asm: LAZY_CORLIB_ASM, type_offset: None, type_index: None, references: &[] };
+            record_slot_kinds(module, id, LAZY_CORLIB_ASM, &method, this_is_managed_pointer(&type_def), SlotGenerics::default(), Some(types));
             module.bind_token(LAZY_CORLIB_ASM, token, id);
             module.set_method_type(id, type_id);
             resolution.index.insert(key, id);
@@ -2932,13 +2943,7 @@ fn materialize_corlib_type<'c>(
                     if matches!(constant, ConstantValue::I8(_) | ConstantValue::U8(_)) {
                         module.set_enum_wide(LAZY_CORLIB_ASM, type_token);
                     }
-                    if matches!(
-                        constant,
-                        ConstantValue::U1(_)
-                            | ConstantValue::U2(_)
-                            | ConstantValue::U4(_)
-                            | ConstantValue::U8(_)
-                    ) {
+                    if enum_constant_is_unsigned(&constant) {
                         module.set_enum_unsigned(LAZY_CORLIB_ASM, type_token);
                     }
                     module.set_enum_width(
@@ -3575,6 +3580,7 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
         &mut field_index,
         true,
         &mut heirs,
+        &[],
     );
     let mut library_type_offsets: Vec<usize> = Vec::with_capacity(libraries.len());
     for (position, library) in libraries.iter().enumerate() {
@@ -3589,6 +3595,7 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
             &mut field_index,
             true,
             &mut heirs,
+            &[],
         );
     }
     let program_asm = 1 + libraries.len() as u8;
@@ -3603,6 +3610,7 @@ fn load_with_corlib_and_libraries_lowered<'c, 'l, 'p>(
         &mut field_index,
         true,
         &mut heirs,
+        &[],
     );
     let mut override_sources = alloc::vec![(0, corlib), (program_asm, program)];
     override_sources.extend(libraries.iter().enumerate().map(|(position, library)| {
@@ -3718,6 +3726,7 @@ fn load_assembly<'pe>(
         field_index,
         resolve_external,
         &mut Vec::new(),
+        &[],
     )
 }
 
@@ -3799,6 +3808,7 @@ fn load_assembly_collecting<'pe>(
     field_index: &mut FieldNameIndex,
     resolve_external: bool,
     heirs: &mut Vec<GenericBaseHeir<'pe>>,
+    references: &[&Assembly<'_>],
 ) -> Option<MethodId> {
     let type_offset = module.type_count();
     let entry_token = assembly.image().entry_point_token();
@@ -3859,6 +3869,11 @@ fn load_assembly_collecting<'pe>(
                     {
                         pending_static_structs.push((slot, value_type));
                     }
+                    let types = TypeSource { assembly, asm, type_offset: Some(type_offset), type_index: Some(&*type_index), references };
+                    let storage = field.signature().and_then(|sig| field_storage(&sig, &|token| struct_type_id(module, asm, token, Some(types))));
+                    if let (Some(storage), Some(slot)) = (storage, module.static_field_slot(asm, token)) {
+                        module.set_static_storage(slot, storage);
+                    }
                     if let (Some(field_name), Some(slot)) =
                         (field.name(), module.static_field_slot(asm, token))
                     {
@@ -3872,13 +3887,7 @@ fn load_assembly_collecting<'pe>(
                         if matches!(constant, ConstantValue::I8(_) | ConstantValue::U8(_)) {
                             module.set_enum_wide(asm, type_token);
                         }
-                        if matches!(
-                            constant,
-                            ConstantValue::U1(_)
-                                | ConstantValue::U2(_)
-                                | ConstantValue::U4(_)
-                                | ConstantValue::U8(_)
-                        ) {
+                        if enum_constant_is_unsigned(&constant) {
                             module.set_enum_unsigned(asm, type_token);
                         }
                         module.set_enum_width(asm, type_token, enum_constant_width(&constant));
@@ -4137,6 +4146,8 @@ fn load_assembly_collecting<'pe>(
                 }
             }
             let id = module.add_method(asm, materialize(raw_il), arg_count(&method));
+            let types = TypeSource { assembly, asm, type_offset: Some(type_offset), type_index: Some(&*type_index), references };
+            record_slot_kinds(module, id, asm, &method, this_is_managed_pointer(&type_def), SlotGenerics::default(), Some(types));
             module.bind_token(asm, token, id);
             module.set_method_type(id, type_id);
             if let Some((ns, tn)) = key_type_name(assembly, &type_def) {
@@ -4936,6 +4947,7 @@ mod type_baseline_binding_tests {
             "op_Equality",
             "op_Inequality",
             "HandleEquals",
+            "ToString",
         ] {
             assert!(
                 binds(method),
@@ -5470,6 +5482,7 @@ fn bcl_intrinsic(
         ("Type", "op_Equality") => Some(intrinsic!(reflect_handle_equals)),
         ("Type", "op_Inequality") => Some(intrinsic!(reflect_handle_not_equals)),
         ("Type", "HandleEquals") => Some(intrinsic!(reflect_handle_equals)),
+        ("Type", "ToString") => to_string_overload(intrinsic!(object_to_string), signature),
         #[cfg(feature = "reflection")]
         ("Type", "GetField") => match parameters_of(signature) {
             [SigType::String] | [SigType::String, _] => Some(intrinsic!(type_get_field)),
@@ -7085,32 +7098,39 @@ fn record_type_field_offsets(
     };
     if offsets.len() == slot_count {
         module.set_type_field_offsets(type_id, end, alignment, &offsets);
-        use lamella_cil_runtime::module::FieldStorage;
         let inherited = slot_count.saturating_sub(own.len());
         let storage = (0..inherited)
             .map(|slot| module.type_field_storage(module.type_base(type_id)?, slot))
-            .chain(own.iter().map(|field| {
-                Some(match field {
-                    SigType::I1 => FieldStorage::Primitive(PrimKind::I1),
-                    SigType::U1 | SigType::Boolean => FieldStorage::Primitive(PrimKind::U1),
-                    SigType::I2 => FieldStorage::Primitive(PrimKind::I2),
-                    SigType::U2 | SigType::Char => FieldStorage::Primitive(PrimKind::U2),
-                    SigType::I4 | SigType::U4 => FieldStorage::Primitive(PrimKind::I4),
-                    SigType::I8 | SigType::U8 => FieldStorage::Primitive(PrimKind::I8),
-                    SigType::R4 => FieldStorage::Primitive(PrimKind::F4),
-                    SigType::R8 => FieldStorage::Primitive(PrimKind::F8),
-                    SigType::IntPtr | SigType::UIntPtr | SigType::Pointer(_) => FieldStorage::Native,
-                    SigType::ValueType(token) => FieldStorage::ValueType(value_type_id(*token)?),
-                    SigType::Object | SigType::String | SigType::Class(_)
-                    | SigType::SzArray(_) | SigType::Array { .. } => FieldStorage::Reference,
-                    _ => return None,
-                })
-            })).collect::<Option<Vec<_>>>();
+            .chain(own.iter().map(|field| field_storage(field, value_type_id)))
+            .collect::<Option<Vec<_>>>();
         if let Some(storage) = storage {
             module.set_type_field_storage(type_id, &storage);
         }
     }
     OffsetRecord::Settled
+}
+
+/// The declared storage of a field whose signature type is `sig` (ECMA-335 6th ed II.23.2.4): a sized
+/// primitive by its width and signedness, a native int or unmanaged pointer, a value type by the id
+/// `value_type_id` names it by, a reference; `None` for any other type, a generic one included.
+fn field_storage(sig: &SigType, value_type_id: &dyn Fn(Token) -> Option<TypeId>) -> Option<lamella_cil_runtime::module::FieldStorage> {
+    use lamella_cil_runtime::module::FieldStorage;
+    Some(match sig {
+        SigType::I1 => FieldStorage::Primitive(PrimKind::I1),
+        SigType::U1 | SigType::Boolean => FieldStorage::Primitive(PrimKind::U1),
+        SigType::I2 => FieldStorage::Primitive(PrimKind::I2),
+        SigType::U2 | SigType::Char => FieldStorage::Primitive(PrimKind::U2),
+        SigType::I4 | SigType::U4 => FieldStorage::Primitive(PrimKind::I4),
+        SigType::I8 | SigType::U8 => FieldStorage::Primitive(PrimKind::I8),
+        SigType::R4 => FieldStorage::Primitive(PrimKind::F4),
+        SigType::R8 => FieldStorage::Primitive(PrimKind::F8),
+        SigType::IntPtr | SigType::UIntPtr | SigType::Pointer(_) => FieldStorage::Native,
+        SigType::ValueType(token) => FieldStorage::ValueType(value_type_id(*token)?),
+        SigType::Object | SigType::String | SigType::Class(_) | SigType::SzArray(_) | SigType::Array { .. } => {
+            FieldStorage::Reference
+        }
+        _ => return None,
+    })
 }
 
 /// Records the byte size of every type a `sizeof` operand names (III.4.25), and of every
@@ -7186,6 +7206,11 @@ fn array_element_default(
     element_type: Token,
     enum_zeros: &BTreeMap<String, Value>,
 ) -> Option<Value> {
+    // An unmanaged pointer element is a native unsigned int (ECMA-335 6th ed I.12.1.1.1), so `new
+    // int*[n]` holds n native int zeros, the null pointer, as an array is zero-initialized (II.13.2).
+    if let Some(SigType::Pointer(_)) = assembly.type_spec_signature(element_type) {
+        return Some(Value::NativeInt(0));
+    }
     let name = assembly.type_token_name(element_type)?;
     if let Some(zero) = type_index_key(assembly, element_type).and_then(|key| enum_zeros.get(&key)) {
         return Some(zero.clone());
@@ -8014,10 +8039,12 @@ fn has_runtime_provided_attribute(assembly: &Assembly, method_token: Token) -> b
 /// `ulong` constant above `long.MaxValue` does not fit. `value__` answers for both.
 fn record_enum_underlying(module: &mut Module, asm: u8, type_token: u32, signature: Option<SigType>) {
     let (width, unsigned) = match signature {
-        Some(SigType::I1 | SigType::Boolean) => (1, false),
-        Some(SigType::U1) => (1, true),
-        Some(SigType::I2 | SigType::Char) => (2, false),
-        Some(SigType::U2) => (2, true),
+        Some(SigType::I1) => (1, false),
+        // A `bool` or `char` underlying type (ECMA-335 6th ed II.14.3) is unsigned (I.8.2.2), as the
+        // constants path reads it too ([`enum_constant_is_unsigned`]).
+        Some(SigType::U1 | SigType::Boolean) => (1, true),
+        Some(SigType::I2) => (2, false),
+        Some(SigType::U2 | SigType::Char) => (2, true),
         Some(SigType::I4) => (4, false),
         Some(SigType::U4) => (4, true),
         Some(SigType::I8) => (8, false),
@@ -8034,12 +8061,26 @@ fn record_enum_underlying(module: &mut Module, asm: u8, type_token: u32, signatu
     }
 }
 
-/// The underlying byte width an enum constant's kind implies (`sbyte`/`byte` = 1,
+/// Whether an enum member's constant names an unsigned underlying type, the enum's: an unsigned
+/// integer, a `char` or a `bool` (ECMA-335 6th ed II.14.3 and I.8.2.2).
+fn enum_constant_is_unsigned(value: &ConstantValue) -> bool {
+    matches!(
+        value,
+        ConstantValue::U1(_)
+            | ConstantValue::U2(_)
+            | ConstantValue::U4(_)
+            | ConstantValue::U8(_)
+            | ConstantValue::Char(_)
+            | ConstantValue::Bool(_)
+    )
+}
+
+/// The underlying byte width an enum constant's kind implies (`sbyte`/`byte`/`bool` = 1,
 /// `short`/`ushort`/`char` = 2, `int`/`uint` = 4, `long`/`ulong` = 8) -- the enum's underlying
 /// type, which every member shares. `Enum.Format`'s "X" zero-pads to `width * 2` hex digits.
 fn enum_constant_width(value: &ConstantValue) -> u8 {
     match value {
-        ConstantValue::I1(_) | ConstantValue::U1(_) => 1,
+        ConstantValue::I1(_) | ConstantValue::U1(_) | ConstantValue::Bool(_) => 1,
         ConstantValue::I2(_) | ConstantValue::U2(_) | ConstantValue::Char(_) => 2,
         ConstantValue::I8(_) | ConstantValue::U8(_) => 8,
         _ => 4,
@@ -9519,4 +9560,224 @@ fn arg_count(method: &Method<'_>) -> u16 {
     let parameters = method.signature().map_or(0, |sig| sig.parameters.len());
     let this = usize::from(!method.is_static());
     u16::try_from(parameters + this).unwrap_or(u16::MAX)
+}
+
+/// The type arguments a generic copy's `!n` and `!!n` stand for (a generic type's nth parameter and a
+/// generic method's, ECMA-335 6th ed II.23.2.12 and II.23.2.15), and the assembly each list's tokens
+/// are written in. Empty for a method that is not a generic copy.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SlotGenerics<'a> {
+    pub(crate) type_arguments: &'a [SigType],
+    pub(crate) type_asm: u8,
+    pub(crate) method_arguments: &'a [SigType],
+    pub(crate) method_asm: u8,
+}
+
+/// Where a slot's signature can be read to tell an enum from another value type and to name a struct's
+/// type, whatever order the loader meets the types in: the assembly whose tokens it is written in,
+/// loaded as module assembly `asm`; the id of that assembly's first type, where the loader numbers its
+/// types in row order; the index of every type loaded so far by name, for a `TypeRef` to another
+/// assembly's; and the assemblies whose types that index names only once they are materialized (the
+/// lazily loaded corlib), read by name.
+#[derive(Clone, Copy)]
+pub(crate) struct TypeSource<'a, 'pe> {
+    pub(crate) assembly: &'a Assembly<'pe>,
+    pub(crate) asm: u8,
+    pub(crate) type_offset: Option<usize>,
+    pub(crate) type_index: Option<&'a TypeNameIndex>,
+    pub(crate) references: &'a [&'a Assembly<'a>],
+}
+
+/// The underlying integer of the enum the value-type `token`, in module assembly `asm`'s tokens, names,
+/// if it names one (ECMA-335 6th ed II.14.3): the loader's record of the enum; else, read from `types`
+/// where its assembly is `asm`'s, a type of that assembly by its `value__` field, whether or not the
+/// loader has reached it yet, and a type of another assembly by the record of the type its name
+/// resolves to in the loaded types' index.
+fn enum_underlying(module: &Module, asm: u8, token: Token, types: Option<TypeSource<'_, '_>>) -> Option<PrimKind> {
+    let recorded = |handle| module.enum_underlying_prim_by_handle(handle).and_then(CastPrim::prim_kind);
+    if let Some(kind) = recorded(asm_key(asm, token.0)) {
+        return Some(kind);
+    }
+    let source = types.filter(|source| source.asm == asm)?;
+    match token.table() {
+        TYPE_DEF => metadata_enum_underlying(source.assembly, &source.assembly.type_def(token.row())?),
+        TYPE_REF => {
+            let (namespace, name) = source.assembly.type_token_full_name(token)?;
+            if let Some(kind) = source
+                .type_index
+                .and_then(|index| index.get(&type_key(&namespace, &name)))
+                .and_then(|id| module.type_handle_of(*id))
+                .and_then(recorded)
+            {
+                return Some(kind);
+            }
+            // A type of an assembly loaded lazily is named by the index only once it is materialized,
+            // and a type a body names only in a signature is not: its metadata is read by name.
+            source.references.iter().find_map(|reference| {
+                let type_def = reference.type_defs().find(|type_def| {
+                    type_def.name().is_some_and(|row| row.name == name)
+                        && reference
+                            .type_token_full_name(type_def.token())
+                            .is_some_and(|(row_namespace, _)| row_namespace == namespace)
+                })?;
+                metadata_enum_underlying(reference, &type_def)
+            })
+        }
+        _ => None,
+    }
+}
+
+/// The underlying integer of `type_def` of `assembly` when it is an enum: the type of its `value__`
+/// instance field (ECMA-335 6th ed II.14.3), read from metadata.
+fn metadata_enum_underlying(assembly: &Assembly<'_>, type_def: &TypeDef<'_>) -> Option<PrimKind> {
+    if !is_enum_type(assembly, type_def.extends()) {
+        return None;
+    }
+    let value = type_def.fields().find(|field| !field.is_static() && field.name() == Some("value__"))?;
+    match value.signature()? {
+        SigType::I1 => Some(PrimKind::I1),
+        SigType::U1 | SigType::Boolean => Some(PrimKind::U1),
+        SigType::I2 => Some(PrimKind::I2),
+        SigType::U2 | SigType::Char => Some(PrimKind::U2),
+        SigType::I4 | SigType::U4 => Some(PrimKind::I4),
+        SigType::I8 | SigType::U8 => Some(PrimKind::I8),
+        _ => None,
+    }
+}
+
+/// The id of the value type `token`, in module assembly `asm`'s tokens, names: the type it is bound to;
+/// else, through `types` where its assembly is `asm`'s, a type of that assembly by its row where the
+/// loader numbers that assembly's types in row order, whether or not it has reached the type yet, and a
+/// type of another assembly by the type its name resolves to in the loaded types' index. `None` for a
+/// type the loader has not reached by either (one of the lazily loaded corlib it has not
+/// materialized).
+fn struct_type_id(module: &Module, asm: u8, token: Token, types: Option<TypeSource<'_, '_>>) -> Option<TypeId> {
+    if let Some(id) = module.type_id_of(asm, token) {
+        return Some(id);
+    }
+    let source = types.filter(|source| source.asm == asm)?;
+    match token.table() {
+        TYPE_DEF => {
+            source.assembly.type_def(token.row())?;
+            let row = usize::try_from(token.row()).ok()?.checked_sub(1)?;
+            TypeId::try_from(source.type_offset?.checked_add(row)?).ok()
+        }
+        TYPE_REF => {
+            let (namespace, name) = source.assembly.type_token_full_name(token)?;
+            source.type_index?.get(&type_key(&namespace, &name)).copied()
+        }
+        _ => None,
+    }
+}
+
+/// The value type of a [`SlotKind::Struct`] slot whose signature type, written in assembly `asm`'s
+/// tokens, is `sig` ([`struct_type_id`]), and of `!n` or `!!n` the argument `generics` gives it. `None`
+/// for a generic instantiation, whose type the monomorphizer makes.
+pub(crate) fn slot_struct_type(
+    module: &Module,
+    asm: u8,
+    sig: &SigType,
+    generics: SlotGenerics<'_>,
+    types: Option<TypeSource<'_, '_>>,
+) -> Option<TypeId> {
+    let argument = |arguments: &[SigType], index: &u32, argument_asm: u8| {
+        let argument = arguments.get(usize::try_from(*index).ok()?)?;
+        slot_struct_type(module, argument_asm, argument, SlotGenerics::default(), types)
+    };
+    match sig {
+        SigType::ValueType(token) => struct_type_id(module, asm, *token, types),
+        SigType::Var(index) => argument(generics.type_arguments, index, generics.type_asm),
+        SigType::MVar(index) => argument(generics.method_arguments, index, generics.method_asm),
+        _ => None,
+    }
+}
+
+/// The declared kind of a slot whose signature type, written in assembly `asm`'s tokens, is `sig`
+/// ([`SlotKind`]): an enum is its underlying integer (ECMA-335 6th ed II.14.3), told apart from another
+/// value type through `types` where the loader has not recorded it yet ([`enum_underlying`]), an
+/// unmanaged pointer a native int (I.12.1.1.1), a generic instantiation an object reference or a struct
+/// as its definition is, and `!n` or `!!n` the kind of the argument `generics` gives it.
+pub(crate) fn slot_kind(
+    module: &Module,
+    asm: u8,
+    sig: &SigType,
+    generics: SlotGenerics<'_>,
+    types: Option<TypeSource<'_, '_>>,
+) -> SlotKind {
+    let argument = |arguments: &[SigType], index: &u32, argument_asm: u8| {
+        usize::try_from(*index)
+            .ok()
+            .and_then(|index| arguments.get(index))
+            .map_or(SlotKind::Unknown, |argument| slot_kind(module, argument_asm, argument, SlotGenerics::default(), types))
+    };
+    match sig {
+        SigType::I1 => SlotKind::Primitive(PrimKind::I1),
+        SigType::U1 | SigType::Boolean => SlotKind::Primitive(PrimKind::U1),
+        SigType::I2 => SlotKind::Primitive(PrimKind::I2),
+        SigType::U2 | SigType::Char => SlotKind::Primitive(PrimKind::U2),
+        SigType::I4 | SigType::U4 => SlotKind::Primitive(PrimKind::I4),
+        SigType::I8 | SigType::U8 => SlotKind::Primitive(PrimKind::I8),
+        SigType::R4 => SlotKind::Primitive(PrimKind::F4),
+        SigType::R8 => SlotKind::Primitive(PrimKind::F8),
+        SigType::IntPtr | SigType::UIntPtr | SigType::Pointer(_) => SlotKind::Native,
+        SigType::Object | SigType::String | SigType::Class(_) | SigType::SzArray(_) | SigType::Array { .. } => {
+            SlotKind::Reference
+        }
+        SigType::ByRef(_) => SlotKind::ByRef,
+        SigType::ValueType(token) => enum_underlying(module, asm, *token, types).map_or(SlotKind::Struct, SlotKind::Primitive),
+        // An enum nested in a generic type is named through its instantiation, and is its underlying
+        // integer at any instantiation.
+        SigType::GenericInst { definition, .. } => match **definition {
+            SigType::ValueType(token) => enum_underlying(module, asm, token, types).map_or(SlotKind::Struct, SlotKind::Primitive),
+            _ => SlotKind::Reference,
+        },
+        SigType::Var(index) => argument(generics.type_arguments, index, generics.type_asm),
+        SigType::MVar(index) => argument(generics.method_arguments, index, generics.method_asm),
+        _ => SlotKind::Unknown,
+    }
+}
+
+/// Whether an instance method of `type_def` takes `this` as a managed pointer: a value type's does
+/// (ECMA-335 6th ed II.13.3), and `System.ValueType` and `System.Enum`, which derive from
+/// `System.ValueType` but are reference types (II.13 and II.14.3), take an object reference.
+pub(crate) fn this_is_managed_pointer(type_def: &TypeDef<'_>) -> bool {
+    type_def.is_value_type() && !is_special_reference_base(type_def.name())
+}
+
+/// Records the declared kinds of `method`'s slots for the module method `id`: its arguments (`this`
+/// first for an instance method, a managed pointer when `this_by_ref`, the `this` of a value type's
+/// method, else an object reference) from its signature (ECMA-335 6th ed II.23.2.1), then its locals
+/// from its local variable signature (II.23.2.6); and the type of each struct slot the loader can name
+/// ([`slot_struct_type`]), whose layout places the bytes a pointer into the variable reaches.
+pub(crate) fn record_slot_kinds(
+    module: &mut Module,
+    id: MethodId,
+    asm: u8,
+    method: &Method<'_>,
+    this_by_ref: bool,
+    generics: SlotGenerics<'_>,
+    types: Option<TypeSource<'_, '_>>,
+) {
+    let typed = |sig: &SigType| {
+        let kind = slot_kind(module, asm, sig, generics, types);
+        let structure = if kind == SlotKind::Struct { slot_struct_type(module, asm, sig, generics, types) } else { None };
+        (kind, structure)
+    };
+    let mut args = Vec::new();
+    if !method.is_static() {
+        args.push((if this_by_ref { SlotKind::ByRef } else { SlotKind::Reference }, None));
+    }
+    if let Some(signature) = method.signature() {
+        args.extend(signature.parameters.iter().map(&typed));
+    }
+    let locals: Vec<(SlotKind, Option<TypeId>)> = method.local_variable_slots().iter().map(|local| typed(&local.ty)).collect();
+    let kinds = |slots: &[(SlotKind, Option<TypeId>)]| slots.iter().map(|&(kind, _)| kind).collect::<Vec<_>>();
+    module.set_method_slot_kinds(id, &kinds(&args), &kinds(&locals));
+    for (argument, slots) in [(true, &args), (false, &locals)] {
+        for (slot, &(_, structure)) in slots.iter().enumerate() {
+            if let Some(type_id) = structure {
+                module.set_method_slot_struct_type(id, argument, slot, type_id);
+            }
+        }
+    }
 }

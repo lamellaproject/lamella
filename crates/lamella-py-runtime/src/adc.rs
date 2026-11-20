@@ -87,7 +87,9 @@ pub(crate) struct AdcFacts {
     pub cs: u32,
     /// The conversion-result register.
     pub result: u32,
-    /// The ADC clock-generator control (its ENABLED bit is polled at bring-up).
+    /// The ADC clock-generator control (its ENABLED bit is polled at bring-up). The off-device sim
+    /// answers that poll, so this and `clk_enabled` are compiled only there.
+    #[cfg(not(target_os = "none"))]
     pub clk_ctrl: u32,
     /// The CS base value keeping the converter + temp bias enabled (EN | TS_EN).
     pub cs_enabled: u32,
@@ -98,6 +100,7 @@ pub(crate) struct AdcFacts {
     /// CS.ERR -- the most recent conversion errored (discard + re-run).
     pub cs_err: u32,
     /// CLK_ADC_CTRL.ENABLED (read-only) -- the generator reports running.
+    #[cfg(not(target_os = "none"))]
     pub clk_enabled: u32,
     /// The result field mask (the hardware count).
     pub result_mask: u32,

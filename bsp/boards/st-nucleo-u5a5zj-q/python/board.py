@@ -72,7 +72,9 @@ INSTANCES = {
     "gpioj": {"block": "gpio", "base": 0x42022400, "rcc_en_off": 0x8C, "rcc_en_bit": 0x9},
     "usart1": {"block": "usart", "base": 0x40013800, "rcc_en_off": 0xA4, "rcc_en_bit": 0xE},
     "rcc": {"block": "rcc", "base": 0x46020C00},
+    "exti": {"block": "exti", "base": 0x46022000},
     "pwr": {"block": "pwr", "base": 0x46020800, "rcc_en_off": 0x94, "rcc_en_bit": 0x2},
+    "tim5": {"block": "tim", "base": 0x40000C00, "rcc_en_off": 0x9C, "rcc_en_bit": 0x3},
 }
 
 PLANS = {
@@ -93,4 +95,16 @@ DEVICES = {
     "led1": {"kind": "gpio-out", "port_base": 0x42020400, "pin": 7, "bank": 0, "mask": 0x80, "active_low": False},
     "led2": {"kind": "gpio-out", "port_base": 0x42021800, "pin": 2, "bank": 0, "mask": 0x4, "active_low": False},
     "button0": {"kind": "gpio-in", "port_base": 0x42020800, "pin": 13, "bank": 0, "mask": 0x2000, "active_low": False, "pull_up": False, "pull_down": True},
+    "swdio": {"port_base": 0x42020000, "pin": 13, "bank": 0, "mask": 0x2000},
+    "swclk": {"port_base": 0x42020000, "pin": 14, "bank": 0, "mask": 0x4000},
+}
+
+# The sockets a removable module plugs into. The socket is board truth -- it is on the
+# schematic and identical on every unit -- and what is plugged into it is not, so no entry here
+# names a module. "buses" holds the roles a socket brings out whole; "pins" holds the single
+# lines, each under the standard's own name for that position. Which of a socket's protocols an
+# attached module speaks is a property of the module, so a board that offers several states all
+# of them and chooses none.
+CONNECTORS = {
+    "arduino": {"standard": "arduino-uno-v3", "buses": {}, "pins": {"a0": {"port_base": 0x42020000, "pin": 3, "bank": 0, "mask": 0x8}, "a1": {"port_base": 0x42020000, "pin": 2, "bank": 0, "mask": 0x4}, "a2": {"port_base": 0x42020800, "pin": 3, "bank": 0, "mask": 0x8}, "a3": {"port_base": 0x42020400, "pin": 0, "bank": 0, "mask": 0x1}, "a4": {"port_base": 0x42020800, "pin": 1, "bank": 0, "mask": 0x2}, "a5": {"port_base": 0x42020800, "pin": 0, "bank": 0, "mask": 0x1}, "d0": {"port_base": 0x42021800, "pin": 8, "bank": 0, "mask": 0x100}, "d1": {"port_base": 0x42021800, "pin": 7, "bank": 0, "mask": 0x80}, "d2": {"port_base": 0x42021400, "pin": 15, "bank": 0, "mask": 0x8000}, "d3": {"port_base": 0x42021000, "pin": 13, "bank": 0, "mask": 0x2000}, "d4": {"port_base": 0x42021400, "pin": 14, "bank": 0, "mask": 0x4000}, "d5": {"port_base": 0x42021000, "pin": 11, "bank": 0, "mask": 0x800}, "d6": {"port_base": 0x42021000, "pin": 9, "bank": 0, "mask": 0x200}, "d7": {"port_base": 0x42021400, "pin": 13, "bank": 0, "mask": 0x2000}, "d8": {"port_base": 0x42021400, "pin": 12, "bank": 0, "mask": 0x1000}, "d9": {"port_base": 0x42020C00, "pin": 15, "bank": 0, "mask": 0x8000}, "d10": {"port_base": 0x42020C00, "pin": 14, "bank": 0, "mask": 0x4000}, "d11": {"port_base": 0x42020000, "pin": 7, "bank": 0, "mask": 0x80}, "d12": {"port_base": 0x42020000, "pin": 6, "bank": 0, "mask": 0x40}, "d13": {"port_base": 0x42020000, "pin": 5, "bank": 0, "mask": 0x20}, "d14": {"port_base": 0x42020400, "pin": 9, "bank": 0, "mask": 0x200}, "d15": {"port_base": 0x42020400, "pin": 8, "bank": 0, "mask": 0x100}}},
 }

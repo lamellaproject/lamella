@@ -397,4 +397,11 @@ impl<N: NetBackend> Transport for TcpTransport<N> {
     fn poll(&mut self) -> Result<Option<Frame>, TransportError> {
         self.link.poll_frame(&mut self.net)
     }
+
+    /// The largest payload the protocol carries. TCP's window holds back what this end has not
+    /// read, so a frame of any length arrives whole however long the firmware is busy, and the
+    /// reader assembles any length a header can state.
+    fn max_inbound_payload(&self) -> Option<usize> {
+        Some(lamella_wire::MAX_PAYLOAD)
+    }
 }

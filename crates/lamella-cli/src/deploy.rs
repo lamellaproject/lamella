@@ -3,7 +3,7 @@
 use crate::args::{self, Positional, Spec};
 use lamella_wire::Capabilities;
 use lamella_wire_host::on_device::{self, capitalized, describe_refusal, host_caps, the_board};
-use lamella_wire_host::{AnyTransport, TransferAck, board_name, hello_blocking, open_target};
+use lamella_wire_host::{AnyTransport, TransferAck, board_name, open_target};
 use std::path::Path;
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
@@ -13,7 +13,7 @@ pub const ERASE_FLAG: &str = "--erase";
 
 /// What a deploy over a `--device` does once the image is on the board.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AfterDeploy {
+pub(crate) enum AfterDeploy {
     /// Nothing: the image is stored and runs at the board's next reset (`--no-run`).
     Store,
     /// Start it and return (the default).
@@ -180,6 +180,9 @@ pub fn deploy_command(args: &[String]) -> ExitCode {
                 crate::flash::build_kind(&parsed),
             )
         }
+        Destination::Device(target) if crate::python_on_device::is_python(&path) => {
+            crate::python_on_device::deploy(&path, target, after)
+        }
         Destination::Device(target) if kind == lamella_flash_routes::artifact::Kind::WirePayload => {
             send_payload(&path, target, after)
         }
@@ -276,6 +279,9 @@ mod source_refusal_tests {
         assert_eq!(uncompilable_source(Path::new("Blink.cs")), None, "C# is what they compile");
         assert_eq!(uncompilable_source(Path::new("app.py")), Some(Uncompilable::Python));
         assert_eq!(uncompilable_source(Path::new("notes.txt")), Some(Uncompilable::Other));
+        // ASCII case folding gives these extensions the same classification as their lowercase forms.
+        assert_eq!(uncompilable_source(Path::new("Blink.CS")), None, "C# whatever the case");
+        assert_eq!(uncompilable_source(Path::new("MAIN.PY")), Some(Uncompilable::Python), "Python whatever the case");
     }
 
     /// The predicate is shared and the SENTENCE is not. An earlier unification shared the finished
@@ -286,13 +292,12 @@ mod source_refusal_tests {
     fn the_deploy_refusal_speaks_for_deploys_own_routes_only() {
         let python = deploy_refusal(Path::new("app.py"), &Uncompilable::Python);
         assert!(python.starts_with("lamella deploy: "), "its own verb: {python}");
-        assert!(python.contains("BUNDLE") && python.contains("lamella build"), "and the real route");
         assert!(
-            !python.contains("deploy path is separate"),
-            "it must not point at a route that also refuses Python: {python}"
+            python.contains("BUNDLE") && python.contains("lamella deploy app.py --device <device>"),
+            "and the route that takes it: {python}"
         );
         let other = deploy_refusal(Path::new("notes.txt"), &Uncompilable::Other);
-        assert!(other.contains("not a C# file"), "and says so plainly: {other}");
+        assert!(other.contains("not a C# or Python file"), "and says so plainly: {other}");
     }
 }
 
@@ -304,8 +309,8 @@ Usage:
 Build a program and put it on a board.
 
 Arguments:
-  <file>  The program: a .cs file or a .csproj project, or, with --device, a .lmli image that
-          `lamella build` wrote.
+  <file>  The program: a .cs file or a .csproj project, or, with --device, a .py file, or a .lmli
+          image or .lpyc bundle that `lamella build` wrote.
 
 Options:
   --device <device>               The board's resident interpreter firmware, at a run target ID
@@ -352,6 +357,11 @@ Details:
   reaches. A library the program reaches through another is carried only when the program was
   compiled against it too; otherwise the deploy is refused, naming it.
 
+  A Python program goes, with --device, to a board whose Lamella firmware runs Python: a .py file
+  is compiled into a .lpyc bundle for that board, with every module it imports, and a .lpyc is
+  sent as it stands. A board that runs the other language refuses the program before anything is
+  sent.
+
   --erase stops the program the board is running and erases the one it stores, so at each reset
   the board starts no program and waits for a deploy. Deploying a program replaces the stored one.
 
@@ -383,16 +393,6 @@ Details:
 /// Somebody who built a `.lmli` on a build machine, or received one, has to be able to put it on a
 /// board.
 fn send_payload(path: &Path, target: &str, after: AfterDeploy) -> ExitCode {
-    if path.extension().and_then(|extension| extension.to_str()) == Some("lpyc") {
-        eprintln!(
-            "lamella deploy: {} is a Python bundle, which travels by a different wire message \
-             (DEPLOY_BUNDLE)\nthan a baked C# image. The host side of that message is not a \
-             library call, so this verb\ncannot send one -- and sending it down the image path \
-             would deploy successfully and leave the\nboard unable to boot what it holds.",
-            path.display()
-        );
-        return ExitCode::FAILURE;
-    }
     let image = match std::fs::read(path) {
         Ok(image) => image,
         Err(error) => {
@@ -424,7 +424,8 @@ pub enum Uncompilable {
 /// the compiler rather than of any one verb.
 #[must_use]
 pub fn uncompilable_source(path: &Path) -> Option<Uncompilable> {
-    match path.extension().and_then(|extension| extension.to_str()) {
+    // Classify the extension after ASCII case folding.
+    match path.extension().and_then(|extension| extension.to_str()).map(str::to_ascii_lowercase).as_deref() {
         Some("cs") => None,
         Some("py") => Some(Uncompilable::Python),
         _ => Some(Uncompilable::Other),
@@ -436,15 +437,15 @@ pub fn uncompilable_source(path: &Path) -> Option<Uncompilable> {
 pub fn deploy_refusal(path: &Path, what: &Uncompilable) -> String {
     match what {
         Uncompilable::Python => format!(
-            "lamella deploy: {} is a Python program, and this verb compiles C#.\n\n\
-             Neither route of this verb takes one: `--device` sends a baked C# image and \
-             `--board`\nbuilds one ahead of time. A Python program reaches a board as a BUNDLE, \
-             which `lamella build`\nproduces; this verb does not send bundles.",
+            "lamella deploy: {} is a Python program, and --board builds a C# image for the chip.\n\n\
+             A Python program goes to a board whose Lamella firmware runs Python, as a BUNDLE:\n\
+             \x20   lamella deploy {} --device <device>",
+            path.display(),
             path.display()
         ),
         Uncompilable::Other => format!(
-            "lamella deploy: {} is not a C# file. This verb deploys the baked C# image; \
-             `lamella build` produces the Python bundle, whose deploy path is separate.",
+            "lamella deploy: {} is not a C# or Python file. This verb deploys a .cs or .csproj \
+             program, a .py program, or an image or bundle `lamella build` wrote.",
             path.display()
         ),
     }
@@ -467,6 +468,11 @@ fn to_running_firmware(path: &Path, target: &str, after: AfterDeploy, folders: &
     let Some((mut transport, session)) = connect("deploy", target, host_caps(), board.as_ref()) else {
         return ExitCode::FAILURE;
     };
+    let program = path.display().to_string();
+    if let Err(refusal) = crate::python_on_device::takes_csharp("deploy", &program, target, &session) {
+        eprintln!("{refusal}");
+        return ExitCode::FAILURE;
+    }
     let answered = lamella_wire_host::boards::board_answering(session.identity.product_model);
     let image = match crate::bake::image_for_firmware(path, "deploy", deploy_refusal, answered.as_deref(), folders) {
         Ok(image) => image,
@@ -509,28 +515,18 @@ pub(crate) fn connect_checked(
     caps: Capabilities,
     board: Option<&crate::project::BoardCheck>,
 ) -> Result<(AnyTransport, lamella_wire::Negotiated), String> {
-    let mut transport = open_named(target, TIMEOUT).map_err(|why| format!(
-        "lamella {verb}: {why} Run `lamella devices` to list attached boards and their target names.\n\n{}",
-        effect_of(verb)
-    ))?;
-    let session = hello_on(&mut transport, 0, verb, target, caps)?;
+    let opening = |target: &str| {
+        open_named(target, TIMEOUT).map_err(|why| format!(
+            "lamella {verb}: {why} Run `lamella devices` to list attached boards and their target names.\n\n{}",
+            effect_of(verb)
+        ))
+    };
+    let (transport, hello) = lamella_wire_host::reopen::opened_and_asked(target, 0, caps, TIMEOUT, &opening)?;
+    let session = hello.map_err(|error| hello_failure(verb, target, error))?;
     if let Some(board) = board {
         board.against(verb, target, session.identity.product_model)?;
     }
     Ok((transport, session))
-}
-
-/// Open `target`, or say why not and answer `None`.
-fn open(verb: &str, target: &str, effect: &str) -> Option<AnyTransport> {
-    match open_named(target, TIMEOUT) {
-        Ok(transport) => Some(transport),
-        Err(why) => {
-            eprintln!(
-                "lamella {verb}: {why} Run `lamella devices` to list attached boards and their target names.\n\n{effect}"
-            );
-            None
-        }
-    }
 }
 
 /// What a command line that names a device to `verb` says when the device cannot be opened.
@@ -659,20 +655,10 @@ fn open_quietly(name: &str, raise: bool) -> Result<AnyTransport, lamella_serial_
     Ok(AnyTransport::Serial(lamella_wire_host::SerialTransport::from_port(Box::new(port))))
 }
 
-/// Complete a HELLO offering `caps` with the firmware at the other end of `transport`, or say why
-/// not, in `verb`'s words.
-///
-/// # Errors
-/// The board refused the session, speaks another protocol version, or did not answer -- each in
-/// its own words.
-pub(crate) fn hello_on(
-    transport: &mut impl lamella_wire::Transport,
-    seq: u16,
-    verb: &str,
-    target: &str,
-    caps: Capabilities,
-) -> Result<lamella_wire::Negotiated, String> {
-    hello_blocking(transport, seq, caps, TIMEOUT).map_err(|error| match error {
+/// What a HELLO that failed with `error` says, in `verb`'s words: the board refused the session,
+/// speaks another protocol version, or did not answer, each in its own words.
+fn hello_failure(verb: &str, target: &str, error: lamella_wire::TransportError) -> String {
+    match error {
         lamella_wire::TransportError::Refused { reason, .. } => {
             format!("lamella {verb}: {target} refused the connection: {}", describe_refusal(reason))
         }
@@ -683,9 +669,9 @@ pub(crate) fn hello_on(
         error => format!(
             "lamella {verb}: {target} did not answer a HELLO ({}).\n{}",
             lamella_wire_host::link_failure(error),
-            no_answer()
+            no_answer(target)
         ),
-    })
+    }
 }
 
 /// Put `image` on the firmware running at `target`, then do what `after` says.
@@ -702,6 +688,10 @@ fn send_image(
     let Some((mut transport, session)) = connect("deploy", target, host_caps(), board) else {
         return ExitCode::FAILURE;
     };
+    if let Err(refusal) = crate::python_on_device::takes_csharp("deploy", "the image", target, &session) {
+        eprintln!("{refusal}");
+        return ExitCode::FAILURE;
+    }
     deliver(&mut transport, &session, target, image, after)
 }
 
@@ -714,7 +704,38 @@ fn deliver(
     image: &[u8],
     after: AfterDeploy,
 ) -> ExitCode {
-    if let Err(refusal) = on_device::store_image(transport, session, target, image, &mut std::io::stdout()) {
+    deliver_with(transport, session, target, image, after, on_device::store_image, on_device::start_deployed)
+}
+
+/// [`deliver`] for a Python bundle, stored by [`on_device::store_bundle`].
+pub(crate) fn deliver_bundle(
+    transport: &mut AnyTransport,
+    session: &lamella_wire::Negotiated,
+    target: &str,
+    bundle: &[u8],
+    after: AfterDeploy,
+) -> ExitCode {
+    deliver_with(transport, session, target, bundle, after, on_device::store_bundle, on_device::start_deployed_program)
+}
+
+/// Store `program` with `store`, then do what `after` says, starting it with `start`, whose
+/// sentences name what was stored.
+fn deliver_with(
+    transport: &mut AnyTransport,
+    session: &lamella_wire::Negotiated,
+    target: &str,
+    program: &[u8],
+    after: AfterDeploy,
+    store: fn(
+        &mut AnyTransport,
+        &lamella_wire::Negotiated,
+        &str,
+        &[u8],
+        &mut dyn std::io::Write,
+    ) -> Result<on_device::Stored, String>,
+    start: fn(&mut AnyTransport, Duration) -> Result<&'static str, String>,
+) -> ExitCode {
+    if let Err(refusal) = store(transport, session, target, program, &mut std::io::stdout()) {
         eprintln!("lamella deploy: {refusal}");
         return ExitCode::FAILURE;
     }
@@ -722,7 +743,7 @@ fn deliver(
         println!("not started (--no-run). It runs at the board's next reset.");
         return ExitCode::SUCCESS;
     }
-    match on_device::start_deployed(transport, on_device::START_PATIENCE) {
+    match start(transport, on_device::START_PATIENCE) {
         Ok(line) => {
             println!("{line}");
             ExitCode::SUCCESS
@@ -776,10 +797,22 @@ fn running_now(
 /// Stop the program the firmware at `target` is running, erase the one it stores, and say what the
 /// board reported at each step.
 fn erase_stored(target: &str) -> ExitCode {
-    let Some(mut transport) = open("deploy", target, "Nothing was erased.") else {
-        return ExitCode::FAILURE;
+    let opening = |target: &str| {
+        open_named(target, TIMEOUT).map_err(|why| {
+            format!(
+                "lamella deploy: {why} Run `lamella devices` to list attached boards and their target names.\n\n\
+                 Nothing was erased."
+            )
+        })
     };
-    let erased = erase_on(&mut transport, target);
+    let transport = match lamella_wire_host::reopen::opened(target, &opening) {
+        Ok(transport) => transport,
+        Err(refusal) => {
+            eprintln!("{refusal}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let erased = erase_reopening(transport, target, &opening);
     for line in &erased.lines {
         println!("{line}");
     }
@@ -808,19 +841,31 @@ impl Erased {
     }
 }
 
-/// [`erase_stored`] over a carrier that is already open.
+/// [`erase_stored`] over a carrier that is already open, opening the board again with `opening`
+/// when it resets to take back the program it runs, as a board that runs Python does
+/// ([`lamella_wire_host::reopen::hello_reopening`]).
 ///
 /// **EVERY LINE IS THE BOARD'S OWN ANSWER.** Whether a program was running, whether one was stored
 /// and whether one is stored now are each asked rather than assumed, so a board that took the erase
 /// and still holds a program is reported as exactly that rather than as done.
-fn erase_on(transport: &mut impl lamella_wire::Transport, target: &str) -> Erased {
+fn erase_reopening<T: lamella_wire::Transport>(
+    mut transport: T,
+    target: &str,
+    opening: &dyn Fn(&str) -> Result<T, String>,
+) -> Erased {
     use lamella_wire_host::{Aborted, abort_blocking, clear_deployed_blocking, deploy_status_blocking};
     let mut erased = Erased::default();
-    let was_running = running_now(transport, 1, STATUS_PATIENCE);
-    let session = match hello_on(transport, 2, "deploy", target, host_caps()) {
-        Ok(session) => session,
+    let was_running = running_now(&mut transport, 1, STATUS_PATIENCE);
+    let (mut transport, hello) =
+        match lamella_wire_host::reopen::hello_reopening(transport, target, 2, host_caps(), TIMEOUT, opening) {
+        Ok(asked) => asked,
         Err(refusal) => return erased.refused(refusal),
     };
+    let session = match hello {
+        Ok(session) => session,
+        Err(error) => return erased.refused(hello_failure("deploy", target, error)),
+    };
+    let transport = &mut transport;
     let name = board_name(session.identity.product_model);
     let board = the_board(name);
     let aborted = match abort_blocking(transport, 3, TIMEOUT) {
@@ -963,7 +1008,15 @@ fn to_running_firmware(
 /// no Lamella firmware on it are the same event on the wire, and a reader told only "no response"
 /// checks their cable -- which is the wrong half in the commoner case, because a board arrives
 /// with no Lamella firmware on it and has to be given some once.
-fn no_answer() -> String {
+fn no_answer(target: &str) -> String {
+    if lamella_wire_host::has_link_identity(target) {
+        return "\nThe board's USB says it runs Lamella firmware; what did not happen is an answer. A \
+                board can stop reading its USB while its program\ncomputes and neither prints nor sleeps \
+                -- Lamella's Python firmware does -- and it runs that program again at every start.\nIf \
+                the program on the board is one like that, the board answers once the program prints, \
+                sleeps or ends.\n"
+            .to_owned();
+    }
     "\nThe port opened, so the board is attached and the cable carries data. What did not happen \
      is an answer,\nand the usual reason is that the board is not running Lamella firmware yet -- \
      a board is not born with any.\n\n\
@@ -977,11 +1030,23 @@ fn no_answer() -> String {
 mod tests {
     use super::*;
 
+    /// **A BOARD WHOSE USB SAYS IT IS A LAMELLA LINK RUNS LAMELLA FIRMWARE**, so when it does not answer
+    /// the reason given is a program that keeps it from reading its USB, not missing firmware. Any
+    /// other target keeps the sentence about firmware not yet on the board.
+    #[test]
+    fn a_lamella_link_that_does_not_answer_is_said_to_be_busy_not_bare() {
+        let link = hello_failure("run", "usb:39e9:0001:D4C3", lamella_wire::TransportError::Closed);
+        assert!(!link.contains("not running Lamella firmware"), "{link}");
+        assert!(link.contains("neither prints nor sleeps"), "{link}");
+        let port = hello_failure("run", "COM8", lamella_wire::TransportError::Closed);
+        assert!(port.contains("not running Lamella firmware"), "{port}");
+    }
+
     /// **THE NO-ANSWER TEXT IS THE POINT OF THIS FILE'S ERROR HANDLING**, so it is asserted rather
     /// than left to drift back into "no response from target".
     #[test]
     fn the_no_answer_text_names_the_likelier_cause_rather_than_the_cable() {
-        let text = no_answer();
+        let text = no_answer("COM8");
         assert!(text.contains("cable carries data"), "it rules the cable out: {text}");
         assert!(text.contains("not running Lamella firmware"), "and names the real cause");
         assert!(text.contains("--board"), "and hands over the route that works: {text}");
@@ -1110,6 +1175,72 @@ mod tests {
         });
         assert_eq!(running_now(&mut refusing, 9, quick), None, "a firmware that predates the question");
         assert_eq!(running_now(&mut Answering::with(|_| {}), 9, quick), None, "and one that is silent");
+    }
+
+    /// A handle on a board's own USB where the system lends the device to one handle at a time:
+    /// `open` counts the handles open on it, and the board can be opened only while none is. Behind
+    /// the first handle the board leaves the bus at the HELLO, as a board that runs Python does to take
+    /// back the program it runs; behind a later one it is back, serving.
+    #[cfg(feature = "bake")]
+    struct OneAtATime {
+        open: std::rc::Rc<std::cell::Cell<u32>>,
+        board: Option<lamella_wire_host::loopback::LoopbackBoard>,
+    }
+
+    #[cfg(feature = "bake")]
+    impl OneAtATime {
+        /// A handle on `board`, or, for `None`, on a board that leaves the bus when it is asked anything.
+        fn open(
+            open: &std::rc::Rc<std::cell::Cell<u32>>,
+            board: Option<lamella_wire_host::loopback::LoopbackBoard>,
+        ) -> Self {
+            open.set(open.get() + 1);
+            Self { open: std::rc::Rc::clone(open), board }
+        }
+    }
+
+    #[cfg(feature = "bake")]
+    impl Drop for OneAtATime {
+        fn drop(&mut self) {
+            self.open.set(self.open.get() - 1);
+        }
+    }
+
+    #[cfg(feature = "bake")]
+    impl lamella_wire::Transport for OneAtATime {
+        fn send(&mut self, msg_type: u8, seq: u16, payload: &[u8]) -> Result<(), lamella_wire::TransportError> {
+            match &mut self.board {
+                Some(board) => lamella_wire::Transport::send(board, msg_type, seq, payload),
+                None => Ok(()),
+            }
+        }
+
+        fn poll(&mut self) -> Result<Option<lamella_wire::Frame>, lamella_wire::TransportError> {
+            match &mut self.board {
+                Some(board) => lamella_wire::Transport::poll(board),
+                None => Err(lamella_wire::TransportError::Carrier),
+            }
+        }
+    }
+
+    /// **AN ERASE LETS GO OF A BOARD THAT RESET UNDER ITS HELLO BEFORE IT OPENS THE BOARD AGAIN**, so a
+    /// system that lends a device to one handle at a time lends it to the new one. A board that runs
+    /// Python takes back the program it runs by resetting.
+    #[cfg(feature = "bake")]
+    #[test]
+    fn an_erase_lets_go_of_a_board_that_reset_before_opening_it_again() {
+        use lamella_wire_host::loopback::{LoopbackBoard, RamFlash};
+        let open = std::rc::Rc::new(std::cell::Cell::new(0));
+        let opening = |target: &str| {
+            if open.get() > 0 {
+                return Err(format!("lamella deploy: another handle holds {target}. Nothing was erased."));
+            }
+            Ok(OneAtATime::open(&open, Some(LoopbackBoard::on(RamFlash::erased(64 * 1024)))))
+        };
+        let erased = erase_reopening(OneAtATime::open(&open, None), "usb", &opening);
+        assert_eq!(erased.refusal, None, "{erased:?}");
+        assert!(erased.lines.iter().any(|line| line.contains("held no stored program")), "{erased:?}");
+        assert_eq!(open.get(), 0, "and the erase let go of the board when it was done");
     }
 }
 

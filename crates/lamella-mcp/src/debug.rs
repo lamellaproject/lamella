@@ -87,6 +87,20 @@ fn response_ok(msgs: &[Message], command: &str) -> bool {
     msgs.iter().any(|m| matches!(m, Message::Response(r) if r.command == command && r.success))
 }
 
+/// What `lamella_debug_launch` answers when the debugger's `launch` did not succeed: the reason the
+/// debugger gave, which says what the board or the image refused, or the steps that did not succeed
+/// when it gave none.
+fn launch_failure(target: &str, launched: &[Message]) -> String {
+    let reason = launched.iter().find_map(|m| match m {
+        Message::Response(r) if r.command == "launch" && !r.success => r.message.as_deref(),
+        _ => None,
+    });
+    match reason {
+        Some(reason) => format!("debug launch failed on {target}: {reason}"),
+        None => format!("debug launch failed on {target} (deploy/attach did not succeed)."),
+    }
+}
+
 /// The top stack frame as "Type.Method (input.cs:line)", by asking the debugger for its stack.
 fn top_frame(session: &mut Session) -> String {
     let st = handle(&mut session.debugger, &mut session.seq, "stackTrace", Some(json!({ "threadId": 1 })));
@@ -217,7 +231,7 @@ impl Sessions {
         let _ = handle(&mut session.debugger, &mut session.seq, "initialize", None);
         let launched = handle(&mut session.debugger, &mut session.seq, "launch", Some(json!({ "stopOnEntry": true })));
         if !response_ok(&launched, "launch") {
-            return text_result(format!("debug launch failed on {target} (deploy/attach did not succeed)."), true);
+            return text_result(launch_failure(target, &launched), true);
         }
         let done = handle(&mut session.debugger, &mut session.seq, "configurationDone", None);
         let summary = stop_summary(&mut session, &done);
@@ -401,3 +415,24 @@ impl Sessions {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use lamella_dap::protocol::Response;
+
+    /// **A LAUNCH THE DEBUGGER REFUSED IS ANSWERED WITH ITS REASON**, which says what the board or the
+    /// image refused, in the words every host gives.
+    #[test]
+    fn a_failed_launch_is_answered_with_the_debuggers_reason() {
+        let reason = "The session could not start: Update the board's firmware first.";
+        let launched = [Message::Response(Response {
+            seq: 2,
+            request_seq: 2,
+            success: false,
+            command: "launch".to_owned(),
+            message: Some(reason.to_owned()),
+            body: None,
+        })];
+        assert_eq!(launch_failure("COM8", &launched), format!("debug launch failed on COM8: {reason}"));
+    }
+}

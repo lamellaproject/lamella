@@ -1,5 +1,6 @@
-# BLOCK layout: the STM32F769 GPIO port block -- the registers a uart binding muxes through.
-# PARTIAL: MODER/AFRH fields are stated for the pins bindings claim and grow as more do.
+# BLOCK layout: the STM32F769 GPIO port block -- the registers a uart binding muxes through and a
+# GPIO driver drives. PARTIAL: MODER/AFRH fields are stated for the pins bindings claim and grow as
+# more do.
 # Offsets are instance-base-relative; port instance bases live in ../instances.toml.
 #
 # A pin's alternate function is selected in TWO registers, which is the thing to get right: MODER
@@ -78,9 +79,23 @@ width = 32
 fields = { AFSEL9 = [4, 4], AFSEL10 = [8, 4] }
 notes = "Alternate function for pins 8..15, 4 bits per pin at [4*(n-8), 4] (PARTIAL: pins 9 and 10 stated)."
 
+# MODER's four modes and PUPDR's three codes are RM0410 6.4.1's and 6.4.4's: MODER 00 input, 01
+# general purpose output, 10 alternate function, 11 analog; PUPDR 00 no pull-up or pull-down, 01
+# pull-up, 10 pull-down, and 11 reserved.
+#
+# MODER_MODE_RESET is the mode a pin leaves reset in, for every pin outside the debug port: 6.4.1
+# gives MODER's reset value as 0x0000 0000 for every port but A and B, and its field description
+# names 00, input, the reset state. A GPIO driver returns a closed pin to it, so a pin a program
+# closes is in the state a pin no program touched is in. It is not the STM32U5's, whose pins reset
+# to analog.
 [constants]
+MODER_MODE_INPUT = 0
 MODER_MODE_OUTPUT = 1
 MODER_MODE_AF = 2
+MODER_MODE_ANALOG = 3
+MODER_MODE_RESET = 0
 OTYPER_OPEN_DRAIN = 1
 OSPEEDR_VERY_HIGH = 3
+PUPDR_NONE = 0
 PUPDR_PULL_UP = 1
+PUPDR_PULL_DOWN = 2

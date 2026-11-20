@@ -546,6 +546,10 @@ pub struct ControlPin {
     /// Whether the board's own circuit drives the line, so a program's GPIO controller refuses
     /// it: a radio's control lines, which the radio's driver runs. Pin-wired rows only.
     pub reserved: bool,
+    /// Whether the board's circuit allows the line's pad only as an input, so a program's GPIO
+    /// controller refuses to make it an output: a button its manual forbids driving, which a low
+    /// output would short when pressed. Pin-wired rows only, and never a reserved one.
+    pub input_only: bool,
 }
 
 impl Default for ControlPin {
@@ -560,6 +564,7 @@ impl Default for ControlPin {
             pull: String::new(),
             twin: String::new(),
             reserved: false,
+            input_only: false,
         }
     }
 }
@@ -3354,6 +3359,7 @@ fn control_pin_key(
         ("address", RawValue::Int(i)) => pin.address = i.value,
         ("twin", v @ RawValue::Inline(_)) => pin.twin = as_pin_ref(line, "twin", v)?.pin,
         ("reserved", RawValue::Int(i)) => pin.reserved = i.value != 0,
+        ("input_only", RawValue::Int(i)) => pin.input_only = i.value != 0,
         ("source", RawValue::Str(_)) => {}
         (other, _) => return Err(err(line, &format!("unexpected control-pin key '{other}'"))),
     }
@@ -5225,6 +5231,20 @@ pub fn resolve_board(set: &FamilySet, board: BoardTable) -> Result<ResolvedBoard
                 "board {}: device '{}' is reserved but wired to no pin -- only a pin-wired line can be kept from a program's GPIO controller",
                 board.board, line.name
             ));
+        }
+        if line.input_only {
+            if line.pin.is_empty() || line.reserved {
+                return Err(format!(
+                    "board {}: device '{}' is input-only, which only a pin-wired line a program may open can be",
+                    board.board, line.name
+                ));
+            }
+            if !set.family.starts_with("stm32") {
+                return Err(format!(
+                    "board {}: device '{}' is input-only, and the {} family's GPIO row states no input-only pads",
+                    board.board, line.name, set.family
+                ));
+            }
         }
         if !line.pin.is_empty() && line.active.is_empty() {
             return Err(format!(
@@ -15303,7 +15323,7 @@ pub const BUS_KIND_SPI: u32 = 3;
 /// The families whose `System.Device.Gpio` build carries their drivers. A row's words are what
 /// one of those drivers is constructed from, so a board of any other family has no table, and an
 /// image built for it answers that it has none.
-pub const BUS_TABLE_FAMILIES: &[&str] = &["rp2350"];
+pub const BUS_TABLE_FAMILIES: &[&str] = &["rp2350", "stm32f7", "stm32f769", "stm32u5a5"];
 
 /// The generated file, beside a board's other generated Rust, that holds its bus table.
 pub const BUS_TABLE_FILE: &str = "bus_table.rs";
@@ -15321,6 +15341,7 @@ pub fn bus_table(set: &FamilySet, board: &ResolvedBoard) -> Result<Vec<u32>, Str
     let id = &board.board.board;
     let mut rows = match set.family.as_str() {
         "rp2350" => rp2350_bus_rows(set, board)?,
+        "stm32f7" | "stm32f769" | "stm32u5a5" => vec![(BUS_KIND_GPIO, 0, stm32_gpio_words(set, board)?)],
         other => {
             return Err(format!(
                 "{id}: family '{other}' has no bus table, because its System.Device.Gpio build carries no drivers"
@@ -15396,6 +15417,81 @@ fn rp2350_bus_rows(set: &FamilySet, resolved: &ResolvedBoard) -> Result<Vec<BusR
         rows.push((BUS_KIND_SPI, bus_number(id, &spi.instance)?, bus_words(id, &spi.prefix, &values)?));
     }
     Ok(rows)
+}
+
+/// An STM32 board's GPIO row, the words the shared STM32 GPIO driver is constructed from: one word a
+/// port, port A first, through the last port the family's instances place. A word's low sixteen bits
+/// mark the pads of that port the part's package bonds, from the part's whole pad set; its high
+/// sixteen mark the pads the board keeps from a program -- the pins of its default carrier's binding,
+/// the link a program is deployed over, and every device row it marks `reserved`. On a board with a
+/// device row it marks `input_only`, a second half follows, again one word a port: its low sixteen
+/// bits mark the pads a program may open only as inputs. A board without one has no second half.
+///
+/// # Errors
+/// When the family places no port A, when the part does not state its whole pad set, when a pad is
+/// on a port the family does not place, when the board keeps a pad, or holds one to input, that the
+/// package does not bond, or when it holds to input a pad it keeps.
+fn stm32_gpio_words(set: &FamilySet, resolved: &ResolvedBoard) -> Result<Vec<u32>, String> {
+    let id = &resolved.board.board;
+    let placed = |port: char| {
+        set.instances.rows.iter().any(|row| row.port_char() == Some(port))
+            || [format!("port{port}"), format!("gpio{port}")].iter().any(|name| set.instances.row(name).is_some())
+    };
+    let ports = ('a'..='z').take_while(|&port| placed(port)).count();
+    if ports == 0 {
+        return Err(format!("{id}: family {} places no GPIO port A, and the GPIO row starts there", set.family));
+    }
+    let part = set
+        .parts
+        .rows
+        .iter()
+        .find(|row| row.part == resolved.part)
+        .ok_or_else(|| format!("{id}: part '{}' is not in parts.toml", resolved.part))?;
+    if !part.pins_complete {
+        return Err(format!(
+            "{id}: part '{}' does not state its whole pad set, and the GPIO row marks every pad the package bonds",
+            resolved.part
+        ));
+    }
+    let place = |pin: &str| -> Result<(usize, u32), String> {
+        let (port, index) = split_pin(pin).ok_or_else(|| format!("{id}: '{pin}' is not a GPIO pin"))?;
+        let at = (port as usize).wrapping_sub('a' as usize);
+        if !port.is_ascii_lowercase() || at >= ports || index > 15 {
+            return Err(format!("{id}: {pin} is not on a port family {} places", set.family));
+        }
+        Ok((at, index))
+    };
+    let mut words = vec![0u32; ports];
+    for pin in expand_part_pins(id, &part.pins)? {
+        let (port, index) = place(&pin)?;
+        words[port] |= 1 << index;
+    }
+    let carrier = resolved.bindings.iter().filter(|binding| binding.role == resolved.board.carrier.role);
+    let kept = carrier
+        .flat_map(|binding| binding.pins.iter().map(|(_, pin)| pin.pin.as_str()))
+        .chain(resolved.board.devices.iter().filter(|device| device.reserved).map(|device| device.pin.as_str()));
+    for pin in kept {
+        let (port, index) = place(pin)?;
+        if words[port] & (1 << index) == 0 {
+            return Err(format!("{id}: the board keeps {pin}, which part '{}' does not bond", resolved.part));
+        }
+        words[port] |= 1 << (16 + index);
+    }
+    let mut input_only = vec![0u32; ports];
+    for device in resolved.board.devices.iter().filter(|device| device.input_only) {
+        let (port, index) = place(&device.pin)?;
+        if words[port] & (1 << index) == 0 {
+            return Err(format!("{id}: the board holds {} to input, which part '{}' does not bond", device.pin, resolved.part));
+        }
+        if words[port] & (1 << (16 + index)) != 0 {
+            return Err(format!("{id}: the board holds {} to input and keeps it, and no program opens a pad the board keeps", device.pin));
+        }
+        input_only[port] |= 1 << index;
+    }
+    if input_only.iter().any(|&word| word != 0) {
+        words.extend(input_only);
+    }
+    Ok(words)
 }
 
 /// What `TargetBoard` asks of the board's PWM lines: whether the board keeps a line for itself, and a
@@ -17780,5 +17876,66 @@ resolution_bits = "16..20, depending only on the oversampling setting"
             let error = pico2_w_settings_with(&format!("{SETTINGS}{region}")).expect_err(expected);
             assert!(error.contains(expected), "{expected:?} in {error:?}");
         }
+    }
+
+    /// The NUCLEO-U5A5ZJ-Q holds PC13, its user button, to input, so its GPIO row has a second half, one
+    /// word a port, whose one bit is PC13's; the STM32F746G-DISCO holds no pad, and its row is one word a
+    /// port. A device row held to input must be a line a program may open, on a pad the package bonds and
+    /// the board does not keep, and on an STM32 family, whose row alone carries the second half: any
+    /// other is refused.
+    #[test]
+    fn a_pad_held_to_input_is_the_second_half_of_an_stm32_boards_gpio_row() {
+        let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let table = |id: &str| {
+            let Strata::Board(board) = parse(&read(&crate::boards::board_dir(&repo, id).join("board.toml")).expect("reads"))
+                .expect("parses")
+            else {
+                panic!("{id} is a board")
+            };
+            board
+        };
+        let u5a5 = load_family(&repo, "stm32u5a5").expect("the stm32u5a5 family loads");
+        let nucleo = resolve_board(&u5a5, table("st-nucleo-u5a5zj-q")).expect("the NUCLEO-U5A5ZJ-Q resolves");
+        let words = stm32_gpio_words(&u5a5, &nucleo).expect("its row");
+        assert_eq!(words.len(), 20, "ports A to J, then a word a port of the pads held to input");
+        assert_eq!(words[10..], [0, 0, 1 << 13, 0, 0, 0, 0, 0, 0, 0], "PC13 alone is held to input");
+        let f7 = load_family(&repo, "stm32f7").expect("the stm32f7 family loads");
+        let disco = resolve_board(&f7, table("st-stm32f746g-disco")).expect("the STM32F746G-DISCO resolves");
+        assert_eq!(stm32_gpio_words(&f7, &disco).expect("its row").len(), 11, "ports A to K, and no second half");
+
+        let holding = |name: &str, change: &dyn Fn(&mut ControlPin)| {
+            let mut board = table("st-nucleo-u5a5zj-q");
+            let device = board.devices.iter_mut().find(|device| device.name == name).expect("the device row");
+            change(device);
+            board
+        };
+        let reserved = resolve_board(&u5a5, holding("swdio", &|device| device.input_only = true)).expect_err("a kept line");
+        assert!(reserved.contains("device 'swdio' is input-only, which only a pin-wired line"), "{reserved}");
+        let unwired = resolve_board(
+            &u5a5,
+            holding("button0", &|device| {
+                device.pin = String::new();
+                device.input_only = true;
+            }),
+        )
+        .expect_err("a row wired to no pin");
+        assert!(unwired.contains("device 'button0' is input-only, which only a pin-wired line"), "{unwired}");
+        let rp2350 = load_family(&repo, "rp2350").expect("the rp2350 family loads");
+        let mut pico = table("raspberrypi-pico-2");
+        let led = pico.devices.iter_mut().find(|device| !device.pin.is_empty() && !device.reserved).expect("a pin-wired row");
+        led.input_only = true;
+        let family = resolve_board(&rp2350, pico).expect_err("a family whose row states no input-only pads");
+        assert!(family.contains("the rp2350 family's GPIO row states no input-only pads"), "{family}");
+
+        let row_with = |pin: &str| {
+            let mut board = nucleo.clone();
+            let device = board.board.devices.iter_mut().find(|device| device.name == "button0").expect("the button's row");
+            device.pin = String::from(pin);
+            stm32_gpio_words(&u5a5, &board).expect_err("refused")
+        };
+        let absent = row_with("PB12");
+        assert!(absent.contains("holds PB12 to input, which part 'stm32u5a5zjt6q' does not bond"), "{absent}");
+        let kept = row_with("PA9");
+        assert!(kept.contains("holds PA9 to input and keeps it"), "{kept}");
     }
 }

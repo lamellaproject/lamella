@@ -44,6 +44,9 @@ package = "144-pin LQFP, dedicated SMPS pinout"
 flash = 0x400000
 ram = 0x270000
 pins = ["PA0-PA15", "PB0-PB11", "PB13-PB15", "PC0-PC3", "PC6-PC15", "PD0-PD15", "PE0-PE15", "PF0-PF15", "PG0-PG10", "PG12-PG15", "PH0-PH1", "PH3"]
+# The package's WHOLE general-purpose I/O set: every pad figure 13 draws, 111 of them, so a pin
+# missing here is missing from the part.
+pins_complete = true
 rails = { vddio2 = ["PG2-PG15"] }
 rail_valid = { vddio2 = "pwr.SVMCR.IO2SV" }
 source = "DS13543 Rev 3 section 7 ordering information decodes STM32U5A5ZJT6Q as 5A5 = STM32U5A5xx with OTG_HS and hardware encryption accelerators, Z = 144 pins or 150 balls, J = 4 Mbytes flash, T = LQFP, 6 = industrial -40 to 85 C, and Q = DEDICATED PINOUT SUPPORTING INTERNAL SMPS STEP-DOWN CONVERTER. Z with T resolves to LQFP144, and the Q selects figure 13 (LQFP144_SMPS pinout) rather than figure 14 (LQFP144). The pad set above is the COMPLETE general-purpose I/O set of figure 13, 111 pads. flash 0x400000 is the 4096 Kbytes the part's own FLASH_SIZE register reports, read on a NUCLEO-U5A5ZJ-Q. ram 0x270000 is the 2496-Kbyte CONTIGUOUS span, bounded on silicon at 0x20000000-0x2026FFFF and independently equal to RM0456 Rev 7 table 7's SRAM1 768 + SRAM2 64 + SRAM3 832 + SRAM5 832 for the STM32U59x/5Ax column. The 16-Kbyte SRAM4 at 0x28000000-0x28003FFF and the 2-Kbyte backup SRAM are real and are NOT in this figure, because neither is contiguous with it. The core is an Arm Cortex-M33."

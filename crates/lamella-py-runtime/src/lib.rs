@@ -21,16 +21,21 @@ pub(crate) mod shims;
 pub(crate) mod tables;
 pub mod interp;
 pub mod object;
+mod native_stack;
+mod representation;
 pub mod reactor;
 pub mod stdlib;
 pub mod trap;
 pub mod value;
 
+pub mod exit;
+pub use exit::{system_exit, trapped_end, trapped_end_in, SystemExitCode, TrappedEnd};
 pub use builtins::Builtin;
 pub use gpio::Board;
 pub use interp::{run, run_bundle, run_module, Frame};
 pub use lamella_py_bytecode::{
     is_bundle_header, BinOp, Bundle, CmpOp, CodeObject, Const, Functions, Module, Op, Source,
+    BUNDLE_FORMAT_VERSION,
 };
 pub use object::{Arena, FinalizerSkips, Footprint, InlineCache, ObjectModel, PyType};
 pub use trap::Trap;

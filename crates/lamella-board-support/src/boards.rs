@@ -26,3 +26,9 @@ pub mod raspberrypi_pico_2;
 pub mod raspberrypi_pico_2_w;
 #[cfg(any(feature = "board-sparkfun-iot-redboard-rp2350", not(target_os = "none")))]
 pub mod sparkfun_iot_redboard_rp2350;
+#[cfg(any(feature = "board-st-nucleo-u5a5zj-q", not(target_os = "none")))]
+pub mod st_nucleo_u5a5zj_q;
+#[cfg(any(feature = "board-st-stm32f746g-disco", not(target_os = "none")))]
+pub mod st_stm32f746g_disco;
+#[cfg(any(feature = "board-st-stm32f769i-disco", not(target_os = "none")))]
+pub mod st_stm32f769i_disco;

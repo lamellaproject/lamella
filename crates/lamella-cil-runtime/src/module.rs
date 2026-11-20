@@ -206,6 +206,24 @@ impl CastPrim {
         }
     }
 
+    /// The packed element kind that stores this primitive (a `bool` as a `byte`, a `char` as a
+    /// `ushort`, either signedness of an integer as its width), or `None` for a native int, whose
+    /// width is the target's.
+    #[must_use]
+    pub fn prim_kind(self) -> Option<PrimKind> {
+        Some(match self {
+            CastPrim::I1 => PrimKind::I1,
+            CastPrim::Bool | CastPrim::U1 => PrimKind::U1,
+            CastPrim::I2 => PrimKind::I2,
+            CastPrim::Char | CastPrim::U2 => PrimKind::U2,
+            CastPrim::I4 | CastPrim::U4 => PrimKind::I4,
+            CastPrim::I8 | CastPrim::U8 => PrimKind::I8,
+            CastPrim::F4 => PrimKind::F4,
+            CastPrim::F8 => PrimKind::F8,
+            CastPrim::I | CastPrim::U => return None,
+        })
+    }
+
     /// The stable frozen-image code (the enum discriminant).
     #[must_use]
     pub fn code(self) -> u8 {
@@ -621,6 +639,135 @@ impl FieldStorage {
             (4, 0) => Self::Reference,
             _ => return None,
         })
+    }
+}
+
+/// The declared kind of one of a method's argument or local slots, from the method's signature
+/// (ECMA-335 6th ed II.23.2.1) or its local variable signature (II.23.2.6): the value a frame zeroes
+/// the slot to, the width a floating value stored in it takes, and the bytes an access through its
+/// address may reach.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SlotKind {
+    /// A fixed-width primitive, including the signedness of a narrow integer; an enum is its
+    /// underlying integer type (ECMA-335 6th ed II.14.3).
+    Primitive(PrimKind),
+    /// A native int, a native unsigned int or an unmanaged pointer, as wide as the executing
+    /// target's pointer (ECMA-335 6th ed I.12.1.1 and I.12.1.1.1).
+    Native,
+    /// An object reference.
+    Reference,
+    /// A managed pointer: a by-reference parameter or local (ECMA-335 6th ed II.23.2.1 and
+    /// II.23.2.6), or the `this` of a value type's instance method (II.13.3).
+    ByRef,
+    /// A value type that is not a primitive or an enum. Where the loader names the type, the module
+    /// records it beside the kind ([`Module::method_local_struct_type`]).
+    Struct,
+    /// A type the loader did not settle: a typed reference, or a generic parameter it had no
+    /// argument for.
+    Unknown,
+}
+
+impl SlotKind {
+    /// The byte a method's kinds table holds for this kind: a primitive's [`PrimKind`] code (1 to 8),
+    /// 16 to 19 for the others, 0 for [`SlotKind::Unknown`].
+    #[must_use]
+    pub fn code(self) -> u8 {
+        match self {
+            Self::Primitive(kind) => kind.code(),
+            Self::Native => 16,
+            Self::Reference => 17,
+            Self::ByRef => 18,
+            Self::Struct => 19,
+            Self::Unknown => 0,
+        }
+    }
+
+    /// The kind `code` names; a byte that names none is [`SlotKind::Unknown`].
+    #[must_use]
+    pub fn from_code(code: u8) -> Self {
+        match code {
+            16 => Self::Native,
+            17 => Self::Reference,
+            18 => Self::ByRef,
+            19 => Self::Struct,
+            other => PrimKind::from_code(other).map_or(Self::Unknown, Self::Primitive),
+        }
+    }
+}
+
+/// Each method's slot kinds as [`SlotKind::code`] bytes in one buffer: a method's run is its
+/// argument count and its local count (2 little-endian bytes each), then one code per argument and
+/// one per local. A method with no run (an intrinsic, or one whose kinds were not recorded) has none.
+#[derive(Clone, Default)]
+struct SlotKindTable {
+    /// Where each method's run starts in `bytes`, indexed by [`MethodId`]; `u32::MAX` for none.
+    starts: Vec<u32>,
+    bytes: Vec<u8>,
+    /// The value type of each [`SlotKind::Struct`] slot whose type the loader named: the position of
+    /// the slot's code in `bytes`, in ascending order, and the type.
+    struct_types: Vec<(u32, TypeId)>,
+}
+
+impl SlotKindTable {
+    fn set(&mut self, method: MethodId, args: &[SlotKind], locals: &[SlotKind]) {
+        let (Ok(arg_count), Ok(local_count), Ok(start), Ok(index)) = (
+            u16::try_from(args.len()),
+            u16::try_from(locals.len()),
+            u32::try_from(self.bytes.len()),
+            usize::try_from(method),
+        ) else {
+            return;
+        };
+        if self.starts.len() <= index {
+            self.starts.resize(index + 1, u32::MAX);
+        }
+        self.starts[index] = start;
+        self.bytes.extend_from_slice(&arg_count.to_le_bytes());
+        self.bytes.extend_from_slice(&local_count.to_le_bytes());
+        self.bytes.extend(args.iter().chain(locals).map(|kind| kind.code()));
+    }
+
+    /// Where `method`'s codes start in `bytes`, and its argument count and local count.
+    fn run(&self, method: MethodId) -> Option<(usize, usize, usize)> {
+        let start = *self.starts.get(usize::try_from(method).ok()?)?;
+        let start = usize::try_from(start).ok().filter(|_| start != u32::MAX)?;
+        let counts = self.bytes.get(start..start.checked_add(4)?)?;
+        let args = usize::from(u16::from_le_bytes([counts[0], counts[1]]));
+        let locals = usize::from(u16::from_le_bytes([counts[2], counts[3]]));
+        Some((start + 4, args, locals))
+    }
+
+    /// `method`'s argument codes and local codes.
+    fn get(&self, method: MethodId) -> Option<(&[u8], &[u8])> {
+        let (codes, args, locals) = self.run(method)?;
+        let codes = self.bytes.get(codes..codes + args + locals)?;
+        Some(codes.split_at(args))
+    }
+
+    /// The position in `bytes` of the code of `method`'s argument `slot` (`argument`) or local `slot`.
+    fn position(&self, method: MethodId, argument: bool, slot: usize) -> Option<u32> {
+        let (codes, args, locals) = self.run(method)?;
+        let index = if argument { (slot < args).then_some(slot)? } else { (slot < locals).then_some(args + slot)? };
+        u32::try_from(codes + index).ok()
+    }
+
+    fn set_struct_type(&mut self, method: MethodId, argument: bool, slot: usize, type_id: TypeId) {
+        let Some(position) = self.position(method, argument, slot) else {
+            return;
+        };
+        if self.bytes.get(position as usize) != Some(&SlotKind::Struct.code()) {
+            return;
+        }
+        match self.struct_types.binary_search_by_key(&position, |&(at, _)| at) {
+            Ok(index) => self.struct_types[index].1 = type_id,
+            Err(index) => self.struct_types.insert(index, (position, type_id)),
+        }
+    }
+
+    fn struct_type(&self, method: MethodId, argument: bool, slot: usize) -> Option<TypeId> {
+        let position = self.position(method, argument, slot)?;
+        let index = self.struct_types.binary_search_by_key(&position, |&(at, _)| at).ok()?;
+        Some(self.struct_types[index].1)
     }
 }
 
@@ -1083,6 +1230,8 @@ pub enum FieldConstant {
 #[derive(Clone, Default)]
 pub struct Module {
     methods: Vec<Method>,
+    /// Each managed method's argument and local slot kinds, where the loader recorded them.
+    slot_kinds: SlotKindTable,
     /// Call-token bindings before [`Module::freeze`] drains them into the arena, and any bound
     /// AFTER the freeze (an incremental REPL delta) -- the loader's scratch and the small mutable
     /// overlay in one. Runtime lookups try the frozen tables first, then here.
@@ -1145,6 +1294,9 @@ pub struct Module {
     static_fields: BTreeMap<u64, usize>,
     /// The zero value of each static field, indexed by storage slot.
     static_defaults: Vec<Value>,
+    /// The declared storage of each static field the loader recorded, as [`FieldStorage`]'s two words,
+    /// indexed by storage slot; a tag of 0 for a slot it did not record.
+    static_storage: Vec<[u32; 2]>,
     /// The static constructors (`.cctor`), in declaration order. The bake-time trim keeps each one
     /// as a root, and an image baked before the trigger tables existed runs them in this order
     /// before its entry point.
@@ -1269,10 +1421,9 @@ pub struct Module {
     /// Each method's owning assembly id, indexed by [`MethodId`] -- the assembly whose
     /// token space the method's CIL resolves against. Single-assembly loads are all 0.
     method_asm: Vec<u8>,
-    /// The [`TypeId`] of `System.String`, if a loaded assembly defined it. It backs virtual
-    /// dispatch on a heap string: a `callvirt` on a string receiver dispatches through this
-    /// type's vtable (reaching String's Equals / GetHashCode / ToString overrides) since a
-    /// heap string is not a field-carrying instance and so has no per-object type id.
+    /// The [`TypeId`] of `System.String`, if a loaded assembly defined it, as word 10 of a baked
+    /// image's header holds it. The table below holds the same id, and [`Module::intrinsic_type_id`]
+    /// answers from the table.
     string_type_id: Option<u32>,
     /// The recorded [`TypeId`] of each [`IntrinsicType`], keyed by [`IntrinsicType::key`] -- the
     /// one facility every structurally-represented object recovers its runtime type through.
@@ -1555,7 +1706,7 @@ impl WordRun {
     }
 
     /// Whether the whole run lies inside an arena of `arena_len` bytes.
-    #[cfg(all(feature = "code-in-place", feature = "board-buses"))]
+    #[cfg(feature = "board-buses")]
     fn fits(&self, arena_len: usize) -> bool {
         self.entries
             .checked_mul(4)
@@ -1806,43 +1957,29 @@ struct FrozenTables {
     explicit_overrides: SortedTokenTable,
     /// The frozen `delegate_ctors` (`newobj` tokens constructing a delegate).
     delegate_ctors: SortedTokenSet,
-    /// The frozen `delegate_ctor_types` (delegate ctor token -> declaring [`TypeId`]). In the
-    /// TRAILING directory section, so an image baked before it existed simply has none and its
-    /// delegates fall back to the behavior that predates this table.
+    /// The frozen `delegate_ctor_types` (delegate ctor token -> declaring [`TypeId`]).
     delegate_ctor_types: SortedTokenTable,
-    /// The frozen `intrinsic_type_ids` ([`IntrinsicType::key`] -> [`TypeId`]). Trailing, for the
-    /// same reason.
+    /// The frozen `intrinsic_type_ids` ([`IntrinsicType::key`] -> [`TypeId`]).
     intrinsic_type_ids: SortedTokenTable,
-    /// The frozen `runtime_field_slots` (well-known id -> instance slot). Trailing, for the same
-    /// reason: an image baked before it existed simply has none, and the runtime then reports the
-    /// field absent rather than misreading a slot it never recorded.
+    /// The frozen `runtime_field_slots` (well-known id -> instance slot).
     runtime_field_slots: SortedTokenTable,
-    /// The frozen `runtime_methods` (well-known id -> [`MethodId`]). Trailing, for the same reason.
+    /// The frozen `runtime_methods` (well-known id -> [`MethodId`]).
     runtime_methods: SortedTokenTable,
-    /// The frozen `enum_unsigned` (enum handles whose underlying type is unsigned). Trailing, for
-    /// the same reason: an image baked before it existed reads every enum as signed, as it always
-    /// did.
+    /// The frozen `enum_unsigned` (enum handles whose underlying type is unsigned).
     enum_unsigned: SortedTokenSet,
-    /// The frozen `cast_elems` (cast-test token -> its [`CastElem::write_frozen_record`]). Trailing, for
-    /// the same reason: an image baked before it existed matches every cast test leniently, as it
-    /// always did.
+    /// The frozen `cast_elems` (cast-test token -> its [`CastElem::write_frozen_record`]).
     cast_elems: SortedWideTable,
     /// The frozen `cctor_types` ([`TypeId`] -> its `.cctor`), the lazy initialization trigger.
-    /// Trailing, for the same reason: an image baked before it existed has none, and
-    /// [`crate::boot_baked`] then runs its type initializers before the entry point, as it always
-    /// did.
     cctor_types: SortedTokenTable,
     /// The frozen `static_slot_types`: the [`TypeId`] owning each static storage slot, a dense
     /// column indexed by slot, so a static access on a baked image finds the type whose `.cctor`
-    /// it triggers. Trailing, for the same reason.
+    /// it triggers.
     static_slot_types: DenseIdColumn,
     /// The frozen `field_offsets`: per [`TypeId`] that has one, the arena offset and word count of
-    /// its offset run. Sparse, because only a type with a computed layout has an entry. Trailing:
-    /// an image baked before it existed has none, and a field address in it cannot be walked.
+    /// its offset run. Sparse, because only a type with a computed layout has an entry.
     field_offset_runs: SortedWideTable,
-    /// The frozen `board_buses`: the words of the board's bus table, as the host wrote them.
-    /// Trailing: an image baked before it existed has none, and every bus then reads as absent,
-    /// as in an image baked with no board named.
+    /// The frozen `board_buses`: the words of the board's bus table, as the host wrote them. Empty
+    /// in an image baked with no board named, where every bus reads as absent.
     board_buses: WordRun,
     /// The frozen `enum_wide` (enum handles with a 64-bit underlying type).
     enum_wide: SortedTokenSet,
@@ -1873,10 +2010,20 @@ struct FrozenTables {
     /// The frozen `Type.GetProperty` index, same key shape.
     properties_by_name: SortedWideTable,
     /// The frozen `Event` index, keyed like the property index but in a separate table.
-    /// Its directory entry is trailing so older images have an empty event index.
     events_by_name: SortedWideTable,
     /// Per-type runs of field storage descriptors, in instance-slot order.
     field_storage_runs: SortedWideTable,
+    /// The frozen slot kinds: per [`MethodId`], the arena offset of the method's run plus one, `0`
+    /// for a method with none. A run is laid out as [`SlotKindTable`] records it: the argument count
+    /// and the local count (2 little-endian bytes each), then one [`SlotKind::code`] per argument and
+    /// one per local.
+    slot_kind_runs: DenseIdColumn,
+    /// The frozen value types of [`SlotKind::Struct`] slots, keyed `(method << 32) | the slot's index
+    /// in its run` (its arguments first, then its locals).
+    slot_struct_types: SortedTokenTable,
+    /// The frozen `static_storage`: per static storage slot, `(tag << 32) | value` of its
+    /// [`FieldStorage::words`], `0` for a slot the loader recorded nothing for (every tag is nonzero).
+    static_storage: DenseU64Column,
     /// The frozen `name_to_handle` (full-name id -> type handle, split u32s).
     name_to_handle: SortedWideTable,
     /// The frozen `type_ctors` (type handle -> public parameterless ctor).
@@ -2228,9 +2375,11 @@ impl core::fmt::Display for ProfileViolation {
 pub enum BakeError {
     /// A bound intrinsic has no registry id -- add it to `intrinsic_registry`.
     UnregisteredIntrinsic(MethodId),
-    /// The image bytes are not a Lamella image (bad magic / truncated).
+    /// The image bytes are not a Lamella image: no magic, truncated, or a directory that is not the
+    /// format's own.
     NotAnImage,
-    /// The image's format version is not this build's.
+    /// The image's format is not the one this build boots ([`BAKED_IMAGE_FORMAT`]); the number is the
+    /// image's own format word.
     WrongVersion(u32),
     /// The image records an intrinsic id this build's registry lacks (a profile mismatch).
     MissingIntrinsic(u32),
@@ -2242,25 +2391,6 @@ pub enum BakeError {
         /// The checksum recomputed from the image's directory + arena as read.
         computed: u64,
     },
-    /// The image REQUIRES a format feature this build does not implement.
-    ///
-    /// This is the difference between "a newer toolchain wrote this" and "this runtime cannot run
-    /// it", and it is why the version number alone is not the gate: an image that uses nothing new
-    /// stays runnable by an older device, and one that does is refused BY NAME rather than by a
-    /// number that says only "not mine".
-    UnsupportedFeatures {
-        /// Everything the image asked for.
-        required: u64,
-        /// The bits this build does not implement -- the reason for the refusal.
-        unsupported: u64,
-    },
-    /// The header is structurally wrong: it declares fewer words than this build must read, or a
-    /// reserved word is non-zero.
-    ///
-    /// A non-zero reserved word means a writer used a slot WITHOUT declaring the matching feature
-    /// bit, so the image would otherwise be misread as if the field were absent. Refusing is the
-    /// point: the zero-check is what catches a forgotten feature bit.
-    BadHeader,
     /// The board's bus table is one this runtime cannot serve, whether a host set it with
     /// [`Module::set_board_buses`] or an image booted with it.
     ///
@@ -2276,24 +2406,13 @@ impl core::fmt::Display for BakeError {
                 write!(f, "method {id} is bound to an unregistered intrinsic")
             }
             BakeError::NotAnImage => f.write_str("not a Lamella baked image"),
-            BakeError::WrongVersion(version) => {
-                write!(f, "baked image format version {version} is not supported")
-            }
+            BakeError::WrongVersion(_) => f.write_str(lamella_wire::image_format::REDEPLOY_PROGRAM),
             BakeError::MissingIntrinsic(id) => {
                 write!(f, "image needs intrinsic 0x{id:08X}, absent from this build")
             }
             BakeError::ChecksumMismatch { stored, computed } => {
                 write!(f, "baked image checksum mismatch: header {stored:#018x}, computed {computed:#018x}")
             }
-            BakeError::UnsupportedFeatures { required, unsupported } => write!(
-                f,
-                "baked image requires format features {required:#018x}, of which \
-                 {unsupported:#018x} are not implemented by this build",
-            ),
-            BakeError::BadHeader => f.write_str(
-                "baked image header is malformed: too few declared words, or a reserved word is \
-                 not zero",
-            ),
             BakeError::BusTable(fault) => write!(f, "the board's bus table is refused: {fault}"),
         }
     }
@@ -2307,7 +2426,6 @@ fn image_push(out: &mut Vec<u8>, value: u64) {
 }
 
 /// Reads the `index`th image-directory word.
-#[cfg(feature = "code-in-place")]
 fn image_word(bytes: &[u8], index: usize) -> Option<u64> {
     let at = index * 8;
     bytes
@@ -2329,7 +2447,6 @@ fn record_word(record: &[u8; 24], index: usize) -> u32 {
 /// A baked image's content checksum uses this: strong error detection for flash integrity, and a
 /// 64-bit content id for deploy-skip -- a false collision would skip a NEEDED redeploy, so the 32-bit
 /// wire CRC is too few bits here.
-#[cfg(feature = "code-in-place")]
 fn crc64_update(mut crc: u64, bytes: &[u8]) -> u64 {
     const POLY: u64 = 0x42F0_E1EB_A9EA_3693;
     for &byte in bytes {
@@ -2343,19 +2460,17 @@ fn crc64_update(mut crc: u64, bytes: &[u8]) -> u64 {
 
 /// A baked image's content checksum: CRC-64 over the directory then the arena (the actual baked
 /// data). `write_baked` records it in the header; `from_baked` recomputes + compares at boot.
-#[cfg(feature = "code-in-place")]
 fn image_checksum(directory: &[u8], arena: &[u8]) -> u64 {
     crc64_update(crc64_update(0, directory), arena)
 }
 
-/// `image` as a writer from before its directory's last `pairs` trailing tables would have
-/// written it: the same bytes without those pairs, and the header's directory length and checksum
-/// recomputed to match. A test's way to hold an older image without committing one per table.
+/// `image` without its directory's last `pairs` tables: the same bytes without those pairs, and the
+/// header's directory length and checksum recomputed to match. An image missing tables its format
+/// defines.
 #[cfg(all(test, feature = "code-in-place"))]
 pub(crate) fn image_without_trailing_tables(image: &[u8], pairs: usize) -> Vec<u8> {
     let words = &image[8..];
-    let header_words = image_word(words, HEADER_WORD_COUNT_INDEX).expect("a header");
-    let directory_start = baked_directory_start(header_words).expect("a whole header");
+    let directory_start = DIRECTORY_START;
     let directory_len = image_word(words, HEADER_DIRECTORY_LEN_INDEX).expect("a directory length");
     let arena_start = directory_start + directory_len as usize;
     let shorter = directory_len as usize - pairs * 16;
@@ -2374,16 +2489,161 @@ pub(crate) fn image_without_trailing_tables(image: &[u8], pairs: usize) -> Vec<u
     older
 }
 
-/// The content checksum recorded in a baked image's header (word 18), or `None` if the bytes are not
-/// a current-version Lamella image. Reads ONLY the fixed header -- for a deploy-skip check (does a
-/// device already hold this exact image?) without parsing or hashing the whole image. Not gated on
-/// `code-in-place`: a deploy HOST that never boots an image still needs it to content-address one.
-pub fn baked_image_checksum(image: &[u8]) -> Option<u64> {
+/// `image` with `words` appended to its directory, the header's directory length and checksum
+/// recomputed to match: an image whose directory holds more than its format defines.
+#[cfg(all(test, feature = "code-in-place"))]
+pub(crate) fn image_with_extra_directory_words(image: &[u8], words: &[u64]) -> Vec<u8> {
+    let header = &image[8..];
+    let directory_start = DIRECTORY_START;
+    let directory_len = image_word(header, HEADER_DIRECTORY_LEN_INDEX).expect("a directory length") as usize;
+    let arena_start = directory_start + directory_len;
+    let mut directory = image[directory_start..arena_start].to_vec();
+    for word in words {
+        image_push(&mut directory, *word);
+    }
+    let arena = &image[arena_start..];
+    let mut longer = image[..directory_start].to_vec();
+    for (index, value) in [
+        (HEADER_DIRECTORY_LEN_INDEX, directory.len() as u64),
+        (HEADER_CHECKSUM_INDEX, image_checksum(&directory, arena)),
+    ] {
+        let at = 8 + index * 8;
+        longer[at..at + 8].copy_from_slice(&value.to_le_bytes());
+    }
+    longer.extend_from_slice(&directory);
+    longer.extend_from_slice(arena);
+    longer
+}
+
+/// The format word of a baked image, the word after its magic, whatever format the image is; `None`
+/// when the bytes do not begin with a baked image's magic. A host compares it with
+/// [`BAKED_IMAGE_FORMAT`] before it sends an image file to a board.
+#[must_use]
+pub fn baked_image_format(image: &[u8]) -> Option<u32> {
     if image.get(..4) != Some(&BAKED_IMAGE_MAGIC[..]) {
         return None;
     }
-    let version = u32::from_le_bytes(image.get(4..8)?.try_into().ok()?);
-    if version != BAKED_IMAGE_VERSION {
+    Some(u32::from_le_bytes(image.get(4..8)?.try_into().ok()?))
+}
+
+/// Whether `image` holds a program a board boots: an image its boot takes ([`baked_image_refusal`]
+/// answers `None`) that records an entry point, which a board runs; an image without one leaves it
+/// nothing to run. A host asks it before it takes a board back from the program it runs, so an image
+/// the board would not boot, which sending would leave it with nothing to run, is not sent. `false`
+/// for bytes that are not such an image; one takes more than [`BAKED_IMAGE_MIN_LEN`] bytes.
+#[must_use]
+pub fn baked_image_holds_a_program(image: &[u8]) -> bool {
+    checked_image(image).is_ok_and(|(words, ..)| words[HEADER_ENTRY_INDEX] != 0)
+}
+
+/// Why a board's boot ([`Module::from_baked`]) refuses `image`, by every check it makes of an image's
+/// bytes but the one only a board can make, that its intrinsic registry holds each intrinsic the image
+/// names; `None` for an image that passes them. A host asks it before it sends an image
+/// ([`baked_image_holds_a_program`]) and a board before it names the image it holds
+/// ([`verified_image_checksum`]), so the host, the board's deploy status and its boot answer as one.
+#[must_use]
+pub fn baked_image_refusal(image: &[u8]) -> Option<BakeError> {
+    checked_image(image).err()
+}
+
+/// The header's payload words, the arena and the tables the directory records of `image`, each read
+/// and checked as a board's boot reads and checks them before it boots one: the magic and this build's
+/// format ([`BAKED_IMAGE_FORMAT`]); the fixed header whole; a directory and an arena, at the lengths
+/// the header records, that end within the bytes, the sums checked; the content checksum the header
+/// records, over the two; a directory read to its exact length; an entry point, where one is recorded,
+/// that names one of the image's methods and has a body of at least one byte inside the arena; a method
+/// table, a method-to-assembly column and a static constructor list that lie within the arena, each
+/// listed constructor's id below the count of methods (whether that method is a static constructor, and
+/// its record and its body, are not checked); and, in a build that serves the board's bus table, a table
+/// it reads. Nothing else is checked: not the type table, the statics, the header's other words or any
+/// method's record but the entry's. Not gated on `code-in-place`: a host that never boots an image asks
+/// it.
+fn checked_image(image: &[u8]) -> Result<([u64; HEADER_PAYLOAD_WORDS], &[u8], FrozenTables), BakeError> {
+    if image.get(..4) != Some(&BAKED_IMAGE_MAGIC[..]) {
+        return Err(BakeError::NotAnImage);
+    }
+    let version = image
+        .get(4..8)
+        .and_then(|word| word.try_into().ok())
+        .map(u32::from_le_bytes)
+        .ok_or(BakeError::NotAnImage)?;
+    if version != u32::from(BAKED_IMAGE_FORMAT) {
+        return Err(BakeError::WrongVersion(version));
+    }
+    let mut words = [0u64; HEADER_PAYLOAD_WORDS];
+    for (index, word) in words.iter_mut().enumerate() {
+        *word = image_word(&image[8..], index).ok_or(BakeError::NotAnImage)?;
+    }
+    let length = |index: usize| usize::try_from(words[index]).map_err(|_| BakeError::NotAnImage);
+    let arena_start = DIRECTORY_START.checked_add(length(HEADER_DIRECTORY_LEN_INDEX)?).ok_or(BakeError::NotAnImage)?;
+    let arena_end = arena_start.checked_add(length(HEADER_ARENA_LEN_INDEX)?).ok_or(BakeError::NotAnImage)?;
+    let directory = image.get(DIRECTORY_START..arena_start).ok_or(BakeError::NotAnImage)?;
+    let arena = image.get(arena_start..arena_end).ok_or(BakeError::NotAnImage)?;
+    let stored = words[HEADER_CHECKSUM_INDEX];
+    let computed = image_checksum(directory, arena);
+    if computed != stored {
+        return Err(BakeError::ChecksumMismatch { stored, computed });
+    }
+    let (frozen, words_read) = FrozenTables::read_directory(directory).ok_or(BakeError::NotAnImage)?;
+    if words_read.checked_mul(8) != Some(directory.len()) {
+        return Err(BakeError::NotAnImage);
+    }
+    if words[HEADER_ENTRY_INDEX].checked_sub(1).is_some_and(|entry| entry >= words[HEADER_METHOD_COUNT_INDEX]) {
+        return Err(BakeError::NotAnImage);
+    }
+    let within_arena = |count: usize, record: usize, offset: usize| {
+        count.checked_mul(record).and_then(|bytes| offset.checked_add(bytes)).is_some_and(|end| end <= arena.len())
+    };
+    if !within_arena(length(HEADER_METHOD_COUNT_INDEX)?, 24, length(HEADER_METHOD_TABLE_INDEX)?)
+        || !within_arena(length(HEADER_STATIC_CTOR_COUNT_INDEX)?, 4, length(HEADER_STATIC_CTORS_INDEX)?)
+        || !within_arena(length(HEADER_METHOD_COUNT_INDEX)?, 1, length(HEADER_METHOD_ASM_INDEX)?)
+    {
+        return Err(BakeError::NotAnImage);
+    }
+    let arena_u32 = |at: usize| Some(u32::from_le_bytes(arena.get(at..at.checked_add(4)?)?.try_into().ok()?));
+    if let Some(entry) = words[HEADER_ENTRY_INDEX].checked_sub(1) {
+        let record = usize::try_from(entry).ok().and_then(|entry| length(HEADER_METHOD_TABLE_INDEX).ok()?.checked_add(entry * 24));
+        let word = |index: usize| arena_u32(record? + index * 4);
+        let body = (word(0), word(2), word(3));
+        let runs = matches!(body, (Some(0), Some(offset), Some(len))
+            if len >= 1 && (offset as usize).checked_add(len as usize).is_some_and(|end| end <= arena.len()));
+        if !runs {
+            return Err(BakeError::NotAnImage);
+        }
+    }
+    let ctors = length(HEADER_STATIC_CTORS_INDEX)?;
+    for index in 0..length(HEADER_STATIC_CTOR_COUNT_INDEX)? {
+        if !arena_u32(ctors + index * 4).is_some_and(|id| u64::from(id) < words[HEADER_METHOD_COUNT_INDEX]) {
+            return Err(BakeError::NotAnImage);
+        }
+    }
+    #[cfg(feature = "board-buses")]
+    {
+        let buses = frozen.board_buses;
+        if buses.entries != 0 {
+            if !buses.fits(arena.len()) {
+                return Err(BakeError::NotAnImage);
+            }
+            let word = |index: usize| {
+                let at = buses.offset.checked_add(index.checked_mul(4)?)?;
+                Some(u32::from_le_bytes(arena.get(at..at.checked_add(4)?)?.try_into().ok()?))
+            };
+            lamella_board_buses::check_words(buses.entries, word).map_err(BakeError::BusTable)?;
+        }
+    }
+    Ok((words, arena, frozen))
+}
+
+/// The fewest bytes a baked image of this build's format takes: its fixed header and the shortest
+/// directory the format writes, with an empty arena.
+pub const BAKED_IMAGE_MIN_LEN: usize = DIRECTORY_START + DIRECTORY_MIN_LEN;
+
+/// The content checksum recorded in a baked image's header (payload word 18), or `None` if the bytes
+/// are not a Lamella image of this build's format ([`BAKED_IMAGE_FORMAT`]). Reads ONLY the fixed header -- for a deploy-skip check (does a
+/// device already hold this exact image?) without parsing or hashing the whole image. Not gated on
+/// `code-in-place`: a deploy HOST that never boots an image still needs it to content-address one.
+pub fn baked_image_checksum(image: &[u8]) -> Option<u64> {
+    if baked_image_format(image)? != u32::from(BAKED_IMAGE_FORMAT) {
         return None;
     }
     let at = 8 + HEADER_CHECKSUM_INDEX * 8;
@@ -2401,78 +2661,60 @@ pub fn baked_image_checksum(image: &[u8]) -> Option<u64> {
 /// it exists to check: the host skips a deploy the board needs, and the next attach reports a corrupt
 /// image with nothing connecting it to the deploy that never happened.
 ///
-/// This is the same comparison [`Module::from_baked`] makes before booting an image, without
-/// building the module -- so a board answers the deploy-status query with an image it could actually
-/// boot, rather than with one that merely claims to be there.
+/// These are the checks [`Module::from_baked`] makes of an image's bytes before booting it
+/// ([`baked_image_refusal`]), without building the module -- so a board answers the deploy-status query
+/// with an image whose bytes its boot takes, rather than with one that merely claims to be there. Its
+/// boot's one other check, that its intrinsic registry holds each intrinsic the image names, is not made
+/// here.
 #[cfg(feature = "code-in-place")]
 pub fn verified_image_checksum(image: &[u8]) -> Option<u64> {
-    let stored = baked_image_checksum(image)?;
-    let words = image.get(8..)?;
-    let directory_len = image_word(words, HEADER_DIRECTORY_LEN_INDEX)? as usize;
-    let arena_len = image_word(words, HEADER_ARENA_LEN_INDEX)? as usize;
-    let directory_start = baked_directory_start(image_word(words, HEADER_WORD_COUNT_INDEX)?)?;
-    let arena_start = directory_start.checked_add(directory_len)?;
-    let directory = image.get(directory_start..arena_start)?;
-    let arena = image.get(arena_start..arena_start.checked_add(arena_len)?)?;
-    (image_checksum(directory, arena) == stored).then_some(stored)
+    checked_image(image).ok().map(|(words, ..)| words[HEADER_CHECKSUM_INDEX])
 }
 
-/// The baked-image format version, and the magic that guards it.
-///
-/// The version field exists so a FUTURE runtime can recognise an OLDER image, and that clock
-/// starts at the first PUBLIC release: a format version only means anything across a boundary a
-/// consumer can observe.
-///
-/// **THE MAGIC MOVES WITH THE NUMBER, AND THAT IS NOT OPTIONAL.** After a reset, "version 1"
-/// means something DIFFERENT from the historical v1, so a surviving genuine-v1 artifact would
-/// present `version == 1`, be accepted, and misparse -- the exact failure the field exists to
-/// prevent. Prefer structural impossibility to a probabilistic "the checksum would probably
-/// reject it": an artifact that cannot be mistaken needs no argument about how many exist.
-const BAKED_IMAGE_VERSION: u32 = 1;
+/// The baked-image format this build writes and boots, the one tag an image carries: the word after
+/// the magic, the [`lamella_wire::image_format::PRE_RELEASE`] flag and a count. An image of any other
+/// format is refused ([`BakeError::WrongVersion`]), and a change to what an image holds takes the
+/// next number.
+pub const BAKED_IMAGE_FORMAT: u16 = lamella_wire::image_format::PRE_RELEASE | 1;
 
-/// The image magic. See [`BAKED_IMAGE_VERSION`] for why it moved with the reset.
+/// The image magic, the same for every format.
 const BAKED_IMAGE_MAGIC: &[u8; 4] = b"LML1";
 
 
-/// Header word 0: how many `u64` words the header holds, INCLUDING this one.
-///
-/// **THIS IS THE WORD THAT MAKES THE FORMAT ADDITIVE.** A reader computes the directory offset
-/// from the count the IMAGE declares, not from a constant it was compiled with -- so an image
-/// written by a LATER toolchain with more header words is still readable by THIS runtime, which
-/// reads the words it knows and skips the rest. Without it, every new header field moves the
-/// directory and every older device rejects the result -- a version split arrived at by accident,
-/// and one a fielded fleet pays for rather than the toolchain that caused it.
-const HEADER_WORD_COUNT_INDEX: usize = 0;
 
-/// Header word 1: the feature bits this image REQUIRES of the runtime. See [`SUPPORTED_FEATURES`].
-const HEADER_REQUIRED_FEATURES_INDEX: usize = 1;
-
-/// The format's payload words begin after the two structural words above.
-const HEADER_PAYLOAD_BASE: usize = 2;
-
-/// How many payload words the format defines today (entry .. checksum).
+/// How many payload words the header holds, after the magic and the format word (entry ..
+/// checksum).
 const HEADER_PAYLOAD_WORDS: usize = 19;
 
+/// Payload word 0: the entry point's method id plus one, or 0 where the image records none.
+const HEADER_ENTRY_INDEX: usize = 0;
+/// Payload word 1: how many method records the image holds.
+const HEADER_METHOD_COUNT_INDEX: usize = 1;
+/// Payload word 2: the arena offset of the method records.
+const HEADER_METHOD_TABLE_INDEX: usize = 2;
+/// Payload word 3: the arena offset of the method-to-assembly column, a byte a method.
+const HEADER_METHOD_ASM_INDEX: usize = 3;
+/// Payload word 8: how many static constructors the image lists.
+const HEADER_STATIC_CTOR_COUNT_INDEX: usize = 8;
+/// Payload word 9: the arena offset of the static constructor list.
+const HEADER_STATIC_CTORS_INDEX: usize = 9;
+
 /// Payload word 16: the directory length in bytes.
-const HEADER_DIRECTORY_LEN_INDEX: usize = HEADER_PAYLOAD_BASE + 16;
+const HEADER_DIRECTORY_LEN_INDEX: usize = 16;
 /// Payload word 17: the arena length in bytes.
-const HEADER_ARENA_LEN_INDEX: usize = HEADER_PAYLOAD_BASE + 17;
+const HEADER_ARENA_LEN_INDEX: usize = 17;
 /// Payload word 18: the CRC-64 over directory + arena.
-const HEADER_CHECKSUM_INDEX: usize = HEADER_PAYLOAD_BASE + 18;
+const HEADER_CHECKSUM_INDEX: usize = 18;
 
-/// Reserved words, which a reader validates are ZERO.
-///
-/// **THE ZERO-CHECK IS NOT THE EXTENSION MECHANISM -- it is the check on the extension
-/// mechanism.** A future field uses a reserved slot AND sets a bit in
-/// [`HEADER_REQUIRED_FEATURES_INDEX`]; an older runtime then refuses BY NAME. The zero-check is
-/// what catches the mistake of writing the slot and FORGETTING the bit, which would otherwise be
-/// read as "field absent" and silently misinterpreted.
-const HEADER_RESERVED_BASE: usize = HEADER_PAYLOAD_BASE + HEADER_PAYLOAD_WORDS;
-/// How many reserved words this build writes and validates.
-const HEADER_RESERVED_WORDS: usize = 3;
+/// The byte offset of the directory: the magic and the format word, then the payload words.
+const DIRECTORY_START: usize = 8 + HEADER_PAYLOAD_WORDS * 8;
 
-/// How many header words this build WRITES. A reader must not assume this of an image.
-const HEADER_WORDS: usize = HEADER_RESERVED_BASE + HEADER_RESERVED_WORDS;
+/// The tables a directory records by their offset and entry count, after its two column counts.
+const DIRECTORY_TABLES: usize = 68;
+
+/// The bytes of the shortest directory this format writes: its two column counts with no column after
+/// either, and each table's offset and entry count.
+const DIRECTORY_MIN_LEN: usize = (2 + 2 * DIRECTORY_TABLES) * 8;
 
 /// The well-known id of `System.Exception`'s message field in [`Module::runtime_field_slots`].
 ///
@@ -2514,33 +2756,6 @@ const RUNTIME_METHOD_WALL_CLOCK_SOURCE: u64 = 2;
 const RUNTIME_METHOD_PIN_EVENT_DISPATCH: u64 = 3;
 /// `Lamella.Hardware.PinEvents::ReportLost()`. See [`RUNTIME_METHOD_WALL_CLOCK_SETTER`].
 const RUNTIME_METHOD_PIN_EVENT_LOST: u64 = 4;
-
-/// Feature bits an image may require of the runtime. **None is defined yet, and that is correct:**
-/// v1 requires nothing beyond the base format, so every v1 image sets zero and any runtime that
-/// understands the base format can boot it. Generics and async are the first two expected to claim
-/// a bit; a compact bake layout is a candidate but is NOT reserved here, because which knobs exist
-/// is a question for measurement rather than for this constant.
-const SUPPORTED_FEATURES: u64 = 0;
-
-/// What an image THIS build bakes declares it requires. Zero: nothing beyond the base format.
-///
-/// Deliberately a separate constant from [`SUPPORTED_FEATURES`], which is what a runtime
-/// IMPLEMENTS. They are equal today and they are not the same question -- a toolchain that gains a
-/// feature raises what it may WRITE, a runtime that gains one raises what it may READ, and the
-/// whole point of the mask is that those two move independently.
-const IMAGE_REQUIRED_FEATURES: u64 = 0;
-
-/// The byte offset of the directory in an image whose header declares `header_words` words.
-///
-/// `None` when the image declares FEWER words than this build must read -- a truncated or foreign
-/// header, not something to be read optimistically.
-fn baked_directory_start(header_words: u64) -> Option<usize> {
-    let declared = usize::try_from(header_words).ok()?;
-    if declared < HEADER_WORDS {
-        return None;
-    }
-    declared.checked_mul(8)?.checked_add(8)
-}
 
 /// Packs a by-name index key: the member/type handle in the high 40 bits, the name id in the low
 /// 24. `None` if either exceeds its field (the entry then stays in the builder map).
@@ -2711,11 +2926,13 @@ impl FrozenTables {
         pair(out, self.board_buses.offset, self.board_buses.entries);
         pair(out, self.events_by_name.offset, self.events_by_name.entries);
         pair(out, self.field_storage_runs.offset, self.field_storage_runs.entries);
+        pair(out, self.slot_kind_runs.offset, self.slot_kind_runs.entries);
+        pair(out, self.slot_struct_types.offset, self.slot_struct_types.entries);
+        pair(out, self.static_storage.offset, self.static_storage.entries);
     }
 
     /// Reads a [`FrozenTables::write_directory`] image back; returns the views and the word
     /// count consumed.
-    #[cfg(feature = "code-in-place")]
     fn read_directory(bytes: &[u8]) -> Option<(FrozenTables, usize)> {
         let mut frozen = FrozenTables::default();
         let mut cursor = 0usize;
@@ -2807,26 +3024,22 @@ impl FrozenTables {
         sorted!(assembly_types, SortedWideTable);
         sorted!(enum_constants, SortedWideTable);
 
-        macro_rules! trailing {
-            ($field:ident, $kind:ident) => {
-                if let Some((offset, entries)) = pair(bytes) {
-                    frozen.$field = $kind { offset, entries };
-                }
-            };
-        }
-        trailing!(nullable_underlying, SortedWideTable);
-        trailing!(delegate_ctor_types, SortedTokenTable);
-        trailing!(intrinsic_type_ids, SortedTokenTable);
-        trailing!(runtime_field_slots, SortedTokenTable);
-        trailing!(runtime_methods, SortedTokenTable);
-        trailing!(enum_unsigned, SortedTokenSet);
-        trailing!(cast_elems, SortedWideTable);
-        trailing!(cctor_types, SortedTokenTable);
-        trailing!(static_slot_types, DenseIdColumn);
-        trailing!(field_offset_runs, SortedWideTable);
-        trailing!(board_buses, WordRun);
-        trailing!(events_by_name, SortedWideTable);
-        trailing!(field_storage_runs, SortedWideTable);
+        sorted!(nullable_underlying, SortedWideTable);
+        sorted!(delegate_ctor_types, SortedTokenTable);
+        sorted!(intrinsic_type_ids, SortedTokenTable);
+        sorted!(runtime_field_slots, SortedTokenTable);
+        sorted!(runtime_methods, SortedTokenTable);
+        sorted!(enum_unsigned, SortedTokenSet);
+        sorted!(cast_elems, SortedWideTable);
+        sorted!(cctor_types, SortedTokenTable);
+        sorted!(static_slot_types, DenseIdColumn);
+        sorted!(field_offset_runs, SortedWideTable);
+        sorted!(board_buses, WordRun);
+        sorted!(events_by_name, SortedWideTable);
+        sorted!(field_storage_runs, SortedWideTable);
+        sorted!(slot_kind_runs, DenseIdColumn);
+        sorted!(slot_struct_types, SortedTokenTable);
+        sorted!(static_storage, DenseU64Column);
         Some((frozen, cursor))
     }
 }
@@ -2992,6 +3205,80 @@ impl Module {
         )
     }
 
+    /// Records `method`'s slot kinds: one per argument (`this` first for an instance method), then
+    /// one per local, each in slot order.
+    pub fn set_method_slot_kinds(&mut self, method: MethodId, args: &[SlotKind], locals: &[SlotKind]) {
+        self.slot_kinds.set(method, args, locals);
+    }
+
+    /// `method`'s argument kinds and local kinds as [`SlotKind::code`] bytes, in slot order; `None`
+    /// where the loader recorded no kinds for the method.
+    #[must_use]
+    pub fn method_slot_kinds(&self, method: MethodId) -> Option<(&[u8], &[u8])> {
+        self.slot_kinds.get(method).or_else(|| {
+            let (codes, args, locals) = self.frozen_slot_kind_run(method)?;
+            Some(self.arena.bytes.get(codes..codes.checked_add(args + locals)?)?.split_at(args))
+        })
+    }
+
+    /// Where `method`'s frozen slot codes start in the arena, and its argument count and local count.
+    fn frozen_slot_kind_run(&self, method: MethodId) -> Option<(usize, usize, usize)> {
+        let offset = usize::try_from(self.frozen.slot_kind_runs.get(&self.arena, method)?).ok()?;
+        let counts = self.arena.bytes.get(offset..offset.checked_add(4)?)?;
+        let args = usize::from(u16::from_le_bytes([counts[0], counts[1]]));
+        let locals = usize::from(u16::from_le_bytes([counts[2], counts[3]]));
+        Some((offset + 4, args, locals))
+    }
+
+    /// The value type recorded for `method`'s argument `slot` (`argument`) or local `slot`, from the
+    /// live table while the method's run is there, and from the frozen one once a freeze drained it.
+    fn slot_struct_type(&self, method: MethodId, argument: bool, slot: usize) -> Option<TypeId> {
+        if self.slot_kinds.run(method).is_some() {
+            return self.slot_kinds.struct_type(method, argument, slot);
+        }
+        let (_, args, locals) = self.frozen_slot_kind_run(method)?;
+        let index = if argument { (slot < args).then_some(slot)? } else { (slot < locals).then_some(args + slot)? };
+        self.frozen.slot_struct_types.get(&self.arena, (u64::from(method) << 32) | index as u64)
+    }
+
+    /// The declared kind of `method`'s argument `slot`; `None` where the loader recorded no kinds for
+    /// the method or it has no such argument.
+    #[must_use]
+    pub fn method_arg_kind(&self, method: MethodId, slot: usize) -> Option<SlotKind> {
+        let (args, _) = self.method_slot_kinds(method)?;
+        args.get(slot).copied().map(SlotKind::from_code)
+    }
+
+    /// The declared kind of `method`'s local `slot`; `None` where the loader recorded no kinds for the
+    /// method or it has no such local.
+    #[must_use]
+    pub fn method_local_kind(&self, method: MethodId, slot: usize) -> Option<SlotKind> {
+        let (_, locals) = self.method_slot_kinds(method)?;
+        locals.get(slot).copied().map(SlotKind::from_code)
+    }
+
+    /// Records that `method`'s argument `slot` (`argument`) or local `slot`, recorded as a
+    /// [`SlotKind::Struct`] by [`Module::set_method_slot_kinds`], holds a value of the value type
+    /// `type_id`, whose field layout places the bytes a pointer into the variable reaches (ECMA-335 6th
+    /// ed II.10.1.2). A slot recorded as another kind takes no type.
+    pub fn set_method_slot_struct_type(&mut self, method: MethodId, argument: bool, slot: usize, type_id: TypeId) {
+        self.slot_kinds.set_struct_type(method, argument, slot, type_id);
+    }
+
+    /// The value type of `method`'s argument `slot`, where it is a struct whose type the loader
+    /// recorded ([`Module::set_method_slot_struct_type`]).
+    #[must_use]
+    pub fn method_arg_struct_type(&self, method: MethodId, slot: usize) -> Option<TypeId> {
+        self.slot_struct_type(method, true, slot)
+    }
+
+    /// The value type of `method`'s local `slot`, where it is a struct whose type the loader recorded
+    /// ([`Module::set_method_slot_struct_type`]).
+    #[must_use]
+    pub fn method_local_struct_type(&self, method: MethodId, slot: usize) -> Option<TypeId> {
+        self.slot_struct_type(method, false, slot)
+    }
+
     /// Adds a native intrinsic belonging to assembly `asm` and returns its [`MethodId`]. `id` is the
     /// intrinsic's stable registry id (`intrinsic_registry::intrinsic_id(fn_name)`), stamped by the
     /// binder so the bake never compares fn pointers.
@@ -3104,6 +3391,8 @@ impl Module {
         self.freeze_type_shape();
         self.freeze_field_offsets();
         self.freeze_field_storage();
+        self.freeze_slot_kinds();
+        self.freeze_static_storage();
         self.freeze_strings();
         self.freeze_names();
         self.freeze_reflect_records();
@@ -3985,19 +4274,23 @@ impl Module {
         DenseU64Column { offset, entries }
     }
 
-    /// Drops, before a bake, the byte layout of every type whose fields no pointer can walk.
+    /// Drops, before a bake, the byte layout of every class whose fields no pointer can reach.
     ///
-    /// Field addresses keep the declaring layout and its derived layouts. Direct field accesses
-    /// also keep value-type layouts when the image can allocate raw stack storage. Nested value
-    /// fields keep their layouts recursively. A trimmed image's dropped bodies are empty.
+    /// A pointer reaches a class's fields only from the address of one of them (`ldflda`, ECMA-335
+    /// 6th ed III.4.10), so a class keeps its layout where a body in the image takes the address of
+    /// one of its fields or of a field it inherits. A value type keeps its layout, as does a type a
+    /// field, a static or a variable is recorded as holding as a struct, and every type keeps its
+    /// fields' storage: the interpreter reads a struct through its bytes wherever a pointer reaches
+    /// one (the address of a struct variable, of a static, of a boxed value, or the bytes of another
+    /// variable read or written as the struct with `ldobj` or `stobj`, III.4.13 and III.4.29), and
+    /// `stfld` holds a value at its field's declared storage (III.4.28), with no field's address
+    /// taken. A trimmed image's dropped bodies are empty.
     #[cfg(feature = "code-in-place")]
     fn drop_unaddressed_field_offsets(&mut self) {
         if self.field_offsets.is_empty() {
             return;
         }
         let mut addressed: BTreeSet<TypeId> = BTreeSet::new();
-        let mut raw_fields: BTreeSet<TypeId> = BTreeSet::new();
-        let mut has_stack_allocation = false;
         for (id, method) in self.methods.iter().enumerate() {
             let Method::Managed { body, .. } = method else {
                 continue;
@@ -4007,23 +4300,14 @@ impl Module {
             };
             let asm = self.method_asm(id as MethodId);
             for instruction in &code {
-                has_stack_allocation |= instruction.opcode == lamella_cil::Opcode::Localloc;
-                if let (lamella_cil::Opcode::Ldflda | lamella_cil::Opcode::Ldfld | lamella_cil::Opcode::Stfld,
-                    lamella_cil::Operand::Token(token)) =
+                if let (lamella_cil::Opcode::Ldflda, lamella_cil::Operand::Token(token)) =
                     (instruction.opcode, &instruction.operand)
                 {
                     if let Some(owner) = self.field_type(asm, *token) {
-                        if instruction.opcode == lamella_cil::Opcode::Ldflda {
-                            addressed.insert(owner);
-                        } else if self.type_is_value_type(owner) {
-                            raw_fields.insert(owner);
-                        }
+                        addressed.insert(owner);
                     }
                 }
             }
-        }
-        if has_stack_allocation {
-            addressed.extend(raw_fields);
         }
         let walkable = |type_id: TypeId| {
             let mut current = Some(type_id);
@@ -4040,8 +4324,20 @@ impl Module {
             .field_offsets
             .keys()
             .copied()
-            .filter(|&type_id| walkable(type_id))
+            .filter(|&type_id| self.type_is_value_type(type_id) || walkable(type_id))
             .collect();
+        for slot in 0..self.static_field_count() {
+            if let Some(FieldStorage::ValueType(held)) = self.static_storage(slot) {
+                kept.insert(held);
+            }
+        }
+        for method in 0..self.methods.len() as MethodId {
+            let Some((args, locals)) = self.method_slot_kinds(method).map(|(args, locals)| (args.len(), locals.len())) else {
+                continue;
+            };
+            kept.extend((0..args).filter_map(|slot| self.method_arg_struct_type(method, slot)));
+            kept.extend((0..locals).filter_map(|slot| self.method_local_struct_type(method, slot)));
+        }
         let mut pending: Vec<TypeId> = kept.iter().copied().collect();
         while let Some(owner) = pending.pop() {
             let slots = self.type_field_offsets(owner).map_or(0, |layout| layout.slot_count());
@@ -4054,7 +4350,6 @@ impl Module {
             }
         }
         self.field_offsets.retain(|type_id, _| kept.contains(type_id));
-        self.field_storage.retain(|type_id, _| kept.contains(type_id));
     }
 
     /// Drains `field_offsets` into one run of words per type, addressed by a sparse table keyed by
@@ -4102,6 +4397,71 @@ impl Module {
         }
         self.frozen.field_storage_runs = SortedWideTable::write(&mut self.arena,
             records.into_iter().map(|(key, (offset, words))| (key, offset, words)).collect());
+    }
+
+    /// Drains the slot kinds into the arena: each method's run copied whole, a dense column of the
+    /// runs' offsets by [`MethodId`], and the struct types keyed by method and position in the run,
+    /// carrying an earlier freeze's entries forward.
+    fn freeze_slot_kinds(&mut self) {
+        if self.slot_kinds.starts.is_empty() {
+            return;
+        }
+        let table = core::mem::take(&mut self.slot_kinds);
+        let old = self.frozen.slot_kind_runs;
+        let entries = self.methods.len().max(old.entries).max(table.starts.len());
+        let mut runs = alloc::vec![0u32; entries];
+        for (method, run) in runs.iter_mut().enumerate().take(old.entries) {
+            *run = self.arena.read_u32(old.offset + method * 4).unwrap_or(0);
+        }
+        let mut struct_types: BTreeMap<u64, u32> =
+            self.frozen.slot_struct_types.entries_of(&self.arena).into_iter().collect();
+        for (method, run) in runs.iter_mut().enumerate() {
+            let Ok(id) = MethodId::try_from(method) else { continue };
+            let Some((codes, args, locals)) = table.run(id) else { continue };
+            let (Some(bytes), Ok(offset)) =
+                (table.bytes.get(codes - 4..codes + args + locals), u32::try_from(self.arena.bytes.len()))
+            else {
+                continue;
+            };
+            self.arena.bytes.to_mut().extend_from_slice(bytes);
+            *run = offset + 1;
+            let (Ok(start), Ok(end)) = (u32::try_from(codes), u32::try_from(codes + args + locals)) else { continue };
+            let first = table.struct_types.partition_point(|&(at, _)| at < start);
+            for &(at, type_id) in table.struct_types[first..].iter().take_while(|&&(at, _)| at < end) {
+                struct_types.insert((u64::from(id) << 32) | u64::from(at - start), type_id);
+            }
+        }
+        let offset = self.arena.bytes.len();
+        for run in &runs {
+            self.arena.push_u32(*run);
+        }
+        self.frozen.slot_kind_runs = DenseIdColumn { offset, entries };
+        self.frozen.slot_struct_types = SortedTokenTable::write(&mut self.arena, struct_types.into_iter().collect());
+    }
+
+    /// Drains `static_storage` into a dense column indexed by static slot, each entry
+    /// `(tag << 32) | value` of the slot's [`FieldStorage::words`], carrying an earlier column forward.
+    fn freeze_static_storage(&mut self) {
+        if self.static_storage.is_empty() {
+            return;
+        }
+        let recorded = core::mem::take(&mut self.static_storage);
+        let old = self.frozen.static_storage;
+        let entries = self.static_defaults.len().max(old.entries).max(recorded.len());
+        let mut words = alloc::vec![0u64; entries];
+        for (slot, word) in words.iter_mut().enumerate().take(old.entries) {
+            *word = self.arena.read_u64(old.offset + slot * 8).unwrap_or(0);
+        }
+        for (word, [tag, value]) in words.iter_mut().zip(recorded) {
+            if tag != 0 {
+                *word = (u64::from(tag) << 32) | u64::from(value);
+            }
+        }
+        let offset = self.arena.bytes.len();
+        for word in &words {
+            self.arena.push_u64(*word);
+        }
+        self.frozen.static_storage = DenseU64Column { offset, entries };
     }
 
     /// Drains `static_slot_types` into a dense column indexed by static slot, carrying an earlier
@@ -4306,6 +4666,7 @@ impl Module {
     /// nothing in its body to differ by -- so for exactly the ones worth telling apart, the
     /// pointers are the least reliable.
     #[must_use]
+    #[cfg(any(feature = "bcl", all(test, feature = "code-in-place")))]
     pub(crate) fn intrinsic_id(&self, method: MethodId) -> Option<u32> {
         #[cfg(feature = "code-in-place")]
         if let Some(baked) = &self.baked {
@@ -4624,9 +4985,7 @@ impl Module {
 
         let mut out = Vec::new();
         out.extend_from_slice(&BAKED_IMAGE_MAGIC[..]);
-        out.extend_from_slice(&BAKED_IMAGE_VERSION.to_le_bytes());
-        image_push(&mut out, HEADER_WORDS as u64);
-        image_push(&mut out, IMAGE_REQUIRED_FEATURES);
+        out.extend_from_slice(&u32::from(BAKED_IMAGE_FORMAT).to_le_bytes());
         image_push(&mut out, entry.map_or(0, |method| u64::from(method) + 1));
         image_push(&mut out, method_count as u64);
         image_push(&mut out, method_table as u64);
@@ -4651,14 +5010,7 @@ impl Module {
         image_push(&mut out, directory.len() as u64);
         image_push(&mut out, self.arena.bytes.len() as u64);
         image_push(&mut out, image_checksum(&directory, &self.arena.bytes));
-        for _ in 0..HEADER_RESERVED_WORDS {
-            image_push(&mut out, 0);
-        }
-        debug_assert_eq!(
-            out.len(),
-            8 + HEADER_WORDS * 8,
-            "the header written must be exactly the header declared in word 0"
-        );
+        debug_assert_eq!(out.len(), DIRECTORY_START, "the header written is the format's header");
         out.extend_from_slice(&directory);
         out.extend_from_slice(&self.arena.bytes);
         Ok(out)
@@ -4672,77 +5024,27 @@ impl Module {
     /// [`BakeError`] for a non-image, a version mismatch, or an intrinsic id this build lacks.
     #[cfg(feature = "code-in-place")]
     pub fn from_baked(image: &'static [u8]) -> Result<(Module, Option<MethodId>), BakeError> {
-        if image.get(..4) != Some(BAKED_IMAGE_MAGIC) {
-            return Err(BakeError::NotAnImage);
-        }
-        let version = image
-            .get(4..8)
-            .and_then(|word| word.try_into().ok())
-            .map(u32::from_le_bytes)
-            .ok_or(BakeError::NotAnImage)?;
-        if version != BAKED_IMAGE_VERSION {
-            return Err(BakeError::WrongVersion(version));
-        }
-        let words = &image[8..];
-        let raw = |index: usize| image_word(words, index).ok_or(BakeError::NotAnImage);
-        let required = raw(HEADER_REQUIRED_FEATURES_INDEX)?;
-        let unsupported = required & !SUPPORTED_FEATURES;
-        if unsupported != 0 {
-            return Err(BakeError::UnsupportedFeatures { required, unsupported });
-        }
-        let directory_start =
-            baked_directory_start(raw(HEADER_WORD_COUNT_INDEX)?).ok_or(BakeError::BadHeader)?;
-        for index in 0..HEADER_RESERVED_WORDS {
-            if raw(HEADER_RESERVED_BASE + index)? != 0 {
-                return Err(BakeError::BadHeader);
-            }
-        }
-        let word = |index: usize| raw(HEADER_PAYLOAD_BASE + index);
-        let entry = word(0)?;
-        let method_count = word(1)? as usize;
-        let method_table = word(2)? as usize;
-        let method_asm = word(3)? as usize;
-        let type_count = word(4)? as usize;
-        let type_table = word(5)? as usize;
-        let static_count = word(6)? as usize;
-        let statics = word(7)? as usize;
-        let static_ctor_count = word(8)? as usize;
-        let static_ctors_at = word(9)? as usize;
-        let string_type_id = word(10)?;
-        let primitive_int32 = word(11)?;
-        let primitive_int64 = word(12)?;
-        let primitive_native = word(13)?;
-        let primitive_float = word(14)?;
-        let fingerprint = word(15)?;
-        let directory_len = word(16)? as usize;
-        let arena_len = word(17)? as usize;
-        let stored_checksum = word(18)?;
-        let arena_start = directory_start + directory_len;
-        let directory = image
-            .get(directory_start..arena_start)
-            .ok_or(BakeError::NotAnImage)?;
-        let arena_bytes = image
-            .get(arena_start..arena_start + arena_len)
-            .ok_or(BakeError::NotAnImage)?;
-        let computed = image_checksum(directory, arena_bytes);
-        if computed != stored_checksum {
-            return Err(BakeError::ChecksumMismatch { stored: stored_checksum, computed });
-        }
-        let (frozen, _) =
-            FrozenTables::read_directory(directory).ok_or(BakeError::NotAnImage)?;
+        let (words, arena_bytes, frozen) = checked_image(image)?;
+        let word = |index: usize| words[index];
+        let entry = word(HEADER_ENTRY_INDEX);
+        let method_count = word(HEADER_METHOD_COUNT_INDEX) as usize;
+        let method_table = word(HEADER_METHOD_TABLE_INDEX) as usize;
+        let method_asm = word(HEADER_METHOD_ASM_INDEX) as usize;
+        let type_count = word(4) as usize;
+        let type_table = word(5) as usize;
+        let static_count = word(6) as usize;
+        let statics = word(7) as usize;
+        let static_ctor_count = word(HEADER_STATIC_CTOR_COUNT_INDEX) as usize;
+        let static_ctors_at = word(HEADER_STATIC_CTORS_INDEX) as usize;
+        let string_type_id = word(10);
+        let primitive_int32 = word(11);
+        let primitive_int64 = word(12);
+        let primitive_native = word(13);
+        let primitive_float = word(14);
+        let fingerprint = word(15);
         let arena = TableArena {
             bytes: alloc::borrow::Cow::Borrowed(arena_bytes),
         };
-        #[cfg(feature = "board-buses")]
-        let buses = frozen.board_buses;
-        #[cfg(feature = "board-buses")]
-        if buses.entries != 0 {
-            if !buses.fits(arena_bytes.len()) {
-                return Err(BakeError::NotAnImage);
-            }
-            lamella_board_buses::check_words(buses.entries, |index| buses.word(&arena, index))
-                .map_err(BakeError::BusTable)?;
-        }
 
         let hints_valid =
             fingerprint == crate::intrinsic_registry::registry_fingerprint();
@@ -4954,6 +5256,19 @@ impl Module {
             if let Some(type_id) = self.method_type.get(&method).copied() {
                 type_queue.push((type_id, false));
             }
+            if let Some((args, locals)) = self.method_slot_kinds(method) {
+                let (args, locals) = (args.len(), locals.len());
+                for slot in 0..args {
+                    if let Some(declared) = self.method_arg_struct_type(method, slot) {
+                        type_queue.push((declared, false));
+                    }
+                }
+                for slot in 0..locals {
+                    if let Some(declared) = self.method_local_struct_type(method, slot) {
+                        type_queue.push((declared, false));
+                    }
+                }
+            }
             let asm = self.method_asm(method);
             let Some(Method::Managed { body, .. }) = self.methods.get(method as usize) else {
                 continue;
@@ -5037,6 +5352,12 @@ impl Module {
                     | Opcode::Ldsflda => {
                         if let Some(type_id) = self.field_type(asm, token) {
                             type_queue.push((type_id, false));
+                        }
+                        if matches!(instruction.opcode, Opcode::Ldsfld | Opcode::Stsfld | Opcode::Ldsflda)
+                            && let Some(FieldStorage::ValueType(declared)) =
+                                self.static_field_slot(asm, token).and_then(|slot| self.static_storage(slot))
+                        {
+                            type_queue.push((declared, false));
                         }
                     }
                     Opcode::Box
@@ -5513,6 +5834,11 @@ impl Module {
             ("field offset runs (frozen)", self.frozen.field_offset_runs.entries),
             ("field_storage", self.field_storage.len()),
             ("field storage runs (frozen)", self.frozen.field_storage_runs.entries),
+            ("slot_kinds bytes", self.slot_kinds.bytes.len()),
+            ("slot kind run column entries (frozen)", self.frozen.slot_kind_runs.entries),
+            ("slot struct types (frozen)", self.frozen.slot_struct_types.entries),
+            ("static_storage", self.static_storage.len()),
+            ("static storage column entries (frozen)", self.frozen.static_storage.entries),
             ("board bus table words", self.board_buses.as_ref().map_or(0, |table| table.len())),
             ("board bus table words (frozen)", self.frozen.board_buses.entries),
             ("enum_widths", self.enum_widths.len()),
@@ -6006,6 +6332,29 @@ impl Module {
         let slot = self.static_defaults.len();
         self.static_defaults.push(default);
         self.static_fields.insert(asm_key(asm, token.0), slot);
+    }
+
+    /// Records the declared storage of the static field in storage slot `slot` (ECMA-335 6th ed II.22.15:
+    /// the field's signature): the width a floating value stored there takes (I.12.1.3) and the bytes
+    /// a pointer to it reaches.
+    pub fn set_static_storage(&mut self, slot: usize, storage: FieldStorage) {
+        if self.static_storage.len() <= slot {
+            self.static_storage.resize(slot + 1, [0, 0]);
+        }
+        self.static_storage[slot] = storage.words();
+    }
+
+    /// The declared storage of the static field in storage slot `slot`, where the loader recorded it
+    /// ([`Module::set_static_storage`]).
+    #[must_use]
+    pub fn static_storage(&self, slot: usize) -> Option<FieldStorage> {
+        match self.static_storage.get(slot) {
+            Some(&[tag, value]) if tag != 0 => FieldStorage::from_words(tag, value),
+            _ => {
+                let word = self.frozen.static_storage.get(&self.arena, u32::try_from(slot).ok()?)?;
+                FieldStorage::from_words((word >> 32) as u32, word as u32)
+            }
+        }
     }
 
     /// Replaces the zero value of an already-bound static slot. The loader binds a static field
@@ -6508,11 +6857,6 @@ impl Module {
             .intrinsic_type_ids
             .get(&self.arena, which.key())
             .or_else(|| self.intrinsic_type_ids.get(&which.key()).copied())
-            .or_else(|| {
-                matches!(which, IntrinsicType::String)
-                    .then_some(self.string_type_id)
-                    .flatten()
-            })
     }
 
     /// Records the canonical `TypeDef` `token` of a primitive value type a corlib defines (in
@@ -8191,9 +8535,7 @@ mod tests {
         assert_eq!(baked.type_event_handle(keep_handle, "Signal"), Some(keep_event));
         assert_eq!(baked.type_event_handle(drop_handle, "Signal"), None);
         assert_eq!(baked.type_property_handle(keep_handle, "Signal"), Some(asm_key(0, 0x1700_0001)));
-        let (old, _) = Module::from_baked(Box::leak(older.into_boxed_slice())).expect("read older directory");
-        assert_eq!(old.type_event_handle(keep_handle, "Signal"), None);
-        assert_eq!(old.type_property_handle(keep_handle, "Signal"), Some(asm_key(0, 0x1700_0001)));
+        assert_eq!(Module::from_baked(Box::leak(older.into_boxed_slice())).err(), Some(BakeError::NotAnImage));
     }
 
     /// The entry assembly is FIRST-WINS, and the case that needs it is the REPL: an incremental
@@ -8336,7 +8678,7 @@ mod tests {
 
     #[cfg(feature = "code-in-place")]
     #[test]
-    fn stack_struct_storage_table_is_optional_in_older_baked_images() {
+    fn stack_struct_storage_table_is_required_in_a_baked_image() {
         let mut module = Module::new();
         let owner = module.add_type(alloc::vec![Value::Int32(0)]);
         module.set_type_field_offsets(owner, 4, 4, &[0]);
@@ -8347,9 +8689,38 @@ mod tests {
         let (baked, _) = Module::from_baked(Box::leak(image.into_boxed_slice())).unwrap();
         assert_eq!(baked.type_field_storage(owner, 0), Some(FieldStorage::Primitive(PrimKind::I4)));
         assert_eq!(baked.type_field_offsets(owner).unwrap().end(), 4);
-        let (old, _) = Module::from_baked(Box::leak(older.into_boxed_slice())).unwrap();
-        assert_eq!(old.type_field_storage(owner, 0), None);
-        assert_eq!(old.type_field_offsets(owner).unwrap().end(), 4);
+        assert_eq!(Module::from_baked(Box::leak(older.into_boxed_slice())).err(), Some(BakeError::NotAnImage));
+    }
+
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn slot_kinds_and_static_storage_survive_the_bake() {
+        let mut module = Module::new();
+        let owner = module.add_type(alloc::vec![Value::Int32(0)]);
+        let method = module.add_method(0, one_ret_raw(), 2);
+        let args = [SlotKind::Primitive(PrimKind::I4), SlotKind::Struct];
+        let locals = [SlotKind::Native, SlotKind::Struct, SlotKind::Reference];
+        module.set_method_slot_kinds(method, &args, &locals);
+        module.set_method_slot_struct_type(method, true, 1, owner);
+        module.set_method_slot_struct_type(method, false, 1, owner);
+        let unrecorded = module.reserve_static_slot(Value::Int32(0));
+        let slot = module.reserve_static_slot(Value::Int32(0));
+        module.set_static_storage(slot, FieldStorage::ValueType(owner));
+        module.freeze();
+        let image = module.write_baked(None).unwrap();
+        let older = image_without_trailing_tables(&image, 3);
+        let (baked, _) = Module::from_baked(Box::leak(image.into_boxed_slice())).unwrap();
+        let codes = |kinds: &[SlotKind]| kinds.iter().map(|kind| kind.code()).collect::<Vec<u8>>();
+        let (arg_codes, local_codes) = baked.method_slot_kinds(method).expect("the slot kinds are baked");
+        assert_eq!((arg_codes, local_codes), (&codes(&args)[..], &codes(&locals)[..]));
+        assert_eq!(baked.method_local_kind(method, 2), Some(SlotKind::Reference));
+        assert_eq!(baked.method_arg_struct_type(method, 1), Some(owner));
+        assert_eq!(baked.method_local_struct_type(method, 1), Some(owner));
+        assert_eq!(baked.method_local_struct_type(method, 0), None, "a slot of another kind has no type");
+        assert_eq!(baked.method_arg_struct_type(method, 2), None, "past the arguments");
+        assert_eq!(baked.static_storage(slot), Some(FieldStorage::ValueType(owner)));
+        assert_eq!(baked.static_storage(unrecorded), None);
+        assert_eq!(Module::from_baked(Box::leak(older.into_boxed_slice())).err(), Some(BakeError::NotAnImage));
     }
 
     #[test]
@@ -8626,10 +8997,10 @@ mod tests {
             "an unreached intrinsic demotes to an empty managed body (no baked demand)"
         );
 
-        let image = module.write_baked(Some(reached)).expect("bake");
+        let image = module.write_baked(None).expect("bake");
         let leaked: &'static [u8] = Box::leak(image.into_boxed_slice());
         let (_booted, entry) = Module::from_baked(leaked).expect("boot the trimmed bake");
-        assert_eq!(entry, Some(reached));
+        assert_eq!(entry, None);
     }
 
     #[cfg(feature = "code-in-place")]
@@ -8726,21 +9097,96 @@ mod tests {
         assert_eq!(baked.delegate_ctor_type(0, Token::new(METHOD_DEF, 11)), None);
     }
 
+    /// A host knows an image holds a program as the board's boot does ([`checked_image`]): one this
+    /// build bakes with an entry point does, and it boots; its header alone, the image without its
+    /// entry, and the image cut short do not. The shortest directory the format writes is the one
+    /// [`BAKED_IMAGE_MIN_LEN`] counts.
     #[cfg(feature = "code-in-place")]
     #[test]
-    fn an_image_predating_the_facility_still_resolves_the_string_from_its_header_word() {
-        let mut module = Module::new();
-        let string_type = module.add_type(Vec::new());
-        module.set_intrinsic_type_id(IntrinsicType::String, string_type);
-        let image = module.write_baked(None).expect("bake");
-        let leaked: &'static [u8] = Box::leak(image.into_boxed_slice());
-        let (baked, _entry) = Module::from_baked(leaked).expect("the image reads back");
+    fn a_host_knows_an_image_holds_a_program_as_its_boot_does() {
+        let mut directory = Vec::new();
+        FrozenTables::default().write_directory(&mut directory);
+        assert_eq!(directory.len(), DIRECTORY_MIN_LEN, "the shortest directory this format writes");
 
-        assert_eq!(baked.intrinsic_type_id(IntrinsicType::String), Some(string_type));
-        assert_eq!(
-            baked.string_type_id, Some(string_type),
-            "the grandfathered header word is still written, or an older runtime's \n             string dispatch is lost"
-        );
+        let mut module = Module::new();
+        let entry = module.add_method(0, one_ret_raw(), 0);
+        let image = module.write_baked(Some(entry)).expect("bake");
+        assert!(image.len() >= BAKED_IMAGE_MIN_LEN);
+        assert!(baked_image_holds_a_program(&image), "an image this build bakes with an entry");
+        let leaked: &'static [u8] = Box::leak(image.clone().into_boxed_slice());
+        assert!(matches!(Module::from_baked(leaked), Ok((_, Some(_)))), "and it boots");
+
+        let mut header_alone = image[..DIRECTORY_START].to_vec();
+        header_alone[8 + HEADER_DIRECTORY_LEN_INDEX * 8..8 + HEADER_ARENA_LEN_INDEX * 8 + 8].fill(0);
+        let mut no_entry = image.clone();
+        no_entry[8..16].fill(0);
+        for (name, bytes) in [
+            ("its header alone, recording no directory and no arena", header_alone),
+            ("the image without its entry point", no_entry),
+            ("the image cut short", image[..image.len() - 1].to_vec()),
+        ] {
+            assert!(!baked_image_holds_a_program(&bytes), "{name}");
+        }
+    }
+
+    /// **THE HOST, THE BOARD'S DEPLOY STATUS AND ITS BOOT REFUSE ONE IMAGE ALIKE** ([`checked_image`]),
+    /// changed from one this build bakes in the header's words, which its checksum does not cover, or
+    /// in the content, which it does: the directory 16 bytes longer and the arena 16 bytes shorter,
+    /// which leaves the checksum over the two as it was; a byte of the arena changed, the header's
+    /// checksum kept; an entry that names none of the image's methods; a method table or a static
+    /// constructor list past the arena; and a directory or an arena length at `u64::MAX`, whose sum
+    /// overflowed at boot.
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn the_host_the_deploy_status_and_the_boot_refuse_one_image_alike() {
+        let mut module = Module::new();
+        let entry = module.add_method(0, one_ret_raw(), 0);
+        let image = module.write_baked(Some(entry)).expect("bake");
+        let read = |index: usize| image_word(&image[8..], index).expect("a header word");
+        let with = |changes: &[(usize, u64)]| {
+            let mut changed = image.clone();
+            for &(index, value) in changes {
+                changed[8 + index * 8..16 + index * 8].copy_from_slice(&value.to_le_bytes());
+            }
+            changed
+        };
+        let (directory, arena) = (read(HEADER_DIRECTORY_LEN_INDEX), read(HEADER_ARENA_LEN_INDEX));
+        let with_record_word = |word: usize, value: u32| {
+            let mut changed = image.clone();
+            let arena_start = DIRECTORY_START + directory as usize;
+            let entry = read(HEADER_ENTRY_INDEX) as usize - 1;
+            let at = arena_start + read(HEADER_METHOD_TABLE_INDEX) as usize + entry * 24 + word * 4;
+            changed[at..at + 4].copy_from_slice(&value.to_le_bytes());
+            let checksum = image_checksum(&changed[DIRECTORY_START..arena_start], &changed[arena_start..]);
+            changed[8 + HEADER_CHECKSUM_INDEX * 8..16 + HEADER_CHECKSUM_INDEX * 8].copy_from_slice(&checksum.to_le_bytes());
+            changed
+        };
+        let mut corrupt = image.clone();
+        *corrupt.last_mut().expect("an arena") ^= 1;
+        let leaked: &'static [u8] = Box::leak(image.clone().into_boxed_slice());
+        assert!(baked_image_holds_a_program(&image), "the host takes the image as baked");
+        assert!(verified_image_checksum(&image).is_some(), "the deploy status names it");
+        assert!(Module::from_baked(leaked).is_ok(), "and it boots");
+        for (name, bytes) in [
+            ("the boundary between directory and arena moved",
+                with(&[(HEADER_DIRECTORY_LEN_INDEX, directory + 16), (HEADER_ARENA_LEN_INDEX, arena - 16)])),
+            ("a byte of the arena changed", corrupt),
+            ("an entry past the methods", with(&[(HEADER_ENTRY_INDEX, read(HEADER_METHOD_COUNT_INDEX) + 1)])),
+            ("a method table past the arena", with(&[(HEADER_METHOD_TABLE_INDEX, arena)])),
+            ("a static constructor past the arena", with(&[(HEADER_STATIC_CTOR_COUNT_INDEX, 1), (HEADER_STATIC_CTORS_INDEX, arena)])),
+            ("a directory length at u64::MAX", with(&[(HEADER_DIRECTORY_LEN_INDEX, u64::MAX)])),
+            ("an arena length at u64::MAX", with(&[(HEADER_ARENA_LEN_INDEX, u64::MAX)])),
+            ("an entry whose record is an intrinsic's", with_record_word(0, 1)),
+            ("an entry with no instruction", with_record_word(3, 0)),
+            ("an entry whose body lies past the arena", with_record_word(2, arena as u32)),
+            ("a static constructor naming no method",
+                with(&[(HEADER_STATIC_CTOR_COUNT_INDEX, 1), (HEADER_STATIC_CTORS_INDEX, read(HEADER_METHOD_TABLE_INDEX) + 12)])),
+            ("a method-to-assembly column past the arena", with(&[(HEADER_METHOD_ASM_INDEX, arena)])),
+        ] {
+            assert!(!baked_image_holds_a_program(&bytes), "the host: {name}");
+            assert_eq!(verified_image_checksum(&bytes), None, "the deploy status: {name}");
+            assert!(Module::from_baked(Box::leak(bytes.into_boxed_slice())).is_err(), "the boot: {name}");
+        }
     }
 
     /// An enum's SIGN survives a bake, at every unsigned width. `unbox.any` normalizes an enum's box
@@ -8931,58 +9377,22 @@ mod tests {
 
     #[cfg(feature = "code-in-place")]
     #[test]
-    fn a_later_format_may_append_directory_columns_and_this_build_skips_them() {
-        let word_at = |image: &[u8], index: usize| image_word(&image[8..], index).expect("header word");
-        let put_word = |image: &mut [u8], index: usize, value: u64| {
-            let at = 8 + index * 8;
-            image[at..at + 8].copy_from_slice(&value.to_le_bytes());
-        };
+    fn an_image_carries_the_one_format_tag_this_build_writes() {
+        let image = Module::new().write_baked(None).expect("bake an empty module");
+        assert_eq!(&image[..4], b"LML1");
+        let tag = u32::from_le_bytes(image[4..8].try_into().expect("a format word"));
+        assert_eq!(tag, u32::from(lamella_wire::image_format::PRE_RELEASE | 1));
+    }
 
-        let mut module = Module::new();
-        let image = module.write_baked(None).expect("bake an empty module");
-
+    #[cfg(feature = "code-in-place")]
+    #[test]
+    fn an_image_whose_directory_holds_more_than_its_format_defines_is_refused() {
+        let image = Module::new().write_baked(None).expect("bake an empty module");
         let leaked: &'static [u8] = Box::leak(image.clone().into_boxed_slice());
-        assert!(Module::from_baked(leaked).is_ok(), "the unmodified image must load");
-
-        let header_words = word_at(&image, HEADER_WORD_COUNT_INDEX);
-        let directory_start = baked_directory_start(header_words).expect("directory offset");
-        let directory_len = word_at(&image, HEADER_DIRECTORY_LEN_INDEX) as usize;
-        let arena_len = word_at(&image, HEADER_ARENA_LEN_INDEX) as usize;
-        let directory = &image[directory_start..directory_start + directory_len];
-        let arena = &image[directory_start + directory_len..directory_start + directory_len + arena_len];
-
-        let mut extended = Vec::from(directory);
-        for word in [0xBDEu64, 2, 0xDEAD_BEEF, 7] {
-            image_push(&mut extended, word);
-        }
-        let mut grown = Vec::from(&image[..directory_start]);
-        grown.extend_from_slice(&extended);
-        grown.extend_from_slice(arena);
-        put_word(&mut grown, HEADER_DIRECTORY_LEN_INDEX, extended.len() as u64);
-        put_word(&mut grown, HEADER_CHECKSUM_INDEX, image_checksum(&extended, arena));
-
-        let leaked: &'static [u8] = Box::leak(grown.into_boxed_slice());
-        assert!(
-            Module::from_baked(leaked).is_ok(),
-            "appended directory columns must be SKIPPED, not fatal -- without this, B-device \
-             cannot be added after the v1 format freeze"
-        );
-
-        let mut gated = image.clone();
-        let claimed = 1u64 << 0;
-        assert_eq!(SUPPORTED_FEATURES & claimed, 0, "pick a bit this build does NOT implement");
-        put_word(&mut gated, HEADER_REQUIRED_FEATURES_INDEX, claimed);
-        let leaked: &'static [u8] = Box::leak(gated.into_boxed_slice());
-        match Module::from_baked(leaked) {
-            Err(BakeError::UnsupportedFeatures { required, unsupported }) => {
-                assert_eq!(required, claimed);
-                assert_eq!(unsupported, claimed, "the refusal must NAME the bit it cannot serve");
-            }
-            other => panic!(
-                "an image requiring an unimplemented feature must be refused BY NAME, got {:?}",
-                other.map(|_| "loaded")
-            ),
-        }
+        assert!(Module::from_baked(leaked).is_ok(), "the image as baked boots");
+        let longer = image_with_extra_directory_words(&image, &[0xBDE, 2, 0xDEAD_BEEF, 7]);
+        let leaked: &'static [u8] = Box::leak(longer.into_boxed_slice());
+        assert_eq!(Module::from_baked(leaked).err(), Some(BakeError::NotAnImage));
     }
 
     /// A board's bus table with two rows: I2C bus 0 of three words and SPI bus 1 of two.
@@ -9092,21 +9502,6 @@ mod tests {
         assert_eq!(baked.board_bus_length(2, 0), -1, "an image baked without a table has none");
     }
 
-    /// An image baked before the table existed holds no pair for it, and still boots: a board with
-    /// no buses, as an image baked today with no board named.
-    #[cfg(feature = "code-in-place")]
-    #[test]
-    fn an_image_baked_before_the_bus_table_boots_as_a_board_with_no_buses() {
-        let mut module = Module::new();
-        module.set_board_buses(&two_bus_table()).expect("a well-formed table");
-        let image = module.write_baked(None).expect("bake");
-        let older = image_without_trailing_tables(&image, 3);
-        let leaked: &'static [u8] = Box::leak(older.into_boxed_slice());
-        let (baked, _) = Module::from_baked(leaked).expect("an older image still boots");
-        assert_eq!(baked.board_bus_length(2, 0), -1);
-        assert_eq!(baked.board_bus_word(2, 0, 0), 0);
-    }
-
     /// A table this runtime cannot read refuses the image at boot, by name, even with its checksum
     /// intact -- a later layout version, here -- and a table the directory places outside the
     /// arena refuses it as no image at all.
@@ -9117,12 +9512,12 @@ mod tests {
         module.set_board_buses(&two_bus_table()).expect("a well-formed table");
         let image = module.write_baked(None).expect("bake");
         let word_at = |image: &[u8], index: usize| image_word(&image[8..], index).expect("header word");
-        let directory_start =
-            baked_directory_start(word_at(&image, HEADER_WORD_COUNT_INDEX)).expect("a whole header");
+        let directory_start = DIRECTORY_START;
         let directory_len = word_at(&image, HEADER_DIRECTORY_LEN_INDEX) as usize;
         let arena_start = directory_start + directory_len;
-        // The bus table precedes the event index and field storage table.
-        let pair_at = arena_start - 48;
+        // The bus table's pair is the sixth from the directory's end: the event index, the field
+        // storage table and the three slot tables follow it.
+        let pair_at = arena_start - 6 * 16;
         let table_offset = u64::from_le_bytes(image[pair_at..pair_at + 8].try_into().expect("8 bytes"));
         let resealed = |edit: &dyn Fn(&mut Vec<u8>)| {
             let mut image = image.clone();

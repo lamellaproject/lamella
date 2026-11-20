@@ -1,6 +1,6 @@
-# PARTS table for the stm32f7 family. Its `pins` lists are partial: each names the pins checked
-# against the datasheet's pinout, not the whole package, so a consumer must not read one as the
-# package. A pin that is not listed is refused rather than assumed.
+# PARTS table for the stm32f7 family. A part's `pins` list is its package's whole GPIO set, read
+# off the datasheet's ballout, and says so with `pins_complete`: a pin that is not listed is not
+# on the part, and is refused rather than assumed.
 #
 # ram: SRAM1 only. This part's RAM is three banks that happen to ABUT -- DTCM (64 KB) at
 # 0x20000000, SRAM1 (240 KB) at 0x20010000, SRAM2 (16 KB) at 0x2004C000, 320 KB in one unbroken
@@ -21,25 +21,12 @@ part = "stm32f746ng"
 package = "216-pin TFBGA"
 flash = 0x100000
 ram = 0x3C000
-source = "DS10916 Rev 5 ordering information (N = 216 pins, G = 1024 Kbytes flash, H = TFBGA) + RM0385 Rev 9 memory map (SRAM1 240 KB). The pin list is PARTIAL rather than the package's full set."
-# Every pin the family's map names, stated as same-port ranges where the run is contiguous. The
-# high ports are the interesting claim -- F, G, H and I exist only on the larger packages.
-#
-# Twenty-two of these are carried by the board's own documents.
-# UM1907 Table 6 assigns each of them to a numbered position of a board header, which is a claim
-# only a package that brings the pin out can support: a board cannot route a pad the part does not
-# have to a hole a shield plugs into. That is what carries port I, which no binding here reaches
-# and which no external memory on this board uses. Twenty of the twenty-two are stated a third time
-# by that manual's own per-ball I/O assignment, Table 13; the two it does not carry are PB14 and
-# PB15, and its silence about them is not a contradiction of the table that names them.
+source = "DS10916 Rev 5 ordering information (N = 216 pins, G = 1024 Kbytes flash, H = TFBGA) + RM0385 Rev 9 memory map (SRAM1 240 KB). The pin list is the package's complete GPIO set, every pad DS10916 Rev 5 figure 18 (the STM32F74xNx TFBGA216 ballout) draws: ports A to J whole and PK0 to PK7, 168 pads, as many as the datasheet's features list gives the line at most ('up to 168 I/O ports with interrupt capability'). UM1907 Table 6 assigns pads of ports A, B, C, F, G, H and I to the board's Arduino connectors, each among the pads listed here."
+# The package's WHOLE general-purpose I/O set: every pad figure 18 draws, so a pin missing here is
+# missing from the part.
 pins = [
-    "PA0", "PA8-PA9", "PA15",
-    "PB2", "PB4", "PB6-PB9", "PB14-PB15",
-    "PC3", "PC6-PC7",
-    "PD0-PD1", "PD8-PD15",
-    "PE0-PE2", "PE7-PE15",
-    "PF0-PF15",
-    "PG0-PG1", "PG4-PG8", "PG15",
-    "PH3", "PH5-PH8",
-    "PI0-PI3",
+    "PA0-PA15", "PB0-PB15", "PC0-PC15", "PD0-PD15", "PE0-PE15", "PF0-PF15", "PG0-PG15", "PH0-PH15", "PI0-PI15",
+    "PJ0-PJ15",
+    "PK0-PK7",
 ]
+pins_complete = true

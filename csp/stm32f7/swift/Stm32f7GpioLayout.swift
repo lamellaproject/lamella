@@ -14,6 +14,12 @@ public enum Stm32f7GpioLayout {
     public static let OSPEEDR_WIDTH: Int32 = 32
     public static let PUPDR_OFF: UInt32 = 0xC
     public static let PUPDR_WIDTH: Int32 = 32
+    public static let IDR_OFF: UInt32 = 0x10
+    public static let IDR_WIDTH: Int32 = 32
+    public static let ODR_OFF: UInt32 = 0x14
+    public static let ODR_WIDTH: Int32 = 32
+    public static let BSRR_OFF: UInt32 = 0x18
+    public static let BSRR_WIDTH: Int32 = 32
     public static let AFRL_OFF: UInt32 = 0x20
     public static let AFRL_WIDTH: Int32 = 32
     public static let AFRH_OFF: UInt32 = 0x24
@@ -30,8 +36,14 @@ public enum Stm32f7GpioLayout {
     public static let AFRH_AFSEL9_LSB: UInt32 = 4
 
     // -- block constants --
+    public static let MODER_MODE_INPUT: UInt32 = 0
+    public static let MODER_MODE_OUTPUT: UInt32 = 1
     public static let MODER_MODE_AF: UInt32 = 2
+    public static let MODER_MODE_ANALOG: UInt32 = 3
+    public static let MODER_MODE_RESET: UInt32 = 0
     public static let OTYPER_OPEN_DRAIN: UInt32 = 1
     public static let OSPEEDR_VERY_HIGH: UInt32 = 3
+    public static let PUPDR_NONE: UInt32 = 0
     public static let PUPDR_PULL_UP: UInt32 = 1
+    public static let PUPDR_PULL_DOWN: UInt32 = 2
 }

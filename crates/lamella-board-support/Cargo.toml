@@ -10,19 +10,31 @@ publish = false
 
 [features]
 # One board per build. On a bare-metal target exactly one must be selected, and the library then
-# defines the three symbols the runtime archive calls for that board. On the host every board's
+# defines the symbols the runtime archive calls for that board. On the host every board's
 # descriptor is compiled, so the tests read each board's real facts.
-board-raspberrypi-pico-2 = []
-board-raspberrypi-pico-2-w = []
-board-pimoroni-pico-plus-2 = []
-board-pimoroni-pico-plus-2-w = []
-board-adafruit-feather-rp2350-hstx = []
-board-adafruit-feather-rp2350-hstx-psram = []
-board-adafruit-metro-rp2350 = []
-board-adafruit-metro-rp2350-psram = []
-board-pimoroni-pico-lipo-2 = []
-board-pimoroni-pico-lipo-2-xl-w = []
-board-sparkfun-iot-redboard-rp2350 = []
+#
+# Each board selects its part family's half as well, and a bare-metal build compiles that family's
+# half and no other: the STM32 boards' builds are for Thumb-1, which has no compare-and-swap, and the
+# RP2350's half keeps its state with one. The STM32F7 and STM32U5 boards share their clock's half.
+rp2350 = []
+stm32f7 = []
+stm32u5 = []
+board-raspberrypi-pico-2 = ["rp2350"]
+board-raspberrypi-pico-2-w = ["rp2350"]
+board-pimoroni-pico-plus-2 = ["rp2350"]
+board-pimoroni-pico-plus-2-w = ["rp2350"]
+board-adafruit-feather-rp2350-hstx = ["rp2350"]
+board-adafruit-feather-rp2350-hstx-psram = ["rp2350"]
+board-adafruit-metro-rp2350 = ["rp2350"]
+board-adafruit-metro-rp2350-psram = ["rp2350"]
+board-pimoroni-pico-lipo-2 = ["rp2350"]
+board-pimoroni-pico-lipo-2-xl-w = ["rp2350"]
+board-sparkfun-iot-redboard-rp2350 = ["rp2350"]
+# The STM32 boards, whose startup starts the board's millisecond clock on TIM5, the NUCLEO-U5A5ZJ-Q's
+# after validating its VDDIO2 rail. Their images' console is the ring a debug probe reads.
+board-st-nucleo-u5a5zj-q = ["stm32u5"]
+board-st-stm32f746g-disco = ["stm32f7"]
+board-st-stm32f769i-disco = ["stm32f7"]
 
 [dependencies]
 # The bring-up of a QSPI PSRAM a board fits: the part's facts, the window's timing, the RP2350's

@@ -261,6 +261,13 @@ impl<'d, 'b, B: UsbBus> UsbCarrier<'d, 'b, B> {
         self.configured
     }
 
+    /// Services the device as a poll does, and keeps what arrives: a frame that comes in meanwhile is
+    /// returned by the next [`Transport::poll`], not here. For a firmware waiting on the link, for
+    /// the endpoint to take what it is sending.
+    pub fn service(&mut self) {
+        self.pump();
+    }
+
     /// Service the device (enumeration + endpoint events) and drain every pending bulk OUT
     /// packet into the frame reader.
     fn pump(&mut self) {
@@ -320,6 +327,13 @@ impl<B: UsbBus> Transport for UsbCarrier<'_, '_, B> {
     fn poll(&mut self) -> Result<Option<Frame>, TransportError> {
         self.pump();
         Ok(self.reader.next_frame())
+    }
+
+    /// The largest payload the protocol carries. The host sends a bulk OUT packet only when the
+    /// endpoint has taken the last one, so a frame of any length arrives whole however long the
+    /// firmware is busy, and the reader assembles any length a header can state.
+    fn max_inbound_payload(&self) -> Option<usize> {
+        Some(lamella_wire::MAX_PAYLOAD)
     }
 
     /// The first packet is the probe. If the endpoint will not take it, nothing has been written

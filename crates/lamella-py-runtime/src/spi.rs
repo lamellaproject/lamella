@@ -108,7 +108,9 @@ pub(crate) enum SpiConfigError {
 }
 
 /// The per-instance registers the sim needs to model a transfer (the data register, the status
-/// shape), plus the sim's ready facts. The full bring-up lives in the board's `spi_open_ops`.
+/// shape), plus the sim's ready facts, compiled only off the device, where the sim runs. The full
+/// bring-up lives in the board's `spi_open_ops`.
+#[cfg(not(target_os = "none"))]
 pub(crate) struct SpiFacts {
     /// The data register: a write pushes one TX byte; a read pops the full-duplex reply.
     pub data_reg: u32,
@@ -136,7 +138,8 @@ impl crate::gpio::Board {
         }
     }
 
-    /// The per-op register facts for `instance`, or `None` when this board has no SPI arm.
+    /// The sim's register facts for `instance`, or `None` when this board has no SPI arm.
+    #[cfg(not(target_os = "none"))]
     pub(crate) fn spi_facts(self, instance: u32) -> Option<SpiFacts> {
         match self {
             crate::gpio::Board::Rp2350 if instance == 0 => Some(spi_rp2350::facts()),

@@ -146,7 +146,7 @@ fn check_inst(
                 expect(MirType::I32, r, errors);
             }
         }
-        Inst::TypeName { descriptor } => {
+        Inst::TypeName { descriptor } | Inst::TypeObject { descriptor } => {
             use_value(func, defined, *descriptor, errors);
             if let Some(rt) = result_ty {
                 expect(MirType::ObjectRef, rt, errors);

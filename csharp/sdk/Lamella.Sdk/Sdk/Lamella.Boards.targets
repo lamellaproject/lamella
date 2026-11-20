@@ -165,18 +165,22 @@ public sealed class LamellaCheckBoard : Task
           Condition="'@(LamellaFlashRegion)' != ''">
     <PropertyGroup>
       <_LamellaRegionFilesFile>$(_LamellaIntermediateDir)lamella.regions.proj</_LamellaRegionFilesFile>
-      <_LamellaRegionOptions>@(LamellaFlashRegion->'--region &quot;%(FullPath)&quot;', ' ')</_LamellaRegionOptions>
-      <_LamellaRegionOptions Condition="'$(LamellaTargetBoard)' != ''">--board &quot;$(LamellaTargetBoard)&quot; $(_LamellaRegionOptions)</_LamellaRegionOptions>
       <_LamellaRegionsExit>-1</_LamellaRegionsExit>
     </PropertyGroup>
+    <ItemGroup>
+      <_LamellaRegionsArgument Include="flash" />
+      <_LamellaRegionsArgument Include="$(_LamellaRegionFilesFile)" Option="--msbuild-regions" />
+      <_LamellaRegionsArgument Include="$(LamellaTargetBoard)" Option="--board" Condition="'$(LamellaTargetBoard)' != ''" />
+      <_LamellaRegionsArgument Include="@(LamellaFlashRegion->'%(FullPath)')" Option="--region" />
+    </ItemGroup>
     <MakeDir Directories="$(_LamellaIntermediateDir)" />
     <Delete Files="$(_LamellaRegionFilesFile)" />
-    <Exec Command="&quot;$(_LamellaTool)&quot; flash --msbuild-regions &quot;$(_LamellaRegionFilesFile)&quot; $(_LamellaRegionOptions)"
-          IgnoreExitCode="true" IgnoreStandardErrorWarningFormat="true" ConsoleToMSBuild="true"
-          EchoOff="true" StandardOutputImportance="low" StandardErrorImportance="low">
+    <LamellaRunProgram Program="$(_LamellaTool)" Arguments="@(_LamellaRegionsArgument)"
+                       IgnoreExitCode="true" IgnoreStandardErrorWarningFormat="true" ConsoleToMSBuild="true"
+                       EchoOff="true" StandardOutputImportance="low" StandardErrorImportance="low">
       <Output TaskParameter="ExitCode" PropertyName="_LamellaRegionsExit" />
       <Output TaskParameter="ConsoleOutput" ItemName="_LamellaRegionsOutput" />
-    </Exec>
+    </LamellaRunProgram>
     <PropertyGroup Condition="'$(_LamellaRegionsExit)' != '0'">
       <_LamellaRegionsFailure>@(_LamellaRegionsOutput, '%0A')</_LamellaRegionsFailure>
       <_LamellaRegionsFailure Condition="'$(_LamellaRegionsFailure)' == ''">The board's flash regions could not be checked (exit code $(_LamellaRegionsExit)).</_LamellaRegionsFailure>

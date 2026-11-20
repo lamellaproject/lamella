@@ -106,6 +106,9 @@ corlib-lazy = ["flash-image"]
 
 [dev-dependencies]
 lamella-pe = { path = "../lamella-pe" }
+# The answer a board gives at boot to an image of another format, which the committed-image test
+# compares a refusal with.
+lamella-wire = { path = "../lamella-wire" }
 # The FAT backend (with the mkfs formatter) -- so a test can install a real RAM-disk StorageProvider
 # (MemoryBlockDevice + format + FatFs) and prove the mount-provider seam end to end over a real fs.
 lamella-fs-fat = { path = "../lamella-fs-fat", features = ["format"] }

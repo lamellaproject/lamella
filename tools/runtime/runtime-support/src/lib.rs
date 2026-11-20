@@ -52,7 +52,10 @@ pub use lamella_runtime_support_debug as debug_support;
     feature = "board-adafruit-metro-rp2350-psram",
     feature = "board-pimoroni-pico-lipo-2",
     feature = "board-pimoroni-pico-lipo-2-xl-w",
-    feature = "board-sparkfun-iot-redboard-rp2350"
+    feature = "board-sparkfun-iot-redboard-rp2350",
+    feature = "board-st-nucleo-u5a5zj-q",
+    feature = "board-st-stm32f746g-disco",
+    feature = "board-st-stm32f769i-disco"
 ))]
 pub use lamella_board_support as board_support;
 
@@ -401,10 +404,10 @@ unsafe extern "C" {
 }
 
 /// The console ring's transcript size in bytes: 16 KiB on the RP2350, whose statics window is most
-/// of its RAM.
+/// of its RAM, and on a Thumb-1 board build that asks for it (`console-ring-16k`), an STM32 board's.
 #[cfg(all(feature = "console-memory", console_ring_16k))]
 const CONSOLE_RING_BYTES: usize = 16 * 1024;
-/// The console ring's transcript size in bytes on every other part. On a micro:bit the link lays the
+/// The console ring's transcript size in bytes on every other build. On a micro:bit the link lays the
 /// ring among the program's statics and this archive's own, and the heap takes the RAM they leave, so
 /// every byte the ring keeps is a byte the heap does not have.
 #[cfg(all(feature = "console-memory", not(console_ring_16k)))]
@@ -1932,15 +1935,15 @@ pub extern "C" fn lamella_sched_demo() -> u32 {
 }
 
 
-/// A board's monotonic millisecond counter, supplied by the IMAGE.
-///
-/// A board's timebase is a board fact -- which timer peripheral, what tick rate, which prescaler --
-/// and this archive is built once per ISA for every board, so it cannot name one. Under
-/// `clock-board` the image supplies this symbol and every timed operation here reads it. Selecting
-/// the feature without providing it fails the LINK, which is the loud failure: the alternative is an
-/// image whose `Thread.Sleep` returns at once and reports nothing.
 #[cfg(feature = "clock-board")]
 unsafe extern "C" {
+    /// A board's monotonic millisecond counter, supplied by the IMAGE.
+    ///
+    /// A board's timebase is a board fact -- which timer peripheral, what tick rate, which
+    /// prescaler -- and this archive is built once per ISA for every board, so it cannot name one.
+    /// Under `clock-board` the image supplies this symbol and every timed operation here reads it.
+    /// Selecting the feature without providing it fails the LINK, which is the loud failure: the
+    /// alternative is an image whose `Thread.Sleep` returns at once and reports nothing.
     fn lamella_board_now_ms() -> u64;
 }
 

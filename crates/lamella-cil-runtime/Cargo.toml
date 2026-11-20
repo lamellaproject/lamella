@@ -43,6 +43,10 @@ lamella-pin-events = { path = "../lamella-pin-events" }
 # the decimal kernel, for the same reason: the bake, the AOT link and both runtime-support archives
 # read the same table, and one reading is the only way they agree.
 lamella-board-buses = { path = "../lamella-board-buses" }
+# An image's format number (the pre-release flag and a count) and the answer a board gives at boot to
+# an image of another format: one place for every runtime, firmware and host. A leaf with no
+# dependencies.
+lamella-wire = { path = "../lamella-wire" }
 # Accurate no_std transcendental math (sqrt/sin/cos/pow/log/exp), behind `math-transcendental`.
 # A MUSL/fdlibm port (the accurate option; a fast/approximate alternative is a future knob).
 libm = { version = "0.2.16", optional = true }

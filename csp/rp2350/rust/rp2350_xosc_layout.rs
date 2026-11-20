@@ -11,6 +11,8 @@ pub const STATUS_OFF: u32 = 0x4;
 pub const STATUS_WIDTH: i32 = 32;
 pub const STARTUP_OFF: u32 = 0xC;
 pub const STARTUP_WIDTH: i32 = 32;
+pub const COUNT_OFF: u32 = 0x10;
+pub const COUNT_WIDTH: i32 = 32;
 
 /// -- fields: <REG>_<FIELD> = the shifted mask; _LSB = the shift --
 pub const CTRL_FREQ_RANGE: u32 = 0xFFF;
@@ -21,6 +23,8 @@ pub const STATUS_STABLE: u32 = 0x80000000;
 pub const STATUS_STABLE_LSB: u32 = 31;
 pub const STARTUP_DELAY: u32 = 0x3FFF;
 pub const STARTUP_DELAY_LSB: u32 = 0;
+pub const COUNT_COUNT: u32 = 0xFFFF;
+pub const COUNT_COUNT_LSB: u32 = 0;
 
 /// -- block constants --
 pub const CTRL_ENABLE_MAGIC: u32 = 0xFAB;

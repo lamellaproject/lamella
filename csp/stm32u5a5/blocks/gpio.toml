@@ -112,11 +112,23 @@ fields = { }
 notes = "Secure configuration, one bit per pin. Governs nothing while TZEN is 0."
 
 # MODER field values (13.4.1). MODER_MODE_AF is the name the shared STM32 uart resolver reads.
+#
+# MODER_MODE_RESET is the mode a pin leaves reset in, for every pin outside the debug port: 13.4.1
+# gives MODER's reset value on this sub-group as 0xFFFF FFFF for ports C to I, and 11 in each of
+# port J's twelve fields, and its field description names 11, analog mode, the reset state. A GPIO
+# driver returns a closed pin to it, so a pin a program closes is in the state a pin no program
+# touched is in: analog, its input buffer off.
+#
+# PUPDR's three codes are 13.4.4's: 00 no pull-up or pull-down, 01 pull-up, 10 pull-down, and 11
+# reserved.
 [constants]
 MODER_MODE_INPUT = 0
 MODER_MODE_OUTPUT = 1
 MODER_MODE_AF = 2
 MODER_MODE_ANALOG = 3
+MODER_MODE_RESET = 3
 OTYPER_OPEN_DRAIN = 1
 OSPEEDR_VERY_HIGH = 3
+PUPDR_NONE = 0
 PUPDR_PULL_UP = 1
+PUPDR_PULL_DOWN = 2

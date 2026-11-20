@@ -41,6 +41,21 @@ const LINKED_TARGETS: &[LinkedTarget] = &[
         triple: "thumbv8m.main-none-eabi",
         per_board: true,
     },
+    LinkedTarget {
+        aot_target: "stm32f746",
+        triple: "thumbv6m-none-eabi",
+        per_board: true,
+    },
+    LinkedTarget {
+        aot_target: "stm32f769",
+        triple: "thumbv6m-none-eabi",
+        per_board: true,
+    },
+    LinkedTarget {
+        aot_target: "stm32u5a5",
+        triple: "thumbv6m-none-eabi",
+        per_board: true,
+    },
 ];
 
 /// The archive file name, which is the staticlib's own and is the same for every ARM triple.
@@ -73,7 +88,8 @@ pub fn per_board(aot_target: &str) -> bool {
     row_for(aot_target).is_some_and(|row| row.per_board)
 }
 
-/// Every `aot_target` the tier covers, for a refusal that has to list them.
+/// Every `aot_target` the tier covers.
+#[cfg(test)]
 pub fn targets() -> impl Iterator<Item = &'static str> {
     LINKED_TARGETS.iter().map(|row| row.aot_target)
 }
@@ -691,8 +707,8 @@ mod tests {
             .collect();
         assert_eq!(
             boards.len(),
-            13,
-            "the eleven RP2350 boards and the two micro:bits take a board build: {boards:?}"
+            16,
+            "the eleven RP2350 boards, the two micro:bits and the three STM32 boards take a board build: {boards:?}"
         );
         for board in boards {
             let feature = board_feature(board);
@@ -701,6 +717,60 @@ mod tests {
                     .lines()
                     .any(|line| line.trim_start().starts_with(&format!("{feature} = ["))),
                 "the runtime-support manifest declares {feature}"
+            );
+        }
+    }
+
+    /// **AN STM32 BOARD's BUILD KEEPS THE 16 KiB CONSOLE RING.** Its archive is built for Thumb-1,
+    /// where the ring is 256 bytes unless the build asks for more, so every board build on an STM32
+    /// row selects `console-ring-16k`: a program that prints more than 256 bytes before a probe reads
+    /// the ring would otherwise lose its start.
+    #[test]
+    fn the_stm32_boards_builds_keep_the_16_kib_console_ring() {
+        let manifest = include_str!("../../../tools/runtime/runtime-support/Cargo.toml");
+        let boards: Vec<&str> = lamella_flash_routes::PROGRAMMING
+            .iter()
+            .filter(|route| route.aot_target.is_some_and(|target| target.starts_with("stm32")))
+            .filter(|route| route.aot_target.and_then(row_for).is_some_and(|row| row.per_board))
+            .map(|route| route.board)
+            .collect();
+        assert_eq!(boards.len(), 3, "the F769, the F746 and the U5A5 take a board build: {boards:?}");
+        for board in boards {
+            let feature = board_feature(board);
+            let line = manifest
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with(&format!("{feature} = [")))
+                .unwrap_or_else(|| panic!("the runtime-support manifest declares {feature}"));
+            assert!(line.contains("\"console-ring-16k\""), "{feature} keeps the 16 KiB ring: {line}");
+        }
+    }
+
+    /// **AN STM32 BOARD's BUILD KEEPS A CLOCK.** Each board build on an STM32 row selects
+    /// `clock-board` and compiles its board's half, whose startup starts the board's millisecond
+    /// counter and which answers `lamella_board_now_ms`. Without them the image has no clock:
+    /// `Thread.Sleep` returns at once, and `Environment.TickCount64` and `Stopwatch` read 0.
+    #[test]
+    fn the_stm32_boards_builds_keep_a_clock() {
+        let manifest = include_str!("../../../tools/runtime/runtime-support/Cargo.toml");
+        let boards: Vec<&str> = lamella_flash_routes::PROGRAMMING
+            .iter()
+            .filter(|route| route.aot_target.is_some_and(|target| target.starts_with("stm32")))
+            .filter(|route| route.aot_target.and_then(row_for).is_some_and(|row| row.per_board))
+            .map(|route| route.board)
+            .collect();
+        assert_eq!(boards.len(), 3, "the F769, the F746 and the U5A5 take a board build: {boards:?}");
+        for board in boards {
+            let feature = board_feature(board);
+            let line = manifest
+                .lines()
+                .map(str::trim)
+                .find(|line| line.starts_with(&format!("{feature} = [")))
+                .unwrap_or_else(|| panic!("the runtime-support manifest declares {feature}"));
+            assert!(line.contains("\"clock-board\""), "{feature} keeps a clock: {line}");
+            assert!(
+                line.contains(&format!("\"lamella-board-support/{feature}\"")),
+                "{feature} compiles its board's half, which answers the clock: {line}"
             );
         }
     }

@@ -266,7 +266,8 @@ pub fn live_intervals(func: &Function, live: &Liveness) -> Vec<Interval> {
                 }
                 Inst::InterfaceHasTag { descriptor, .. }
                 | Inst::DescriptorWord { descriptor, .. }
-                | Inst::TypeName { descriptor } => {
+                | Inst::TypeName { descriptor }
+                | Inst::TypeObject { descriptor } => {
                     mark(&mut lo, &mut hi, &mut defined, *descriptor, ip);
                 }
                 Inst::InterfaceHasArrayElementTag {
@@ -687,7 +688,8 @@ pub(crate) fn each_inst_use(inst: &Inst, mut f: impl FnMut(ValueId)) {
         Inst::LoadTypeDesc { object } | Inst::NullCheck { object } => f(*object),
         Inst::InterfaceHasTag { descriptor, .. }
         | Inst::DescriptorWord { descriptor, .. }
-        | Inst::TypeName { descriptor } => f(*descriptor),
+        | Inst::TypeName { descriptor }
+        | Inst::TypeObject { descriptor } => f(*descriptor),
         Inst::InterfaceHasArrayElementTag {
             descriptor,
             array_descriptor,

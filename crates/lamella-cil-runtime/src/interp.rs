@@ -3,10 +3,10 @@
 #[cfg(feature = "bcl")]
 use crate::intrinsic_registry::intrinsic_id;
 use crate::module::{
-    CastElem, CastPrim, FieldOffsets, IntrinsicType, MethodId, MethodKind, Module, TypeId,
+    CastElem, CastPrim, FieldOffsets, IntrinsicType, MethodId, MethodKind, Module, SlotKind, TypeId,
     asm_key,
 };
-use crate::object::{Heap, ObjectRef};
+use crate::object::{Heap, ObjectRef, PrimKind};
 use crate::trap::{Trap, UnhandledException};
 use crate::value::{Location, Value};
 use alloc::borrow::Cow;
@@ -1626,6 +1626,7 @@ impl Vm {
     /// storage at all, so a `TypeInitializationException` the VES mints cannot assign the
     /// `_innerException` field a managed constructor would have. Without this the wrapper's
     /// `InnerException` reads null, which is a divergence from .NET in a BCL class.
+    #[cfg(feature = "exceptions")]
     pub(crate) fn set_exception_inner(&mut self, exception: ObjectRef, inner: ObjectRef) {
         self.exception_inners.insert(exception, inner);
     }
@@ -2140,6 +2141,8 @@ enum Flow {
         /// The triggering opcode, so a narrow `ldind.i1`/`u1`/`i2`/`u2` re-narrows the loaded value
         /// to its width (truncate + sign/zero-extend). `Ldobj` and the wide `ldind`s are no-ops.
         opcode: Opcode,
+        /// The type `ldobj` names; `Token(0)` for an `ldind`.
+        token: Token,
     },
     /// `stobj`: store a value-type instance through a managed pointer to `location`.
     StoreObj {
@@ -2147,6 +2150,10 @@ enum Flow {
         location: Location,
         /// The value to store.
         value: Value,
+        /// The instruction storing it: `stobj`, or the `stind.<type>` whose width the store has.
+        opcode: Opcode,
+        /// The type `stobj` names; `Token(0)` for a `stind`.
+        token: Token,
     },
     /// `cpobj`: copy the value-type instance at `src` to `dest` (both managed pointers).
     CopyObj {
@@ -2278,14 +2285,6 @@ pub fn run_method(body: &MethodBodyImage, args: Vec<Value>) -> Result<Option<Val
     }
 }
 
-/// Runs `entry` in `module` with `args`, following static calls, and returns the
-/// value the entry method ultimately returns. This is [`Session::run`] without
-/// stopping at breakpoints.
-///
-/// # Errors
-/// Returns a [`Trap`] as [`run_method`] does, plus [`Trap::UnresolvedCall`] for a
-/// call token that names no method and [`Trap::CallStackOverflow`] for runaway
-/// recursion.
 /// The cooperative scheduler's deterministic time slice: a thread is preempted after this many CIL
 /// instructions in a multi-threaded run (checked at every interp instruction boundary, which is a GC
 /// safe point). Op-count, not wall-clock, so interleavings reproduce host-and-device. K in the
@@ -2632,17 +2631,6 @@ impl Watching {
     }
 }
 
-/// Runs `module`'s `entry` (with `args`) to completion, returning its result.
-///
-/// Execution is driven by a COOPERATIVE green-thread scheduler: the entry is thread 0 (the main
-/// thread), and a `Thread.Start` spawns another thread as a fresh [`Session`] (a thread IS a reified
-/// session). The scheduler steps the running thread until it finishes or reaches a yield point
-/// (`Thread.Yield` / `Sleep` / `Join`, signalled via the [`Vm`]'s thread-op channel), then picks the
-/// next runnable thread. With a single thread -- the common case, and every program that spawns none
-/// -- the loop reduces to running thread 0 to completion, exactly as before.
-///
-/// # Errors
-/// Propagates a [`Trap`] from any thread's execution.
 /// Installs the wall clock through the MANAGED setter -- `Lamella.Runtime.Clock::SetTicks(long)` --
 /// and notifies the embedder's wall-clock sink. `false` when the loaded module declares no such
 /// setter, which is every module that carries no corlib.
@@ -2765,6 +2753,25 @@ pub fn wall_clock_source(module: &Module, vm: &mut Vm) -> Option<i32> {
     }
 }
 
+/// Runs `module`'s `entry` (with `args`) to completion, returning its result: [`run_serviced`]
+/// with no service callback.
+///
+/// Execution is driven by a green-thread scheduler: the entry is thread 0 (the main thread), and a
+/// `Thread.Start` spawns another thread as a fresh [`Session`] (a thread is a reified session). The
+/// scheduler steps the running thread until it finishes, reaches a yield point (`Thread.Yield` /
+/// `Sleep` / `Join`, a contended lock, a blocking socket, signalled through the [`Vm`]'s thread-op
+/// channel) or, while another thread is live, spends its time slice of CIL instructions; then it
+/// picks the next runnable thread. With a single thread -- the common case, and every program that
+/// spawns none -- the loop reduces to running thread 0 to completion.
+///
+/// `Thread.Start`, `Sleep` and `Join` are the Base Class Library's (ECMA-335 6th ed IV.5.3; the
+/// members are specified in its CLILibraryTypes.xml): a started thread becomes ready to run, and
+/// `Sleep` and `Join` block the calling thread. `Thread.Yield` is .NET's, outside that library.
+///
+/// # Errors
+/// Propagates a [`Trap`] from any thread's execution, and returns [`Trap::StaticCtorsNotRun`] for
+/// an image whose static constructors run before its entry point when [`boot_baked`] has not run
+/// them. When a type's initializer may run is ECMA-335 6th ed I.8.9.5.
 pub fn run(
     module: &Module,
     vm: &mut Vm,
@@ -4116,6 +4123,7 @@ impl Session {
                     let mut args = args;
                     run_pending_cctor_nested(module, vm, method, frames, &mut args)?;
                     if !is_compare_exchange(module, method) {
+                        read_builtin_receiver(frames, vm, module, method, &mut args)?;
                         deref_byref_args_in_place(frames, vm, &mut args)?;
                     }
                     #[cfg(feature = "gc")]
@@ -4361,6 +4369,14 @@ impl Session {
                     let (address, storage) = stack_field_address(module, asm, field, slot, location, Opcode::Ldfld)?;
                     let bytes = stack_field_bytes(frames, module, &address, storage, Opcode::Ldfld)?;
                     decode_stack_field(module, storage, bytes, 0)?
+                } else if let Location::Element { array, index, byte_offset } = location
+                    && array_element_index(vm, array, index, byte_offset).is_none()
+                {
+                    return Err(Trap::Unsupported(Opcode::Ldfld));
+                } else if moved_off_a_whole_value(vm, &location)
+                    && !matches!(read_location_value(frames, vm, location.clone()), Some(Value::Struct(_)))
+                {
+                    return Err(Trap::Unsupported(Opcode::Ldfld));
                 } else {
                     read_field_at(frames, vm, location, slot)
                 };
@@ -4403,12 +4419,23 @@ impl Session {
                 Ok(Status::Running)
             }
             Flow::InitObj { location, kind } => {
-                let value = zero_of_type(module, module.type_id_of(asm, kind), asm_key(asm, kind.0));
+                let value = match declared_variable_kind(frames, module, &location) {
+                    // A local or an argument of a recorded number kind zeroes as that kind (ECMA-335 6th ed
+                    // III.4.5 and I.12.1.1.1): `initobj int32*` leaves the null pointer.
+                    Some(declared) if declared_slot_width(declared, crate::native_pointer_size() as usize).is_some() => {
+                        zero_of_slot_kind(declared)
+                    }
+                    _ => zero_of_type(module, module.type_id_of(asm, kind), asm_key(asm, kind.0)),
+                };
                 write_location_value(frames, vm, location, value)?;
                 Ok(Status::Running)
             }
-            Flow::LoadObj { location, opcode } => {
-                let value = narrow_loaded_int(read_byref(frames, vm, location, opcode)?, opcode);
+            Flow::LoadObj { location, opcode, token } => {
+                let (opcode, structure) = obj_access(frames, vm, module, asm, &location, opcode, token);
+                let value = match structure {
+                    Some(id) => load_struct_from_bytes(frames, vm, module, &location, id)?,
+                    None => typed_load(frames, vm, module, location, opcode)?,
+                };
                 frames
                     .get_mut(current)
                     .ok_or(Trap::StackUnderflow)?
@@ -4416,12 +4443,32 @@ impl Session {
                     .push(value);
                 Ok(Status::Running)
             }
-            Flow::StoreObj { location, value } => {
-                write_location_value(frames, vm, location, value)?;
+            Flow::StoreObj { location, value, opcode, token } => {
+                let (store, structure) = obj_access(frames, vm, module, asm, &location, opcode, token);
+                if let Some(id) = structure {
+                    store_struct_into_bytes(frames, vm, module, &location, id, &value)?;
+                    return Ok(Status::Running);
+                }
+                // A `stobj` that moves as a `stind` takes its value as that `stind` does in `step`.
+                let value = match (opcode, store) {
+                    (Opcode::Stobj, Opcode::StindI1 | Opcode::StindI2) => narrow_stored_int(value, store),
+                    (Opcode::Stobj, Opcode::StindR4 | Opcode::StindR8) => stored_at_instruction_width(value, store)?,
+                    _ => value,
+                };
+                if !store_into_declared_slot(frames, module, &location, store, &value)?
+                    && !store_into_packed_element(vm, &location, store, &value)?
+                    && !store_into_struct_variable(frames, module, &location, store, &value)?
+                    && !store_into_object_fields(vm, module, &location, store, &value)?
+                {
+                    let value = checked_whole_store(frames, vm, module, &location, store, stored_storage(module, asm, store, token), value)?;
+                    let value = stored_at_slot_kind(declared_variable_kind(frames, module, &location), value);
+                    write_location_value(frames, vm, location, value)?;
+                }
                 Ok(Status::Running)
             }
             Flow::CopyObj { dest, src } => {
                 let value = read_byref(frames, vm, src, Opcode::Cpobj)?;
+                let value = stored_at_slot_kind(declared_variable_kind(frames, module, &dest), value);
                 write_location_value(frames, vm, dest, value)?;
                 Ok(Status::Running)
             }
@@ -4481,30 +4528,66 @@ impl Session {
     }
 }
 
-/// The array element index a `Location::Element` addresses: its base `index` advanced by the
-/// raw `byte_offset` a pinned-array pointer accumulated (`fixed (int* p = arr)` then `p[i]`).
-/// The offset is a whole multiple of the element width for the indexing csc emits; with a
-/// zero offset (a plain `ldelema` pointer) this is just the base index. Falls back to the
-/// base index if the element width is unknown (an empty array -- not dereferenceable anyway).
-fn array_element_index(vm: &Vm, array: ObjectRef, index: usize, byte_offset: u32) -> usize {
+/// The array element index a `Location::Element` addresses as a whole element: its base `index` moved
+/// by the `byte_offset` a pinned-array pointer accumulated, forward or back ([`element_displacement`];
+/// `fixed (int* p = arr)` then `p[i]`, ECMA-334 2nd ed 25.6). With a zero offset (a plain `ldelema`
+/// pointer) this is the base index. `None` where the pointer was moved by a part of an element, or to
+/// before the first element or past any index: no element starts there, and a typed access through an
+/// array whose elements have bytes of their own is answered from those bytes before this is asked.
+/// `None` too for a moved pointer into an array whose element width is not known here (a rectangular
+/// array of structs): which element it reaches is not known, so none is answered for it.
+fn array_element_index(vm: &Vm, array: ObjectRef, index: usize, byte_offset: u32) -> Option<usize> {
     if byte_offset == 0 {
-        return index;
+        return Some(index);
     }
-    match vm.heap().array_element_width(array) {
-        Some(width) if width != 0 => index + (byte_offset as usize) / width,
-        _ => index,
+    let width = i64::try_from(vm.heap().array_element_width(array)?).ok().filter(|&width| width != 0)?;
+    let displacement = element_displacement(byte_offset);
+    if displacement % width != 0 {
+        return None;
     }
+    usize::try_from(i64::try_from(index).ok()?.checked_add(displacement / width)?).ok()
 }
 
 /// The UTF-16 code unit at `index` of a string's units, treating the position one past the
-/// last unit as the U+0000 terminator .NET guarantees after every string's character data
-/// (so `fixed (char* p = "")` reads '\0' and a terminator scan stops at the end); anything
-/// further is outside the pinned data.
+/// last unit as the U+0000 terminator after every pinned string's characters (ECMA-334 2nd ed
+/// 25.6: the pointer value `p + s.Length` of a fixed string always points to a null character), so
+/// `fixed (char* p = "")` reads '\0' and a terminator scan stops at the end; anything further is
+/// outside the pinned data.
 fn string_unit_at(units: &[u16], index: usize) -> Option<u16> {
     units
         .get(index)
         .copied()
         .or_else(|| (index == units.len()).then_some(0))
+}
+
+/// The byte at `offset` of a string's character data as a pinned pointer reaches it: its UTF-16 code
+/// units, each in the target's byte order (little-endian here, ECMA-335 6th ed I.12.6.3), then the
+/// U+0000 terminator .NET keeps after every string ([`string_unit_at`]). `None` past the terminator.
+fn string_byte_at(units: &[u16], offset: usize) -> Option<u8> {
+    string_unit_at(units, offset / 2).map(|unit| unit.to_le_bytes()[offset % 2])
+}
+
+/// Reads with the `ldind.<type>` `opcode` through a pointer into a pinned string's character data
+/// ([`Location::StringChar`]): the instruction loads a value of its type from the address (ECMA-335 6th
+/// ed III.3.42), so it reads that many bytes of the code units from the pointer on ([`string_byte_at`]),
+/// inside one unit or across several: `((byte*)p)[1]` of `fixed (char* p = "\u0201")` reads 2, and
+/// `*(int*)p` of "AB" 0x00420041 (ECMA-334 2nd ed 25.4 and 25.6). A read past the terminator is
+/// refused. `None` for any other location and for an instruction with no width here.
+fn load_from_string_chars(vm: &Vm, location: &Location, opcode: Opcode) -> Result<Option<Value>, Trap> {
+    let Location::StringChar { string, byte_offset } = *location else {
+        return Ok(None);
+    };
+    let native = crate::native_pointer_size() as usize;
+    let Some(width) = indirect_width_at(opcode, native) else {
+        return Ok(None);
+    };
+    let units = vm.heap().as_string(string).ok_or(Trap::NullReference)?;
+    let mut raw = [0u8; 8];
+    for (index, byte) in raw.iter_mut().take(width).enumerate() {
+        *byte = string_byte_at(&units, (byte_offset as usize).checked_add(index).ok_or(Trap::Unsupported(opcode))?)
+            .ok_or(Trap::Unsupported(opcode))?;
+    }
+    stack_loaded_value_at(opcode, raw, native).map(Some)
 }
 
 /// The whole value at a managed-pointer `location` -- a frame local/arg, a heap
@@ -4520,9 +4603,7 @@ fn read_location_value(frames: &[Frame], vm: &Vm, location: Location) -> Option<
             array,
             index,
             byte_offset,
-        } => vm
-            .heap()
-            .array_get(array, array_element_index(vm, array, index, byte_offset)),
+        } => array_element_index(vm, array, index, byte_offset).and_then(|element| vm.heap().array_get(array, element)),
         Location::StringChar {
             string,
             byte_offset,
@@ -4548,7 +4629,8 @@ fn read_location_value(frames: &[Frame], vm: &Vm, location: Location) -> Option<
             slot,
             byte_offset: 0,
         } => read_location_value(frames, vm, Location::Arg { frame, slot }),
-        Location::LocalBytes { .. } | Location::ArgBytes { .. } => None,
+        Location::StaticBytes { slot, byte_offset: 0 } => read_location_value(frames, vm, Location::Static { slot }),
+        Location::LocalBytes { .. } | Location::ArgBytes { .. } | Location::StaticBytes { .. } => None,
     }
 }
 
@@ -4584,7 +4666,7 @@ fn write_location_value(
             index,
             byte_offset,
         } => {
-            let element = array_element_index(vm, array, index, byte_offset);
+            let element = array_element_index(vm, array, index, byte_offset).ok_or(Trap::Unsupported(Opcode::Stobj))?;
             vm.heap_mut()
                 .array_set(array, element, value)
                 .then_some(())
@@ -4621,9 +4703,24 @@ fn write_location_value(
             slot,
             byte_offset: 0,
         } => write_location_value(frames, vm, Location::Arg { frame, slot }, value),
-        Location::LocalBytes { .. } | Location::ArgBytes { .. } => {
+        Location::StaticBytes { slot, byte_offset: 0 } => write_location_value(frames, vm, Location::Static { slot }, value),
+        Location::LocalBytes { .. } | Location::ArgBytes { .. } | Location::StaticBytes { .. } => {
             Err(Trap::Unsupported(Opcode::Stobj))
         }
+    }
+}
+
+/// Whether `location` is a place a pointer was moved to where no whole value starts, or a field of one:
+/// an array element no element index names ([`array_element_index`]), or a variable or a static at a
+/// byte past its start.
+fn moved_off_a_whole_value(vm: &Vm, location: &Location) -> bool {
+    match location {
+        Location::Element { array, index, byte_offset } => array_element_index(vm, *array, *index, *byte_offset).is_none(),
+        Location::LocalBytes { byte_offset, .. } | Location::ArgBytes { byte_offset, .. } | Location::StaticBytes { byte_offset, .. } => {
+            *byte_offset != 0
+        }
+        Location::Nested { base, .. } => moved_off_a_whole_value(vm, base),
+        _ => false,
     }
 }
 
@@ -4722,10 +4819,7 @@ fn decode_stack_field(
         let mut raw = [0; 8];
         let destination = raw.get_mut(..bytes.len()).ok_or(Trap::Unsupported(Opcode::Ldfld))?;
         destination.copy_from_slice(bytes);
-        if storage == FieldStorage::Native && crate::native_pointer_size() == 4 {
-            return Ok(Value::NativeInt(i32::from_le_bytes(raw[..4].try_into().unwrap()) as i64));
-        }
-        return stack_loaded_value(load, raw);
+        return stack_loaded_value(load, raw).map_err(|_| Trap::Unsupported(Opcode::Ldfld));
     }
     let FieldStorage::ValueType(id) = storage else { return Err(Trap::Unsupported(Opcode::Ldfld)) };
     let layout = module.type_field_offsets(id).ok_or(Trap::Unsupported(Opcode::Ldfld))?;
@@ -4855,7 +4949,9 @@ fn read_utf16_through_pointer(
             index,
             byte_offset,
         } => {
-            let base = array_element_index(vm, *array, *index, *byte_offset) + start;
+            let base = array_element_index(vm, *array, *index, *byte_offset)
+                .and_then(|element| element.checked_add(start))
+                .ok_or(Trap::NullReference)?;
             if let Some(length) = length {
                 return vm
                     .heap()
@@ -4863,7 +4959,7 @@ fn read_utf16_through_pointer(
                     .ok_or(Trap::NullReference);
             }
             collect_units(
-                |index| match vm.heap().array_get(*array, base + index) {
+                |index| match base.checked_add(index).and_then(|at| vm.heap().array_get(*array, at)) {
                     Some(Value::Int32(unit)) => Some(unit as u16),
                     _ => None,
                 },
@@ -4875,8 +4971,14 @@ fn read_utf16_through_pointer(
             byte_offset,
         } => {
             let units = vm.heap().as_string(*string).ok_or(Trap::NullReference)?;
-            let base = *byte_offset as usize / 2 + start;
-            collect_units(|index| string_unit_at(&units, base + index), length)
+            let base = (*byte_offset as usize).checked_add(start.checked_mul(2).ok_or(Trap::NullReference)?).ok_or(Trap::NullReference)?;
+            collect_units(
+                |index| {
+                    let at = base.checked_add(index.checked_mul(2)?)?;
+                    Some(u16::from_le_bytes([string_byte_at(&units, at)?, string_byte_at(&units, at.checked_add(1)?)?]))
+                },
+                length,
+            )
         }
         _ => Err(Trap::TypeMismatch(Opcode::Newobj)),
     }
@@ -4905,14 +5007,13 @@ fn collect_units(
     }
 }
 
-/// Normalizes the value `stind.i1` / `stind.i2` stores through a byref to a VALUE slot (a local /
-/// argument / field -- NOT raw localloc memory, which takes the byte-accurate path). C# always
-/// pre-narrows with `conv.u1`/`conv.i1` (or the i2 pair) before the store, so the `int32` reaching
-/// the slot is ALREADY the final byte/short value -- signed for an sbyte/short, UNSIGNED for a
-/// byte/ushort, the `conv` having chosen. The slot is read back sign-AGNOSTICALLY (`ldloc` / `ldfld`
-/// / a value-slot `ldind` return it as-is), so the value must be PRESERVED here: re-narrowing cannot
-/// tell a byte from an sbyte and would corrupt an unsigned store -- `(byte)200` is `0xC8`, which must
-/// read back 200, not the sign-extended -56. A `NativeInt` collapses to the `int32` the slot holds.
+/// Normalizes the value `stind.i1` / `stind.i2` stores through a byref to a VALUE slot (a local, an
+/// argument, a field, a static -- NOT raw localloc memory, which takes the value's low bytes): a
+/// `NativeInt` collapses to the `int32` such a slot holds for a narrower integer (ECMA-335 6th ed
+/// I.12.1.2), and any other value is kept as it is. A local or an argument whose declared kind the
+/// loader recorded then takes only the instruction's low byte or two, as a store into a 1- or 2-byte
+/// location truncates to fit (ECMA-335 6th ed I.12.1.2 and III.3.62), and is read back by that kind
+/// ([`store_into_declared_slot`]); any other slot takes the value in place of its whole value.
 fn narrow_stored_int(value: Value, opcode: Opcode) -> Value {
     match (opcode, value) {
         (Opcode::StindI1 | Opcode::StindI2, Value::NativeInt(n)) => Value::Int32(n as i32),
@@ -4920,26 +5021,1618 @@ fn narrow_stored_int(value: Value, opcode: Opcode) -> Value {
     }
 }
 
-/// Re-narrows the value a `ldind.i1`/`u1`/`i2`/`u2` loaded from a VALUE slot (a local / argument /
-/// field) to the opcode's width: truncate to the low 8 / 16 bits, then sign-extend (`.i1`/`.i2`) or
-/// zero-extend (`.u1`/`.u2`). For values C# already pre-narrowed (`conv.u1` etc.) this is idempotent;
-/// it only changes a hand-written-IL store of a value wider than the width (e.g. `stind.i1` of `0x1FF`
-/// then `ldind.i1` -> -1). The wide `ldind`s and `ldobj` pass the value through unchanged.
-fn narrow_loaded_int(value: Value, opcode: Opcode) -> Value {
-    let truncated = |n: i32| match opcode {
-        Opcode::LdindI1 => i32::from(n as i8),
-        Opcode::LdindU1 => i32::from(n as u8),
-        Opcode::LdindI2 => i32::from(n as i16),
-        Opcode::LdindU2 => i32::from(n as u16),
-        _ => n,
+/// The value `stind.r4` or `stind.r8` stores through a byref to a VALUE slot: a float32 or a float64,
+/// as the instruction names it, a floating value being rounded from its native size to the size the
+/// instruction names (ECMA-335 6th ed III.3.62). Raw localloc memory takes the same widths in
+/// [`stack_stored_bytes`]. A value that is not floating is refused there and here, as correct CIL
+/// stores a value of the pointer's type (ECMA-335 6th ed III.3.62); on a build without floating point
+/// both instructions are refused, as ECMA-335 6th ed IV.4.1.1 leaves them unimplemented there. Every
+/// other store keeps its value.
+fn stored_at_instruction_width(value: Value, opcode: Opcode) -> Result<Value, Trap> {
+    match (opcode, value) {
+        #[cfg(feature = "float")]
+        (Opcode::StindR8, Value::Single(f)) => Ok(Value::Float(f64::from(f))),
+        #[cfg(feature = "float")]
+        (Opcode::StindR4, Value::Float(f)) => Ok(Value::Single(f as f32)),
+        #[cfg(feature = "float")]
+        (Opcode::StindR4 | Opcode::StindR8, value @ (Value::Single(_) | Value::Float(_))) => Ok(value),
+        #[cfg(feature = "float")]
+        (Opcode::StindR4 | Opcode::StindR8, _) => Err(Trap::TypeMismatch(opcode)),
+        #[cfg(not(feature = "float"))]
+        (Opcode::StindR4 | Opcode::StindR8, _) => Err(Trap::Unsupported(opcode)),
+        (_, value) => Ok(value),
+    }
+}
+
+/// The zero a local of declared kind `kind` starts as: with the localsinit flag a local is 0 of its
+/// integer type, 0.0 of its floating type and null for an object reference (ECMA-335 6th ed I.12.4.1
+/// and II.13.2), and a native int or unmanaged pointer the native int 0, the null pointer
+/// (I.12.1.1.1). A struct, or a kind the loader did not settle, starts as the int32 0 an unwritten
+/// slot reads as.
+fn zero_of_slot_kind(kind: SlotKind) -> Value {
+    match kind {
+        SlotKind::Primitive(PrimKind::I8) => Value::Int64(0),
+        #[cfg(feature = "float")]
+        SlotKind::Primitive(PrimKind::F4) => Value::Single(0.0),
+        #[cfg(feature = "float")]
+        SlotKind::Primitive(PrimKind::F8) => Value::Float(0.0),
+        SlotKind::Native => Value::NativeInt(0),
+        SlotKind::Reference | SlotKind::ByRef => Value::Null,
+        _ => Value::Int32(0),
+    }
+}
+
+/// `value` as a local or an argument of declared kind `kind` holds it: a floating value at the slot's
+/// floating width, and a null reference in a native int or pointer slot as the native int 0, the null
+/// pointer (an unmanaged pointer is a native unsigned int, ECMA-335 6th ed I.12.1.1.1). A local or an
+/// argument may hold a floating value wider than its type (I.12.1.3 and III.1.1.1); here it takes
+/// its declared width, so the variable's address reads its declared bytes. Any other value is kept.
+fn stored_at_slot_kind(kind: Option<SlotKind>, value: Value) -> Value {
+    match (kind, value) {
+        #[cfg(feature = "float")]
+        (Some(SlotKind::Primitive(PrimKind::F8)), Value::Single(f)) => Value::Float(f64::from(f)),
+        #[cfg(feature = "float")]
+        (Some(SlotKind::Primitive(PrimKind::F4)), Value::Float(f)) => Value::Single(f as f32),
+        (Some(SlotKind::Native), Value::Null) => Value::NativeInt(0),
+        (_, value) => value,
+    }
+}
+
+/// The width in bytes of a local or an argument of declared kind `kind`, where the slot holds a number
+/// this build can take apart into bytes: a primitive's width, or the target's native width for a native
+/// int or pointer (ECMA-335 6th ed I.12.1.1). `None` for any other kind.
+fn declared_slot_width(kind: SlotKind, native: usize) -> Option<usize> {
+    match kind {
+        #[cfg(not(feature = "float"))]
+        SlotKind::Primitive(PrimKind::F4 | PrimKind::F8) => None,
+        SlotKind::Primitive(kind) => Some(kind.byte_width()),
+        SlotKind::Native => Some(native),
+        _ => None,
+    }
+}
+
+/// The bits of `value` held in a slot of declared kind `kind`, little-endian at the kind's width: a
+/// narrow integer's low bytes (the slot holds it widened to int32, ECMA-335 6th ed I.12.1.2). `None`
+/// when the value is not that kind's representation.
+fn declared_slot_bits(kind: SlotKind, value: &Value) -> Option<u64> {
+    match (kind, value) {
+        (SlotKind::Primitive(PrimKind::I8), Value::Int64(n)) | (SlotKind::Native, Value::NativeInt(n)) => Some(*n as u64),
+        (SlotKind::Primitive(PrimKind::I1 | PrimKind::U1 | PrimKind::I2 | PrimKind::U2 | PrimKind::I4), Value::Int32(n)) => {
+            Some(u64::from(*n as u32))
+        }
+        #[cfg(feature = "float")]
+        (SlotKind::Primitive(PrimKind::F4), Value::Single(f)) => Some(u64::from(f.to_bits())),
+        #[cfg(feature = "float")]
+        (SlotKind::Primitive(PrimKind::F8), Value::Float(f)) => Some(f.to_bits()),
+        _ => None,
+    }
+}
+
+/// The value a slot of declared kind `kind` holds for the little-endian `bits` at its width: a
+/// narrow integer sign- or zero-extended to int32 as its type says (ECMA-335 6th ed I.12.1.2). A
+/// native int of four bytes with the top bit set is refused, as [`stack_loaded_value_at`] refuses it.
+fn declared_slot_value(kind: SlotKind, bits: u64, native: usize, opcode: Opcode) -> Result<Value, Trap> {
+    Ok(match kind {
+        SlotKind::Primitive(PrimKind::I1) => Value::Int32(i32::from(bits as u8 as i8)),
+        SlotKind::Primitive(PrimKind::U1) => Value::Int32(i32::from(bits as u8)),
+        SlotKind::Primitive(PrimKind::I2) => Value::Int32(i32::from(bits as u16 as i16)),
+        SlotKind::Primitive(PrimKind::U2) => Value::Int32(i32::from(bits as u16)),
+        SlotKind::Primitive(PrimKind::I4) => Value::Int32(bits as u32 as i32),
+        SlotKind::Primitive(PrimKind::I8) => Value::Int64(bits as i64),
+        #[cfg(feature = "float")]
+        SlotKind::Primitive(PrimKind::F4) => Value::Single(f32::from_bits(bits as u32)),
+        #[cfg(feature = "float")]
+        SlotKind::Primitive(PrimKind::F8) => Value::Float(f64::from_bits(bits)),
+        SlotKind::Native if native == 4 => {
+            let word = bits as u32;
+            if word & 0x8000_0000 != 0 {
+                return Err(Trap::Unsupported(opcode));
+            }
+            Value::NativeInt(i64::from(word))
+        }
+        SlotKind::Native => Value::NativeInt(bits as i64),
+        _ => return Err(Trap::Unsupported(opcode)),
+    })
+}
+
+/// Stores `value` with the `stind.<type>` `opcode` through a pointer to a local or an argument whose
+/// declared kind is a number ([`declared_slot_width`]), at the pointer's displacement inside the
+/// variable: the instruction stores a value of its type at the address (ECMA-335 6th ed III.3.62),
+/// so its bytes replace that many of the variable's bytes and the rest are kept --
+/// `*(byte*)&value = 0x7f` changes only `value`'s lowest-addressed byte (ECMA-334 2nd ed 25.4), and
+/// `*(float*)&bits = 1.0f` leaves `bits` holding the float's bits. A store that would run past the
+/// variable is refused. Returns whether it stored: a variable of any other kind, or one whose kinds
+/// the loader did not record, is left to the whole-value store.
+fn store_into_declared_slot(
+    frames: &mut [Frame],
+    module: &Module,
+    location: &Location,
+    opcode: Opcode,
+    value: &Value,
+) -> Result<bool, Trap> {
+    let (frame, slot, argument, displacement) = match *location {
+        Location::Local { frame, slot } => (frame, slot, false, 0),
+        Location::Arg { frame, slot } => (frame, slot, true, 0),
+        Location::LocalBytes { frame, slot, byte_offset } => (frame, slot, false, byte_offset as usize),
+        Location::ArgBytes { frame, slot, byte_offset } => (frame, slot, true, byte_offset as usize),
+        _ => return Ok(false),
     };
-    match opcode {
-        Opcode::LdindI1 | Opcode::LdindU1 | Opcode::LdindI2 | Opcode::LdindU2 => match value {
-            Value::Int32(n) => Value::Int32(truncated(n)),
-            Value::NativeInt(n) => Value::Int32(truncated(n as i32)),
-            other => other,
+    let native = crate::native_pointer_size() as usize;
+    let (Some(width), Some(owner)) = (indirect_width_at(opcode, native), frames.get_mut(frame)) else {
+        return Ok(false);
+    };
+    let kind = if argument {
+        module.method_arg_kind(owner.method, slot)
+    } else {
+        module.method_local_kind(owner.method, slot)
+    };
+    let Some((kind, declared)) = kind.and_then(|kind| Some((kind, declared_slot_width(kind, native)?))) else {
+        return Ok(false);
+    };
+    if displacement.checked_add(width).is_none_or(|end| end > declared) {
+        return Err(Trap::Unsupported(opcode));
+    }
+    let slots = if argument { &mut owner.args } else { &mut owner.locals };
+    let stored = stack_stored_bytes(opcode, value.clone()).map(u64::from_le_bytes);
+    let merged = if displacement == 0 && width == declared {
+        match stored {
+            // `stind.i` stores a native int into a native int or pointer variable as it is (ECMA-335 6th
+            // ed III.3.62 and I.12.1.1.1): a pointer, which has no bytes here, a null reference, which is
+            // the null pointer there, or a native int, which four bytes on a 4-byte target could not give
+            // back in the form it was stored in ([`stack_loaded_value_at`]).
+            _ if kind == SlotKind::Native && opcode == Opcode::StindI => stored_at_slot_kind(Some(kind), value.clone()),
+            // Any other full-width store puts the instruction's bytes there, which the variable holds as
+            // its declared kind: `*(long*)&p = 0L` leaves a pointer variable the native int 0.
+            Ok(bits) => declared_slot_value(kind, bits, native, opcode)?,
+            // A value that is not of the instruction's type is not correct CIL (III.3.62), and is
+            // refused, as the same store into `stackalloc` memory is.
+            Err(trap) => return Err(trap),
+        }
+    } else {
+        let stored = stored.map_err(|_| Trap::Unsupported(opcode))?;
+        let current = slots.get(slot).cloned().unwrap_or_else(|| zero_of_slot_kind(kind));
+        let bits = declared_slot_bits(kind, &current).ok_or(Trap::Unsupported(opcode))?;
+        let shift = displacement * 8;
+        let mask = if width >= 8 { u64::MAX } else { (1u64 << (width * 8)) - 1 };
+        declared_slot_value(kind, (bits & !(mask << shift)) | ((stored & mask) << shift), native, opcode)?
+    };
+    set_slot(slots, slot, merged);
+    Ok(true)
+}
+
+/// Reads with the `ldind.<type>` `opcode` through a pointer to a local or an argument whose declared
+/// kind is a number ([`declared_slot_width`]), at the pointer's displacement inside the variable: the
+/// instruction loads a value of its type from the address (ECMA-335 6th ed III.3.42), so it reads that
+/// many of the variable's declared bytes, which [`store_into_declared_slot`] and the stores of a local
+/// or an argument keep at the variable's declared kind. `((byte*)&negative)[1]` of an `int` holding -1
+/// reads 255, and `*(uint*)&d` of a `double` its low four bytes (ECMA-334 2nd ed 25.4, 25.5.3 and
+/// 25.5.6; the target's byte order, little-endian here, ECMA-335 6th ed I.12.6.3). A read that would run past the
+/// variable is refused. `None` where the variable has no such kind, or holds a value that is not its
+/// kind's (a managed pointer in a pointer variable), for [`load_from_slot`]'s read.
+fn load_from_declared_slot(frames: &[Frame], module: &Module, location: &Location, opcode: Opcode) -> Result<Option<Value>, Trap> {
+    let (frame, slot, argument, displacement) = match *location {
+        Location::Local { frame, slot } => (frame, slot, false, 0),
+        Location::Arg { frame, slot } => (frame, slot, true, 0),
+        Location::LocalBytes { frame, slot, byte_offset } => (frame, slot, false, byte_offset as usize),
+        Location::ArgBytes { frame, slot, byte_offset } => (frame, slot, true, byte_offset as usize),
+        _ => return Ok(None),
+    };
+    let native = crate::native_pointer_size() as usize;
+    let (Some(width), Some(owner)) = (indirect_width_at(opcode, native), frames.get(frame)) else {
+        return Ok(None);
+    };
+    let kind = if argument {
+        module.method_arg_kind(owner.method, slot)
+    } else {
+        module.method_local_kind(owner.method, slot)
+    };
+    let Some((kind, declared)) = kind.and_then(|kind| Some((kind, declared_slot_width(kind, native)?))) else {
+        return Ok(None);
+    };
+    let current = if argument { owner.args.get(slot) } else { owner.locals.get(slot) };
+    let Some((current, bits)) = current.and_then(|current| Some((current, declared_slot_bits(kind, current)?))) else {
+        return Ok(None);
+    };
+    if displacement.checked_add(width).is_none_or(|end| end > declared) {
+        return Err(Trap::Unsupported(opcode));
+    }
+    // A native int variable read whole as a native int is its own value: `ldind.i` loads the native int
+    // at the address (ECMA-335 6th ed III.3.42 and I.12.1.1), whatever form it was stored in
+    // ([`load_from_slot_at`]).
+    if kind == SlotKind::Native && opcode == Opcode::LdindI && displacement == 0 {
+        return Ok(Some(current.clone()));
+    }
+    stack_loaded_value_at(opcode, (bits >> (displacement * 8)).to_le_bytes(), native).map(Some)
+}
+
+/// The bytes pointer arithmetic moved a pointer to an array element by, forward or back: the walk keeps
+/// them wrapped in a 32-bit count ([`stack_pointer_arithmetic`]), so a step back of four bytes is
+/// 0xFFFFFFFC, and an array spans fewer than 2^31 bytes on every target this runs on.
+fn element_displacement(byte_offset: u32) -> i64 {
+    i64::from(byte_offset as i32)
+}
+
+/// The byte at which a pointer to element `index` of an array, moved `byte_offset` bytes on or back by
+/// pointer arithmetic ([`element_displacement`]), points into the array's elements, each `width` bytes
+/// wide; `None` before the first element or past the range an index can name.
+fn element_byte_position(index: usize, byte_offset: u32, width: usize) -> Option<usize> {
+    let start = i64::try_from(index.checked_mul(width)?).ok()?;
+    usize::try_from(start.checked_add(element_displacement(byte_offset))?).ok()
+}
+
+/// Reads with the `ldind.<type>` `opcode` through a pointer into an array whose elements are packed
+/// (of a primitive type): the instruction loads a value of its type from the address (ECMA-335 6th ed
+/// III.3.42), and the elements are contiguous (I.8.9.1, a rectangular array's in row-major order) in
+/// the target's byte order, little-endian on every target this runs on (I.12.6.3), so it reads that
+/// many of the array's bytes from the address, inside one element or across several:
+/// `((byte*)q)[1]` of an `int[] { 0x04030201 }` reads 2, and `*(int*)p` of a pinned `byte[] { 1, 2,
+/// 3, 4 }` 0x04030201 (ECMA-334 2nd ed 25.4 and 25.6). A read past the array is refused. `None` for any
+/// other location, and for `ldobj`, which names no width here. A packed array holds no object
+/// reference, so `ldind.ref` there reads the native int a pointer is (ECMA-335 6th ed I.12.1.1.1), as
+/// lcsc reads `*pp` of a `byte** pp` where csc uses `ldind.i`.
+fn load_from_packed_element(vm: &Vm, location: &Location, opcode: Opcode) -> Result<Option<Value>, Trap> {
+    let Location::Element { array, index, byte_offset } = *location else {
+        return Ok(None);
+    };
+    let opcode = if opcode == Opcode::LdindRef { Opcode::LdindI } else { opcode };
+    let native = crate::native_pointer_size() as usize;
+    let (Some(width), Some((bytes, element))) = (indirect_width_at(opcode, native), vm.heap().packed_array_bytes(array)) else {
+        return Ok(None);
+    };
+    let read = element_byte_position(index, byte_offset, element)
+        .and_then(|start| bytes.get(start..start.checked_add(width)?))
+        .ok_or(Trap::Unsupported(opcode))?;
+    let mut raw = [0u8; 8];
+    raw[..width].copy_from_slice(read);
+    stack_loaded_value_at(opcode, raw, native).map(Some)
+}
+
+/// Stores `value` with the `stind.<type>` `opcode` through a pointer into an array whose elements are
+/// packed: the instruction stores a value of its type at the address (ECMA-335 6th ed III.3.62), so
+/// its bytes replace that many of the array's bytes from the address and the rest are kept, inside
+/// one element or across several: `((byte*)q)[1] = 0xAA` into an `int[] { 0x12345678 }` leaves
+/// 0x1234AA78, and `*(int*)p = 0x04030201` into a pinned `byte[4]` leaves 1, 2, 3, 4. A store past the
+/// array is refused and changes nothing. Returns whether it stored: any other location, and `stobj`,
+/// are left to the whole-value store. `stind.ref` there stores the native int a pointer is, as
+/// [`load_from_packed_element`] reads it.
+fn store_into_packed_element(vm: &mut Vm, location: &Location, opcode: Opcode, value: &Value) -> Result<bool, Trap> {
+    let Location::Element { array, index, byte_offset } = *location else {
+        return Ok(false);
+    };
+    let opcode = if opcode == Opcode::StindRef { Opcode::StindI } else { opcode };
+    let native = crate::native_pointer_size() as usize;
+    let Some(width) = indirect_width_at(opcode, native) else {
+        return Ok(false);
+    };
+    let Some((bytes, element)) = vm.heap_mut().packed_array_bytes_mut(array) else {
+        return Ok(false);
+    };
+    let stored = stack_stored_bytes(opcode, value.clone())?;
+    let written = element_byte_position(index, byte_offset, element)
+        .and_then(|start| bytes.get_mut(start..start.checked_add(width)?))
+        .ok_or(Trap::Unsupported(opcode))?;
+    written.copy_from_slice(&stored[..width]);
+    Ok(true)
+}
+
+/// The local or argument `location` points into, at any displacement: `(frame, slot, argument,
+/// displacement)`.
+fn variable_location(location: &Location) -> Option<(usize, usize, bool, usize)> {
+    match *location {
+        Location::Local { frame, slot } => Some((frame, slot, false, 0)),
+        Location::Arg { frame, slot } => Some((frame, slot, true, 0)),
+        Location::LocalBytes { frame, slot, byte_offset } => Some((frame, slot, false, byte_offset as usize)),
+        Location::ArgBytes { frame, slot, byte_offset } => Some((frame, slot, true, byte_offset as usize)),
+        _ => None,
+    }
+}
+
+/// The declared kind of the variable `location` points into and its width, where the loader recorded a
+/// number kind for it ([`declared_slot_width`]).
+fn declared_number_variable(frames: &[Frame], module: &Module, location: &Location) -> Option<(SlotKind, usize)> {
+    let (frame, slot, argument, _) = variable_location(location)?;
+    let owner = frames.get(frame)?;
+    let kind = if argument { module.method_arg_kind(owner.method, slot) } else { module.method_local_kind(owner.method, slot) }?;
+    Some((kind, declared_slot_width(kind, crate::native_pointer_size() as usize)?))
+}
+
+/// A pointer into a local or an argument whose declared kind is a struct of a type the loader recorded
+/// ([`Module::method_local_struct_type`]): the variable, its type, the byte the pointer reaches inside
+/// it, and the storage of what the pointer points at there, where that is the variable itself or one of
+/// its fields (`None` for a byte pointer arithmetic reached).
+#[derive(Clone, Copy)]
+struct StructPointer {
+    frame: usize,
+    slot: usize,
+    argument: bool,
+    type_id: TypeId,
+    displacement: usize,
+    at: Option<crate::module::FieldStorage>,
+}
+
+/// The struct variable `location` points into ([`StructPointer`]), `method_of` naming the method each
+/// frame runs: the variable's own address, a byte pointer arithmetic moved it to, or the address of a
+/// field of it, or of a field of a struct field of it, at the byte the field starts at by the layout
+/// of the struct that declares it (ECMA-335 6th ed II.10.1.2). `None` for any other location.
+fn struct_pointer(module: &Module, method_of: &impl Fn(usize) -> Option<MethodId>, location: &Location) -> Option<StructPointer> {
+    use crate::module::FieldStorage;
+    if let Location::Nested { base, slot } = location {
+        let outer = struct_pointer(module, method_of, base)?;
+        let Some(FieldStorage::ValueType(owner)) = outer.at else {
+            return None;
+        };
+        let slot = *slot as usize;
+        let layout = module.type_field_offsets(owner).filter(|layout| slot < layout.slot_count())?;
+        let offset = usize::try_from(layout.offset_of(slot)?).ok()?;
+        let at = module.type_field_storage(owner, slot)?;
+        return Some(StructPointer { displacement: outer.displacement.checked_add(offset)?, at: Some(at), ..outer });
+    }
+    let (frame, slot, argument, displacement) = variable_location(location)?;
+    let method = method_of(frame)?;
+    let type_id = if argument { module.method_arg_struct_type(method, slot) } else { module.method_local_struct_type(method, slot) }?;
+    if holds_pointer_width(module, type_id, 0) {
+        return None;
+    }
+    Some(StructPointer {
+        frame,
+        slot,
+        argument,
+        type_id,
+        displacement,
+        at: (displacement == 0).then_some(FieldStorage::ValueType(type_id)),
+    })
+}
+
+/// The method each of `frames` runs, by its index, for [`struct_pointer`].
+fn method_of_frame(frames: &[Frame]) -> impl Fn(usize) -> Option<MethodId> + '_ {
+    move |index| frames.get(index).map(|frame| frame.method)
+}
+
+/// Whether every field of the value type `id`, and of each struct field in it, is a fixed-width number
+/// held as bytes here, so its bytes, laid out by its fields (ECMA-335 6th ed II.10.1.2), are its whole
+/// value. A field that is a reference is not; nor is a native int or a pointer, whose width, and so the
+/// offset of every field after it, is the loading host's (a 64-bit host bakes 8 where a 32-bit board's
+/// .NET lays out 4, I.12.1.1). `depth` bounds recursive metadata.
+fn has_byte_layout(module: &Module, id: TypeId, depth: usize) -> bool {
+    use crate::module::FieldStorage;
+    if depth >= MAX_STACK_FIELD_DEPTH {
+        return false;
+    }
+    let Some(layout) = module.type_field_offsets(id) else {
+        return false;
+    };
+    (0..layout.slot_count()).all(|slot| match module.type_field_storage(id, slot) {
+        Some(FieldStorage::Primitive(kind)) => kind.packable(),
+        Some(FieldStorage::ValueType(inner)) => has_byte_layout(module, inner, depth + 1),
+        _ => false,
+    })
+}
+
+/// Whether the value type `id`, or a struct field in it, has a field as wide as a pointer: a native int,
+/// a pointer or a reference (ECMA-335 6th ed I.12.1.1), whose width the loading host's layout took.
+/// `true` past `depth`'s bound, where nothing is known.
+fn holds_pointer_width(module: &Module, id: TypeId, depth: usize) -> bool {
+    use crate::module::FieldStorage;
+    if depth >= MAX_STACK_FIELD_DEPTH {
+        return true;
+    }
+    let slots = module.type_field_offsets(id).map_or(0, |layout| layout.slot_count());
+    (0..slots).any(|slot| match module.type_field_storage(id, slot) {
+        Some(FieldStorage::Native | FieldStorage::Reference) => true,
+        Some(FieldStorage::ValueType(inner)) => holds_pointer_width(module, inner, depth + 1),
+        _ => false,
+    })
+}
+
+/// The bytes of the struct variable `pointer` points into, laid out by its type's fields (ECMA-335 6th
+/// ed II.10.1.2) from the value it holds, where every field is a number ([`has_byte_layout`]); a struct
+/// local no store has reached holds the int32 0 a frame starts it at, and is zero bytes, as a local is
+/// with the localsinit flag (II.13.2). `None` for a type with a field that is not a number, and for a
+/// value holding one that has no bytes here (a field that points at a variable).
+fn struct_variable_bytes(frames: &[Frame], module: &Module, pointer: &StructPointer) -> Option<Vec<u8>> {
+    if !has_byte_layout(module, pointer.type_id, 0) {
+        return None;
+    }
+    let mut bytes = alloc::vec![0u8; module.type_field_offsets(pointer.type_id)?.end() as usize];
+    let owner = frames.get(pointer.frame)?;
+    match if pointer.argument { owner.args.get(pointer.slot) } else { owner.locals.get(pointer.slot) }? {
+        Value::Int32(0) => {}
+        value => encode_stack_field(module, crate::module::FieldStorage::ValueType(pointer.type_id), &mut bytes, value, 0).ok()?,
+    }
+    Some(bytes)
+}
+
+/// Leaves the struct variable `pointer` points into holding the struct `bytes` make, decoded by its
+/// type's field layout (ECMA-335 6th ed II.10.1.2). Bytes that make no value of the type are refused as
+/// `opcode`.
+fn set_struct_variable_bytes(frames: &mut [Frame], module: &Module, pointer: &StructPointer, bytes: &[u8], opcode: Opcode) -> Result<(), Trap> {
+    let storage = crate::module::FieldStorage::ValueType(pointer.type_id);
+    let value = decode_stack_field(module, storage, bytes, 0).map_err(|_| Trap::Unsupported(opcode))?;
+    let mut kept = alloc::vec![0u8; bytes.len()];
+    encode_stack_field(module, storage, &mut kept, &value, 0).map_err(|_| Trap::Unsupported(opcode))?;
+    if kept != bytes {
+        return Err(Trap::Unsupported(opcode));
+    }
+    let owner = frames.get_mut(pointer.frame).ok_or(Trap::Unsupported(opcode))?;
+    set_slot(if pointer.argument { &mut owner.args } else { &mut owner.locals }, pointer.slot, value);
+    Ok(())
+}
+
+/// Reads with the `ldind.<type>` `opcode` through a pointer into a struct variable whose fields are all
+/// numbers ([`struct_variable_bytes`]): the instruction loads a value of its type from the address
+/// (ECMA-335 6th ed III.3.42), so it reads that many of the struct's bytes from the pointer on, within
+/// one field or across several: `*(byte*)&s` of a `struct S { int X; }` holding 0x01020304 reads 4, and
+/// `*(int*)&s.a` of a `struct S { byte a, b, c, d; }` holding 1, 2, 3 and 4 reads 0x04030201 (ECMA-334
+/// 2nd ed 25.4 and 25.5.6; the target's byte order, little-endian here, ECMA-335 6th ed I.12.6.3). A
+/// read past the struct is refused. Such a struct holds no object reference, so `ldind.ref` there reads
+/// the native int a pointer is (I.12.1.1.1), as lcsc reads `*pp` of a `byte** pp`. `None` for any other
+/// location, for a struct holding a value with no bytes here, and for `ldobj`, which moves a value whole.
+fn load_from_struct_variable(frames: &[Frame], module: &Module, location: &Location, opcode: Opcode) -> Result<Option<Value>, Trap> {
+    let opcode = if opcode == Opcode::LdindRef { Opcode::LdindI } else { opcode };
+    let native = crate::native_pointer_size() as usize;
+    let Some(width) = indirect_width_at(opcode, native) else {
+        return Ok(None);
+    };
+    let Some(pointer) = struct_pointer(module, &method_of_frame(frames), location) else {
+        return Ok(None);
+    };
+    let Some(bytes) = struct_variable_bytes(frames, module, &pointer) else {
+        return Ok(None);
+    };
+    let read = bytes
+        .get(pointer.displacement..pointer.displacement.checked_add(width).ok_or(Trap::Unsupported(opcode))?)
+        .ok_or(Trap::Unsupported(opcode))?;
+    let mut raw = [0u8; 8];
+    raw[..width].copy_from_slice(read);
+    stack_loaded_value_at(opcode, raw, native).map(Some)
+}
+
+/// Stores `value` with the `stind.<type>` `opcode` through a pointer into a struct variable whose fields
+/// are all numbers ([`struct_variable_bytes`]): the instruction stores a value of its type at the address
+/// (ECMA-335 6th ed III.3.62), so its bytes replace that many of the struct's bytes from the pointer on
+/// and the rest are kept, and the variable holds the struct its bytes then make. A store past the struct
+/// is refused and changes nothing. Returns whether it stored: any other location, a struct holding a
+/// value with no bytes here, a value with none (a pointer to a variable), and `stobj` are left to the
+/// whole-value store. `stind.ref` there stores the native int a pointer is.
+fn store_into_struct_variable(frames: &mut [Frame], module: &Module, location: &Location, opcode: Opcode, value: &Value) -> Result<bool, Trap> {
+    let opcode = if opcode == Opcode::StindRef { Opcode::StindI } else { opcode };
+    let Some(width) = indirect_width_at(opcode, crate::native_pointer_size() as usize) else {
+        return Ok(false);
+    };
+    let Some(pointer) = struct_pointer(module, &method_of_frame(frames), location) else {
+        return Ok(false);
+    };
+    let (Some(mut bytes), Ok(stored)) = (struct_variable_bytes(frames, module, &pointer), stack_stored_bytes(opcode, value.clone())) else {
+        return Ok(false);
+    };
+    let end = pointer.displacement.checked_add(width).ok_or(Trap::Unsupported(opcode))?;
+    bytes.get_mut(pointer.displacement..end).ok_or(Trap::Unsupported(opcode))?.copy_from_slice(&stored[..width]);
+    set_struct_variable_bytes(frames, module, &pointer, &bytes, opcode)?;
+    Ok(true)
+}
+
+/// What an [`ObjectPointer`] points into.
+#[derive(Clone, Copy)]
+enum Holder {
+    /// A class instance's fields, numbered by the instance's type's layout.
+    Instance { object: ObjectRef, owner: TypeId },
+    /// A boxed struct's fields, numbered by the boxed type's layout.
+    Boxed { object: ObjectRef, owner: TypeId },
+    /// A static field's value, of the storage the loader recorded for it.
+    Static { slot: usize, storage: crate::module::FieldStorage },
+    /// The elements of an array of structs whose fields are all numbers ([`has_byte_layout`]): the
+    /// element type and the bytes its layout gives each element. The pointer's region is the array's.
+    Element { array: ObjectRef, owner: TypeId, stride: usize },
+}
+
+/// A pointer to a field of a heap object, a class instance's or a boxed struct's, to a static field or a
+/// field of a struct static, or into an array of structs: what it points into, the byte the field starts
+/// at there, the field's storage, and the bytes around it whose layout is the value's own
+/// ([`object_pointer`]).
+#[derive(Clone, Copy)]
+struct ObjectPointer {
+    holder: Holder,
+    displacement: usize,
+    at: crate::module::FieldStorage,
+    region: Option<(usize, usize)>,
+}
+
+impl ObjectPointer {
+    /// Whether the pointer is into an array of structs at a byte inside an element rather than at an
+    /// element's start: a value of the element's own type there is read and written through the
+    /// array's bytes, as no element starts at that byte.
+    fn inside_an_element(&self) -> bool {
+        matches!(self.holder, Holder::Element { stride, .. } if self.displacement % stride != 0)
+    }
+
+    /// The bytes a typed access through the pointer may reach: the largest value around it whose fields
+    /// are all numbers ([`has_byte_layout`]), else the field it points at.
+    fn bound(&self, module: &Module) -> Option<(usize, usize)> {
+        match self.region {
+            Some(region) => Some(region),
+            None => Some((self.displacement, self.displacement.checked_add(field_width(module, self.at)?)?)),
+        }
+    }
+}
+
+/// The bytes from `start` that a field of `storage` there takes, where they are a number or a struct
+/// whose fields are all numbers ([`has_byte_layout`]): a region whose layout is the value's own.
+fn number_region(module: &Module, storage: crate::module::FieldStorage, start: usize) -> Option<(usize, usize)> {
+    use crate::module::FieldStorage;
+    match storage {
+        FieldStorage::ValueType(id) if !has_byte_layout(module, id, 0) => None,
+        FieldStorage::Reference => None,
+        storage => Some((start, start.checked_add(field_width(module, storage)?)?)),
+    }
+}
+
+/// The object or static field `location` points at ([`ObjectPointer`]): an instance field's address, a
+/// boxed struct's own address, a static field's address (where the loader recorded its storage), or the
+/// address of a field of a struct field of any of them, at the byte the field starts at by the layout of
+/// the struct that declares it (ECMA-335 6th ed II.10.1.2). A struct whose fields are all numbers is laid
+/// out in sequence and its bytes are its own; a class's fields, and those of a struct holding a
+/// reference, are laid out at the runtime's choice (auto layout, II.10.1.2), so the bytes beyond the
+/// field or the number struct the pointer is in are not this value's to name, and
+/// [`ObjectPointer::bound`] stops there; a static is its own allocation. A pointer into an array of
+/// structs whose fields are all numbers names any of the array's bytes: the elements lie one after
+/// another (I.8.9.1), each at the stride its layout gives, so a typed access may start inside one
+/// element and reach into the next. `None` for any other location, for an array whose elements are
+/// packed numbers or hold a reference, and for an object whose layout the loader did not record for
+/// the fields it holds.
+fn object_pointer(module: &Module, vm: &Vm, location: &Location) -> Option<ObjectPointer> {
+    use crate::module::FieldStorage;
+    match location {
+        Location::Field { object, slot } => {
+            let Some(crate::object::Object::Instance { type_id, fields }) = vm.heap().get(*object) else {
+                return None;
+            };
+            let slot = *slot as usize;
+            let layout = module.type_field_offsets(*type_id).filter(|layout| layout.slot_count() == fields.len() && slot < fields.len())?;
+            let displacement = usize::try_from(layout.offset_of(slot)?).ok()?;
+            let at = module.type_field_storage(*type_id, slot)?;
+            let holder = Holder::Instance { object: *object, owner: *type_id };
+            Some(ObjectPointer { holder, displacement, at, region: number_region(module, at, displacement) })
+        }
+        Location::Boxed { object } => {
+            let Some(crate::object::Object::Boxed { type_token, value: Value::Struct(_) }) = vm.heap().get(*object) else {
+                return None;
+            };
+            let owner = module.type_id_by_handle(*type_token)?;
+            let at = FieldStorage::ValueType(owner);
+            Some(ObjectPointer { holder: Holder::Boxed { object: *object, owner }, displacement: 0, at, region: number_region(module, at, 0) })
+        }
+        Location::Static { slot } => {
+            let storage = module.static_storage(*slot)?;
+            let holder = Holder::Static { slot: *slot, storage };
+            Some(ObjectPointer { holder, displacement: 0, at: storage, region: number_region(module, storage, 0) })
+        }
+        Location::StaticBytes { slot, byte_offset } => {
+            let storage = module.static_storage(*slot)?;
+            let region = number_region(module, storage, 0)?;
+            let displacement = usize::try_from(element_displacement(*byte_offset)).ok()?;
+            let holder = Holder::Static { slot: *slot, storage };
+            Some(ObjectPointer { holder, displacement, at: storage, region: Some(region) })
+        }
+        Location::Nested { base, slot } => {
+            let outer = object_pointer(module, vm, base)?;
+            let FieldStorage::ValueType(inner) = outer.at else {
+                return None;
+            };
+            let slot = *slot as usize;
+            let layout = module.type_field_offsets(inner).filter(|layout| slot < layout.slot_count())?;
+            let displacement = outer.displacement.checked_add(usize::try_from(layout.offset_of(slot)?).ok()?)?;
+            let at = module.type_field_storage(inner, slot)?;
+            Some(ObjectPointer { displacement, at, region: outer.region.or_else(|| number_region(module, at, displacement)), ..outer })
+        }
+        Location::Element { array, index, byte_offset } => {
+            let heap = vm.heap();
+            if heap.packed_array_bytes(*array).is_some() {
+                return None;
+            }
+            let owner = module.type_id_by_handle(heap.array_element_type(*array)?)?;
+            let stride = heap.array_declared_element_width(*array)?;
+            let at = FieldStorage::ValueType(owner);
+            if !module.type_is_value_type(owner) || !has_byte_layout(module, owner, 0) || field_width(module, at)? != stride {
+                return None;
+            }
+            let length = heap.array_len(*array)?;
+            let displacement = element_byte_position(*index, *byte_offset, stride)?;
+            let holder = Holder::Element { array: *array, owner, stride };
+            Some(ObjectPointer { holder, displacement, at, region: Some((0, length.checked_mul(stride)?)) })
+        }
+        _ => None,
+    }
+}
+
+/// The bytes a field of `storage` takes in its type's layout: a primitive's width, a native int's, an
+/// object reference's (as wide as a pointer, ECMA-335 6th ed I.12.1.1), and a struct's size.
+fn field_width(module: &Module, storage: crate::module::FieldStorage) -> Option<usize> {
+    use crate::module::FieldStorage;
+    match storage {
+        FieldStorage::Primitive(kind) => Some(kind.byte_width()),
+        FieldStorage::Native | FieldStorage::Reference => Some(crate::native_pointer_size() as usize),
+        FieldStorage::ValueType(id) => usize::try_from(module.type_field_offsets(id)?.end()).ok(),
+    }
+}
+
+/// The fields of a value of type `owner` that the bytes from `start` to `end` reach, as its layout places
+/// them (ECMA-335 6th ed II.10.1.2): each one's slot, storage and byte range, where the record covers
+/// `count` fields and the range lies inside the value; `None` otherwise.
+fn fields_in_range(module: &Module, owner: TypeId, count: usize, start: usize, end: usize) -> Option<Vec<(usize, crate::module::FieldStorage, usize, usize)>> {
+    let layout = module.type_field_offsets(owner).filter(|layout| layout.slot_count() == count)?;
+    if start > end || end > usize::try_from(layout.end()).ok()? {
+        return None;
+    }
+    let mut reached = Vec::new();
+    for slot in 0..count {
+        let storage = module.type_field_storage(owner, slot)?;
+        let at = usize::try_from(layout.offset_of(slot)?).ok()?;
+        let field_end = at.checked_add(field_width(module, storage)?)?;
+        if at < end && start < field_end {
+            reached.push((slot, storage, at, field_end));
+        }
+    }
+    Some(reached)
+}
+
+/// The bytes from `start` to `start + len` of a value of type `owner` whose fields hold `fields`, as its
+/// layout places them (ECMA-335 6th ed II.10.1.2); a byte no field covers, padding, reads as zero. Only
+/// the fields the range reaches are read, so a reference elsewhere in the value is no bar. `None` where
+/// the range reaches a field with no bytes here (a reference, or a field that points at a variable) or
+/// runs past the value. `depth` bounds recursive metadata.
+fn fields_range_bytes(module: &Module, owner: TypeId, fields: &[Value], start: usize, len: usize, depth: usize) -> Option<Vec<u8>> {
+    use crate::module::FieldStorage;
+    if depth >= MAX_STACK_FIELD_DEPTH {
+        return None;
+    }
+    let end = start.checked_add(len)?;
+    let mut out = alloc::vec![0u8; len];
+    for (slot, storage, at, field_end) in fields_in_range(module, owner, fields.len(), start, end)? {
+        let (low, high) = (start.max(at), end.min(field_end));
+        let value = fields.get(slot)?;
+        let bytes = match (storage, value) {
+            (FieldStorage::Reference, _) => return None,
+            (FieldStorage::ValueType(inner), Value::Struct(inner_fields)) => fields_range_bytes(module, inner, inner_fields, low - at, high - low, depth + 1)?,
+            (storage, value) => {
+                let mut whole = alloc::vec![0u8; field_end - at];
+                encode_stack_field(module, storage, &mut whole, value, 0).ok()?;
+                whole[low - at..high - at].to_vec()
+            }
+        };
+        out[low - start..high - start].copy_from_slice(&bytes);
+    }
+    Some(out)
+}
+
+/// Writes `bytes` from `start` into a value of type `owner` whose fields hold `fields`: each field the
+/// bytes reach takes the value its bytes then make, decoded by its storage (ECMA-335 6th ed II.10.1.2),
+/// and the fields they do not reach are left as they are. Returns the slots it changed; `None`, and
+/// nothing written, where the bytes reach a field with no bytes here or run past the value.
+fn write_fields_range(module: &Module, owner: TypeId, fields: &mut [Value], start: usize, bytes: &[u8], depth: usize) -> Option<Vec<usize>> {
+    use crate::module::FieldStorage;
+    if depth >= MAX_STACK_FIELD_DEPTH {
+        return None;
+    }
+    let end = start.checked_add(bytes.len())?;
+    let mut updates = Vec::new();
+    for (slot, storage, at, field_end) in fields_in_range(module, owner, fields.len(), start, end)? {
+        let (low, high) = (start.max(at), end.min(field_end));
+        let written = &bytes[low - start..high - start];
+        let value = match (storage, fields.get(slot)?) {
+            (FieldStorage::Reference, _) => return None,
+            (FieldStorage::ValueType(inner), Value::Struct(inner_fields)) => {
+                let mut inner_fields = inner_fields.to_vec();
+                write_fields_range(module, inner, &mut inner_fields, low - at, written, depth + 1)?;
+                Value::Struct(inner_fields.into_boxed_slice())
+            }
+            (storage, value) => {
+                let mut whole = alloc::vec![0u8; field_end - at];
+                encode_stack_field(module, storage, &mut whole, value, 0).ok()?;
+                whole[low - at..high - at].copy_from_slice(written);
+                decode_stack_field(module, storage, &whole, 0).ok()?
+            }
+        };
+        updates.push((slot, value));
+    }
+    let changed = updates.iter().map(|&(slot, _)| slot).collect();
+    for (slot, value) in updates {
+        fields[slot] = value;
+    }
+    Some(changed)
+}
+
+/// The fields of the object `object` holds: an instance's, or the boxed struct's.
+fn object_fields(vm: &Vm, object: ObjectRef, boxed: bool) -> Option<&[Value]> {
+    match vm.heap().get(object)? {
+        crate::object::Object::Instance { fields, .. } if !boxed => Some(fields),
+        crate::object::Object::Boxed { value: Value::Struct(fields), .. } if boxed => Some(fields),
+        _ => None,
+    }
+}
+
+/// The bytes from `start` to `start + len` of `value`, a value of `storage`: a struct's by its layout
+/// ([`fields_range_bytes`]), any other number's encoded at its width. `None` for a reference, a value
+/// with no bytes here, and a range past the value.
+fn value_range_bytes(module: &Module, storage: crate::module::FieldStorage, value: &Value, start: usize, len: usize) -> Option<Vec<u8>> {
+    use crate::module::FieldStorage;
+    match (storage, value) {
+        (FieldStorage::Reference, _) => None,
+        (FieldStorage::ValueType(owner), Value::Struct(fields)) => fields_range_bytes(module, owner, fields, start, len, 0),
+        (storage, value) => {
+            let mut whole = alloc::vec![0u8; field_width(module, storage)?];
+            encode_stack_field(module, storage, &mut whole, value, 0).ok()?;
+            whole.get(start..start.checked_add(len)?).map(<[u8]>::to_vec)
+        }
+    }
+}
+
+/// `value`, a value of `storage`, with `bytes` written from `start` ([`value_range_bytes`]'s inverse):
+/// a struct's fields the bytes reach decoded again ([`write_fields_range`]), any other number decoded
+/// from its merged bytes. `None` where the bytes reach a reference or run past the value.
+fn write_value_range(module: &Module, storage: crate::module::FieldStorage, value: &Value, start: usize, bytes: &[u8]) -> Option<Value> {
+    use crate::module::FieldStorage;
+    match (storage, value) {
+        (FieldStorage::Reference, _) => None,
+        (FieldStorage::ValueType(owner), Value::Struct(fields)) => {
+            let mut fields = fields.to_vec();
+            write_fields_range(module, owner, &mut fields, start, bytes, 0)?;
+            Some(Value::Struct(fields.into_boxed_slice()))
+        }
+        (storage, value) => {
+            let mut whole = alloc::vec![0u8; field_width(module, storage)?];
+            encode_stack_field(module, storage, &mut whole, value, 0).ok()?;
+            whole.get_mut(start..start.checked_add(bytes.len())?)?.copy_from_slice(bytes);
+            decode_stack_field(module, storage, &whole, 0).ok()
+        }
+    }
+}
+
+/// Whether `len` bytes from the pointer stay inside the bytes it may reach ([`ObjectPointer::bound`]).
+fn object_reach(module: &Module, pointer: &ObjectPointer, len: usize) -> bool {
+    pointer.bound(module).is_some_and(|(_, high)| pointer.displacement.checked_add(len).is_some_and(|end| end <= high))
+}
+
+/// `len` bytes of the object `pointer` points into, from the pointer on ([`fields_range_bytes`]), where
+/// they stay inside the bytes the pointer may reach ([`object_reach`]).
+fn object_bytes(module: &Module, vm: &Vm, pointer: &ObjectPointer, len: usize) -> Option<Vec<u8>> {
+    if !object_reach(module, pointer, len) {
+        return None;
+    }
+    match pointer.holder {
+        Holder::Instance { object, owner } => fields_range_bytes(module, owner, object_fields(vm, object, false)?, pointer.displacement, len, 0),
+        Holder::Boxed { object, owner } => fields_range_bytes(module, owner, object_fields(vm, object, true)?, pointer.displacement, len, 0),
+        Holder::Static { slot, storage } => value_range_bytes(module, storage, &vm.static_field(slot)?, pointer.displacement, len),
+        Holder::Element { array, owner, stride } => {
+            let mut bytes = Vec::with_capacity(len);
+            for (index, within, chunk) in element_chunks(stride, pointer.displacement, len)? {
+                let Value::Struct(fields) = vm.heap().array_get(array, index)? else {
+                    return None;
+                };
+                bytes.extend(fields_range_bytes(module, owner, &fields, within, chunk, 0)?);
+            }
+            Some(bytes)
+        }
+    }
+}
+
+/// The elements the `len` bytes from the byte `start` of an array cover, whose elements take `stride`
+/// bytes each: for each, its index, the byte the range starts at in it, and how many of its bytes the
+/// range takes.
+fn element_chunks(stride: usize, start: usize, len: usize) -> Option<Vec<(usize, usize, usize)>> {
+    let end = start.checked_add(len)?;
+    let mut chunks = Vec::new();
+    let mut at = start;
+    while at < end {
+        let (index, within) = (at.checked_div(stride)?, at % stride);
+        let chunk = (stride - within).min(end - at);
+        chunks.push((index, within, chunk));
+        at += chunk;
+    }
+    Some(chunks)
+}
+
+/// Writes `bytes` into the object `pointer` points into, from the pointer on ([`write_fields_range`]),
+/// where they stay inside the bytes the pointer may reach ([`object_reach`]); `None`, and nothing
+/// written, where they do not, or reach a field with no bytes here.
+fn write_object_bytes(module: &Module, vm: &mut Vm, pointer: &ObjectPointer, bytes: &[u8]) -> Option<()> {
+    if !object_reach(module, pointer, bytes.len()) {
+        return None;
+    }
+    let keeps = |fields: &[Value], owner: TypeId, start: usize, written: &[u8]| {
+        fields_range_bytes(module, owner, fields, start, written.len(), 0).as_deref() == Some(written)
+    };
+    match pointer.holder {
+        Holder::Instance { object, owner } => {
+            let mut fields = object_fields(vm, object, false)?.to_vec();
+            let slots = write_fields_range(module, owner, &mut fields, pointer.displacement, bytes, 0)?;
+            keeps(&fields, owner, pointer.displacement, bytes).then_some(())?;
+            for slot in slots {
+                let value = fields.get(slot)?.clone();
+                vm.heap_mut().set_instance_field(object, u32::try_from(slot).ok()?, value).then_some(())?;
+            }
+            Some(())
+        }
+        Holder::Boxed { object, owner } => {
+            let mut fields = object_fields(vm, object, true)?.to_vec();
+            write_fields_range(module, owner, &mut fields, pointer.displacement, bytes, 0)?;
+            keeps(&fields, owner, pointer.displacement, bytes).then_some(())?;
+            vm.heap_mut().set_boxed_value(object, Value::Struct(fields.into_boxed_slice())).then_some(())
+        }
+        Holder::Static { slot, storage } => {
+            let value = write_value_range(module, storage, &vm.static_field(slot)?, pointer.displacement, bytes)?;
+            (value_range_bytes(module, storage, &value, pointer.displacement, bytes.len()).as_deref() == Some(bytes)).then_some(())?;
+            vm.set_static_field(slot, value);
+            Some(())
+        }
+        Holder::Element { array, owner, stride } => {
+            let mut written = Vec::new();
+            let mut from = 0;
+            for (index, within, chunk) in element_chunks(stride, pointer.displacement, bytes.len())? {
+                let Value::Struct(fields) = vm.heap().array_get(array, index)? else {
+                    return None;
+                };
+                let mut fields = fields.to_vec();
+                let part = bytes.get(from..from + chunk)?;
+                write_fields_range(module, owner, &mut fields, within, part, 0)?;
+                keeps(&fields, owner, within, part).then_some(())?;
+                written.push((index, Value::Struct(fields.into_boxed_slice())));
+                from += chunk;
+            }
+            for (index, value) in written {
+                vm.heap_mut().array_set(array, index, value).then_some(())?;
+            }
+            Some(())
+        }
+    }
+}
+
+/// Reads with the `ldind.<type>` `opcode` through a pointer to a field of a heap object ([`object_pointer`]):
+/// the instruction loads a value of its type from the address (ECMA-335 6th ed III.3.42), so it reads that
+/// many bytes from the field on, as its storage and the layout of the number struct it is in place them
+/// (II.10.1.2): `*(int*)&o.F` of a `float` field holding 1.0f reads 0x3F800000, and the address of a boxed
+/// struct `Halves` holding the shorts 1 and 2 reads 0x00020001 as an `int` (ECMA-334 2nd ed 25.4). A
+/// pointer into an array of such structs reads the array's bytes, inside one element or across two:
+/// `*(long*)((byte*)p + 4)` of a pinned `P2[]` holds the first element's second `int` and the second's
+/// first (I.8.9.1). A read past the bytes the pointer may reach ([`ObjectPointer::bound`]), as past a
+/// class's field into the fields the runtime laid out after it, or past the array, is refused. `ldind.ref` over numbers reads the native int a
+/// pointer is (I.12.1.1.1). `None` for any other location and for `ldobj`, and where the bytes reach a
+/// reference or a field with no bytes here, for the read that answers from the field's value.
+fn load_from_object_fields(vm: &Vm, module: &Module, location: &Location, requested: Opcode) -> Result<Option<Value>, Trap> {
+    let opcode = if requested == Opcode::LdindRef { Opcode::LdindI } else { requested };
+    let native = crate::native_pointer_size() as usize;
+    let Some(width) = indirect_width_at(opcode, native) else {
+        return Ok(None);
+    };
+    let Some(pointer) = object_pointer(module, vm, location) else {
+        return Ok(None);
+    };
+    if !object_reach(module, &pointer, width) {
+        return Err(Trap::Unsupported(requested));
+    }
+    let Some(bytes) = object_bytes(module, vm, &pointer, width) else {
+        return Ok(None);
+    };
+    let mut raw = [0u8; 8];
+    raw[..width].copy_from_slice(&bytes);
+    stack_loaded_value_at(opcode, raw, native).map(Some)
+}
+
+/// Stores `value` with the `stind.<type>` `opcode` through a pointer to a field of a heap object
+/// ([`object_pointer`]): the instruction stores a value of its type at the address (ECMA-335 6th ed
+/// III.3.62), so its bytes replace that many from the field on, and each field they reach holds the
+/// value its bytes then make, in each element they reach of an array of structs. A store past the bytes
+/// the pointer may reach ([`ObjectPointer::bound`]) is refused and changes nothing. Returns whether it stored: any other location, `stobj`, a value with no
+/// bytes here (a pointer to a variable), and bytes that reach a reference are left to the whole-value
+/// store. `stind.ref` over numbers stores the native int a pointer is.
+fn store_into_object_fields(vm: &mut Vm, module: &Module, location: &Location, requested: Opcode, value: &Value) -> Result<bool, Trap> {
+    let opcode = if requested == Opcode::StindRef { Opcode::StindI } else { requested };
+    let Some(width) = indirect_width_at(opcode, crate::native_pointer_size() as usize) else {
+        return Ok(false);
+    };
+    let Some(pointer) = object_pointer(module, vm, location) else {
+        return Ok(false);
+    };
+    if !object_reach(module, &pointer, width) {
+        return Err(Trap::Unsupported(requested));
+    }
+    let Ok(stored) = stack_stored_bytes(opcode, value.clone()) else {
+        return Ok(false);
+    };
+    match write_object_bytes(module, vm, &pointer, &stored[..width]) {
+        Some(()) => Ok(true),
+        None if pointer.region.is_some() => Err(Trap::Unsupported(requested)),
+        None => Ok(false),
+    }
+}
+
+/// `value` with a pointer to a field of a struct variable ([`Location::Nested`] over a [`StructPointer`])
+/// given as the byte of the variable the field starts at ([`Location::LocalBytes`] or
+/// [`Location::ArgBytes`]), the form pointer arithmetic walks and pointer comparison and difference
+/// read (ECMA-335 6th ed III.1.5): `(byte*)&s.b - (byte*)&s` is the field's offset. Any other value as
+/// it is.
+fn as_variable_bytes(module: Option<&Module>, method_of: &impl Fn(usize) -> Option<MethodId>, value: Value) -> Value {
+    let (Some(module), Value::ByRef(location @ Location::Nested { .. })) = (module, &value) else {
+        return value;
+    };
+    let Some(pointer) = struct_pointer(module, method_of, location) else {
+        return value;
+    };
+    let Ok(byte_offset) = u32::try_from(pointer.displacement) else {
+        return value;
+    };
+    Value::ByRef(if pointer.argument {
+        Location::ArgBytes { frame: pointer.frame, slot: pointer.slot, byte_offset }
+    } else {
+        Location::LocalBytes { frame: pointer.frame, slot: pointer.slot, byte_offset }
+    })
+}
+
+/// The operands of a binary operation or a comparison in the frame at `frame_index`, which runs
+/// `method` above `callers`, each pointer to a field of a struct variable given as the byte of the
+/// variable it points at ([`as_variable_bytes`]). Only a field's address changes, so integer operands,
+/// the hot case, are passed through untouched.
+fn variable_bytes_pair(module: Option<&Module>, method: MethodId, frame_index: usize, callers: &[Frame], a: Value, b: Value) -> (Value, Value) {
+    let nested = |value: &Value| matches!(value, Value::ByRef(Location::Nested { .. }));
+    if !nested(&a) && !nested(&b) {
+        return (a, b);
+    }
+    let method_of = |index: usize| if index == frame_index { Some(method) } else { callers.get(index).map(|frame| frame.method) };
+    (as_variable_bytes(module, &method_of, a), as_variable_bytes(module, &method_of, b))
+}
+
+/// Whether the storage `location` points into holds bytes that a typed access reads and writes: a
+/// local or an argument whose declared kind is a number, or an array whose elements are packed.
+fn holds_bytes(frames: &[Frame], vm: &Vm, module: &Module, location: &Location) -> bool {
+    match *location {
+        Location::Element { array, .. } => vm.heap().packed_array_bytes(array).is_some(),
+        Location::StringChar { .. } => true,
+        _ => declared_number_variable(frames, module, location).is_some(),
+    }
+}
+
+/// The storage of a value of the type `token` names in assembly `asm`, as `ldobj` and `stobj` move it:
+/// an enum's is its underlying integer's (ECMA-335 6th ed II.14.3), a built-in value type's its
+/// primitive or native int, any other value type's its fields by its layout, a reference type's a
+/// reference. `None` for a type the module recorded no id for.
+fn obj_storage(module: &Module, asm: u8, token: Token) -> Option<crate::module::FieldStorage> {
+    Some(storage_of_type(module, module.type_id_of(asm, token)?))
+}
+
+/// The storage of a value of the type `id`, as [`obj_storage`] gives a token's.
+fn storage_of_type(module: &Module, id: TypeId) -> crate::module::FieldStorage {
+    use crate::module::FieldStorage;
+    if let Some(kind) = module
+        .type_handle_of(id)
+        .and_then(|handle| module.enum_underlying_prim_by_handle(handle))
+        .and_then(CastPrim::prim_kind)
+    {
+        return FieldStorage::Primitive(kind);
+    }
+    match builtin_storage(module, id) {
+        Some(storage) => storage,
+        None if module.type_is_value_type(id) => FieldStorage::ValueType(id),
+        None => FieldStorage::Reference,
+    }
+}
+
+/// The declared storage of the whole value `location` names, where the loader recorded it: a local's or
+/// an argument's (its struct type, or its slot kind), an object's field's, a static's, a boxed value's,
+/// an array element's, or a field's of any of those that is a struct, an enum's being its underlying
+/// integer's (ECMA-335 6th ed II.14.3). `None` where nothing was recorded, and for a pointer moved into a
+/// value, which names no whole one.
+fn declared_storage_at(
+    method_of: &impl Fn(usize) -> Option<MethodId>, vm: &Vm, module: &Module, location: &Location,
+) -> Option<crate::module::FieldStorage> {
+    use crate::module::FieldStorage;
+    let declared = match location {
+        Location::Local { frame, slot } | Location::LocalBytes { frame, slot, byte_offset: 0 } => {
+            variable_storage(method_of, module, *frame, *slot, false)?
+        }
+        Location::Arg { frame, slot } | Location::ArgBytes { frame, slot, byte_offset: 0 } => {
+            variable_storage(method_of, module, *frame, *slot, true)?
+        }
+        Location::Field { object, slot } => match vm.heap().get(*object) {
+            Some(crate::object::Object::Instance { type_id, .. }) => module.type_field_storage(*type_id, *slot as usize)?,
+            _ => return None,
         },
-        _ => value,
+        Location::Static { slot } | Location::StaticBytes { slot, byte_offset: 0 } => module.static_storage(*slot)?,
+        Location::Boxed { object } => storage_of_type(module, module.type_id_by_handle(vm.heap().boxed_type_token(*object)?)?),
+        Location::Element { array, index, byte_offset } => {
+            array_element_index(vm, *array, *index, *byte_offset)?;
+            storage_of_type(module, module.type_id_by_handle(vm.heap().array_element_type(*array)?)?)
+        }
+        Location::Nested { base, slot } => match declared_storage_at(method_of, vm, module, base)? {
+            FieldStorage::ValueType(owner) => module.type_field_storage(owner, *slot as usize)?,
+            _ => return None,
+        },
+        _ => return None,
+    };
+    Some(match declared {
+        FieldStorage::ValueType(id) => storage_of_type(module, id),
+        storage => storage,
+    })
+}
+
+/// The declared storage of the local or argument `slot` of the method frame `frame` runs, by the slot
+/// kind the loader recorded and, for a struct, its type.
+fn variable_storage(
+    method_of: &impl Fn(usize) -> Option<MethodId>, module: &Module, frame: usize, slot: usize, argument: bool,
+) -> Option<crate::module::FieldStorage> {
+    use crate::module::FieldStorage;
+    let method = method_of(frame)?;
+    let kind = if argument { module.method_arg_kind(method, slot) } else { module.method_local_kind(method, slot) }?;
+    Some(match kind {
+        SlotKind::Primitive(prim) => FieldStorage::Primitive(prim),
+        SlotKind::Native => FieldStorage::Native,
+        SlotKind::Reference => FieldStorage::Reference,
+        SlotKind::Struct => FieldStorage::ValueType(if argument {
+            module.method_arg_struct_type(method, slot)
+        } else {
+            module.method_local_struct_type(method, slot)
+        }?),
+        SlotKind::ByRef | SlotKind::Unknown => return None,
+    })
+}
+
+/// The storage of the value the `stind.<type>` `store` stores, or, for a `stobj` that moves a value
+/// whole, of the type `token` names in assembly `asm`'s tokens.
+fn stored_storage(module: &Module, asm: u8, store: Opcode, token: Token) -> Option<crate::module::FieldStorage> {
+    use crate::module::FieldStorage;
+    Some(match store {
+        Opcode::StindI1 => FieldStorage::Primitive(PrimKind::I1),
+        Opcode::StindI2 => FieldStorage::Primitive(PrimKind::I2),
+        Opcode::StindI4 => FieldStorage::Primitive(PrimKind::I4),
+        Opcode::StindI8 => FieldStorage::Primitive(PrimKind::I8),
+        Opcode::StindR4 => FieldStorage::Primitive(PrimKind::F4),
+        Opcode::StindR8 => FieldStorage::Primitive(PrimKind::F8),
+        Opcode::StindI => FieldStorage::Native,
+        Opcode::StindRef => FieldStorage::Reference,
+        Opcode::Stobj => return obj_storage(module, asm, token),
+        _ => return None,
+    })
+}
+
+/// Whether a value of `stored`'s storage replaces a whole value of `declared`'s: a number of the same
+/// width and the same kind, integer or floating; a native int over a native int and a reference over a
+/// reference; or a struct over one of its own type.
+fn whole_store_fits(declared: crate::module::FieldStorage, stored: crate::module::FieldStorage) -> bool {
+    use crate::module::FieldStorage;
+    let floating = |kind: PrimKind| matches!(kind, PrimKind::F4 | PrimKind::F8);
+    match (declared, stored) {
+        (FieldStorage::Primitive(a), FieldStorage::Primitive(b)) => a.byte_width() == b.byte_width() && floating(a) == floating(b),
+        (FieldStorage::Native, FieldStorage::Native) | (FieldStorage::Reference, FieldStorage::Reference) => true,
+        (FieldStorage::ValueType(a), FieldStorage::ValueType(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Whether the value `held` is in the representation of `stored`'s storage: an int64 for an int64, a
+/// float of its width for a float, a native int for a native int, a reference for a reference, and an
+/// int32 for an int32. A narrower integer is held as an int32 too, so an int32 value fits an int32's
+/// storage whether or not it came from a narrower type, and fits no narrower storage. A struct, whose
+/// type the value does not carry, and nothing at all fit no storage.
+fn unrecorded_store_fits(held: Option<&Value>, stored: Option<crate::module::FieldStorage>) -> bool {
+    use crate::module::FieldStorage;
+    match (held, stored) {
+        (Some(Value::Int32(_)), Some(FieldStorage::Primitive(PrimKind::I4)))
+        | (Some(Value::Int64(_)), Some(FieldStorage::Primitive(PrimKind::I8)))
+        | (Some(Value::NativeInt(_)), Some(FieldStorage::Native))
+        | (Some(Value::Object(_) | Value::Null), Some(FieldStorage::Reference)) => true,
+        #[cfg(feature = "float")]
+        (Some(Value::Single(_)), Some(FieldStorage::Primitive(PrimKind::F4)))
+        | (Some(Value::Float(_)), Some(FieldStorage::Primitive(PrimKind::F8))) => true,
+        _ => false,
+    }
+}
+
+/// Whether `value` is a floating value and `declared` a floating storage, of either width.
+fn floating_into_floating(declared: crate::module::FieldStorage, value: &Value) -> bool {
+    #[cfg(feature = "float")]
+    if let crate::module::FieldStorage::Primitive(PrimKind::F4 | PrimKind::F8) = declared {
+        return matches!(value, Value::Single(_) | Value::Float(_));
+    }
+    let _ = (declared, value);
+    false
+}
+
+/// `value`, an integer `stind` stores whole into a number of `declared` storage of its width, as that
+/// storage holds it: a byte or a short with the declared sign, so `stind.i1` of 255 into a `byte` holds
+/// 255 (CIL's `stind` has no unsigned form, ECMA-335 6th ed III.3.62). Any other value as it is.
+fn as_declared_integer(declared: crate::module::FieldStorage, value: Value) -> Value {
+    use crate::module::FieldStorage;
+    match (declared, value) {
+        (FieldStorage::Primitive(PrimKind::U1), Value::Int32(n)) => Value::Int32(i32::from(n as u8)),
+        (FieldStorage::Primitive(PrimKind::I1), Value::Int32(n)) => Value::Int32(i32::from(n as i8)),
+        (FieldStorage::Primitive(PrimKind::U2), Value::Int32(n)) => Value::Int32(i32::from(n as u16)),
+        (FieldStorage::Primitive(PrimKind::I2), Value::Int32(n)) => Value::Int32(i32::from(n as i16)),
+        (_, value) => value,
+    }
+}
+
+/// The value the whole-value store `stind` and `stobj` come to, when no byte path took them (a
+/// variable's declared bytes, a packed array's, a struct variable's, an object's), writes at `location`,
+/// or a refusal, as `store`, where it would replace something other than a value of the store's type:
+/// the instruction stores a value of its type at the address and changes nothing else (ECMA-335 6th ed
+/// III.3.62 and III.4.29). Where the loader recorded the storage the location names
+/// ([`declared_storage_at`]), the store's must fit it ([`whole_store_fits`]) and the value takes its
+/// sign ([`as_declared_integer`]). Two stores are judged otherwise there, and their values kept as they
+/// are: a pointer or a null reference that `stind.ref` stores into a native int or a pointer, which is
+/// taken; and a `stobj` of a type the module names no id for, which is judged by its value alone
+/// ([`unrecorded_store_fits`], [`floating_into_floating`]), so an int32 value replaces a whole int32
+/// though it may have come from a narrower type, and a floating value replaces a floating one of either
+/// width. Where it recorded none, the value replaces what the location holds unless that is a struct and
+/// the value is not: a store there cannot be told from one into part of a wider value, and a verifiable
+/// store, which stores a value of the location's own type, must go on. Any other store into recorded
+/// storage that does not fit is refused, and is not made to replace the whole variable, field or element
+/// it points into.
+fn checked_whole_store(
+    frames: &[Frame], vm: &Vm, module: &Module, location: &Location, store: Opcode, stored: Option<crate::module::FieldStorage>, value: Value,
+) -> Result<Value, Trap> {
+    use crate::module::FieldStorage;
+    match (declared_storage_at(&method_of_frame(frames), vm, module, location), stored) {
+        (Some(declared), Some(stored)) if whole_store_fits(declared, stored) => Ok(as_declared_integer(declared, value)),
+        (Some(FieldStorage::Native), Some(FieldStorage::Reference))
+            if matches!(value, Value::Null | Value::NativeInt(_) | Value::ByRef(_)) => Ok(value),
+        (Some(declared), None) if unrecorded_store_fits(Some(&value), Some(declared)) || floating_into_floating(declared, &value) => Ok(value),
+        (None, _) if matches!(value, Value::Struct(_)) || !matches!(read_location_value(frames, vm, location.clone()), Some(Value::Struct(_))) => Ok(value),
+        _ => Err(Trap::Unsupported(store)),
+    }
+}
+
+/// The storage of the built-in value type `id` names, a primitive or a native int, by its full name
+/// (ECMA-335 6th ed I.8.2.2); `None` for any other type.
+fn builtin_storage(module: &Module, id: TypeId) -> Option<crate::module::FieldStorage> {
+    use crate::module::FieldStorage;
+    Some(match module.type_full_name(id)? {
+        "System.SByte" => FieldStorage::Primitive(PrimKind::I1),
+        "System.Byte" | "System.Boolean" => FieldStorage::Primitive(PrimKind::U1),
+        "System.Int16" => FieldStorage::Primitive(PrimKind::I2),
+        "System.UInt16" | "System.Char" => FieldStorage::Primitive(PrimKind::U2),
+        "System.Int32" | "System.UInt32" => FieldStorage::Primitive(PrimKind::I4),
+        "System.Int64" | "System.UInt64" => FieldStorage::Primitive(PrimKind::I8),
+        "System.Single" => FieldStorage::Primitive(PrimKind::F4),
+        "System.Double" => FieldStorage::Primitive(PrimKind::F8),
+        "System.IntPtr" | "System.UIntPtr" => FieldStorage::Native,
+        _ => return None,
+    })
+}
+
+/// Reads with the `ldind.<type>` (or `ldobj`) `opcode` through a managed pointer to `location`: from the
+/// bytes of a variable whose declared kind is a number ([`load_from_declared_slot`]), of a packed array
+/// ([`load_from_packed_element`]), of a struct variable ([`load_from_struct_variable`]), of an object's or
+/// a static's field or an array of structs ([`load_from_object_fields`]) or of a pinned string ([`load_from_string_chars`]), and
+/// anywhere else from the value the slot holds ([`load_from_slot`]).
+fn typed_load(frames: &[Frame], vm: &Vm, module: &Module, location: Location, opcode: Opcode) -> Result<Value, Trap> {
+    if let Some(value) = load_from_declared_slot(frames, module, &location, opcode)? {
+        return Ok(value);
+    }
+    if let Some(value) = load_from_packed_element(vm, &location, opcode)? {
+        return Ok(value);
+    }
+    if let Some(value) = load_from_struct_variable(frames, module, &location, opcode)? {
+        return Ok(value);
+    }
+    if let Some(value) = load_from_object_fields(vm, module, &location, opcode)? {
+        return Ok(value);
+    }
+    if let Some(value) = load_from_string_chars(vm, &location, opcode)? {
+        return Ok(value);
+    }
+    let slot = load_slot(vm, location, opcode)?;
+    let declared = declared_width(vm, &slot);
+    let variable = is_variable_address(&slot);
+    load_from_slot(read_byref(frames, vm, slot, opcode)?, opcode, declared, variable)
+}
+
+/// The receiver of a runtime-provided method of a built-in value type, where it is a managed pointer:
+/// read as the `ldind` of that type reads it ([`typed_load`]), so `(*(float*)&bits).ToString()` of a
+/// `uint` holding 0x3F800000 formats the float 1 and `chars[1].ToString()` over an `int` the second
+/// `char` its bytes make (ECMA-335 6th ed II.13.3: a value type's instance method takes its value
+/// through a managed pointer, and III.3.42). No static method of a built-in value type takes a
+/// managed pointer first, so a pointer there is the receiver; read at its own type, a receiver whose
+/// storage is that type reads as it did.
+fn read_builtin_receiver(frames: &[Frame], vm: &Vm, module: &Module, method: MethodId, args: &mut [Value]) -> Result<(), Trap> {
+    let Some(Value::ByRef(location)) = args.first() else {
+        return Ok(());
+    };
+    let Some((load, _)) = module.method_type(method).and_then(|id| builtin_storage(module, id)).and_then(stack_field_opcodes) else {
+        return Ok(());
+    };
+    args[0] = typed_load(frames, vm, module, location.clone(), load)?;
+    Ok(())
+}
+
+/// How `ldobj` or `stobj` (`opcode`) of the type `token` names moves a value through a pointer to
+/// `location`, in assembly `asm`'s tokens. Where the pointer's storage holds bytes ([`holds_bytes`]),
+/// a primitive or an enum moves as the `ldind` or `stind` of its type, those instructions being
+/// `ldobj` and `stobj` of the built-in types (ECMA-335 6th ed III.4.13 and III.4.29), and a struct as
+/// the bytes its field layout gives it (the second value, its type, II.10.1.2). In a struct variable
+/// ([`struct_pointer`]) the value of the type the pointer points at, the variable's own or a field's,
+/// moves whole, as it is held, and a value of another type through the struct's bytes where its fields
+/// are all numbers ([`has_byte_layout`]): `*(S*)&h` of a `Halves h` holding the shorts 1 and 2 is the
+/// `S` whose `int` is 0x00020001. Anywhere else, and for a type that names no storage, the instruction
+/// moves the value whole, as it is held.
+fn obj_access(frames: &[Frame], vm: &Vm, module: &Module, asm: u8, location: &Location, opcode: Opcode, token: Token) -> (Opcode, Option<TypeId>) {
+    use crate::module::FieldStorage;
+    if !matches!(opcode, Opcode::Ldobj | Opcode::Stobj) {
+        return (opcode, None);
+    }
+    let storage = obj_storage(module, asm, token);
+    let through_bytes = match struct_pointer(module, &method_of_frame(frames), location) {
+        Some(pointer) => storage.is_some() && pointer.at != storage && has_byte_layout(module, pointer.type_id, 0),
+        None => match object_pointer(module, vm, location) {
+            Some(pointer) => storage.is_some() && (Some(pointer.at) != storage || pointer.inside_an_element()),
+            None => holds_bytes(frames, vm, module, location),
+        },
+    };
+    if !through_bytes {
+        return (opcode, None);
+    }
+    match storage {
+        Some(FieldStorage::ValueType(id)) => (opcode, Some(id)),
+        Some(storage) => match stack_field_opcodes(storage) {
+            Some((load, store)) => (if opcode == Opcode::Ldobj { load } else { store }, None),
+            None => (opcode, None),
+        },
+        None => (opcode, None),
+    }
+}
+
+/// `len` bytes of the storage `location` points into, from the pointer on: a variable's declared bytes
+/// ([`declared_slot_bits`]), a struct variable's ([`struct_variable_bytes`]), a packed array's, or an
+/// object's, a static's or an array of structs' ([`object_bytes`]), in the target's byte order
+/// (ECMA-335 6th ed I.12.6.3). A read past the storage, or of a variable holding
+/// a value that has no bytes here, is refused as `opcode`.
+fn bytes_at(frames: &[Frame], vm: &Vm, module: &Module, location: &Location, len: usize, opcode: Opcode) -> Result<Vec<u8>, Trap> {
+    let refused = || Trap::Unsupported(opcode);
+    if let Location::Element { array, index, byte_offset } = *location
+        && let Some((bytes, element)) = vm.heap().packed_array_bytes(array)
+    {
+        let start = element_byte_position(index, byte_offset, element).ok_or_else(refused)?;
+        return bytes.get(start..start.checked_add(len).ok_or_else(refused)?).map(<[u8]>::to_vec).ok_or_else(refused);
+    }
+    if let Some(pointer) = struct_pointer(module, &method_of_frame(frames), location) {
+        let bytes = struct_variable_bytes(frames, module, &pointer).ok_or_else(refused)?;
+        let end = pointer.displacement.checked_add(len).ok_or_else(refused)?;
+        return bytes.get(pointer.displacement..end).map(<[u8]>::to_vec).ok_or_else(refused);
+    }
+    if let Some(pointer) = object_pointer(module, vm, location) {
+        return object_bytes(module, vm, &pointer, len).ok_or_else(refused);
+    }
+    if let Location::StringChar { string, byte_offset } = *location {
+        let units = vm.heap().as_string(string).ok_or(Trap::NullReference)?;
+        return (0..len)
+            .map(|index| (byte_offset as usize).checked_add(index).and_then(|at| string_byte_at(&units, at)).ok_or_else(refused))
+            .collect();
+    }
+    let (frame, slot, argument, displacement) = variable_location(location).ok_or_else(refused)?;
+    let (kind, declared) = declared_number_variable(frames, module, location).ok_or_else(refused)?;
+    let owner = frames.get(frame).ok_or_else(refused)?;
+    let current = if argument { owner.args.get(slot) } else { owner.locals.get(slot) };
+    let bits = current.and_then(|current| declared_slot_bits(kind, current)).ok_or_else(refused)?;
+    let end = displacement.checked_add(len).filter(|&end| end <= declared).ok_or_else(refused)?;
+    Ok(bits.to_le_bytes()[displacement..end].to_vec())
+}
+
+/// Writes `bytes` into the storage `location` points into, from the pointer on, keeping the bytes it
+/// does not cover: into a variable's declared bytes, which the variable then holds as its declared
+/// kind ([`declared_slot_value`]), into a struct variable's, which it then holds as the struct they
+/// make ([`set_struct_variable_bytes`]), into a packed array's, or into an object's, a static's or an
+/// array of structs' ([`write_object_bytes`]). A write past the storage, or into a
+/// variable holding a value that has no bytes here, is refused as `opcode` and changes nothing.
+fn write_bytes_at(frames: &mut [Frame], vm: &mut Vm, module: &Module, location: &Location, bytes: &[u8], opcode: Opcode) -> Result<(), Trap> {
+    let refused = || Trap::Unsupported(opcode);
+    if let Location::Element { array, index, byte_offset } = *location
+        && let Some((storage, element)) = vm.heap_mut().packed_array_bytes_mut(array)
+    {
+        let start = element_byte_position(index, byte_offset, element).ok_or_else(refused)?;
+        let end = start.checked_add(bytes.len()).ok_or_else(refused)?;
+        storage.get_mut(start..end).ok_or_else(refused)?.copy_from_slice(bytes);
+        return Ok(());
+    }
+    let pointer = struct_pointer(module, &method_of_frame(frames), location);
+    if let Some(pointer) = pointer {
+        let mut merged = struct_variable_bytes(frames, module, &pointer).ok_or_else(refused)?;
+        let end = pointer.displacement.checked_add(bytes.len()).ok_or_else(refused)?;
+        merged.get_mut(pointer.displacement..end).ok_or_else(refused)?.copy_from_slice(bytes);
+        return set_struct_variable_bytes(frames, module, &pointer, &merged, opcode);
+    }
+    if let Some(pointer) = object_pointer(module, vm, location) {
+        return write_object_bytes(module, vm, &pointer, bytes).ok_or_else(refused);
+    }
+    let (frame, slot, argument, displacement) = variable_location(location).ok_or_else(refused)?;
+    let (kind, declared) = declared_number_variable(frames, module, location).ok_or_else(refused)?;
+    let end = displacement.checked_add(bytes.len()).filter(|&end| end <= declared).ok_or_else(refused)?;
+    let owner = frames.get_mut(frame).ok_or_else(refused)?;
+    let slots = if argument { &mut owner.args } else { &mut owner.locals };
+    let current = slots.get(slot).cloned().unwrap_or_else(|| zero_of_slot_kind(kind));
+    let mut merged = declared_slot_bits(kind, &current).ok_or_else(refused)?.to_le_bytes();
+    merged[displacement..end].copy_from_slice(bytes);
+    let value = declared_slot_value(kind, u64::from_le_bytes(merged), crate::native_pointer_size() as usize, opcode)?;
+    set_slot(slots, slot, value);
+    Ok(())
+}
+
+/// Reads with `ldobj` the struct of type `id` from the bytes of the storage `location` points into
+/// ([`bytes_at`]), decoded by its field layout (ECMA-335 6th ed III.4.13 and II.10.1.2): `*(Wrap*)&n`
+/// of an `int n = 42` is the `Wrap` whose `int` field holds 42. A struct with a field that is not a
+/// number has no bytes to make it from, and is refused.
+fn load_struct_from_bytes(frames: &[Frame], vm: &Vm, module: &Module, location: &Location, id: TypeId) -> Result<Value, Trap> {
+    let layout = module.type_field_offsets(id).ok_or(Trap::Unsupported(Opcode::Ldobj))?;
+    let bytes = bytes_at(frames, vm, module, location, layout.end() as usize, Opcode::Ldobj)?;
+    decode_stack_field(module, crate::module::FieldStorage::ValueType(id), &bytes, 0).map_err(|_| Trap::Unsupported(Opcode::Ldobj))
+}
+
+/// Stores with `stobj` the struct `value` of type `id` into the bytes of the storage `location` points
+/// into, encoded by its field layout (ECMA-335 6th ed III.4.29 and II.10.1.2) and written with
+/// [`write_bytes_at`]. A struct with a field that is not a number is refused.
+fn store_struct_into_bytes(frames: &mut [Frame], vm: &mut Vm, module: &Module, location: &Location, id: TypeId, value: &Value) -> Result<(), Trap> {
+    let layout = module.type_field_offsets(id).ok_or(Trap::Unsupported(Opcode::Stobj))?;
+    let mut bytes = alloc::vec![0u8; layout.end() as usize];
+    encode_stack_field(module, crate::module::FieldStorage::ValueType(id), &mut bytes, value, 0)
+        .map_err(|_| Trap::Unsupported(Opcode::Stobj))?;
+    write_bytes_at(frames, vm, module, location, &bytes, Opcode::Stobj)
+}
+
+/// The declared kind of the local or argument `location` names at its own address, where the loader
+/// recorded it: a whole value stored there through the address, with `stobj`, `stind.ref` or `cpobj`
+/// (ECMA-335 6th ed III.4.29, III.3.62 and III.4.4), takes that kind as a `stloc` or a `starg` of it does
+/// ([`stored_at_slot_kind`]), so a null reference stored in a pointer variable is the null pointer and
+/// a float32 stored in a float64 variable the float64 of its value (I.12.1.1.1 and I.12.1.3).
+fn declared_variable_kind(frames: &[Frame], module: &Module, location: &Location) -> Option<SlotKind> {
+    let (frame, slot, argument) = match *location {
+        Location::Local { frame, slot } | Location::LocalBytes { frame, slot, byte_offset: 0 } => (frame, slot, false),
+        Location::Arg { frame, slot } | Location::ArgBytes { frame, slot, byte_offset: 0 } => (frame, slot, true),
+        _ => return None,
+    };
+    let owner = frames.get(frame)?;
+    if argument {
+        module.method_arg_kind(owner.method, slot)
+    } else {
+        module.method_local_kind(owner.method, slot)
+    }
+}
+
+/// `value` as a field or a static of declared `storage` holds it: a floating value at the storage's
+/// floating width, as a value stored in a field or a static takes its type's (ECMA-335 6th ed I.12.1.3:
+/// statics and fields of classes are of fixed size, and a floating value put there is coerced to it),
+/// and a null reference in a native int or pointer field as the native int 0, the null pointer
+/// (I.12.1.1.1). Any other value is kept, as is any value where no storage was recorded.
+fn stored_at_storage(storage: Option<crate::module::FieldStorage>, value: Value) -> Value {
+    use crate::module::FieldStorage;
+    match (storage, value) {
+        #[cfg(feature = "float")]
+        (Some(FieldStorage::Primitive(PrimKind::F8)), Value::Single(f)) => Value::Float(f64::from(f)),
+        #[cfg(feature = "float")]
+        (Some(FieldStorage::Primitive(PrimKind::F4)), Value::Float(f)) => Value::Single(f as f32),
+        (Some(FieldStorage::Native), Value::Null) => Value::NativeInt(0),
+        (_, value) => value,
+    }
+}
+
+/// Whether a value stored in a local or an argument may need the slot's declared kind
+/// ([`stored_at_slot_kind`]): a floating value or a null reference.
+fn depends_on_slot_kind(value: &Value) -> bool {
+    holds_floating(value) || matches!(value, Value::Null)
+}
+
+/// Converts the value on top of `frame`'s stack to the declared kind of the local or argument it is
+/// about to be stored in ([`stored_at_slot_kind`]); `kind` is asked only for a value that may need it.
+fn declare_top(frame: &mut Frame, kind: impl FnOnce(MethodId) -> Option<SlotKind>) {
+    let method = frame.method;
+    if let Some(top) = frame.stack.last_mut() {
+        if depends_on_slot_kind(top) {
+            let value = core::mem::replace(top, Value::Null);
+            *top = stored_at_slot_kind(kind(method), value);
+        }
+    }
+}
+
+/// A new frame's arguments at their declared kinds ([`stored_at_slot_kind`]) and its locals at their
+/// declared kinds' zeros ([`zero_of_slot_kind`]), where the loader recorded the method's slot kinds.
+fn declare_frame(frame: &mut Frame, module: &Module, id: MethodId) {
+    let Some((args, locals)) = module.method_slot_kinds(id) else {
+        return;
+    };
+    for (value, &code) in frame.args.iter_mut().zip(args) {
+        if depends_on_slot_kind(value) {
+            let taken = core::mem::replace(value, Value::Null);
+            *value = stored_at_slot_kind(Some(SlotKind::from_code(code)), taken);
+        }
+    }
+    frame.locals.clear();
+    frame.locals.extend(locals.iter().map(|&code| zero_of_slot_kind(SlotKind::from_code(code))));
+}
+
+/// The slot an indirect load through `location` reads: the location itself, or for a pointer that
+/// pointer arithmetic moved along a pinned array by whole elements, the element it reached (ECMA-334
+/// 2nd ed 25.6 and 25.5.6). An array whose elements are packed is read through its bytes
+/// ([`load_from_packed_element`]) before this. A pointer moved by a number of bytes that is not a
+/// whole number of elements of any other array, or along an array whose element width is not known,
+/// is refused; so is one moved inside a pinned string's UTF-16 code unit, and one moved into a local
+/// or an argument, where it is read.
+fn load_slot(vm: &Vm, location: Location, opcode: Opcode) -> Result<Location, Trap> {
+    match location {
+        Location::StringChar { byte_offset, .. } if byte_offset % 2 != 0 => Err(Trap::Unsupported(opcode)),
+        Location::Element { array, index, byte_offset } if byte_offset != 0 => {
+            let width = vm
+                .heap()
+                .array_element_width(array)
+                .and_then(|width| i64::try_from(width).ok())
+                .filter(|&width| width != 0)
+                .ok_or(Trap::Unsupported(opcode))?;
+            let displacement = element_displacement(byte_offset);
+            if displacement % width != 0 {
+                return Err(Trap::Unsupported(opcode));
+            }
+            // A step back reaches the element before, and one before the first element no element.
+            let index = i64::try_from(index)
+                .ok()
+                .and_then(|index| index.checked_add(displacement / width))
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or(Trap::Unsupported(opcode))?;
+            Ok(Location::Element { array, index, byte_offset: 0 })
+        }
+        Location::StaticBytes { slot, byte_offset: 0 } => Ok(Location::Static { slot }),
+        Location::StaticBytes { .. } => Err(Trap::Unsupported(opcode)),
+        other => Ok(other),
+    }
+}
+
+/// The bits of a slot that holds a number, and how many bytes its value occupies: 4 for an `int32`
+/// (to which a slot widens every narrower integer, as a load from a 1- or 2-byte location does,
+/// ECMA-335 6th ed I.12.1.2) or a `float32`, 8 for an `int64` or a `float64`, and `native` for a
+/// native int, the size the target maps it to (ECMA-335 6th ed I.12.1.1).
+fn scalar_slot_bits(value: &Value, native: usize) -> Option<(u64, usize)> {
+    match *value {
+        Value::Int32(n) => Some((u64::from(n as u32), 4)),
+        Value::Int64(n) => Some((n as u64, 8)),
+        Value::NativeInt(n) => Some((n as u64, native)),
+        #[cfg(feature = "float")]
+        Value::Single(f) => Some((u64::from(f.to_bits()), 4)),
+        #[cfg(feature = "float")]
+        Value::Float(f) => Some((f.to_bits(), 8)),
+        _ => None,
+    }
+}
+
+/// Reads an `ldind.<type>` at the address of a VALUE slot (a local, argument, field, element or
+/// static) holding `value`; a read through a pointer moved inside a slot is refused before it gets
+/// here. ECMA-335 6th ed III.3.42 loads a value of the instruction's type from the address, and
+/// ECMA-334 2nd ed 25.4 allows converting `&variable` to another pointer type and points a `byte*` at
+/// the variable's lowest-addressed byte. A local or an argument whose declared kind the loader
+/// recorded is read through [`load_from_declared_slot`] before this, and an array whose elements are
+/// packed through [`load_from_packed_element`]. Any other slot holds a typed value rather than bytes,
+/// so a read answers only where the bytes it names are the value's own bits, taken in little-endian
+/// order, the byte order of every target this runs on (ECMA-335 6th ed I.12.6.3 leaves it to the
+/// target):
+///
+/// - a read of the slot's own type is its value, and a read of another integer type as wide as the
+///   slot's integer value is its bits (`*(uint*)&i` of an `int`; `*(long*)&p` of a pointer where the
+///   target's native int is 8 bytes, ECMA-335 6th ed I.12.1.1);
+/// - a `byte`- or `short`-wide read of an `int32` or a native int is its lowest-addressed byte or two;
+/// - at a local's or an argument's own address (`variable`), and nowhere else, an `int32` read as a
+///   `float32` and an `int64` read as a `float64` are the floating values with those bits, and each of
+///   those floating values read as the integer of its own width is its bits (`*(float*)&bits` of a
+///   `uint`, `*(ulong*)&d` of a `double`).
+///
+/// Every other read is refused: a number read as another kind at a field, a static, an array element
+/// or a string's code unit; a narrower read of an `int64`; an `int32`-wide read of a native int wider
+/// than four bytes; a
+/// floating value read at another width, as a local or an argument may hold a floating value in a
+/// representation other than its nominal type (ECMA-335 6th ed I.12.1.3 and III.1.1.1); and a read
+/// past the slot's value or past `declared`, the slot's width when the model records it (an element
+/// of a typed value array, and a pinned string's UTF-16 code unit, 2 bytes, ECMA-335 6th ed
+/// III.1.1.3; an `ldind` through a pinned string reads its bytes before this,
+/// [`load_from_string_chars`]). A
+/// local, an argument, a static and a field record no width here, and a narrower integer in one is
+/// held widened to `int32` (ECMA-335 6th ed I.12.1.2), so a read wider than a `byte` or `short`
+/// variable but inside its slot answers from the widened value. Past a local, an argument or a static
+/// the bytes it reads are not the variable's; past a field they are other fields of its struct or
+/// object (in a type of sequential layout, the fields declared after it, ECMA-335 6th ed II.10.1.2),
+/// which such a read does not see. A value that is not a number passes through unchanged only to the read
+/// that moves it whole: any value to `ldobj` (ECMA-335 6th ed III.4.13), an object reference or a
+/// pointer to `ldind.ref`, and a pointer to `ldind.i` (ECMA-335 6th ed III.3.42 and I.12.1.1). A
+/// numeric read of a struct, a reference or a pointer is refused, as is `ldind.r4` or `ldind.r8` on a
+/// build without floating point.
+fn load_from_slot(value: Value, opcode: Opcode, declared: Option<usize>, variable: bool) -> Result<Value, Trap> {
+    load_from_slot_at(value, opcode, crate::native_pointer_size() as usize, declared, variable)
+}
+
+/// Whether `slot` is a local's or an argument's own address, the one slot at which [`load_from_slot`]
+/// reads a number as another kind of number.
+fn is_variable_address(slot: &Location) -> bool {
+    matches!(
+        slot,
+        Location::Local { .. }
+            | Location::Arg { .. }
+            | Location::LocalBytes { byte_offset: 0, .. }
+            | Location::ArgBytes { byte_offset: 0, .. }
+    )
+}
+
+/// The storage width of `slot` when the model records it: an array element's, when the array
+/// records its element width, and a pinned string's UTF-16 code unit, 2 bytes (ECMA-335 6th ed
+/// III.1.1.3: a char occupies 2 bytes and is a UTF-16 code unit).
+fn declared_width(vm: &Vm, slot: &Location) -> Option<usize> {
+    match slot {
+        Location::Element { array, .. } => vm.heap().array_declared_element_width(*array),
+        Location::StringChar { .. } => Some(2),
+        _ => None,
+    }
+}
+
+/// [`load_from_slot`] for a target whose native int is `native` bytes wide: `ldind.i` reads a native
+/// int, as wide as the target maps it (ECMA-335 6th ed I.12.1.1 and III.3.42), and decodes four bytes
+/// as [`stack_loaded_value_at`] does.
+fn load_from_slot_at(value: Value, opcode: Opcode, native: usize, declared: Option<usize>, variable: bool) -> Result<Value, Trap> {
+    // `ldobj` copies a whole value of any type and `ldind.ref` an object reference (ECMA-335 6th ed
+    // III.4.13 and III.3.42), so neither has a width of its own. A pointer is as wide as an object
+    // reference (ECMA-335 6th ed I.12.1.1), so `ldind.ref` of a pointer variable is its own value too.
+    // `ldind.r4` and `ldind.r8` have no width on a build without floating point, and are refused there.
+    let Some(width) = indirect_width_at(opcode, native) else {
+        return match (opcode, &value) {
+            (Opcode::Ldobj, _)
+            | (Opcode::LdindRef, Value::Object(_) | Value::Null | Value::ByRef(_) | Value::NativeInt(_)) => Ok(value),
+            _ => Err(Trap::Unsupported(opcode)),
+        };
+    };
+    // A pointer variable read as a native int is its own value (ECMA-335 6th ed I.12.1.1.1 treats an
+    // unmanaged pointer as a native unsigned int). Any other value that is not a number (a struct, a
+    // reference) is refused for a numeric read.
+    let Some((bits, size)) = scalar_slot_bits(&value, native) else {
+        return match (opcode, &value) {
+            (Opcode::LdindI, Value::ByRef(_) | Value::Null) => Ok(value),
+            _ => Err(Trap::Unsupported(opcode)),
+        };
+    };
+    // A slot read here records no declared type (a local or an argument with one is read through
+    // [`load_from_declared_slot`]), so the value's tag stands in for it: an `Int32` holds at most 4
+    // bytes, an `Int64` 8, a native int the target's native size. An array that records its element
+    // width bounds the read by it too: a packed `byte[]` element is one byte, though its value is held
+    // widened to int32 (ECMA-335 6th ed I.12.1.2: a load from a 1- or 2-byte location expands to 4
+    // bytes). Every answer below is inside both bounds.
+    if width > declared.map_or(size, |declared| declared.min(size)) {
+        return Err(Trap::Unsupported(opcode));
+    }
+    if !answers_from_slot_value(&value, opcode, width, size, variable) {
+        return Err(Trap::Unsupported(opcode));
+    }
+    // A native int variable read as a native int is read at its own width (ECMA-335 6th ed I.12.1.1
+    // and III.3.42), so its value is kept in the form it holds rather than decoded from its bytes,
+    // which on a 4-byte target cannot say which form was stored.
+    if opcode == Opcode::LdindI && matches!(value, Value::NativeInt(_)) {
+        return Ok(value);
+    }
+    stack_loaded_value_at(opcode, bits.to_le_bytes(), native)
+}
+
+/// Whether an `ldind` `width` bytes wide answers from the bits of `value`, a number `size` bytes wide
+/// held at a local's or an argument's own address when `variable` is set; [`load_from_slot`] lists the
+/// reads that answer. A read of a number as another kind answers only at such an address and only at
+/// the value's own width; a narrower read of the same kind only takes a byte or two of an `int32` or a
+/// native int, and a floating value is read only at its own width.
+fn answers_from_slot_value(value: &Value, opcode: Opcode, width: usize, size: usize, variable: bool) -> bool {
+    if matches!(opcode, Opcode::LdindR4 | Opcode::LdindR8) != holds_floating(value) {
+        return variable
+            && match (value, opcode) {
+                (Value::Int32(_), Opcode::LdindR4) | (Value::Int64(_), Opcode::LdindR8) => true,
+                #[cfg(feature = "float")]
+                (Value::Single(_), Opcode::LdindI4 | Opcode::LdindU4) | (Value::Float(_), Opcode::LdindI8) => true,
+                _ => false,
+            };
+    }
+    width == size
+        || matches!(opcode, Opcode::LdindI1 | Opcode::LdindU1 | Opcode::LdindI2 | Opcode::LdindU2)
+            && matches!(value, Value::Int32(_) | Value::NativeInt(_))
+}
+
+/// Whether `value` is a floating value, a `float32` or a `float64`.
+fn holds_floating(value: &Value) -> bool {
+    match value {
+        #[cfg(feature = "float")]
+        Value::Single(_) | Value::Float(_) => true,
+        _ => false,
     }
 }
 
@@ -4963,6 +6656,43 @@ fn read_enum_value(
         Value::Int32(n) => Some(i64::from(n)),
         Value::Int64(n) => Some(n),
         _ => None,
+    }
+}
+
+/// `value`, an enum's value as its storage holds it, with the sign of the enum's declared underlying
+/// type `cast` (ECMA-335 6th ed II.14.3): an unsigned type's bits zero-extended, so a uint enum's
+/// 0xFFFFFFFF is 4294967295, and a signed type's sign-extended. An eight-byte type leaves it as it is.
+#[cfg(feature = "bcl")]
+fn with_declared_sign(cast: CastPrim, value: i64) -> i64 {
+    match cast {
+        CastPrim::I1 => i64::from(value as i8),
+        CastPrim::U1 | CastPrim::Bool => i64::from(value as u8),
+        CastPrim::I2 => i64::from(value as i16),
+        CastPrim::U2 | CastPrim::Char => i64::from(value as u16),
+        CastPrim::I4 => i64::from(value as i32),
+        CastPrim::U4 => i64::from(value as u32),
+        _ => value,
+    }
+}
+
+/// Refuses, as `callvirt`, a `constrained.` call whose receiver pointer names a variable, a field, an
+/// element or a static the loader recorded with another storage than the constraint type's: a pointer
+/// cast from it (`((E*)&n)->ToString()` of a `long n`), whose bytes this interpreter does not read as the
+/// constraint type. Where nothing is recorded the call goes on as before. `frame` runs at `frame_index`
+/// above `callers`.
+#[allow(clippy::too_many_arguments)]
+fn refuse_cast_receiver(
+    frame: &Frame, frame_index: usize, callers: &[Frame], vm: &Vm, module: &Module, location: &Location, asm: u8, constraint: Token,
+) -> Result<(), Trap> {
+    if let Location::Element { array, index, byte_offset } = *location
+        && array_element_index(vm, array, index, byte_offset).is_none()
+    {
+        return Err(Trap::Unsupported(Opcode::Callvirt));
+    }
+    let method_of = |index: usize| if index == frame_index { Some(frame.method) } else { callers.get(index).map(|caller| caller.method) };
+    match (declared_storage_at(&method_of, vm, module, location), obj_storage(module, asm, constraint)) {
+        (Some(declared), Some(own)) if declared != own => Err(Trap::Unsupported(Opcode::Callvirt)),
+        _ => Ok(()),
     }
 }
 
@@ -4990,10 +6720,11 @@ fn read_constrained_receiver(
             array,
             index,
             byte_offset,
-        } => vm
-            .heap()
-            .array_get(*array, array_element_index(vm, *array, *index, *byte_offset)),
+        } => array_element_index(vm, *array, *index, *byte_offset).and_then(|element| vm.heap().array_get(*array, element)),
         Location::Static { slot } => vm.static_field(*slot),
+        Location::LocalBytes { frame: f, slot, byte_offset: 0 } => containing_frame(*f)?.locals.get(*slot).cloned(),
+        Location::ArgBytes { frame: f, slot, byte_offset: 0 } => containing_frame(*f)?.args.get(*slot).cloned(),
+        Location::StaticBytes { slot, byte_offset: 0 } => vm.static_field(*slot),
         Location::Boxed { object } => vm.heap().boxed_value(*object),
         Location::Nested { base, slot } => {
             match read_constrained_receiver(frame, frame_index, callers, vm, base) {
@@ -5080,12 +6811,8 @@ fn string_value_ctor_form(module: &Module, method: MethodId) -> Option<StringVal
     }
 }
 
-#[cfg(not(feature = "bcl"))]
-fn string_value_ctor_form(_module: &Module, _method: MethodId) -> Option<StringValueCtor> {
-    None
-}
-
 /// The three SAFE String constructors, by the shape of their arguments.
+#[cfg(feature = "bcl")]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum StringValueCtor {
     /// `String(char[])` -- every code unit of the array.
@@ -5102,6 +6829,7 @@ enum StringValueCtor {
 /// range runs past the array is a caller mistake, and answering it with a shorter string hands back
 /// something well formed and wrong -- the far end has no way to tell it from a string that was
 /// always that length, which is the same reasoning the frame codec refuses an over-long payload on.
+#[cfg(feature = "bcl")]
 fn build_string_value(
     vm: &mut Vm,
     args: &[Value],
@@ -5381,6 +7109,7 @@ fn new_frame(vm: &mut Vm, module: &Module, id: MethodId, args: Vec<Value>) -> Re
         Some(MethodKind::Managed) => {
             let mut frame = vm.frame_pool.revive(id, MethodContext::of(module, id), args);
             frame.prepare_for_handlers(eh_clause_count(module, id));
+            declare_frame(&mut frame, module, id);
             Ok(frame)
         }
         _ => Err(Trap::NoSuchMethod(id)),
@@ -5394,6 +7123,7 @@ fn new_frame_cold(module: &Module, id: MethodId, args: Vec<Value>) -> Result<Fra
         Some(MethodKind::Managed) => {
             let mut frame = Frame::new(id, MethodContext::of(module, id), args);
             frame.prepare_for_handlers(eh_clause_count(module, id));
+            declare_frame(&mut frame, module, id);
             Ok(frame)
         }
         _ => Err(Trap::NoSuchMethod(id)),
@@ -6056,6 +7786,12 @@ pub(crate) fn check_alloc_budget(vm: &Vm) -> Result<(), Trap> {
 /// element type's zero, and does it pack" would be two answers to a question whose wrong answer is
 /// silent -- an array of nulls where .NET has zeroed structs reads as working code until an
 /// element is used.
+///
+/// The element type's kind is the one the loader bound to `token`, an enum's underlying integer's, or,
+/// where neither applies, that of the built-in value type `token` names ([`builtin_storage`]): a
+/// generic body's `new T[n]` at `T = int` names `System.Int32` through the token its `T` was
+/// rewritten to, and the array it makes is an `int[]` (ECMA-335 6th ed III.4.20), packed as a written
+/// `new int[n]` is. A native int's elements are the executing target's pointer width (I.12.1.1).
 pub(crate) fn alloc_array_of_element(
     vm: &mut Vm,
     module: &Module,
@@ -6063,9 +7799,21 @@ pub(crate) fn alloc_array_of_element(
     token: Token,
     length: usize,
 ) -> ObjectRef {
+    use crate::module::FieldStorage;
     let element_type = asm_key(asm, token.0);
-    match module.array_prim_kind(asm, token) {
-        Some(kind) if kind.packable() => vm.heap_mut().alloc_packed_array(kind, length, element_type),
+    // An enum's storage is its underlying integer's (ECMA-335 6th ed II.14.3), so its array packs as
+    // that integer's does, and a pointer into it reads and writes those bytes.
+    let kind = module
+        .array_prim_kind(asm, token)
+        .or_else(|| module.enum_underlying_prim_by_handle(element_type).and_then(CastPrim::prim_kind));
+    let builtin = match kind {
+        Some(kind) => Some(FieldStorage::Primitive(kind)),
+        None => module.type_id_of(asm, token).and_then(|id| builtin_storage(module, id)),
+    };
+    match builtin {
+        Some(FieldStorage::Primitive(kind)) if kind.packable() => {
+            vm.heap_mut().alloc_packed_array(kind, length, element_type)
+        }
         _ => {
             let default = match module.array_default(asm, token) {
                 Some(default) => default,
@@ -6078,19 +7826,65 @@ pub(crate) fn alloc_array_of_element(
             };
             // Preserve the declared storage size independently of the reduced value slots.
             // A reference to a type in another assembly uses that type's defining handle.
-            let element_width = module.type_size(asm, token).or_else(|| {
-                let canonical = module.canonical_type_handle(element_type)?;
-                module.type_size((canonical >> 32) as u8, Token(canonical as u32))
-            }).or_else(|| {
-                let type_id = module.type_id_of(asm, token)?;
-                module.type_is_value_type(type_id).then_some(type_id)
-                    .and_then(|id| module.type_field_offsets(id)).map(|layout| layout.end())
-            }).map(|size| size as usize);
+            let element_width = if matches!(builtin, Some(FieldStorage::Native)) {
+                Some(crate::native_pointer_size() as usize)
+            } else {
+                module.type_size(asm, token).or_else(|| {
+                    let canonical = module.canonical_type_handle(element_type)?;
+                    module.type_size((canonical >> 32) as u8, Token(canonical as u32))
+                }).or_else(|| {
+                    let type_id = module.type_id_of(asm, token)?;
+                    module.type_is_value_type(type_id).then_some(type_id)
+                        .and_then(|id| module.type_field_offsets(id)).map(|layout| layout.end())
+                }).map(|size| size as usize)
+            };
             vm.heap_mut().alloc_array_with_element_width(
                 alloc::vec![default; length], element_type, element_width,
             )
         }
     }
+}
+
+/// Allocates the rectangular array the constructor `token` in assembly `asm` creates, with the
+/// lengths `dims`. Its elements are of its element type (ECMA-335 6th ed I.8.9.1) and start at that
+/// type's zero (II.13.2): a sized primitive or an enum (its underlying integer, II.14.3) is packed as
+/// a vector's elements are; an unmanaged pointer or a native int starts as the native int 0, the null
+/// pointer (I.12.1.1.1); a struct as its zero instance; a reference as null. An element type the
+/// loader recorded no shape for, or a generic value type, starts as the int32 0.
+fn alloc_md_array_of_element(vm: &mut Vm, module: &Module, asm: u8, token: Token, dims: Vec<i32>) -> ObjectRef {
+    let array_type = asm_key(asm, token.0);
+    let element = match module.cast_elem(array_type) {
+        Some(CastElem::MdArray { element, .. }) => Some(*element),
+        _ => None,
+    };
+    let kind = match &element {
+        Some(CastElem::Prim(prim)) => prim.prim_kind(),
+        Some(CastElem::Named(handle)) => module.enum_underlying_prim_by_handle(*handle).and_then(CastPrim::prim_kind),
+        _ => None,
+    };
+    if let Some(kind) = kind.filter(|kind| kind.packable()) {
+        return vm.heap_mut().alloc_md_array_packed(dims, kind, array_type);
+    }
+    let zero = match element {
+        Some(CastElem::Prim(CastPrim::I | CastPrim::U) | CastElem::Pointer(_)) => Value::NativeInt(0),
+        Some(CastElem::Named(handle)) if kind.is_none() => match module.type_id_by_handle(handle) {
+            Some(id) if module.type_is_value_type(id) => module
+                .type_field_defaults(id)
+                .map_or(Value::Int32(0), |fields| Value::Struct(fields.into_boxed_slice())),
+            Some(_) => Value::Null,
+            None => Value::Int32(0),
+        },
+        Some(
+            CastElem::String
+            | CastElem::Object
+            | CastElem::Array(_)
+            | CastElem::MdArray { .. }
+            | CastElem::VectorInterface(_)
+            | CastElem::Lenient,
+        ) => Value::Null,
+        _ => Value::Int32(0),
+    };
+    vm.heap_mut().alloc_md_array_of(dims, zero, array_type)
 }
 
 fn step(
@@ -6157,12 +7951,26 @@ fn step(
         Opcode::Ldloc2 => frame.load_local(2),
         Opcode::Ldloc3 => frame.load_local(3),
         Opcode::LdlocS | Opcode::Ldloc => frame.load_local(var_operand(instruction)?),
-        Opcode::Stloc0 => frame.store_local(0)?,
-        Opcode::Stloc1 => frame.store_local(1)?,
-        Opcode::Stloc2 => frame.store_local(2)?,
-        Opcode::Stloc3 => frame.store_local(3)?,
-        Opcode::StlocS | Opcode::Stloc => frame.store_local(var_operand(instruction)?)?,
-        Opcode::StargS | Opcode::Starg => frame.store_arg(var_operand(instruction)?)?,
+        Opcode::Stloc0 | Opcode::Stloc1 | Opcode::Stloc2 | Opcode::Stloc3 | Opcode::StlocS | Opcode::Stloc => {
+            let slot = match opcode {
+                Opcode::Stloc0 => 0,
+                Opcode::Stloc1 => 1,
+                Opcode::Stloc2 => 2,
+                Opcode::Stloc3 => 3,
+                _ => var_operand(instruction)?,
+            };
+            if let Some(module) = module {
+                declare_top(frame, |method| module.method_local_kind(method, usize::from(slot)));
+            }
+            frame.store_local(slot)?;
+        }
+        Opcode::StargS | Opcode::Starg => {
+            let slot = var_operand(instruction)?;
+            if let Some(module) = module {
+                declare_top(frame, |method| module.method_arg_kind(method, usize::from(slot)));
+            }
+            frame.store_arg(slot)?;
+        }
         Opcode::LdlocaS | Opcode::Ldloca => frame.stack.push(Value::ByRef(Location::Local {
             frame: frame_index,
             slot: var_operand(instruction)? as usize,
@@ -6184,6 +7992,7 @@ fn step(
         | Opcode::MulOvf
         | Opcode::MulOvfUn => {
             let (a, b) = frame.pop2()?;
+            let (a, b) = variable_bytes_pair(module, frame.method, frame_index, callers, a, b);
             let result = match stack_pointer_arithmetic(vm.heap(), opcode, &a, &b)? {
                 Some(pointer) => pointer,
                 None if matches!(a, Value::ByRef(_)) || matches!(b, Value::ByRef(_)) => {
@@ -6285,7 +8094,8 @@ fn step(
 
         Opcode::Ceq | Opcode::Cgt | Opcode::CgtUn | Opcode::Clt | Opcode::CltUn => {
             let (a, b) = frame.pop2()?;
-            let result = compare(vm.heap(), opcode, a, b)?;
+            let (a, b) = variable_bytes_pair(module, frame.method, frame_index, callers, a, b);
+            let result = compare(vm.heap(), &field_offset_in(module, vm, frame.method, frame_index, callers), opcode, a, b)?;
             frame.stack.push(Value::Int32(i32::from(result)));
         }
 
@@ -6323,7 +8133,8 @@ fn step(
         | Opcode::BltUn
         | Opcode::BltUnS => {
             let (a, b) = frame.pop2()?;
-            if compare(vm.heap(), opcode, a, b)? {
+            let (a, b) = variable_bytes_pair(module, frame.method, frame_index, callers, a, b);
+            if compare(vm.heap(), &field_offset_in(module, vm, frame.method, frame_index, callers), opcode, a, b)? {
                 frame.ip = branch_target(instruction, code_len)?;
             }
         }
@@ -6455,10 +8266,17 @@ fn step(
                     let handle = asm_key(asm, constraint.0);
                     let enum_value = match args.first() {
                         Some(Value::ByRef(location)) => {
+                            refuse_cast_receiver(frame, frame_index, callers, vm, module, location, asm, constraint)?;
                             read_enum_value(frame, frame_index, callers, vm, location.clone())
                         }
                         _ => None,
                     };
+                    let unread = enum_value.is_none() && matches!(args.first(), Some(Value::ByRef(_)));
+                    let declared = module
+                        .type_id_of(asm, constraint)
+                        .and_then(|id| module.type_handle_of(id))
+                        .and_then(|handle| module.enum_underlying_prim_by_handle(handle));
+                    let enum_value = enum_value.map(|value| declared.map_or(value, |cast| with_declared_sign(cast, value)));
                     if let Some(value) = enum_value {
                         if let Some(name) = module.enum_name_or_flags(handle, value, false) {
                             let string = vm.heap_mut().alloc_text(&name);
@@ -6471,6 +8289,9 @@ fn step(
                             return Ok(Flow::Next);
                         }
                     }
+                    if unread && module.is_enum_by_handle(handle) {
+                        return Err(Trap::Unsupported(Opcode::Callvirt));
+                    }
                     if let Some(name) = module.type_name_by_handle(handle) {
                         let string = vm.heap_mut().alloc_text(name);
                         frame.stack.push(Value::Object(string));
@@ -6481,6 +8302,7 @@ fn step(
             if let Some(constraint) = constraint {
                 if !module.method_declares_value_type(method) {
                     if let Some(Value::ByRef(location)) = args.first().cloned() {
+                        refuse_cast_receiver(frame, frame_index, callers, vm, module, &location, asm, constraint)?;
                         match read_constrained_receiver(frame, frame_index, callers, vm, &location) {
                             None => {}
                             Some(value @ (Value::Object(_) | Value::Null)) => args[0] = value,
@@ -6592,7 +8414,7 @@ fn step(
                     })
                     .collect();
                 vm.frame_pool.give_values(lengths);
-                let array = vm.heap_mut().alloc_md_array_typed(dims, asm_key(asm, token.0));
+                let array = alloc_md_array_of_element(vm, module, asm, token, dims);
                 frame.stack.push(Value::Object(array));
                 return Ok(Flow::Next);
             }
@@ -6652,6 +8474,7 @@ fn step(
                     length,
                 });
             }
+            #[cfg(feature = "bcl")]
             if let Some(form) = string_value_ctor_form(module, ctor) {
                 let arity = match form {
                     StringValueCtor::WholeArray => 1,
@@ -6735,6 +8558,12 @@ fn step(
                 .field_slot(asm, token)
                 .ok_or_else(|| unresolved_field(module, asm, token))?;
             let value = frame.pop()?;
+            let value = if depends_on_slot_kind(&value) {
+                let storage = module.field_type(asm, token).and_then(|owner| module.type_field_storage(owner, slot as usize));
+                stored_at_storage(storage, value)
+            } else {
+                value
+            };
             match frame.pop()? {
                 Value::Object(object) => {
                     if !vm.heap_mut().set_instance_field(object, slot, value) {
@@ -6835,7 +8664,7 @@ fn step(
             }
         }
         Opcode::Ldobj => match frame.pop()? {
-            Value::ByRef(location) => return Ok(Flow::LoadObj { location, opcode }),
+            Value::ByRef(location) => return Ok(Flow::LoadObj { location, opcode, token: token_operand(instruction)? }),
             other @ (Value::Struct(_) | Value::Object(_)) => frame.stack.push(other),
             Value::Null => return Err(Trap::NullReference),
             _ => return Err(Trap::TypeMismatch(Opcode::Ldobj)),
@@ -6843,7 +8672,7 @@ fn step(
         Opcode::Stobj => {
             let value = frame.pop()?;
             match frame.pop()? {
-                Value::ByRef(location) => return Ok(Flow::StoreObj { location, value }),
+                Value::ByRef(location) => return Ok(Flow::StoreObj { location, value, opcode, token: token_operand(instruction)? }),
                 Value::Null => return Err(Trap::NullReference),
                 _ => return Err(Trap::TypeMismatch(Opcode::Stobj)),
             }
@@ -6897,10 +8726,18 @@ fn step(
                     .ok_or(Trap::NullReference)?;
                 frame.stack.push(stack_loaded_value(opcode, raw)?);
             }
-            Value::ByRef(location) => return Ok(Flow::LoadObj { location, opcode }),
+            Value::ByRef(location) => return Ok(Flow::LoadObj { location, opcode, token: Token(0) }),
             Value::Null => return Err(Trap::NullReference),
             _ => return Err(Trap::TypeMismatch(Opcode::LdindI4)),
         },
+        // stind.i1 / stind.i2 store the value's low 8 / 16 bits, as a store into a 1- or 2-byte location
+        // truncates to fit (ECMA-335 6th ed I.12.1.2 and III.3.62); raw `stackalloc` memory takes exactly
+        // those bytes, and so does a local or an argument whose declared kind the loader recorded, into
+        // its declared bytes ([`store_into_declared_slot`]), and an array whose elements are packed, into
+        // its bytes at the address ([`store_into_packed_element`]). Any other value slot takes the value
+        // as an `int32` in place of its whole value ([`narrow_stored_int`]). stind.r4 / stind.r8 store a float32 / float64, rounding a floating
+        // value of the other width (ECMA-335 6th ed III.3.62) and refusing any other value
+        // ([`stored_at_instruction_width`]); the others store the value as it is.
         Opcode::StindI1 | Opcode::StindI2 => {
             let value = frame.pop()?;
             match frame.pop()? {
@@ -6927,7 +8764,7 @@ fn step(
                 }
                 Value::ByRef(location) => {
                     let value = narrow_stored_int(value, opcode);
-                    return Ok(Flow::StoreObj { location, value });
+                    return Ok(Flow::StoreObj { location, value, opcode, token: Token(0) });
                 }
                 Value::Null => return Err(Trap::NullReference),
                 _ => return Err(Trap::TypeMismatch(Opcode::StindI4)),
@@ -6962,7 +8799,10 @@ fn step(
                     };
                     store_stack_indirect(frame, frame_index, opcode, location, value)?;
                 }
-                Value::ByRef(location) => return Ok(Flow::StoreObj { location, value }),
+                Value::ByRef(location) => {
+                    let value = stored_at_instruction_width(value, opcode)?;
+                    return Ok(Flow::StoreObj { location, value, opcode, token: Token(0) });
+                }
                 Value::Null => return Err(Trap::NullReference),
                 _ => return Err(Trap::TypeMismatch(Opcode::StindI4)),
             }
@@ -7005,6 +8845,7 @@ fn step(
                 }
             }
             let value = frame.pop()?;
+            let value = if depends_on_slot_kind(&value) { stored_at_storage(module.static_storage(slot), value) } else { value };
             if vm.statics_len() < module.static_field_count() {
                 vm.init_statics(&module.decode_static_defaults());
             }
@@ -7630,12 +9471,18 @@ fn block_byte(value: Value) -> u8 {
 /// for `ldind.ref` / `stind.ref`, which move an object reference rather than raw bytes
 /// (a `Location::Stack` pointer carries no object reference, so those do not apply to it).
 fn indirect_width(opcode: Opcode) -> Option<usize> {
+    indirect_width_at(opcode, crate::native_pointer_size() as usize)
+}
+
+/// [`indirect_width`] for a target whose native int is `native` bytes wide: `ldind.i` and
+/// `stind.i` move a native int, as wide as the target maps it (ECMA-335 6th ed I.12.1.1).
+fn indirect_width_at(opcode: Opcode, native: usize) -> Option<usize> {
     match opcode {
         Opcode::LdindI1 | Opcode::LdindU1 | Opcode::StindI1 => Some(1),
         Opcode::LdindI2 | Opcode::LdindU2 | Opcode::StindI2 => Some(2),
         Opcode::LdindI4 | Opcode::LdindU4 | Opcode::StindI4 => Some(4),
         Opcode::LdindI8 | Opcode::StindI8 => Some(8),
-        Opcode::LdindI | Opcode::StindI => Some(8),
+        Opcode::LdindI | Opcode::StindI => Some(native),
         #[cfg(feature = "float")]
         Opcode::LdindR4 | Opcode::StindR4 => Some(4),
         #[cfg(feature = "float")]
@@ -7648,7 +9495,23 @@ fn indirect_width(opcode: Opcode) -> Option<usize> {
 /// stack value the typed opcode yields -- sign- or zero-extending a sub-`int32` integer
 /// to `int32` (III.1.6), and producing the wider integer / native / float types directly.
 fn stack_loaded_value(opcode: Opcode, raw: [u8; 8]) -> Result<Value, Trap> {
+    stack_loaded_value_at(opcode, raw, crate::native_pointer_size() as usize)
+}
+
+/// [`stack_loaded_value`] for a target whose native int is `native` bytes wide (ECMA-335 6th ed
+/// I.12.1.1). The interpreter keeps a native int in 64 bits, and on a 4-byte target the same 32-bit
+/// value has two forms there: `conv.u` zero-extends it and `conv.i` sign-extends it (ECMA-335 6th ed
+/// III.3.27). Four bytes below 0x80000000 are the same value in both forms; four bytes with the top
+/// bit set cannot be given back in the form they were stored in, so their `ldind.i` is refused.
+fn stack_loaded_value_at(opcode: Opcode, raw: [u8; 8], native: usize) -> Result<Value, Trap> {
     let low8 = u64::from_le_bytes(raw);
+    if opcode == Opcode::LdindI && native == 4 {
+        let word = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        if word & 0x8000_0000 != 0 {
+            return Err(Trap::Unsupported(opcode));
+        }
+        return Ok(Value::NativeInt(i64::from(word)));
+    }
     Ok(match opcode {
         Opcode::LdindI1 => Value::Int32(i32::from(raw[0] as i8)),
         Opcode::LdindU1 => Value::Int32(i32::from(raw[0])),
@@ -7968,6 +9831,14 @@ fn stack_pointer_arithmetic(
             slot: *slot,
             byte_offset: walked(*byte_offset)?,
         },
+        Location::Static { slot } => Location::StaticBytes {
+            slot: *slot,
+            byte_offset: walked(0)?,
+        },
+        Location::StaticBytes { slot, byte_offset } => Location::StaticBytes {
+            slot: *slot,
+            byte_offset: walked(*byte_offset)?,
+        },
         _ => return Ok(None),
     };
     Ok(Some(Value::ByRef(stepped)))
@@ -8132,9 +10003,9 @@ fn field_walk_start<'v, 'm>(
 
 /// Whether a managed pointer is one of the byte-addressed kinds that pointer arithmetic
 /// walks: a `localloc` (`stackalloc`) buffer pointer, a pinned-array element pointer, a
-/// pinned-string character pointer, or the address of a frame local/argument (which
-/// arithmetic promotes to its `*Bytes` displaced form). A heap field/static/box pointer
-/// is not byte-addressed.
+/// pinned-string character pointer, or the address of a frame local/argument or a static
+/// (which arithmetic promotes to its `*Bytes` displaced form). A heap field's or a box's
+/// pointer is not byte-addressed here.
 fn is_raw_pointer(location: &Location) -> bool {
     matches!(
         location,
@@ -8145,6 +10016,8 @@ fn is_raw_pointer(location: &Location) -> bool {
             | Location::Arg { .. }
             | Location::LocalBytes { .. }
             | Location::ArgBytes { .. }
+            | Location::Static { .. }
+            | Location::StaticBytes { .. }
     )
 }
 
@@ -8155,6 +10028,9 @@ fn is_raw_pointer(location: &Location) -> bool {
 fn raw_pointer_byte_difference(heap: &Heap, a: &Location, b: &Location) -> Option<i64> {
     if let (Some((base_a, off_a)), Some((base_b, off_b))) = (slot_pointer(a), slot_pointer(b)) {
         return (base_a == base_b).then(|| i64::from(off_a) - i64::from(off_b));
+    }
+    if let (Some((slot_a, off_a)), Some((slot_b, off_b))) = (static_pointer(a), static_pointer(b)) {
+        return (slot_a == slot_b).then(|| element_displacement(off_a) - element_displacement(off_b));
     }
     if let (Some((base_a, off_a)), Some((base_b, off_b))) =
         (array_pointer(heap, a), array_pointer(heap, b))
@@ -8210,6 +10086,9 @@ fn pointer_compare(heap: &Heap, a: &Location, b: &Location) -> core::cmp::Orderi
     if let (Some((base_a, off_a)), Some((base_b, off_b))) = (slot_pointer(a), slot_pointer(b)) {
         return base_a.cmp(&base_b).then(off_a.cmp(&off_b));
     }
+    if let (Some((slot_a, off_a)), Some((slot_b, off_b))) = (static_pointer(a), static_pointer(b)) {
+        return slot_a.cmp(&slot_b).then(element_displacement(off_a).cmp(&element_displacement(off_b)));
+    }
     if let (Some(a), Some(b)) = (array_pointer(heap, a), array_pointer(heap, b)) {
         return a.cmp(&b);
     }
@@ -8220,7 +10099,7 @@ fn pointer_compare(heap: &Heap, a: &Location, b: &Location) -> core::cmp::Orderi
             Location::Stack { .. } => 2,
             Location::Element { .. } => 3,
             Location::Field { .. } => 4,
-            Location::Static { .. } => 5,
+            Location::Static { .. } | Location::StaticBytes { .. } => 5,
             Location::Boxed { .. } => 6,
             Location::Nested { .. } => 7,
             Location::StringChar { .. } => 8,
@@ -8288,7 +10167,8 @@ fn pointer_compare(heap: &Heap, a: &Location, b: &Location) -> core::cmp::Orderi
 }
 
 /// An array pointer's byte displacement from the start of its array. The element
-/// index and an arithmetic offset can name the same address in different ways.
+/// index and an arithmetic offset, forward or back ([`element_displacement`]), can name
+/// the same address in different ways.
 fn array_pointer(heap: &Heap, location: &Location) -> Option<(ObjectRef, u64)> {
     let Location::Element {
         array,
@@ -8298,7 +10178,7 @@ fn array_pointer(heap: &Heap, location: &Location) -> Option<(ObjectRef, u64)> {
         return None;
     };
     let width = heap.array_element_width(*array)? as u64;
-    let offset = (*index as u64).wrapping_mul(width).wrapping_add(u64::from(*byte_offset));
+    let offset = (*index as u64).wrapping_mul(width).wrapping_add(element_displacement(*byte_offset) as u64);
     Some((*array, offset))
 }
 
@@ -8320,6 +10200,87 @@ fn slot_pointer(location: &Location) -> Option<((bool, usize, usize), u32)> {
             slot,
             byte_offset,
         } => Some(((false, *frame, *slot), *byte_offset)),
+        _ => None,
+    }
+}
+
+/// The storage a pointer is into, as `(kind, a, b)`: a frame's local or argument, a frame's `localloc`
+/// buffer, a heap object (an array, a string, a class instance or a box) or a static. A field's
+/// address ([`Location::Nested`]) is into its container's storage.
+fn pointer_storage(location: &Location) -> (u8, usize, usize) {
+    match location {
+        Location::Local { frame, slot } | Location::LocalBytes { frame, slot, .. } => (0, *frame, *slot),
+        Location::Arg { frame, slot } | Location::ArgBytes { frame, slot, .. } => (1, *frame, *slot),
+        Location::Stack { frame, buffer, .. } => (2, *frame, *buffer),
+        Location::Element { array: object, .. }
+        | Location::StringChar { string: object, .. }
+        | Location::Field { object, .. }
+        | Location::Boxed { object } => (3, object.index() as usize, 0),
+        Location::Static { slot } | Location::StaticBytes { slot, .. } => (4, *slot, 0),
+        Location::Nested { base, .. } => pointer_storage(base),
+    }
+}
+
+/// Whether the pointers `a` and `b` name one place, however each was reached: the same location; one
+/// element of one array, given by an index and a byte displacement two ways (ECMA-335 6th ed I.8.9.1:
+/// the elements lie at their stride); a variable's or a static's start, given plainly and as its first
+/// byte; or one field of one such place.
+fn same_place(heap: &Heap, a: &Location, b: &Location) -> bool {
+    let plain = |location: &Location| match *location {
+        Location::LocalBytes { frame, slot, byte_offset: 0 } => Location::Local { frame, slot },
+        Location::ArgBytes { frame, slot, byte_offset: 0 } => Location::Arg { frame, slot },
+        Location::StaticBytes { slot, byte_offset: 0 } => Location::Static { slot },
+        ref other => other.clone(),
+    };
+    match (plain(a), plain(b)) {
+        (a, b) if a == b => true,
+        (
+            Location::Element { array: x, index: i, byte_offset: o },
+            Location::Element { array: y, index: j, byte_offset: p },
+        ) if x == y => heap
+            .array_declared_element_width(x)
+            .and_then(|stride| Some((element_byte_position(i, o, stride)?, element_byte_position(j, p, stride)?)))
+            .is_some_and(|(m, n)| m == n),
+        (Location::Nested { base: x, slot: s }, Location::Nested { base: y, slot: t }) => s == t && same_place(heap, &x, &y),
+        _ => false,
+    }
+}
+
+/// The byte offset within its container of the field whose address `location` is ([`Location::Nested`]),
+/// by the layout the loader recorded for the container's declared struct type ([`declared_storage_at`]).
+/// `None` for any other pointer and where no layout was recorded: the loader records none for an
+/// explicit layout or a `[StructLayout]` packing or size, whose fields' order does not say where they sit.
+fn recorded_field_offset(
+    method_of: &impl Fn(usize) -> Option<MethodId>, vm: &Vm, module: &Module, location: &Location,
+) -> Option<u32> {
+    let Location::Nested { base, slot } = location else {
+        return None;
+    };
+    let crate::module::FieldStorage::ValueType(owner) = declared_storage_at(method_of, vm, module, base)? else {
+        return None;
+    };
+    let offsets = module.type_field_offsets(owner)?;
+    let slot = *slot as usize;
+    if slot < offsets.slot_count() { offsets.offset_of(slot) } else { None }
+}
+
+/// [`recorded_field_offset`] in the frame at `frame_index`, which runs `method` above `callers`.
+fn field_offset_in<'a>(
+    module: Option<&'a Module>, vm: &'a Vm, method: MethodId, frame_index: usize, callers: &'a [Frame],
+) -> impl Fn(&Location) -> Option<u32> + 'a {
+    move |location| {
+        let method_of = |index: usize| if index == frame_index { Some(method) } else { callers.get(index).map(|frame| frame.method) };
+        recorded_field_offset(&method_of, vm, module?, location)
+    }
+}
+
+/// A static's pointer as `(slot, byte displacement)`: the static's own address at displacement 0,
+/// and [`Location::StaticBytes`] with the displacement pointer arithmetic accumulated. `None` for any
+/// other kind.
+fn static_pointer(location: &Location) -> Option<(usize, u32)> {
+    match location {
+        Location::Static { slot } => Some((*slot, 0)),
+        Location::StaticBytes { slot, byte_offset } => Some((*slot, *byte_offset)),
         _ => None,
     }
 }
@@ -8630,8 +10591,9 @@ fn relation_of(opcode: Opcode) -> Option<(Relation, bool)> {
 
 /// Evaluates a comparison or conditional branch (III.1.5, Table 13). Integers
 /// compare signed unless the unsigned variant is used; floats compare ordered,
-/// with the unordered (NaN) result chosen by the `.un` variant.
-fn compare(heap: &Heap, opcode: Opcode, a: Value, b: Value) -> Result<bool, Trap> {
+/// with the unordered (NaN) result chosen by the `.un` variant. `field_offset` gives a
+/// field's address its recorded offset in its container ([`recorded_field_offset`]).
+fn compare(heap: &Heap, field_offset: &dyn Fn(&Location) -> Option<u32>, opcode: Opcode, a: Value, b: Value) -> Result<bool, Trap> {
     let (relation, unordered_or_unsigned) = relation_of(opcode).ok_or(Trap::Unsupported(opcode))?;
     #[cfg(feature = "float")]
     if let (Some(x), Some(y)) = (as_double(&a), as_double(&b)) {
@@ -8641,6 +10603,20 @@ fn compare(heap: &Heap, opcode: Opcode, a: Value, b: Value) -> Result<bool, Trap
         return Ok(apply_relation(relation, x.partial_cmp(&y)));
     }
     if let (Value::ByRef(la), Value::ByRef(lb)) = (&a, &b) {
+        let field = |location: &Location| matches!(location, Location::Nested { .. });
+        if let (Location::Nested { base: ba, slot: sa }, Location::Nested { base: bb, slot: sb }) = (la, lb)
+            && same_place(heap, ba, bb)
+        {
+            let ordering = match (field_offset(la), field_offset(lb)) {
+                (Some(x), Some(y)) => x.cmp(&y),
+                _ if sa == sb => core::cmp::Ordering::Equal,
+                _ => return Err(Trap::Unsupported(opcode)),
+            };
+            return Ok(apply_relation(relation, Some(ordering)));
+        }
+        if (field(la) || field(lb)) && pointer_storage(la) == pointer_storage(lb) {
+            return Err(Trap::Unsupported(opcode));
+        }
         let ordering = pointer_compare(heap, la, lb);
         return Ok(apply_relation(relation, Some(ordering)));
     }
@@ -9306,6 +11282,18 @@ pub(crate) fn prim_of_full_name(full_name: &str) -> Option<CastPrim> {
     })
 }
 
+/// Whether the type `handle` names is one that no instantiation of a generic value type can be: a
+/// reference type, or a value type whose recorded full name holds no backtick, which a generic type's
+/// name marks its arity with, and no bracket, which an instantiation's name holds its type arguments
+/// in. A type the module cannot resolve, or whose name it did not record, is not known to be one.
+fn cannot_be_a_generic_value_type(module: &Module, handle: u64) -> bool {
+    let Some(type_id) = module.type_id_by_handle(handle) else {
+        return false;
+    };
+    !module.type_is_value_type(type_id)
+        || module.type_full_name(type_id).is_some_and(|name| !name.contains('`') && !name.contains('['))
+}
+
 /// Whether an operand element shape is compatible with a target element shape under `rule`.
 /// Enums normalize to their underlying primitive for array casts, storage and unboxing.
 /// Exact reference-type identity retains enum types and signedness inside nested arrays.
@@ -9329,8 +11317,13 @@ fn elem_compatible(module: &Module, op: &CastElem, target: &CastElem, rule: Elem
     let nested_rule = if rule == ElemRule::Address { ElemRule::Identity } else { rule };
     match (&op, &target) {
         (CastElem::Prim(_), CastElem::Lenient) | (CastElem::Lenient, CastElem::Prim(_)) => false,
-        (CastElem::GenericValueType, CastElem::GenericValueType | CastElem::Named(_) | CastElem::Lenient)
-        | (CastElem::Named(_) | CastElem::Lenient, CastElem::GenericValueType) => true,
+        (CastElem::GenericValueType, CastElem::Named(named)) | (CastElem::Named(named), CastElem::GenericValueType) => {
+            // The test is for array elements: under the unbox rule a named type matches, since `unbox.any` to a
+            // reference type such as `System.ValueType` or an interface reaches here with the box's shape.
+            rule == ElemRule::Unbox || !cannot_be_a_generic_value_type(module, *named)
+        }
+        (CastElem::GenericValueType, CastElem::GenericValueType | CastElem::Lenient)
+        | (CastElem::Lenient, CastElem::GenericValueType) => true,
         (CastElem::GenericValueType, _) | (_, CastElem::GenericValueType) => false,
         (CastElem::Lenient, _) | (_, CastElem::Lenient) => true,
         (CastElem::Prim(a), CastElem::Prim(b)) => {
@@ -10621,7 +12614,13 @@ mod tests {
             check_stack_struct_storage_modes(module, entry, value, expected);
         }
         let (module, entry) = stack_struct_cross_frame_program(Module::new(), FieldStorage::Native);
-        check_stack_struct_storage_modes(module, entry, Value::NativeInt(-1), Value::NativeInt(-1));
+        check_stack_struct_storage_modes(module.clone(), entry, Value::NativeInt(0x1234), Value::NativeInt(0x1234));
+        if crate::native_pointer_size() == 4 {
+            assert_eq!(super::run(&module, &mut Vm::new(), entry, vec![Value::NativeInt(-1)]),
+                Err(Trap::Unsupported(Opcode::Ldfld)));
+        } else {
+            check_stack_struct_storage_modes(module, entry, Value::NativeInt(-1), Value::NativeInt(-1));
+        }
     }
 
     #[cfg(feature = "float")]
@@ -11957,6 +13956,111 @@ mod tests {
         );
     }
 
+    fn generic_array_module(name: &str, zero: Value) -> (Module, Token, TypeId) {
+        let definition = Token::new(0x02, 3);
+        let synthetic = Token::new(0x7E, 1);
+        let mut module = Module::new();
+        let element = module.add_type(Vec::new());
+        module.set_type_is_value_type(element, true);
+        module.bind_type_token(1, definition, element);
+        module.bind_type_full_name(element, name.into());
+        module.set_type_size(1, definition, 0);
+        module.bind_type_token(0, synthetic, element);
+        module.bind_array_default(0, synthetic, zero);
+        (module, synthetic, element)
+    }
+
+    fn prepared(mut module: Module, preparation: &str) -> Option<Module> {
+        match preparation {
+            "frozen" => module.freeze(),
+            "baked" => {
+                #[cfg(not(feature = "code-in-place"))]
+                return None;
+                #[cfg(feature = "code-in-place")]
+                {
+                    let image = module.write_baked(None).expect("bake the generic array's module");
+                    module = Module::from_baked(Box::leak(image.into_boxed_slice()))
+                        .expect("read the generic array's module").0;
+                }
+            }
+            _ => {}
+        }
+        Some(module)
+    }
+
+    #[test]
+    fn a_generic_array_of_int_reads_its_elements_as_ints() {
+        for preparation in ["live", "frozen", "baked"] {
+            let (mut module, synthetic, _) = generic_array_module("System.Int32", Value::Int32(0));
+            let main = module.add_method_image(
+                0,
+                method(vec![
+                    Instruction::simple(Opcode::LdcI42),
+                    Instruction::new(Opcode::Newarr, Operand::Token(synthetic)),
+                    Instruction::simple(Opcode::Stloc0),
+                    Instruction::simple(Opcode::Ldloc0),
+                    Instruction::simple(Opcode::LdcI40),
+                    Instruction::new(Opcode::LdcI4S, Operand::Int8(7)),
+                    Instruction::new(Opcode::Stelem, Operand::Token(synthetic)),
+                    Instruction::simple(Opcode::Ldloc0),
+                    Instruction::simple(Opcode::LdcI40),
+                    Instruction::new(Opcode::Ldelema, Operand::Token(synthetic)),
+                    Instruction::simple(Opcode::LdindI4),
+                    Instruction::simple(Opcode::Ldloc0),
+                    Instruction::simple(Opcode::LdcI41),
+                    Instruction::new(Opcode::Ldelema, Operand::Token(synthetic)),
+                    Instruction::simple(Opcode::LdindI4),
+                    Instruction::simple(Opcode::Add),
+                    Instruction::simple(Opcode::Ret),
+                ]),
+                0,
+            );
+            let Some(module) = prepared(module, preparation) else { continue };
+            assert_eq!(
+                super::run(&module, &mut Vm::new(), main, Vec::new()),
+                Ok(Some(Value::Int32(7))),
+                "{preparation}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_generic_array_of_intptr_reads_its_elements_as_native_ints() {
+        for preparation in ["live", "frozen", "baked"] {
+            let (mut module, synthetic, _) = generic_array_module("System.IntPtr", Value::NativeInt(0));
+            let main = module.add_method_image(
+                0,
+                method(vec![
+                    Instruction::simple(Opcode::LdcI42),
+                    Instruction::new(Opcode::Newarr, Operand::Token(synthetic)),
+                    Instruction::simple(Opcode::Stloc0),
+                    Instruction::simple(Opcode::Ldloc0),
+                    Instruction::simple(Opcode::LdcI40),
+                    Instruction::new(Opcode::LdcI4S, Operand::Int8(6)),
+                    Instruction::simple(Opcode::ConvI),
+                    Instruction::new(Opcode::Stelem, Operand::Token(synthetic)),
+                    Instruction::simple(Opcode::Ldloc0),
+                    Instruction::simple(Opcode::LdcI40),
+                    Instruction::new(Opcode::Ldelema, Operand::Token(synthetic)),
+                    Instruction::simple(Opcode::LdindI),
+                    Instruction::simple(Opcode::Ldloc0),
+                    Instruction::simple(Opcode::LdcI41),
+                    Instruction::new(Opcode::Ldelema, Operand::Token(synthetic)),
+                    Instruction::simple(Opcode::LdindI),
+                    Instruction::simple(Opcode::Add),
+                    Instruction::simple(Opcode::Ret),
+                ]),
+                0,
+            );
+            let Some(module) = prepared(module, preparation) else { continue };
+            assert_eq!(
+                super::run(&module, &mut Vm::new(), main, Vec::new()),
+                Ok(Some(Value::NativeInt(6))),
+                "{preparation}"
+            );
+        }
+    }
+
     fn array_address_module() -> (Module, Token, Token) {
         let root_token = Token(0x0200_0001);
         let leaf_token = Token(0x0200_0002);
@@ -12367,6 +14471,1536 @@ mod tests {
             Ok(Some(Value::Int32(42))));
     }
 
+    /// Runs `ldarga.s 0; <load>; ret` on `argument`: the CIL of `*(T*)&argument` (ECMA-334 2nd ed 25.4,
+    /// 25.5.1 and 25.5.4; ECMA-335 6th ed III.3.42).
+    fn load_through_argument_address(load: Opcode, argument: Value) -> Result<Option<Value>, Trap> {
+        let mut module = Module::new();
+        let main = module.add_method_image(0, method(vec![
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            Instruction::simple(load),
+            ret(),
+        ]), 1);
+        super::run(&module, &mut Vm::new(), main, vec![argument])
+    }
+
+    #[test]
+    #[cfg(feature = "float")]
+    fn a_float_read_through_an_int_address_is_the_ints_bits() {
+        assert_eq!(load_through_argument_address(Opcode::LdindR4, Value::Int32(0x3F80_0000)),
+            Ok(Some(Value::Single(1.0))));
+        let Ok(Some(Value::Single(nan))) = load_through_argument_address(Opcode::LdindR4, Value::Int32(0x7FC0_0000))
+        else {
+            panic!("expected a float32");
+        };
+        assert!(nan.is_nan());
+    }
+
+    #[test]
+    #[cfg(feature = "float")]
+    fn an_int_read_through_a_float_address_is_the_floats_bits() {
+        assert_eq!(load_through_argument_address(Opcode::LdindU4, Value::Single(1.0)),
+            Ok(Some(Value::Int32(0x3F80_0000))));
+        assert_eq!(load_through_argument_address(Opcode::LdindI4, Value::Single(-0.0)),
+            Ok(Some(Value::Int32(i32::MIN))));
+    }
+
+    #[test]
+    #[cfg(feature = "float")]
+    fn a_double_and_a_long_read_each_others_bits() {
+        assert_eq!(load_through_argument_address(Opcode::LdindR8, Value::Int64(0x3FF0_0000_0000_0000)),
+            Ok(Some(Value::Float(1.0))));
+        assert_eq!(load_through_argument_address(Opcode::LdindI8, Value::Float(-2.0)),
+            Ok(Some(Value::Int64(0xC000_0000_0000_0000_u64 as i64))));
+    }
+
+    #[test]
+    fn a_scalar_read_of_a_struct_reference_or_pointer_is_refused() {
+        let s = Value::Struct(vec![Value::Int32(42)].into_boxed_slice());
+        assert_eq!(load_through_argument_address(Opcode::LdindI4, s.clone()), Err(Trap::Unsupported(Opcode::LdindI4)));
+        assert_eq!(load_through_argument_address(Opcode::LdindU1, s.clone()), Err(Trap::Unsupported(Opcode::LdindU1)));
+        let pointer = Value::ByRef(Location::Arg { frame: 0, slot: 0 });
+        assert_eq!(load_through_argument_address(Opcode::LdindU1, pointer.clone()), Err(Trap::Unsupported(Opcode::LdindU1)));
+        assert_eq!(load_through_argument_address(Opcode::LdindRef, Value::Int32(1)), Err(Trap::Unsupported(Opcode::LdindRef)));
+        let mut module = Module::new();
+        let ldobj = module.add_method_image(0, method(vec![
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            Instruction::new(Opcode::Ldobj, Operand::Token(Token(0x0200_0001))),
+            ret(),
+        ]), 1);
+        assert_eq!(super::run(&module, &mut Vm::new(), ldobj, vec![s.clone()]), Ok(Some(s)));
+        assert_eq!(load_through_argument_address(Opcode::LdindRef, Value::Null), Ok(Some(Value::Null)));
+        assert_eq!(load_through_argument_address(Opcode::LdindI, pointer.clone()), Ok(Some(pointer)));
+    }
+
+    #[test]
+    fn a_pointer_read_as_an_object_reference_is_its_own_value() {
+        let pointer = Value::ByRef(Location::Arg { frame: 0, slot: 0 });
+        assert_eq!(load_through_argument_address(Opcode::LdindRef, pointer.clone()), Ok(Some(pointer)));
+        assert_eq!(load_through_argument_address(Opcode::LdindRef, Value::NativeInt(0x1234)),
+            Ok(Some(Value::NativeInt(0x1234))));
+    }
+
+    #[test]
+    #[cfg(not(feature = "float"))]
+    fn a_floating_read_without_float_support_is_refused() {
+        assert_eq!(load_through_argument_address(Opcode::LdindR4, Value::Int32(0x3F80_0000)),
+            Err(Trap::Unsupported(Opcode::LdindR4)));
+    }
+
+    #[test]
+    fn a_read_of_the_slots_own_type_is_unchanged() {
+        assert_eq!(load_through_argument_address(Opcode::LdindI4, Value::Int32(-7)), Ok(Some(Value::Int32(-7))));
+        assert_eq!(load_through_argument_address(Opcode::LdindI8, Value::Int64(-7)), Ok(Some(Value::Int64(-7))));
+        assert_eq!(load_through_argument_address(Opcode::LdindU1, Value::Int32(0x1FF)), Ok(Some(Value::Int32(0xFF))));
+    }
+
+    /// Runs `ldarg.0` for an object `o`, or `ldarga.s 0` for a struct argument `s`, then `ldflda f; <load>;
+    /// ret`: the read of `*(T*)p` once `p` holds the field's address, which C# takes inside `fixed (U* p =
+    /// &o.f)` for an object's field, a moveable variable, and as `&s.f` for a struct argument's, a fixed
+    /// one (ECMA-334 2nd ed 25.3, 25.4 and 25.6); `ldflda` loads the field's address (ECMA-335 6th ed
+    /// III.4.11) and the `ldind` reads through it (III.3.42).
+    fn load_through_field_address(load: Opcode, receiver: Value, field_value: Value) -> Result<Option<Value>, Trap> {
+        let field = Token(0x0400_0001);
+        let mut module = Module::new();
+        let class = module.add_type(vec![field_value.clone()]);
+        module.bind_field(0, field, 0);
+        module.bind_field_type(0, field, class);
+        let first = if matches!(receiver, Value::Struct(_)) {
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0))
+        } else {
+            Instruction::simple(Opcode::Ldarg0)
+        };
+        let main = module.add_method_image(0, method(vec![
+            first,
+            Instruction::new(Opcode::Ldflda, Operand::Token(field)),
+            Instruction::simple(load),
+            ret(),
+        ]), 1);
+        let mut vm = Vm::new();
+        let receiver = match receiver {
+            Value::Struct(_) => receiver,
+            _ => Value::Object(vm.heap_mut().alloc_instance(class, vec![field_value])),
+        };
+        super::run(&module, &mut vm, main, vec![receiver])
+    }
+
+    /// Runs `ldsflda s; <load>; ret` on a static holding `value`: the read of `*(T*)p` once `p` holds the
+    /// static's address, which C# takes inside `fixed (U* p = &s)`, a static field being a moveable
+    /// variable (ECMA-334 2nd ed 25.3, 25.4 and 25.6); `ldsflda` loads the static's address (ECMA-335 6th
+    /// ed III.4.15) and the `ldind` reads through it (III.3.42).
+    fn load_through_static_address(load: Opcode, value: Value) -> Result<Option<Value>, Trap> {
+        let field = Token(0x0400_0001);
+        let mut module = Module::new();
+        module.bind_static_field(0, field, value);
+        let main = module.add_method_image(0, method(vec![
+            Instruction::new(Opcode::Ldsflda, Operand::Token(field)),
+            Instruction::simple(load),
+            ret(),
+        ]), 0);
+        super::run(&module, &mut Vm::new(), main, Vec::new())
+    }
+
+    /// Runs `ldarg.0; <load>; ret` on a pointer to element `[0, 0]` of a 1-by-1 rectangular array
+    /// holding `value`: the read of `*(T*)p` after `fixed (U* p = &a[0, 0])` (ECMA-334 2nd ed 25.4 and
+    /// 25.6), the element's address being what the array's `Address` method returns (ECMA-335 6th ed
+    /// II.14.2) and the `ldind` reading through it (III.3.42).
+    fn load_from_rectangular(load: Opcode, value: Value) -> Result<Option<Value>, Trap> {
+        let mut module = Module::new();
+        let main = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(load),
+            ret(),
+        ]), 1);
+        let mut vm = Vm::new();
+        let array = vm.heap_mut().alloc_md_array(vec![1, 1]);
+        assert!(vm.heap_mut().md_array_set(array, &[0, 0], value));
+        super::run(&module, &mut vm, main, vec![Value::ByRef(Location::Element { array, index: 0, byte_offset: 0 })])
+    }
+
+    #[test]
+    #[cfg(feature = "float")]
+    fn a_number_is_read_as_another_kind_only_at_a_variables_own_address() {
+        assert_eq!(load_through_argument_address(Opcode::LdindR4, Value::Int32(0x3F80_0000)), Ok(Some(Value::Single(1.0))));
+        assert_eq!(load_through_argument_address(Opcode::LdindU4, Value::Single(1.0)), Ok(Some(Value::Int32(0x3F80_0000))));
+        assert_eq!(load_through_argument_address(Opcode::LdindR8, Value::Int64(0x3FF0_0000_0000_0000)), Ok(Some(Value::Float(1.0))));
+        assert_eq!(load_through_argument_address(Opcode::LdindI8, Value::Float(1.0)), Ok(Some(Value::Int64(0x3FF0_0000_0000_0000))));
+        let float_one = Value::Single(1.0);
+        assert_eq!(load_through_field_address(Opcode::LdindI4, Value::Null, float_one.clone()), Err(Trap::Unsupported(Opcode::LdindI4)));
+        let structure = Value::Struct(vec![float_one.clone()].into_boxed_slice());
+        assert_eq!(load_through_field_address(Opcode::LdindI4, structure, float_one.clone()), Err(Trap::Unsupported(Opcode::LdindI4)));
+        assert_eq!(load_through_static_address(Opcode::LdindI4, float_one.clone()), Err(Trap::Unsupported(Opcode::LdindI4)));
+        assert_eq!(load_inside_element(Opcode::LdindI4, vec![float_one.clone()], 4, 0), Err(Trap::Unsupported(Opcode::LdindI4)));
+        assert_eq!(load_from_rectangular(Opcode::LdindI4, float_one.clone()), Err(Trap::Unsupported(Opcode::LdindI4)));
+        assert_eq!(load_from_rectangular(Opcode::LdindR4, Value::Int32(0x3F80_0000)), Err(Trap::Unsupported(Opcode::LdindR4)));
+        assert_eq!(load_through_static_address(Opcode::LdindR8, Value::Int64(0x3FF0_0000_0000_0000)), Err(Trap::Unsupported(Opcode::LdindR8)));
+        assert_eq!(load_from_packed(Opcode::LdindU4, crate::PrimKind::F4, vec![0, 0, 0x80, 0x3F], 0), Ok(Some(Value::Int32(0x3F80_0000))));
+        assert_eq!(load_from_packed(Opcode::LdindR4, crate::PrimKind::I4, vec![0, 0, 0x80, 0x3F], 0), Ok(Some(Value::Single(1.0))));
+        assert_eq!(load_through_field_address(Opcode::LdindR4, Value::Null, float_one.clone()), Ok(Some(float_one.clone())));
+        assert_eq!(load_through_static_address(Opcode::LdindU4, Value::Int32(-1)), Ok(Some(Value::Int32(-1))));
+        assert_eq!(load_from_rectangular(Opcode::LdindR4, float_one.clone()), Ok(Some(float_one)));
+        assert_eq!(load_through_argument_address(Opcode::LdindR8, Value::NativeInt(0x3FF0_0000_0000_0000)),
+            Err(Trap::Unsupported(Opcode::LdindR8)));
+        assert_eq!(load_through_argument_address(Opcode::LdindI, Value::Float(1.0)), Err(Trap::Unsupported(Opcode::LdindI)));
+        assert_eq!(load_through_argument_address(Opcode::LdindR4, Value::Int64(0x3F80_0000)), Err(Trap::Unsupported(Opcode::LdindR4)));
+    }
+
+    #[test]
+    fn a_narrower_read_of_a_long_or_of_a_wider_native_int_is_refused() {
+        assert_eq!(load_through_argument_address(Opcode::LdindI4, Value::Int64(0x0000_0001_0000_0002)),
+            Err(Trap::Unsupported(Opcode::LdindI4)));
+        assert_eq!(load_at_argument_offset(Opcode::LdindI4, 4, Value::Int64(0x0000_0001_0000_0002)),
+            Err(Trap::Unsupported(Opcode::LdindI4)));
+        assert_eq!(load_through_argument_address(Opcode::LdindU1, Value::Int64(0x1FF)), Err(Trap::Unsupported(Opcode::LdindU1)));
+        assert_eq!(load_through_static_address(Opcode::LdindU4, Value::Int64(5)), Err(Trap::Unsupported(Opcode::LdindU4)));
+        if crate::native_pointer_size() == 8 {
+            assert_eq!(load_through_argument_address(Opcode::LdindI4, Value::NativeInt(5)), Err(Trap::Unsupported(Opcode::LdindI4)));
+        }
+        assert_eq!(super::load_from_slot_at(Value::Int64(0x1_2000_0010), Opcode::LdindI, 4, None, true),
+            Err(Trap::Unsupported(Opcode::LdindI)));
+        assert_eq!(super::load_from_slot_at(Value::NativeInt(5), Opcode::LdindI4, 4, None, true), Ok(Value::Int32(5)));
+        assert_eq!(load_through_argument_address(Opcode::LdindU2, Value::NativeInt(0x1_0002)), Ok(Some(Value::Int32(2))));
+        assert_eq!(load_through_static_address(Opcode::LdindI1, Value::Int32(0x1FF)), Ok(Some(Value::Int32(-1))));
+        if crate::native_pointer_size() == 8 {
+            assert_eq!(load_through_argument_address(Opcode::LdindI8, Value::NativeInt(-2)), Ok(Some(Value::Int64(-2))));
+            assert_eq!(load_through_argument_address(Opcode::LdindI, Value::Int64(-2)), Ok(Some(Value::NativeInt(-2))));
+        }
+    }
+
+    /// Runs `ldarga.s 0; conv.u; ldc.i4 <offset>; add; <load>; ret`: the CIL of a `T*` read `offset` bytes
+    /// into the argument through `(byte*)&argument` (ECMA-334 2nd ed 25.4, 25.5.3 and 25.5.6; ECMA-335 6th ed
+    /// III.3.1 and III.3.42).
+    fn load_at_argument_offset(load: Opcode, offset: i32, argument: Value) -> Result<Option<Value>, Trap> {
+        let mut module = Module::new();
+        let main = module.add_method_image(0, method(vec![
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(offset)),
+            Instruction::simple(Opcode::Add),
+            Instruction::simple(load),
+            ret(),
+        ]), 1);
+        super::run(&module, &mut Vm::new(), main, vec![argument])
+    }
+
+    #[test]
+    fn a_byte_walk_into_a_variable_is_refused() {
+        let mut module = Module::new();
+        let main = module.add_method_image(0, method(vec![
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(0x7f)),
+            Instruction::simple(Opcode::StindI1),
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::simple(Opcode::LdcI41),
+            Instruction::simple(Opcode::Add),
+            Instruction::simple(Opcode::LdindU1),
+            ret(),
+        ]), 1);
+        assert_eq!(super::run(&module, &mut Vm::new(), main, vec![Value::Int32(0x0403_0201)]),
+            Err(Trap::Unsupported(Opcode::LdindU1)));
+        assert_eq!(load_at_argument_offset(Opcode::LdindU1, 0, Value::Int32(0x0403_0201)), Ok(Some(Value::Int32(1))));
+        for offset in 1..4 {
+            assert_eq!(load_at_argument_offset(Opcode::LdindU1, offset, Value::Int32(0x0403_0201)),
+                Err(Trap::Unsupported(Opcode::LdindU1)), "offset {offset}");
+        }
+        assert_eq!(load_at_argument_offset(Opcode::LdindU1, 7, Value::Int64(0x0800_0000_0000_0000)),
+            Err(Trap::Unsupported(Opcode::LdindU1)));
+        assert_eq!(load_at_argument_offset(Opcode::LdindU2, 2, Value::Int32(-1)), Err(Trap::Unsupported(Opcode::LdindU2)));
+    }
+
+    #[test]
+    #[cfg(feature = "float")]
+    fn a_floating_variable_is_read_only_at_the_width_its_value_holds() {
+        let mut module = Module::new();
+        let main = module.add_method_image(0, method(vec![
+            Instruction::new(Opcode::LdcR8, Operand::Float64(1.0)),
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::LdindR4),
+            ret(),
+        ]), 0);
+        assert_eq!(super::run(&module, &mut Vm::new(), main, Vec::new()), Err(Trap::Unsupported(Opcode::LdindR4)));
+        assert_eq!(load_through_argument_address(Opcode::LdindU1, Value::Single(1.0)),
+            Err(Trap::Unsupported(Opcode::LdindU1)));
+        assert_eq!(load_through_argument_address(Opcode::LdindI4, Value::Float(1.0)),
+            Err(Trap::Unsupported(Opcode::LdindI4)));
+        assert_eq!(load_at_argument_offset(Opcode::LdindU1, 3, Value::Single(1.0)),
+            Err(Trap::Unsupported(Opcode::LdindU1)));
+        assert_eq!(load_inside_element(Opcode::LdindU1, vec![Value::Single(1.0)], 4, 3),
+            Err(Trap::Unsupported(Opcode::LdindU1)));
+    }
+
+    /// Runs `ldarga.s 0; <constant>; <store>; ldarga.s 0; <load>; ret` on an argument holding `variable`:
+    /// a floating value stored through the argument's address, then read back through it.
+    #[cfg(feature = "float")]
+    fn store_then_load_through_argument_address(store: Opcode, stored: Value, load: Opcode, variable: Value) -> Result<Option<Value>, Trap> {
+        let constant = match stored {
+            Value::Single(f) => Instruction::new(Opcode::LdcR4, Operand::Float32(f)),
+            Value::Float(f) => Instruction::new(Opcode::LdcR8, Operand::Float64(f)),
+            other => panic!("not a floating constant: {other:?}"),
+        };
+        let mut module = Module::new();
+        let main = module.add_method_image(0, method(vec![
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            constant,
+            Instruction::simple(store),
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            Instruction::simple(load),
+            ret(),
+        ]), 1);
+        super::run(&module, &mut Vm::new(), main, vec![variable])
+    }
+
+    #[test]
+    fn a_floating_store_of_a_value_that_is_not_floating_is_refused() {
+        for store in [Opcode::StindR4, Opcode::StindR8] {
+            let mut module = Module::new();
+            let main = module.add_method_image(0, method(vec![
+                Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+                Instruction::new(Opcode::LdcI4, Operand::Int32(0x3F80_0000)),
+                Instruction::simple(store),
+                Instruction::simple(Opcode::Ldarg0),
+                ret(),
+            ]), 1);
+            let refused = if cfg!(feature = "float") { Trap::TypeMismatch(store) } else { Trap::Unsupported(store) };
+            assert_eq!(super::run(&module, &mut Vm::new(), main, vec![Value::Int32(0)]), Err(refused), "{store:?}");
+        }
+    }
+
+    #[test]
+    #[cfg(feature = "float")]
+    fn a_floating_store_through_a_pointer_takes_its_instructions_width() {
+        assert_eq!(store_then_load_through_argument_address(Opcode::StindR8, Value::Single(1.0), Opcode::LdindI4, Value::Float(0.0)),
+            Err(Trap::Unsupported(Opcode::LdindI4)));
+        assert_eq!(store_then_load_through_argument_address(Opcode::StindR8, Value::Single(1.5), Opcode::LdindR8, Value::Float(0.0)),
+            Ok(Some(Value::Float(1.5))));
+        assert_eq!(store_then_load_through_argument_address(Opcode::StindR4, Value::Float(1.0), Opcode::LdindI4, Value::Single(0.0)),
+            Ok(Some(Value::Int32(0x3F80_0000))));
+    }
+
+    /// Runs `code` as a method whose argument and local slots have the declared kinds `args` and
+    /// `locals`, called with `arguments`.
+    fn run_with_slot_kinds(code: Vec<Instruction>, args: &[SlotKind], locals: &[SlotKind], arguments: Vec<Value>) -> Result<Option<Value>, Trap> {
+        let mut module = Module::new();
+        let main = module.add_method_image(0, method(code), u16::try_from(args.len()).unwrap());
+        module.set_method_slot_kinds(main, args, locals);
+        super::run(&module, &mut Vm::new(), main, arguments)
+    }
+
+    #[test]
+    fn a_whole_value_store_into_recorded_storage_replaces_only_a_value_of_its_own() {
+        let int = |n: i32| Instruction::new(Opcode::LdcI4, Operand::Int32(n));
+        let through_local = |first: Vec<Instruction>, stored: Vec<Instruction>, store: Opcode| {
+            let mut code = first;
+            code.extend([Instruction::new(Opcode::StlocS, Operand::Variable(0)), Instruction::new(Opcode::LdlocaS, Operand::Variable(0))]);
+            code.extend(stored);
+            code.extend([Instruction::simple(store), Instruction::new(Opcode::LdlocS, Operand::Variable(0)), ret()]);
+            code
+        };
+        let unrecorded = |code| run_with_slot_kinds(code, &[], &[SlotKind::Unknown], Vec::new());
+        assert_eq!(unrecorded(through_local(vec![int(0x0403_0201)], vec![int(9)], Opcode::StindI4)), Ok(Some(Value::Int32(9))));
+        let native = || vec![int(5), Instruction::simple(Opcode::ConvU)];
+        assert_eq!(
+            run_with_slot_kinds(through_local(vec![Instruction::simple(Opcode::Ldnull)], native(), Opcode::StindI), &[], &[SlotKind::Reference], Vec::new()),
+            Err(Trap::Unsupported(Opcode::StindI))
+        );
+        let null_pointer = || vec![int(0), Instruction::simple(Opcode::ConvU)];
+        let into_native = |stored| run_with_slot_kinds(through_local(null_pointer(), stored, Opcode::StindRef), &[], &[SlotKind::Native], Vec::new());
+        assert_eq!(into_native(native()), Ok(Some(Value::NativeInt(5))));
+        assert_eq!(into_native(vec![Instruction::simple(Opcode::Ldnull)]), Ok(Some(Value::NativeInt(0))));
+    }
+
+    #[test]
+    fn an_unwritten_local_is_its_declared_kinds_zero() {
+        let read = |kind, load| run_with_slot_kinds(vec![
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(load),
+            ret(),
+        ], &[], &[kind], Vec::new());
+        assert_eq!(read(SlotKind::Primitive(PrimKind::I8), Opcode::LdindI8), Ok(Some(Value::Int64(0))));
+        #[cfg(feature = "float")]
+        assert_eq!(read(SlotKind::Primitive(PrimKind::F8), Opcode::LdindI8), Ok(Some(Value::Int64(0))));
+        assert_eq!(read(SlotKind::Native, Opcode::LdindI), Ok(Some(Value::NativeInt(0))));
+    }
+
+    #[test]
+    #[cfg(feature = "float")]
+    fn a_floating_value_stored_in_a_local_or_an_argument_takes_its_declared_width() {
+        let f8 = SlotKind::Primitive(PrimKind::F8);
+        let f4 = SlotKind::Primitive(PrimKind::F4);
+        let store_then_load = |constant: Instruction, kind, load| run_with_slot_kinds(vec![
+            constant,
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(load),
+            ret(),
+        ], &[], &[kind], Vec::new());
+        assert_eq!(store_then_load(Instruction::new(Opcode::LdcR4, Operand::Float32(1.5)), f8, Opcode::LdindR8),
+            Ok(Some(Value::Float(1.5))));
+        assert_eq!(store_then_load(Instruction::new(Opcode::LdcR8, Operand::Float64(1.0)), f4, Opcode::LdindR4),
+            Ok(Some(Value::Single(1.0))));
+        assert_eq!(store_then_load(Instruction::new(Opcode::LdcR4, Operand::Float32(1.0)), f8, Opcode::LdindU4),
+            Ok(Some(Value::Int32(0))));
+        let argument = |code| run_with_slot_kinds(code, &[f8], &[], vec![Value::Single(1.5)]);
+        assert_eq!(argument(vec![
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::LdindR8),
+            ret(),
+        ]), Ok(Some(Value::Float(1.5))));
+        assert_eq!(argument(vec![
+            Instruction::new(Opcode::LdcR4, Operand::Float32(1.0)),
+            Instruction::new(Opcode::StargS, Operand::Variable(0)),
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::LdindU4),
+            ret(),
+        ]), Ok(Some(Value::Int32(0))));
+    }
+
+    /// Runs `ldc.i4 <initial>; stloc.0; ldloca.s 0; conv.u; ldc.i4 <displacement>; add; <constant>;
+    /// <store>; ldloc.0; ret` on a local of declared kind `kind`: a store through a pointer
+    /// `displacement` bytes into the variable, then the variable read whole.
+    fn store_inside_local(kind: SlotKind, initial: Instruction, displacement: i32, constant: Instruction, store: Opcode) -> Result<Option<Value>, Trap> {
+        run_with_slot_kinds(vec![
+            initial,
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(displacement)),
+            Instruction::simple(Opcode::Add),
+            constant,
+            Instruction::simple(store),
+            Instruction::simple(Opcode::Ldloc0),
+            ret(),
+        ], &[], &[kind], Vec::new())
+    }
+
+    #[test]
+    fn a_store_through_a_pointer_replaces_only_the_bytes_it_writes() {
+        let i4 = SlotKind::Primitive(PrimKind::I4);
+        let int = |n: i32| Instruction::new(Opcode::LdcI4, Operand::Int32(n));
+        assert_eq!(store_inside_local(i4, int(0x0403_0201), 0, int(0x7f), Opcode::StindI1), Ok(Some(Value::Int32(0x0403_027f))));
+        assert_eq!(store_inside_local(i4, int(0x0403_0201), 1, int(0xAA), Opcode::StindI1), Ok(Some(Value::Int32(0x0403_AA01))));
+        assert_eq!(store_inside_local(i4, int(0x0403_0201), 2, int(0x7777), Opcode::StindI2), Ok(Some(Value::Int32(0x7777_0201))));
+        #[cfg(feature = "float")]
+        assert_eq!(store_inside_local(i4, int(0), 0, Instruction::new(Opcode::LdcR4, Operand::Float32(1.0)), Opcode::StindR4),
+            Ok(Some(Value::Int32(0x3F80_0000))));
+        assert_eq!(store_inside_local(i4, int(1), 0, Instruction::new(Opcode::LdcI8, Operand::Int64(2)), Opcode::StindI8),
+            Err(Trap::Unsupported(Opcode::StindI8)));
+        assert_eq!(store_inside_local(i4, int(1), 4, int(2), Opcode::StindI1), Err(Trap::Unsupported(Opcode::StindI1)));
+        assert_eq!(store_inside_local(SlotKind::Primitive(PrimKind::I1), int(0), 0, int(0xC8), Opcode::StindI1),
+            Ok(Some(Value::Int32(-56))));
+        assert_eq!(store_inside_local(i4, int(1), 0, int(-7), Opcode::StindI4), Ok(Some(Value::Int32(-7))));
+    }
+
+    /// Runs `<initial>; stloc.0; ldloca.s 0; conv.u; ldc.i4 <displacement>; add; <load>; ret` on a local
+    /// of declared kind `kind`: a read through a pointer `displacement` bytes into the variable.
+    fn load_inside_local(kind: SlotKind, initial: Instruction, displacement: i32, load: Opcode) -> Result<Option<Value>, Trap> {
+        run_with_slot_kinds(vec![
+            initial,
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(displacement)),
+            Instruction::simple(Opcode::Add),
+            Instruction::simple(load),
+            ret(),
+        ], &[], &[kind], Vec::new())
+    }
+
+    #[test]
+    fn a_read_through_a_pointer_takes_the_variables_declared_bytes() {
+        let i4 = SlotKind::Primitive(PrimKind::I4);
+        let int = |n: i32| Instruction::new(Opcode::LdcI4, Operand::Int32(n));
+        assert_eq!(load_inside_local(i4, int(-1), 1, Opcode::LdindU1), Ok(Some(Value::Int32(255))));
+        assert_eq!(load_inside_local(i4, int(0x0403_0201), 2, Opcode::LdindU2), Ok(Some(Value::Int32(0x0403))));
+        assert_eq!(load_inside_local(SlotKind::Primitive(PrimKind::I8), Instruction::new(Opcode::LdcI8, Operand::Int64(0x0000_0001_0000_0001)), 4, Opcode::LdindI4),
+            Ok(Some(Value::Int32(1))));
+        #[cfg(feature = "float")]
+        {
+            let f8 = SlotKind::Primitive(PrimKind::F8);
+            let one = || Instruction::new(Opcode::LdcR8, Operand::Float64(1.0));
+            assert_eq!(load_inside_local(f8, one(), 0, Opcode::LdindU4), Ok(Some(Value::Int32(0))));
+            assert_eq!(load_inside_local(f8, one(), 4, Opcode::LdindU4), Ok(Some(Value::Int32(0x3FF0_0000))));
+            assert_eq!(load_inside_local(f8, Instruction::new(Opcode::LdcR4, Operand::Float32(1.0)), 0, Opcode::LdindU4),
+                Ok(Some(Value::Int32(0))));
+        }
+        assert_eq!(load_inside_local(i4, int(1), 0, Opcode::LdindI8), Err(Trap::Unsupported(Opcode::LdindI8)));
+        assert_eq!(load_inside_local(i4, int(1), 4, Opcode::LdindU1), Err(Trap::Unsupported(Opcode::LdindU1)));
+    }
+
+    #[test]
+    fn a_read_after_a_partial_store_sees_both() {
+        assert_eq!(run_with_slot_kinds(vec![
+            Instruction::new(Opcode::LdcI4, Operand::Int32(0x0403_0201)),
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(0x7f)),
+            Instruction::simple(Opcode::StindI1),
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::simple(Opcode::LdcI41),
+            Instruction::simple(Opcode::Add),
+            Instruction::simple(Opcode::LdindU1),
+            ret(),
+        ], &[], &[SlotKind::Primitive(PrimKind::I4)], Vec::new()), Ok(Some(Value::Int32(2))));
+    }
+
+    #[test]
+    fn a_full_width_store_into_a_pointer_variable_leaves_a_native_int() {
+        let native = crate::native_pointer_size();
+        let (full, zero) = if native == 8 {
+            (Opcode::StindI8, Instruction::new(Opcode::LdcI8, Operand::Int64(0)))
+        } else {
+            (Opcode::StindI4, Instruction::new(Opcode::LdcI4, Operand::Int32(0)))
+        };
+        assert_eq!(run_with_slot_kinds(vec![
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            zero,
+            Instruction::simple(full),
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::LdcI41),
+            Instruction::simple(Opcode::StindI1),
+            Instruction::simple(Opcode::Ldloc0),
+            ret(),
+        ], &[], &[SlotKind::Native], Vec::new()), Ok(Some(Value::NativeInt(1))));
+        #[cfg(feature = "float")]
+        {
+            let (floating, zero) = if native == 8 {
+                (Opcode::StindR8, Instruction::new(Opcode::LdcR8, Operand::Float64(0.0)))
+            } else {
+                (Opcode::StindR4, Instruction::new(Opcode::LdcR4, Operand::Float32(0.0)))
+            };
+            assert_eq!(run_with_slot_kinds(vec![
+                Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+                zero,
+                Instruction::simple(floating),
+                Instruction::simple(Opcode::Ldloc0),
+                ret(),
+            ], &[], &[SlotKind::Native], Vec::new()), Ok(Some(Value::NativeInt(0))));
+        }
+        assert_eq!(run_with_slot_kinds(vec![
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::Ldnull),
+            Instruction::simple(Opcode::StindI),
+            Instruction::simple(Opcode::Ldloc0),
+            ret(),
+        ], &[], &[SlotKind::Native], Vec::new()), Ok(Some(Value::NativeInt(0))));
+    }
+
+    #[test]
+    #[cfg(feature = "float")]
+    fn a_full_width_store_of_a_value_without_the_instructions_type_is_refused() {
+        assert_eq!(run_with_slot_kinds(vec![
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::new(Opcode::LdcR4, Operand::Float32(1.0)),
+            Instruction::simple(Opcode::StindI4),
+            Instruction::simple(Opcode::Ldloc0),
+            ret(),
+        ], &[], &[SlotKind::Primitive(PrimKind::I4)], Vec::new()), Err(Trap::TypeMismatch(Opcode::StindI4)));
+    }
+
+    #[test]
+    fn a_whole_value_stored_through_a_variables_address_takes_its_declared_kind() {
+        assert_eq!(run_with_slot_kinds(vec![
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::Ldnull),
+            Instruction::simple(Opcode::StindRef),
+            Instruction::simple(Opcode::Ldloc0),
+            Instruction::simple(Opcode::LdcI40),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::simple(Opcode::Ceq),
+            ret(),
+        ], &[], &[SlotKind::Native], Vec::new()), Ok(Some(Value::Int32(1))));
+        assert_eq!(run_with_slot_kinds(vec![
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::new(Opcode::Initobj, Operand::Token(Token::new(0x1b, 9))),
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::LdindI),
+            ret(),
+        ], &[], &[SlotKind::Native], Vec::new()), Ok(Some(Value::NativeInt(0))));
+        #[cfg(feature = "float")]
+        assert_eq!(run_with_slot_kinds(vec![
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::new(Opcode::LdcR4, Operand::Float32(1.0)),
+            Instruction::new(Opcode::Stobj, Operand::Token(Token::new(0x01, 9))),
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::LdindU4),
+            ret(),
+        ], &[], &[SlotKind::Primitive(PrimKind::F8)], Vec::new()), Ok(Some(Value::Int32(0))));
+    }
+
+    #[test]
+    fn a_null_reference_stored_in_a_pointer_local_is_the_null_pointer() {
+        assert_eq!(run_with_slot_kinds(vec![
+            Instruction::simple(Opcode::Ldnull),
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::simple(Opcode::Ldloc0),
+            Instruction::simple(Opcode::LdcI40),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::simple(Opcode::Ceq),
+            ret(),
+        ], &[], &[SlotKind::Native], Vec::new()), Ok(Some(Value::Int32(1))));
+    }
+
+    /// Constructs with `newobj` a two-dimensional array, `rows` by `columns`, whose element shape the
+    /// loader recorded as `element`; returns the module, the machine, the array, and a method of the
+    /// module that reads its argument, a pointer, with `read`.
+    fn new_rectangular(element: CastElem, rows: i32, columns: i32, read: Opcode) -> (Module, Vm, ObjectRef, MethodId) {
+        let ctor = Token::new(0x0a, 1);
+        let mut module = Module::new();
+        module.mark_md_array_ctor(0, ctor, 2);
+        module.bind_cast_elem(0, ctor, CastElem::MdArray { element: Box::new(element), rank: 2 });
+        let main = module.add_method_image(0, method(vec![
+            Instruction::new(Opcode::LdcI4, Operand::Int32(rows)),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(columns)),
+            Instruction::new(Opcode::Newobj, Operand::Token(ctor)),
+            ret(),
+        ]), 0);
+        let reader = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(read),
+            ret(),
+        ]), 1);
+        let mut vm = Vm::new();
+        let array = match super::run(&module, &mut vm, main, Vec::new()) {
+            Ok(Some(Value::Object(array))) => array,
+            other => panic!("newobj of a rectangular array gave {other:?}"),
+        };
+        (module, vm, array, reader)
+    }
+
+    #[test]
+    fn a_rectangular_arrays_elements_start_at_their_element_types_zero() {
+        let zero = |element| {
+            let (_, vm, array, _) = new_rectangular(element, 1, 1, Opcode::LdindI4);
+            vm.heap().md_array_get(array, &[0, 0])
+        };
+        assert_eq!(zero(CastElem::Prim(CastPrim::I8)), Some(Value::Int64(0)));
+        assert_eq!(zero(CastElem::Prim(CastPrim::U8)), Some(Value::Int64(0)));
+        assert_eq!(zero(CastElem::Prim(CastPrim::U1)), Some(Value::Int32(0)));
+        #[cfg(feature = "float")]
+        {
+            assert_eq!(zero(CastElem::Prim(CastPrim::F8)), Some(Value::Float(0.0)));
+            assert_eq!(zero(CastElem::Prim(CastPrim::F4)), Some(Value::Single(0.0)));
+        }
+        assert_eq!(zero(CastElem::Prim(CastPrim::I)), Some(Value::NativeInt(0)));
+        assert_eq!(zero(CastElem::Pointer(Box::new(CastElem::Prim(CastPrim::I4)))), Some(Value::NativeInt(0)));
+        assert_eq!(zero(CastElem::String), Some(Value::Null));
+        assert_eq!(zero(CastElem::Array(Box::new(CastElem::Prim(CastPrim::I4)))), Some(Value::Null));
+    }
+
+    #[test]
+    fn a_rectangular_arrays_element_width_is_its_element_types() {
+        let (module, mut vm, array, reader) = new_rectangular(CastElem::Prim(CastPrim::I8), 1, 3, Opcode::LdindI8);
+        assert!(vm.heap_mut().md_array_set(array, &[0, 1], Value::Int64(11)));
+        assert!(vm.heap_mut().md_array_set(array, &[0, 2], Value::Int64(22)));
+        let walked = |byte_offset| vec![Value::ByRef(Location::Element { array, index: 0, byte_offset })];
+        assert_eq!(super::run(&module, &mut vm, reader, walked(8)), Ok(Some(Value::Int64(11))));
+        let (module, mut vm, array, reader) = new_rectangular(CastElem::Prim(CastPrim::U1), 2, 3, Opcode::LdindU1);
+        for (flat, value) in (1..=6).enumerate() {
+            let indices = [i32::try_from(flat / 3).unwrap(), i32::try_from(flat % 3).unwrap()];
+            assert!(vm.heap_mut().md_array_set(array, &indices, Value::Int32(value)));
+        }
+        let walked = |byte_offset| vec![Value::ByRef(Location::Element { array, index: 0, byte_offset })];
+        assert_eq!(super::run(&module, &mut vm, reader, walked(4)), Ok(Some(Value::Int32(5))));
+    }
+
+    /// Runs `code` as a method of one argument, called on `vm` with a pointer to `location`.
+    fn run_on_pointer(vm: &mut Vm, code: Vec<Instruction>, location: Location) -> Result<Option<Value>, Trap> {
+        let mut module = Module::new();
+        let main = module.add_method_image(0, method(code), 1);
+        super::run(&module, vm, main, vec![Value::ByRef(location)])
+    }
+
+    /// `ldarg.0; <load>; ret`: a read through a pointer to `location`.
+    fn read_through(vm: &mut Vm, location: Location, load: Opcode) -> Result<Option<Value>, Trap> {
+        run_on_pointer(vm, vec![Instruction::simple(Opcode::Ldarg0), Instruction::simple(load), ret()], location)
+    }
+
+    /// `ldarg.0; <constant>; <store>; ldnull; ret`: a store through a pointer to `location`.
+    fn store_through(vm: &mut Vm, location: Location, constant: Instruction, store: Opcode) -> Result<Option<Value>, Trap> {
+        run_on_pointer(vm, vec![
+            Instruction::simple(Opcode::Ldarg0),
+            constant,
+            Instruction::simple(store),
+            Instruction::simple(Opcode::Ldnull),
+            ret(),
+        ], location)
+    }
+
+    /// A pointer to element `index` of `array`, moved `byte_offset` bytes on by pointer arithmetic.
+    fn element_at(array: ObjectRef, index: usize, byte_offset: u32) -> Location {
+        Location::Element { array, index, byte_offset }
+    }
+
+    /// A packed array of `kind` holding `values`.
+    fn packed(vm: &mut Vm, kind: PrimKind, values: &[Value]) -> ObjectRef {
+        let array = vm.heap_mut().alloc_packed_array(kind, values.len(), 0);
+        for (index, value) in values.iter().enumerate() {
+            assert!(vm.heap_mut().array_set(array, index, value.clone()));
+        }
+        array
+    }
+
+    #[test]
+    fn a_read_through_a_pointer_into_a_packed_array_takes_its_bytes() {
+        let mut vm = Vm::new();
+        let ints = packed(&mut vm, PrimKind::I4, &[Value::Int32(0x0403_0201)]);
+        assert_eq!(read_through(&mut vm, element_at(ints, 0, 1), Opcode::LdindU1), Ok(Some(Value::Int32(2))));
+        assert_eq!(read_through(&mut vm, element_at(ints, 0, 2), Opcode::LdindU2), Ok(Some(Value::Int32(0x0403))));
+        let bytes = packed(&mut vm, PrimKind::U1, &[1, 2, 3, 4].map(Value::Int32));
+        assert_eq!(read_through(&mut vm, element_at(bytes, 0, 0), Opcode::LdindI4), Ok(Some(Value::Int32(0x0403_0201))));
+        let shorts = packed(&mut vm, PrimKind::I2, &[Value::Int32(-256), Value::Int32(0x1234)]);
+        assert_eq!(read_through(&mut vm, element_at(shorts, 0, 1), Opcode::LdindU2), Ok(Some(Value::Int32(0x34FF))));
+        let eight = packed(&mut vm, PrimKind::U1, &[1, 2, 3, 4, 5, 6, 7, 8].map(Value::Int32));
+        let native = if crate::native_pointer_size() == 8 { 0x0807_0605_0403_0201 } else { 0x0403_0201 };
+        assert_eq!(read_through(&mut vm, element_at(eight, 0, 0), Opcode::LdindI), Ok(Some(Value::NativeInt(native))));
+        let grid = vm.heap_mut().alloc_md_array_packed(vec![2, 3], PrimKind::U1, 0);
+        for (flat, value) in (1..=6).enumerate() {
+            assert!(vm.heap_mut().array_set(grid, flat, Value::Int32(value)));
+        }
+        assert_eq!(read_through(&mut vm, element_at(grid, 0, 0), Opcode::LdindI4), Ok(Some(Value::Int32(0x0403_0201))));
+        assert_eq!(read_through(&mut vm, element_at(bytes, 0, 1), Opcode::LdindI4), Err(Trap::Unsupported(Opcode::LdindI4)));
+        assert_eq!(read_through(&mut vm, element_at(bytes, 3, 1), Opcode::LdindU1), Err(Trap::Unsupported(Opcode::LdindU1)));
+    }
+
+    #[test]
+    fn a_store_through_a_pointer_into_a_packed_array_replaces_only_its_bytes() {
+        let mut vm = Vm::new();
+        let int = |n: i32| Instruction::new(Opcode::LdcI4, Operand::Int32(n));
+        let bytes = packed(&mut vm, PrimKind::U1, &[0, 0, 0, 0].map(Value::Int32));
+        assert_eq!(store_through(&mut vm, element_at(bytes, 0, 0), int(0x0403_0201), Opcode::StindI4), Ok(Some(Value::Null)));
+        let all = |vm: &Vm| (0..4).map(|index| vm.heap().array_get(bytes, index)).collect::<Vec<_>>();
+        assert_eq!(all(&vm), [1, 2, 3, 4].map(|n| Some(Value::Int32(n))));
+        let ints = packed(&mut vm, PrimKind::I4, &[Value::Int32(0x1234_5678)]);
+        assert_eq!(store_through(&mut vm, element_at(ints, 0, 1), int(0xAA), Opcode::StindI1), Ok(Some(Value::Null)));
+        assert_eq!(vm.heap().array_get(ints, 0), Some(Value::Int32(0x1234_AA78)));
+        assert_eq!(store_through(&mut vm, element_at(bytes, 0, 2), int(-1), Opcode::StindI4), Err(Trap::Unsupported(Opcode::StindI4)));
+        assert_eq!(all(&vm), [1, 2, 3, 4].map(|n| Some(Value::Int32(n))));
+    }
+
+    #[test]
+    fn a_pointer_stepped_back_inside_an_array_reaches_the_element_before() {
+        let mut vm = Vm::new();
+        let ints = packed(&mut vm, PrimKind::I4, &[Value::Int32(42), Value::Int32(99)]);
+        let back = element_at(ints, 1, 4u32.wrapping_neg());
+        assert_eq!(read_through(&mut vm, back.clone(), Opcode::LdindI4), Ok(Some(Value::Int32(42))));
+        assert_eq!(store_through(&mut vm, back, Instruction::new(Opcode::LdcI4, Operand::Int32(77)), Opcode::StindI4),
+            Ok(Some(Value::Null)));
+        assert_eq!(vm.heap().array_get(ints, 0), Some(Value::Int32(77)));
+        let native = crate::native_pointer_size();
+        let pointers = vm.heap_mut().alloc_array_with_element_width(
+            vec![Value::NativeInt(5), Value::NativeInt(6)], 0, Some(native as usize),
+        );
+        assert_eq!(read_through(&mut vm, element_at(pointers, 1, native.wrapping_neg()), Opcode::LdindI), Ok(Some(Value::NativeInt(5))));
+        assert_eq!(read_through(&mut vm, element_at(ints, 0, 4u32.wrapping_neg()), Opcode::LdindI4), Err(Trap::Unsupported(Opcode::LdindI4)));
+        assert_eq!(read_through(&mut vm, element_at(pointers, 0, native.wrapping_neg()), Opcode::LdindI), Err(Trap::Unsupported(Opcode::LdindI)));
+    }
+
+    #[test]
+    fn a_pointer_stepped_back_compares_and_subtracts_at_its_address() {
+        let mut vm = Vm::new();
+        let ints = packed(&mut vm, PrimKind::I4, &[Value::Int32(42), Value::Int32(99)]);
+        let four = || Instruction::new(Opcode::LdcI4, Operand::Int32(4));
+        let mut module = Module::new();
+        let equal = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            four(),
+            Instruction::simple(Opcode::Sub),
+            Instruction::simple(Opcode::Ldarg1),
+            Instruction::simple(Opcode::Ceq),
+            ret(),
+        ]), 2);
+        let difference = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            four(),
+            Instruction::simple(Opcode::Sub),
+            Instruction::simple(Opcode::Ldarg1),
+            Instruction::simple(Opcode::Sub),
+            ret(),
+        ]), 2);
+        let pointers = vec![Value::ByRef(element_at(ints, 1, 0)), Value::ByRef(element_at(ints, 0, 0))];
+        assert_eq!(super::run(&module, &mut vm, equal, pointers.clone()), Ok(Some(Value::Int32(1))));
+        assert_eq!(super::run(&module, &mut vm, difference, pointers), Ok(Some(Value::NativeInt(0))));
+    }
+
+    /// Allocates with `newarr` an array of `length` elements of an enum whose underlying integer is
+    /// `width` bytes wide and signed or not as `unsigned` says.
+    fn new_enum_array(vm: &mut Vm, width: u8, unsigned: bool, length: i32) -> ObjectRef {
+        let element = Token::new(0x02, 7);
+        let mut module = Module::new();
+        module.set_enum_constant(0, element.0, 1, String::from("A"));
+        module.set_enum_width(0, element.0, width);
+        if unsigned {
+            module.set_enum_unsigned(0, element.0);
+        }
+        let main = module.add_method_image(0, method(vec![
+            Instruction::new(Opcode::LdcI4, Operand::Int32(length)),
+            Instruction::new(Opcode::Newarr, Operand::Token(element)),
+            ret(),
+        ]), 0);
+        match super::run(&module, vm, main, Vec::new()) {
+            Ok(Some(Value::Object(array))) => array,
+            other => panic!("newarr of an enum gave {other:?}"),
+        }
+    }
+
+    #[test]
+    fn an_enum_arrays_elements_are_its_underlying_integers_bytes() {
+        let mut vm = Vm::new();
+        let array = new_enum_array(&mut vm, 4, false, 2);
+        assert_eq!(store_through(&mut vm, element_at(array, 0, 0), Instruction::new(Opcode::LdcI8, Operand::Int64(5)), Opcode::StindI),
+            Ok(Some(Value::Null)));
+        assert!(vm.heap_mut().array_set(array, 1, Value::Int32(2)));
+        let native = if crate::native_pointer_size() == 8 { 0x0000_0002_0000_0005 } else { 5 };
+        assert_eq!(read_through(&mut vm, element_at(array, 0, 0), Opcode::LdindI), Ok(Some(Value::NativeInt(native))));
+        let bytes = new_enum_array(&mut vm, 1, true, 2);
+        assert!(vm.heap_mut().array_set(bytes, 1, Value::Int32(7)));
+        assert_eq!(read_through(&mut vm, element_at(bytes, 0, 1), Opcode::LdindU1), Ok(Some(Value::Int32(7))));
+        let signed = new_enum_array(&mut vm, 1, false, 1);
+        assert!(vm.heap_mut().array_set(signed, 0, Value::Int32(-1)));
+        assert_eq!(vm.heap().array_get(signed, 0), Some(Value::Int32(-1)));
+    }
+
+    #[test]
+    fn a_pointer_moved_with_ldind_ref_or_stind_ref_over_a_packed_array_is_a_native_int() {
+        let mut vm = Vm::new();
+        let ints = packed(&mut vm, PrimKind::I4, &[Value::Int32(1), Value::Int32(2)]);
+        assert_eq!(run_on_pointer(&mut vm, vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(5)),
+            Instruction::simple(Opcode::ConvI),
+            Instruction::simple(Opcode::StindRef),
+            Instruction::simple(Opcode::Ldnull),
+            ret(),
+        ], element_at(ints, 0, 0)), Ok(Some(Value::Null)));
+        assert!(vm.heap_mut().array_set(ints, 1, Value::Int32(2)));
+        let native = if crate::native_pointer_size() == 8 { 0x0000_0002_0000_0005 } else { 5 };
+        assert_eq!(read_through(&mut vm, element_at(ints, 0, 0), Opcode::LdindRef), Ok(Some(Value::NativeInt(native))));
+    }
+
+    /// The token of `struct Wrap { int X; }`, of `struct Holder { string S; int X; }`, of `System.Byte`,
+    /// of `struct Halves { short A; short B; }`, of `struct Bytes { sbyte A; byte B, C, D; }` and of
+    /// `struct Item { byte Small; int Wide; short Tail; }` in the module [`obj_types_module`] builds.
+    const WRAP: Token = Token(0x0200_0010);
+    const HOLDER: Token = Token(0x0200_0011);
+    const BYTE: Token = Token(0x0100_0012);
+    const HALVES: Token = Token(0x0200_0013);
+    const BYTES: Token = Token(0x0200_0014);
+    const ITEM: Token = Token(0x0200_0015);
+    /// The token of `class Quad { byte A, B, C, D; }`, of `class Mixed { string S; int X; int Y; }` and of
+    /// `class Keeper { Halves H; int Z; }`.
+    const QUAD: Token = Token(0x0200_0016);
+    const MIXED: Token = Token(0x0200_0017);
+    const KEEPER: Token = Token(0x0200_0018);
+
+    /// A module that declares the value types `Wrap`, `Holder`, `System.Byte`, `Halves`, `Bytes` and `Item`
+    /// and the classes `Quad`, `Mixed` and `Keeper` under [`WRAP`], [`HOLDER`], [`BYTE`], [`HALVES`],
+    /// [`BYTES`], [`ITEM`], [`QUAD`], [`MIXED`] and [`KEEPER`], every one but `System.Byte` with its field
+    /// layout (ECMA-335 6th ed II.10.1.2).
+    fn obj_types_module() -> Module {
+        use crate::module::FieldStorage;
+        let mut module = Module::new();
+        let pointer = crate::native_pointer_size();
+        let mut declare = |token: Token, name: &str, layout: Option<(u32, u32, &[(u32, FieldStorage)])>| {
+            let fields = layout.map_or(&[][..], |(_, _, fields)| fields);
+            let zero = fields.iter().map(|&(_, storage)| if storage == FieldStorage::Reference { Value::Null } else { Value::Int32(0) });
+            let id = module.add_type(zero.collect());
+            if let Some((end, alignment, fields)) = layout {
+                module.set_type_field_offsets(id, end, alignment, &fields.iter().map(|&(offset, _)| offset).collect::<Vec<_>>());
+                module.set_type_field_storage(id, &fields.iter().map(|&(_, storage)| storage).collect::<Vec<_>>());
+            }
+            module.bind_type_full_name(id, String::from(name));
+            module.set_type_is_value_type(id, !matches!(name, "Quad" | "Mixed" | "Keeper"));
+            module.bind_type_token(0, token, id);
+            id
+        };
+        let field = |kind| FieldStorage::Primitive(kind);
+        declare(WRAP, "Wrap", Some((4, 4, &[(0, field(PrimKind::I4))])));
+        declare(HOLDER, "Holder", Some((pointer + 4, pointer, &[(0, FieldStorage::Reference), (pointer, field(PrimKind::I4))])));
+        declare(BYTE, "System.Byte", None);
+        let halves = declare(HALVES, "Halves", Some((4, 2, &[(0, field(PrimKind::I2)), (2, field(PrimKind::I2))])));
+        let bytes = [(0, field(PrimKind::I1)), (1, field(PrimKind::U1)), (2, field(PrimKind::U1)), (3, field(PrimKind::U1))];
+        declare(BYTES, "Bytes", Some((4, 1, &bytes)));
+        declare(ITEM, "Item", Some((12, 4, &[(0, field(PrimKind::U1)), (4, field(PrimKind::I4)), (8, field(PrimKind::I2))])));
+        let quad = [(0, field(PrimKind::U1)), (1, field(PrimKind::U1)), (2, field(PrimKind::U1)), (3, field(PrimKind::U1))];
+        declare(QUAD, "Quad", Some((4, 1, &quad)));
+        declare(MIXED, "Mixed", Some((pointer + 8, pointer, &[(0, FieldStorage::Reference), (pointer, field(PrimKind::I4)), (pointer + 4, field(PrimKind::I4))])));
+        declare(KEEPER, "Keeper", Some((8, 4, &[(0, FieldStorage::ValueType(halves)), (4, field(PrimKind::I4))])));
+        module
+    }
+
+    /// Runs `code` as [`run_with_slot_kinds`] does, in the module [`obj_types_module`] builds.
+    fn run_with_obj_types(code: Vec<Instruction>, args: &[SlotKind], locals: &[SlotKind], arguments: Vec<Value>, vm: &mut Vm) -> Result<Option<Value>, Trap> {
+        let mut module = obj_types_module();
+        let main = module.add_method_image(0, method(code), u16::try_from(args.len()).unwrap());
+        module.set_method_slot_kinds(main, args, locals);
+        super::run(&module, vm, main, arguments)
+    }
+
+    /// Runs `code` as [`run_with_obj_types`] does, each argument and local a struct variable of the type
+    /// its token names, recorded as the loader records a struct variable's type, or, for `None`, an
+    /// unmanaged pointer.
+    fn run_with_struct_variables(code: Vec<Instruction>, args: &[Option<Token>], locals: &[Option<Token>], arguments: Vec<Value>) -> Result<Option<Value>, Trap> {
+        let mut module = obj_types_module();
+        let main = module.add_method_image(0, method(code), u16::try_from(args.len()).unwrap());
+        let kinds = |slots: &[Option<Token>]| slots.iter().map(|token| if token.is_some() { SlotKind::Struct } else { SlotKind::Native }).collect::<Vec<_>>();
+        module.set_method_slot_kinds(main, &kinds(args), &kinds(locals));
+        for (argument, slots) in [(true, args), (false, locals)] {
+            for (slot, token) in slots.iter().enumerate() {
+                if let Some(id) = token.and_then(|token| module.type_id_of(0, token)) {
+                    module.set_method_slot_struct_type(main, argument, slot, id);
+                }
+            }
+        }
+        super::run(&module, &mut Vm::new(), main, arguments)
+    }
+
+    /// A struct of the module [`obj_types_module`] builds, holding the int32 `values` in its fields.
+    fn fields(values: &[i32]) -> Value {
+        Value::Struct(values.iter().map(|&value| Value::Int32(value)).collect())
+    }
+
+    #[test]
+    fn a_struct_variable_is_read_and_written_through_its_bytes() {
+        let int = |n: i32| Instruction::new(Opcode::LdcI4, Operand::Int32(n));
+        let at_argument = |access: Instruction| vec![
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::ConvU),
+            access,
+            ret(),
+        ];
+        assert_eq!(run_with_struct_variables(at_argument(Instruction::simple(Opcode::LdindU1)), &[Some(WRAP)], &[], vec![fields(&[0x0102_0304])]),
+            Ok(Some(Value::Int32(4))));
+        assert_eq!(run_with_struct_variables(at_argument(Instruction::new(Opcode::Ldobj, Operand::Token(WRAP))), &[Some(HALVES)], &[], vec![fields(&[1, 2])]),
+            Ok(Some(fields(&[0x0002_0001]))));
+        let field = |slot| Value::ByRef(Location::Nested { base: Box::new(Location::Arg { frame: 0, slot: 0 }), slot });
+        let through_field = |code, values: &[i32], slot| run_with_struct_variables(code, &[Some(BYTES), None], &[], vec![fields(values), field(slot)]);
+        let read_int = || vec![Instruction::simple(Opcode::Ldarg1), Instruction::simple(Opcode::LdindI4), ret()];
+        assert_eq!(through_field(read_int(), &[1, 2, 3, 4], 0), Ok(Some(Value::Int32(0x0403_0201))));
+        assert_eq!(through_field(read_int(), &[-1, 0, 0, 0], 0), Ok(Some(Value::Int32(255))));
+        assert_eq!(through_field(vec![
+            Instruction::simple(Opcode::Ldarg1),
+            Instruction::simple(Opcode::LdcI42),
+            Instruction::simple(Opcode::Add),
+            Instruction::simple(Opcode::LdindU1),
+            ret(),
+        ], &[1, 2, 3, 4], 0), Ok(Some(Value::Int32(3))));
+        assert_eq!(through_field(vec![
+            Instruction::simple(Opcode::Ldarg1),
+            int(0x0A0B_0C0D),
+            Instruction::simple(Opcode::StindI4),
+            Instruction::simple(Opcode::Ldarg0),
+            ret(),
+        ], &[1, 2, 3, 4], 0), Ok(Some(fields(&[0x0D, 0x0C, 0x0B, 0x0A]))));
+        assert_eq!(run_with_struct_variables(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::simple(Opcode::LdcI41),
+            Instruction::simple(Opcode::Add),
+            int(0xBBAA),
+            Instruction::simple(Opcode::StindI2),
+            Instruction::simple(Opcode::Ldloc0),
+            ret(),
+        ], &[Some(HALVES)], &[Some(HALVES)], vec![fields(&[0x1122, 0x3344])]), Ok(Some(fields(&[i32::from(0xAA22u16 as i16), 0x33BB]))));
+        assert_eq!(run_with_struct_variables(vec![
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::ConvU),
+            int(0x0002_0001),
+            Instruction::simple(Opcode::StindI4),
+            Instruction::simple(Opcode::Ldloc0),
+            ret(),
+        ], &[], &[Some(HALVES)], Vec::new()), Ok(Some(fields(&[1, 2]))));
+        assert_eq!(run_with_struct_variables(vec![
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::simple(Opcode::LdcI44),
+            Instruction::simple(Opcode::Add),
+            Instruction::new(Opcode::Ldobj, Operand::Token(WRAP)),
+            ret(),
+        ], &[Some(ITEM)], &[], vec![fields(&[17, 1_234_567, 2345])]), Ok(Some(fields(&[1_234_567]))));
+        assert_eq!(run_with_struct_variables(vec![
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::simple(Opcode::Ldarg1),
+            Instruction::new(Opcode::Stobj, Operand::Token(WRAP)),
+            Instruction::simple(Opcode::Ldarg0),
+            ret(),
+        ], &[Some(HALVES), Some(WRAP)], &[], vec![fields(&[1, 2]), fields(&[0x0004_0003])]), Ok(Some(fields(&[3, 4]))));
+        assert_eq!(run_with_struct_variables(at_argument(Instruction::simple(Opcode::LdindI8)), &[Some(WRAP)], &[], vec![fields(&[1])]),
+            Err(Trap::Unsupported(Opcode::LdindI8)));
+        let holder = Value::Struct(vec![Value::Null, Value::Int32(7)].into_boxed_slice());
+        assert_eq!(run_with_struct_variables(at_argument(Instruction::new(Opcode::Ldobj, Operand::Token(HOLDER))), &[Some(HOLDER)], &[], vec![holder.clone()]),
+            Ok(Some(holder.clone())));
+        assert_eq!(run_with_struct_variables(read_int(), &[Some(HOLDER), None], &[], vec![holder, field(1)]), Ok(Some(Value::Int32(7))));
+    }
+
+    #[test]
+    fn a_pointer_to_an_objects_field_reads_and_writes_its_bytes_within_the_value_it_is_in() {
+        let types = obj_types_module();
+        let id = |token| types.type_id_of(0, token).unwrap();
+        let int = |n: i32| Instruction::new(Opcode::LdcI4, Operand::Int32(n));
+        let mut vm = Vm::new();
+        let quad = vm.heap_mut().alloc_instance(id(QUAD), [1, 2, 3, 4].map(Value::Int32).to_vec());
+        let field = |object, slot| Value::ByRef(Location::Field { object, slot });
+        let through = |code, argument, vm: &mut Vm| run_with_obj_types(code, &[SlotKind::Native], &[], vec![argument], vm);
+        let read = |load| vec![Instruction::simple(Opcode::Ldarg0), Instruction::simple(load), ret()];
+        assert_eq!(through(read(Opcode::LdindI4), field(quad, 0), &mut vm), Err(Trap::Unsupported(Opcode::LdindI4)));
+        let store = vec![Instruction::simple(Opcode::Ldarg0), int(0x0A0B_0C0D), Instruction::simple(Opcode::StindI4), int(0), ret()];
+        assert_eq!(through(store, field(quad, 0), &mut vm), Err(Trap::Unsupported(Opcode::StindI4)));
+        assert_eq!((0..4).map(|slot| vm.heap().instance_field(quad, slot)).collect::<Vec<_>>(), [1, 2, 3, 4].map(|n| Some(Value::Int32(n))));
+        assert_eq!(through(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::new(Opcode::Ldobj, Operand::Token(WRAP)),
+            ret(),
+        ], field(quad, 0), &mut vm), Err(Trap::Unsupported(Opcode::Ldobj)));
+        let text = vm.heap_mut().alloc_string(&[u16::from(b's')]).unwrap();
+        let mixed = vm.heap_mut().alloc_instance(id(MIXED), vec![Value::Object(text), Value::Int32(0x3F80_0000), Value::Int32(6)]);
+        #[cfg(feature = "float")]
+        assert_eq!(through(read(Opcode::LdindR4), field(mixed, 1), &mut vm), Ok(Some(Value::Single(1.0))));
+        assert_eq!(through(read(Opcode::LdindI8), field(mixed, 1), &mut vm), Err(Trap::Unsupported(Opcode::LdindI8)));
+        assert_eq!(through(read(Opcode::LdindRef), field(mixed, 0), &mut vm), Ok(Some(Value::Object(text))));
+        let halves = fields(&[1, 2]);
+        let keeper = vm.heap_mut().alloc_instance(id(KEEPER), vec![halves.clone(), Value::Int32(3)]);
+        let h_field = |slot| Value::ByRef(Location::Nested { base: Box::new(Location::Field { object: keeper, slot: 0 }), slot });
+        assert_eq!(through(read(Opcode::LdindI4), h_field(0), &mut vm), Ok(Some(Value::Int32(0x0002_0001))));
+        assert_eq!(through(read(Opcode::LdindI8), h_field(0), &mut vm), Err(Trap::Unsupported(Opcode::LdindI8)));
+        let store_short = vec![Instruction::simple(Opcode::Ldarg0), int(9), Instruction::simple(Opcode::StindI2), int(0), ret()];
+        assert_eq!(through(store_short, h_field(1), &mut vm), Ok(Some(Value::Int32(0))));
+        assert_eq!(vm.heap().instance_field(keeper, 0), Some(fields(&[1, 9])));
+        let boxed = vm.heap_mut().alloc_boxed(crate::module::asm_key(0, HALVES.0), halves);
+        let in_box = Value::ByRef(Location::Boxed { object: boxed });
+        let b_in_box = Value::ByRef(Location::Nested { base: Box::new(Location::Boxed { object: boxed }), slot: 1 });
+        assert_eq!(through(read(Opcode::LdindI4), in_box, &mut vm), Ok(Some(Value::Int32(0x0002_0001))));
+        assert_eq!(through(read(Opcode::LdindU1), b_in_box, &mut vm), Ok(Some(Value::Int32(2))));
+    }
+
+    /// The tokens of `static int SI` (starting 0x04030201), `static float SF` and `static double SD` (starting
+    /// 1.0), and of the field `float F` of `class Floats`, in the module [`statics_module`] builds.
+    const SI: Token = Token(0x0400_0010);
+    #[cfg(feature = "float")]
+    const SF: Token = Token(0x0400_0011);
+    #[cfg(feature = "float")]
+    const SD: Token = Token(0x0400_0012);
+    #[cfg(feature = "float")]
+    const FLOATS_F: Token = Token(0x0400_0013);
+
+    /// The module [`obj_types_module`] builds, with the statics [`SI`], [`SF`] and [`SD`] and the class
+    /// `Floats` holding the field [`FLOATS_F`], each with its declared storage recorded as the loader
+    /// records it.
+    fn statics_module() -> Module {
+        use crate::module::FieldStorage;
+        let mut module = obj_types_module();
+        let mut bind = |token: Token, default: Value, kind: PrimKind| {
+            module.bind_static_field(0, token, default);
+            let slot = module.static_field_slot(0, token).unwrap();
+            module.set_static_storage(slot, FieldStorage::Primitive(kind));
+        };
+        bind(SI, Value::Int32(0x0403_0201), PrimKind::I4);
+        #[cfg(feature = "float")]
+        {
+            bind(SF, Value::Single(0.0), PrimKind::F4);
+            bind(SD, Value::Float(1.0), PrimKind::F8);
+            let floats = module.add_type(vec![Value::Single(0.0)]);
+            module.set_type_field_offsets(floats, 4, 4, &[0]);
+            module.set_type_field_storage(floats, &[FieldStorage::Primitive(PrimKind::F4)]);
+            module.bind_field(0, FLOATS_F, 0);
+            module.bind_field_type(0, FLOATS_F, floats);
+        }
+        module
+    }
+
+    /// Runs `code` with `arguments` in the module [`statics_module`] builds, on a fresh [`Vm`].
+    fn run_with_statics(code: Vec<Instruction>, arguments: Vec<Value>) -> Result<Option<Value>, Trap> {
+        let mut module = statics_module();
+        let main = module.add_method_image(0, method(code), u16::try_from(arguments.len()).unwrap());
+        super::run(&module, &mut Vm::new(), main, arguments)
+    }
+
+    #[test]
+    fn a_pointer_to_a_static_reads_and_writes_its_declared_bytes() {
+        let static_address = Instruction::new(Opcode::Ldsflda, Operand::Token(SI));
+        assert_eq!(run_with_statics(vec![
+            static_address.clone(),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(0x7f)),
+            Instruction::simple(Opcode::StindI1),
+            Instruction::new(Opcode::Ldsfld, Operand::Token(SI)),
+            ret(),
+        ], Vec::new()), Ok(Some(Value::Int32(0x0403_027F))));
+        assert_eq!(run_with_statics(vec![static_address.clone(), Instruction::simple(Opcode::LdindI2), ret()], Vec::new()),
+            Ok(Some(Value::Int32(0x0201))));
+        assert_eq!(run_with_statics(vec![static_address, Instruction::simple(Opcode::LdindI8), ret()], Vec::new()),
+            Err(Trap::Unsupported(Opcode::LdindI8)));
+    }
+
+    #[test]
+    fn two_field_addresses_on_one_place_order_by_their_recorded_offsets() {
+        use crate::module::FieldStorage;
+        const S: Token = Token(0x0400_0020);
+        const A: Token = Token(0x0400_0021);
+        const B: Token = Token(0x0400_0022);
+        let ordered = |recorded: bool, first: Token, second: Token, opcode: Opcode| {
+            let mut module = obj_types_module();
+            let owner = if recorded {
+                module.type_id_of(0, HALVES).unwrap()
+            } else {
+                let unrecorded = module.add_type(vec![Value::Int32(0), Value::Int32(0)]);
+                module.set_type_is_value_type(unrecorded, true);
+                unrecorded
+            };
+            module.bind_static_field(0, S, fields(&[0, 0]));
+            let slot = module.static_field_slot(0, S).unwrap();
+            module.set_static_storage(slot, FieldStorage::ValueType(owner));
+            module.bind_field(0, A, 0);
+            module.bind_field(0, B, 1);
+            let main = module.add_method_image(0, method(vec![
+                Instruction::new(Opcode::Ldsflda, Operand::Token(S)),
+                Instruction::new(Opcode::Ldflda, Operand::Token(first)),
+                Instruction::new(Opcode::Ldsflda, Operand::Token(S)),
+                Instruction::new(Opcode::Ldflda, Operand::Token(second)),
+                Instruction::simple(opcode),
+                ret(),
+            ]), 0);
+            super::run(&module, &mut Vm::new(), main, Vec::new())
+        };
+        assert_eq!(ordered(true, A, B, Opcode::Clt), Ok(Some(Value::Int32(1))));
+        assert_eq!(ordered(true, B, A, Opcode::Clt), Ok(Some(Value::Int32(0))));
+        assert_eq!(ordered(true, B, B, Opcode::Ceq), Ok(Some(Value::Int32(1))));
+        assert_eq!(ordered(false, A, B, Opcode::Clt), Err(Trap::Unsupported(Opcode::Clt)));
+        assert_eq!(ordered(false, A, B, Opcode::Ceq), Err(Trap::Unsupported(Opcode::Ceq)));
+        assert_eq!(ordered(false, B, B, Opcode::Ceq), Ok(Some(Value::Int32(1))));
+    }
+
+    #[test]
+    #[cfg(feature = "float")]
+    fn a_floating_store_into_a_field_or_a_static_takes_its_declared_width() {
+        let r8 = |value: f64| Instruction::new(Opcode::LdcR8, Operand::Float64(value));
+        let compare = |store: Vec<Instruction>, load: Vec<Instruction>, arguments| {
+            let mut code = store;
+            code.extend(load);
+            code.extend([r8(16_777_217.0), Instruction::simple(Opcode::Ceq), ret()]);
+            run_with_statics(code, arguments)
+        };
+        assert_eq!(compare(
+            vec![r8(16_777_217.0), Instruction::new(Opcode::Stsfld, Operand::Token(SF))],
+            vec![Instruction::new(Opcode::Ldsfld, Operand::Token(SF))],
+            Vec::new(),
+        ), Ok(Some(Value::Int32(0))));
+        let types = statics_module();
+        let floats = types.field_type(0, FLOATS_F).unwrap();
+        let mut vm = Vm::new();
+        let object = vm.heap_mut().alloc_instance(floats, vec![Value::Single(0.0)]);
+        let mut module = statics_module();
+        let main = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            r8(16_777_217.0),
+            Instruction::new(Opcode::Stfld, Operand::Token(FLOATS_F)),
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::new(Opcode::Ldfld, Operand::Token(FLOATS_F)),
+            r8(16_777_217.0),
+            Instruction::simple(Opcode::Ceq),
+            ret(),
+        ]), 1);
+        assert_eq!(super::run(&module, &mut vm, main, vec![Value::Object(object)]), Ok(Some(Value::Int32(0))));
+        assert_eq!(run_with_statics(vec![
+            Instruction::new(Opcode::LdcR4, Operand::Float32(1.0)),
+            Instruction::new(Opcode::Stsfld, Operand::Token(SD)),
+            Instruction::new(Opcode::Ldsflda, Operand::Token(SD)),
+            Instruction::simple(Opcode::LdindI4),
+            ret(),
+        ], Vec::new()), Ok(Some(Value::Int32(0))));
+        assert_eq!(run_with_statics(vec![
+            Instruction::new(Opcode::Ldsflda, Operand::Token(SD)),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::new(Opcode::LdcR4, Operand::Float32(0.0)),
+            Instruction::simple(Opcode::StindR4),
+            Instruction::new(Opcode::Ldsfld, Operand::Token(SD)),
+            r8(1.0),
+            Instruction::simple(Opcode::Ceq),
+            ret(),
+        ], Vec::new()), Ok(Some(Value::Int32(1))));
+    }
+
+    #[test]
+    fn a_builtin_methods_receiver_is_read_through_its_address_as_its_type() {
+        fn observe(_vm: &mut Vm, _module: &Module, args: &[Value]) -> Result<Option<Value>, Trap> {
+            Ok(args.first().cloned())
+        }
+        let run = |name: &str, stored: i32, address: Vec<Instruction>| {
+            let mut module = Module::new();
+            let owner = module.add_type(Vec::new());
+            module.bind_type_full_name(owner, String::from(name));
+            module.set_type_is_value_type(owner, true);
+            let token = Token(0x0a00_0001);
+            let intrinsic = module.add_intrinsic(0, observe, 0, 1);
+            module.set_method_type(intrinsic, owner);
+            module.bind_token(0, token, intrinsic);
+            let mut code = vec![Instruction::new(Opcode::LdcI4, Operand::Int32(stored)), Instruction::simple(Opcode::Stloc0)];
+            code.extend(address);
+            code.extend([Instruction::new(Opcode::Call, Operand::Token(token)), ret()]);
+            let main = module.add_method_image(0, method(code), 0);
+            module.set_method_slot_kinds(main, &[], &[SlotKind::Primitive(PrimKind::I4)]);
+            super::run(&module, &mut Vm::new(), main, Vec::new())
+        };
+        let address = || vec![Instruction::new(Opcode::LdlocaS, Operand::Variable(0)), Instruction::simple(Opcode::ConvU)];
+        #[cfg(feature = "float")]
+        assert_eq!(run("System.Single", 0x3F80_0000, address()), Ok(Some(Value::Single(1.0))));
+        let mut second = address();
+        second.extend([Instruction::simple(Opcode::LdcI42), Instruction::simple(Opcode::Add)]);
+        assert_eq!(run("System.Char", 0x0042_0041, second), Ok(Some(Value::Int32(0x42))));
+        assert_eq!(run("System.Int32", 7, address()), Ok(Some(Value::Int32(7))));
+    }
+
+    #[test]
+    fn a_pointer_into_a_pinned_string_reads_its_bytes_at_any_byte() {
+        let mut vm = Vm::new();
+        let mut string = |text: &str| vm.heap_mut().alloc_string(&text.encode_utf16().collect::<Vec<_>>()).unwrap();
+        let (one, ab, abc) = (string("\u{0201}"), string("AB"), string("ABC"));
+        let at = |string, byte_offset| Value::ByRef(Location::StringChar { string, byte_offset });
+        let read = |load, pointer, vm: &mut Vm| {
+            run_with_obj_types(vec![Instruction::simple(Opcode::Ldarg0), Instruction::simple(load), ret()], &[SlotKind::Native], &[], vec![pointer], vm)
+        };
+        assert_eq!(read(Opcode::LdindU1, at(one, 1), &mut vm), Ok(Some(Value::Int32(2))));
+        assert_eq!(read(Opcode::LdindI4, at(ab, 0), &mut vm), Ok(Some(Value::Int32(0x0042_0041))));
+        assert_eq!(read(Opcode::LdindI2, at(ab, 1), &mut vm), Ok(Some(Value::Int32(0x4200))));
+        assert_eq!(read(Opcode::LdindI8, at(abc, 0), &mut vm), Ok(Some(Value::Int64(0x0000_0043_0042_0041))));
+        assert_eq!(read(Opcode::LdindI8, at(ab, 0), &mut vm), Err(Trap::Unsupported(Opcode::LdindI8)));
+        assert_eq!(read_utf16_through_pointer(&[], &vm, &Location::StringChar { string: ab, byte_offset: 1 }, 0, None), Ok(vec![0x4200]));
+        assert_eq!(read_utf16_through_pointer(&[], &vm, &Location::StringChar { string: ab, byte_offset: 0 }, 0, None), Ok(vec![0x41, 0x42]));
+    }
+
+    #[test]
+    fn a_pointer_to_a_field_of_a_struct_variable_is_the_byte_the_field_starts_at() {
+        let field = |slot| Value::ByRef(Location::Nested { base: Box::new(Location::Arg { frame: 0, slot: 0 }), slot });
+        let difference = |slot| run_with_struct_variables(vec![
+            Instruction::simple(Opcode::Ldarg1),
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::simple(Opcode::Sub),
+            ret(),
+        ], &[Some(ITEM), None], &[], vec![fields(&[17, 1_234_567, 2345]), field(slot)]);
+        assert_eq!([difference(0), difference(1), difference(2)], [0, 4, 8].map(|offset| Ok(Some(Value::NativeInt(offset)))));
+        assert_eq!(run_with_struct_variables(vec![
+            Instruction::simple(Opcode::Ldarg1),
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::simple(Opcode::LdcI41),
+            Instruction::simple(Opcode::Add),
+            Instruction::simple(Opcode::Ceq),
+            ret(),
+        ], &[Some(BYTES), None], &[], vec![fields(&[1, 2, 3, 4]), field(1)]), Ok(Some(Value::Int32(1))));
+    }
+
+    #[test]
+    fn ldobj_and_stobj_move_a_value_of_their_type_through_a_pointer_into_a_number() {
+        let i4 = SlotKind::Primitive(PrimKind::I4);
+        let int = |n: i32| Instruction::new(Opcode::LdcI4, Operand::Int32(n));
+        let mut vm = Vm::new();
+        assert_eq!(run_with_obj_types(vec![
+            int(42),
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::new(Opcode::Ldobj, Operand::Token(WRAP)),
+            ret(),
+        ], &[], &[i4], Vec::new(), &mut vm), Ok(Some(Value::Struct(vec![Value::Int32(42)].into_boxed_slice()))));
+        assert_eq!(run_with_obj_types(vec![
+            int(0x0403_0201),
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::simple(Opcode::LdcI41),
+            Instruction::simple(Opcode::Add),
+            Instruction::new(Opcode::Ldobj, Operand::Token(BYTE)),
+            ret(),
+        ], &[], &[i4], Vec::new(), &mut vm), Ok(Some(Value::Int32(2))));
+        assert_eq!(run_with_obj_types(vec![
+            int(0x0403_0201),
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            int(0x7f),
+            Instruction::new(Opcode::Stobj, Operand::Token(BYTE)),
+            Instruction::simple(Opcode::Ldloc0),
+            ret(),
+        ], &[], &[i4], Vec::new(), &mut vm), Ok(Some(Value::Int32(0x0403_027f))));
+        assert_eq!(run_with_obj_types(vec![
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::new(Opcode::Stobj, Operand::Token(WRAP)),
+            Instruction::simple(Opcode::Ldloc0),
+            ret(),
+        ], &[SlotKind::Struct], &[i4], vec![Value::Struct(vec![Value::Int32(7)].into_boxed_slice())], &mut vm), Ok(Some(Value::Int32(7))));
+        let bytes = packed(&mut vm, PrimKind::U1, &[1, 2, 3, 4].map(Value::Int32));
+        assert_eq!(run_with_obj_types(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::new(Opcode::Ldobj, Operand::Token(WRAP)),
+            ret(),
+        ], &[SlotKind::ByRef], &[], vec![Value::ByRef(element_at(bytes, 0, 0))], &mut vm),
+            Ok(Some(Value::Struct(vec![Value::Int32(0x0403_0201)].into_boxed_slice()))));
+        assert_eq!(run_with_obj_types(vec![
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::new(Opcode::Ldobj, Operand::Token(HOLDER)),
+            ret(),
+        ], &[], &[SlotKind::Primitive(PrimKind::I8)], Vec::new(), &mut vm), Err(Trap::Unsupported(Opcode::Ldobj)));
+        let structure = Value::Struct(vec![Value::Int32(9)].into_boxed_slice());
+        assert_eq!(run_with_obj_types(vec![
+            Instruction::new(Opcode::LdargaS, Operand::Variable(0)),
+            Instruction::new(Opcode::Ldobj, Operand::Token(WRAP)),
+            ret(),
+        ], &[SlotKind::Struct], &[], vec![structure.clone()], &mut vm), Ok(Some(structure)));
+    }
+
+    #[test]
+    #[cfg(feature = "float")]
+    fn a_floating_element_is_read_and_written_through_its_bytes() {
+        let mut vm = Vm::new();
+        let doubles = packed(&mut vm, PrimKind::F8, &[Value::Float(0.0)]);
+        assert_eq!(store_through(&mut vm, element_at(doubles, 0, 0), Instruction::new(Opcode::LdcR4, Operand::Float32(1.0)), Opcode::StindR4),
+            Ok(Some(Value::Null)));
+        assert_eq!(read_through(&mut vm, element_at(doubles, 0, 0), Opcode::LdindI8), Ok(Some(Value::Int64(0x3F80_0000))));
+        assert_eq!(vm.heap().array_get(doubles, 0), Some(Value::Float(f64::from_bits(0x3F80_0000))));
+        let floats = packed(&mut vm, PrimKind::F4, &[Value::Single(1.0)]);
+        assert_eq!(read_through(&mut vm, element_at(floats, 0, 3), Opcode::LdindU1), Ok(Some(Value::Int32(0x3F))));
+        let floats = packed(&mut vm, PrimKind::F4, &[Value::Single(0.0)]);
+        assert_eq!(store_through(&mut vm, element_at(floats, 0, 0), Instruction::new(Opcode::LdcI4, Operand::Int32(0x3F80_0000)), Opcode::StindI4),
+            Ok(Some(Value::Null)));
+        assert_eq!(vm.heap().array_get(floats, 0), Some(Value::Single(1.0)));
+        let grid = vm.heap_mut().alloc_md_array_packed(vec![1, 1], PrimKind::F8, 0);
+        assert!(vm.heap_mut().md_array_set(grid, &[0, 0], Value::Single(1.0)));
+        assert_eq!(read_through(&mut vm, element_at(grid, 0, 0), Opcode::LdindI4), Ok(Some(Value::Int32(0))));
+    }
+
+    #[test]
+    fn a_read_wider_than_the_slot_is_refused() {
+        assert_eq!(load_through_argument_address(Opcode::LdindI8, Value::Int32(1)),
+            Err(Trap::Unsupported(Opcode::LdindI8)));
+    }
+
+    #[test]
+    #[cfg(feature = "float")]
+    fn a_field_or_a_static_assigned_after_a_store_through_its_address_holds_the_value_assigned() {
+        let d = Token(0x0400_0001);
+        let s = Token(0x0400_0002);
+        let mut module = Module::new();
+        let class = module.add_type(vec![Value::Float(0.0)]);
+        module.bind_field(0, d, 0);
+        module.bind_field_type(0, d, class);
+        module.bind_static_field(0, s, Value::Float(0.0));
+        let assigned = || Instruction::new(Opcode::LdcR8, Operand::Float64(16_777_217.0));
+        let zero = || Instruction::new(Opcode::LdcR4, Operand::Float32(0.0));
+        let field_program = |module: &mut Module, receiver: Instruction| module.add_method_image(0, method(vec![
+            receiver.clone(),
+            Instruction::new(Opcode::Ldflda, Operand::Token(d)),
+            zero(),
+            Instruction::simple(Opcode::StindR4),
+            receiver.clone(),
+            assigned(),
+            Instruction::new(Opcode::Stfld, Operand::Token(d)),
+            receiver,
+            Instruction::new(Opcode::Ldfld, Operand::Token(d)),
+            assigned(),
+            Instruction::simple(Opcode::Ceq),
+            ret(),
+        ]), 1);
+        let object_field = field_program(&mut module, Instruction::simple(Opcode::Ldarg0));
+        let struct_field = field_program(&mut module, Instruction::new(Opcode::LdargaS, Operand::Variable(0)));
+        let static_field = module.add_method_image(0, method(vec![
+            Instruction::new(Opcode::Ldsflda, Operand::Token(s)),
+            zero(),
+            Instruction::simple(Opcode::StindR4),
+            assigned(),
+            Instruction::new(Opcode::Stsfld, Operand::Token(s)),
+            Instruction::new(Opcode::Ldsfld, Operand::Token(s)),
+            assigned(),
+            Instruction::simple(Opcode::Ceq),
+            ret(),
+        ]), 0);
+        let mut vm = Vm::new();
+        let object = Value::Object(vm.heap_mut().alloc_instance(class, vec![Value::Float(0.0)]));
+        assert_eq!(super::run(&module, &mut vm, object_field, vec![object]), Ok(Some(Value::Int32(1))));
+        let structure = Value::Struct(vec![Value::Float(0.0)].into_boxed_slice());
+        assert_eq!(super::run(&module, &mut vm, struct_field, vec![structure]), Ok(Some(Value::Int32(1))));
+        assert_eq!(super::run(&module, &mut vm, static_field, Vec::new()), Ok(Some(Value::Int32(1))));
+    }
+
+    #[test]
+    fn a_byte_walk_into_a_local_is_refused() {
+        let mut module = Module::new();
+        let main = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(Opcode::Stloc0),
+            Instruction::new(Opcode::LdlocaS, Operand::Variable(0)),
+            Instruction::simple(Opcode::ConvU),
+            Instruction::simple(Opcode::LdcI42),
+            Instruction::simple(Opcode::Add),
+            Instruction::simple(Opcode::LdindU1),
+            ret(),
+        ]), 1);
+        assert_eq!(super::run(&module, &mut Vm::new(), main, vec![Value::Int32(0x0403_0201)]),
+            Err(Trap::Unsupported(Opcode::LdindU1)));
+    }
+
+    /// Runs `ldarg.0; <load>; ret` on a pointer `byte_offset` bytes past the start of an array of
+    /// `width`-byte `elements`.
+    fn load_inside_element(load: Opcode, elements: Vec<Value>, width: usize, byte_offset: u32) -> Result<Option<Value>, Trap> {
+        let mut module = Module::new();
+        let main = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(load),
+            ret(),
+        ]), 1);
+        let mut vm = Vm::new();
+        let array = vm.heap_mut().alloc_array_with_element_width(elements, 0, Some(width));
+        super::run(&module, &mut vm, main, vec![Value::ByRef(Location::Element { array, index: 0, byte_offset })])
+    }
+
+    /// Runs `ldarg.0; <load>; ret` on a pointer `byte_offset` bytes past the start of a packed array of
+    /// `kind` elements holding `bytes`, as `newarr` allocates a primitive array.
+    fn load_from_packed(load: Opcode, kind: crate::PrimKind, bytes: Vec<u8>, byte_offset: u32) -> Result<Option<Value>, Trap> {
+        let mut module = Module::new();
+        let main = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(load),
+            ret(),
+        ]), 1);
+        let mut vm = Vm::new();
+        let array = vm.heap_mut().alloc_packed_from_bytes(kind, bytes, 0);
+        super::run(&module, &mut vm, main, vec![Value::ByRef(Location::Element { array, index: 0, byte_offset })])
+    }
+
+    #[test]
+    fn a_read_wider_than_a_packed_element_reads_the_next_elements_bytes() {
+        assert_eq!(load_from_packed(Opcode::LdindI4, crate::PrimKind::U1, vec![1, 2, 3, 4], 0),
+            Ok(Some(Value::Int32(0x0403_0201))));
+        assert_eq!(load_from_packed(Opcode::LdindI4, crate::PrimKind::U1, vec![42], 0),
+            Err(Trap::Unsupported(Opcode::LdindI4)));
+        assert_eq!(load_from_packed(Opcode::LdindU2, crate::PrimKind::I2, vec![0x00, 0xFF, 0x34, 0x12], 1),
+            Ok(Some(Value::Int32(0x34FF))));
+        assert_eq!(load_from_packed(Opcode::LdindU1, crate::PrimKind::I2, vec![0x00, 0xFF], 0), Ok(Some(Value::Int32(0))));
+        assert_eq!(load_from_packed(Opcode::LdindU4, crate::PrimKind::I4, vec![0, 0, 0x80, 0x3F], 0),
+            Ok(Some(Value::Int32(0x3F80_0000))));
+    }
+
+    /// Runs `ldarg.0; <load>; ret` on a pointer `byte_offset` bytes into a pinned string of `units`.
+    fn load_from_string(load: Opcode, units: &[u16], byte_offset: u32) -> Result<Option<Value>, Trap> {
+        let mut module = Module::new();
+        let main = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(load),
+            ret(),
+        ]), 1);
+        let mut vm = Vm::new();
+        let string = vm.heap_mut().alloc_string(units).expect("the string allocates");
+        super::run(&module, &mut vm, main, vec![Value::ByRef(Location::StringChar { string, byte_offset })])
+    }
+
+    #[test]
+    fn a_read_inside_or_across_a_pinned_strings_characters_reads_their_bytes() {
+        assert_eq!(load_from_string(Opcode::LdindU1, &[0x0201], 1), Ok(Some(Value::Int32(2))));
+        assert_eq!(load_from_string(Opcode::LdindI4, &[0x41, 0x42], 0), Ok(Some(Value::Int32(0x0042_0041))));
+        assert_eq!(load_from_string(Opcode::LdindU1, &[0x0201], 0), Ok(Some(Value::Int32(1))));
+        assert_eq!(load_from_string(Opcode::LdindU2, &[0x41, 0x42], 2), Ok(Some(Value::Int32(0x42))));
+        assert_eq!(load_from_string(Opcode::LdindU2, &[0x41, 0x42], 4), Ok(Some(Value::Int32(0))));
+    }
+
+    #[test]
+    fn a_step_before_or_far_past_an_array_is_refused_without_overflow() {
+        assert_eq!(load_from_packed(Opcode::LdindI4, crate::PrimKind::I4, vec![42, 0, 0, 0, 99, 0, 0, 0], 0xFFFF_FFFC),
+            Err(Trap::Unsupported(Opcode::LdindI4)));
+        let mut module = Module::new();
+        let load = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(Opcode::LdindI4),
+            ret(),
+        ]), 1);
+        let store = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(Opcode::LdcI41),
+            Instruction::simple(Opcode::StindI4),
+            Instruction::simple(Opcode::Ldnull),
+            ret(),
+        ]), 1);
+        let mut vm = Vm::new();
+        let array = vm.heap_mut().alloc_packed_from_bytes(crate::PrimKind::I4, vec![42, 0, 0, 0], 0);
+        let far = Value::ByRef(Location::Element { array, index: usize::MAX, byte_offset: 4 });
+        assert_eq!(super::run(&module, &mut vm, load, vec![far.clone()]), Err(Trap::Unsupported(Opcode::LdindI4)));
+        assert_eq!(super::run(&module, &mut vm, store, vec![far]), Err(Trap::Unsupported(Opcode::StindI4)));
+    }
+
+    #[test]
+    fn a_read_inside_a_packed_element_takes_its_byte() {
+        let mut module = Module::new();
+        let main = module.add_method_image(0, method(vec![
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::new(Opcode::LdcI4, Operand::Int32(0xAA)),
+            Instruction::simple(Opcode::StindI1),
+            Instruction::simple(Opcode::Ldarg0),
+            Instruction::simple(Opcode::LdindU1),
+            ret(),
+        ]), 1);
+        let mut vm = Vm::new();
+        let array = vm.heap_mut().alloc_packed_from_bytes(crate::PrimKind::I4, vec![0x78, 0x56, 0x34, 0x12], 0);
+        let pointer = Value::ByRef(Location::Element { array, index: 0, byte_offset: 1 });
+        assert_eq!(super::run(&module, &mut vm, main, vec![pointer]), Ok(Some(Value::Int32(0xAA))));
+        for offset in 0..8 {
+            assert_eq!(load_from_packed(Opcode::LdindU1, crate::PrimKind::I4, vec![1, 2, 3, 4, 5, 6, 7, 8], offset),
+                Ok(Some(Value::Int32(offset as i32 + 1))), "offset {offset}");
+        }
+    }
+
+    #[test]
+    fn a_native_int_slot_is_as_wide_as_the_targets_native_int() {
+        assert_eq!(super::load_from_slot_at(Value::NativeInt(-1), Opcode::LdindI8, 4, None, true),
+            Err(Trap::Unsupported(Opcode::LdindI8)));
+        assert_eq!(super::load_from_slot_at(Value::NativeInt(-2), Opcode::LdindI, 4, None, true), Ok(Value::NativeInt(-2)));
+        assert_eq!(super::load_from_slot_at(Value::NativeInt(-1), Opcode::LdindI8, 8, None, true), Ok(Value::Int64(-1)));
+    }
+
+    #[test]
+    fn a_native_int_read_is_bounded_by_the_slot_before_its_value_is_kept() {
+        assert_eq!(super::load_from_slot_at(Value::Int32(1), Opcode::LdindI, 4, Some(1), false), Err(Trap::Unsupported(Opcode::LdindI)));
+        assert_eq!(super::load_from_slot_at(Value::Int32(0x41), Opcode::LdindI, 4, Some(2), false), Err(Trap::Unsupported(Opcode::LdindI)));
+        assert_eq!(super::load_from_slot_at(Value::NativeInt(5), Opcode::LdindI, 8, Some(4), false), Err(Trap::Unsupported(Opcode::LdindI)));
+        assert_eq!(super::load_from_slot_at(Value::Int32(-536_813_552), Opcode::LdindI, 4, None, true),
+            Err(Trap::Unsupported(Opcode::LdindI)));
+        assert_eq!(super::load_from_slot_at(Value::Int32(0x2000_0010), Opcode::LdindI, 4, None, true),
+            Ok(Value::NativeInt(0x2000_0010)));
+    }
+
+    #[test]
+    fn a_native_int_in_raw_memory_is_as_wide_as_the_targets_native_int() {
+        assert_eq!(super::indirect_width_at(Opcode::LdindI, 4), Some(4));
+        assert_eq!(super::indirect_width_at(Opcode::StindI, 4), Some(4));
+        assert_eq!(super::indirect_width_at(Opcode::LdindI, 8), Some(8));
+        let raw = [0xFF, 0xFF, 0xFF, 0x7F, 0x34, 0x12, 0, 0];
+        assert_eq!(super::stack_loaded_value_at(Opcode::LdindI, raw, 4), Ok(Value::NativeInt(0x7FFF_FFFF)));
+        assert_eq!(super::stack_loaded_value_at(Opcode::LdindI, raw, 8), Ok(Value::NativeInt(0x1234_7FFF_FFFF)));
+    }
+
+    #[test]
+    fn a_native_int_read_on_a_4_byte_target_is_its_own_value_or_refused() {
+        let pointer = Value::NativeInt(0xE000_E010);
+        assert_eq!(super::load_from_slot_at(pointer.clone(), Opcode::LdindI, 4, None, true), Ok(pointer));
+        let high = [0x10, 0xE0, 0x00, 0xE0, 0, 0, 0, 0];
+        assert_eq!(super::stack_loaded_value_at(Opcode::LdindI, high, 4), Err(Trap::Unsupported(Opcode::LdindI)));
+        let low = [0x10, 0x00, 0x00, 0x20, 0xFF, 0xFF, 0xFF, 0xFF];
+        assert_eq!(super::stack_loaded_value_at(Opcode::LdindI, low, 4), Ok(Value::NativeInt(0x2000_0010)));
+        assert_eq!(super::stack_loaded_value_at(Opcode::LdindI, high, 8), Ok(Value::NativeInt(0xE000_E010)));
+    }
+
+    #[test]
+    fn a_displacement_before_the_variable_is_refused() {
+        assert_eq!(load_at_argument_offset(Opcode::LdindU1, -1, Value::Int32(1)), Err(Trap::Unsupported(Opcode::LdindU1)));
+    }
+
+    #[test]
+    fn a_byte_walk_past_the_variable_is_refused() {
+        assert_eq!(load_at_argument_offset(Opcode::LdindU1, 4, Value::Int32(1)), Err(Trap::Unsupported(Opcode::LdindU1)));
+        assert_eq!(load_at_argument_offset(Opcode::LdindI4, 2, Value::Int32(1)), Err(Trap::Unsupported(Opcode::LdindI4)));
+    }
+
     fn constrained_reference_outer_program(nested: bool, local: bool) -> (Module, MethodId, TypeId) {
         let (mut module, _, derived) = constrained_reference_program(false);
         let field = Token(0x0400_0002);
@@ -12739,36 +16373,17 @@ mod tests {
         );
     }
 
-    /// AN IMAGE BAKED BEFORE THE TRIGGER TABLES has the ordered `.cctor` list and nothing to fire
-    /// it with, so its entry point is refused until `boot_baked` runs the list. Without the refusal
-    /// the entry reads 0 and reports success, which is what such an image did before it existed.
+    /// AN IMAGE MISSING TABLES IS NOT AN IMAGE OF THIS FORMAT. Every table the format defines is
+    /// required, so an image whose directory stops before its last tables is refused rather than
+    /// read with them empty: the trigger tables here, and every table after them.
     #[cfg(feature = "code-in-place")]
     #[test]
-    fn an_image_baked_before_the_trigger_tables_is_refused_until_booted() {
+    fn an_image_missing_its_last_tables_is_refused() {
         let (mut module, main) = static_readonly_program();
         let image = module.write_baked(Some(main)).expect("bake");
-        let older = crate::module::image_without_trailing_tables(&image, 6);
-        let image: &'static [u8] = Box::leak(older.into_boxed_slice());
-        let (baked, entry) = Module::from_baked(image).expect("an older image still reads");
-        let entry = entry.expect("the image records its entry point");
-
-        assert!(
-            !baked.initializes_types_on_first_access(),
-            "an image with a cctor and no trigger table must not claim the lazy path"
-        );
-        assert_eq!(
-            super::run(&baked, &mut Vm::new(), entry, Vec::new()),
-            Err(Trap::StaticCtorsNotRun),
-            "an older image refuses its entry point until its cctors have run"
-        );
-
-        let mut vm = Vm::new();
-        let entry = super::boot_baked(&baked, &mut vm, entry).expect("the cctors boot");
-        assert_eq!(
-            super::run(&baked, &mut vm, entry, Vec::new()),
-            Ok(Some(Value::Int32(7))),
-            "after boot_baked the static holds what its constructor wrote"
-        );
+        let shorter = crate::module::image_without_trailing_tables(&image, 6);
+        let image: &'static [u8] = Box::leak(shorter.into_boxed_slice());
+        assert_eq!(Module::from_baked(image).err(), Some(crate::module::BakeError::NotAnImage));
     }
 
     /// A module holding `System.Nullable<T>` over one value type, wired exactly as the loader

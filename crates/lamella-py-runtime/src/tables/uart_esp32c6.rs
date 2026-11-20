@@ -52,11 +52,16 @@ pub(crate) fn facts() -> UartFacts {
             status: STATUS,
             rx_shift: 0,
             rx_mask: 0xFF,
+            #[cfg(not(target_os = "none"))]
             tx_shift: 16,
+            #[cfg(not(target_os = "none"))]
             tx_mask: 0xFF,
         },
+        #[cfg(not(target_os = "none"))]
         self_clear_reg: REG_UPDATE,
+        #[cfg(not(target_os = "none"))]
         sim_ready: &[],
+        #[cfg(not(target_os = "none"))]
         fifo_depth: FIFO_DEPTH,
     }
 }

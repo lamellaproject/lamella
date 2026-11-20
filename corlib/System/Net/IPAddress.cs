@@ -6,7 +6,34 @@ namespace System.Net
     {
         private byte[] _bytes;
 
-        public IPAddress(byte[] address) { _bytes = address; }
+        /// <summary>The address whose octets are given in network order: 4 for IPv4, 16 for IPv6.</summary>
+        /// <exception cref="ArgumentNullException"><paramref name="address"/> is null.</exception>
+        /// <exception cref="ArgumentException"><paramref name="address"/> is neither 4 nor 16 bytes long.</exception>
+        public IPAddress(byte[] address)
+        {
+            if ((object)address == null) throw new ArgumentNullException("address");
+            if (address.Length != 4 && address.Length != 16)
+                throw new ArgumentException("An invalid IP address was specified.", "address");
+            _bytes = Copy(address);
+        }
+
+        private IPAddress() { }
+
+        internal static IPAddress FromOwnedOctets(byte[] octets)
+        {
+            IPAddress address = new IPAddress();
+            address._bytes = octets;
+            return address;
+        }
+
+        internal byte[] Octets { get { return _bytes; } }
+
+        private static byte[] Copy(byte[] octets)
+        {
+            byte[] copy = new byte[octets.Length];
+            for (int i = 0; i < octets.Length; i++) copy[i] = octets[i];
+            return copy;
+        }
 
         private static byte[] V4(byte a, byte b, byte c, byte d)
         {
@@ -25,12 +52,24 @@ namespace System.Net
             return octets;
         }
 
-        public static readonly IPAddress Loopback = new IPAddress(V4(127, 0, 0, 1));
-        public static readonly IPAddress Any = new IPAddress(V4(0, 0, 0, 0));
-        public static readonly IPAddress IPv6Loopback = new IPAddress(V6Loopback());
-        public static readonly IPAddress IPv6Any = new IPAddress(new byte[16]);
+        public static readonly IPAddress Loopback = FromOwnedOctets(V4(127, 0, 0, 1));
+        public static readonly IPAddress Any = FromOwnedOctets(V4(0, 0, 0, 0));
+        public static readonly IPAddress IPv6Loopback = FromOwnedOctets(V6Loopback());
+        public static readonly IPAddress IPv6Any = FromOwnedOctets(new byte[16]);
 
-        public byte[] GetAddressBytes() { return _bytes; }
+        /// <summary>The address's octets in network order, in a new array on each call.</summary>
+        public byte[] GetAddressBytes() { return Copy(_bytes); }
+
+        /// <summary>The address's family: InterNetwork for IPv4, InterNetworkV6 for IPv6.</summary>
+        public System.Net.Sockets.AddressFamily AddressFamily
+        {
+            get
+            {
+                return _bytes.Length == 16
+                    ? System.Net.Sockets.AddressFamily.InterNetworkV6
+                    : System.Net.Sockets.AddressFamily.InterNetwork;
+            }
+        }
 
         public static IPAddress Parse(string ipString)
         {
@@ -90,7 +129,7 @@ namespace System.Net
             }
             if (!hasDigit || part != 3) return false;
             octets[3] = (byte)value;
-            address = new IPAddress(octets);
+            address = FromOwnedOctets(octets);
             return true;
         }
 
@@ -165,7 +204,7 @@ namespace System.Net
                     bytes[pos * 2 + 1] = (byte)(right[i] & 0xFF);
                 }
             }
-            address = new IPAddress(bytes);
+            address = FromOwnedOctets(bytes);
             return true;
         }
 

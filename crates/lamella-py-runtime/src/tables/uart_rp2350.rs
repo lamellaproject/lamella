@@ -63,6 +63,7 @@ const LCR_PEN: u32 = 1 << 1;
 const CR_ENABLED_TX_RX: u32 = 0x301;
 
 const XOSC_HZ: u64 = 12_000_000;
+#[cfg(not(target_os = "none"))]
 const FIFO_DEPTH: u32 = 32;
 
 /// The table-fixed console pins of instance 0 (TX, RX): the Pico 2's GP0/GP1.
@@ -72,8 +73,11 @@ pub(crate) fn facts() -> UartFacts {
     UartFacts {
         fifo: UARTDR,
         status: UartStatus::Flags { flags: UARTFR, rx_empty_mask: FR_RXFE },
+        #[cfg(not(target_os = "none"))]
         self_clear_reg: 0,
+        #[cfg(not(target_os = "none"))]
         sim_ready: &[(XOSC_STATUS, XOSC_STABLE)],
+        #[cfg(not(target_os = "none"))]
         fifo_depth: FIFO_DEPTH,
     }
 }

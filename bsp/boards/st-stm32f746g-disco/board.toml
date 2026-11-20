@@ -459,6 +459,26 @@ pclk_hz = 16000000          # the APB clock feeding this board's bound USART. US
                             # named for a bus number. Under reset prescalers it equals HSI,
                             # which the generator verifies rather than takes.
 
+# --- the debug link ---------------------------------------------------------------------------
+#
+# The on-board debugger reaches the part over SWD on PA13 and PA14. Both lines are kept from a
+# program's GPIO controller: reconfiguring either would end a debug session, and with it the
+# output of a program whose console the debugger reads.
+
+[[devices]]
+name = "swdio"
+pin = "PA13"
+active = "none"
+reserved = true
+source = "MB1191 schematic rev B03 sheet 3 (STM32F746NGH6 Connexion): net SWDIO on PA13, ball A15; sheet 4 (ST-LINK/V2-1 with support of SWD only): the ST-LINK's T_JTMS reaches SWDIO through SB17."
+
+[[devices]]
+name = "swclk"
+pin = "PA14"
+active = "none"
+reserved = true
+source = "MB1191 schematic rev B03 sheet 3: net SWCLK on PA14, ball A14; sheet 4: the ST-LINK's T_JTCK reaches SWCLK through SB14."
+
 [debug]
 signals = []
 exposure = "unknown"

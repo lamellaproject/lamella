@@ -170,8 +170,9 @@ pub(crate) fn with_static<T>(bytes: &[u8], f: impl FnOnce(&'static [u8]) -> T) -
 
 /// Splits the references buffer (`[u32 count]` then `count` x `[u32 len][bytes]`) into the
 /// individual assembly byte slices; stops at the first malformed length. Shared by the compile ABI,
-/// the REPL ABI (which packs its compile references the same way) and the multi-library bake -- so
-/// it lives here, ungated, rather than behind any one feature.
+/// the REPL ABI (which packs its compile references the same way), the AOT ABI and the
+/// multi-library bake -- so it lives here, compiled with any of them, rather than behind one.
+#[cfg(any(feature = "compile", feature = "aot", feature = "bake"))]
 pub(crate) fn split_refs(refs: &[u8]) -> Vec<&[u8]> {
     let mut out = Vec::new();
     let Some(count) = refs
@@ -202,6 +203,7 @@ pub(crate) fn split_refs(refs: &[u8]) -> Vec<&[u8]> {
 /// A driver-stack bake loads several library assemblies at once, and nesting `with_static` cannot
 /// express a count known only at run time. Same contract and same safety argument as the singular
 /// form: `f` returns an OWNED value, so nothing borrows the staged buffers once it has returned.
+#[cfg(feature = "bake")]
 pub(crate) fn with_static_all<T>(buffers: &[&[u8]], f: impl FnOnce(&[&'static [u8]]) -> T) -> T {
     let staged: Vec<&'static [u8]> = buffers
         .iter()

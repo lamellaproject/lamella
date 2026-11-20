@@ -132,11 +132,16 @@ INSTANCES = {
     "gpiog": {"block": "gpio", "base": 0x40021800, "rcc_en_off": 0x30, "rcc_en_bit": 0x6},
     "gpioh": {"block": "gpio", "base": 0x40021C00, "rcc_en_off": 0x30, "rcc_en_bit": 0x7},
     "gpioi": {"block": "gpio", "base": 0x40022000, "rcc_en_off": 0x30, "rcc_en_bit": 0x8},
+    "gpioj": {"block": "gpio", "base": 0x40022400, "rcc_en_off": 0x30, "rcc_en_bit": 0x9},
+    "gpiok": {"block": "gpio", "base": 0x40022800, "rcc_en_off": 0x30, "rcc_en_bit": 0xA},
+    "exti": {"block": "exti", "base": 0x40013C00},
+    "syscfg": {"block": "syscfg", "base": 0x40013800, "rcc_en_off": 0x44, "rcc_en_bit": 0xE},
     "rcc": {"block": "rcc", "base": 0x40023800},
     "i2c1": {"block": "i2c", "base": 0x40005400, "rcc_en_off": 0x40, "rcc_en_bit": 0x15},
     "i2c3": {"block": "i2c", "base": 0x40005C00, "rcc_en_off": 0x40, "rcc_en_bit": 0x17},
     "fmc": {"block": "fmc", "base": 0xA0000000, "rcc_en_off": 0x38, "rcc_en_bit": 0x0},
     "quadspi": {"block": "quadspi", "base": 0xA0001000, "rcc_en_off": 0x38, "rcc_en_bit": 0x1},
+    "tim5": {"block": "tim", "base": 0x40000C00, "rcc_en_off": 0x40, "rcc_en_bit": 0x3},
 }
 
 PLANS = {
@@ -148,6 +153,8 @@ PLANS = {
 # own idiom.
 DEVICES = {
     "wm8994": {"kind": "i2c-device", "role": "codec-i2c", "address": 0x1A},
+    "swdio": {"port_base": 0x40020000, "pin": 13, "bank": 0, "mask": 0x2000},
+    "swclk": {"port_base": 0x40020000, "pin": 14, "bank": 0, "mask": 0x4000},
 }
 
 # Memory regions the board fits. A region with a "controller" does not exist until

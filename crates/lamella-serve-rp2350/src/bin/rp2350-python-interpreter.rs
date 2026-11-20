@@ -2,6 +2,11 @@
 //! bytecode interpreter linked bare-metal, running a bundle the host compiled and printing what the
 //! program prints over the board's UART0 console.
 //!
+//! Built with `python-serve` (hygiene-allow: a cargo feature, not a crate), it takes its program
+//! from the lamella CLI over the board's own USB port, as the C# firmware does: `lamella run program.py --device <device>` stores the program in
+//! the board's flash, runs it and shows its output, and the board runs it again at each reset. The
+//! serve tier is `rp2350_python_serve.rs`, which says how a program that runs is reached.
+//!
 //! On the Pico 2 W, Python's `socket` reaches the radio: the `python-net` build hands the
 //! interpreter a `smoltcp` stack over the CYW43439's ethernet data channel -- the same
 //! `lamella-net-smoltcp` mapping of the same `lamella-net-core` seam that carries C# evaluations on
@@ -25,7 +30,8 @@
 //! therefore installs no clock rather than a plausible one, and `time.monotonic()` refuses on a
 //! ring-oscillator boot instead of returning durations that are four times wrong. The refusal is
 //! the feature. `rp2350-csharp-interpreter` takes the other route and programs the tree itself
-//! (`rp2350_usb::clocks_init`), which is what makes its rate knowable rather than inherited.
+//! (`rp2350_usb::clocks_init`), which is what makes its rate knowable rather than inherited, and a
+//! `python-serve` image does the same, since its USB needs that tree (hygiene-allow: a cargo feature, not a crate).
 //!
 //! A native capability is named in every recipe that means to have it. This crate takes
 //! `lamella-py-runtime` with `default-features = false`, so a recipe that omits `python-float`
@@ -50,17 +56,20 @@
 //!        --target thumbv8m.main-none-eabi --features python-net,rp2350,python-float,python-threading,python-complex,python-reflection (hygiene-allow: a cargo feature, not a crate)
 //! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-python-interpreter --profile flash
 //!        --target thumbv8m.main-none-eabi --features python-net,rp2350,python-threading,python-reflection (the no-float tier, on purpose)
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-python-interpreter --profile flash
+//!        --target thumbv8m.main-none-eabi --features python-serve,rp2350,python-float,python-threading,python-complex,python-reflection (hygiene-allow: a cargo feature, not a crate)
+//! Build: cargo build -p lamella-serve-rp2350 --bin rp2350-python-interpreter --profile flash
+//!        --target thumbv8m.main-none-eabi --features python-serve,python-net,rp2350,python-float,python-threading,python-complex,python-reflection (hygiene-allow: a cargo feature, not a crate)
+//! The last two are the Pico 2's and the Pico 2 W's released Python firmware, which take programs
+//! over USB.
 //! Flash: objcopy to .bin and program at 0x10000000 over the debug probe, or drag a UF2 to BOOTSEL.
 //!
-//! The recipes above carry no credentials, and a `python-net` image built without them is a real
-//! build rather than a broken one: `LAMELLA_WIFI_SSID`, `LAMELLA_WIFI_PSK` and
-//! `LAMELLA_WIFI_SECURITY` (`wpa3` for a WPA3 network; WPA2 otherwise) are `option_env!` reads in
-//! the shared `pico_wifi.rs`, so no network's secret is ever in this tree, and absent them the
-//! bring-up stops after radio-up and says so. Such a build proves the image links and nothing
-//! about whether it associates. Set them to run it against a network, and set
-//! `LAMELLA_PY_BUNDLE` to the program it should run. A `python-net` build also downloads the radio's
-//! images and checks them against their pinned hashes; with no network, point
-//! `LAMELLA_WIFI_IMAGES_DIR` at a folder fetched earlier.
+//! A `python-net` image joins the network the board stores, which `lamella wifi set` writes into the
+//! board's settings, at start when that network's setting is to join at start (`--at-start join`).
+//! Otherwise, or with none stored, it leaves the radio off: a Python program has no class to join a
+//! network with. Set `LAMELLA_PY_BUNDLE` to the program it should run. A `python-net` build also
+//! downloads the radio's images and checks them against their pinned hashes; to build without network
+//! access, point `LAMELLA_WIFI_IMAGES_DIR` at a folder fetched earlier.
 #![cfg_attr(target_os = "none", no_std)]
 #![cfg_attr(target_os = "none", no_main)]
 
@@ -75,6 +84,13 @@ static IMAGE_DEF: [u32; 5] = [0xffff_ded3, 0x1021_0142, 0x0000_01ff, 0x0000_0000
 #[cfg(target_os = "none")]
 #[path = "../../../lamella-serve-core/src/startup.rs"]
 mod startup;
+
+/// The board a serving image is built for, which its HELLO and its USB product string name: the
+/// Pico 2, or with `python-net` the Pico 2 W.
+#[cfg(all(feature = "python-serve", not(feature = "python-net")))]
+const BOARD: u16 = lamella_wire::product_model::PICO2;
+#[cfg(all(feature = "python-serve", feature = "python-net"))]
+const BOARD: u16 = lamella_wire::product_model::PICO2_W;
 
 #[cfg(all(target_os = "none", not(feature = "python-net")))]
 #[path = "../../../../bsp/boards/raspberrypi-pico-2/rust/raspberrypi_pico_2_bindings.rs"]
@@ -108,6 +124,31 @@ mod rp2350_clocks;
 #[path = "../pico_wifi.rs"]
 mod pico_wifi;
 
+#[cfg(all(target_os = "none", feature = "python-net", not(feature = "python-serve")))]
+#[path = "../rp2350_settings.rs"]
+mod rp2350_settings;
+#[cfg(all(target_os = "none", feature = "python-net", feature = "python-serve"))]
+use rp2350_flash::settings as rp2350_settings;
+
+#[cfg(all(target_os = "none", feature = "python-serve"))]
+#[path = "../rp2350_flash.rs"]
+mod rp2350_flash;
+#[cfg(all(target_os = "none", feature = "python-serve"))]
+#[path = "../../../lamella-serve-core/src/bare_critical_section.rs"]
+mod bare_critical_section;
+#[cfg(all(target_os = "none", feature = "python-serve"))]
+#[path = "../../../lamella-serve-core/src/usb_transport.rs"]
+mod usb_transport;
+#[cfg(all(target_os = "none", feature = "python-serve"))]
+#[path = "../rp2350_usb.rs"]
+mod rp2350_usb;
+#[cfg(all(target_os = "none", feature = "python-serve"))]
+#[path = "../rp2350_python_serve.rs"]
+mod python_serve;
+#[cfg(all(target_os = "none", feature = "python-serve"))]
+#[path = "../rp2350_python_window.rs"]
+mod python_window;
+
 #[cfg(all(target_os = "none", feature = "python-net"))]
 #[path = "../../../lamella-serve-core/src/rp2350_trng.rs"]
 mod rp2350_trng;
@@ -115,14 +156,25 @@ mod rp2350_trng;
 #[cfg(target_os = "none")]
 mod python {
     extern crate alloc;
+    #[cfg(not(feature = "python-serve"))]
     use alloc::vec::Vec;
     use core::sync::atomic::{AtomicUsize, Ordering};
-    use lamella_py_runtime::{Bundle, ObjectModel, Trap, run_bundle};
+    use lamella_py_runtime::{ObjectModel, Trap};
+    #[cfg(not(feature = "python-serve"))]
+    use lamella_py_runtime::{Bundle, run_bundle};
 
     use crate::board_bindings as board;
     use crate::rp2350_clocks;
     use crate::rp2350_instances as chip;
-    use crate::rp2350_uart as uart;
+    pub(crate) use crate::rp2350_uart as uart;
+
+    pub(crate) fn configure_native_stack(model: &mut ObjectModel) {
+        unsafe extern "C" {
+            static _stack_floor: u8;
+        }
+        // The reserve covers unchecked helper calls, exception reporting, and fault entry.
+        model.set_native_stack_floor(core::ptr::addr_of!(_stack_floor) as usize + 18 * 1024);
+    }
 
     const ARENA_BYTES: usize = 256 * 1024;
     #[allow(dead_code)]
@@ -195,7 +247,7 @@ mod python {
     /// Constant time, which is a requirement rather than a nicety: this is read at every safe
     /// point, before every op.
     #[cfg(feature = "python-gc-engine")]
-    fn arena_probe() -> (usize, usize) {
+    pub(crate) fn arena_probe() -> (usize, usize) {
         (arena_live(), ARENA_BYTES)
     }
 
@@ -221,6 +273,9 @@ mod python {
             uart::decimal(failed);
         }
         uart::str("\r\n");
+        #[cfg(feature = "python-serve")]
+        crate::python_serve::reset_after_fault();
+        #[cfg(not(feature = "python-serve"))]
         loop {}
     }
 
@@ -265,7 +320,7 @@ mod python {
     /// The resolution is a millisecond, not a nanosecond, and the unit belongs to the seam rather
     /// than being a claim about the counter. A program timing something shorter than a millisecond on
     /// this board measures zero, which is the honest answer from a clock read this way.
-    mod board_clock {
+    pub(crate) mod board_clock {
         use crate::systick_clock;
 
         /// Nanoseconds since the clock was installed.
@@ -276,23 +331,56 @@ mod python {
         /// The interpreter's sleep seam. Rounds a sub-millisecond request UP to one millisecond
         /// rather than to zero: a `sleep` that returns at once is the one answer a caller asking to
         /// wait ruled out, and it is the same rounding rule the socket timeout seam uses for the
-        /// same reason.
+        /// same reason. A serving image sleeps in its serve tier instead, which reads the link while
+        /// it waits.
+        #[cfg(not(feature = "python-serve"))]
         pub fn sleep_ns(nanos: i64) {
             if nanos <= 0 {
                 return;
             }
-            let millis = ((nanos + 999_999) / 1_000_000) as u64;
-            systick_clock::sleep_ms(millis);
+            let until = systick_clock::now_ms().saturating_add(((nanos + 999_999) / 1_000_000) as u64);
+            loop {
+                let now = systick_clock::now_ms();
+                if now >= until {
+                    return;
+                }
+                systick_clock::sleep_ms(until - now);
+                if systick_clock::now_ms() == now {
+                    return;
+                }
+            }
+        }
+    }
+
+    /// The board's stored settings as the radio's controller reads them: the network `lamella wifi
+    /// set` stored, read where the C# interpreter firmware reads it, and never written. A Python
+    /// program has no class that stores, changes or clears a network, so a write here could only be
+    /// a reader's tidying of a stale copy; it is refused, and the copy is read past.
+    #[cfg(feature = "python-net")]
+    struct StoredSettings;
+
+    #[cfg(feature = "python-net")]
+    impl lamella_wifi_cyw4343x_smoltcp::record::RecordStore for StoredSettings {
+        fn read(&self, slot: usize) -> &[u8] {
+            crate::rp2350_settings::settings_sector(slot)
+        }
+
+        fn erase(&mut self, _slot: usize) -> bool {
+            false
+        }
+
+        fn program(&mut self, _slot: usize, _offset: usize, _page: &[u8; lamella_wifi_cyw4343x_smoltcp::record::PAGE]) -> bool {
+            false
         }
     }
 
     /// Starts the radio's controller and hands the interpreter a network backend without writing
-    /// setup diagnostics to the program's console.
+    /// setup diagnostics to the program's console. The stack reads `now_ms` as its clock.
     #[cfg(feature = "python-net")]
-    fn install_net(model: &mut ObjectModel, ticks_per_ms: u32) {
+    pub(crate) fn install_net(model: &mut ObjectModel, ticks_per_ms: u32, now_ms: fn() -> u64) {
         use crate::pico_wifi;
 
-        let settings = alloc::boxed::Box::new(lamella_wifi_cyw4343x_smoltcp::record::NoStore);
+        let settings = alloc::boxed::Box::new(StoredSettings);
         pico_wifi::start_wifi(ticks_per_ms.saturating_mul(1000), settings);
         if !pico_wifi::fitted() {
             return;
@@ -320,13 +408,7 @@ mod python {
             let mac = pico_wifi::chip_address().unwrap_or([0; 6]);
             u64::from(u32::from_le_bytes([mac[2], mac[3], mac[4], mac[5]])) ^ crate::systick_clock::now_ms()
         };
-        let net = lamella_net_smoltcp::SmoltcpNet::new(
-            device,
-            config,
-            crate::systick_clock::now_ms,
-            seed,
-        )
-        .with_wifi(pico_wifi::view);
+        let net = lamella_net_smoltcp::SmoltcpNet::new(device, config, now_ms, seed).with_wifi(pico_wifi::view);
         model.set_net_backend(alloc::boxed::Box::new(net));
     }
 
@@ -342,7 +424,7 @@ mod python {
     /// The live and high-water figures are both reported because they answer different questions:
     /// the high-water is what the program ever needed, and the live figure is what a collection left
     /// behind.
-    fn report_arena(model: &ObjectModel) {
+    pub(crate) fn report_arena(model: &ObjectModel) {
         uart::str("[py] arena ");
         uart::decimal(arena_used());
         uart::str(" high-water, ");
@@ -361,17 +443,20 @@ mod python {
     /// interpreter's flash cost on its own.
     static BUNDLE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/bundle.lpyc"));
 
-    /// Any exception/fault vector lands here.
+    /// Any exception/fault vector lands here. A serving board resets into its serve loop.
     #[unsafe(no_mangle)]
     pub extern "C" fn fault() -> ! {
         uart::str("\r\n[py] fault\r\n");
+        #[cfg(feature = "python-serve")]
+        crate::python_serve::reset_after_fault();
+        #[cfg(not(feature = "python-serve"))]
         loop {}
     }
 
     /// The name a trap reports on the wire. An uncaught Python exception carries its own type name
     /// from the model; these are the interpreter's own failure reasons, which a Python program cannot
     /// catch and which a reader needs told apart from the program's output.
-    fn trap_name(trap: Trap) -> &'static str {
+    pub(crate) fn trap_name(trap: Trap) -> &'static str {
         match trap {
             Trap::OutOfMemory => "OutOfMemory",
             Trap::Overflow => "Overflow",
@@ -385,6 +470,9 @@ mod python {
             _ => "Exception",
         }
     }
+
+    /// Whether the installed clock was seen moving, which a serving image's HELLO says.
+    static CLOCK_RUNS: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
 
     /// Installs the monotonic clock if the tree can say what rate it runs at, and answers the tick
     /// scale -- `clk_sys` in kilohertz, which the wireless's PIO engine also needs.
@@ -403,7 +491,8 @@ mod python {
         );
         match rp2350_clocks::clk_sys_hz_from(&tree, board::XOSC_HZ_PLL_150_48) {
             Some(clk_sys_hz) => {
-                crate::systick_clock::install(clk_sys_hz);
+                let source = crate::systick_clock::install(clk_sys_hz);
+                CLOCK_RUNS.store(matches!(source, crate::systick_clock::ClockSource::Running), Ordering::Relaxed);
                 Some(clk_sys_hz / 1000)
             }
             None => {
@@ -415,6 +504,86 @@ mod python {
         }
     }
 
+    /// What a serving image's HELLO says it is, as the C# firmware says it of the same board: the
+    /// board's model, the chip's SW-DP IDCODE (a constant, what a probe reads as DPIDR) and its
+    /// SYSINFO chip id (RP2350 datasheet 12.15.1), which names the silicon revision, the part and
+    /// Raspberry Pi's JEDEC code, and the one runtime it holds, Python, with no managed library.
+    #[cfg(feature = "python-serve")]
+    fn serve_identity() -> lamella_wire::TargetIdentity {
+        use crate::BOARD;
+        use lamella_wire::{Surface, TargetIdentity, chip_id_kind, msg};
+        const RP2350_DPIDR: u32 = 0x4c01_3477;
+        const SYSINFO_CHIP_ID: usize = 0x4000_0000;
+        let chip_id = unsafe { core::ptr::read_volatile(SYSINFO_CHIP_ID as *const u32) };
+        let mut chip = [0u8; 8];
+        chip[..4].copy_from_slice(&RP2350_DPIDR.to_le_bytes());
+        chip[4..].copy_from_slice(&chip_id.to_le_bytes());
+        TargetIdentity {
+            product_model: BOARD,
+            arch: lamella_wire::arch::from_target_triple(env!("LAMELLA_TARGET_TRIPLE")),
+            ..TargetIdentity::default()
+        }
+        .with_chip_id(chip_id_kind::DEBUG_PORT_AND_DEVICE_ID, &chip)
+        .with_surface(Surface { tier: msg::tier::PYTHON, ..Surface::default() })
+    }
+
+    /// A serving image runs the clock tree the C# firmware runs: clk_sys at 150 MHz from the
+    /// crystal's PLL and clk_usb at 48 MHz, which the USB controller needs. That also makes the rate
+    /// known on every boot path, so `time.monotonic` works whichever way the board started. It is
+    /// bounded: a crystal or PLL that never comes ready leaves the board on its boot clock, without
+    /// USB. Answers whether clk_usb runs.
+    #[cfg(feature = "python-serve")]
+    fn start_clock_tree() -> bool {
+        crate::rp2350_usb::clocks_init()
+    }
+
+    /// An image without the serve keeps the clock tree the board booted with, and has no USB.
+    #[cfg(not(feature = "python-serve"))]
+    fn start_clock_tree() -> bool {
+        false
+    }
+
+    /// A serving image first takes the board off the USB bus when a reset left the controller out of
+    /// reset -- its own reset, a debug probe's, or one that cut an earlier hold short -- and holds it
+    /// off long enough that the host sees the board go and enumerates it afresh.
+    #[cfg(feature = "python-serve")]
+    fn leave_the_bus() {
+        crate::rp2350_usb::detach_at_boot();
+    }
+
+    /// An image without the serve has no USB to leave.
+    #[cfg(not(feature = "python-serve"))]
+    fn leave_the_bus() {}
+
+    /// With the serve, the board is the serve tier's from here: its link, then the stored program
+    /// or the one built in, then the serve loop. The device is built once and kept for the board's
+    /// life, since its enumeration has to survive every request and every run. Its serial is the OTP
+    /// chip id, so a host picker can address this board, and its product string names the board the
+    /// HELLO announces, as the C# firmware's names it. What the board runs, its HELLO says.
+    #[cfg(feature = "python-serve")]
+    fn serve(built_in: &'static [u8], usb_clock: bool, ticks_per_ms: Option<u32>) -> ! {
+        use crate::BOARD;
+        const USB_PRODUCT: &str = lamella_wire::link_product_string!(BOARD);
+        let link = usb_clock.then(|| {
+            crate::python_serve::link_with(|bus| {
+                crate::usb_transport::build_device(bus, USB_PRODUCT, crate::rp2350_usb::serial_number())
+            })
+        });
+        crate::python_serve::boot(crate::python_serve::Boot {
+            link,
+            identity: serve_identity(),
+            net: crate::python_serve::NetSetup { ticks_per_ms },
+            clock_runs: CLOCK_RUNS.load(Ordering::Relaxed),
+            built_in,
+        })
+    }
+
+    /// Without the serve there is nothing further to do: the built-in bundle has run and said so.
+    #[cfg(not(feature = "python-serve"))]
+    fn serve(_built_in: &'static [u8], _usb_clock: bool, _ticks_per_ms: Option<u32>) -> ! {
+        loop {}
+    }
+
     /// The post-startup entry (`startup::reset` has zeroed .bss and copied .data).
     #[unsafe(no_mangle)]
     pub extern "C" fn lamella_main() -> ! {
@@ -422,17 +591,22 @@ mod python {
         unsafe {
             ALLOCATOR.0.init(core::ptr::addr_of_mut!(ARENA).cast::<u8>(), ARENA_BYTES);
         }
+        leave_the_bus();
         uart::init();
         uart::str("[py] boot\r\n");
+        let usb_clock = start_clock_tree();
         systick_start();
         let ticks_per_ms = install_clock();
 
         let image: &'static [u8] = core::hint::black_box(BUNDLE);
 
+        #[cfg(not(feature = "python-serve"))]
         match Bundle::decode(image) {
             Ok((bundle, _features)) => {
                 let mut model = ObjectModel::new(Vec::new(), PY_HEAP_BYTES);
+                configure_native_stack(&mut model);
                 model.set_console(uart::str);
+                model.set_error_console(uart::str);
                 if ticks_per_ms.is_some() {
                     model.set_monotonic(board_clock::now_ns, board_clock::sleep_ns);
                 }
@@ -442,16 +616,15 @@ mod python {
                 model.set_collect_when_full(true);
                 #[cfg(feature = "python-net")]
                 if let Some(ticks) = ticks_per_ms {
-                    install_net(&mut model, ticks);
+                    install_net(&mut model, ticks, crate::systick_clock::now_ms);
                 }
                 let outcome = run_bundle(bundle, &mut model);
                 uart::str(&model.take_stdout());
                 match outcome {
                     Ok(_) => uart::str("\r\n[py] done\r\n"),
                     Err(trap) => {
-                        uart::str("\r\n[py] trap=");
-                        uart::str(trap_name(trap));
-                        uart::str("\r\n");
+                        let end = lamella_py_runtime::trapped_end(&mut model, trap_name(trap));
+                        uart::str(&end.console_report());
                     }
                 }
                 report_arena(&model);
@@ -459,13 +632,17 @@ mod python {
             Err(_) => uart::str("\r\n[py] no bundle\r\n"),
         }
 
-        loop {}
+        serve(image, usb_clock, ticks_per_ms)
     }
 }
 
 #[cfg(not(target_os = "none"))]
 fn main() {
+    #[cfg(feature = "python-serve")]
+    let board = lamella_wire::product_model::name(BOARD).unwrap_or("board");
+    #[cfg(not(feature = "python-serve"))]
+    let board = "Pico 2 and Pico 2 W";
     println!(
-        "rp2350-python-interpreter is a bare-metal target; build for thumbv8m.main-none-eabi with the python feature"
+        "rp2350-python-interpreter for the {board} is a bare-metal target; build for thumbv8m.main-none-eabi with the python feature"
     );
 }

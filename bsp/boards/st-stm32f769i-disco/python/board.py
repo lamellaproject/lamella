@@ -63,11 +63,21 @@ INSTANCES = {
     "usart1": {"block": "usart", "base": 0x40011000, "rcc_en_off": 0x44, "rcc_en_bit": 0x4},
     "sdmmc2": {"block": "sdmmc", "base": 0x40011C00, "rcc_en_off": 0x44, "rcc_en_bit": 0x7},
     "gpioa": {"block": "gpio", "base": 0x40020000, "rcc_en_off": 0x30, "rcc_en_bit": 0x0},
+    "gpiob": {"block": "gpio", "base": 0x40020400, "rcc_en_off": 0x30, "rcc_en_bit": 0x1},
+    "gpioc": {"block": "gpio", "base": 0x40020800, "rcc_en_off": 0x30, "rcc_en_bit": 0x2},
+    "gpiod": {"block": "gpio", "base": 0x40020C00, "rcc_en_off": 0x30, "rcc_en_bit": 0x3},
+    "gpioe": {"block": "gpio", "base": 0x40021000, "rcc_en_off": 0x30, "rcc_en_bit": 0x4},
+    "gpiof": {"block": "gpio", "base": 0x40021400, "rcc_en_off": 0x30, "rcc_en_bit": 0x5},
+    "gpiog": {"block": "gpio", "base": 0x40021800, "rcc_en_off": 0x30, "rcc_en_bit": 0x6},
+    "gpioh": {"block": "gpio", "base": 0x40021C00, "rcc_en_off": 0x30, "rcc_en_bit": 0x7},
+    "gpioi": {"block": "gpio", "base": 0x40022000, "rcc_en_off": 0x30, "rcc_en_bit": 0x8},
     "gpioj": {"block": "gpio", "base": 0x40022400, "rcc_en_off": 0x30, "rcc_en_bit": 0x9},
+    "gpiok": {"block": "gpio", "base": 0x40022800, "rcc_en_off": 0x30, "rcc_en_bit": 0xA},
     "rcc": {"block": "rcc", "base": 0x40023800},
     "exti": {"block": "exti", "base": 0x40013C00},
     "syscfg": {"block": "syscfg", "base": 0x40013800, "rcc_en_off": 0x44, "rcc_en_bit": 0xE},
     "quadspi": {"block": "quadspi", "base": 0xA0001000, "rcc_en_off": 0x38, "rcc_en_bit": 0x1},
+    "tim5": {"block": "tim", "base": 0x40000C00, "rcc_en_off": 0x40, "rcc_en_bit": 0x3},
 }
 
 PLANS = {
@@ -82,6 +92,8 @@ DEVICES = {
     "led0": {"kind": "gpio-out", "port_base": 0x40022400, "pin": 13, "bank": 0, "mask": 0x2000, "active_low": False},
     "led1": {"kind": "gpio-out", "port_base": 0x40022400, "pin": 5, "bank": 0, "mask": 0x20, "active_low": False},
     "button0": {"kind": "gpio-in", "port_base": 0x40020000, "pin": 0, "bank": 0, "mask": 0x1, "active_low": False},
+    "swdio": {"port_base": 0x40020000, "pin": 13, "bank": 0, "mask": 0x2000},
+    "swclk": {"port_base": 0x40020000, "pin": 14, "bank": 0, "mask": 0x4000},
 }
 
 # Memory regions the board fits. A region with a "controller" does not exist until

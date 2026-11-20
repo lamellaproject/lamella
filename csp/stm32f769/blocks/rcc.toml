@@ -1,0 +1,45 @@
+# BLOCK: the STM32F76x/F77x reset and clock control, as far as the clock a timer counts before any
+# clock plan has run. Offsets are relative to the RCC instance's base in ../instances.toml; each
+# peripheral's clock gate is stated in that peripheral's own instance row.
+#
+# Every system reset leaves the part on HSI, its 16 MHz internal RC oscillator, with the AHB and APB1
+# prescalers dividing by 1 and TIMPRE clear. An APB timer's clock is then its bus clock, so a timer
+# on APB1 counts 16 MHz. A program timing anything before a clock plan has run is running at these
+# rates.
+
+[table]
+kind = "block"
+family = "stm32f769"
+block = "rcc"
+sources = [
+    "STM32F76xxx/STM32F77xxx reference manual RM0410 Rev 5 section 5.2.2 (HSI clock, page 158): 'The HSI clock signal is generated from an internal 16 MHz RC oscillator and can be used directly as a system clock, or used as PLL input.'",
+    "RM0410 Rev 5 section 5.2.6 (System clock (SYSCLK) selection, page 159): 'After a system reset, the HSI oscillator is selected as the system clock.'",
+    "RM0410 Rev 5 section 5.3.3 (RCC_CFGR, page 169): address offset 0x08, reset value 0x0000 0000; SW bits 1:0, '00: HSI oscillator selected as system clock'; HPRE bits 7:4, '0xxx: system clock not divided'; PPRE1 bits 12:10, '0xx: AHB clock not divided'.",
+    "RM0410 Rev 5 section 5.3.25 (RCC_DCKCFGR1, page 213): address offset 0x8C, reset value 0x0000 0000, TIMPRE bit 24.",
+    "RM0410 Rev 5 section 5.2 (Clocks, page 156): 'If TIMPRE bit in RCC_DCKCFGR1 register is reset: If the APB prescaler is configured to a division factor of 1, the timer clock frequencies (TIMxCLK) are set to PCLKx. Otherwise, the timer clock frequencies are twice the frequency of the APB domain to which the timers are connected'.",
+    "RM0410 Rev 5 section 5.1.1 (System reset, page 151): 'A system reset sets all registers to their reset values unless specified otherwise in the register description', a software reset through SYSRESETREQ among its sources.",
+]
+notes = [
+    "AN APB TIMER RUNS AT TWICE ITS BUS CLOCK WHENEVER THAT BUS IS DIVIDED. The rate below holds only while PPRE1 divides by 1, which is its reset value; a plan that divides APB1 doubles every APB1 timer's clock relative to PCLK1.",
+]
+
+[registers.CFGR]
+offset = 0x08
+width = 32
+fields = { SW = [0, 2], HPRE = [4, 4], PPRE1 = [10, 3] }
+notes = "Clock configuration. Resets to 0x0000 0000: SW selects HSI, and HPRE and PPRE1 divide by 1."
+
+[registers.DCKCFGR1]
+offset = 0x8C
+width = 32
+fields = { TIMPRE = [24, 1] }
+notes = "Dedicated clocks configuration 1. Resets to 0x0000 0000: TIMPRE clear, so an APB timer's clock is its bus clock while that bus's prescaler is 1, and twice it otherwise."
+
+# The clock an APB1 timer counts at reset, stated as its parts and the rate they make: the
+# oscillator, the reset values of the two registers between it and the timer, and the timer clock
+# they leave.
+[constants]
+HSI_HZ = 16000000
+CFGR_RESET = 0x0
+DCKCFGR1_RESET = 0x0
+APB1_TIMER_RESET_HZ = 16000000

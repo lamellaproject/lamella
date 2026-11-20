@@ -188,11 +188,13 @@ pub(crate) const DEFAULT_REPORT_LEN: usize = 64;
 
 /// The report length to size a buffer from, given what the operating system said about a device.
 ///
-/// **ONE FUNCTION, CALLED BY EVERY BACKEND.** The rule is easy to get wrong per-platform: a device
-/// reports its own length, and a buffer sized to anything else silently fails to carry a report.
-/// An Atmel/Microchip EDBG uses 512-byte reports, and IOKit will not deliver one into a 64-byte
-/// buffer -- so a backend that registers a fixed size cannot reach those probes at all. Deciding
-/// this in one place is what keeps the three platforms agreeing.
+/// **ONE FUNCTION, CALLED BY EVERY BACKEND THAT LEARNS A LENGTH FROM THE OPERATING SYSTEM** --
+/// Windows' and macOS'; the Linux backend learns none, so it is compiled for those two and for the
+/// tests. The rule is easy to get wrong per-platform: a device reports its own length, and a buffer
+/// sized to anything else silently fails to carry a report. An Atmel/Microchip EDBG uses 512-byte
+/// reports, and IOKit will not deliver one into a 64-byte buffer -- so a backend that registers a
+/// fixed size cannot reach those probes at all. Deciding this in one place is what keeps the
+/// platforms agreeing.
 ///
 /// `None` and `Some(0)` are the same answer -- the device has told us nothing, rather than told us
 /// zero -- and a zero-length buffer is not a small buffer, it is no buffer. **That clause is the
@@ -202,6 +204,7 @@ pub(crate) const DEFAULT_REPORT_LEN: usize = 64;
 /// agree on what a length counts: Windows includes the report-id byte and the others do not, so its
 /// fallback is one larger for the same device. The convention belongs at the call site; the rule
 /// about zero does not.
+#[cfg(any(target_os = "windows", target_os = "macos", test))]
 pub(crate) fn report_len_or_default(os_reported: Option<usize>, fallback: usize) -> usize {
     os_reported.filter(|&len| len != 0).unwrap_or(fallback)
 }

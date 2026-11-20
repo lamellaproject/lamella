@@ -1,0 +1,71 @@
+# BLOCK: the STM32F74x/F75x external interrupt controller, for the sixteen lines GPIO pins drive.
+# Offsets are relative to the EXTI instance's base in ../instances.toml.
+#
+# A line is the pin index, and the port is a separate choice made in SYSCFG (blocks/syscfg.toml):
+# line x is driven by pin x of whichever port SYSCFG_EXTICR selects for it, so PA5, PB5 and every
+# other port's pin 5 compete for line 5, and only one of them drives it at a time.
+#
+# Routing a pin needs the SYSCFG clock, and EXTI has no clock of its own to enable. A driver that
+# configures EXTI without enabling SYSCFG writes EXTICR into a peripheral that is not clocked, the
+# write is lost, and the line stays bound to port A, the reset selection.
+#
+# Twenty-four lines and only the first sixteen are pads. Lines 0 to 15 are the GPIO lines; the rest
+# are internal sources -- the PVD, the RTC's alarms and wakeup, USB wakeup and the like -- which reach
+# the same registers and are not selected by SYSCFG.
+#
+# Seven vectors for sixteen lines, which decides the shape of a handler. Lines 0 to 4 have a vector
+# each; lines 5 to 9 share one; lines 10 to 15 share another. So a handler for a shared vector is
+# entered without knowing which pad fired and reads EXTI_PR to find out, and may service several
+# lines from one entry.
+
+[table]
+kind = "block"
+family = "stm32f7"
+block = "exti"
+sources = [
+    "STM32F75xxx/F74xxx reference manual RM0385 Rev 9 section 11.9, register descriptions, each stating its own address offset: 11.9.1 EXTI_IMR 0x00, 11.9.2 EXTI_EMR 0x04, 11.9.3 EXTI_RTSR 0x08, 11.9.4 EXTI_FTSR 0x0C, 11.9.5 EXTI_SWIER 0x10, 11.9.6 EXTI_PR 0x14, each with a bit per line in bits 23:0.",
+    "RM0385 Rev 9 section 11.9.6 (EXTI_PR): 'This bit is set when the selected edge event arrives on the external interrupt line. This bit is cleared by programming it to 1.'",
+    "RM0385 Rev 9 section 11, its opening paragraph: 'The external interrupt/event controller consists of up to 24 edge detectors for generating event/interrupt requests.'",
+    "RM0385 Rev 9 Table 44 (STM32F75xxx and STM32F74xxx vector table): EXTI0 position 6 at 0x0000 0058, EXTI1 7 at 0x0000 005C, EXTI2 8 at 0x0000 0060, EXTI3 9 at 0x0000 0064, EXTI4 10 at 0x0000 0068, EXTI9_5 23 at 0x0000 009C, EXTI15_10 40 at 0x0000 00E0.",
+    "RM0385 Rev 9 Table 1 (register boundary addresses): EXTI at 0x40013C00-0x40013FFF on APB2. No RCC register names an EXTI enable.",
+]
+notes = [
+    "EVERY POSITION ABOVE CHECKS AGAINST ITS ROW'S OWN ADDRESS, which is 0x40 + 4 x the position, and the seven are the STM32F76x/F77x's as well.",
+    "EXTI_PR IS WRITE-ONE-TO-CLEAR AND CLEARING IT IS NOT OPTIONAL: a handler that returns without writing the pending bit re-enters at once. It is also the only way to learn WHICH line fired on the two shared vectors, and its one bit per line does not say which edge it was.",
+]
+
+[registers.IMR]
+offset = 0x00
+width = 32
+fields = { MR = [0, 24] }
+notes = "One interrupt mask bit per line, 1 unmasked. The trigger registers decide what counts as an edge; this one connects a line to its vector."
+
+[registers.EMR]
+offset = 0x04
+width = 32
+fields = { MR = [0, 24] }
+notes = "The event mask, which routes a detection to the event system rather than to the NVIC."
+
+[registers.RTSR]
+offset = 0x08
+width = 32
+fields = { TR = [0, 24] }
+notes = "Rising-edge trigger enable, one bit per line. Setting this and FTSR together is how a both-edge trigger is expressed."
+
+[registers.FTSR]
+offset = 0x0C
+width = 32
+fields = { TR = [0, 24] }
+notes = "Falling-edge trigger enable, one bit per line."
+
+[registers.SWIER]
+offset = 0x10
+width = 32
+fields = { SWIER = [0, 24] }
+notes = "Software-raised interrupt per line, which sets the line's pending bit with no pad activity."
+
+[registers.PR]
+offset = 0x14
+width = 32
+fields = { PR = [0, 24] }
+notes = "WRITE-ONE-TO-CLEAR. A handler that returns without clearing re-enters at once, and on the EXTI9_5 and EXTI15_10 vectors this is the only register that says which line fired."

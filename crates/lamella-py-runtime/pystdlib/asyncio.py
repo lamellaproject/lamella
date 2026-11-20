@@ -419,10 +419,14 @@ class EventLoop:
                     # is a deadlock, and saying so beats CPython's behavior of waiting forever: a
                     # program that can never finish is more useful stopped with a reason.
                     raise RuntimeError("Event loop stopped before Future completed")
+            # Normal completion retrieves this future's result below. A callback that raises
+            # before the loop finishes does not retrieve it.
+            future._retrieved = True
         finally:
             self._running = False
-            # SWEPT ON THE WAY OUT TOO. A task that died on the last pass never sees an idle loop,
-            # because the main future completing is what ends the run.
+            # Finish this run by reporting task exceptions whose results remain unobserved.
+            # Python 3.14 Library Reference, "Developing with asyncio", "Detect never-retrieved
+            # exceptions", describes a garbage-collection-time diagnostic. This call runs at loop exit.
             self._report_unretrieved()
         return future.result()
 

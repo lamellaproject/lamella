@@ -9,7 +9,8 @@
    into OUT_DIR, because the flash a firmware may occupy is not the flash the part has. A
    firmware built with `serve` shares the flash with the deployed-image region, so it gets that
    region's base as its ceiling and one that outgrows it fails at link time; a firmware that
-   takes no deploys owns the board's whole flash, which build.rs reads from the board's facts.
+   takes no deploys owns the board's flash up to the board's settings in its last sectors, which
+   build.rs reads from the board's facts and from rp2350_settings.rs.
    Without the bound, an oversized firmware links cleanly and is then silently overwritten by
    the first deploy -- the failure this ceiling exists to refuse. build.rs derives the ceiling
    from IMAGE_BASE and refuses a base it cannot read, so the two spellings of one fact cannot

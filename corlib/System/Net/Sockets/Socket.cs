@@ -39,7 +39,7 @@ namespace System.Net.Sockets
         public void Connect(EndPoint remoteEP)
         {
             IPEndPoint endpoint = (IPEndPoint)remoteEP;
-            int handle = ConnectStart(endpoint.Address.GetAddressBytes(), endpoint.Port);
+            int handle = ConnectStart(endpoint.Address.Octets, endpoint.Port);
             if (handle < 0) throw new SocketException();
             _handle = handle;
             int result;
@@ -52,7 +52,7 @@ namespace System.Net.Sockets
             IPEndPoint endpoint = (IPEndPoint)localEP;
             if (_socketType == SocketType.Dgram)
             {
-                int handle = UdpBind(endpoint.Address.GetAddressBytes(), endpoint.Port);
+                int handle = UdpBind(endpoint.Address.Octets, endpoint.Port);
                 if (handle < 0) throw new SocketException();
                 _handle = handle;
             }
@@ -66,7 +66,7 @@ namespace System.Net.Sockets
         {
             IPEndPoint endpoint = (IPEndPoint)remoteEP;
             int sent;
-            while ((sent = UdpSendTo(_handle, buffer, offset, size, endpoint.Address.GetAddressBytes(), endpoint.Port)) == WouldBlock) { }
+            while ((sent = UdpSendTo(_handle, buffer, offset, size, endpoint.Address.Octets, endpoint.Port)) == WouldBlock) { }
             if (sent == SockError) throw new SocketException();
             return sent;
         }
@@ -92,13 +92,13 @@ namespace System.Net.Sockets
             int addrLength = senderMeta[0];
             byte[] address = new byte[addrLength];
             for (int i = 0; i < addrLength; i++) address[i] = senderAddr[i];
-            remoteEP = new IPEndPoint(new IPAddress(address), senderMeta[1]);
+            remoteEP = new IPEndPoint(IPAddress.FromOwnedOctets(address), senderMeta[1]);
             return received;
         }
 
         public void Listen(int backlog)
         {
-            int handle = ListenStart(_bindEndPoint.Address.GetAddressBytes(), _bindEndPoint.Port, backlog);
+            int handle = ListenStart(_bindEndPoint.Address.Octets, _bindEndPoint.Port, backlog);
             if (handle < 0) throw new SocketException();
             _handle = handle;
         }

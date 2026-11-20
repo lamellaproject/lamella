@@ -71,9 +71,9 @@ pub const MAX_PAYLOAD: usize = u16::MAX as usize;
 /// rediscover, and it is what makes [`HelloAck::max_inbound_payload`] safe to leave unset.
 ///
 /// 240 bytes, which is 249 on the wire and so fits the smallest receive ring any serve firmware in
-/// this tree uses, with room left over. It is deliberately round rather than the exact 247 that
-/// ring allows: this is a number that goes into a conformance sentence somebody has to implement
-/// against, not one derived at a call site.
+/// this tree uses, with room left over. It is deliberately round rather than the exact 246 that
+/// ring allows ([`max_payload_for_ring`]): this is a number that goes into a conformance sentence
+/// somebody has to implement against, not one derived at a call site.
 pub const MIN_INBOUND_PAYLOAD: usize = 240;
 
 /// The largest payload a receiver holding a `buffer`-byte assembly buffer can take, accounting for
@@ -84,8 +84,9 @@ pub const MIN_INBOUND_PAYLOAD: usize = 240;
 /// The framing overhead is not public and should not be. A firmware that subtracted its own idea of
 /// the header size would be silently wrong the day the header changes -- and silently wrong here
 /// means OVER-advertising, which is the failure this whole mechanism exists to prevent. So a target
-/// states the number it actually knows, which is how big its ring is, and the layer that owns the
-/// header does the subtraction.
+/// states the number it actually knows, which is how big its buffer is, and the layer that owns the
+/// header does the subtraction. A receive ring states its length to [`max_payload_for_ring`]
+/// instead.
 ///
 /// Saturating rather than underflowing: a buffer too small to hold any frame carries no payload,
 /// which is a true answer, and a panic in a `const` initializer on a firmware is not a diagnosis
@@ -95,11 +96,24 @@ pub const fn max_payload_for_buffer(buffer: usize) -> usize {
     buffer.saturating_sub(HEADER_LEN + CRC_LEN)
 }
 
+/// The largest payload a receiver can take whose interrupt fills a ring of `slots` bytes, accounting
+/// for the framing and for the slot the ring keeps empty.
+///
+/// A ring whose producer and consumer each own one index tells full from empty by leaving one slot
+/// unused: it is full when the next write would land on the slot being read. So it holds one byte
+/// less than its length, and a frame as long as the ring loses its last byte.
+#[must_use]
+pub const fn max_payload_for_ring(slots: usize) -> usize {
+    max_payload_for_buffer(slots.saturating_sub(1))
+}
+
 pub mod msg;
 
 pub mod arch;
 
 pub mod surface;
+
+pub mod image_format;
 
 /// What an [`crate::msg::ERROR`] carries: why a frame was refused.
 ///
@@ -1690,6 +1704,16 @@ pub struct HelloAck {
     /// zero-means-unknown value because zero is a legal thing to compute from a tiny buffer, and a
     /// target that genuinely can take nothing must not read as one that declined to say.
     pub max_inbound_payload: Option<u16>,
+    /// The one image format each resident runtime loads, one entry per
+    /// [`TargetIdentity::surfaces`] entry and in that order: the format number an image of that
+    /// runtime carries, and [`image_format::LOADS_NONE`] for a runtime that loads no image. `None`
+    /// when the target stated none, which a host reads as a target that loads no format it writes
+    /// ([`image_format::refusal`]).
+    ///
+    /// Sent only with [`Self::max_inbound_payload`], which comes first on the wire: a target states
+    /// its formats over a carrier that declares its limit, and over one that declares none it states
+    /// neither ([`Self::encode`]).
+    pub image_formats: Option<Vec<u16>>,
 }
 
 impl HelloAck {
@@ -1698,8 +1722,9 @@ impl HelloAck {
 
     /// This acknowledgement, declaring the most payload the target can absorb in one frame.
     ///
-    /// Takes the number in payload bytes -- [`max_payload_for_buffer`] converts a ring size into
-    /// one -- and clamps to what the wire's `u16` length field can express, because a target
+    /// Takes the number in payload bytes -- [`max_payload_for_ring`] converts a ring's size into one,
+    /// [`max_payload_for_buffer`] a linear buffer's -- and clamps to what the wire's `u16` length
+    /// field can express, because a target
     /// roomier than the protocol still cannot be sent more than the protocol carries.
     #[must_use]
     pub fn with_max_inbound_payload(mut self, payload_bytes: usize) -> Self {
@@ -1719,14 +1744,26 @@ impl HelloAck {
     /// **Trailing fields are therefore APPEND-ONLY.** A reader stops at the first one it does not
     /// know, so removing or reordering one silently re-points every field after it -- and silently
     /// is the operative word, because the bytes still decode.
+    ///
+    /// The trailing fields, in order: the most inbound payload (`u16`), then the image formats, one
+    /// `u16` per surface of the identity. The image formats are sent only after a declared limit.
+    /// Every host reads the number in the limit's place as what the carrier declared, and sizes what
+    /// it sends by it, so a target whose carrier declares none sends neither field rather than a
+    /// number it did not declare. An empty list is not sent.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut payload = Vec::with_capacity(Self::FIXED_LEN + TargetIdentity::FIXED_LEN);
         payload.extend_from_slice(&self.chosen.to_le_bytes());
         payload.extend_from_slice(&self.caps.0.to_le_bytes());
         self.identity.encode_into(&mut payload);
+        let surfaces = self.identity.surfaces.len();
         if let Some(max_inbound) = self.max_inbound_payload {
             payload.extend_from_slice(&max_inbound.to_le_bytes());
+            if let Some(formats) = self.image_formats.as_deref().filter(|_| surfaces > 0) {
+                for index in 0..surfaces {
+                    payload.extend_from_slice(&formats.get(index).copied().unwrap_or(image_format::LOADS_NONE).to_le_bytes());
+                }
+            }
         }
         payload
     }
@@ -1744,11 +1781,17 @@ impl HelloAck {
         let tail = Self::FIXED_LEN + identity_len;
         let max_inbound_payload =
             payload.get(tail..tail + 2).map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]));
+        let surfaces = identity.surfaces.len();
+        let image_formats = payload
+            .get(tail + 2..tail + 2 + 2 * surfaces)
+            .filter(|_| surfaces > 0)
+            .map(|bytes| bytes.chunks_exact(2).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect());
         Some(Self {
             chosen: u16::from_le_bytes([payload[0], payload[1]]),
             caps: Capabilities(u64::from_le_bytes(caps.try_into().ok()?)),
             identity,
             max_inbound_payload,
+            image_formats,
         })
     }
 
@@ -1832,9 +1875,20 @@ pub struct Negotiated {
     /// -- `None` when it did not say. Send by [`Self::inbound_payload_limit`]; this is the raw
     /// advertisement, for a tool reporting what a board claimed rather than what to do about it.
     pub max_inbound_payload: Option<u16>,
+    /// The image format each resident runtime loads, as the target stated it
+    /// ([`HelloAck::image_formats`]); read one with [`Self::image_format`].
+    pub image_formats: Option<Vec<u16>>,
 }
 
 impl Negotiated {
+    /// The one image format the target's runtime of tier `tier` ([`msg::tier`]) loads, as its
+    /// handshake stated it; `None` when the target has no such runtime or stated no formats.
+    #[must_use]
+    pub fn image_format(&self, tier: u8) -> Option<u16> {
+        let index = self.identity.surfaces.iter().position(|surface| surface.tier == tier)?;
+        self.image_formats.as_ref()?.get(index).copied()
+    }
+
     /// The most payload one frame may carry TO the target on this session: what it advertised, or
     /// [`MIN_INBOUND_PAYLOAD`] when it advertised nothing.
     ///
@@ -1890,16 +1944,30 @@ impl Negotiated {
 /// how a carrier declines rather than something a caller can leave out, because four different
 /// handshakes in this tree build an acknowledgement and a rule with several implementations gains
 /// its next case in none of them. A site that forgets this one does not compile.
+///
+/// `image_formats` is the one image format each of the identity's runtimes loads, in the order of
+/// its surfaces ([`HelloAck::image_formats`]), or `None` for a target that states none. Required
+/// for the same reason. A missing entry is sent as [`image_format::LOADS_NONE`], and an entry past
+/// the last surface is not sent; a target with no resident runtime states no formats.
+///
+/// The formats are stated only with a declared `max_inbound_payload`, which they follow on the
+/// wire. Over a carrier that declares nothing, a target states neither, and a host then reads it
+/// as one stating no format, so each carrier of a target with formats to state declares its limit.
 pub fn target_respond(
     host: &Hello,
     target_range: ProtocolRange,
     target_caps: Capabilities,
     identity: TargetIdentity,
     max_inbound_payload: Option<usize>,
+    image_formats: Option<&[u16]>,
 ) -> Result<HelloAck, HelloNak> {
     match negotiate(host.range, target_range) {
         Some(chosen) => {
-            let ack = HelloAck { chosen, caps: target_caps, identity, max_inbound_payload: None };
+            let surfaces = identity.surfaces.len();
+            let image_formats = image_formats.filter(|_| surfaces > 0 && max_inbound_payload.is_some()).map(|formats| {
+                (0..surfaces).map(|index| formats.get(index).copied().unwrap_or(image_format::LOADS_NONE)).collect::<Vec<u16>>()
+            });
+            let ack = HelloAck { chosen, caps: target_caps, identity, max_inbound_payload: None, image_formats };
             Ok(match max_inbound_payload {
                 Some(bytes) => ack.with_max_inbound_payload(bytes),
                 None => ack,
@@ -1924,6 +1992,7 @@ pub fn host_finish(ack: &HelloAck, host_caps: Capabilities) -> Negotiated {
         target_caps: ack.caps,
         identity: ack.identity.clone(),
         max_inbound_payload: ack.max_inbound_payload,
+        image_formats: ack.image_formats.clone(),
     }
 }
 
@@ -2123,13 +2192,15 @@ pub trait Transport {
     /// is the object that knows.
     ///
     /// `None` -- the default -- means this carrier declines to declare one, and a sender then uses
-    /// [`MIN_INBOUND_PAYLOAD`]. That is the SAFE reading and it is why this could be added without
-    /// touching a single existing carrier: a transport that says nothing is sent the floor, which
-    /// every target must accept anyway. Declaring is how a roomy carrier earns bigger frames, not
-    /// how a small one stays safe.
+    /// [`MIN_INBOUND_PAYLOAD`]. That is the SAFE reading for what is sent: a transport that says
+    /// nothing is sent the floor, which every target must accept anyway. Declaring is how a roomy
+    /// carrier earns bigger frames, not how a small one stays safe. It is also how a target states
+    /// its image formats ([`HelloAck::image_formats`]), which follow the limit on the wire: over a
+    /// carrier that declines, a target states none.
     ///
-    /// Answer in PAYLOAD bytes, from [`max_payload_for_buffer`] -- the framing overhead is not
-    /// public, and a carrier subtracting its own idea of it would over-declare on the day it moves.
+    /// Answer in PAYLOAD bytes, from [`max_payload_for_ring`] for a ring or [`max_payload_for_buffer`]
+    /// for a linear buffer -- the framing overhead is not public, and a carrier subtracting its own
+    /// idea of it would over-declare on the day it moves.
     fn max_inbound_payload(&self) -> Option<usize> {
         None
     }
@@ -2188,13 +2259,24 @@ pub struct MemTransport {
     reader: FrameReader,
     /// Encoded bytes this side has sent (a test feeds them to the peer).
     pub sent: Vec<u8>,
+    /// The limit this side declares ([`Transport::max_inbound_payload`]), or `None` for none.
+    max_inbound_payload: Option<usize>,
 }
 
 impl MemTransport {
-    /// A new, empty in-memory transport.
+    /// A new, empty in-memory transport, which declares no inbound limit.
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// This transport, declaring `payload_bytes` as the most payload one frame it receives may carry
+    /// ([`Transport::max_inbound_payload`]), as a board's carrier does. Nothing it receives is checked
+    /// against the number: it is the answer a target's handshake gives over this transport.
+    #[must_use]
+    pub fn with_max_inbound_payload(mut self, payload_bytes: usize) -> Self {
+        self.max_inbound_payload = Some(payload_bytes);
+        self
     }
 
     /// Deliver bytes the peer sent.
@@ -2221,6 +2303,10 @@ impl Transport for MemTransport {
 
     fn discarded_bytes(&self) -> Option<u64> {
         Some(self.reader.discarded_bytes())
+    }
+
+    fn max_inbound_payload(&self) -> Option<usize> {
+        self.max_inbound_payload
     }
 }
 
@@ -2498,6 +2584,7 @@ mod tests {
             caps: Capabilities(Capabilities::PROFILE_CHIPID | Capabilities::RESIDENT_CORLIB),
             identity: identity.clone(),
             max_inbound_payload: None,
+            image_formats: None,
         };
         let bytes = ack.encode();
         let back = HelloAck::decode(&bytes).expect("an ack decodes");
@@ -2554,12 +2641,13 @@ mod tests {
         let frame = encode_frame(msg::PING, 1, &alloc::vec![0u8; MIN_INBOUND_PAYLOAD])
             .expect("the floor is a carryable payload");
         assert!(
-            frame.len() <= SMALLEST_SERVE_RING,
-            "the floor is {} on the wire and the smallest ring is {SMALLEST_SERVE_RING}",
+            frame.len() < SMALLEST_SERVE_RING,
+            "the floor is {} on the wire and the smallest ring holds {}",
             frame.len(),
+            SMALLEST_SERVE_RING - 1,
         );
         assert!(
-            MIN_INBOUND_PAYLOAD <= max_payload_for_buffer(SMALLEST_SERVE_RING),
+            MIN_INBOUND_PAYLOAD <= max_payload_for_ring(SMALLEST_SERVE_RING),
             "the floor must not exceed what that ring can take",
         );
     }
@@ -2572,10 +2660,11 @@ mod tests {
             caps: Capabilities(0),
             identity: an_identity(),
             max_inbound_payload: None,
+            image_formats: None,
         }
-        .with_max_inbound_payload(max_payload_for_buffer(512));
+        .with_max_inbound_payload(max_payload_for_ring(512));
         let back = HelloAck::decode(&declared.encode()).expect("an ack decodes");
-        assert_eq!(back.max_inbound_payload, Some(503), "a 512-byte ring, less the framing");
+        assert_eq!(back.max_inbound_payload, Some(502), "a 512-byte ring's 511 bytes, less the framing");
         assert_eq!(back, declared, "every field round-trips");
 
         let silent = HelloAck {
@@ -2583,6 +2672,7 @@ mod tests {
             caps: Capabilities(0),
             identity: an_identity(),
             max_inbound_payload: None,
+            image_formats: None,
         };
         let quiet = HelloAck::decode(&silent.encode()).expect("an ack decodes");
         assert_eq!(quiet.max_inbound_payload, None, "silence is not a zero");
@@ -2600,6 +2690,7 @@ mod tests {
             caps: Capabilities(0),
             identity: TargetIdentity::default(),
             max_inbound_payload: None,
+            image_formats: None,
         }
         .with_max_inbound_payload(1_048_576);
         assert_eq!(roomy.max_inbound_payload, Some(MAX_PAYLOAD as u16));
@@ -2620,6 +2711,7 @@ mod tests {
             caps: Capabilities(0),
             identity: identity.clone(),
             max_inbound_payload: None,
+            image_formats: None,
         }
         .with_max_inbound_payload(503);
         let with_tail = modern.encode();
@@ -2651,6 +2743,7 @@ mod tests {
                     caps: Capabilities(0),
                     identity: TargetIdentity::default(),
                     max_inbound_payload,
+                    image_formats: None,
                 },
                 Capabilities(0),
             )
@@ -2674,18 +2767,20 @@ mod tests {
         assert_eq!(session(None).max_chunk_data(), MIN_INBOUND_PAYLOAD - msg::CHUNK_HEADER_LEN);
     }
 
-    /// A chunk sized by `max_chunk_data` FRAMES within what the target said it can take -- proved
-    /// by encoding one, rather than by re-deriving the subtraction that produced it.
+    /// A chunk sized by `max_chunk_data` FRAMES within what the target's ring holds -- proved by
+    /// encoding one, rather than by re-deriving the subtraction that produced it. A serve's ring
+    /// keeps one slot empty to tell full from empty, so it holds one byte less than its length.
     #[test]
     fn a_chunk_sized_for_a_session_fits_the_ring_it_was_sized_from() {
         for ring in [256usize, 512, 4096] {
-            let advertised = max_payload_for_buffer(ring);
+            let advertised = max_payload_for_ring(ring);
             let session = host_finish(
                 &HelloAck {
                     chosen: 1,
                     caps: Capabilities(0),
                     identity: TargetIdentity::default(),
                     max_inbound_payload: None,
+                    image_formats: None,
                 }
                 .with_max_inbound_payload(advertised),
                 Capabilities(0),
@@ -2696,8 +2791,9 @@ mod tests {
             let frame = encode_frame(msg::DEPLOY_IMAGE, 1, &payload).expect("a chunk frames");
             assert_eq!(
                 frame.len(),
-                ring,
-                "a full chunk to a {ring}-byte ring lands inside it, not one byte over",
+                ring - 1,
+                "a full chunk to a {ring}-byte ring lands inside the {} bytes it holds, not one byte over",
+                ring - 1,
             );
         }
     }
@@ -2715,6 +2811,7 @@ mod tests {
             caps: Capabilities(0),
             identity: TargetIdentity::default(),
             max_inbound_payload: None,
+            image_formats: None,
         };
         let bytes = ack.encode();
         assert_eq!(bytes.len(), 10 + 11, "the head, then the smallest identity");
@@ -2723,6 +2820,94 @@ mod tests {
         assert_eq!(back.identity.arch, arch::UNKNOWN);
         assert_eq!(back.identity.chip_id_kind, chip_id_kind::NONE);
         assert!(back.identity.surfaces.is_empty(), "no resident interpreter");
+    }
+
+    const CIL_FORMAT: u16 = image_format::PRE_RELEASE | 1;
+    const PYTHON_FORMAT: u16 = image_format::PRE_RELEASE | 7;
+
+    fn a_two_runtime_identity() -> TargetIdentity {
+        an_identity().with_surface(Surface {
+            tier: msg::tier::PYTHON,
+            abi: 0,
+            hash: 0x0123_4567_89AB_CDEF,
+            lib_version: [0, 0, 0, 0],
+            lib_file_version: [0, 0, 0, 0],
+            caps: 0,
+        })
+    }
+
+    fn encoded_identity_len(identity: &TargetIdentity) -> usize {
+        let mut bytes = Vec::new();
+        identity.encode_into(&mut bytes);
+        bytes.len()
+    }
+
+    fn respond(identity: TargetIdentity, max_inbound: Option<usize>, formats: Option<&[u16]>) -> HelloAck {
+        let host = Hello { range: ProtocolRange::single(PROTOCOL_VERSION), caps: Capabilities(0) };
+        target_respond(&host, ProtocolRange::single(PROTOCOL_VERSION), Capabilities(0), identity, max_inbound, formats)
+            .expect("one version both speak")
+    }
+
+    const DECLARED: usize = max_payload_for_ring(512);
+
+    #[test]
+    fn an_ack_states_the_image_format_each_runtime_loads() {
+        let ack = respond(a_two_runtime_identity(), Some(DECLARED), Some(&[CIL_FORMAT, PYTHON_FORMAT]));
+        assert_eq!(ack.image_formats, Some(alloc::vec![CIL_FORMAT, PYTHON_FORMAT]));
+        assert_eq!(ack.max_inbound_payload, Some(DECLARED as u16), "a declared limit stays as declared");
+        let back = HelloAck::decode(&ack.encode()).expect("an ack decodes");
+        assert_eq!(back, ack);
+        let session = host_finish(&back, Capabilities(0));
+        assert_eq!(session.image_format(msg::tier::CIL), Some(CIL_FORMAT));
+        assert_eq!(session.image_format(msg::tier::PYTHON), Some(PYTHON_FORMAT));
+        assert_eq!(session.image_format(msg::tier::ECMASCRIPT), None, "no such runtime here");
+        assert_eq!(session.inbound_payload_limit(), DECLARED);
+    }
+
+    #[test]
+    fn a_carrier_that_declares_no_limit_carries_no_formats() {
+        let ack = respond(a_two_runtime_identity(), None, Some(&[CIL_FORMAT, PYTHON_FORMAT]));
+        assert_eq!(ack.max_inbound_payload, None, "no limit is made up for the carrier");
+        assert_eq!(ack.image_formats, None, "so the formats, which follow one, are not stated");
+        let identity_end = 10 + encoded_identity_len(&a_two_runtime_identity());
+        assert_eq!(ack.encode().len(), identity_end, "nothing after the identity");
+        let built = HelloAck { image_formats: Some(alloc::vec![CIL_FORMAT, PYTHON_FORMAT]), ..ack };
+        assert_eq!(built.encode().len(), identity_end, "a list with no limit ahead of it is not sent");
+    }
+
+    #[test]
+    fn an_ack_that_states_no_formats_is_a_board_loading_none_a_host_writes() {
+        let ack = respond(a_two_runtime_identity(), None, None);
+        let bytes = ack.encode();
+        assert_eq!(bytes.len(), 10 + encoded_identity_len(&a_two_runtime_identity()), "nothing after the identity");
+        let session = host_finish(&HelloAck::decode(&bytes).expect("an ack decodes"), Capabilities(0));
+        assert_eq!(session.image_formats, None);
+        assert_eq!(session.image_format(msg::tier::CIL), None);
+        assert_eq!(image_format::refusal(session.image_format(msg::tier::CIL), CIL_FORMAT), Some(image_format::UPDATE_FIRMWARE));
+    }
+
+    #[test]
+    fn a_host_from_before_the_formats_reads_the_declared_limit_and_nothing_else() {
+        let ack = respond(a_two_runtime_identity(), Some(DECLARED), Some(&[CIL_FORMAT, PYTHON_FORMAT]));
+        let bytes = ack.encode();
+        let tail = 10 + encoded_identity_len(&a_two_runtime_identity());
+        assert_eq!(&bytes[tail..tail + 2], &(DECLARED as u16).to_le_bytes());
+        assert_eq!(bytes.len(), tail + 2 + 2 * 2, "the limit, then one format per runtime");
+        let older = HelloAck::decode(&bytes[..tail + 2]).expect("what such a host decodes");
+        assert_eq!(older.image_formats, None);
+        assert_eq!(host_finish(&older, Capabilities(0)).inbound_payload_limit(), DECLARED);
+    }
+
+    #[test]
+    fn the_formats_follow_the_identitys_surfaces() {
+        let short = respond(a_two_runtime_identity(), Some(DECLARED), Some(&[CIL_FORMAT]));
+        assert_eq!(short.image_formats, Some(alloc::vec![CIL_FORMAT, image_format::LOADS_NONE]), "a runtime with no entry loads none");
+        let long = respond(an_identity(), Some(DECLARED), Some(&[CIL_FORMAT, PYTHON_FORMAT]));
+        assert_eq!(long.image_formats, Some(alloc::vec![CIL_FORMAT]), "one entry per runtime, no more");
+        let none = respond(TargetIdentity::default(), Some(DECLARED), Some(&[CIL_FORMAT]));
+        assert_eq!(none.image_formats, None, "a target with no runtime states no format");
+        assert_eq!(none.max_inbound_payload, Some(DECLARED as u16), "and its carrier's limit stays declared");
+        assert_eq!(HelloAck::decode(&short.encode()).expect("an ack decodes"), short);
     }
 
     /// A truncated identity is a DECODE FAILURE, not a shorter identity.
@@ -2738,6 +2923,7 @@ mod tests {
             caps: Capabilities(0),
             identity: an_identity(),
             max_inbound_payload: None,
+            image_formats: None,
         };
         let bytes = ack.encode();
         for cut in 1..bytes.len() {
@@ -2759,7 +2945,7 @@ mod tests {
             caps: 0,
         });
         let ack =
-            HelloAck { chosen: 1, caps: Capabilities(0), identity, max_inbound_payload: None };
+            HelloAck { chosen: 1, caps: Capabilities(0), identity, max_inbound_payload: None, image_formats: None };
         let back = HelloAck::decode(&ack.encode()).expect("decodes");
         assert_eq!(back.identity.surfaces.len(), 2);
         assert_eq!(back.identity.surfaces[0].abi, 1);
@@ -2928,7 +3114,7 @@ mod tests {
     fn no_shared_version_is_a_nak_that_names_the_target_range() {
         let host = Hello { range: ProtocolRange { min: 4, max: 6 }, caps: Capabilities::default() };
         let target = ProtocolRange { min: 1, max: 1 };
-        let nak = target_respond(&host, target, Capabilities::default(), an_identity(), None)
+        let nak = target_respond(&host, target, Capabilities::default(), an_identity(), None, None)
             .expect_err("4..6 and 1..1 do not overlap");
         assert_eq!(nak.target_range, target, "the refusal names what the target CAN speak");
 
@@ -2946,6 +3132,7 @@ mod tests {
             ProtocolRange { min: 2, max: 5 },
             Capabilities::default(),
             an_identity(),
+            None,
             None,
         )
         .expect("2..3 overlaps");
@@ -3337,7 +3524,7 @@ mod tests {
         let frame = target.poll().unwrap().expect("HELLO arrived");
         assert_eq!(frame.msg_type, msg::HELLO);
         let received = Hello::decode(&frame.payload).unwrap();
-        let ack = target_respond(&received, target_range, target_caps, an_identity(), None)
+        let ack = target_respond(&received, target_range, target_caps, an_identity(), None, None)
             .expect("a compatible version");
         target.send(msg::HELLO_ACK, frame.seq, &ack.encode()).unwrap();
         host.feed(&target.take_sent());
@@ -3365,6 +3552,7 @@ mod tests {
             ProtocolRange::single(1),
             Capabilities::default(),
             TargetIdentity::default(),
+            None,
             None,
         );
         assert_eq!(err, Err(HelloNak { target_range: ProtocolRange::single(1) }));

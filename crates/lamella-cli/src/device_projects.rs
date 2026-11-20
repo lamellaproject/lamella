@@ -413,11 +413,39 @@ mod tests {
         assert!(ids(&listed(&options, &[])).is_empty());
     }
 
+    /// **A PROJECT's LIST READS NO LANGUAGE FROM A BOARD's USB STRING**, whatever follows the board's name
+    /// there: the string is for people. A board whose firmware runs Python names its board alone, as a C#
+    /// firmware does, so a C# project is offered it by that name, and a deploy's HELLO refuses it before
+    /// anything is sent.
+    #[test]
+    fn a_projects_list_reads_no_language_from_a_boards_usb_string() {
+        let bench = [
+            link("usb:MATCH", "Pimoroni Pico Plus 2"),
+            link("usb:PYTHON", "Raspberry Pi Pico 2 W"),
+            link("usb:NOTED", "Raspberry Pi Pico 2 W, Python"),
+        ];
+        let all = ["local", "usb:MATCH", "usb:PYTHON", "usb:NOTED"];
+        assert_eq!(ids(&listed(&["--framework", "lamella1.0", "--json"], &bench)), all);
+        let its_own = ["--framework", "lamella1.0", "--board", "raspberrypi-pico-2-w", "--json"];
+        assert_eq!(ids(&listed(&its_own, &bench)), ["usb:PYTHON", "usb:NOTED"]);
+        let named = ["--framework", "lamella1.0", "--board", "pimoroni-pico-plus-2", "--json"];
+        assert!(!ids(&listed(&named, &bench)).contains(&"usb:PYTHON"), "a known board is another board's");
+    }
+
     #[test]
     fn a_board_without_a_lamella_native_image_gets_no_native_probe() {
         let bench = [attached(Some("probe:STLINK"), Kind::Probe, (0x0483, 0x374b), "STM32 STLink")];
-        let list = listed(&["--framework", "lamella1.0", "--board", "st-stm32f769i-disco", "--json"], &bench);
+        let list = listed(&["--framework", "lamella1.0", "--board", "st-nucleo-l476rg", "--json"], &bench);
         assert!(list.devices.is_empty());
+    }
+
+    /// A board whose native image is written through its own ST-LINK lists that ST-LINK.
+    #[test]
+    fn an_stm32_board_with_a_lamella_native_image_lists_its_st_link() {
+        let bench = [attached(Some("probe:STLINK"), Kind::Probe, (0x0483, 0x374b), "STM32 STLink")];
+        let list = listed(&["--framework", "lamella1.0", "--board", "st-stm32f769i-disco", "--json"], &bench);
+        assert_eq!(ids(&list), ["probe:STLINK"]);
+        assert!(list.devices[0].description.ends_with("deploy as native (AOT)"), "{}", list.devices[0].description);
     }
 
     #[test]

@@ -37,9 +37,6 @@
 
 use core::sync::atomic::{AtomicU32, Ordering};
 
-#[path = "idle_block.rs"]
-pub mod idle_block;
-
 /// Cortex-M SysTick, at its architectural addresses (the same on every profile that has it).
 const SYST_RVR: usize = 0xe000_e014;
 const SYST_CVR: usize = 0xe000_e018;
@@ -262,29 +259,10 @@ const MAX_BLOCK_MS: u64 = 16;
 /// and the sleep returns immediately. The program runs at the wrong speed, which is bad, and it does
 /// so while remaining reachable, which is what makes it recoverable. `Capabilities::MONOTONIC_CLOCK`
 /// is what says which of the two a host is talking to.
-/// # Why it can stop the core rather than spin
-///
-/// This is `ReactorEnv::sleep_millis` on every Cortex-M board in the tree -- the device half of the
-/// runtime's one block point, and the only place a board is ever idle on purpose. Spinning here is
-/// what makes a chip run flat out with nothing to do, so each pass offers the core to
-/// [`super::idle_block::block`] before falling back to the spin.
-///
-/// The offer is declined on a board that has not registered a
-/// [`super::idle_block::WakeSource::Timer`], because a sleep with no way to end it would turn
-/// `Thread.Sleep(100)` into "until something unrelated happens". Such a board spins exactly as it
-/// would without the block point, and a board that registers a timer stops spinning with no change
-/// here.
-///
-/// The spin is also load-bearing beyond burning time: it calls [`now_ms`] repeatedly, which keeps
-/// the SysTick fold live so the counter cannot wrap unobserved. A sleep must therefore stay shorter
-/// than one wrap, which [`MAX_BLOCK_MS`] already guarantees on every board this serves.
 pub fn sleep_ms(millis: u64) {
     if !RUNNING.load(Ordering::Relaxed) {
         return;
     }
-    let slice = millis.min(MAX_BLOCK_MS);
-    let deadline = now_ms().saturating_add(slice);
-    while now_ms() < deadline {
-        let _ = idle_block::block(slice, true);
-    }
+    let deadline = now_ms().saturating_add(millis.min(MAX_BLOCK_MS));
+    while now_ms() < deadline {}
 }

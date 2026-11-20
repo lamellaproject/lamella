@@ -1,0 +1,44 @@
+# BLOCK: the STM32U59x/5Ax reset and clock control, as far as the clock a timer counts before any
+# clock plan has run. Offsets are relative to the RCC instance's base in ../instances.toml; each
+# peripheral's clock gate is stated in that peripheral's own instance row.
+#
+# Every system reset leaves the part on MSIS at 4 MHz, with the AHB and APB1 prescalers dividing by
+# 1. An APB timer's clock is then its bus clock, so a timer on APB1 counts 4 MHz. A program timing
+# anything before a clock plan has run is running at these rates.
+
+[table]
+kind = "block"
+family = "stm32u5a5"
+block = "rcc"
+sources = [
+    "STM32U5 series reference manual RM0456 Rev 7 section 11.4 (RCC clock functional description, page 485): 'The MSIS is used as system clock source after startup from reset, configured at 4 MHz.'",
+    "RM0456 Rev 7 section 11.8.6 (RCC_CFGR1, page 520): address offset 0x01C, reset value 0x0000 0000; SW bits 1:0, '00: MSIS selected as system clock'.",
+    "RM0456 Rev 7 section 11.8.7 (RCC_CFGR2, pages 522 and 523): address offset 0x020, reset value '0x0000 6000 (for STM32U59x/5Ax/5Fx/5Gx)'; HPRE bits 3:0, '0xxx: SYSCLK not divided'; PPRE1 bits 6:4, '0xx: PCLK1 not divided'.",
+    "RM0456 Rev 7 section 11.4.15 (Timer clock, page 500): 'If the APB prescaler equals 1, the timer clock frequencies are set to the APB domain frequency. Otherwise, they are set to twice (x2) the APB domain frequency.'",
+    "RM0456 Rev 7 section 11.3.2 (System reset, page 484): 'A system reset sets all registers to their reset values except the reset flags in RCC_CSR, and the registers in the backup domain.'",
+]
+notes = [
+    "RCC_CFGR2's RESET VALUE DIFFERS BY SUB-GROUP: 0x0000 0000 on the STM32U535/545/575/585 and 0x0000 6000 on this one, whose bits 14:12 reset its DSI PHY prescaler to divide by 8. HPRE and PPRE1 reset to 0 on both.",
+    "AN APB TIMER RUNS AT TWICE ITS BUS CLOCK WHENEVER THAT BUS IS DIVIDED. The rate below holds only while PPRE1 divides by 1, which is its reset value.",
+]
+
+[registers.CFGR1]
+offset = 0x1C
+width = 32
+fields = { SW = [0, 2] }
+notes = "Clock configuration 1. Resets to 0x0000 0000: SW selects MSIS."
+
+[registers.CFGR2]
+offset = 0x20
+width = 32
+fields = { HPRE = [0, 4], PPRE1 = [4, 3] }
+notes = "Clock configuration 2. Resets to 0x0000 6000 on this sub-group: HPRE and PPRE1 divide by 1."
+
+# The clock an APB1 timer counts at reset, stated as its parts and the rate they make: the
+# oscillator, the reset values of the two registers between it and the timer, and the timer clock
+# they leave.
+[constants]
+MSIS_RESET_HZ = 4000000
+CFGR1_RESET = 0x0
+CFGR2_RESET = 0x6000
+APB1_TIMER_RESET_HZ = 4000000

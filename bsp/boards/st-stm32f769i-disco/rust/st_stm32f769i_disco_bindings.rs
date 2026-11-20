@@ -39,7 +39,7 @@ pub const VCP_RX_AFR_MASK: u32 = 0xF00;
 pub const VCP_RX_AFR_VALUE: u32 = 0x700;
 pub const VCP_PCLK_HZ: u32 = 16000000;
 pub const VCP_BRR_115200_HSI_16MHZ: u32 = 0x8B;
-pub const DEVICE_COUNT: u32 = 3;
+pub const DEVICE_COUNT: u32 = 5;
 
 // -- on-board devices: PORT group base + pin index + mask --
 pub const LED0_PORT_BASE: u32 = 0x40022400;
@@ -57,6 +57,14 @@ pub const BUTTON0_PIN: u32 = 0;
 pub const BUTTON0_BANK: u32 = 0;
 pub const BUTTON0_MASK: u32 = 0x1;
 pub const BUTTON0_ACTIVE_LOW: u32 = 0;
+pub const SWDIO_PORT_BASE: u32 = 0x40020000;
+pub const SWDIO_PIN: u32 = 13;
+pub const SWDIO_BANK: u32 = 0;
+pub const SWDIO_MASK: u32 = 0x2000;
+pub const SWCLK_PORT_BASE: u32 = 0x40020000;
+pub const SWCLK_PIN: u32 = 14;
+pub const SWCLK_BANK: u32 = 0;
+pub const SWCLK_MASK: u32 = 0x4000;
 
 /// -- memory regions the board fits: SIZE is what a program may reach, which a device's own
 /// size may exceed; a region with a CONTROLLER does not exist until that instance is brought

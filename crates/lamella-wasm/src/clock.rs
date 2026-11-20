@@ -2,6 +2,10 @@
 
 #[cfg(target_arch = "wasm32")]
 mod imported {
+    // SAFETY: a function the WebAssembly host provides can be declared only in an `unsafe extern`
+    // block. Each is declared `safe`: they take and return integers, so no call can break memory
+    // safety.
+    #[allow(unsafe_code)]
     #[link(wasm_import_module = "lamella_host")]
     unsafe extern "C" {
         pub safe fn now_millis() -> u64;

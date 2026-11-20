@@ -39,6 +39,7 @@ fn read_reg(addr: usize) -> u32 {
 #[path = "rp2350_usb_clocks.rs"]
 mod clocks;
 
+#[cfg(feature = "serve")]
 pub use clocks::CLK_SYS_HZ;
 
 /// The chip's own registers, for the clock sequence.
@@ -53,8 +54,53 @@ impl clocks::Registers for Mmio {
     }
 }
 
-// USBCTRL (28) is hand-coded because the chip's instance rows do not include the USB controller.
-const RESET_USBCTRL: u32 = 1 << 28;
+// ---- leaving the bus before a reset ---------------------------------------------------------------
+// The sequence is rp2350_usb_detach.rs, over a trait for the same reason as the clock tree's: a host
+// test runs it over a model of the registers and of elapsed time.
+
+#[path = "rp2350_usb_detach.rs"]
+mod detach;
+
+use detach::{RESET_USBCTRL, SIE_CTRL, SIE_CTRL_PULLUP_EN};
+
+impl detach::Board for Mmio {
+    fn read(&mut self, address: usize) -> u32 {
+        read_reg(address)
+    }
+    fn write(&mut self, address: usize, value: u32) {
+        write_reg(address, value);
+    }
+    fn wait_at_least_us(&mut self, micros: u32) {
+        // Each pass takes at least one cycle and clk_sys runs at most CLK_SYS_HZ, so the passes take
+        // at least `micros`; a slower clk_sys only lengthens the wait.
+        let passes = u64::from(micros) * u64::from(clocks::CLK_SYS_HZ / 1_000_000);
+        for _ in 0..passes {
+            unsafe { core::arch::asm!("nop", options(nomem, nostack, preserves_flags)) };
+        }
+    }
+}
+
+/// Takes the board off the USB bus for [`detach::HOLD_US`] if it is on it, then resets the
+/// processors with SYSRESETREQ: the host sees the board leave, and enumerates it again when the next
+/// boot's [`UsbBus`] attaches. Every reset the firmware makes for itself goes through here.
+pub fn detach_and_reset() -> ! {
+    detach::detach_and_reset(&mut Mmio);
+    loop {}
+}
+
+/// Takes the board off the USB bus and holds it off for [`detach::HOLD_US`] whenever a reset left the
+/// USB controller out of reset -- a reset of the processors alone, the firmware's own or a debug
+/// probe's, or one that cut an earlier hold short -- so the host sees the board go and enumerates it
+/// again when [`UsbBus`] attaches. An image that serves over USB calls it first in its boot: before
+/// its clocks change, so no clock changes while the controller is attached (the workaround for
+/// erratum RP2350-E12 runs clk_sys at least 10 % faster than clk_usb while the controller is in use,
+/// in the RP2350 datasheet of build-version d126e9e), and whether or not its clocks then come up. A
+/// power-on or any chip-level reset leaves the controller held in reset: each chip-level reset of
+/// Table 528 restarts the power-on state machine (7.3.1), which leaves every subsystem's reset
+/// asserted (7.4.1) until software releases it (7.5.1). Then this reads one register and returns.
+pub fn detach_at_boot() {
+    detach::detach(&mut Mmio);
+}
 
 /// Pulse a RESETS bit with both edges confirmed, on the chip's registers.
 fn reset_cycle(reset_bit: u32) {
@@ -105,7 +151,6 @@ const REGS_CLR: usize = REGS + 0x3000;
 
 const ADDR_ENDP: usize = REGS + 0x00;
 const MAIN_CTRL: usize = REGS + 0x40;
-const SIE_CTRL: usize = REGS + 0x4c;
 const SIE_STATUS: usize = REGS + 0x50;
 const BUFF_STATUS: usize = REGS + 0x58;
 const EP_STALL_ARM: usize = REGS + 0x68;
@@ -114,7 +159,6 @@ const USB_PWR: usize = REGS + 0x78;
 
 const MAIN_CTRL_CONTROLLER_EN: u32 = 1 << 0; // written alone it also clears PHY_ISO (bit 2)
 const SIE_CTRL_EP0_INT_1BUF: u32 = 1 << 29; // EP0 completions appear in BUFF_STATUS
-const SIE_CTRL_PULLUP_EN: u32 = 1 << 16; // present as a Full Speed device
 const SIE_STATUS_DATA_SEQ_ERROR: u32 = 1 << 31;
 const SIE_STATUS_ACK_REC: u32 = 1 << 30;
 const SIE_STATUS_RX_TIMEOUT: u32 = 1 << 27;
@@ -392,6 +436,8 @@ impl usb_device::bus::UsbBus for UsbBus {
     }
 
     fn enable(&mut self) {
+        // A controller a reset left out of reset has been off the bus for the hold since early in the
+        // boot ([`detach_at_boot`]), so the host saw the device go before it attaches again here.
         // Reset-cycle the controller (both edges confirmed -- see reset_cycle); the DPRAM is
         // only accessible out of reset.
         reset_cycle(RESET_USBCTRL);

@@ -4,15 +4,24 @@
 /// Called for every console write, with the UTF-16 units of that write.
 #[cfg(target_arch = "wasm32")]
 mod imported {
+    // SAFETY: a function the WebAssembly host provides can be declared only in an `unsafe extern`
+    // block. `write_stdout` reads `len` UTF-16 units at `ptr`, so it is unsafe to call: the caller
+    // is the one that knows the range is valid.
+    #[allow(unsafe_code)]
     #[link(wasm_import_module = "lamella_host")]
     unsafe extern "C" {
-        pub safe fn write_stdout(ptr: *const u16, len: usize);
+        pub fn write_stdout(ptr: *const u16, len: usize);
     }
 }
 
 #[cfg(target_arch = "wasm32")]
 fn tap(chars: &[u16]) {
-    imported::write_stdout(chars.as_ptr(), chars.len());
+    // SAFETY: `chars` is a live slice for the whole call, so `len` units at `ptr` are valid to read,
+    // and the host reads them and returns before this function does.
+    #[allow(unsafe_code)]
+    unsafe {
+        imported::write_stdout(chars.as_ptr(), chars.len());
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]

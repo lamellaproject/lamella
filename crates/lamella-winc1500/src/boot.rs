@@ -24,9 +24,12 @@ pub const WAIT_FOR_HOST: u32 = 0x207bc;
 /// `BOOTROM_REG`: the boot ROM's ready marker, then the host's firmware-start command.
 pub const BOOTROM: u32 = 0xc000c;
 
-pub const FINISH_BOOT_ROM: u32 = 0x10ad_d09e;
-pub const START_FIRMWARE: u32 = 0xef52_2f61;
-pub const FINISH_INIT_STATE: u32 = 0x0253_2636;
+/// The boot ROM's ready marker, read from [`BOOTROM`].
+const FINISH_BOOT_ROM: u32 = 0x10ad_d09e;
+/// The command that starts the firmware, written to [`BOOTROM`].
+const START_FIRMWARE: u32 = 0xef52_2f61;
+/// The firmware's init-done marker, read from [`NMI_STATE`].
+const FINISH_INIT_STATE: u32 = 0x0253_2636;
 
 const HAVE_USE_PMU_BIT: u32 = 1 << 1;
 const HAVE_RESERVED1_BIT: u32 = 1 << 8;
@@ -67,11 +70,22 @@ impl FirmwareVersion {
 /// A boot failure: a bus error, or a poll that exhausted its budget (naming the wait).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BootError {
+    /// A register access failed on the SPI link.
     Spi(SpiError),
+    /// The module never reported its eFuses loaded ([`EFUSE_STATUS`] bit 31).
     EfuseTimeout,
-    BootRomTimeout { last: u32 },
+    /// The boot ROM never posted its ready marker in [`BOOTROM`].
+    BootRomTimeout {
+        /// The last value read from [`BOOTROM`].
+        last: u32,
+    },
+    /// The chip configuration word written to [`NMI_GP_REG_1`] never read back as written.
     ConfigReadbackTimeout,
-    FirmwareStartTimeout { last: u32 },
+    /// The firmware never posted its init-done marker in [`NMI_STATE`] after the start command.
+    FirmwareStartTimeout {
+        /// The last value read from [`NMI_STATE`].
+        last: u32,
+    },
 }
 
 impl From<SpiError> for BootError {
@@ -83,7 +97,9 @@ impl From<SpiError> for BootError {
 /// 32-bit module-register access -- what the boot sequence actually needs, so it can be driven
 /// by the real [`Link`] or a scripted fake in tests.
 pub trait Registers {
+    /// Reads the 32-bit module register at `addr`.
     fn read_reg(&mut self, addr: u32) -> Result<u32, SpiError>;
+    /// Writes `value` to the 32-bit module register at `addr`.
     fn write_reg(&mut self, addr: u32, value: u32) -> Result<(), SpiError>;
 }
 

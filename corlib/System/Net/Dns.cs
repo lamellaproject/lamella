@@ -46,7 +46,7 @@ namespace System.Net
             {
                 byte[] octets = new byte[lengths[i]];
                 for (int j = 0; j < lengths[i]; j++) octets[j] = buffer[i * 16 + j];
-                result[i] = new IPAddress(octets);
+                result[i] = IPAddress.FromOwnedOctets(octets);
             }
             return result;
         }

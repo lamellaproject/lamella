@@ -77,7 +77,143 @@ kind = "gpio-in"
 pin = "PC13"
 active = "high"
 pull = "down"
+input_only = true            # a program's GPIO controller refuses to make PC13 an output: the warning below
 source = "UM2861 Rev 10 (MB1549) section 7.6 Push-buttons: the blue button for the user and wakeup functions is connected to PC13 to support the default TAMPER function, with SB58 ON and SB59 OFF as the default configuration; SB58 OFF and SB59 ON moves it to PA0 instead. The same section states that when the button is pressed the logic state is HIGH, otherwise the logic state is LOW. That section also carries a warning this row exists to carry with the pin: the PC13 I/O used for the user button must be set to INPUT, pulldown (PD) with debouncing, and PC13 must never be set to OUTPUT/LOW level, to avoid a shortcut when the user button is pressed."
+
+# --- the debug link ---------------------------------------------------------------------------
+#
+# The on-board debugger reaches the part over SWD on PA13 and PA14. Both lines are kept from a
+# program's GPIO controller: reconfiguring either would end a debug session, and with it the
+# output of a program whose console the debugger reads.
+
+[[devices]]
+name = "swdio"
+pin = "PA13"
+active = "none"
+reserved = true
+source = "MB1549 schematic rev C04 sheet 3 (STM32_microcontroller_IOs): T_SWDIO on PA13, pin 105; sheet 8 (STLINK_V3E): the STLINK-V3E's T_SWDIO port is PA13."
+
+[[devices]]
+name = "swclk"
+pin = "PA14"
+active = "none"
+reserved = true
+source = "MB1549 schematic rev C04 sheet 3: T_SWCLK on PA14, pin 109; sheet 8: the STLINK-V3E's T_SWCLK port is PA14."
+
+# --- the expansion socket -----------------------------------------------------------------------
+#
+# The Zio connectors CN7, CN8, CN9 and CN10 carry an ARDUINO Uno V3 socket among their other
+# positions. The socket is board truth and what is plugged into it is not, so the socket is stated
+# here and no row names a shield.
+#
+# Every position below is a single line, named for the hole a shield plugs into and carrying the
+# pin behind it. The manual marks D0/D1 as LPUART1, D11/D12/D13 as SPI1 and D14/D15 as I2C1, and
+# this board binds none of those instances, so a program reaching one of these positions drives it
+# as a port pin. When one is bound, the positions it covers leave this list and the socket names
+# the binding's role instead, as the STM32F746G-DISCO's socket names its I2C pair.
+#
+# What the manual's footnotes add, which no row states:
+# - D0 and D1, on PG8 and PG7, are in the PG2-PG15 range this part supplies from its VDDIO2 rail,
+#   so their I/O level can differ from the rest of the socket's.
+# - A1 and A3, on PA2 and PB0, are also the OCTOSPI interface's CS and IO1 (CN10's D26 and D29),
+#   and a pad serves one or the other.
+# - D10, on PD14, is the SPI chip select by way of a plain I/O: the part cannot route the SPI's own
+#   NSS to that pad.
+
+[[connectors]]
+name = "arduino"
+standard = "arduino-uno-v3"
+source = "UM2861 Rev 10 section 8.1 (page 33): the Zio connectors CN7, CN8, CN9 and CN10 are female connectors supporting the ARDUINO Uno V3 standard. Table 15 (CN7, page 34) gives D8 = PF12, D9 = PD15, D10 = PD14, D11 = PA7, D12 = PA6, D13 = PA5, D14 = PB9 and D15 = PB8. Table 17 (CN9, page 35) gives A0 = PA3, A1 = PA2, A2 = PC3, A3 = PB0, A4 = PC1 and A5 = PC0. Table 18 (CN10, page 35) gives D0 = PG8, D1 = PG7, D2 = PF15, D3 = PE13, D4 = PF14, D5 = PE11, D6 = PE9 and D7 = PF13. Their footnotes: the default configuration for D0/D1 is LPUART1 on PG7 and PG8, while USART1 on PA9 and PA10 is connected to the STLINK-V3E (page 35); PG2 to PG15 can have a different I/O level from other I/Os (page 36); A1 and A3 are I/O shared between ADC and OCTOSPI, exclusive (page 36); and D10 does its chip selection with an I/O function, since SPI_NSS is not available as an alternate on that I/O (page 34)."
+
+# The analog positions, A0 to A5.
+[[connectors.arduino.pins]]
+signal = "a0"
+pin = "PA3"
+
+[[connectors.arduino.pins]]
+signal = "a1"
+pin = "PA2"
+
+[[connectors.arduino.pins]]
+signal = "a2"
+pin = "PC3"
+
+[[connectors.arduino.pins]]
+signal = "a3"
+pin = "PB0"
+
+[[connectors.arduino.pins]]
+signal = "a4"
+pin = "PC1"
+
+[[connectors.arduino.pins]]
+signal = "a5"
+pin = "PC0"
+
+# The digital positions, D0 to D15.
+[[connectors.arduino.pins]]
+signal = "d0"
+pin = "PG8"
+
+[[connectors.arduino.pins]]
+signal = "d1"
+pin = "PG7"
+
+[[connectors.arduino.pins]]
+signal = "d2"
+pin = "PF15"
+
+[[connectors.arduino.pins]]
+signal = "d3"
+pin = "PE13"
+
+[[connectors.arduino.pins]]
+signal = "d4"
+pin = "PF14"
+
+[[connectors.arduino.pins]]
+signal = "d5"
+pin = "PE11"
+
+[[connectors.arduino.pins]]
+signal = "d6"
+pin = "PE9"
+
+[[connectors.arduino.pins]]
+signal = "d7"
+pin = "PF13"
+
+[[connectors.arduino.pins]]
+signal = "d8"
+pin = "PF12"
+
+[[connectors.arduino.pins]]
+signal = "d9"
+pin = "PD15"
+
+[[connectors.arduino.pins]]
+signal = "d10"
+pin = "PD14"
+
+[[connectors.arduino.pins]]
+signal = "d11"
+pin = "PA7"
+
+[[connectors.arduino.pins]]
+signal = "d12"
+pin = "PA6"
+
+[[connectors.arduino.pins]]
+signal = "d13"
+pin = "PA5"
+
+[[connectors.arduino.pins]]
+signal = "d14"
+pin = "PB9"
+
+[[connectors.arduino.pins]]
+signal = "d15"
+pin = "PB8"
 
 [debug]
 signals = []

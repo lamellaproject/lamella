@@ -6,12 +6,13 @@ use crate::hif::{self, HifError, ModuleBus};
 
 /// `tenuM2mConfigCmd` (base 1).
 pub const REQ_SCAN: u8 = 16;
-pub const RESP_SCAN_DONE: u8 = 17;
-pub const REQ_SCAN_RESULT: u8 = 18;
-pub const RESP_SCAN_RESULT: u8 = 19;
+const RESP_SCAN_DONE: u8 = 17;
+const REQ_SCAN_RESULT: u8 = 18;
+const RESP_SCAN_RESULT: u8 = 19;
 /// `tenuM2mStaCmd` (base 40).
 pub const REQ_CONNECT: u8 = 40;
-pub const RESP_CON_STATE_CHANGED: u8 = 44;
+/// The firmware's notice that the connection state changed.
+pub(crate) const RESP_CON_STATE_CHANGED: u8 = 44;
 /// Doubles as the firmware's DHCP-lease notification to the host.
 pub const REQ_DHCP_CONF: u8 = 50;
 /// The firmware's DHCP-timeout notification (no payload); the firmware disconnects after it.
@@ -21,41 +22,75 @@ pub const REQ_DHCP_FAILURE: u8 = 61;
 pub const CHANNEL_ALL: u8 = 255;
 /// `tenuM2mSecType`: WPA/WPA2 personal (passphrase).
 pub const SEC_WPA_PSK: u8 = 2;
-pub const SEC_OPEN: u8 = 1;
+const SEC_OPEN: u8 = 1;
 
-pub const MAX_SSID: usize = 32;
-pub const MAX_PSK: usize = 63;
+const MAX_SSID: usize = 32;
+const MAX_PSK: usize = 63;
 
 /// A decoded Wi-Fi group event.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WifiEvent {
     /// The scan pass finished: `count` results are fetchable by index.
-    ScanDone { count: u8, state: i8 },
+    ScanDone {
+        /// How many results the scan found.
+        count: u8,
+        /// The firmware's scan state (`tstrM2mScanDone`'s `s8ScanState`).
+        state: i8,
+    },
     /// One scan result (request one at a time by index).
     ScanResult(ScanResult),
     /// Connection state changed: `connected` per `tenuM2mConnState` (1 = connected), with the
     /// firmware's error code on disconnect.
-    Connection { connected: bool, error: u8 },
+    Connection {
+        /// Whether the module is now connected.
+        connected: bool,
+        /// The firmware's error code, when the change is a disconnect.
+        error: u8,
+    },
     /// The DHCP lease (all fields in network byte order on the wire, decoded here to octets).
-    IpLease { ip: [u8; 4], gateway: [u8; 4], dns: [u8; 4], subnet: [u8; 4], lease_seconds: u32 },
+    IpLease {
+        /// The address the module was given.
+        ip: [u8; 4],
+        /// The gateway's address.
+        gateway: [u8; 4],
+        /// The DNS server's address.
+        dns: [u8; 4],
+        /// The subnet mask.
+        subnet: [u8; 4],
+        /// How long the lease lasts, in seconds.
+        lease_seconds: u32,
+    },
     /// DHCP did not complete; the firmware drops the association after this.
     DhcpFailure,
     /// A message this layer does not decode (another group, or an unhandled opcode).
-    Other { group: u8, opcode: u8, length: u16 },
+    Other {
+        /// The message's request group.
+        group: u8,
+        /// The message's opcode within its group.
+        opcode: u8,
+        /// The message's length in bytes, its header included.
+        length: u16,
+    },
 }
 
 /// One access point from the scan list (`tstrM2mWifiscanResult`, 44 bytes).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanResult {
+    /// The result's index in the scan list.
     pub index: u8,
+    /// The access point's received signal strength, in dBm.
     pub rssi: i8,
+    /// The access point's security type (`tenuM2mSecType`).
     pub auth: u8,
+    /// The RF channel the access point is on.
     pub channel: u8,
+    /// The access point's BSSID.
     pub bssid: [u8; 6],
     ssid: [u8; 33],
 }
 
 impl ScanResult {
+    /// The access point's network name, or `<non-utf8>` when its bytes are not UTF-8.
     pub fn ssid(&self) -> &str {
         let end = self.ssid.iter().position(|&b| b == 0).unwrap_or(self.ssid.len());
         core::str::from_utf8(&self.ssid[..end]).unwrap_or("<non-utf8>")
@@ -65,8 +100,11 @@ impl ScanResult {
 /// A connect-request build failure.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WifiError {
+    /// Sending the request failed.
     Hif(HifError),
+    /// The network name is longer than 32 bytes.
     SsidTooLong,
+    /// The passphrase is shorter than 8 bytes or longer than 63.
     PskLength,
 }
 

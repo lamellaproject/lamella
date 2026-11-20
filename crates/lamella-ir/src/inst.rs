@@ -581,6 +581,29 @@ pub enum Inst {
         /// answers null rather than dereferencing).
         descriptor: ValueId,
     },
+    /// The `System.Type` object of `descriptor`'s type, as a reference -- what `typeof(T)` and
+    /// `Object.GetType()` answer. 0 (null) for a 0 descriptor.
+    ///
+    /// Every descriptor carries its own read-only `Type` object, laid right after the NAME word that
+    /// [`Inst::TypeName`] reads: a header word naming `System.Type`'s descriptor, then one payload word
+    /// holding this descriptor's address relative to the object. So this walks to the name word by the
+    /// same arithmetic -- `desc + 16 + nrefs * 4` to the itable for a class, the fixed array offset for an
+    /// array, `+ 4 + 8 * count` past it -- and answers the address 8 bytes on, where the object's
+    /// payload starts (its header is at `object - 4`, as every object's is).
+    ///
+    /// ONE OBJECT PER TYPE where the descriptor is canonical per type -- a class, a struct, a constructed
+    /// generic type -- so `typeof(T) == typeof(T)` and `a.GetType() == typeof(T)` stay pointer compares:
+    /// there is one `System.Type` object for any given type (ECMA-334 4th ed, 14.5.11), and two objects
+    /// of identical run-time types answer `Type`s that `ReferenceEquals` (ECMA-335 4th ed, IV.5.3, the
+    /// library XML's `System.Object.GetType`). An ARRAY's descriptor
+    /// is laid by each assembly that allocates it, so it is not canonical, and the backend never answers
+    /// an array's `Type` (its `GetType()` traps). A virtual call on the object dispatches through
+    /// `System.Type`'s vtable like any object's. A descriptor is not an object itself -- its word before
+    /// is a vtable slot, not a header -- which is why it cannot be the `Type`.
+    TypeObject {
+        /// The TypeDesc address (from [`Inst::LoadTypeDesc`] or [`Inst::TypeDescAddr`]; 0 answers null).
+        descriptor: ValueId,
+    },
     /// A dynamic-object operation from Python's abstract object protocol -- the `op`-selected
     /// operation over `args` (receiver-first). Lowers to a call into the Python runtime-support
     /// library at a backend-threaded entry point (the [`Inst::Alloc`]/`lamella_gc_alloc` pattern),

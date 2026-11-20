@@ -74,7 +74,8 @@ pub enum CredentialSource {
     Program = 1,
     /// The network stored on the board.
     StoredRecord = 2,
-    /// The network named when the firmware was built, which only a development build carries.
+    /// A network named when the firmware was built. No firmware names one, so none reports this source;
+    /// the number is `Lamella.Net.WiFi.WiFiCredentialSource.BuildTime`'s.
     BuildTime = 3,
 }
 

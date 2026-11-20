@@ -189,7 +189,9 @@ impl Board {
     /// The board's RESETS `(clear-alias, done)` register pair, or `None` when the board has no such
     /// block. The host sim accumulates writes to the clear-alias and reflects them in the done
     /// register, so peripherals sharing one done register each observe their own bit cleared. (The
-    /// ESP32-C6 clocks/resets through PCR, not a RESETS block, so it has no pair.)
+    /// ESP32-C6 clocks/resets through PCR, not a RESETS block, so it has no pair.) Only the sim reads
+    /// it, so it is compiled only off the device.
+    #[cfg(not(target_os = "none"))]
     pub(crate) fn reset_regs(self) -> Option<(u32, u32)> {
         match self {
             Board::Rp2350 => Some((0x4002_3000, 0x4002_0008)),

@@ -2652,25 +2652,17 @@ impl Module {
     }
 }
 
-/// Set in a container's version word when the payload is a [`Bundle`] rather than a bare [`Module`],
-/// leaving the low 15 bits to carry [`FORMAT_VERSION`]. One word still says both things, so a reader
-/// tells the two containers apart exactly as before.
-const BUNDLE_KIND_BIT: u16 = 0x8000;
-
-/// The binary format version of a [`Bundle`] container -- a program's entry module plus its
-/// importable managed (Python-authored) modules.
+/// The format number of a [`Bundle`] container -- a program's entry module plus its importable
+/// managed (Python-authored) modules: the one tag a bundle carries after [`MAGIC`], the format a board
+/// that runs Python states in its handshake, and what a reader compares for strict equality.
 ///
-/// It is DERIVED from [`FORMAT_VERSION`] rather than chosen, and that is the whole point. A bundle's
-/// entry and modules are written by the same writer a bare module uses, so [`FORMAT_VERSION`] is what
-/// identifies the layout of a bundle's payload. While the two numbers were independent, nothing made
-/// anyone move this one when that one moved -- and nothing did: the module layout advanced through
-/// several byte-level changes while this stayed put, so a bundle declared a version that described
-/// its container and said nothing about its contents. A reader compares for strict equality precisely
-/// to refuse a stale payload, and on the bundle path there was no number for it to refuse.
+/// A format number is [`lamella_wire::image_format`]'s: the pre-release flag and a count. This is the
+/// first pre-release bundle format.
 ///
-/// Deriving it closes that by construction rather than by remembering: a bump to [`FORMAT_VERSION`]
-/// moves this in the same edit, and the two cannot drift apart again.
-pub const BUNDLE_FORMAT_VERSION: u16 = FORMAT_VERSION | BUNDLE_KIND_BIT;
+/// A bundle's entry and modules are written by the writer a bare module uses, so a change to the
+/// layout [`FORMAT_VERSION`] names is a change to this format too, and takes the next number: a test
+/// pins the two numbers together, so neither moves without the other being decided.
+pub const BUNDLE_FORMAT_VERSION: u16 = lamella_wire::image_format::PRE_RELEASE | 1;
 
 /// Whether `prefix` opens a [`Bundle`] container this build can decode -- the [`MAGIC`] and the
 /// version word, and deliberately nothing past them.
@@ -2682,7 +2674,7 @@ pub const BUNDLE_FORMAT_VERSION: u16 = FORMAT_VERSION | BUNDLE_KIND_BIT;
 /// opening bytes, ahead of the erase, rather than by [`Bundle::decode`] once the transfer lands.
 ///
 /// **A bare [`Module`] is refused, and that case is the reason the magic alone will not do:** the
-/// two containers share [`MAGIC`] and are told apart only by the kind bit in the version word, so a
+/// two containers share [`MAGIC`] and are told apart only by their version words, so a
 /// check that stopped at the magic would accept the likeliest wrong payload there is.
 ///
 /// This is not a validity check and does not stand in for [`Bundle::decode`]: it reads the header
@@ -3506,25 +3498,25 @@ mod tests {
         );
     }
 
-    /// The payload of both containers is written by one function, so a bundle has to declare the
-    /// layout version of what it embeds. This asserts the DERIVATION rather than a literal, because a
-    /// literal is what let the two drift in the first place: a test naming today's number passes
-    /// forever while `FORMAT_VERSION` walks away from it.
+    /// The payload of both containers is written by one function, so a change to the module layout
+    /// is a change to the bundle format. The two numbers are pinned as a PAIR: a literal on one side
+    /// alone is what once let them drift, a bundle number passing forever while `FORMAT_VERSION`
+    /// walked away from it, and a pair fails the moment either moves.
     #[test]
-    fn a_bundle_version_carries_the_module_layout_version_it_embeds() {
+    fn the_bundle_format_moves_with_the_module_layout_it_embeds() {
         assert_eq!(
-            BUNDLE_FORMAT_VERSION & !BUNDLE_KIND_BIT,
-            FORMAT_VERSION,
-            "a bundle must declare the layout version of the module content it carries"
+            (FORMAT_VERSION, BUNDLE_FORMAT_VERSION),
+            (31, lamella_wire::image_format::PRE_RELEASE | 1),
+            "the module layout and the bundle format moved apart: a change to FORMAT_VERSION's layout \
+             gives BUNDLE_FORMAT_VERSION the next pre-release number, and this pair is pinned again"
         );
         assert_ne!(
             BUNDLE_FORMAT_VERSION, FORMAT_VERSION,
             "the two containers must still be distinguishable by their version word alone"
         );
-        assert_eq!(
-            FORMAT_VERSION & BUNDLE_KIND_BIT,
-            0,
-            "the kind bit must stay outside the range the layout version can reach"
+        assert!(
+            BUNDLE_FORMAT_VERSION & lamella_wire::image_format::PRE_RELEASE != 0,
+            "a bundle format before the production release is a pre-release one"
         );
     }
 

@@ -10,11 +10,11 @@ publish = false
 
 [dependencies]
 lamella-cil-runtime = { path = "../lamella-cil-runtime", default-features = false }
-# The firmware's Lamella Link side: the framed protocol and the baked-image runner core.
+# The firmware's Lamella Link side: the framed protocol, and the runner: its baked-image core for the
+# C# firmware (`serve` turns it on), and the output splitting every firmware that streams output
+# shares.
 lamella-wire = { path = "../lamella-wire", optional = true }
-lamella-runner = { path = "../lamella-runner", optional = true, default-features = false, features = [
-    "baked-image",
-] }
+lamella-runner = { path = "../lamella-runner", optional = true, default-features = false }
 # The reclaiming O(1) segregated global allocator: deployed apps run unbounded, and the M33
 # has the atomic CAS its spin lock needs. Pulled by the `rp2350` part feature.
 lamella-heap = { path = "../lamella-heap", optional = true }
@@ -62,6 +62,9 @@ lamella-tls-roots = { path = "../lamella-tls-roots", optional = true }
 # image carries is named by a recipe rather than inherited -- see the `python-float` feature.
 lamella-py-runtime = { path = "../lamella-py-runtime", optional = true, default-features = false }
 
+[dev-dependencies]
+lamella-py-frontend = { path = "../lamella-py-frontend" }
+
 [features]
 # A debugging aid, off by default: mirror every console byte into a RAM buffer so a debug probe
 # can read what the board printed when the UART cannot be read. Costs a 4 KiB static and one call
@@ -77,7 +80,13 @@ arena-trace = []
 # for a board other than the Pico 2 and Pico 2 W, that board's feature (the boards are below) --
 # e.g. `serve,rp2350` (Pico 2), `serve,rp2350,usb,cyw43` (Pico 2 W) or
 # `serve,rp2350,usb,pico-lipo-2` (Pico LiPo 2).
-serve = ["dep:lamella-wire", "dep:lamella-runner", "dep:critical-section", "dep:lamella-pin-events"]
+serve = [
+    "dep:lamella-wire",
+    "dep:lamella-runner",
+    "lamella-runner/baked-image",
+    "dep:critical-section",
+    "dep:lamella-pin-events",
+]
 # The RP2350 part (Cortex-M33 / ARMv8-M, 520 KB SRAM; XIP flash on the board, 4 MB on the Pico 2
 # and Pico 2 W, 8 MB on the two Feathers and 16 MB on the other boards): a firmware build takes the
 # runner's full profile and the reclaiming heap.
@@ -187,6 +196,12 @@ i2c-scan = []
 # bundle the host compiled and prints what the program prints. Combine with the part --
 # `python,rp2350`.
 python = ["dep:lamella-py-runtime", "python-gc-engine", "dep:lamella-heap"]
+# The Python firmware takes its program from the lamella CLI over the board's own USB port, as the
+# C# firmware does: `lamella run program.py --device` stores the program in the board's flash, runs it
+# and shows its output, and the board runs it again at each reset. Combine with the part -- e.g.
+# `python-serve,rp2350` (Pico 2) or `python-serve,python-net,rp2350` (Pico 2 W) (hygiene-allow: a cargo feature, not a crate).
+# The build refuses it beside `serve`: the two are different firmware.
+python-serve = ["python", "usb", "dep:lamella-wire", "dep:lamella-runner"]
 # Python over the Pico 2 W's wireless: `socket` on the CYW43439's ethernet data channel, through
 # the same `lamella-net-smoltcp` mapping of the same `lamella-net-core` seam that carries the C#
 # evaluations on this board and Python on the SAM E54's wired GMAC. Three consumers, one seam --

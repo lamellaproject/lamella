@@ -4,9 +4,12 @@
 reproduces what it refers to as well, however deeply nested, and terminates on a structure that
 refers back to itself.
 
-An object can decide for itself by defining `__copy__` or `__deepcopy__`. Otherwise a class
-instance is rebuilt the way the language rebuilds one: allocated without running its initializer,
-then given the state `__getstate__` reports, through `__setstate__` when the class defines one.
+An object can customize copying with `__copy__` or `__deepcopy__` (Python 3.14 Library Reference,
+copy). This module rebuilds other class instances through `__new__` and the state protocol
+described by the Python 3.14 Library Reference, pickle, `object.__getstate__` and
+`object.__setstate__`. Exceptions are rebuilt by calling their class with stored constructor
+arguments before restoring state; those arguments are described by the Python 3.14 Library
+Reference, Built-in Exceptions, BaseException.args.
 """
 
 
@@ -32,8 +35,9 @@ def _cannot(x):
 def _rebuild(x, memo):
     """A fresh instance of `x`'s class carrying `x`'s state -- deeply when `memo` is not None.
 
-    The state protocol, not the initializer: an initializer takes constructor arguments, which a
-    copy does not have, and re-running one would repeat whatever else it does.
+    Ordinary instances use the state protocol (Python 3.14 Library Reference, pickle,
+    `object.__getstate__` and `object.__setstate__`). Exceptions instead supply stored args to
+    their constructor (Python 3.14 Library Reference, Built-in Exceptions, BaseException.args).
     """
     for name in ("__reduce_ex__", "__reduce__", "__getnewargs_ex__", "__getnewargs__"):
         if getattr(x, name, None) is not None:
@@ -42,7 +46,17 @@ def _rebuild(x, memo):
                 "__deepcopy__ on " + type(x).__name__ + " instead"
             )
     cls = type(x)
-    made = cls.__new__(cls)
+    if isinstance(x, BaseException):
+        # Use the stored constructor arguments, even when a subclass shadows args. The constructor
+        # supplies the new exception's code, then the instance dictionary is restored below.
+        # Python 3.14 Library Reference, pickle, object.__reduce__, describes reconstruction from
+        # a callable, its arguments and state; Built-in Exceptions, BaseException.args, names args.
+        args = BaseException.args.__get__(x)
+        if memo is not None:
+            args = deepcopy(args, memo)
+        made = cls(*args)
+    else:
+        made = cls.__new__(cls)
     if memo is not None:
         memo[id(x)] = made
     state = x.__getstate__()
@@ -80,8 +94,9 @@ def copy(x):
         return x.copy()
     if getattr(x, "__getstate__", None) is not None:
         return _rebuild(x, None)
-    if callable(x):
-        # A function, a built-in or a bound method: named, not built, so a copy of one is itself.
+    if callable(x) or _by_reference(x):
+        # A function, a built-in, a bound method or a member descriptor: named, not built, so a copy
+        # of one is itself.
         return x
     raise _cannot(x)
 
@@ -161,9 +176,18 @@ def deepcopy(x, memo=None):
         return made
     if getattr(x, "__getstate__", None) is not None:
         return _rebuild(x, memo)
-    if callable(x):
+    if callable(x) or _by_reference(x):
         return x
     raise _cannot(x)
+
+
+def _by_reference(x):
+    """Whether `x` is a native member descriptor that this module copies by identity.
+
+    The Python 3.14 Library Reference, copy, points to the pickle reduction protocol
+    (object.__reduce__). This predicate selects the descriptors returned without rebuilding.
+    """
+    return type(x) is type(SystemExit.code)
 
 
 def _has_copy_method(x):

@@ -9,12 +9,22 @@ const FLASH_ORIGIN: usize = 0x1000_0000;
 fn main() {
     println!("cargo:rerun-if-changed=memory-rp2350.x");
     println!("cargo:rerun-if-changed=src/rp2350_flash.rs");
+    println!("cargo:rerun-if-changed=src/rp2350_settings.rs");
+    let serves_csharp = std::env::var_os("CARGO_FEATURE_SERVE").is_some();
+    let serves_python = std::env::var_os("CARGO_FEATURE_PYTHON_SERVE").is_some();
+    assert!(
+        !(serves_csharp && serves_python),
+        "`serve` builds the C# firmware and `python-serve` the Python one, so give one of them"
+    );
+    // The target this firmware is built for, which a Python serve's HELLO names.
+    println!("cargo:rustc-env=LAMELLA_TARGET_TRIPLE={}", std::env::var("TARGET").expect("TARGET"));
     let board = board();
     let facts = board_facts(board);
     check_psram(board, &facts);
     let whole_flash_bytes = board_flash_bytes(board, &facts);
-    // `rp2350_flash.rs` includes this for `FLASH_END`, so the deploy window runs to the end of
-    // the flash this board solders rather than to one board's figure written down for all of them.
+    // `rp2350_settings.rs` includes this for `FLASH_END`, so the board's settings and the deploy
+    // window below them end where the flash this board solders ends, rather than at one board's
+    // figure written down for all of them.
     let generated =
         std::path::Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("board_flash.rs");
     std::fs::write(
@@ -30,16 +40,19 @@ fn main() {
         // 4 KB (the bootrom scans for it; no stage-2 boot2 on this part, unlike the RP2040).
         //
         // The length is not the part's flash: it is how much of it this firmware may occupy.
-        // A firmware built with `serve` shares the part with the deployed-image region and is
-        // bounded by that region's base, so an oversized one fails at link time instead of
-        // linking cleanly and being silently overwritten by the first deploy. A firmware that
-        // takes no deploys never writes that region and owns the board's whole flash.
-        // Keyed on `serve` rather than on the other bins' features so that a build carrying
-        // both takes the safe bound -- the deploy region is live whenever `serve` is.
-        let length = if std::env::var("CARGO_FEATURE_SERVE").is_ok() {
+        // A firmware built with `serve` or `python-serve` (hygiene-allow: a cargo feature, not a crate)
+        // shares the part with the deployed-program region and is bounded by that region's base, so
+        // an oversized one fails at link time instead of linking cleanly and being silently
+        // overwritten by the first deploy. A firmware
+        // that takes no deploys never writes that region, and owns the board's flash up to its
+        // settings: those belong to the board, which keeps its stored Wi-Fi network there across
+        // firmware updates, so an image written over them would erase it.
+        // Keyed on the features that take deploys rather than on the bins', so that a build
+        // carrying another bin too takes the safe bound -- the region is live whenever one is.
+        let length = if serves_csharp || serves_python {
             deploy_region_base(whole_flash_bytes) - FLASH_ORIGIN
         } else {
-            whole_flash_bytes
+            whole_flash_bytes - settings_bytes()
         };
 
         let template = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("memory-rp2350.x");
@@ -144,7 +157,7 @@ fn embed_python_heap_size() {
             })
         });
     let out = std::path::Path::new(&std::env::var("OUT_DIR").expect("OUT_DIR")).join("py_heap.rs");
-    std::fs::write(&out, format!("const PY_HEAP_BYTES: usize = {bytes};\n"))
+    std::fs::write(&out, format!("pub(crate) const PY_HEAP_BYTES: usize = {bytes};\n"))
         .expect("write the heap-size constant");
 }
 
@@ -192,6 +205,35 @@ fn deploy_region_base(whole_flash_bytes: usize) -> usize {
         "IMAGE_BASE {base:#x} is not inside this part's XIP flash window"
     );
     base
+}
+
+/// The board's settings in bytes -- `SETTINGS_SECTORS` sectors of `SECTOR_BYTES` -- read from
+/// `src/rp2350_settings.rs`, where the firmware states their place, so the bound of a firmware that
+/// takes no deploys moves with them. A value this cannot find or parse fails the build, as for
+/// [`deploy_region_base`].
+fn settings_bytes() -> usize {
+    let module = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rp2350_settings.rs");
+    let text = std::fs::read_to_string(&module)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", module.display()));
+    let constant = |name: &str| -> usize {
+        let declaration = format!("pub const {name}: usize =");
+        let literal = text
+            .lines()
+            .find_map(|line| line.split_once(declaration.as_str())?.1.split(';').next())
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} no longer declares `{declaration} ...;`, so the flash bound of a firmware \
+                     that takes no deploys cannot be kept below the board's settings",
+                    module.display()
+                )
+            })
+            .trim()
+            .replace('_', "");
+        literal
+            .parse()
+            .unwrap_or_else(|_| panic!("{name} is not a decimal literal this can read: {literal:?}"))
+    };
+    constant("SETTINGS_SECTORS") * constant("SECTOR_BYTES")
 }
 
 /// A board's radio, as the firmware's `cyw43` feature sees it.

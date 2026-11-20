@@ -115,6 +115,7 @@ mod tests {
             own: Some(String::from("own00001")),
             references: vec![String::from("corlib01")],
             string: None,
+            system_type: None,
         }
     }
 

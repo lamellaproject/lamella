@@ -231,8 +231,9 @@ done
 # --- System.Device.Gpio, once per family -------------------------------------------------------------
 # Each family with a libs/System.Device.Gpio/Families/<family>.cs gets a System.Device.Gpio of its own,
 # at families/<family>/System.Device.Gpio.dll, holding the drivers that file constructs from a board's
-# bus table and the csp/<family>/csharp sources Families/<family>.sources lists: csharp/build-managed.ps1 says
-# why, and why csharp/build-boards.ps1 leaves those sources out of a board's assembly. The listed sources are
+# bus table and the sources Families/<family>.sources lists, from csp/<family>/csharp and, for an entry
+# starting ./, from beside the family files: csharp/build-managed.ps1 says why, and why
+# csharp/build-boards.ps1 leaves the csp ones out of a board's assembly. The listed sources are
 # compiled from copies whose overrides of GpioDriver's `protected internal` members say so; the edit
 # is the .ps1's, made with sed, and the list is read and refused as the .ps1 reads and refuses it.
 gpio_folded=""
@@ -264,11 +265,15 @@ for family_file in "${family_files[@]}"; do
         echo "libs/System.Device.Gpio/Families/$family.sources does not exist: it lists the csp/$family/csharp sources the $family build of System.Device.Gpio carries" >&2
         exit 1
     fi
+    shared="$root/libs/System.Device.Gpio/Families"
     listed=()
     while IFS= read -r line || [ -n "$line" ]; do
         entry="$(printf '%s' "$line" | tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
         case "$entry" in ''|'#'*) continue ;; esac
         case "$entry" in
+            ./*.cs) if [ -f "$shared/${entry#./}" ]; then listed+=("$entry"); continue; fi
+                    echo "libs/System.Device.Gpio/Families/$family.sources lists '$entry', which is not a C# source in libs/System.Device.Gpio/Families" >&2
+                    exit 1 ;;
             *.cs) if [ -f "$csp/$entry" ]; then listed+=("$entry"); continue; fi ;;
         esac
         echo "libs/System.Device.Gpio/Families/$family.sources lists '$entry', which is not a C# source in csp/$family/csharp" >&2
@@ -281,21 +286,31 @@ for family_file in "${family_files[@]}"; do
     unique="$(printf '%s\n' "${listed[@]}" | LC_ALL=C sort -u | wc -l | tr -d ' ')"
     work="$(mktemp -d)"
     copies=()
+    # The csp sources first, then the shared ones beside the family files, each matched as its list
+    # entry spells it and each in sorted order, as the .ps1 takes them.
     read_lines < <(sources_of "$csp" "")
-    for file in "${REPLY_LINES[@]}"; do
-        relative="${file#"$csp"/}"
+    csp_files=()
+    if [ ${#REPLY_LINES[@]} -gt 0 ]; then csp_files=("${REPLY_LINES[@]}"); fi
+    read_lines < <(sources_of "$shared" "")
+    shared_files=()
+    if [ ${#REPLY_LINES[@]} -gt 0 ]; then shared_files=("${REPLY_LINES[@]}"); fi
+    for file in "${csp_files[@]}" "${shared_files[@]}"; do
+        case "$file" in
+            "$csp"/*) relative="${file#"$csp"/}"; copy="$work/$relative" ;;
+            *) relative="./${file#"$shared"/}"; copy="$work/shared/${file#"$shared"/}" ;;
+        esac
         found=""
         for entry in "${listed[@]}"; do
             if [ "$entry" = "$relative" ]; then found=1; break; fi
         done
         if [ -z "$found" ]; then continue; fi
-        mkdir -p "$work/$(dirname "$relative")"
+        mkdir -p "$(dirname "$copy")"
         sed -E -e '/Dispose\(/!s/^([[:blank:]]*)protected override/\1protected internal override/' \
-            "$file" > "$work/$relative"
-        copies+=("$work/$relative")
+            "$file" > "$copy"
+        copies+=("$copy")
     done
     if [ ${#copies[@]} -ne "$unique" ]; then
-        echo "libs/System.Device.Gpio/Families/$family.sources lists $unique sources and csp/$family/csharp yielded ${#copies[@]} of them" >&2
+        echo "libs/System.Device.Gpio/Families/$family.sources lists $unique sources and csp/$family/csharp and libs/System.Device.Gpio/Families yielded ${#copies[@]} of them" >&2
         exit 1
     fi
     mkdir -p "$out/families/$family"

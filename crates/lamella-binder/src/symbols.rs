@@ -1477,26 +1477,6 @@ impl Model {
         }
     }
 
-    /// The OPEN declaration behind a member reached through an INSTANTIATED generic type, with the
-    /// definition's type-parameter NAMES beside it: `(["T"], Box<T>.Get() -> T)` for a `Get()`
-    /// resolved on `Box<int>`.
-    ///
-    /// **THE OPEN SIGNATURE CANNOT BE RECOVERED FROM THE CLOSED ONE**, which is the same reason
-    /// `MethodInstantiation` exists one axis over: after substitution `Box<int>.Get()` reads
-    /// `int Get()`, indistinguishable from an ordinary `int Get()` on a non-generic type.
-    /// ECMA-335 4th ed II.23.2.1 wants the DEFINITION's signature on the `MemberRef`, so emission
-    /// has to be handed what substitution consumed.
-    ///
-    /// **THE MEMBER IS IDENTIFIED BY SUBSTITUTING, NOT BY POSITION.** `TypeInfo::instantiate`
-    /// clones member-for-member, so an index would work today and would break silently the first
-    /// time anything filters or reorders that list -- and a wrong-but-plausible open signature is
-    /// exactly the failure this whole area cannot see. Substituting each candidate and comparing
-    /// against the parameters overload resolution actually chose asks the question in the same
-    /// terms the answer was produced in.
-    ///
-    /// `None` for a non-instantiated type, for a definition not in the model, and for a member
-    /// that does not match -- emission then refuses rather than writing a `!n` it guessed.
-    #[must_use]
     /// The open declaration an instantiation names, and the type-parameter names its ARGUMENTS
     /// bind to -- in order, so the two zip.
     ///
@@ -1507,13 +1487,6 @@ impl Model {
     /// ordinary type -- and refusing here is silent, because every caller reads `None` as "not
     /// reached through an instantiation" and falls back to the definition's open signature.
     ///
-    /// That is what made `foreach` over a `Span<byte>` fail: the enumerator's `MoveNext` lost its
-    /// instantiation, was minted with a plain `TypeRef` parent, and emission refused it as a call
-    /// outside this module -- while the desugar, seeing no pattern, fell back to non-generic
-    /// `IEnumerator` whose `Current` is `object` and asked for an unbox. One cause, two messages.
-    ///
-    /// Extracted rather than repaired in place: three callers had the same prologue and the same
-    /// wrong comparison, so a fix at one of them would have left two.
     fn open_declaration<'model>(
         &'model self,
         declaring: &TypeSymbol,
@@ -1550,6 +1523,26 @@ impl Model {
         Some((open, names))
     }
 
+    /// The OPEN declaration behind a member reached through an INSTANTIATED generic type, with the
+    /// definition's type-parameter NAMES beside it: `(["T"], Box<T>.Get() -> T)` for a `Get()`
+    /// resolved on `Box<int>`.
+    ///
+    /// **THE OPEN SIGNATURE CANNOT BE RECOVERED FROM THE CLOSED ONE**, which is the same reason
+    /// `MethodInstantiation` exists one axis over: after substitution `Box<int>.Get()` reads
+    /// `int Get()`, indistinguishable from an ordinary `int Get()` on a non-generic type.
+    /// ECMA-335 4th ed II.23.2.1 wants the DEFINITION's signature on the `MemberRef`, so emission
+    /// has to be handed what substitution consumed.
+    ///
+    /// **THE MEMBER IS IDENTIFIED BY SUBSTITUTING, NOT BY POSITION.** `TypeInfo::instantiate`
+    /// clones member-for-member, so an index would work today and would break silently the first
+    /// time anything filters or reorders that list -- and a wrong-but-plausible open signature is
+    /// exactly the failure this whole area cannot see. Substituting each candidate and comparing
+    /// against the parameters overload resolution actually chose asks the question in the same
+    /// terms the answer was produced in.
+    ///
+    /// `None` for a non-instantiated type, for a definition not in the model, and for a member
+    /// that does not match -- emission then refuses rather than writing a `!n` it guessed.
+    #[must_use]
     pub fn open_member(
         &self,
         declaring: &TypeSymbol,
